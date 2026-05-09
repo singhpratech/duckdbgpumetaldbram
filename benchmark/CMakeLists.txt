@@ -28,6 +28,11 @@ set_target_properties(gpudb-window-bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
 
+add_executable(gpudb-hashjoin-bench hashjoin_bench_main.cpp)
+target_link_libraries(gpudb-hashjoin-bench PRIVATE gpudb)
+set_target_properties(gpudb-hashjoin-bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
 if(GPUDB_BUILD_EXT)
     add_executable(gpudb-sql sql_demo_main.cpp)
     target_link_libraries(gpudb-sql PRIVATE gpudb_ext)

@@ -4,6 +4,7 @@ set(GPUDB_SOURCES
     backends/cpu/cpu_aggregator.cpp
     backends/cpu/cpu_groupby.cpp
     backends/cpu/cpu_window.cpp
+    backends/cpu/cpu_hashjoin.cpp
     backends/backend_factory.cpp
 )
 
@@ -21,6 +22,7 @@ if(GPUDB_HAS_METAL)
         backends/metal/metal_aggregator.mm
         backends/metal/metal_groupby.mm
         backends/metal/metal_window.mm
+        backends/metal/metal_hashjoin.mm
     )
 
     # Embed .metal source as C strings so the Objective-C++ TUs can compile

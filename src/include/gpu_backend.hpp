@@ -37,6 +37,21 @@ struct AggResult {
     double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
 };
 
+// Returned by Aggregator::agg_all_i64 — fused SUM + MIN + MAX + COUNT in
+// a single pass over the input. The big win is that each int64 is read
+// from memory exactly ONCE, halving (or quartering) DRAM traffic vs the
+// "call sum/min/max separately" pattern.
+struct AggAllResult {
+    std::int64_t sum;           // SUM(values)
+    std::int64_t min;           // MIN(values), int64 max if rows == 0
+    std::int64_t max;           // MAX(values), int64 min if rows == 0
+    std::size_t  count;         // number of values read (== rows for non-null)
+    std::size_t  rows;          // input row count
+    double       wall_ms;       // total wall time
+    double       kernel_ms;     // GPU kernel time only (0 for CPU)
+    double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
+};
+
 // Opaque handle to a column resident in backend memory.
 // Owns the storage; destruction releases device memory.
 // Created by Aggregator::upload_*; must only be used with the SAME aggregator
@@ -76,6 +91,14 @@ public:
     virtual AggResult min_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult max_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult sum_resident_f64(const ResidentColumn&) = 0;
+
+    // ---- Multi-aggregate fusion (SUM + MIN + MAX + COUNT in one pass) ----
+    // Each int64 is read from memory ONCE; backends compute all four
+    // aggregates simultaneously. Wins over calling sum/min/max separately
+    // by 2-3x on memory-bandwidth-bound work, and proportionally more
+    // when more aggregates are fused.
+    virtual AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) = 0;
+    virtual AggAllResult agg_all_resident_i64(const ResidentColumn&) = 0;
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled
@@ -139,6 +162,26 @@ std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 struct WindowResult {
     std::vector<std::int64_t> output;     // window function value per input row
     std::size_t  rows = 0;
+//  HASH JOIN probe (i64 keys, inner equi-join)
+// =========================================================================
+//
+// v1 contract: inner equi-join on int64 keys, build side has UNIQUE keys
+// (no duplicate handling — for each probe[i] we emit the FIRST matching
+// build[j], which is unambiguous when build is unique).
+//
+// Backend implementation strategy varies:
+//   - CPU:   std::unordered_map<int64,int64> on the build side.
+//   - CUDA:  open-addressing hash table with atomicCAS<int64> (in flight on
+//            feat/cuda-hashjoin).
+//   - Metal: SORT-MERGE join (Apple Silicon GPUs lack 64-bit atomic CAS, so
+//            the CUDA approach cannot be mirrored — see
+//            src/backends/metal/metal_hashjoin.mm header for details).
+struct JoinResult {
+    std::vector<std::int64_t> probe_indices;   // matched probe-side row indices
+    std::vector<std::int64_t> build_indices;   // matched build-side row indices
+    std::size_t  rows_probe = 0;
+    std::size_t  rows_build = 0;
+    std::size_t  matched    = 0;
     double       wall_ms     = 0.0;
     double       kernel_ms   = 0.0;
     double       transfer_ms = 0.0;
@@ -155,6 +198,19 @@ public:
 };
 
 std::unique_ptr<WindowAggregator> make_window_aggregator(Backend);
+class HashJoinProbe {
+public:
+    virtual ~HashJoinProbe() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+    // Inner equi-join: for each probe[i], find the FIRST matching build[j].
+    // (No build-side duplicate handling for v1.)
+    virtual JoinResult inner_join_i64(
+        const std::int64_t* build_keys, std::size_t n_build,
+        const std::int64_t* probe_keys, std::size_t n_probe) = 0;
+};
+
+std::unique_ptr<HashJoinProbe> make_hashjoin_probe(Backend);
 
 // Returns the best backend available at runtime: CUDA if compiled+device,
 // else METAL if compiled+device, else CPU.
