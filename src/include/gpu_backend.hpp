@@ -111,6 +111,45 @@ public:
 
 std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 
+// =========================================================================
+//  Hash join (inner equi-join on i64 keys)
+// =========================================================================
+//
+// Build side: small/medium relation whose keys we materialize into a hash
+// table. Probe side: large relation whose keys we look up. Output is the
+// list of matching (probe_row_idx, build_row_idx) pairs. Inner join only,
+// integer-key only — sufficient for the canonical TPC-H Q3/Q5/Q10 join
+// shape (lineitem ⋈ orders on l_orderkey = o_orderkey).
+//
+// Like our GROUP BY, the device side uses an open-addressing hash table
+// where each slot holds (key, build_row_idx). Empty sentinel = INT64_MIN
+// in the key field — caller must not pass INT64_MIN as a build key.
+
+struct HashJoinResult {
+    std::vector<std::int64_t> probe_indices;   // row index in probe input
+    std::vector<std::int64_t> build_indices;   // row index in build input
+    std::size_t input_probe_rows = 0;
+    std::size_t input_build_rows = 0;
+    double      wall_ms     = 0.0;
+    double      kernel_ms   = 0.0;
+    double      transfer_ms = 0.0;
+};
+
+class HashJoinAggregator {
+public:
+    virtual ~HashJoinAggregator() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+
+    // Inner equi-join on int64 keys. Returns matched (probe_idx, build_idx)
+    // pairs. Order is unspecified across backends; sort to compare.
+    virtual HashJoinResult inner_join_i64(
+        const std::int64_t* build_keys, std::size_t n_build,
+        const std::int64_t* probe_keys, std::size_t n_probe) = 0;
+};
+
+std::unique_ptr<HashJoinAggregator> make_hashjoin_aggregator(Backend);
+
 // Returns the best backend available at runtime: CUDA if compiled+device,
 // else METAL if compiled+device, else CPU.
 [[nodiscard]] Backend default_backend() noexcept;

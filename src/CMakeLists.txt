@@ -3,6 +3,7 @@
 set(GPUDB_SOURCES
     backends/cpu/cpu_aggregator.cpp
     backends/cpu/cpu_groupby.cpp
+    backends/cpu/cpu_hashjoin.cpp
     backends/backend_factory.cpp
 )
 
@@ -10,8 +11,10 @@ if(GPUDB_HAS_CUDA)
     list(APPEND GPUDB_SOURCES
         backends/cuda/cuda_aggregator.cpp
         backends/cuda/cuda_groupby.cpp
+        backends/cuda/cuda_hashjoin.cpp
         backends/cuda/kernels/sum_kernel.cu
         backends/cuda/kernels/groupby_kernel.cu
+        backends/cuda/kernels/hashjoin_kernel.cu
     )
 endif()
 
