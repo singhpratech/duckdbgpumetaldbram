@@ -2,6 +2,61 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, macOS) — Window functions: ROW_NUMBER scaffold, CPU vs Metal stub
+
+Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, AppleClang 21.0.0.
+Code state: `feat/core-window-functions`. New `WindowAggregator` interface,
+CPU reference, Metal scaffold, and `gpudb-window-bench`.
+
+This is **GOAL.md item 8** — the operator Sirius (CIDR 2026 GPU OLAP paper)
+explicitly lacks. The v1 ships the interface and the CPU reference; the Metal
+scaffold reports `backend()==METAL` but delegates to the CPU implementation.
+Honest reporting: `device_name()` says "Metal scaffold — ROW_NUMBER delegates
+to CPU; real radix-sort + scatter kernel gated on PR #5".
+
+### Numbers (1 M random int64 keys over [0, 1e6], 3 runs, median)
+
+| Backend | wall (ms) | kernel (ms) | input throughput | Correctness |
+|---|---:|---:|---:|---|
+| CPU (`std::stable_sort` reference) | 42.19 | — | 0.18 GiB/s | OK vs oracle |
+| **Metal stub** (delegates to CPU)  | 42.22 | 0.00 | 0.18 GiB/s | OK vs oracle |
+
+Metal == CPU is expected and correct: the stub *is* the CPU code path, plus
+a constructor that opens the MTL device so the wiring is real. The bench
+verifies each output value against an independent stable-sort oracle living
+inside the bench binary, so a buggy aggregator can't validate itself.
+
+### What unblocks the real Metal kernel
+
+PR #5 (`feat/metal-radix-sort`) lands an LSD radix sort over int64 keys with
+a sibling int64 payload buffer. Once it merges to main:
+
+1. ROW_NUMBER reuses that radix sort with `payload[i] = i` (the original
+   row index as int64). The sort is stable by construction (per-bucket
+   relative-order preservation), which matches the CPU `std::stable_sort`
+   tie-break exactly.
+2. A trivial `row_number_scatter_i64` kernel writes `output[orig_index[p]]
+   = p + 1`. One dispatch, ceil(N/256) threadgroups, all UMA so the host
+   reads `output` with no D2H copy.
+3. Total expected GPU time: ~radix-sort time + a sub-millisecond scatter.
+   At the 1 M-rows × 1 M-groups sweet spot where `groupby_sum` already
+   wins 2.1× over CPU on this M4 Max, ROW_NUMBER should land in the same
+   neighborhood — both are bounded by the sort, not by what comes after.
+
+The full algorithm is documented in the long header comment of
+`src/backends/metal/metal_window.mm`. PR #5 is the only blocker.
+
+### Reproduce
+
+```bash
+export PATH="/Users/aiexplore369/Library/Python/3.9/bin:$PATH"
+cmake -S . -B build-macos
+cmake --build build-macos -j
+./build-macos/bin/gpudb-window-bench --rows 1000000 --runs 3
+```
+
+---
+
 ## 2026-05-09 (night) — Multi-agg fusion (sum+min+max+count one pass)
 
 The wedge: most analytical queries compute several aggregates over the same

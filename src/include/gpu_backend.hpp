@@ -135,6 +135,39 @@ public:
 std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 
 // =========================================================================
+//  Window functions (v1: ROW_NUMBER() OVER (ORDER BY key ASC))
+// =========================================================================
+//
+// First window-function operator on the project. Sirius (CIDR 2026 GPU OLAP
+// paper) explicitly lacks window functions; shipping it differentiates us.
+// v1 covers the simplest meaningful case — ROW_NUMBER over a single ascending
+// key — to lock the interface shape. Later additions (RANK, DENSE_RANK,
+// LAG/LEAD, partitioning, frame clauses) extend this surface without churn.
+//
+// Output semantics:
+//   For input row i, output[i] is the 1-indexed rank that row i would have
+//   if the input were sorted by key ASC. Ties are broken by stable order
+//   (input position): earlier rows in the input get the smaller rank.
+//
+// Example:
+//   keys   = [40, 10, 30, 10, 20]
+//   sorted = [(10,1), (10,3), (20,4), (30,2), (40,0)]   // (key, orig_idx)
+//   ranks  =   1       2        3        4        5
+//   output[0] = 5  (key=40 → rank 5)
+//   output[1] = 1  (key=10, earliest → rank 1)
+//   output[2] = 4  (key=30 → rank 4)
+//   output[3] = 2  (key=10, later → rank 2)
+//   output[4] = 3  (key=20 → rank 3)
+
+struct WindowResult {
+    std::vector<std::int64_t> output;     // window function value per input row
+    std::size_t  rows = 0;
+    double       wall_ms     = 0.0;
+    double       kernel_ms   = 0.0;
+    double       transfer_ms = 0.0;
+};
+
+// =========================================================================
 //  HASH JOIN probe (i64 keys, inner equi-join)
 // =========================================================================
 //
@@ -160,6 +193,17 @@ struct JoinResult {
     double       transfer_ms = 0.0;
 };
 
+class WindowAggregator {
+public:
+    virtual ~WindowAggregator() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+    // ROW_NUMBER() OVER (ORDER BY key ASC).
+    // Output row i contains the rank of input row i (1-indexed).
+    virtual WindowResult row_number_i64(const std::int64_t* keys, std::size_t n) = 0;
+};
+
+std::unique_ptr<WindowAggregator> make_window_aggregator(Backend);
 class HashJoinProbe {
 public:
     virtual ~HashJoinProbe() = default;
