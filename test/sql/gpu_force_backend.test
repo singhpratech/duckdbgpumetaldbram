@@ -1,0 +1,97 @@
+# gpu_force_backend SQL test — verifies the suite works under the
+# GPUDB_FORCE_BACKEND env var (cpu / gpu / auto).
+#
+# CURRENT STATE:
+#   The env var GPUDB_FORCE_BACKEND is NOT yet honoured by the extension.
+#   src/backends/backend_factory.cpp::default_backend() picks CUDA if the
+#   runtime is available; otherwise CPU. There is no `getenv("GPUDB_FORCE_
+#   BACKEND")` call anywhere in src/.
+#
+#   Consequently, all three sections of this file currently exercise the
+#   SAME backend (whatever default_backend() returns on the host). The
+#   tests still serve a purpose:
+#     1. They pin the contract: running gpudb-sql with the env var set
+#        must not error or crash (forward-compat regression guard).
+#     2. They re-exercise the core gpu_sum/gpu_min/gpu_max correctness
+#        invariants. If a future change wires up the env var and breaks
+#        any backend in isolation, this file will catch it.
+#
+# When the env var is wired up, update each section's expectations to
+# match the per-backend behaviour and split the file if the backends
+# diverge meaningfully (e.g. CPU returns NULL on empty, GPU returns 0).
+#
+# Run via:
+#   ./scripts/run_sql_tests.sh gpu_force_backend
+#
+# The runner honours `-- env: KEY=VAL` directives applied to the next query.
+
+# ===========================================================================
+# Section A — GPUDB_FORCE_BACKEND=cpu (forward-compat: env var no-op today)
+# ===========================================================================
+
+-- env: GPUDB_FORCE_BACKEND=cpu
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(10);
+-- expect: 45  45
+
+-- env: GPUDB_FORCE_BACKEND=cpu
+SELECT gpu_min(range::BIGINT) AS gmin, min(range::BIGINT) AS nmin,
+       gpu_max(range::BIGINT) AS gmax, max(range::BIGINT) AS nmax
+FROM range(1, 11);
+-- expect: 1  1  10  10
+
+-- env: GPUDB_FORCE_BACKEND=cpu
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(100000);
+-- expect: 4999950000  4999950000
+
+# ===========================================================================
+# Section B — GPUDB_FORCE_BACKEND=gpu
+# ===========================================================================
+
+-- env: GPUDB_FORCE_BACKEND=gpu
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(10);
+-- expect: 45  45
+
+-- env: GPUDB_FORCE_BACKEND=gpu
+SELECT gpu_min(range::BIGINT) AS gmin, min(range::BIGINT) AS nmin,
+       gpu_max(range::BIGINT) AS gmax, max(range::BIGINT) AS nmax
+FROM range(1, 11);
+-- expect: 1  1  10  10
+
+-- env: GPUDB_FORCE_BACKEND=gpu
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(1000000);
+-- expect: 499999500000  499999500000
+
+# ===========================================================================
+# Section C — GPUDB_FORCE_BACKEND=auto (default)
+# Skips window+PARTITION (covered as expected_fail in gpu_window.test)
+# ===========================================================================
+
+-- env: GPUDB_FORCE_BACKEND=auto
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(10);
+-- expect: 45  45
+
+-- env: GPUDB_FORCE_BACKEND=auto
+SELECT gpu_sum(x) AS gpu, sum(x) AS native
+FROM (VALUES (-100::BIGINT), (50::BIGINT), (-25::BIGINT), (75::BIGINT), (0::BIGINT)) t(x);
+-- expect: 0  0
+
+-- env: GPUDB_FORCE_BACKEND=auto
+SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
+FROM (VALUES (10::BIGINT), (3::BIGINT), (-7::BIGINT), (42::BIGINT), (0::BIGINT)) t(x);
+-- expect: -7  -7  42  42
+
+-- env: GPUDB_FORCE_BACKEND=auto
+SELECT gpu_sum(range::BIGINT) AS gpu, sum(range::BIGINT) AS native FROM range(1000000);
+-- expect: 499999500000  499999500000
+
+-- env: GPUDB_FORCE_BACKEND=auto
+-- Running-sum window — works under all backends today.
+SELECT range AS r,
+       gpu_sum(range::BIGINT) OVER (ORDER BY range) AS gs,
+       sum(range::BIGINT)     OVER (ORDER BY range) AS ns
+FROM range(5);
+-- expect: 0  0   0
+-- expect: 1  1   1
+-- expect: 2  3   3
+-- expect: 3  6   6
+-- expect: 4  10  10

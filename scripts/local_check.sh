@@ -96,6 +96,13 @@ if [ "$NO_EXT" = "0" ]; then
             "SELECT gpu_sum(v) AS gpu, sum(v) AS native FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet');"
     fi
     green "extension OK"
+
+    hr "SQL test suite (test/sql/*.test) — gpu_sum, gpu_min/max, GROUP BY, window"
+    if ! ./scripts/run_sql_tests.sh; then
+        red "SQL test suite reported FAIL (beyond the documented expected_fails)"
+        exit 1
+    fi
+    green "SQL test suite OK"
 fi
 
 hr "summary"

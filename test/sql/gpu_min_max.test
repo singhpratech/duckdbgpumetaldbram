@@ -1,0 +1,68 @@
+# gpu_min_max SQL test — verifies gpu_min / gpu_max produce identical results
+# to DuckDB's native MIN / MAX on integer ranges, NULL-bearing data, and
+# pseudo-random samples; pins the documented "empty / all-NULL → 0" sentinel.
+#
+# Run via:
+#   ./scripts/run_sql_tests.sh gpu_min_max
+
+-- 1. Tiny mixed-sign sample
+SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
+FROM (VALUES (10::BIGINT), (3::BIGINT), (-7::BIGINT), (42::BIGINT), (0::BIGINT)) t(x);
+-- expect: -7  -7  42  42
+
+-- 2. Strictly positive small range
+SELECT gpu_min(range::BIGINT) gmin, min(range::BIGINT) nmin,
+       gpu_max(range::BIGINT) gmax, max(range::BIGINT) nmax
+FROM range(1, 11);
+-- expect: 1  1  10  10
+
+-- 3. Negative range
+SELECT gpu_min((range - 100)::BIGINT) gmin, min((range - 100)::BIGINT) nmin,
+       gpu_max((range - 100)::BIGINT) gmax, max((range - 100)::BIGINT) nmax
+FROM range(50);
+-- expect: -100  -100  -51  -51
+
+-- 4. Signed range straddling 0
+SELECT gpu_min((range - 50000)::BIGINT) gmin, min((range - 50000)::BIGINT) nmin,
+       gpu_max((range - 50000)::BIGINT) gmax, max((range - 50000)::BIGINT) nmax
+FROM range(100000);
+-- expect: -50000  -50000  49999  49999
+
+-- 5. Large pseudo-random sample (deterministic linear congruential)
+WITH r AS (SELECT (range * 7919 + 13) % 1000003 - 500000 AS x FROM range(100000))
+SELECT gpu_min(x::BIGINT) gmin, min(x::BIGINT) nmin,
+       gpu_max(x::BIGINT) gmax, max(x::BIGINT) nmax FROM r;
+-- expect: -499999  -499999  499972  499972
+
+-- 6. INT64 boundary values must round-trip
+SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
+FROM (VALUES
+        (-9223372036854775807::BIGINT),
+        (9223372036854775807::BIGINT),
+        (0::BIGINT)) t(x);
+-- expect: -9223372036854775807  -9223372036854775807  9223372036854775807  9223372036854775807
+
+-- 7. NULLs are skipped (matches SQL semantics)
+SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
+FROM (SELECT CASE WHEN range % 3 = 0 THEN NULL ELSE range::BIGINT END AS x FROM range(100));
+-- expect: 1  1  98  98
+
+-- 8. MIN(empty) — gpu_min returns 0; native returns NULL.
+--    Documented divergence, same as gpu_sum on empty (see gpu_sum.test).
+SELECT gpu_min(x) gmin, min(x) nmin FROM (SELECT NULL::BIGINT WHERE FALSE) t(x);
+-- expect: 0  NULL
+
+-- 9. MAX(empty) — same divergence as MIN.
+SELECT gpu_max(x) gmax, max(x) nmax FROM (SELECT NULL::BIGINT WHERE FALSE) t(x);
+-- expect: 0  NULL
+
+-- 10. MIN/MAX over an all-NULL column — same divergence (gpu returns 0).
+SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
+FROM (VALUES (NULL::BIGINT), (NULL::BIGINT), (NULL::BIGINT)) t(x);
+-- expect: 0  NULL  0  NULL
+
+-- 11. 1M-row range — wide span correctness
+SELECT gpu_min(range::BIGINT) gmin, min(range::BIGINT) nmin,
+       gpu_max(range::BIGINT) gmax, max(range::BIGINT) nmax
+FROM range(1000000);
+-- expect: 0  0  999999  999999
