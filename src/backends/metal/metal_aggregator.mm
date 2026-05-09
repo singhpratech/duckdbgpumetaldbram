@@ -286,7 +286,37 @@ private:
         return r;
     }
 
+    // Stage host data into a Metal-readable buffer.
+    //
+    // FAST PATH (zero-copy): if `src` is page-aligned (16 KiB on Apple Silicon)
+    // AND the size is page-multiple, wrap it directly via newBufferWithBytesNoCopy.
+    // The GPU reads the same physical pages the CPU wrote — no memcpy. This is
+    // the COLD-vs-HOT eraser: at 1B int64 (8 GiB) the memcpy alone costs
+    // ~150 ms; eliminating it is the difference between "Metal loses 2× cold"
+    // and "Metal wins 5× cold".
+    //
+    // SLOW PATH: caller-provided pointer isn't aligned. Fall back to allocating
+    // a shared MTLBuffer and memcpy'ing.
     id<MTLBuffer> stage_input(const void* src, std::size_t bytes) {
+        constexpr std::uintptr_t kPageSize = 16384;  // Apple Silicon
+        const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(src);
+        if ((addr % kPageSize) == 0 && bytes >= kPageSize) {
+            // Round bytes UP to page boundary. newBufferWithBytesNoCopy
+            // requires page-aligned LENGTH; the kernel only reads the first
+            // `n` elements (passed separately), so the padded tail is
+            // unread. Caller must have allocated `bytes_padded` worth of
+            // memory (use aligned_alloc with the padded size).
+            const std::size_t bytes_padded =
+                ((bytes + kPageSize - 1) / kPageSize) * kPageSize;
+            id<MTLBuffer> buf =
+                [device_ newBufferWithBytesNoCopy:const_cast<void*>(src)
+                                           length:bytes_padded
+                                          options:MTLResourceStorageModeShared
+                                      deallocator:nil];
+            // Don't cache zero-copy buffers — they alias the caller's memory.
+            return buf;
+        }
+        // Slow path: cached shared buffer + memcpy.
         if (!input_buf_ || [input_buf_ length] < bytes) {
             input_buf_ = [device_ newBufferWithLength:bytes
                                               options:MTLResourceStorageModeShared];

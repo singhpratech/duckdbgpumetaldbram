@@ -34,6 +34,7 @@ struct Args {
     gpudb::Dtype dtype = gpudb::Dtype::I64;
     std::string input;
     Mode        mode = Mode::Both;
+    bool        aligned = false;   // page-align synthetic data → enables Metal zero-copy
 };
 
 void usage(const char* a0) {
@@ -66,6 +67,7 @@ bool parse(int argc, char** argv, Args& a) {
             else if (t == "f64") a.dtype = gpudb::Dtype::F64;
             else { std::fprintf(stderr, "bad --dtype: %s\n", t.c_str()); return false; }
         }
+        else if (s == "--aligned") a.aligned = true;
         else if (s == "-h" || s == "--help") { usage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); usage(argv[0]); return false; }
     }
@@ -167,6 +169,53 @@ void bench_backend(gpudb::Backend b, const std::vector<T>& data,
     }
 }
 
+// Variant of bench_backend that takes a raw pointer (so we can pass page-aligned
+// memory directly to the aggregator and trigger the Metal zero-copy path).
+void bench_backend_raw_i64(const std::vector<gpudb::Backend>& backends,
+                           const std::int64_t* data, std::size_t n,
+                           int runs, std::int64_t expected_sum, bool verify, Mode mode) {
+    const std::size_t bytes = n * sizeof(std::int64_t);
+    const double mib = bytes / (1024.0 * 1024.0);
+    for (auto b : backends) {
+        std::printf("\n[%s] rows=%zu (%.1f MiB)  PAGE-ALIGNED INPUT\n",
+                    gpudb::to_string(b), n, mib);
+        std::unique_ptr<gpudb::Aggregator> agg;
+        try { agg = gpudb::make_aggregator(b); }
+        catch (const std::exception& e) { std::printf("  unavailable: %s\n", e.what()); continue; }
+        std::printf("  device: %s\n", agg->device_name().c_str());
+
+        if (mode == Mode::Cold || mode == Mode::Both) {
+            std::vector<double> wall, kernel;
+            for (int i = 0; i < runs; ++i) {
+                auto r = agg->sum_i64(data, n);
+                wall.push_back(r.wall_ms);
+                kernel.push_back(r.kernel_ms);
+                if (i == 0 && verify) verify_or_die(r.value_i64, expected_sum, "cold-aligned");
+            }
+            std::printf("  COLD  median wall=%8.3f ms  kernel=%8.3f ms  throughput=%6.2f GiB/s",
+                        median(wall), median(kernel), gibps(bytes, median(wall)));
+            if (median(kernel) > 0.0)
+                std::printf("  (kernel-only %6.2f GiB/s)", gibps(bytes, median(kernel)));
+            std::printf("\n");
+        }
+        if (mode == Mode::Hot || mode == Mode::Both) {
+            auto col = agg->upload_i64(data, n);
+            agg->sum_resident_i64(*col);   // warmup + verify
+            std::vector<double> wall, kernel;
+            for (int i = 0; i < runs; ++i) {
+                auto r = agg->sum_resident_i64(*col);
+                wall.push_back(r.wall_ms);
+                kernel.push_back(r.kernel_ms);
+            }
+            std::printf("  HOT   median wall=%8.3f ms  kernel=%8.3f ms  throughput=%6.2f GiB/s",
+                        median(wall), median(kernel), gibps(bytes, median(wall)));
+            if (median(kernel) > 0.0)
+                std::printf("  (kernel-only %6.2f GiB/s)", gibps(bytes, median(kernel)));
+            std::printf("\n");
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -211,10 +260,26 @@ int main(int argc, char** argv) {
         std::mt19937_64 rng(0xC0FFEEULL);
         if (a.dtype == gpudb::Dtype::I64) {
             std::uniform_int_distribution<std::int64_t> dist(-1'000'000, 1'000'000);
-            std::vector<std::int64_t> data(a.rows);
-            std::int64_t ref = 0;
-            for (auto& x : data) { x = dist(rng); ref += x; }
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            if (a.aligned) {
+                // Page-aligned input — Metal's stage_input takes the
+                // newBufferWithBytesNoCopy fast path, skipping the COLD memcpy.
+                constexpr std::size_t kPage = 16384;
+                const std::size_t bytes = a.rows * sizeof(std::int64_t);
+                const std::size_t bytes_padded = ((bytes + kPage - 1) / kPage) * kPage;
+                std::int64_t* raw = static_cast<std::int64_t*>(
+                    std::aligned_alloc(kPage, bytes_padded));
+                std::int64_t ref = 0;
+                for (std::size_t i = 0; i < a.rows; ++i) { raw[i] = dist(rng); ref += raw[i]; }
+                std::printf("  (page-aligned input, %zu MiB padded)\n", bytes_padded / (1024 * 1024));
+                // bench_backend_raw uses the pointer directly — no vector copy.
+                bench_backend_raw_i64(backends, raw, a.rows, a.runs, ref, a.verify, a.mode);
+                std::free(raw);
+            } else {
+                std::vector<std::int64_t> data(a.rows);
+                std::int64_t ref = 0;
+                for (auto& x : data) { x = dist(rng); ref += x; }
+                for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            }
         } else {
             std::uniform_real_distribution<double> dist(0.0, 1.0);
             std::vector<double> data(a.rows);
