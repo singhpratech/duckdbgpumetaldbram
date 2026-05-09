@@ -95,6 +95,14 @@ public:
         return run_f64_sum(r.as_f64(), r.rows());
     }
 
+    AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) override {
+        return run_agg_all_i64(data, n);
+    }
+    AggAllResult agg_all_resident_i64(const ResidentColumn& c) override {
+        const auto& r = check_i64(c);
+        return run_agg_all_i64(r.as_i64(), r.rows());
+    }
+
 private:
     enum class ReduceKind { Sum, Min, Max };
 
@@ -138,6 +146,49 @@ private:
         }
         AggResult r{};
         r.value_i64 = v; r.rows = n;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    // Single-pass sum + min + max + count. The whole point: each cache line
+    // is touched once, so on a memory-bandwidth-bound workload this should
+    // be ~3x faster than calling sum/min/max separately.
+    AggAllResult run_agg_all_i64(const std::int64_t* data, std::size_t n) {
+        const auto t0 = std::chrono::steady_clock::now();
+        AggAllResult r{};
+        r.rows  = n;
+        r.count = n;
+        if (n == 0) {
+            r.sum = 0;
+            r.min = std::numeric_limits<std::int64_t>::max();
+            r.max = std::numeric_limits<std::int64_t>::min();
+            r.wall_ms = elapsed_ms(t0);
+            return r;
+        }
+
+        std::int64_t sum_v = 0;
+        std::int64_t min_v = std::numeric_limits<std::int64_t>::max();
+        std::int64_t max_v = std::numeric_limits<std::int64_t>::min();
+#if GPUDB_HAVE_OPENMP
+        #pragma omp parallel for reduction(+:sum_v) reduction(min:min_v) \
+                                 reduction(max:max_v) schedule(static)
+        for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
+            const std::int64_t x = data[i];
+            sum_v += x;
+            if (x < min_v) min_v = x;
+            if (x > max_v) max_v = x;
+        }
+#else
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::int64_t x = data[i];
+            sum_v += x;
+            if (x < min_v) min_v = x;
+            if (x > max_v) max_v = x;
+        }
+#endif
+        r.sum = sum_v;
+        r.min = min_v;
+        r.max = max_v;
         r.wall_ms = elapsed_ms(t0);
         return r;
     }
