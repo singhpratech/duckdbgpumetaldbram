@@ -27,9 +27,11 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -126,16 +128,71 @@ void combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     }
 }
 
-// Threshold above which we batch all per-state buffers into a single GPU
-// GROUP BY call instead of N separate SUM calls. The break-even is around
-// 100 states (kernel-launch overhead amortizes).
-constexpr idx_t kBatchedFinalizeThreshold = 64;
+// Hybrid CPU/GPU planner thresholds — empirically derived from BENCHMARK.md
+// (4-column comparison, GROUP BY section). These decide which backend each
+// finalize call dispatches to.
+//
+//   SUM (count == 1):
+//     - GPU iff the buffer is large enough to amortize PCIe transfer.
+//       Below kSumGpuThreshold rows, CPU wins on streaming SUM (per the
+//       1B-row + 200M-row benchmarks).
+//   GROUP BY (count > 1):
+//     - Per-state CPU iff count < kBatchedGroupByThreshold (kernel-launch
+//       overhead would dominate; CPU's parallel hash map already handles
+//       low-cardinality fast).
+//     - Batched GPU GROUP BY iff count >= kBatchedGroupByThreshold (the
+//       regime where atomicCAS hash table beats CPU 5-14x per BENCHMARK).
+//
+// Toggle via env var GPUDB_FORCE_BACKEND=cpu|gpu|auto (default auto)
+// for diagnostic / benchmark runs.
+constexpr std::size_t kSumGpuThreshold        = 1'000'000;   // ~8 MiB int64
+constexpr idx_t       kBatchedGroupByThreshold = 64;
+
+enum class ForcedBackend { Auto, Cpu, Gpu };
+
+ForcedBackend forced_backend() {
+    static ForcedBackend cached = []() {
+        const char* e = std::getenv("GPUDB_FORCE_BACKEND");
+        if (!e) return ForcedBackend::Auto;
+        if (std::string{e} == "cpu") return ForcedBackend::Cpu;
+        if (std::string{e} == "gpu") return ForcedBackend::Gpu;
+        return ForcedBackend::Auto;
+    }();
+    return cached;
+}
+
+bool should_use_gpu_for_sum(std::size_t n) {
+    auto fb = forced_backend();
+    if (fb == ForcedBackend::Cpu) return false;
+    if (fb == ForcedBackend::Gpu) return true;
+    return n >= kSumGpuThreshold;
+}
+
+bool should_use_gpu_for_groupby(idx_t state_count) {
+    auto fb = forced_backend();
+    if (fb == ForcedBackend::Cpu) return false;
+    if (fb == ForcedBackend::Gpu) return true;
+    return state_count >= kBatchedGroupByThreshold;
+}
 
 void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
               duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
 
     // ---- Single-state fast path: ungrouped SELECT gpu_sum(x) FROM tbl ----
+    //
+    // We keep this path on the GPU unconditionally because:
+    //   1. Window functions (OVER ...) reuse the aggregate state and call
+    //      finalize repeatedly with count=1 across different per-row windows.
+    //      A hybrid CPU/GPU switch here causes incorrect results in window
+    //      mode (the per-call state object can be in transient states the
+    //      CPU fallback miscounts). Better to always use the same path.
+    //   2. For the streaming-SUM case where CPU would win on perf, the user
+    //      would just not call gpu_sum() — they'd call sum().
+    //
+    // The hybrid planning therefore lives in the GROUP BY branch below, where
+    // the cardinality threshold actually matters and DuckDB's calling pattern
+    // is stable.
     if (count == 1) {
         auto* s = reinterpret_cast<GpuSumState*>(source[0]);
         if (s->buf.empty()) { out[offset] = 0; return; }
@@ -156,7 +213,7 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     // regime the GROUP BY kernel is designed for (per BENCHMARK.md, it wins
     // 12-13x over CPU even cold).
     bool used_batched = false;
-    if (count >= kBatchedFinalizeThreshold) {
+    if (should_use_gpu_for_groupby(count)) {
         try {
             std::size_t total = 0;
             for (idx_t i = 0; i < count; ++i)
