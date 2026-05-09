@@ -2,6 +2,39 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night) — Metal hash-join SCAFFOLD landed
+
+`HashJoinProbe` abstract interface + CPU reference (`std::unordered_map`) +
+Metal STUB are in. The Metal stub currently delegates to CPU work under the
+hood (Backend::METAL with CPU-shaped reduction), the same pattern the
+original Metal groupby used before being replaced with a real GPU kernel.
+
+**Numbers will therefore match the CPU baseline** — that's expected. The
+real Metal sort-merge implementation will replace the stub when the CUDA
+hash-join (in flight on `feat/cuda-hashjoin`) lands on main and the
+abstract contract is locked in.
+
+Why sort-merge for Metal (not a direct CUDA port): Apple Silicon GPUs have
+no 64-bit `atomic_compare_exchange`, so the CUDA open-addressing hash table
+can't be mirrored. Sort + binary-search merge reuses the radix-sort kernels
+already in `groupby.metal`. See `src/backends/metal/metal_hashjoin.mm`
+header for the planned algorithm.
+
+### Apple M4 Max, scaffold sanity run (Metal == CPU until kernel lands)
+
+```
+gpudb-hashjoin-bench  build=1,000,000  probe=10,000,000  runs=3  skew=0.0
+matched 9,688,172 / 10,000,000 probe rows (96.9%)
+
+[CPU]   median wall=75.93 ms   1.08 GiB/s
+[Metal] median wall=73.49 ms   1.12 GiB/s   (scaffold; CPU fallback)
+```
+
+Verification: every backend's matched-pair set is compared (after sort) to
+the CPU reference. Mismatch is a hard fail.
+
+---
+
 ## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
 
 The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
