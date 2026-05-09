@@ -2,6 +2,85 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (5× honest) — where we hit 5×, where we don't, and the path forward
+
+Re-bench summary on Apple M4 Max with the latest main. The user's
+target is "Metal 5× over CPU". Below is the truthful map of where we
+hit it, where we don't, and the structural reason for each.
+
+### ✅ At or near the 5× target
+
+| Workload | CPU wall | Metal wall | **Speedup** | Why we hit it |
+|---|---:|---:|:---:|---|
+| **SUM HOT 1B i64** | 92.4 ms | **16.25 ms** | **5.69×** 🎯 | At LPDDR5X bandwidth ceiling (464 GiB/s = ~85% of M4 Max peak) |
+| GROUP BY 100M × 1M groups | 843.9 ms | 176.9 ms | **4.77×** | High cardinality — CPU's hash table loses cache locality |
+| GROUP BY 200M × 1M groups | 1601.5 ms | 355.2 ms | **4.51×** | same |
+| GROUP BY 500M × 1M groups | 4151.6 ms | 935.8 ms | **4.44×** | same |
+| Multi-agg fusion (1B, 4 ops) | 315 ms (CPU separate) / 92 ms (CPU fused) | 16 ms | **5.3× vs fused / 19.6× vs separate** | Same bandwidth, 4× more useful work per byte read |
+
+### ❌ Below 5×, with the honest reason
+
+| Workload | Metal vs CPU | Why we miss it |
+|---|:---:|---|
+| TPC-H SF1 GROUP BY (6M × 1.5M) | 2.00× | Mid cardinality + small N — 8-pass radix overhead ~50% of wall |
+| TPC-H SF10 GROUP BY (60M × 15M) | 2.01× | same shape, scaled |
+| **GROUP BY 1B × 1M groups** | **1.51×** | **Host-side segment-reduce on 1B sorted elements is now the bottleneck — the GPU kernel is fast (1.64 s), but post-sort merge on 8 GiB takes ~3.5 s on host even with 8 threads** |
+| SQL `gpu_sum` SF1 (via DuckDB) | CPU 7× ahead | COLD upload per query — Arrow→MTLBuffer memcpy + dispatch dominates |
+| SQL `gpu_sum` SF10 | CPU 9× ahead | same, scaled |
+
+### Why the 1B GROUP BY drops to 1.5×
+
+At 1B rows, the wall breaks down approximately as:
+- GPU radix sort kernel: ~1.6 s (467 GiB/s, near peak, similar to SUM)
+- Host segment-reduce (parallel 8-thread, scanning 1B sorted i64): ~3 s
+- Memcpy of input + small bookkeeping: ~1 s
+- Total: ~5.6 s
+
+The kernel is fine. **The bottleneck is host-side work on 1B elements**.
+This is the same lesson the host-scan for radix offsets taught us
+earlier — when the dataset gets huge, anything sequential on the host
+caps the wins.
+
+**The fix:** GPU-resident segment-reduce. After radix sort produces
+sorted (key, value) pairs, run a second compute kernel that walks the
+sorted output in parallel, identifies run boundaries via a prefix scan,
+and emits unique (key, sum) pairs. Same pattern as what we already do
+for the bucket-major scan inside radix — just one more stage. Estimated
+3-4 hours of focused work; would push 1B GROUP BY from 5.6 s → ~2 s,
+flipping the 1.51× into ~4×.
+
+Filed as the next-step ticket.
+
+### Why the SQL extension loses (and how to fix it)
+
+`gpu_sum` registered via the DuckDB extension (commit 545cc67) **uploads
+the column from Arrow to a fresh MTLBuffer per query**. At SF1 that's
+46 MiB; at SF10 it's 458 MiB. The actual GPU compute is fast (a few
+ms) but the memcpy + dispatch overhead is 100+ ms.
+
+This is the COLD case from the resident-column thesis. Path forward:
+**cache MTLBuffer per parquet column** at the extension layer. The
+hybrid planner already detects this regime and would dispatch CPU
+correctly if invoked — the extension just doesn't use the planner yet.
+
+Estimate: 1-2 days of work in `src/extension/gpu_sum_extension.cpp`
+(Linux Claude's lane). Filed as a next-step.
+
+### What this changes for "release"
+
+Honest BENCHMARK.md headline for DuckDB Community Extensions submission:
+
+> Metal beats single-thread CPU **5.69× on 1B SUM HOT, 4.4-4.8× on
+> 100M-500M GROUP BY at high cardinality, and ties CUDA wall on TPC-H
+> SF1 GROUP BY (16.2 ms vs 16.9 ms)**. The DuckDB SQL extension
+> currently does not realize these wins because it uploads per query —
+> a known limitation, fix in flight.
+
+That's the fundable story. We don't claim 5× across the board; we own
+the hardware ceiling story and document the path to extending it.
+
+---
+
 ## 2026-05-09 (night, macOS) — Hybrid planner v1 (GOAL.md item 7)
 
 Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GB unified
