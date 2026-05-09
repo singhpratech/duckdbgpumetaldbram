@@ -423,18 +423,15 @@ private:
     id<MTLComputePipelineState> ps_agg_all_i64_          = nil;
     id<MTLComputePipelineState> ps_agg_all_partials_i64_ = nil;
 
-    id<MTLBuffer> input_buf_    = nil;  // grows on demand
-    id<MTLBuffer> partials_buf_ = nil;  // sized for kMaxGrid * sizeof(int64)
-    id<MTLBuffer> out_buf_      = nil;  // single int64
-    // Zero-copy cache (keyed on caller pointer + padded length).
-    id<MTLBuffer> zerocopy_buf_   = nil;
-    const void*   zerocopy_src_   = nullptr;
-    std::size_t   zerocopy_bytes_ = 0;
-    id<MTLBuffer> input_buf_         = nil;  // grows on demand
+    id<MTLBuffer> input_buf_         = nil;  // grows on demand (slow-path memcpy)
     id<MTLBuffer> partials_buf_      = nil;  // sized for kMaxGrid * sizeof(int64)
     id<MTLBuffer> out_buf_           = nil;  // single int64
     id<MTLBuffer> partials_quad_buf_ = nil;  // 4 * kMaxGrid * sizeof(int64) for agg_all
     id<MTLBuffer> out_quad_buf_      = nil;  // 4 longs (sum/min/max/count)
+    // Zero-copy cache (keyed on caller pointer + padded length).
+    id<MTLBuffer> zerocopy_buf_   = nil;
+    const void*   zerocopy_src_   = nullptr;
+    std::size_t   zerocopy_bytes_ = 0;
 };
 
 } // namespace

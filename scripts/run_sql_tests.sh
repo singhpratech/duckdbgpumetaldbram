@@ -146,13 +146,23 @@ execute_query() {
     # call inside { ... } 2>/dev/null with the redirection on the GROUP
     # silences the diagnostic without dropping our captured stderr (which
     # is going to $err_f via the inner redirection).
+    # Pick the right timeout binary: `timeout` on Linux (GNU coreutils),
+    # `gtimeout` on macOS when coreutils is brew-installed, or empty
+    # (no per-query timeout) on macOS without coreutils.
+    local TIMEOUT_CMD=""
+    if command -v timeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="timeout --signal=TERM --kill-after=2s $TLIMIT"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        TIMEOUT_CMD="gtimeout --signal=TERM --kill-after=2s $TLIMIT"
+    fi
     if [ -n "$envspec" ]; then
         # shellcheck disable=SC2086
-        { env $envspec timeout --signal=TERM --kill-after=2s "$TLIMIT" \
+        { env $envspec $TIMEOUT_CMD \
             "$GPUDB_SQL" --sql "$sql" >"$out_f" 2>"$err_f" ; } 2>/dev/null
         rc=$?
     else
-        { timeout --signal=TERM --kill-after=2s "$TLIMIT" \
+        # shellcheck disable=SC2086
+        { $TIMEOUT_CMD \
             "$GPUDB_SQL" --sql "$sql" >"$out_f" 2>"$err_f" ; } 2>/dev/null
         rc=$?
     fi
