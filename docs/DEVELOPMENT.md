@@ -84,7 +84,7 @@ git merge linux-main      # or rebase, your call
 
 ## When you're ready to push to GitHub
 
-The repo `singhpratech/duckdbgpumetaldb` already exists and is private. To start using it:
+The repo `singhpratech/duckdbgpumetaldbram` already exists and is private. To start using it:
 
 ```bash
 cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb

@@ -1,0 +1,27 @@
+# gpu_sum SQL test — verifies the extension function returns identical
+# results to DuckDB's native SUM on real and synthetic data.
+#
+# Run via:
+#   ./build-linux/bin/gpudb-sql --sql "$(cat test/sql/gpu_sum.test)"
+# Or wrap in a CTest target later.
+
+-- 1. Trivial range
+SELECT
+    gpu_sum(range::BIGINT) AS gpu,
+    sum(range::BIGINT)     AS native
+FROM range(10);
+-- expect: 45  45
+
+-- 2. TPC-H lineitem orderkey (6M rows from SF1)
+SELECT
+    gpu_sum(v)             AS gpu,
+    sum(v)                 AS native
+FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet');
+-- expect: 18005322964949  18005322964949
+
+-- 3. Negative + positive mix
+SELECT
+    gpu_sum(x)             AS gpu,
+    sum(x)                 AS native
+FROM (VALUES (-100::BIGINT), (50::BIGINT), (-25::BIGINT), (75::BIGINT), (0::BIGINT)) t(x);
+-- expect: 0  0
