@@ -86,3 +86,6 @@ ehthumbs.db
 
 # Per-worktree symlink to shared data dir
 /data
+
+# DuckDB pre-built shared libs (~140 MB; downloaded by scripts/get_duckdb_libs.sh)
+third_party/duckdb-libs/

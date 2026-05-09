@@ -24,15 +24,43 @@ What's open in 2026:
 
 ## Hard commitments (what we will ship, in order)
 
-1. **CUDA backend** for SUM/MIN/MAX (one-shot + resident) — done (commit 1451f0f).
-2. **CUDA GROUP BY hash aggregate** — done (commit 4f3fd79).
-3. **Honest CPU baseline** (parallel where it actually wins, serial otherwise) — done (this PR).
-4. **CUDA hash-join probe** — in flight on `feat/cuda-hashjoin` (other instance).
-5. **Metal backend** completion: SUM/GROUP-BY/JOIN parity with CUDA on M-series — **owned by macOS Claude instance** when machine is available.
-6. **DuckDB extension wrapper** — registers `gpu_sum`, `gpu_groupby_sum`, `gpu_hashjoin` as DuckDB functions/operators. Loadable via `LOAD '...'`. Branch: `feat/ext-duckdb-stub`.
-7. **Hybrid planner**: at query time, pick CPU vs GPU based on cardinality / size estimates / data residency. The literature's open problem; our wedge.
-8. **Window functions on GPU** (the operator Sirius lacks).
-9. **Publish to DuckDB Community Extensions**: https://github.com/duckdb/community-extensions
+### Phase 1 — DONE (week 1, all merged or in-PR)
+1. **CUDA backend** for SUM/MIN/MAX (one-shot + resident) — ✅ done.
+2. **CUDA GROUP BY hash aggregate** — ✅ done.
+3. **Honest parallel CPU baseline** (cardinality-aware switch) — ✅ done.
+4. **Metal backend** for SUM/MIN/MAX i64 with real compute pipelines (UMA, no transfer) — ✅ done by macOS instance.
+5. **DuckDB extension wrapper** — ✅ done. Registers `gpu_sum`, `gpu_min`, `gpu_max`. NULL handling via validity mask. Batched-finalize for GROUP BY queries. `gpudb-sql` CLI demos it. PR #1 open on `feat/ext-duckdb-stub`.
+
+### Phase 2 — LAUNCH (next 2 weeks, ~3.5 hrs/week)
+The owner has explicitly chosen positioning: **"someone who really solves problems"**, time budget **30 min/day**, primary publishing channel **theaivibe.org**. Ship a publishable v1 then **enhance only after established as a publisher** (2-week milestone).
+
+6. **DuckDB Community Extension submission** — get the `.duckdb_extension` metadata footer right (use the official `duckdb/extension-template` build pipeline) and submit YAML + extension to https://github.com/duckdb/community-extensions. **The single highest-leverage action for recognition.**
+7. **Launch blog post on theaivibe.org** — "The first SQL execution engine for Apple Silicon GPUs" or "Why every GPU database failed and what changes in 2026". Cross-post HN + r/dataengineering.
+8. **README polish** for public consumption (already done in PR #1; revise after first round of comments).
+
+### Phase 3 — ENHANCE (after week 2, once user is established as a publisher)
+The owner stated: "after 2 weeks I will enhance once I've established myself as an enhancer." Treat this as the moment to add the operators that demonstrate continued shipping cadence.
+
+9. **CUDA hash-join probe** — same pattern as GROUP BY hash table; biggest TPC-H impact since joins dominate query time.
+10. **Resident-column SQL hooks** — `gpu_cache(table, col)` table function so users can pre-load columns and query them many times. Where the GPU wins are decisive.
+11. **Metal GROUP BY** with real device-side hash table — open lane for macOS instance. Currently falls back to CPU. Sirius doesn't have this either; we'd be unique.
+12. **Hybrid CPU/GPU planner**: at query time, pick CPU vs GPU based on cardinality / size / residency. Empirical thresholds are documented in BENCHMARK.md; needs to be wired into the extension.
+13. **Window functions on GPU** (the operator Sirius lacks per their CIDR 2026 paper). Highest-value differentiator after Apple Silicon.
+14. **String / regex operators** — libcudf-class functionality is weak; opportunity for a high-impact deep-dive blog post + working code.
+
+## For the macOS Claude Code instance specifically
+
+**Your highest-leverage next action**: implement the Metal version of GROUP BY hash aggregate, mirroring `src/backends/cuda/kernels/groupby_kernel.cu`. Apple GPUs:
+- Have `simd_min`, `simd_max`, `simd_sum`, `atomic_compare_exchange_weak_explicit` (Metal 2.4+)
+- Lack 64-bit atomic CAS until very recent macOS — check support, degrade if needed
+- Use 32-wide simdgroups; threadgroup memory for per-tile reduction
+- See `philipturner/metal-benchmarks` for microarchitectural reference
+
+If 64-bit atomics aren't usable on the target chip:
+- Use 32-bit hash slots (split int64 into two 32-bit lanes; atomic 32-bit ops are universal)
+- OR sort-based GROUP BY (radix sort the keys, then reduce_by_key)
+
+After that lands: the project becomes the **first SQL engine in the world** with both CUDA and Metal GROUP BY working, end-to-end. That's the artifact the launch post should lead with.
 
 ## Empirically grounded (numbers from BENCHMARK.md, not marketing)
 
@@ -79,3 +107,7 @@ Practical Metal notes (from research summarized in `.private/RESEARCH_BRIEFING.m
 
 ## Status snapshot
 See `BENCHMARK.md` for current numbers, `.sync/` for live instance status, `git log --oneline -20` for recent work.
+
+## Owner channel
+
+Long-form writeups, design rationale, and ongoing performance posts live at **[theaivibe.org](https://theaivibe.org)**. The blog is the primary recognition channel for this project; GitHub holds the code.
