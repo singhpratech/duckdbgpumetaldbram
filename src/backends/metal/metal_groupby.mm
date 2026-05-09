@@ -126,10 +126,17 @@ public:
             const auto t_wall0 = std::chrono::steady_clock::now();
 
             const std::size_t bytes = n_pad * sizeof(std::int64_t);
-            id<MTLBuffer> b_keys   = [device_ newBufferWithLength:bytes
-                                                          options:MTLResourceStorageModeShared];
-            id<MTLBuffer> b_values = [device_ newBufferWithLength:bytes
-                                                          options:MTLResourceStorageModeShared];
+            // Buffer cache: avoids ~10-50 ms of vm_allocate per call at scale.
+            if (!b_keys_ || [b_keys_ length] < bytes) {
+                b_keys_ = [device_ newBufferWithLength:bytes
+                                               options:MTLResourceStorageModeShared];
+            }
+            if (!b_values_ || [b_values_ length] < bytes) {
+                b_values_ = [device_ newBufferWithLength:bytes
+                                                 options:MTLResourceStorageModeShared];
+            }
+            id<MTLBuffer> b_keys   = b_keys_;
+            id<MTLBuffer> b_values = b_values_;
 
             std::memcpy([b_keys   contents], keys,   n * sizeof(std::int64_t));
             std::memcpy([b_values contents], values, n * sizeof(std::int64_t));
@@ -247,6 +254,9 @@ private:
     id<MTLComputePipelineState> ps_pad_         = nil;
     id<MTLComputePipelineState> ps_local_sort_  = nil;
     id<MTLComputePipelineState> ps_local_merge_ = nil;
+    // Buffer cache (sized lazily) — avoids vm_allocate per call.
+    id<MTLBuffer> b_keys_   = nil;
+    id<MTLBuffer> b_values_ = nil;
 };
 
 } // namespace
