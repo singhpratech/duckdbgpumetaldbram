@@ -104,8 +104,9 @@ void run_backend(gpudb::Backend b, const std::vector<std::int64_t>& keys,
     catch (const std::exception& e) { std::printf("  unavailable: %s\n", e.what()); return; }
     std::printf("  device: %s\n", agg->device_name().c_str());
 
-    // First call: verify.
-    auto first = agg->groupby_sum_i64(keys.data(), values.data(), keys.size());
+    // First call: verify. Pass cardinality hint when known (synthetic --groups).
+    const std::size_t hint = (reference != nullptr) ? reference->keys.size() : 0;
+    auto first = agg->groupby_sum_i64(keys.data(), values.data(), keys.size(), hint);
     std::printf("  groups produced: %zu\n", first.keys.size());
     if (reference && verify) {
         if (!result_equals(first, *reference)) {
@@ -116,7 +117,7 @@ void run_backend(gpudb::Backend b, const std::vector<std::int64_t>& keys,
 
     std::vector<double> wall, kernel, xfer;
     for (int i = 0; i < runs; ++i) {
-        auto r = agg->groupby_sum_i64(keys.data(), values.data(), keys.size());
+        auto r = agg->groupby_sum_i64(keys.data(), values.data(), keys.size(), hint);
         wall.push_back(r.wall_ms);
         kernel.push_back(r.kernel_ms);
         xfer.push_back(r.transfer_ms);

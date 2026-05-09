@@ -2,6 +2,55 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
+
+The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
+a fair comparison to a 20-thread CPU. Replaced with a cardinality-aware switch:
+
+- **Low cardinality** (`expected_groups <= n / 50`): per-thread map + merge
+  (parallel; merge stays cheap because per-thread maps are small)
+- **High cardinality** (otherwise): single-threaded
+  (the per-thread-merge pattern collapses when per-thread maps approach the
+  full output size — measured below)
+
+This is exactly the kind of decision a hybrid CPU/GPU planner has to make.
+
+### Synthetic: 50M int64 rows, varying cardinality, **honest CPU**
+
+| Cardinality | CPU (mode)        | CUDA wall | CUDA kernel | Winner       |
+|---:|---:|---:|---:|---|
+|        1,024 |  23.2 ms (parallel) |  86.2 ms |   8.7 ms | **CPU** by 3.7× wall  · CUDA kernel 2.6× |
+|    1,000,000 | 1066.9 ms (serial)  |  88.7 ms |   6.5 ms | **CUDA** 12.0× wall · 164× kernel |
+|   10,000,000 | 2321.0 ms (serial)  | 169.5 ms |  46.6 ms | **CUDA** 13.7× wall · 50× kernel |
+
+### Why parallel CPU collapses at high cardinality
+
+With 50M rows and 1M unique keys, each of 20 threads sees 2.5M rows hitting
+~918K unique keys (per balls-and-bins). The merge phase becomes 19 sequential
+merges of ~918K-entry maps into the largest one — about 18M hash-table
+insertions on a hot 1M-entry table. Single-thread total: ~2.3 s; parallel
+total in the older naive impl: ~10 s.
+
+**Fix path** (out of scope for this PR): hash-partition the input rows by
+`hash(key) % nthreads` so per-thread output domains are disjoint and the
+merge becomes free `vector` concatenation. That's the standard radix-shuffle
+pattern from VLDB literature (e.g. Balkesen et al. 2013).
+
+### Implication for the planner
+
+- For SUM/MIN/MAX (memory-bandwidth-bound): **CPU wins on cold data**;
+  GPU wins only when data is resident. Threshold: column resident in VRAM.
+- For GROUP BY:
+  - `groups <= 100K`: **CPU wins**, even cold. PCIe transfer dominates GPU.
+  - `groups > 100K`: **GPU wins** by 10×+ even with PCIe.
+  - Threshold for the planner: estimated cardinality.
+
+This is exactly the open problem from Rosenfeld/Breß CSUR 2022 and
+the Cao SIGMOD 2024 finding that production GPU DBMSs leave perf on the
+table by not making this decision well.
+
+---
+
 ## 2026-05-09 (evening) — GROUP BY hash aggregate, 1.3×–21.8× CUDA win
 
 First end-to-end SUM(value) GROUP BY key on RTX 4090 Laptop. Implementation:

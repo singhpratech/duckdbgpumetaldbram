@@ -83,3 +83,6 @@ ehthumbs.db
 
 # Downloaded helper tools
 .tools/
+
+# Per-worktree symlink to shared data dir
+/data

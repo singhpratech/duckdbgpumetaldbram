@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  linux-cpu:
+    name: linux (cpu-only build + tests)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              build-essential cmake libgomp1
+
+      - name: configure (no CUDA)
+        env:
+          GPUDB_NO_CUDA: "1"
+        run: |
+          ./scripts/build.sh
+
+      - name: run unit tests
+        run: |
+          ./build-linux/test/test_gpudb
+
+      - name: smoke benchmark (synthetic, small)
+        run: |
+          ./build-linux/bin/gpudb-bench --rows 1000000 --runs 2 --mode both
+
+      - name: smoke groupby benchmark
+        run: |
+          ./build-linux/bin/gpudb-groupby-bench --rows 1000000 --groups 1000 --runs 2
+
+  macos-cpu-metal:
+    name: macos (cpu + metal scaffold build)
+    runs-on: macos-14   # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure
+        run: |
+          ./scripts/build.sh
+
+      - name: run unit tests
+        run: |
+          ./build-macos/test/test_gpudb
