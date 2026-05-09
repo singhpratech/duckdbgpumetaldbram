@@ -2,6 +2,95 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (latest, macOS) — Metal GROUP BY: GPU-resident scan, full rows × cardinality matrix
+
+Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GiB unified
+memory). macOS 15.x, MSL 3.2. Single-thread `std::unordered_map` CPU
+baseline; median of 3 runs.
+
+**What's new:** the host-side bucket-major exclusive scan is gone. Three
+new GPU kernels (`radix_bucket_totals`, `radix_bucket_offsets`,
+`radix_per_bucket_scan`) compute the scatter offsets entirely on the GPU.
+**All 8 radix passes + sign-flips now live in a single MTLCommandBuffer**
+with one commit/wait. Wall converges to kernel time.
+
+### Headline: Metal WINS the canonical CUDA benchmark
+
+**TPC-H SF1 `lineitem.l_orderkey` GROUP BY** (6,001,215 rows, 1.5M unique groups):
+
+| backend | wall (ms) | kernel (ms) | throughput | vs CPU |
+|---|---:|---:|---:|---:|
+| CPU (single-thread `unordered_map`) | 35.2 | — | 2.54 GiB/s | 1× |
+| **Metal (GPU radix + GPU scan)** | **28.3** | 21.1 | 3.16 GiB/s (kernel 4.25 GiB/s) | **1.24×** |
+
+This is the workload CUDA shipped 4.8× on. Metal at this code quality
+**wins** — flipped from a 1.14× CPU win in the host-scan version.
+
+### Full ROWS × CARDINALITY matrix
+
+| Rows | 100 groups | 1K groups | 100K groups | 1M groups |
+|---:|:---:|:---:|:---:|:---:|
+|   **1M** | CPU 2.2× | CPU 2.2× | CPU 1.2× | **Metal 3.46×** |
+|  **10M** | CPU 2.0× | CPU 2.3× | CPU 1.2× | **Metal 3.10×** |
+| **100M** | CPU 2.3× | CPU 2.2× | CPU 1.2× | **Metal 3.29×** |
+| **200M** | CPU 2.3× | CPU 2.4× | CPU 1.3× | **Metal 3.29×** |
+| **500M** | CPU 2.9× | CPU 2.9× | CPU 1.4× | **Metal 2.68×** |
+
+Wall times (ms):
+
+| Rows | groups | CPU wall | Metal wall | Metal kernel |
+|---:|---:|---:|---:|---:|
+|   1M |    100 |   2.06 |   4.58 |   3.88 |
+|   1M |     1K |   2.00 |   4.32 |   3.68 |
+|   1M |   100K |   4.47 |   5.31 |   4.22 |
+|   1M |     1M |  25.27 |   **7.31** |   4.68 |
+|  10M |    100 |  19.78 |  40.38 |  36.69 |
+|  10M |     1K |  17.56 |  39.81 |  36.30 |
+|  10M |   100K |  33.76 |  41.09 |  36.71 |
+|  10M |     1M | 137.82 |  **44.48** |  36.88 |
+| 100M |    100 |    181 |    410 |    373 |
+| 100M |     1K |    180 |    405 |    374 |
+| 100M |   100K |    335 |    404 |    373 |
+| 100M |     1M |   1355 |    **412** |    372 |
+| 200M |    100 |    369 |    860 |    789 |
+| 200M |     1K |    352 |    849 |    787 |
+| 200M |   100K |    661 |    860 |    800 |
+| 200M |     1M |   2841 |    **864** |    796 |
+| 500M |    100 |    883 |   2571 |   2417 |
+| 500M |     1K |    819 |   2391 |   2237 |
+| 500M |   100K |   1680 |   2272 |   2122 |
+| 500M |     1M |   5799 |   **2167** |   2016 |
+| TPC-H (6M × 1.5M) |   |  35.2 |   **28.3** |  21.1 |
+
+### Read this table
+
+**The Metal kernel time is essentially constant across cardinality** — 37 ms
+at 10M rows, 372 ms at 100M, 790 ms at 200M, 2.2 s at 500M, regardless of
+group count. That's the radix-sort-with-GPU-scan working: the algorithm is
+genuinely O(N), independent of how many distinct keys exist.
+
+**The CPU baseline scales WITH cardinality**: at low group counts the
+hash table fits in L2/L3 and is cache-resident; at high group counts
+(1M+) it loses cache locality and falls off a cliff (1355 ms at 100M ×
+1M is roughly 7× slower than 100M × 100).
+
+That asymmetry is the wedge: Metal wins decisively where it actually
+matters for OLAP — high-cardinality GROUP BY (the very regime where
+CPU's hash table breaks down).
+
+### Where Metal still loses, and the path forward
+
+**Low cardinality (≤100K groups):** CPU's tiny hash table is cache-
+resident and beats sort-based GROUP BY. Fix: a min-max pre-scan to skip
+radix passes for constant bytes. For uniformly-distributed keys in
+[0, G), only ⌈log₂(G)/8⌉ + 1 of the 8 passes do meaningful work; the
+rest can be skipped (just swap pointers). Expected: 4–8× kernel speedup
+at low cardinality, which would flip these regimes.
+
+That's a small, contained change to land in the next PR.
+
+---
+
 ## 2026-05-09 (late night, macOS) — Metal GROUP BY: LSD radix sort, **Metal WINS at 1M–500M rows**
 
 Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GiB unified
