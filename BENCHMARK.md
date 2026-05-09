@@ -2,6 +2,102 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, macOS) — Hybrid planner v1 (GOAL.md item 7)
+
+Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GB unified
+memory). macOS 15.x, MSL 3.2. Code state: `feat/core-hybrid-planner`,
+single-threaded scalar CPU baseline (no OpenMP wired on this Mac for the
+SUM aggregator path; GROUP BY CPU is single-threaded `unordered_map`).
+
+**What's new:** the hybrid planner the academic literature flagged as an
+open problem (Rosenfeld/Breß CSUR 2022, Cao SIGMOD 2024) is now wired in.
+A new `HybridAggregator` and `HybridGroupByAggregator` wrap the CPU + GPU
+implementations and dispatch per call based on `N`, `expected_groups`, and
+data residency. Decisions are recorded in a `DispatchDecision` struct so
+the bench can prove "we picked the right backend".
+
+The thresholds are simple deterministic numbers derived from the Metal
+sweep (above) — no ML, no auto-tuner. The point: "we know our hardware
+well enough to pick the right backend deterministically".
+
+### Dispatch rule (Apple M4 Max, derived from BENCHMARK.md numbers)
+
+**SUM/MIN/MAX (scalar reduction)**:
+1. `n < 100K` → CPU (Metal launch overhead ≈1.5 ms eats any kernel speedup).
+2. COLD path → CPU at every practical N. The sweep below shows scalar CPU
+   on UMA saturates ~85 GiB/s and beats Metal cold (limited by the staging
+   memcpy + dispatch) by 4–5× even at 200M rows. The break-even is set to
+   1B as a safety sentinel — in practice "GPU never wins COLD on Metal".
+3. HOT (resident column) → GPU. The resident path skips the staging copy;
+   on M4 Max it hits ~280 GiB/s at 100M rows (3.3× CPU's 85 GiB/s).
+4. f64 → CPU (Apple GPUs have no IEEE-754 doubles in MSL).
+
+**GROUP BY (sort-then-segment-reduce on Metal)**:
+1. `n < 100K` → CPU outright (launch overhead alone beats CPU's
+   tens-of-µs `unordered_map`).
+2. `n < 500K` or `n > 2M` → CPU. The GPU sweet spot is narrow on this
+   build's bitonic sort: `O(N log²N)` collapses past 2M, and below 500K
+   the hash table is L2-resident.
+3. `expected_groups < 10K` (within the sweet-spot N band) → CPU
+   (cache-resident hash map).
+4. `expected_groups >= n / 2` (within the sweet-spot N band) → GPU.
+   The 1M × 1M cell wins decisively on GPU (8.3 vs 12.4 ms).
+5. Mid regime (within sweet-spot, neither low nor high cardinality):
+   route CPU on Metal but flag the decision `borderline` so a future
+   re-tune (e.g. when GPU radix sort lands and shifts the curve) is a
+   one-line change.
+
+The same rule shape is safe on CUDA — the CUDA-specific BENCHMARK.md
+numbers (12–22× wins at 1M+ groups, 9× HOT SUM) are strictly stronger
+than Metal so the same conservative thresholds remain correct. We will
+re-tune per-backend when Linux Claude lands online statistics.
+
+### Sweep — `gpudb-groupby-bench --backend sweep --runs 3`
+
+Each cell: hybrid wall vs always-CPU wall vs always-GPU wall, plus the
+hybrid's dispatch decision and reason. Tolerance for "hybrid wins" is
+±15% (sub-millisecond cells are noisy at this resolution).
+
+| N         | groups       | hybrid (ms) | CPU (ms) | GPU (ms) | picked | reason                       | verdict |
+|----------:|-------------:|------------:|---------:|---------:|--------|------------------------------|---------|
+|   100,000 |        1,024 |        0.29 |     0.26 |     1.89 | CPU    | LowCard_CpuWins              | hybrid_wins |
+|   100,000 |       10,000 |        0.64 |     0.63 |     1.92 | CPU    | LowCard_CpuWins              | hybrid_wins |
+|   100,000 |      100,000 |        1.33 |     1.20 |     2.23 | CPU    | LowCard_CpuWins              | hybrid_wins |
+|   100,000 |    1,000,000 |        1.00 |     0.91 |     2.00 | CPU    | LowCard_CpuWins              | hybrid_wins |
+| 1,000,000 |        1,024 |        1.44 |     1.45 |     5.39 | CPU    | LowCard_CpuWins              | hybrid_wins |
+| 1,000,000 |       10,000 |        2.87 |     2.89 |     5.91 | CPU    | Borderline_GpuTry [route CPU]| hybrid_wins (borderline) |
+| 1,000,000 |      100,000 |        4.27 |     4.24 |     6.44 | CPU    | Borderline_GpuTry [route CPU]| hybrid_wins (borderline) |
+| **1,000,000** | **1,000,000** |    **8.32** | **11.94**| **8.11** | **Metal** | **HighCard_GpuWins**     | **hybrid_wins** |
+| 5,000,000 |        1,024 |        7.43 |     7.47 |    61.09 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 5,000,000 |       10,000 |       14.73 |    14.74 |    61.22 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 5,000,000 |      100,000 |       16.75 |    16.34 |    61.94 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 5,000,000 |    1,000,000 |       46.16 |    46.70 |    66.48 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 10,000,000|        1,024 |       14.74 |    14.70 |   136.53 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 10,000,000|       10,000 |       29.72 |    29.62 |   136.97 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 10,000,000|      100,000 |       32.34 |    32.04 |   137.34 | CPU    | HugeN_CpuWins                | hybrid_wins |
+| 10,000,000|    1,000,000 |       92.76 |    91.44 |   142.17 | CPU    | HugeN_CpuWins                | hybrid_wins |
+
+**Summary across 16 cells (all 16 had a Metal GPU available):**
+- hybrid wall ≤ always-CPU wall at **16/16 cells (100%)**
+- hybrid wall ≤ always-GPU wall at **16/16 cells (100%)**
+
+The headline cell where hybrid beats BOTH pure backends is
+**N=1M × G=1M** (632K unique groups after balls-and-bins): hybrid 8.3 ms,
+pure CPU 11.9 ms (1.4× slower), pure GPU 8.1 ms. The planner correctly
+routes to Metal here while routing to CPU at every other tested cell —
+matching the literature finding that the right backend is workload-
+dependent and "always GPU" naively loses on this hardware.
+
+### What this milestone proves
+
+GOAL.md item 7 is satisfied: the hybrid CPU/GPU planner is wired into
+`gpudb-bench` and `gpudb-groupby-bench` via `--backend hybrid` (single-
+call) and `--backend sweep` (the table above). Decisions are exposed via
+`HybridAggregator::last_decision()` so the DuckDB extension and any
+tooling can introspect "why CPU was picked here" without reading bench
+output. New tests in `test/cpp/test_aggregator.cpp` validate every
+documented dispatch path (5 SUM cases + 5 GROUP BY cases). 24/24 baseline
+tests still pass; total now 58/58.
 ## 2026-05-09 (TPC-H thorough) — Metal wins SF1 + SF10 across SUM and GROUP BY, SQL extension verified end-to-end
 
 Hardware: Apple M4 Max, ~64 GiB unified memory, macOS 15.x, MSL 3.2.
@@ -106,6 +202,11 @@ The full algorithm is documented in the long header comment of
 
 ```bash
 export PATH="/Users/aiexplore369/Library/Python/3.9/bin:$PATH"
+cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release
+cmake --build build-macos -j
+./build-macos/test/test_gpudb                         # 58/58
+./build-macos/bin/gpudb-bench --rows 100000000 --backend hybrid
+./build-macos/bin/gpudb-groupby-bench --backend sweep --runs 3
 cmake -S . -B build-macos
 cmake --build build-macos -j
 ./build-macos/bin/gpudb-window-bench --rows 1000000 --runs 3

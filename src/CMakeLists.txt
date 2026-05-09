@@ -6,6 +6,7 @@ set(GPUDB_SOURCES
     backends/cpu/cpu_window.cpp
     backends/cpu/cpu_hashjoin.cpp
     backends/backend_factory.cpp
+    backends/hybrid_planner.cpp
 )
 
 if(GPUDB_HAS_CUDA)
@@ -44,6 +45,8 @@ add_library(gpudb STATIC ${GPUDB_SOURCES})
 target_include_directories(gpudb
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/backends
 )
 
 if(GPUDB_HAS_METAL)
