@@ -21,6 +21,7 @@ std::unique_ptr<HashJoinProbe> make_cpu_hashjoin_probe();
 #if GPUDB_HAVE_CUDA
 std::unique_ptr<Aggregator> make_cuda_aggregator();
 std::unique_ptr<GroupByAggregator> make_cuda_groupby_aggregator();
+std::unique_ptr<HashJoinProbe> make_cuda_hashjoin_probe();
 bool cuda_runtime_available() noexcept;
 #endif
 #if GPUDB_HAVE_METAL
@@ -108,8 +109,7 @@ std::unique_ptr<HashJoinProbe> make_hashjoin_probe(Backend b) {
             return make_cpu_hashjoin_probe();
         case Backend::CUDA:
 #if GPUDB_HAVE_CUDA
-            throw std::runtime_error(
-                "CUDA hash-join not implemented yet — coming on feat/cuda-hashjoin");
+            return make_cuda_hashjoin_probe();
 #else
             throw std::runtime_error("CUDA backend not compiled in");
 #endif
