@@ -69,9 +69,13 @@ void update(duckdb_function_info /*info*/, duckdb_data_chunk input,
     const idx_t n = duckdb_data_chunk_get_size(input);
     if (data == nullptr || n == 0) return;
 
+    // Validity bitmap: 1 bit per row, 64 rows per uint64. NULL rows are skipped
+    // (matches DuckDB's SQL semantics for SUM/MIN/MAX). nullptr means no NULLs.
+    uint64_t* validity = duckdb_vector_get_validity(vec);
+
     // Fast path: SELECT gpu_sum(x) FROM tbl with no GROUP BY.
     // All states[i] alias the same state object, so we can bulk-insert the
-    // chunk in one memcpy instead of n push_backs.
+    // chunk in one memcpy (or filtered copy if there are NULLs).
     if (n > 1 && states[0] == states[n - 1]) {
         bool all_same = true;
         for (idx_t i = 1; i + 1 < n; ++i) {
@@ -79,14 +83,33 @@ void update(duckdb_function_info /*info*/, duckdb_data_chunk input,
         }
         if (all_same) {
             auto* s = reinterpret_cast<GpuSumState*>(states[0]);
-            s->buf.insert(s->buf.end(), data, data + n);
+            if (validity == nullptr) {
+                // No NULLs at all — single memcpy.
+                s->buf.insert(s->buf.end(), data, data + n);
+            } else {
+                // Filter out NULL rows.
+                s->buf.reserve(s->buf.size() + n);
+                for (idx_t i = 0; i < n; ++i) {
+                    if (duckdb_validity_row_is_valid(validity, i)) {
+                        s->buf.push_back(data[i]);
+                    }
+                }
+            }
             return;
         }
     }
     // Slow path: GROUP BY routes different rows to different states.
-    for (idx_t i = 0; i < n; ++i) {
-        auto* s = reinterpret_cast<GpuSumState*>(states[i]);
-        s->buf.push_back(data[i]);
+    if (validity == nullptr) {
+        for (idx_t i = 0; i < n; ++i) {
+            auto* s = reinterpret_cast<GpuSumState*>(states[i]);
+            s->buf.push_back(data[i]);
+        }
+    } else {
+        for (idx_t i = 0; i < n; ++i) {
+            if (!duckdb_validity_row_is_valid(validity, i)) continue;
+            auto* s = reinterpret_cast<GpuSumState*>(states[i]);
+            s->buf.push_back(data[i]);
+        }
     }
 }
 
