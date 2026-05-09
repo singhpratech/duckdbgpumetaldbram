@@ -21,3 +21,13 @@ target_link_libraries(gpudb-groupby-bench PRIVATE gpudb)
 set_target_properties(gpudb-groupby-bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+if(GPUDB_BUILD_EXT)
+    add_executable(gpudb-sql sql_demo_main.cpp)
+    target_link_libraries(gpudb-sql PRIVATE gpudb_ext)
+    set_target_properties(gpudb-sql PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
+    )
+endif()

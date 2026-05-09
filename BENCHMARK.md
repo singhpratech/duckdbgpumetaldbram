@@ -2,6 +2,59 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (late evening +) — first SQL→GPU through DuckDB
+
+The DuckDB extension `gpu_sum(BIGINT) -> BIGINT` is now wired up end-to-end.
+A `gpudb-sql` CLI tool opens an in-memory DuckDB connection, registers
+`gpu_sum`, and runs SQL.
+
+### Correctness on real TPC-H SF1
+```sql
+SELECT gpu_sum(v) AS gpu, sum(v) AS native
+FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet');
+-- gpu_sum     = 18005322964949
+-- native sum  = 18005322964949   ✓ identical
+```
+Backend reported by extension: **CUDA** (RTX 4090 Laptop, sm_89).
+
+### Performance (RTX 4090 Laptop)
+
+| Query | gpu_sum wall | native sum wall | gap |
+|---|---:|---:|---:|
+| TPC-H lineitem.l_orderkey (6M rows) | 52.3 ms | 5.8 ms | gpu_sum 9× slower |
+| `range(100M)::BIGINT` SUM           | 762 ms  | 79 ms  | gpu_sum 9.6× slower |
+
+This is the expected pattern: for a **streaming SUM where data has to be
+materialized into our buffer** before the GPU sees it, native DuckDB's
+in-place vectorized SUM wins every time. The CPU is memory-bandwidth-bound
+and saturates DDR5; the GPU has to first receive the data.
+
+The win for gpu_sum becomes real when:
+- Same column is queried many times (resident-buffer pattern; not yet wired
+  through DuckDB extension)
+- Operator is harder than SUM (GROUP BY, hash join — kernel work amortizes
+  the per-chunk overhead)
+- Multi-aggregation in one pass (SUM + MIN + MAX + COUNT) on the same data
+
+So this PR ships the **architectural achievement** (SQL→GPU dispatch works),
+not a perf win on streaming SUM. The next extension function should be
+`gpu_groupby_sum()` where the GPU's win is decisive (per the GROUP BY
+benchmarks earlier in this file: 12-13.7× cold, 50-79× kernel-only).
+
+### Reproduce
+```bash
+. scripts/env.sh                                       # CUDA on PATH
+./scripts/get_duckdb_libs.sh                           # ~140 MB DuckDB libs
+cmake -S . -B build-linux -DGPUDB_BUILD_EXT=ON
+cmake --build build-linux -j
+./build-linux/bin/gpudb-sql --sql \
+  "SELECT gpu_sum(v) AS gpu, sum(v) AS native
+   FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet');"
+```
+
+---
+
+
 ## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
 
 The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
