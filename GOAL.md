@@ -32,10 +32,10 @@ What's open in 2026:
 5. **DuckDB extension wrapper** — ✅ done. Registers `gpu_sum`, `gpu_min`, `gpu_max`. NULL handling via validity mask. Batched-finalize for GROUP BY queries. `gpudb-sql` CLI demos it. PR #1 open on `feat/ext-duckdb-stub`.
 
 ### Phase 2 — LAUNCH (next 2 weeks, ~3.5 hrs/week)
-The owner has explicitly chosen positioning: **"someone who really solves problems"**, time budget **30 min/day**, primary publishing channel **aivibe.org**. Ship a publishable v1 then **enhance only after established as a publisher** (2-week milestone).
+The owner has explicitly chosen positioning: **"someone who really solves problems"**, time budget **30 min/day**, primary publishing channel **theaivibe.org**. Ship a publishable v1 then **enhance only after established as a publisher** (2-week milestone).
 
 6. **DuckDB Community Extension submission** — get the `.duckdb_extension` metadata footer right (use the official `duckdb/extension-template` build pipeline) and submit YAML + extension to https://github.com/duckdb/community-extensions. **The single highest-leverage action for recognition.**
-7. **Launch blog post on aivibe.org** — "The first SQL execution engine for Apple Silicon GPUs" or "Why every GPU database failed and what changes in 2026". Cross-post HN + r/dataengineering.
+7. **Launch blog post on theaivibe.org** — "The first SQL execution engine for Apple Silicon GPUs" or "Why every GPU database failed and what changes in 2026". Cross-post HN + r/dataengineering.
 8. **README polish** for public consumption (already done in PR #1; revise after first round of comments).
 
 ### Phase 3 — ENHANCE (after week 2, once user is established as a publisher)
@@ -107,3 +107,7 @@ Practical Metal notes (from research summarized in `.private/RESEARCH_BRIEFING.m
 
 ## Status snapshot
 See `BENCHMARK.md` for current numbers, `.sync/` for live instance status, `git log --oneline -20` for recent work.
+
+## Owner channel
+
+Long-form writeups, design rationale, and ongoing performance posts live at **[theaivibe.org](https://theaivibe.org)**. The blog is the primary recognition channel for this project; GitHub holds the code.

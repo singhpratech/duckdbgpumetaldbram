@@ -145,6 +145,10 @@ gpudb: GPU-accelerated DuckDB extension for NVIDIA CUDA and Apple Silicon Metal.
 2026. https://github.com/singhpratech/duckdbgpumetaldbram
 ```
 
+## Author / blog
+
+Build process, design tradeoffs, and ongoing benchmarks are posted at **[theaivibe.org](https://theaivibe.org)**.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
