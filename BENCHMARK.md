@@ -34,25 +34,66 @@ version.
 `std::unordered_map` by sorting both `(key, sum)` lists. Pass at every
 cardinality tested: 1K → 16M rows × 100 → 1M groups. `test_gpudb` 24/24.
 
-### Performance — Metal **wins** at high cardinality
+### Performance — Metal **wins** at the high-cardinality sweet spot
 
 | Workload | CPU wall (1-thread `unordered_map`) | Metal wall | Metal kernel | Winner |
 |---|---:|---:|---:|---|
 |   100K rows, 1K groups   |   0.19 ms |   2.11 ms |   1.51 ms | CPU 11× |
-|    1M rows, 1K groups    |   1.61 ms |   7.57 ms |   5.94 ms | CPU 4.7× |
+|    1M rows, 1K groups    |   2.80 ms |   8.00 ms |   5.96 ms | CPU 2.9× |
 |    1M rows, 100K groups  |   4.12 ms |   6.77 ms |   4.66 ms | CPU 1.6× |
-| **1M rows, 1M groups (632K unique)** | **21.38 ms** | **10.57 ms** | **6.54 ms** | **Metal 2.0×** |
-|    4M rows, 1M groups    |  41.69 ms |  35.09 ms |  25.26 ms | Metal 1.2× |
-|   16M rows, 1M groups    | 132.44 ms | 161.84 ms | 135.61 ms | CPU 1.2× |
+| **1M rows, 1M groups (632K unique)** | **21.82 ms** | **10.37 ms** | **6.35 ms** | **Metal 2.1×** |
+|   10M rows, 1M groups    |  96.25 ms | 148.22 ms | 130.62 ms | CPU 1.5× |
+|   50M rows, 1M groups    | 406.14 ms | 756.29 ms | 682.60 ms | CPU 1.9× |
+|  100M rows, 1M groups    | 798.28 ms |1676.12 ms |1496.04 ms | CPU 2.1× |
 
-Where the GPU wins is the regime that actually matters: **high cardinality**.
-At 1M rows × 1M unique groups, the CPU's hash table loses cache locality
-(632K unique groups blow past L2/L3) and degrades to pointer chasing —
-exactly the failure mode GOAL.md and the GROUP BY section below identify
-as the GPU's wedge. Bitonic sort beats the CPU there by 2×.
+The win is real but narrow. At **1M rows × 1M unique groups (≈632K distinct
+after balls-and-bins dedup)**, CPU's hash table loses cache locality (632K
+groups blow past L2/L3) and degrades to pointer chasing — Metal beats CPU
+**2.1×** there. This is the macOS analog of the CUDA hash-table win
+documented in the GROUP BY section below.
 
-At 16M rows the picture flips because bitonic is `O(N log²N)`. Radix sort
-(`O(8N)` for 64-bit keys) is the cure and is the next implementation step.
+Outside that sweet spot:
+- **Low cardinality** (1K groups) — CPU's unordered_map fits in L2, cache-
+  resident; sort is overkill. CPU wins 3–11×.
+- **Very large N** (≥10M rows) — bitonic sort is `O(N log²N)`; the log²
+  factor scales worse than CPU's `O(N)` hashing. CPU wins 1.5–2.1×.
+
+### Why bitonic and not radix
+
+LSD radix sort (`O(8N)` for 64-bit keys) was the obvious next step and was
+prototyped against this branch. Outcome:
+- **Kernel time ✅** Roughly halves bitonic's kernel time at 10M+ rows
+  (e.g., 73 ms vs 130 ms for 10M × 1M).
+- **Wall time ❌** The host-side scan between histogram and scatter
+  passes (8 of them) is `O(num_blocks · 256)` and was the new bottleneck.
+  Combined with ~16 separate command-buffer `commit/wait` cycles, wall
+  overhead exceeded the kernel speedup.
+
+The fix is straightforward but multi-session work: move the scan to the
+GPU (parallel prefix sum + per-bucket combine) so all 8 passes can live
+in one command buffer with one synchronization point. That's the right
+follow-up for "Metal radix sort" — flagged as a separate ticket; not in
+this PR.
+
+### What this milestone proves
+
+GOAL.md item 5 is satisfied: **real GROUP BY on Apple Silicon GPU, no CPU
+fallback, correctness verified, and a regime where the GPU wins** — which
+is what makes the dual-backend story land. The Metal-GROUP-BY-wins row
+(1M rows × 1M groups, 2.1× over CPU) is the macOS analog of the CUDA
+hash-table 12–22× wins at high cardinality from the section below: GPU
+GROUP BY's value is in the random-access-bound regime where CPU caches
+collapse.
+
+### Next-PR perf paths (in priority order)
+
+1. **GPU-resident radix sort with on-device scan** — eliminates the host
+   scan + commit/wait overhead that gates the prototype. Expected to push
+   the win zone out to 10M+ rows.
+2. **Move segment-reduce to GPU** via parallel scan + atomic-add via
+   32-bit halves (sidesteps the missing 64-bit `atomic_fetch_add`).
+3. **Parallel CPU baseline for `groupby_sum_i64`** so the comparison is
+   apples-to-apples (GPU vs OpenMP-CPU rather than vs single-thread CPU).
 
 ### What this milestone proves
 
