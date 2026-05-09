@@ -172,3 +172,111 @@ kernel void bitonic_local_merge_i64(
     values[base + tid]          = shm_v[tid];
     values[base + tid + TGSIZE] = shm_v[tid + TGSIZE];
 }
+
+// ============================================================================
+// LSD radix sort, 8-bit buckets, 8 passes for int64 keys.
+// Used by metal_groupby.mm as the primary path; bitonic_* above kept as
+// reference / fallback for tiny inputs.
+//
+// Per pass:
+//   1. radix_histogram: 256-bucket per-block histogram into hist[bid*256+b].
+//   2. Host computes scatter offsets (bucket-major exclusive prefix sum).
+//   3. radix_scatter: stable scatter using threadgroup-memory + per-element
+//      preceding-bucket count for in-block local position (O(B²) but B is
+//      small constant; the lockstep simdgroup divergence gates the cost).
+//
+// Sign-bit flip wraps the 8 passes so signed-radix == unsigned-radix.
+
+constant uint RADIX_BLOCK_SIZE     = 256;
+constant uint RADIX_WORK_PER_BLOCK = 256;   // 1 elem/thread minimizes O(B²) scatter inner-loop
+constant uint RADIX_BUCKETS        = 256;
+
+kernel void radix_flip_sign_bit(
+    device long*   keys [[buffer(0)]],
+    constant uint& n    [[buffer(1)]],
+    uint           gid  [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    keys[gid] = (long)((ulong)keys[gid] ^ 0x8000000000000000UL);
+}
+
+kernel void radix_histogram(
+    device const long*  keys     [[buffer(0)]],
+    constant uint&      n        [[buffer(1)]],
+    constant uint&      shift    [[buffer(2)]],
+    device atomic_uint* hist     [[buffer(3)]],
+    uint                tid      [[thread_position_in_threadgroup]],
+    uint                bid      [[threadgroup_position_in_grid]])
+{
+    threadgroup atomic_uint local_hist[RADIX_BUCKETS];
+
+    if (tid < RADIX_BUCKETS) {
+        atomic_store_explicit(&local_hist[tid], 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint base = bid * RADIX_WORK_PER_BLOCK;
+    constexpr uint per_thread = RADIX_WORK_PER_BLOCK / RADIX_BLOCK_SIZE;
+    for (uint i = 0; i < per_thread; ++i) {
+        const uint idx = base + i * RADIX_BLOCK_SIZE + tid;
+        if (idx >= n) break;
+        const ulong k      = (ulong)keys[idx];
+        const uint  bucket = (uint)((k >> shift) & 0xFFu);
+        atomic_fetch_add_explicit(&local_hist[bucket], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < RADIX_BUCKETS) {
+        const uint count = atomic_load_explicit(&local_hist[tid], memory_order_relaxed);
+        atomic_store_explicit(&hist[bid * RADIX_BUCKETS + tid], count, memory_order_relaxed);
+    }
+}
+
+kernel void radix_scatter(
+    device const long*  in_keys    [[buffer(0)]],
+    device const long*  in_values  [[buffer(1)]],
+    constant uint&      n          [[buffer(2)]],
+    constant uint&      shift      [[buffer(3)]],
+    device const uint*  scan       [[buffer(4)]],
+    device long*        out_keys   [[buffer(5)]],
+    device long*        out_values [[buffer(6)]],
+    uint                tid        [[thread_position_in_threadgroup]],
+    uint                bid        [[threadgroup_position_in_grid]])
+{
+    threadgroup long  shm_keys   [RADIX_WORK_PER_BLOCK];
+    threadgroup long  shm_values [RADIX_WORK_PER_BLOCK];
+    threadgroup uchar shm_buckets[RADIX_WORK_PER_BLOCK];
+    threadgroup bool  shm_valid  [RADIX_WORK_PER_BLOCK];
+
+    const uint base = bid * RADIX_WORK_PER_BLOCK;
+    constexpr uint per_thread = RADIX_WORK_PER_BLOCK / RADIX_BLOCK_SIZE;
+
+    for (uint i = 0; i < per_thread; ++i) {
+        const uint pos = i * RADIX_BLOCK_SIZE + tid;
+        const uint idx = base + pos;
+        if (idx < n) {
+            const long key = in_keys[idx];
+            shm_keys   [pos] = key;
+            shm_values [pos] = in_values[idx];
+            shm_buckets[pos] = (uchar)(((ulong)key >> shift) & 0xFFu);
+            shm_valid  [pos] = true;
+        } else {
+            shm_valid  [pos] = false;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = 0; i < per_thread; ++i) {
+        const uint pos = i * RADIX_BLOCK_SIZE + tid;
+        if (!shm_valid[pos]) continue;
+
+        const uchar my_bucket = shm_buckets[pos];
+        uint local_pos = 0;
+        for (uint p = 0; p < pos; ++p) {
+            if (shm_valid[p] && shm_buckets[p] == my_bucket) ++local_pos;
+        }
+        const uint global_pos = scan[bid * RADIX_BUCKETS + my_bucket] + local_pos;
+        out_keys  [global_pos] = shm_keys  [pos];
+        out_values[global_pos] = shm_values[pos];
+    }
+}
