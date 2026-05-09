@@ -75,8 +75,10 @@ public:
             id<MTLLibrary> lib = [device_ newLibraryWithSource:src options:opts error:&err];
             if (!lib) metal_throw("compile groupby.metal", err);
 
-            ps_step_ = make_pso(lib, @"bitonic_step_i64");
-            ps_pad_  = make_pso(lib, @"bitonic_pad_i64");
+            ps_step_        = make_pso(lib, @"bitonic_step_i64");
+            ps_pad_         = make_pso(lib, @"bitonic_pad_i64");
+            ps_local_sort_  = make_pso(lib, @"bitonic_local_sort_i64");
+            ps_local_merge_ = make_pso(lib, @"bitonic_local_merge_i64");
         }
     }
 
@@ -108,7 +110,10 @@ public:
             }
         }
 
-        const std::uint64_t n_pad64 = next_pow2_u64(static_cast<std::uint64_t>(n));
+        // Pad up to at least CHUNK so the local-sort kernel always has full chunks.
+        constexpr std::uint64_t kChunk = 512;
+        std::uint64_t n_pad64 = next_pow2_u64(static_cast<std::uint64_t>(n));
+        if (n_pad64 < kChunk) n_pad64 = kChunk;
         if (n_pad64 > std::numeric_limits<std::uint32_t>::max()) {
             // Bitonic sort needs power-of-2 length; the kernel takes uint32_t for n.
             // For week-1 cap at 2^31 elements; refuse beyond that.
@@ -144,19 +149,44 @@ public:
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             }
 
-            // Bitonic sort stages.
-            [ce setComputePipelineState:ps_step_];
+            // ---- Bitonic sort: two-tier dispatch to amortize launch overhead ----
+            //
+            // CHUNK = 512 must match the constant in groupby.metal.
+            // Tier 1: one local-sort dispatch handles all stages with k ≤ CHUNK.
+            // Tier 2: for each k > CHUNK, do cross-block step dispatches for j > CHUNK/2,
+            //         then one local-merge dispatch finishes j ≤ CHUNK/2.
+            constexpr std::uint32_t CHUNK = 512;
+
+            const NSUInteger n_chunks = n_pad / CHUNK;
+
+            // Tier 1: local sort (handles k = 2 .. CHUNK).
+            [ce setComputePipelineState:ps_local_sort_];
             [ce setBuffer:b_keys   offset:0 atIndex:0];
             [ce setBuffer:b_values offset:0 atIndex:1];
-            [ce setBytes:&n_pad length:sizeof(n_pad) atIndex:2];
-            const NSUInteger grid = ((n_pad + kBlock - 1) / kBlock) * kBlock;
-            for (std::uint32_t k_stage = 2; k_stage <= n_pad; k_stage <<= 1) {
-                for (std::uint32_t j_step = k_stage >> 1; j_step > 0; j_step >>= 1) {
+            [ce dispatchThreadgroups:MTLSizeMake(n_chunks, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
+            // Tier 2: outer k > CHUNK
+            const NSUInteger step_grid = ((n_pad + kBlock - 1) / kBlock);
+            for (std::uint32_t k_stage = CHUNK << 1; k_stage <= n_pad; k_stage <<= 1) {
+                // Cross-block step for j > CHUNK/2.
+                [ce setComputePipelineState:ps_step_];
+                [ce setBuffer:b_keys   offset:0 atIndex:0];
+                [ce setBuffer:b_values offset:0 atIndex:1];
+                [ce setBytes:&n_pad length:sizeof(n_pad) atIndex:2];
+                for (std::uint32_t j_step = k_stage >> 1; j_step > (CHUNK >> 1); j_step >>= 1) {
                     [ce setBytes:&k_stage length:sizeof(k_stage) atIndex:3];
                     [ce setBytes:&j_step  length:sizeof(j_step)  atIndex:4];
-                    [ce dispatchThreadgroups:MTLSizeMake(grid / kBlock, 1, 1)
+                    [ce dispatchThreadgroups:MTLSizeMake(step_grid, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
+                // Local merge finishes j = CHUNK/2 .. 1 inside threadgroup memory.
+                [ce setComputePipelineState:ps_local_merge_];
+                [ce setBuffer:b_keys   offset:0 atIndex:0];
+                [ce setBuffer:b_values offset:0 atIndex:1];
+                [ce setBytes:&k_stage length:sizeof(k_stage) atIndex:2];
+                [ce dispatchThreadgroups:MTLSizeMake(n_chunks, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             }
 
             [ce endEncoding];
@@ -213,8 +243,10 @@ private:
 
     id<MTLDevice>       device_ = nil;
     id<MTLCommandQueue> queue_  = nil;
-    id<MTLComputePipelineState> ps_step_ = nil;
-    id<MTLComputePipelineState> ps_pad_  = nil;
+    id<MTLComputePipelineState> ps_step_        = nil;
+    id<MTLComputePipelineState> ps_pad_         = nil;
+    id<MTLComputePipelineState> ps_local_sort_  = nil;
+    id<MTLComputePipelineState> ps_local_merge_ = nil;
 };
 
 } // namespace
