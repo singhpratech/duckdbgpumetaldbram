@@ -148,6 +148,21 @@ public:
         return reduce_i64_resident(check_i64(c), ReduceKind::Max,
                                    std::numeric_limits<std::int64_t>::min());
     }
+    // TODO(linux-claude): implement fused multi-agg kernel for CUDA.
+    // Pattern matches Metal: per-block reduction producing 4 partials
+    // (sum/min/max/count), final tree reduction over the per-block partials.
+    // Until then this throws so the abstract interface is satisfied without
+    // a half-baked implementation. macOS Claude must not write CUDA per
+    // CLAUDE.md.
+    AggAllResult agg_all_i64(const std::int64_t* /*data*/, std::size_t /*n*/) override {
+        throw std::runtime_error(
+            "CUDA agg_all_i64 not implemented yet — see TODO in cuda_aggregator.cpp");
+    }
+    AggAllResult agg_all_resident_i64(const ResidentColumn& /*c*/) override {
+        throw std::runtime_error(
+            "CUDA agg_all_resident_i64 not implemented yet — see TODO in cuda_aggregator.cpp");
+    }
+
     AggResult sum_resident_f64(const ResidentColumn& c) override {
         const auto& r = check_f64(c);
         AggResult res{};

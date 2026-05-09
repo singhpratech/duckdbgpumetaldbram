@@ -24,7 +24,7 @@ target_include_directories(gpudb_ext PUBLIC
 )
 target_link_libraries(gpudb_ext PUBLIC
     gpudb
-    "${DUCKDB_LIBS_DIR}/libduckdb.so"
+    "${DUCKDB_LIBS_DIR}/libduckdb${CMAKE_SHARED_LIBRARY_SUFFIX}"
 )
 
 # ---- Loadable .so: what users actually LOAD from DuckDB ----

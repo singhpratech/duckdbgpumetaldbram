@@ -12,20 +12,28 @@
 #include "gpu_backend.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 enum class Mode { Cold, Hot, Both };
+// --backend selects which set of backends the bench enumerates:
+//   all     — every available backend, one report per backend (default).
+//   hybrid  — only the hybrid planner; prints which backend it picked per call.
+enum class BackendSel { All, Hybrid };
+enum class Op   { Sum, All };  // "all" = compare separate sum+min+max vs fused agg_all
 
 struct Args {
     std::size_t rows = 10'000'000;
@@ -34,12 +42,17 @@ struct Args {
     gpudb::Dtype dtype = gpudb::Dtype::I64;
     std::string input;
     Mode        mode = Mode::Both;
+    BackendSel  bsel = BackendSel::All;
+    Op          op   = Op::Sum;
 };
 
 void usage(const char* a0) {
     std::fprintf(stderr,
         "usage: %s [--rows N] [--dtype i64|f64] [--input FILE] [--runs K]\n"
-        "          [--mode cold|hot|both] [--no-verify]\n", a0);
+        "          [--mode cold|hot|both] [--backend all|hybrid] [--op sum|all] [--no-verify]\n"
+        "  --op sum  (default): just SUM, with cold/hot timing\n"
+        "  --op all  : compare SUM+MIN+MAX (3 separate calls) vs fused agg_all_i64\n"
+        "              (i64 only). Reports the fusion speedup.\n", a0);
 }
 
 bool parse(int argc, char** argv, Args& a) {
@@ -60,11 +73,23 @@ bool parse(int argc, char** argv, Args& a) {
             else if (t == "both") a.mode = Mode::Both;
             else { std::fprintf(stderr, "bad --mode: %s\n", t.c_str()); return false; }
         }
+        else if (s == "--backend") {
+            auto t = next("--backend");
+            if (t == "all") a.bsel = BackendSel::All;
+            else if (t == "hybrid") a.bsel = BackendSel::Hybrid;
+            else { std::fprintf(stderr, "bad --backend: %s (use all|hybrid)\n", t.c_str()); return false; }
+        }
         else if (s == "--dtype") {
             auto t = next("--dtype");
             if (t == "i64") a.dtype = gpudb::Dtype::I64;
             else if (t == "f64") a.dtype = gpudb::Dtype::F64;
             else { std::fprintf(stderr, "bad --dtype: %s\n", t.c_str()); return false; }
+        }
+        else if (s == "--op") {
+            auto t = next("--op");
+            if (t == "sum") a.op = Op::Sum;
+            else if (t == "all") a.op = Op::All;
+            else { std::fprintf(stderr, "bad --op: %s\n", t.c_str()); return false; }
         }
         else if (s == "-h" || s == "--help") { usage(argv[0]); return false; }
         else { std::fprintf(stderr, "unknown arg: %s\n", s.c_str()); usage(argv[0]); return false; }
@@ -167,6 +192,194 @@ void bench_backend(gpudb::Backend b, const std::vector<T>& data,
     }
 }
 
+// Hybrid bench: exercise the hybrid path. Reports the dispatch decision the
+// planner made on each first call, plus median wall over `runs`.
+template <typename T>
+void bench_hybrid(const std::vector<T>& data, int runs, T expected_sum,
+                  bool verify, Mode mode) {
+    constexpr bool is_i64 = std::is_same_v<T, std::int64_t>;
+    const std::size_t bytes = data.size() * sizeof(T);
+    const double mib = bytes / (1024.0 * 1024.0);
+
+    std::printf("\n[Hybrid] rows=%zu (%.1f MiB)\n", data.size(), mib);
+    auto agg = gpudb::make_hybrid_aggregator();
+    std::printf("  device: %s\n", agg->device_name().c_str());
+
+    if (mode == Mode::Cold || mode == Mode::Both) {
+        std::vector<double> wall;
+        gpudb::DispatchDecision decision{};
+        for (int i = 0; i < runs; ++i) {
+            gpudb::AggResult r;
+            if constexpr (is_i64) r = agg->sum_i64(data.data(), data.size());
+            else                  r = agg->sum_f64(data.data(), data.size());
+            wall.push_back(r.wall_ms);
+            if (i == 0) {
+                decision = agg->last_decision();
+                if (verify) {
+                    if constexpr (is_i64) verify_or_die(r.value_i64, expected_sum, "hybrid cold");
+                    else                  verify_or_die(r.value_f64, expected_sum, "hybrid cold");
+                }
+            }
+        }
+        std::printf("  COLD  median wall=%8.3f ms  throughput=%6.2f GiB/s   "
+                    "picked=%s reason=%s\n",
+                    median(wall), gibps(bytes, median(wall)),
+                    gpudb::to_string(decision.chosen),
+                    gpudb::to_string(decision.reason));
+    }
+
+    if (mode == Mode::Hot || mode == Mode::Both) {
+        std::unique_ptr<gpudb::ResidentColumn> col;
+        if constexpr (is_i64) col = agg->upload_i64(data.data(), data.size());
+        else                  col = agg->upload_f64(data.data(), data.size());
+
+        gpudb::AggResult first;
+        if constexpr (is_i64) first = agg->sum_resident_i64(*col);
+        else                  first = agg->sum_resident_f64(*col);
+        if (verify) {
+            if constexpr (is_i64) verify_or_die(first.value_i64, expected_sum, "hybrid hot");
+            else                  verify_or_die(first.value_f64, expected_sum, "hybrid hot");
+        }
+        const auto decision = agg->last_decision();
+
+        std::vector<double> wall;
+        for (int i = 0; i < runs; ++i) {
+            gpudb::AggResult r;
+            if constexpr (is_i64) r = agg->sum_resident_i64(*col);
+            else                  r = agg->sum_resident_f64(*col);
+            wall.push_back(r.wall_ms);
+        }
+        std::printf("  HOT   median wall=%8.3f ms  throughput=%6.2f GiB/s   "
+                    "picked=%s reason=%s\n",
+                    median(wall), gibps(bytes, median(wall)),
+                    gpudb::to_string(decision.chosen),
+                    gpudb::to_string(decision.reason));
+    }
+}
+
+// =========================================================================
+//  --op all : multi-agg fusion (SUM + MIN + MAX + COUNT) bench
+// =========================================================================
+//
+// Compares running sum_i64 + min_i64 + max_i64 separately (3 calls, baseline)
+// against agg_all_i64 (single fused call). The win on memory-bandwidth-bound
+// workloads should be ~3x because the fused kernel reads each int64 ONCE.
+
+void bench_agg_all(gpudb::Backend b, const std::vector<std::int64_t>& data,
+                   int runs, std::int64_t ref_sum, std::int64_t ref_min,
+                   std::int64_t ref_max, bool verify, Mode mode) {
+    const std::size_t bytes = data.size() * sizeof(std::int64_t);
+    const double mib = bytes / (1024.0 * 1024.0);
+    std::printf("\n[%s] rows=%zu (%.1f MiB)  --op all\n",
+                gpudb::to_string(b), data.size(), mib);
+    std::unique_ptr<gpudb::Aggregator> agg;
+    try { agg = gpudb::make_aggregator(b); }
+    catch (const std::exception& e) { std::printf("  unavailable: %s\n", e.what()); return; }
+    std::printf("  device: %s\n", agg->device_name().c_str());
+
+    auto run_separate_cold = [&]() {
+        auto t0 = std::chrono::steady_clock::now();
+        auto rs = agg->sum_i64(data.data(), data.size());
+        auto rn = agg->min_i64(data.data(), data.size());
+        auto rx = agg->max_i64(data.data(), data.size());
+        auto t1 = std::chrono::steady_clock::now();
+        const double wall = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double ker  = rs.kernel_ms + rn.kernel_ms + rx.kernel_ms;
+        if (verify) {
+            verify_or_die(rs.value_i64, ref_sum, "sep sum");
+            verify_or_die(rn.value_i64, ref_min, "sep min");
+            verify_or_die(rx.value_i64, ref_max, "sep max");
+        }
+        return std::pair<double, double>{wall, ker};
+    };
+
+    auto run_fused_cold = [&]() {
+        auto r = agg->agg_all_i64(data.data(), data.size());
+        if (verify) {
+            verify_or_die(r.sum, ref_sum, "fused sum");
+            verify_or_die(r.min, ref_min, "fused min");
+            verify_or_die(r.max, ref_max, "fused max");
+            if (r.count != data.size()) {
+                std::fprintf(stderr, "  CORRECTNESS FAIL [fused count]: got %zu, expected %zu\n",
+                             r.count, data.size());
+                std::exit(2);
+            }
+        }
+        return std::pair<double, double>{r.wall_ms, r.kernel_ms};
+    };
+
+    if (mode == Mode::Cold || mode == Mode::Both) {
+        std::vector<double> sep_w, sep_k, fus_w, fus_k;
+        for (int i = 0; i < runs; ++i) {
+            auto [w, k] = run_separate_cold();
+            sep_w.push_back(w); sep_k.push_back(k);
+        }
+        for (int i = 0; i < runs; ++i) {
+            auto [w, k] = run_fused_cold();
+            fus_w.push_back(w); fus_k.push_back(k);
+        }
+        const double sw = median(sep_w), sk = median(sep_k);
+        const double fw = median(fus_w), fk = median(fus_k);
+        std::printf("  COLD  separate  wall=%8.3f ms  kernel=%8.3f ms\n", sw, sk);
+        std::printf("  COLD  fused     wall=%8.3f ms  kernel=%8.3f ms\n", fw, fk);
+        std::printf("  COLD  speedup   wall=%5.2fx  kernel=%5.2fx\n",
+                    sw / fw, (fk > 0.0) ? (sk / fk) : 0.0);
+        if (fk > 0.0) {
+            std::printf("  COLD  fused kernel-only throughput: %6.2f GiB/s\n",
+                        gibps(bytes, fk));
+        }
+    }
+
+    if (mode == Mode::Hot || mode == Mode::Both) {
+        auto col = agg->upload_i64(data.data(), data.size());
+
+        auto run_separate_hot = [&]() {
+            auto t0 = std::chrono::steady_clock::now();
+            auto rs = agg->sum_resident_i64(*col);
+            auto rn = agg->min_resident_i64(*col);
+            auto rx = agg->max_resident_i64(*col);
+            auto t1 = std::chrono::steady_clock::now();
+            const double wall = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            const double ker  = rs.kernel_ms + rn.kernel_ms + rx.kernel_ms;
+            if (verify) {
+                verify_or_die(rs.value_i64, ref_sum, "sep sum hot");
+                verify_or_die(rn.value_i64, ref_min, "sep min hot");
+                verify_or_die(rx.value_i64, ref_max, "sep max hot");
+            }
+            return std::pair<double, double>{wall, ker};
+        };
+        auto run_fused_hot = [&]() {
+            auto r = agg->agg_all_resident_i64(*col);
+            if (verify) {
+                verify_or_die(r.sum, ref_sum, "fused sum hot");
+                verify_or_die(r.min, ref_min, "fused min hot");
+                verify_or_die(r.max, ref_max, "fused max hot");
+            }
+            return std::pair<double, double>{r.wall_ms, r.kernel_ms};
+        };
+
+        std::vector<double> sep_w, sep_k, fus_w, fus_k;
+        for (int i = 0; i < runs; ++i) {
+            auto [w, k] = run_separate_hot();
+            sep_w.push_back(w); sep_k.push_back(k);
+        }
+        for (int i = 0; i < runs; ++i) {
+            auto [w, k] = run_fused_hot();
+            fus_w.push_back(w); fus_k.push_back(k);
+        }
+        const double sw = median(sep_w), sk = median(sep_k);
+        const double fw = median(fus_w), fk = median(fus_k);
+        std::printf("  HOT   separate  wall=%8.3f ms  kernel=%8.3f ms\n", sw, sk);
+        std::printf("  HOT   fused     wall=%8.3f ms  kernel=%8.3f ms\n", fw, fk);
+        std::printf("  HOT   speedup   wall=%5.2fx  kernel=%5.2fx\n",
+                    sw / fw, (fk > 0.0) ? (sk / fk) : 0.0);
+        if (fk > 0.0) {
+            std::printf("  HOT   fused kernel-only throughput: %6.2f GiB/s\n",
+                        gibps(bytes, fk));
+        }
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -180,6 +393,21 @@ int main(int argc, char** argv) {
     std::printf("backends:");
     for (auto b : backends) std::printf(" %s", gpudb::to_string(b));
     std::printf("\n");
+
+    auto run_for_data_i64 = [&](const std::vector<std::int64_t>& data, std::int64_t ref) {
+        if (a.bsel == BackendSel::Hybrid) {
+            bench_hybrid(data, a.runs, ref, a.verify, a.mode);
+        } else {
+            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+        }
+    };
+    auto run_for_data_f64 = [&](const std::vector<double>& data, double ref) {
+        if (a.bsel == BackendSel::Hybrid) {
+            bench_hybrid(data, a.runs, ref, a.verify, a.mode);
+        } else {
+            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+        }
+    };
 
     if (!a.input.empty()) {
         std::ifstream f(a.input, std::ios::binary);
@@ -197,30 +425,71 @@ int main(int argc, char** argv) {
             f.read(reinterpret_cast<char*>(data.data()),
                    static_cast<std::streamsize>(data.size() * sizeof(std::int64_t)));
             const auto ref = host_sum(data);
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_i64(data, ref);
+            if (a.op == Op::All) {
+                std::int64_t ref_min = data.empty() ? 0 : data[0];
+                std::int64_t ref_max = data.empty() ? 0 : data[0];
+                for (auto x : data) {
+                    if (x < ref_min) ref_min = x;
+                    if (x > ref_max) ref_max = x;
+                }
+                for (auto b : backends)
+                    bench_agg_all(b, data, a.runs, ref, ref_min, ref_max,
+                                  a.verify, a.mode);
+            } else {
+                for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            }
         } else {
+            if (a.op == Op::All) {
+                std::fprintf(stderr,
+                    "--op all only supported for i64 input (file is f64)\n");
+                return 1;
+            }
             std::vector<double> data(h.count);
             f.read(reinterpret_cast<char*>(data.data()),
                    static_cast<std::streamsize>(data.size() * sizeof(double)));
             const auto ref = host_sum(data);
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_f64(data, ref);
         }
     } else {
-        std::printf("synthetic: rows=%zu dtype=%s\n",
-                    a.rows, a.dtype == gpudb::Dtype::I64 ? "i64" : "f64");
+        std::printf("synthetic: rows=%zu dtype=%s op=%s\n",
+                    a.rows, a.dtype == gpudb::Dtype::I64 ? "i64" : "f64",
+                    a.op == Op::All ? "all" : "sum");
         std::mt19937_64 rng(0xC0FFEEULL);
         if (a.dtype == gpudb::Dtype::I64) {
             std::uniform_int_distribution<std::int64_t> dist(-1'000'000, 1'000'000);
             std::vector<std::int64_t> data(a.rows);
             std::int64_t ref = 0;
             for (auto& x : data) { x = dist(rng); ref += x; }
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_i64(data, ref);
+            std::int64_t ref_sum = 0;
+            std::int64_t ref_min = std::numeric_limits<std::int64_t>::max();
+            std::int64_t ref_max = std::numeric_limits<std::int64_t>::min();
+            for (auto& x : data) {
+                x = dist(rng);
+                ref_sum += x;
+                if (x < ref_min) ref_min = x;
+                if (x > ref_max) ref_max = x;
+            }
+            if (a.op == Op::All) {
+                for (auto b : backends)
+                    bench_agg_all(b, data, a.runs, ref_sum, ref_min, ref_max,
+                                  a.verify, a.mode);
+            } else {
+                for (auto b : backends)
+                    bench_backend(b, data, a.runs, ref_sum, a.verify, a.mode);
+            }
         } else {
+            if (a.op == Op::All) {
+                std::fprintf(stderr,
+                    "--op all only supported for --dtype i64 (no f64 multi-agg yet)\n");
+                return 1;
+            }
             std::uniform_real_distribution<double> dist(0.0, 1.0);
             std::vector<double> data(a.rows);
             double ref = 0.0;
             for (auto& x : data) { x = dist(rng); ref += x; }
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_f64(data, ref);
         }
     }
 
