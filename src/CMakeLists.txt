@@ -20,6 +20,7 @@ if(GPUDB_HAS_METAL)
     list(APPEND GPUDB_SOURCES
         backends/metal/metal_aggregator.mm
         backends/metal/metal_groupby.mm
+        backends/metal/metal_window.mm
     )
 
     # Embed .metal source as C strings so the Objective-C++ TUs can compile

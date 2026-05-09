@@ -25,6 +25,7 @@ bool cuda_runtime_available() noexcept;
 #if GPUDB_HAVE_METAL
 std::unique_ptr<Aggregator> make_metal_aggregator();
 std::unique_ptr<GroupByAggregator> make_metal_groupby_aggregator();
+std::unique_ptr<WindowAggregator> make_metal_window_aggregator();
 bool metal_runtime_available() noexcept;
 #endif
 
@@ -94,10 +95,7 @@ std::unique_ptr<WindowAggregator> make_window_aggregator(Backend b) {
 #endif
         case Backend::METAL:
 #if GPUDB_HAVE_METAL
-            // Metal window aggregator lives in a follow-up commit on this
-            // same branch. Throwing keeps this commit's surface honest.
-            throw std::runtime_error(
-                "Metal window aggregator not wired yet (follow-up commit)");
+            return make_metal_window_aggregator();
 #else
             throw std::runtime_error("Metal backend not compiled in");
 #endif
