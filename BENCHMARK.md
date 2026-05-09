@@ -2,6 +2,88 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, macOS) — TPC-H SF1 + scale sweep to 1 billion rows
+
+Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, MSL 3.2.
+Code state: `feat/metal-groupby-sort` with the buffer cache (PR #3, the
+two-tier bitonic sort).
+
+### TPC-H SF1 — `lineitem` (6,001,215 rows; the canonical CUDA workload)
+
+Generated with `SF=1 ./scripts/gen_tpch.sh` on this Mac.
+
+#### `SUM(l_orderkey)` — int64
+
+| backend | mode | wall (ms) | kernel (ms) | throughput | vs CPU |
+|---|---|---:|---:|---:|---:|
+| CPU (single-thread scalar)        | HOT  | 0.579 | — | 77.26 GiB/s | 1× |
+| **Metal (HOT, resident column)**  | HOT  | 0.916 | 0.283 | 48.79 GiB/s (kernel-only **157.79 GiB/s**) | 0.63× |
+| Metal (COLD)                      | COLD | 1.537 | 0.229 | 29.10 GiB/s | 0.38× |
+
+Metal's kernel-only throughput hits 158 GiB/s on this 46 MiB column, in
+the right neighborhood of M4 Max's 546 GB/s peak. Wall loses to single-
+thread scalar CPU because (a) the CPU baseline saturates the L2/L3 from
+core-count and prefetcher, and (b) Metal pays a fixed dispatch + buffer-
+cache miss on the cold path.
+
+#### `SUM(l_extendedprice)` — f64
+
+| backend | mode | wall (ms) | kernel (ms) | throughput |
+|---|---|---:|---:|---:|
+| CPU                  | HOT  | 2.870 | — | 15.58 GiB/s |
+| Metal (host fallback) | HOT  | 2.885 | 0.000 | 15.50 GiB/s |
+
+Tied — Apple Silicon GPUs have no IEEE-754 doubles, so this stays on a
+host loop (`metal_aggregator.mm` documents the fallback explicitly).
+UMA + zero transfer means the only cost is the host reduction itself,
+which matches CPU's reduction by construction.
+
+#### `SUM(l_orderkey) GROUP BY l_orderkey` — 1.5 M unique groups
+
+| backend | wall (ms) | kernel (ms) | throughput | vs CPU |
+|---|---:|---:|---:|---:|
+| CPU (single-thread `unordered_map`) | 32.10 | — | 2.79 GiB/s | 1× |
+| **Metal** (bitonic + host segment-reduce) | **68.89** | 58.05 | 1.30 GiB/s (kernel 1.54 GiB/s) | 0.47× |
+
+This is the canonical CUDA benchmark (CUDA shipped 4.8× on the same
+workload). Metal at this code quality loses 2.2× — bitonic sort on 6M
+rows pays ~210 dispatches × ~30 µs of launch overhead even with the two-
+tier optimization, plus the host segment-reduce. The fix is GPU-resident
+radix sort (next PR); see the postmortem in the next section.
+
+### Scale sweep — synthetic int64 GROUP BY, 1 M-cardinality keys
+
+How does Metal scale as we push N from 1 M to 1 B? Single-thread CPU
+`unordered_map` is the baseline.
+
+| Rows | Bytes (input) | CPU wall | Metal wall | Metal kernel | Result |
+|---:|---:|---:|---:|---:|---|
+|         1 M  |   8 MiB |    21.8 ms |    10.4 ms |     6.4 ms | **Metal wins 2.1×** |
+|        10 M  |  80 MiB |    96.3 ms |   148.2 ms |   130.6 ms | CPU wins 1.5× |
+|        50 M  | 400 MiB |   406.1 ms |   756.3 ms |   682.6 ms | CPU wins 1.9× |
+|       100 M  | 800 MiB |   798.3 ms |  1676.1 ms |  1496.0 ms | CPU wins 2.1× |
+|       200 M  |  1.6 GiB | 1641.3 ms |  3518.5 ms |  3381.6 ms | CPU wins 2.1× |
+|       500 M  |  4.0 GiB | 4133.5 ms |  7758.3 ms |  7475.5 ms | CPU wins 1.9× |
+| **1 000 M (1 B)** | **8.0 GiB** | **8228.2 ms** | **17735.1 ms** | **16885.1 ms** | **CPU wins 2.2×** |
+
+The 1 B-row run at 16 byte-per-row total (key + value) used ~32 GiB of
+unified memory peak; ran cleanly on this Mac.
+
+The shape is consistent: bitonic sort is `O(N log² N)`, CPU's
+`unordered_map` is `O(N)`. The gap widens linearly with `log N`. The 1 M-
+row sweet spot survives because at small N the constant-factor overhead
+of CPU's hash table dominates.
+
+To make Metal beat CPU at 10 M+ rows, the algorithm has to drop the
+`log²` factor. **GPU-resident radix sort** (8-bit buckets × 8 passes,
+on-device exclusive scan, ~25 dispatches in one command buffer) is the
+next implementation. The radix-sort prototype this PR explored already
+hit competitive kernel times (e.g., 73 ms at 10 M × 1 M groups, vs 130 ms
+for bitonic) but lost on wall because the host scan + per-pass commit/
+wait dominated. Moving the scan to the GPU unlocks it.
+
+---
+
 ## 2026-05-09 (night, macOS) — Metal GROUP BY: bitonic sort + two-tier dispatch
 
 Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, unified memory).
