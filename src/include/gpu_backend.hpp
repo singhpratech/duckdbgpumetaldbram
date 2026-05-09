@@ -134,6 +134,46 @@ public:
 
 std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 
+// =========================================================================
+//  HASH JOIN probe (i64 keys, inner equi-join)
+// =========================================================================
+//
+// v1 contract: inner equi-join on int64 keys, build side has UNIQUE keys
+// (no duplicate handling — for each probe[i] we emit the FIRST matching
+// build[j], which is unambiguous when build is unique).
+//
+// Backend implementation strategy varies:
+//   - CPU:   std::unordered_map<int64,int64> on the build side.
+//   - CUDA:  open-addressing hash table with atomicCAS<int64> (in flight on
+//            feat/cuda-hashjoin).
+//   - Metal: SORT-MERGE join (Apple Silicon GPUs lack 64-bit atomic CAS, so
+//            the CUDA approach cannot be mirrored — see
+//            src/backends/metal/metal_hashjoin.mm header for details).
+struct JoinResult {
+    std::vector<std::int64_t> probe_indices;   // matched probe-side row indices
+    std::vector<std::int64_t> build_indices;   // matched build-side row indices
+    std::size_t  rows_probe = 0;
+    std::size_t  rows_build = 0;
+    std::size_t  matched    = 0;
+    double       wall_ms     = 0.0;
+    double       kernel_ms   = 0.0;
+    double       transfer_ms = 0.0;
+};
+
+class HashJoinProbe {
+public:
+    virtual ~HashJoinProbe() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+    // Inner equi-join: for each probe[i], find the FIRST matching build[j].
+    // (No build-side duplicate handling for v1.)
+    virtual JoinResult inner_join_i64(
+        const std::int64_t* build_keys, std::size_t n_build,
+        const std::int64_t* probe_keys, std::size_t n_probe) = 0;
+};
+
+std::unique_ptr<HashJoinProbe> make_hashjoin_probe(Backend);
+
 // Returns the best backend available at runtime: CUDA if compiled+device,
 // else METAL if compiled+device, else CPU.
 [[nodiscard]] Backend default_backend() noexcept;

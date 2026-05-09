@@ -3,6 +3,7 @@
 set(GPUDB_SOURCES
     backends/cpu/cpu_aggregator.cpp
     backends/cpu/cpu_groupby.cpp
+    backends/cpu/cpu_hashjoin.cpp
     backends/backend_factory.cpp
 )
 
@@ -19,6 +20,7 @@ if(GPUDB_HAS_METAL)
     list(APPEND GPUDB_SOURCES
         backends/metal/metal_aggregator.mm
         backends/metal/metal_groupby.mm
+        backends/metal/metal_hashjoin.mm
     )
 
     # Embed .metal source as C strings so the Objective-C++ TUs can compile
@@ -55,7 +57,11 @@ endif()
 # CUDA flags
 if(GPUDB_HAS_CUDA)
     target_compile_definitions(gpudb PUBLIC GPUDB_HAVE_CUDA=1)
-    set_target_properties(gpudb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    # Separable compilation OFF: keeps the static lib self-contained so that
+    # downstream executables (test_gpudb, gpudb-bench, gpudb-sql, ...) don't
+    # need their own device-link step. If we ever introduce cross-TU __device__
+    # calls, flip this to ON and add CUDA_RESOLVE_DEVICE_SYMBOLS to consumers.
+    set_target_properties(gpudb PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
     # cudart is needed by the .cpp host wrapper (cuda_runtime.h, cudaMalloc, ...)
     target_link_libraries(gpudb PUBLIC CUDA::cudart)
     # Suppress diagnostics that nvcc's generated stubs trip on, only for .cu files.
