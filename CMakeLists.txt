@@ -1,0 +1,103 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(gpudb
+    VERSION 0.0.1
+    DESCRIPTION "GPU-accelerated operators for DuckDB (CUDA + Metal)"
+    LANGUAGES CXX
+)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# -------------------------------------------------------------------
+# Build options
+# -------------------------------------------------------------------
+option(GPUDB_ENABLE_CUDA   "Enable CUDA backend (auto-detected)"  ON)
+option(GPUDB_ENABLE_METAL  "Enable Metal backend (auto on macOS)" ON)
+option(GPUDB_BUILD_TESTS   "Build unit tests"                     ON)
+option(GPUDB_BUILD_BENCH   "Build CLI benchmark tool"             ON)
+option(GPUDB_BUILD_EXT     "Build DuckDB extension wrapper"       OFF)
+
+# -------------------------------------------------------------------
+# Compiler flags
+# -------------------------------------------------------------------
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+add_compile_options(
+    -Wall -Wextra -Wpedantic
+    $<$<CONFIG:Release>:-O3>
+    $<$<CONFIG:Debug>:-g>
+)
+
+# -------------------------------------------------------------------
+# CUDA detection
+# -------------------------------------------------------------------
+set(GPUDB_HAS_CUDA OFF)
+if(GPUDB_ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+        # RTX 4090 is sm_89 (Ada). Sirius requires sm_70+.
+        # Build for a reasonable range; user can override.
+        if(NOT CMAKE_CUDA_ARCHITECTURES)
+            set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+        endif()
+        set(GPUDB_HAS_CUDA ON)
+        message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES})")
+    else()
+        message(STATUS "CUDA toolkit not found — CUDA backend disabled")
+    endif()
+endif()
+
+# -------------------------------------------------------------------
+# Metal detection
+# -------------------------------------------------------------------
+set(GPUDB_HAS_METAL OFF)
+if(GPUDB_ENABLE_METAL AND APPLE)
+    set(GPUDB_HAS_METAL ON)
+    enable_language(OBJCXX)
+    set(CMAKE_OBJCXX_STANDARD 17)
+    message(STATUS "Metal enabled (macOS)")
+endif()
+
+# -------------------------------------------------------------------
+# Library
+# -------------------------------------------------------------------
+add_subdirectory(src)
+
+# -------------------------------------------------------------------
+# Tests
+# -------------------------------------------------------------------
+if(GPUDB_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(test)
+endif()
+
+# -------------------------------------------------------------------
+# Benchmarks
+# -------------------------------------------------------------------
+if(GPUDB_BUILD_BENCH)
+    add_subdirectory(benchmark)
+endif()
+
+# -------------------------------------------------------------------
+# Summary
+# -------------------------------------------------------------------
+message(STATUS "")
+message(STATUS "gpudb configuration:")
+message(STATUS "  Version:       ${PROJECT_VERSION}")
+message(STATUS "  Build type:    ${CMAKE_BUILD_TYPE}")
+message(STATUS "  CUDA backend:  ${GPUDB_HAS_CUDA}")
+message(STATUS "  Metal backend: ${GPUDB_HAS_METAL}")
+message(STATUS "  Tests:         ${GPUDB_BUILD_TESTS}")
+message(STATUS "  Benchmarks:    ${GPUDB_BUILD_BENCH}")
+message(STATUS "  DuckDB ext:    ${GPUDB_BUILD_EXT}")
+message(STATUS "")

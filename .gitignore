@@ -1,0 +1,82 @@
+# Build output
+build/
+build-*/
+out/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+install_manifest.txt
+compile_commands.json
+.cmake/
+
+# CUDA
+*.cubin
+*.fatbin
+*.ptx
+
+# Editors / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.cache/
+.ccls-cache/
+.clangd/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.whl
+
+# Local dev / private
+.private/
+.local/
+notes/
+*.local.md
+TODO.private.md
+secrets/
+*.env
+.env.*
+
+# Test data
+data/
+*.parquet
+*.duckdb
+*.duckdb.wal
+
+# Worktrees (if user creates them inside repo)
+worktrees/
+
+# Coverage / profiling
+*.gcda
+*.gcno
+*.profraw
+coverage/
+nsys-rep/
+*.nsys-rep
+*.qdrep
+*.sqlite
+
+# Logs
+*.log
+logs/
+
+# OS
+Thumbs.db
+ehthumbs.db
