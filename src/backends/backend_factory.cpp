@@ -1,4 +1,5 @@
 #include "gpu_backend.hpp"
+#include "backend_internal.hpp"
 
 #include <stdexcept>
 
@@ -13,9 +14,9 @@ const char* to_string(Backend b) noexcept {
     return "?";
 }
 
-// Forward declarations (impls live in their respective TUs)
-std::unique_ptr<Aggregator> make_cpu_aggregator();
-std::unique_ptr<GroupByAggregator> make_cpu_groupby_aggregator();
+// Per-backend factory forward declarations (impls live in their respective TUs).
+// These are declared in `gpudb` so that the hybrid planner TU (which lives
+// in the same library) can call them without re-declaring.
 #if GPUDB_HAVE_CUDA
 std::unique_ptr<Aggregator> make_cuda_aggregator();
 std::unique_ptr<GroupByAggregator> make_cuda_groupby_aggregator();

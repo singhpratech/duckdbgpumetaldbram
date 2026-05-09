@@ -26,6 +26,10 @@
 namespace {
 
 enum class Mode { Cold, Hot, Both };
+// --backend selects which set of backends the bench enumerates:
+//   all     — every available backend, one report per backend (default).
+//   hybrid  — only the hybrid planner; prints which backend it picked per call.
+enum class BackendSel { All, Hybrid };
 
 struct Args {
     std::size_t rows = 10'000'000;
@@ -34,12 +38,13 @@ struct Args {
     gpudb::Dtype dtype = gpudb::Dtype::I64;
     std::string input;
     Mode        mode = Mode::Both;
+    BackendSel  bsel = BackendSel::All;
 };
 
 void usage(const char* a0) {
     std::fprintf(stderr,
         "usage: %s [--rows N] [--dtype i64|f64] [--input FILE] [--runs K]\n"
-        "          [--mode cold|hot|both] [--no-verify]\n", a0);
+        "          [--mode cold|hot|both] [--backend all|hybrid] [--no-verify]\n", a0);
 }
 
 bool parse(int argc, char** argv, Args& a) {
@@ -59,6 +64,12 @@ bool parse(int argc, char** argv, Args& a) {
             else if (t == "hot") a.mode = Mode::Hot;
             else if (t == "both") a.mode = Mode::Both;
             else { std::fprintf(stderr, "bad --mode: %s\n", t.c_str()); return false; }
+        }
+        else if (s == "--backend") {
+            auto t = next("--backend");
+            if (t == "all") a.bsel = BackendSel::All;
+            else if (t == "hybrid") a.bsel = BackendSel::Hybrid;
+            else { std::fprintf(stderr, "bad --backend: %s (use all|hybrid)\n", t.c_str()); return false; }
         }
         else if (s == "--dtype") {
             auto t = next("--dtype");
@@ -167,6 +178,71 @@ void bench_backend(gpudb::Backend b, const std::vector<T>& data,
     }
 }
 
+// Hybrid bench: exercise the hybrid path. Reports the dispatch decision the
+// planner made on each first call, plus median wall over `runs`.
+template <typename T>
+void bench_hybrid(const std::vector<T>& data, int runs, T expected_sum,
+                  bool verify, Mode mode) {
+    constexpr bool is_i64 = std::is_same_v<T, std::int64_t>;
+    const std::size_t bytes = data.size() * sizeof(T);
+    const double mib = bytes / (1024.0 * 1024.0);
+
+    std::printf("\n[Hybrid] rows=%zu (%.1f MiB)\n", data.size(), mib);
+    auto agg = gpudb::make_hybrid_aggregator();
+    std::printf("  device: %s\n", agg->device_name().c_str());
+
+    if (mode == Mode::Cold || mode == Mode::Both) {
+        std::vector<double> wall;
+        gpudb::DispatchDecision decision{};
+        for (int i = 0; i < runs; ++i) {
+            gpudb::AggResult r;
+            if constexpr (is_i64) r = agg->sum_i64(data.data(), data.size());
+            else                  r = agg->sum_f64(data.data(), data.size());
+            wall.push_back(r.wall_ms);
+            if (i == 0) {
+                decision = agg->last_decision();
+                if (verify) {
+                    if constexpr (is_i64) verify_or_die(r.value_i64, expected_sum, "hybrid cold");
+                    else                  verify_or_die(r.value_f64, expected_sum, "hybrid cold");
+                }
+            }
+        }
+        std::printf("  COLD  median wall=%8.3f ms  throughput=%6.2f GiB/s   "
+                    "picked=%s reason=%s\n",
+                    median(wall), gibps(bytes, median(wall)),
+                    gpudb::to_string(decision.chosen),
+                    gpudb::to_string(decision.reason));
+    }
+
+    if (mode == Mode::Hot || mode == Mode::Both) {
+        std::unique_ptr<gpudb::ResidentColumn> col;
+        if constexpr (is_i64) col = agg->upload_i64(data.data(), data.size());
+        else                  col = agg->upload_f64(data.data(), data.size());
+
+        gpudb::AggResult first;
+        if constexpr (is_i64) first = agg->sum_resident_i64(*col);
+        else                  first = agg->sum_resident_f64(*col);
+        if (verify) {
+            if constexpr (is_i64) verify_or_die(first.value_i64, expected_sum, "hybrid hot");
+            else                  verify_or_die(first.value_f64, expected_sum, "hybrid hot");
+        }
+        const auto decision = agg->last_decision();
+
+        std::vector<double> wall;
+        for (int i = 0; i < runs; ++i) {
+            gpudb::AggResult r;
+            if constexpr (is_i64) r = agg->sum_resident_i64(*col);
+            else                  r = agg->sum_resident_f64(*col);
+            wall.push_back(r.wall_ms);
+        }
+        std::printf("  HOT   median wall=%8.3f ms  throughput=%6.2f GiB/s   "
+                    "picked=%s reason=%s\n",
+                    median(wall), gibps(bytes, median(wall)),
+                    gpudb::to_string(decision.chosen),
+                    gpudb::to_string(decision.reason));
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -180,6 +256,21 @@ int main(int argc, char** argv) {
     std::printf("backends:");
     for (auto b : backends) std::printf(" %s", gpudb::to_string(b));
     std::printf("\n");
+
+    auto run_for_data_i64 = [&](const std::vector<std::int64_t>& data, std::int64_t ref) {
+        if (a.bsel == BackendSel::Hybrid) {
+            bench_hybrid(data, a.runs, ref, a.verify, a.mode);
+        } else {
+            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+        }
+    };
+    auto run_for_data_f64 = [&](const std::vector<double>& data, double ref) {
+        if (a.bsel == BackendSel::Hybrid) {
+            bench_hybrid(data, a.runs, ref, a.verify, a.mode);
+        } else {
+            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+        }
+    };
 
     if (!a.input.empty()) {
         std::ifstream f(a.input, std::ios::binary);
@@ -197,13 +288,13 @@ int main(int argc, char** argv) {
             f.read(reinterpret_cast<char*>(data.data()),
                    static_cast<std::streamsize>(data.size() * sizeof(std::int64_t)));
             const auto ref = host_sum(data);
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_i64(data, ref);
         } else {
             std::vector<double> data(h.count);
             f.read(reinterpret_cast<char*>(data.data()),
                    static_cast<std::streamsize>(data.size() * sizeof(double)));
             const auto ref = host_sum(data);
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_f64(data, ref);
         }
     } else {
         std::printf("synthetic: rows=%zu dtype=%s\n",
@@ -214,13 +305,13 @@ int main(int argc, char** argv) {
             std::vector<std::int64_t> data(a.rows);
             std::int64_t ref = 0;
             for (auto& x : data) { x = dist(rng); ref += x; }
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_i64(data, ref);
         } else {
             std::uniform_real_distribution<double> dist(0.0, 1.0);
             std::vector<double> data(a.rows);
             double ref = 0.0;
             for (auto& x : data) { x = dist(rng); ref += x; }
-            for (auto b : backends) bench_backend(b, data, a.runs, ref, a.verify, a.mode);
+            run_for_data_f64(data, ref);
         }
     }
 
