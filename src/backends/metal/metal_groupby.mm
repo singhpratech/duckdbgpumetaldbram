@@ -249,7 +249,9 @@ public:
                         running += bucket_total[b];
                     }
 
-                    // (c) per-block-per-bucket offsets — sequential cache-friendly walk
+                    // (c) per-block-per-bucket offsets — sequential cache-friendly walk.
+                    // Tried per-bucket parallelization; the 256-byte stride
+                    // access pattern thrashes cache and ends up slower.
                     std::uint32_t block_running[RADIX_BUCKETS] = {0};
                     for (std::uint32_t bid = 0; bid < num_blocks; ++bid) {
                         const std::uint32_t base = bid * RADIX_BUCKETS;
@@ -298,24 +300,71 @@ public:
                 [cb waitUntilCompleted];
             }
 
-            // ---- Host segment-reduce ----
+            // ---- Host segment-reduce (parallel) ----
+            // Sorted (key, value) array. Divide into NTHREADS chunks; each
+            // thread emits (key, sum) pairs for the runs entirely inside its
+            // chunk. Boundary keys (a run that spans the chunk edge) are
+            // stitched together in a final single-thread pass over the
+            // per-thread results.
             const std::int64_t* sk = static_cast<const std::int64_t*>([in_keys   contents]);
             const std::int64_t* sv = static_cast<const std::int64_t*>([in_values contents]);
 
-            r.keys.reserve(64);
-            r.sums.reserve(64);
-            std::size_t i = 0;
-            while (i < n) {
-                const std::int64_t k = sk[i];
-                std::int64_t sum = 0;
-                std::size_t j = i;
-                while (j < n && sk[j] == k) {
-                    sum += sv[j];
-                    ++j;
+            constexpr int kSegThreads = 8;
+            if (n >= 16384) {
+                std::vector<std::vector<std::int64_t>> tk(kSegThreads), ts(kSegThreads);
+
+                // Align each chunk start to a run boundary so no run is split.
+                std::array<std::size_t, kSegThreads + 1> starts;
+                starts[0] = 0;
+                for (int t = 1; t < kSegThreads; ++t) {
+                    std::size_t s = (n / kSegThreads) * t;
+                    while (s < n && s > 0 && sk[s] == sk[s - 1]) ++s;
+                    starts[t] = s;
                 }
-                r.keys.push_back(k);
-                r.sums.push_back(sum);
-                i = j;
+                starts[kSegThreads] = n;
+
+                std::vector<std::thread> workers;
+                workers.reserve(kSegThreads);
+                for (int t = 0; t < kSegThreads; ++t) {
+                    workers.emplace_back([&, t] {
+                        const std::size_t lo = starts[t];
+                        const std::size_t hi = starts[t + 1];
+                        std::size_t i = lo;
+                        while (i < hi) {
+                            const std::int64_t k = sk[i];
+                            std::int64_t sum = 0;
+                            std::size_t j = i;
+                            while (j < hi && sk[j] == k) { sum += sv[j]; ++j; }
+                            tk[t].push_back(k);
+                            ts[t].push_back(sum);
+                            i = j;
+                        }
+                    });
+                }
+                for (auto& w : workers) w.join();
+
+                // Concatenate (no boundary stitching needed: starts[] aligned to runs).
+                std::size_t total = 0;
+                for (int t = 0; t < kSegThreads; ++t) total += tk[t].size();
+                r.keys.reserve(total);
+                r.sums.reserve(total);
+                for (int t = 0; t < kSegThreads; ++t) {
+                    r.keys.insert(r.keys.end(), tk[t].begin(), tk[t].end());
+                    r.sums.insert(r.sums.end(), ts[t].begin(), ts[t].end());
+                }
+            } else {
+                r.keys.reserve(64);
+                r.sums.reserve(64);
+                std::size_t i = 0;
+                while (i < n) {
+                    const std::int64_t k = sk[i];
+                    std::int64_t sum = 0;
+                    std::size_t j = i;
+                    while (j < n && sk[j] == k) { sum += sv[j]; ++j; }
+                    r.keys.push_back(k);
+                    r.sums.push_back(sum);
+                    i = j;
+                }
             }
 
             r.kernel_ms   = kernel_ms_total;
