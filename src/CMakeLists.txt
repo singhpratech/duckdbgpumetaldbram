@@ -36,6 +36,12 @@ endif()
 if(GPUDB_HAS_CUDA)
     target_compile_definitions(gpudb PUBLIC GPUDB_HAVE_CUDA=1)
     set_target_properties(gpudb PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    # cudart is needed by the .cpp host wrapper (cuda_runtime.h, cudaMalloc, ...)
+    target_link_libraries(gpudb PUBLIC CUDA::cudart)
+    # Suppress diagnostics that nvcc's generated stubs trip on, only for .cu files.
+    target_compile_options(gpudb PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-pedantic>
+    )
 endif()
 
 # Metal frameworks

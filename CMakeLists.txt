@@ -28,8 +28,14 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
+# Apply strict flags only to C++ host code; nvcc's generated stub files
+# trip -Wpedantic on its own internal output, so scope by language.
 add_compile_options(
-    -Wall -Wextra -Wpedantic
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+    $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall>
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-Wextra>
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:Debug>:-g>
 )
@@ -46,12 +52,15 @@ if(GPUDB_ENABLE_CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
         # RTX 4090 is sm_89 (Ada). Sirius requires sm_70+.
-        # Build for a reasonable range; user can override.
+        # CUDA 13 dropped sm_70 (Volta) — start at sm_75 (Turing).
+        # Build for a reasonable range; user can override via -DCMAKE_CUDA_ARCHITECTURES.
         if(NOT CMAKE_CUDA_ARCHITECTURES)
             set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
         endif()
+        # Need the runtime library + headers for the .cpp host wrapper too.
+        find_package(CUDAToolkit REQUIRED)
         set(GPUDB_HAS_CUDA ON)
-        message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES})")
+        message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES}, toolkit: ${CUDAToolkit_VERSION})")
     else()
         message(STATUS "CUDA toolkit not found — CUDA backend disabled")
     endif()
