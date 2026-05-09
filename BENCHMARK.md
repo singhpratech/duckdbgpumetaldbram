@@ -2,6 +2,70 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, macOS) — first Metal numbers: Apple M4 Max, SUM int64
+
+Hardware: MacBook Pro, **Apple M4 Max** (Apple GPU family 9, 40-core GPU,
+unified memory). macOS 15.x (Darwin 25.4.0), AppleClang 21.0.0, MSL 3.2.
+
+Build: `cmake -B build-macos -DCMAKE_BUILD_TYPE=Release` (no CUDA on this
+box; Metal backend auto-enabled). Bench: `./build-macos/bin/gpudb-bench --rows
+N --runs K`.
+
+**Implementation:** `MTLComputePipelineState`s compiled at runtime from
+`src/backends/metal/kernels/sum.metal`. Two-pass tree reduction in
+threadgroup memory, threadgroup size 256, grid clamped to 4096. All buffers
+`MTLResourceStorageModeShared` (UMA — no host↔device transfer). Kernel
+time = `[cb GPUEndTime] - [cb GPUStartTime]`.
+
+### Synthetic int64 SUM
+
+| Rows | Bytes | CPU HOT (scalar) | Metal HOT wall | Metal kernel | Metal HOT throughput | Metal kernel throughput | Speedup (HOT) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10M  | 76.3 MiB | 0.833 ms |  0.491 ms |  0.356 ms |  151.7 GiB/s | 209.3 GiB/s | **1.7×** |
+| 50M  | 381.5 MiB | 4.257 ms |  1.165 ms |  0.988 ms |  319.6 GiB/s | 376.9 GiB/s | **3.7×** |
+| 200M | 1525.9 MiB | 17.007 ms |  4.458 ms |  3.990 ms |  334.3 GiB/s | 373.4 GiB/s | **3.8×** |
+
+CPU baseline here is single-threaded scalar (this aggregator path doesn't
+have OpenMP wired in — would close some gap; the parallel CPU work landed
+for GROUP BY only).
+
+Apple M4 Max peak memory bandwidth is ~546 GB/s (LPDDR5X). We hit ~70% of
+that on the kernel-only path, which is the right neighborhood for a tree
+reduction limited by global-memory load throughput.
+
+### COLD (per-call upload + buffer allocation)
+
+| Rows | CPU COLD | Metal COLD wall | Metal kernel | Why COLD loses |
+|---:|---:|---:|---:|---|
+| 10M  |  0.857 ms |  1.822 ms |  0.324 ms | first MTLBuffer allocation + memcpy |
+| 50M  |  4.184 ms |  7.951 ms |  1.706 ms | same, larger buffer |
+| 200M | 17.200 ms | 69.454 ms |  4.200 ms | same, much larger buffer |
+
+The Apple-Silicon version of the CUDA hot/cold story: COLD loses because
+the FIRST shared-buffer allocation pays a full page-table-mapping cost
+(`vm_allocate` for the buffer pages and the GPU MMU mapping). HOT wins
+because subsequent runs reuse the input buffer (handled inside
+`MetalAggregator::stage_input`). This matches the resident-column thesis
+from the CUDA section below: the GPU operator wins **when data stays
+resident across queries**, loses on one-shot cold uploads.
+
+### Why no Metal GROUP BY numbers yet
+
+Apple Silicon GPUs lack two primitives that the CUDA GROUP BY relies on:
+1. **64-bit `atomic_compare_exchange`** is not implemented in MSL on any
+   Apple GPU family. The CUDA path's CAS-on-key insertion can't port.
+2. **64-bit `atomic_fetch_add` on `device` storage** is also rejected by
+   the MSL 3.2 SFINAE predicate, even on M-series GPUs that nominally
+   support `int64Atomics`. Sum accumulation has to go through two 32-bit
+   halves with explicit carry.
+
+(1) is the load-bearing constraint. The fix is sort-then-segment-reduce, which
+is a multi-session implementation. See `docs/METAL_CONSTRAINTS.md` for the
+full forensic write-up. Until then, `MetalGroupByAggregator` honestly
+delegates to the CPU path and the device_name() string says so.
+
+---
+
 ## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
 
 The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
