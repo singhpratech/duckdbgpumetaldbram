@@ -208,8 +208,6 @@ cmake --build build-linux -j
 
 ---
 
-
->>>>>>> origin/main
 ## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
 
 The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
