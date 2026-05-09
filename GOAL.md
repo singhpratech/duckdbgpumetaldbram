@@ -26,13 +26,14 @@ What's open in 2026:
 
 1. **CUDA backend** for SUM/MIN/MAX (one-shot + resident) — done (commit 1451f0f).
 2. **CUDA GROUP BY hash aggregate** — done (commit 4f3fd79).
-3. **Honest CPU baseline** (parallel where it actually wins, serial otherwise) — done (this PR).
-4. **CUDA hash-join probe** — in flight on `feat/cuda-hashjoin` (other instance).
-5. **Metal backend** completion: SUM/GROUP-BY/JOIN parity with CUDA on M-series — **owned by macOS Claude instance** when machine is available.
-6. **DuckDB extension wrapper** — registers `gpu_sum`, `gpu_groupby_sum`, `gpu_hashjoin` as DuckDB functions/operators. Loadable via `LOAD '...'`. Branch: `feat/ext-duckdb-stub`.
-7. **Hybrid planner**: at query time, pick CPU vs GPU based on cardinality / size estimates / data residency. The literature's open problem; our wedge.
-8. **Window functions on GPU** (the operator Sirius lacks).
-9. **Publish to DuckDB Community Extensions**: https://github.com/duckdb/community-extensions
+3. **Honest CPU baseline** (parallel where it actually wins, serial otherwise) — done (PR #3).
+4. **Metal backend** for SUM/MIN/MAX i64 with real compute pipelines (UMA, no transfer) — done by macOS instance (PR #2).
+5. **DuckDB extension wrapper** — registers `gpu_sum`, `gpu_groupby_sum` as DuckDB aggregate functions. Loadable via `LOAD 'libgpudb_duckdb.so'`. **In flight on `feat/ext-duckdb-stub` (this branch).**
+6. **CUDA hash-join probe** — open lane; not started yet (still recommended for next CUDA work).
+7. **Metal GROUP BY** with real device-side hash table — open lane for macOS (currently falls back to CPU).
+8. **Hybrid planner**: at query time, pick CPU vs GPU based on cardinality / size / residency. The empirical thresholds are now measured; needs to be wired into the extension.
+9. **Window functions on GPU** (the operator Sirius lacks).
+10. **Publish to DuckDB Community Extensions**: https://github.com/duckdb/community-extensions
 
 ## Empirically grounded (numbers from BENCHMARK.md, not marketing)
 
