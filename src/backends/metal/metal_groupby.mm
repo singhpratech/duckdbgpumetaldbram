@@ -27,12 +27,15 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cstdint>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace gpudb {
 
@@ -191,23 +194,54 @@ public:
                     kernel_ms_total += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
                 }
 
-                // ---- 2. Scatter offsets (cache-friendly host scan) ----
-                // Three sequential passes over hist (read) / scan (write) keep
-                // memory access linear and L2-friendly.
+                // ---- 2. Scatter offsets (multi-threaded host scan) ----
+                // The bucket_total reduction parallelizes cleanly across
+                // threads (per-thread private 256-bucket arrays merged at
+                // the end). The per-block running sum (step c) is sequential
+                // along the block axis but parallelizable across buckets;
+                // we keep it cache-friendly (sequential hist+scan walk) and
+                // single-threaded — the bucket_total dominates wall at scale.
                 {
                     const std::uint32_t* hist_in =
                         static_cast<const std::uint32_t*>([b_hist contents]);
                     std::uint32_t*       scan_out =
                         static_cast<std::uint32_t*>([b_scan contents]);
 
-                    // (a) bucket totals: sequential read of hist
+                    constexpr int kHostThreads = 8;
+                    const std::uint64_t total_entries =
+                        static_cast<std::uint64_t>(num_blocks) * RADIX_BUCKETS;
+
+                    // (a) bucket totals — parallel, per-thread private arrays
                     std::uint32_t bucket_total[RADIX_BUCKETS] = {0};
-                    const std::uint32_t total_entries = num_blocks * RADIX_BUCKETS;
-                    for (std::uint32_t i = 0; i < total_entries; ++i) {
-                        bucket_total[i & (RADIX_BUCKETS - 1)] += hist_in[i];
+                    if (total_entries >= 65536) {
+                        std::vector<std::array<std::uint32_t, RADIX_BUCKETS>>
+                            per_thread(kHostThreads);
+                        for (auto& a : per_thread) a.fill(0);
+                        std::vector<std::thread> workers;
+                        workers.reserve(kHostThreads);
+                        for (int t = 0; t < kHostThreads; ++t) {
+                            workers.emplace_back([&, t] {
+                                const std::uint64_t lo = total_entries * t / kHostThreads;
+                                const std::uint64_t hi = total_entries * (t + 1) / kHostThreads;
+                                auto& local = per_thread[t];
+                                for (std::uint64_t i = lo; i < hi; ++i) {
+                                    local[i & (RADIX_BUCKETS - 1)] += hist_in[i];
+                                }
+                            });
+                        }
+                        for (auto& w : workers) w.join();
+                        for (int t = 0; t < kHostThreads; ++t) {
+                            for (std::uint32_t b = 0; b < RADIX_BUCKETS; ++b) {
+                                bucket_total[b] += per_thread[t][b];
+                            }
+                        }
+                    } else {
+                        for (std::uint64_t i = 0; i < total_entries; ++i) {
+                            bucket_total[i & (RADIX_BUCKETS - 1)] += hist_in[i];
+                        }
                     }
 
-                    // (b) bucket offsets (256 elements, exclusive scan)
+                    // (b) bucket offsets (256 elements, trivial)
                     std::uint32_t bucket_offset[RADIX_BUCKETS];
                     std::uint32_t running = 0;
                     for (std::uint32_t b = 0; b < RADIX_BUCKETS; ++b) {
@@ -215,7 +249,7 @@ public:
                         running += bucket_total[b];
                     }
 
-                    // (c) per-block-per-bucket offsets: sequential read of hist + write of scan
+                    // (c) per-block-per-bucket offsets — sequential cache-friendly walk
                     std::uint32_t block_running[RADIX_BUCKETS] = {0};
                     for (std::uint32_t bid = 0; bid < num_blocks; ++bid) {
                         const std::uint32_t base = bid * RADIX_BUCKETS;
