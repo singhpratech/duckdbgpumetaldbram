@@ -3,6 +3,7 @@
 set(GPUDB_SOURCES
     backends/cpu/cpu_aggregator.cpp
     backends/cpu/cpu_groupby.cpp
+    backends/cpu/cpu_window.cpp
     backends/backend_factory.cpp
 )
 
