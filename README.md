@@ -110,7 +110,16 @@ Backend selection is automatic: CUDA if a device is found at runtime, else Metal
 ## Testing
 ```bash
 ./build-linux/test/test_gpudb        # 24 unit tests across CPU + CUDA backends
+./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window
+./scripts/local_check.sh             # everything CI would run, end to end
 ```
+
+The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
+`-- expect:` lines after each query; the runner reports per-query
+PASS / FAIL / XFAIL (expected fail) / SKIP. A few cases are currently
+documented as expected fails and are tracked on `fix/window-partition-bug`:
+the partitioned running-sum window, the unbounded `OVER ()` window, the
+running-sum across chunk boundaries, and mid-cardinality GROUP BY totals.
 
 CI runs on every push: Linux (Ubuntu 24.04, CPU-only) + macOS-14 (CPU + Metal scaffold).
 
