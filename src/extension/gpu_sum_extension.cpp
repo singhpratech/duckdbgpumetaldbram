@@ -19,6 +19,24 @@
 //   - For SELECT gpu_sum(x) GROUP BY g: one state per group, each finalized
 //     separately. Less ideal — a future operator-replacement pass should
 //     batch the per-group reductions; out of scope here.
+//
+// Window contract:
+//   DuckDB's window operator (e.g. SUM() OVER (PARTITION BY ...)) builds
+//   intermediate per-partition aggregate states and then, for each row in the
+//   partition, calls combine() repeatedly with the SAME source state into a
+//   *different* per-row destination. The source acts as a partial-aggregate
+//   "donor" that the operator queries multiple times. That means combine()
+//   must NOT mutate the source state — it must read-only-copy from src to
+//   dst. See the comment on combine() below for the bug history.
+//
+// Concurrency model:
+//   The Aggregator returned by gpudb::make_aggregator() owns mutable GPU
+//   resources (a single CUDA stream + reused d_in/d_partials/d_out device
+//   buffers). It is NOT internally thread-safe. DuckDB's window and grouped
+//   aggregate operators parallelise across threads, so finalize() can be
+//   invoked from multiple threads concurrently for the same aggregate
+//   function — and they all share our process-wide shared_agg() singleton.
+//   Every call into shared_agg() is therefore guarded by gpu_call_mutex().
 
 #include "gpu_sum_extension.hpp"
 #include "gpu_backend.hpp"
@@ -29,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <string>
@@ -44,6 +63,71 @@ gpudb::Aggregator& shared_agg() {
         return gpudb::make_aggregator(gpudb::default_backend());
     }();
     return *agg;
+}
+
+// Single global mutex serialising every entry into shared_agg(). The
+// Aggregator's reused device buffers (d_in_, d_partials_, d_out_) and CUDA
+// stream are shared mutable state; without this lock, two threads finalising
+// different partitions race and read each other's results back from d_out_.
+std::mutex& gpu_call_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+// Below this threshold we don't even attempt the GPU — kernel-launch overhead
+// dwarfs the work, AND going to the GPU would block on gpu_call_mutex() behind
+// some other partition's much larger reduction. Window functions in particular
+// hand us tiny per-row buffers (1..N values), so this hits constantly there.
+constexpr std::size_t kSumGpuMinRows = 4096;
+
+// CPU fallbacks. Used unconditionally for tiny inputs and on GPU exceptions.
+inline std::int64_t cpu_sum(const std::int64_t* data, std::size_t n) {
+    std::int64_t acc = 0;
+    for (std::size_t i = 0; i < n; ++i) acc += data[i];
+    return acc;
+}
+inline std::int64_t cpu_min(const std::int64_t* data, std::size_t n) {
+    std::int64_t v = data[0];
+    for (std::size_t i = 1; i < n; ++i) if (data[i] < v) v = data[i];
+    return v;
+}
+inline std::int64_t cpu_max(const std::int64_t* data, std::size_t n) {
+    std::int64_t v = data[0];
+    for (std::size_t i = 1; i < n; ++i) if (data[i] > v) v = data[i];
+    return v;
+}
+
+// Thread-safe wrappers around the singleton aggregator. For sub-threshold
+// inputs they short-circuit to CPU to avoid lock contention on tiny work.
+std::int64_t safe_sum_i64(const std::int64_t* data, std::size_t n) {
+    if (n == 0) return 0;
+    if (n < kSumGpuMinRows) return cpu_sum(data, n);
+    try {
+        std::lock_guard<std::mutex> lock(gpu_call_mutex());
+        return shared_agg().sum_i64(data, n).value_i64;
+    } catch (const std::exception&) {
+        return cpu_sum(data, n);
+    }
+}
+std::int64_t safe_min_i64(const std::int64_t* data, std::size_t n) {
+    if (n == 0) return 0;
+    if (n < kSumGpuMinRows) return cpu_min(data, n);
+    try {
+        std::lock_guard<std::mutex> lock(gpu_call_mutex());
+        return shared_agg().min_i64(data, n).value_i64;
+    } catch (const std::exception&) {
+        return cpu_min(data, n);
+    }
+}
+std::int64_t safe_max_i64(const std::int64_t* data, std::size_t n) {
+    if (n == 0) return 0;
+    if (n < kSumGpuMinRows) return cpu_max(data, n);
+    try {
+        std::lock_guard<std::mutex> lock(gpu_call_mutex());
+        return shared_agg().max_i64(data, n).value_i64;
+    } catch (const std::exception&) {
+        return cpu_max(data, n);
+    }
 }
 
 struct GpuSumState {
@@ -117,14 +201,34 @@ void update(duckdb_function_info /*info*/, duckdb_data_chunk input,
 
 void combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
              duckdb_aggregate_state* target, idx_t count) {
+    // CRITICAL: combine() must NOT mutate the source state.
+    //
+    // DuckDB's window operator (e.g. SUM() OVER (PARTITION BY g ORDER BY k))
+    // builds a partial-aggregate state for each partition and then, for each
+    // row's window, calls combine() with that partition state as the SOURCE
+    // and a fresh per-row state as the destination. The same source is used
+    // many times — it is read-only from combine()'s perspective.
+    //
+    // The earlier implementation move-assigned src->buf into dst->buf when
+    // dst was empty, as an optimisation. That left src empty for every
+    // subsequent combine() call against the same source, producing two
+    // distinct visible symptoms:
+    //   - small inputs (5 rows / 2 partitions): "first row of every
+    //     non-first partition is wrong" — intermittent, depending on which
+    //     order the parallel partition workers happened to call combine()
+    //     and finalize() in.
+    //   - larger inputs (any partition that spans more than one update()
+    //     chunk, i.e. > ~16 rows): the running sum collapsed to ~0 partway
+    //     through every partition, because the per-row windows after the
+    //     first stopped seeing the chunk-1 state (it had already been
+    //     moved out).
+    //
+    // The fix is to *copy* src->buf into dst->buf and never mutate src.
     for (idx_t i = 0; i < count; ++i) {
-        auto* src = reinterpret_cast<GpuSumState*>(source[i]);
+        const auto* src = reinterpret_cast<const GpuSumState*>(source[i]);
         auto* dst = reinterpret_cast<GpuSumState*>(target[i]);
-        if (dst->buf.empty()) {
-            dst->buf = std::move(src->buf);
-        } else {
-            dst->buf.insert(dst->buf.end(), src->buf.begin(), src->buf.end());
-        }
+        if (src->buf.empty()) continue;
+        dst->buf.insert(dst->buf.end(), src->buf.begin(), src->buf.end());
     }
 }
 
@@ -132,21 +236,15 @@ void combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
 // (4-column comparison, GROUP BY section). These decide which backend each
 // finalize call dispatches to.
 //
-//   SUM (count == 1):
-//     - GPU iff the buffer is large enough to amortize PCIe transfer.
-//       Below kSumGpuThreshold rows, CPU wins on streaming SUM (per the
-//       1B-row + 200M-row benchmarks).
 //   GROUP BY (count > 1):
-//     - Per-state CPU iff count < kBatchedGroupByThreshold (kernel-launch
-//       overhead would dominate; CPU's parallel hash map already handles
-//       low-cardinality fast).
+//     - Per-state path iff count < kBatchedGroupByThreshold (kernel-launch
+//       overhead would dominate; safe_sum_i64 internally picks CPU vs GPU).
 //     - Batched GPU GROUP BY iff count >= kBatchedGroupByThreshold (the
 //       regime where atomicCAS hash table beats CPU 5-14x per BENCHMARK).
 //
 // Toggle via env var GPUDB_FORCE_BACKEND=cpu|gpu|auto (default auto)
 // for diagnostic / benchmark runs.
-constexpr std::size_t kSumGpuThreshold        = 1'000'000;   // ~8 MiB int64
-constexpr idx_t       kBatchedGroupByThreshold = 64;
+constexpr idx_t kBatchedGroupByThreshold = 64;
 
 enum class ForcedBackend { Auto, Cpu, Gpu };
 
@@ -161,13 +259,6 @@ ForcedBackend forced_backend() {
     return cached;
 }
 
-bool should_use_gpu_for_sum(std::size_t n) {
-    auto fb = forced_backend();
-    if (fb == ForcedBackend::Cpu) return false;
-    if (fb == ForcedBackend::Gpu) return true;
-    return n >= kSumGpuThreshold;
-}
-
 bool should_use_gpu_for_groupby(idx_t state_count) {
     auto fb = forced_backend();
     if (fb == ForcedBackend::Cpu) return false;
@@ -179,30 +270,18 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
               duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
 
-    // ---- Single-state fast path: ungrouped SELECT gpu_sum(x) FROM tbl ----
+    // ---- Single-state fast path: ungrouped SELECT gpu_sum(x) FROM tbl,
+    //      and per-row finalize calls from window functions without
+    //      PARTITION BY. ----
     //
-    // We keep this path on the GPU unconditionally because:
-    //   1. Window functions (OVER ...) reuse the aggregate state and call
-    //      finalize repeatedly with count=1 across different per-row windows.
-    //      A hybrid CPU/GPU switch here causes incorrect results in window
-    //      mode (the per-call state object can be in transient states the
-    //      CPU fallback miscounts). Better to always use the same path.
-    //   2. For the streaming-SUM case where CPU would win on perf, the user
-    //      would just not call gpu_sum() — they'd call sum().
-    //
-    // The hybrid planning therefore lives in the GROUP BY branch below, where
-    // the cardinality threshold actually matters and DuckDB's calling pattern
-    // is stable.
+    // safe_sum_i64() short-circuits to CPU under kSumGpuMinRows (so window
+    // functions and tiny ungrouped sums avoid the lock and the kernel-launch
+    // cost) and serialises shared_agg() calls above that with a mutex (so
+    // multi-threaded window finalize calls don't trash the singleton's
+    // device buffers).
     if (count == 1) {
         auto* s = reinterpret_cast<GpuSumState*>(source[0]);
-        if (s->buf.empty()) { out[offset] = 0; return; }
-        try {
-            out[offset] = shared_agg().sum_i64(s->buf.data(), s->buf.size()).value_i64;
-        } catch (const std::exception&) {
-            std::int64_t acc = 0;
-            for (auto v : s->buf) acc += v;
-            out[offset] = acc;
-        }
+        out[offset] = safe_sum_i64(s->buf.data(), s->buf.size());
         return;
     }
 
@@ -251,17 +330,9 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     }
 
     if (!used_batched) {
-        auto& agg = shared_agg();
         for (idx_t i = 0; i < count; ++i) {
             auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-            if (s->buf.empty()) { out[offset + i] = 0; continue; }
-            try {
-                out[offset + i] = agg.sum_i64(s->buf.data(), s->buf.size()).value_i64;
-            } catch (const std::exception&) {
-                std::int64_t acc = 0;
-                for (auto v : s->buf) acc += v;
-                out[offset + i] = acc;
-            }
+            out[offset + i] = safe_sum_i64(s->buf.data(), s->buf.size());
         }
     }
 }
@@ -270,34 +341,18 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
 void finalize_min(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
-    auto& agg = shared_agg();
     for (idx_t i = 0; i < count; ++i) {
         auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-        if (s->buf.empty()) { out[offset + i] = 0; continue; }  // SQL NULL handling: TODO
-        try {
-            out[offset + i] = agg.min_i64(s->buf.data(), s->buf.size()).value_i64;
-        } catch (const std::exception&) {
-            std::int64_t v = s->buf[0];
-            for (auto x : s->buf) if (x < v) v = x;
-            out[offset + i] = v;
-        }
+        out[offset + i] = safe_min_i64(s->buf.data(), s->buf.size());
     }
 }
 
 void finalize_max(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
-    auto& agg = shared_agg();
     for (idx_t i = 0; i < count; ++i) {
         auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-        if (s->buf.empty()) { out[offset + i] = 0; continue; }
-        try {
-            out[offset + i] = agg.max_i64(s->buf.data(), s->buf.size()).value_i64;
-        } catch (const std::exception&) {
-            std::int64_t v = s->buf[0];
-            for (auto x : s->buf) if (x > v) v = x;
-            out[offset + i] = v;
-        }
+        out[offset + i] = safe_max_i64(s->buf.data(), s->buf.size());
     }
 }
 
