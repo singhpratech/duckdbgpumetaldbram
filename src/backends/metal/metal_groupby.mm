@@ -88,6 +88,7 @@ public:
             ps_radix_bucket_totals_  = make_pso(lib, @"radix_bucket_totals");
             ps_radix_bucket_offsets_ = make_pso(lib, @"radix_bucket_offsets");
             ps_radix_per_bucket_scan_ = make_pso(lib, @"radix_per_bucket_scan");
+            ps_radix_minmax_ = make_pso(lib, @"radix_minmax_i64");
         }
     }
 
@@ -179,6 +180,74 @@ public:
             id<MTLBuffer> in_keys   = b_keys_a,   in_values   = b_values_a;
             id<MTLBuffer> out_keys  = b_keys_b,   out_values  = b_values_b;
 
+            // ---- Min-max pre-scan to detect "constant byte" passes ----
+            // Run a separate cb so we can read the result on the host before
+            // building the radix pipeline. The cost is one extra commit/wait
+            // (~100 µs) plus a tiny kernel — and it can save 4-7 of the 8
+            // radix passes for low-cardinality input.
+            constexpr NSUInteger kMinMaxGrid = 256;
+            const std::size_t bytes_minmax_partials =
+                kMinMaxGrid * 4 * sizeof(std::int32_t);  // per block: 2 ints for min, 2 for max
+            if (!b_minmax_partials_ || [b_minmax_partials_ length] < bytes_minmax_partials) {
+                b_minmax_partials_ = [device_ newBufferWithLength:bytes_minmax_partials
+                                                          options:MTLResourceStorageModeShared];
+            }
+            // Layout: [min_lo_0, min_hi_0, ..., min_lo_K-1, min_hi_K-1,
+            //          max_lo_0, max_hi_0, ..., max_lo_K-1, max_hi_K-1]
+            // (K = kMinMaxGrid).
+            std::uint8_t active_bytes = 0xFF;  // default: all 8 bytes active
+            {
+                id<MTLCommandBuffer>         cb_mm = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce_mm = [cb_mm computeCommandEncoder];
+                [ce_mm setComputePipelineState:ps_radix_minmax_];
+                [ce_mm setBuffer:b_keys_a offset:0 atIndex:0];
+                [ce_mm setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce_mm setBuffer:b_minmax_partials_
+                          offset:0
+                         atIndex:2];
+                [ce_mm setBuffer:b_minmax_partials_
+                          offset:kMinMaxGrid * 2 * sizeof(std::int32_t)
+                         atIndex:3];
+                [ce_mm dispatchThreadgroups:MTLSizeMake(kMinMaxGrid, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [ce_mm endEncoding];
+                [cb_mm commit];
+                [cb_mm waitUntilCompleted];
+
+                // Host-side final reduction over per-block partials.
+                const std::int32_t* parts =
+                    static_cast<const std::int32_t*>([b_minmax_partials_ contents]);
+                std::int64_t mn = INT64_MAX, mx = INT64_MIN;
+                for (NSUInteger b = 0; b < kMinMaxGrid; ++b) {
+                    const std::uint64_t mlo = static_cast<std::uint32_t>(parts[b * 2 + 0]);
+                    const std::uint64_t mhi = static_cast<std::uint32_t>(parts[b * 2 + 1]);
+                    const std::uint64_t Mlo = static_cast<std::uint32_t>(parts[(kMinMaxGrid + b) * 2 + 0]);
+                    const std::uint64_t Mhi = static_cast<std::uint32_t>(parts[(kMinMaxGrid + b) * 2 + 1]);
+                    std::int64_t bm, bM;
+                    const std::uint64_t bmu = (mhi << 32) | mlo;
+                    const std::uint64_t bMu = (Mhi << 32) | Mlo;
+                    std::memcpy(&bm, &bmu, sizeof(std::int64_t));
+                    std::memcpy(&bM, &bMu, sizeof(std::int64_t));
+                    if (bm < mn) mn = bm;
+                    if (bM > mx) mx = bM;
+                }
+
+                // After sign-flip, signed sort == unsigned sort. Compute
+                // active byte mask using XOR-with-sign-bit form.
+                const std::uint64_t mn_u = static_cast<std::uint64_t>(mn) ^ 0x8000000000000000ULL;
+                const std::uint64_t mx_u = static_cast<std::uint64_t>(mx) ^ 0x8000000000000000ULL;
+                active_bytes = 0;
+                for (std::uint32_t p = 0; p < 8; ++p) {
+                    const std::uint64_t shift = p * 8;
+                    const std::uint8_t mn_b = static_cast<std::uint8_t>((mn_u >> shift) & 0xFFu);
+                    const std::uint8_t mx_b = static_cast<std::uint8_t>((mx_u >> shift) & 0xFFu);
+                    if (mn_b != mx_b) active_bytes |= (1u << p);
+                }
+                // If all keys are equal (no byte varies), still need pass 0
+                // so the data lands in the right ping-pong slot.
+                if (active_bytes == 0) active_bytes = 0x01;
+            }
+
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
 
@@ -190,6 +259,7 @@ public:
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
 
             for (std::uint32_t pass = 0; pass < 8; ++pass) {
+                if (!(active_bytes & (1u << pass))) continue;   // skip constant byte
                 const std::uint32_t shift = pass * 8u;
 
                 // 1. Histogram
@@ -358,8 +428,10 @@ private:
     id<MTLComputePipelineState> ps_radix_bucket_totals_ = nil;
     id<MTLComputePipelineState> ps_radix_bucket_offsets_ = nil;
     id<MTLComputePipelineState> ps_radix_per_bucket_scan_ = nil;
+    id<MTLComputePipelineState> ps_radix_minmax_ = nil;
     id<MTLBuffer> b_bucket_total_  = nil;
     id<MTLBuffer> b_bucket_offset_ = nil;
+    id<MTLBuffer> b_minmax_partials_ = nil;
     // Buffer cache for radix's ping-pong + histogram / scan.
     id<MTLBuffer> b_keys_     = nil;
     id<MTLBuffer> b_values_   = nil;

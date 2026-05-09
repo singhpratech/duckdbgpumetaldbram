@@ -386,3 +386,83 @@ kernel void radix_per_bucket_scan(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// ============================================================================
+// Min-max pre-scan (one kernel per radix sort, runs once before pass 0).
+//
+// Computes min and max of the input keys (signed int64) so the host can
+// determine which radix-sort passes are "constant byte" no-ops and skip
+// them. For uniformly-distributed keys in [0, G), only the lowest
+// ceil(log2(G)/8) bytes vary; the higher bytes are zero across all keys
+// and the corresponding radix passes do nothing useful.
+//
+// Output: a 16-byte buffer holding {min: int64, max: int64}.
+
+kernel void radix_minmax_i64(
+    device const long*  keys     [[buffer(0)]],
+    constant uint&      n        [[buffer(1)]],
+    device atomic_int*  out_min  [[buffer(2)]],   // 2 atomic_int = lo, hi
+    device atomic_int*  out_max  [[buffer(3)]],
+    uint                tid      [[thread_position_in_threadgroup]],
+    uint                bid      [[threadgroup_position_in_grid]],
+    uint                gsize    [[threads_per_grid]],
+    uint                gid      [[thread_position_in_grid]])
+{
+    threadgroup long shm_min[256];
+    threadgroup long shm_max[256];
+
+    long local_min = 0x7FFFFFFFFFFFFFFFL;
+    long local_max = (long)0x8000000000000000UL;
+    for (uint i = gid; i < n; i += gsize) {
+        const long k = keys[i];
+        local_min = (k < local_min) ? k : local_min;
+        local_max = (k > local_max) ? k : local_max;
+    }
+    shm_min[tid] = local_min;
+    shm_max[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            const long a = shm_min[tid];
+            const long b = shm_min[tid + s];
+            shm_min[tid] = (a < b) ? a : b;
+            const long c = shm_max[tid];
+            const long d = shm_max[tid + s];
+            shm_max[tid] = (c > d) ? c : d;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        // Reduce per-block partials into a single (min, max) using 32-bit
+        // atomic min/max on the low / high halves. Apple supports
+        // atomic_fetch_min/max on int (32-bit) but not on long; do it in
+        // two halves with monotonic comparison.
+        // For a coarse "do this byte vary?" estimate, we don't need a
+        // bit-perfect 64-bit reduction — but we do need correctness. The
+        // simplest correct path here: just have block 0 do a final
+        // sequential reduction via atomics on 32-bit halves below.
+        //
+        // Implementation note: we use the "two passes" pattern. The
+        // initial values sentinel are stored in out_min[0..1] (lo,hi for min)
+        // and out_max[0..1] (lo,hi for max) by the host. Each block's tid==0
+        // applies its partial via the atomic 32-bit min/max API, with a
+        // careful split so the result represents the true 64-bit value.
+        //
+        // For simplicity and since this kernel runs ONCE per groupby call
+        // (negligible cost), we let block 0 wait via a serialization trick:
+        // we actually just store each block's partial to a per-block slot
+        // and do the final 64-bit reduction on the host. To keep this kernel
+        // self-contained as written, store the per-block partials at
+        // out_min[bid * 2..bid * 2 + 1] and same for max.
+        atomic_store_explicit(&out_min[bid * 2 + 0], (int)((ulong)shm_min[0] & 0xFFFFFFFFu),
+                              memory_order_relaxed);
+        atomic_store_explicit(&out_min[bid * 2 + 1], (int)((ulong)shm_min[0] >> 32),
+                              memory_order_relaxed);
+        atomic_store_explicit(&out_max[bid * 2 + 0], (int)((ulong)shm_max[0] & 0xFFFFFFFFu),
+                              memory_order_relaxed);
+        atomic_store_explicit(&out_max[bid * 2 + 1], (int)((ulong)shm_max[0] >> 32),
+                              memory_order_relaxed);
+    }
+}
