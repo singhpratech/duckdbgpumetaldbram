@@ -301,20 +301,25 @@ private:
         constexpr std::uintptr_t kPageSize = 16384;  // Apple Silicon
         const std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(src);
         if ((addr % kPageSize) == 0 && bytes >= kPageSize) {
-            // Round bytes UP to page boundary. newBufferWithBytesNoCopy
-            // requires page-aligned LENGTH; the kernel only reads the first
-            // `n` elements (passed separately), so the padded tail is
-            // unread. Caller must have allocated `bytes_padded` worth of
-            // memory (use aligned_alloc with the padded size).
             const std::size_t bytes_padded =
                 ((bytes + kPageSize - 1) / kPageSize) * kPageSize;
-            id<MTLBuffer> buf =
+            // Cache the no-copy buffer if the caller hands us the same pointer
+            // again — newBufferWithBytesNoCopy itself takes a few ms at large
+            // sizes (presumably because Metal registers the pages with the GPU
+            // MMU), so reusing the wrapper across repeated calls eliminates
+            // that per-call cost.
+            if (zerocopy_src_ == src && zerocopy_bytes_ == bytes_padded
+                && zerocopy_buf_ != nil) {
+                return zerocopy_buf_;
+            }
+            zerocopy_buf_ =
                 [device_ newBufferWithBytesNoCopy:const_cast<void*>(src)
                                            length:bytes_padded
                                           options:MTLResourceStorageModeShared
                                       deallocator:nil];
-            // Don't cache zero-copy buffers — they alias the caller's memory.
-            return buf;
+            zerocopy_src_   = src;
+            zerocopy_bytes_ = bytes_padded;
+            return zerocopy_buf_;
         }
         // Slow path: cached shared buffer + memcpy.
         if (!input_buf_ || [input_buf_ length] < bytes) {
@@ -338,6 +343,10 @@ private:
     id<MTLBuffer> input_buf_    = nil;  // grows on demand
     id<MTLBuffer> partials_buf_ = nil;  // sized for kMaxGrid * sizeof(int64)
     id<MTLBuffer> out_buf_      = nil;  // single int64
+    // Zero-copy cache (keyed on caller pointer + padded length).
+    id<MTLBuffer> zerocopy_buf_   = nil;
+    const void*   zerocopy_src_   = nullptr;
+    std::size_t   zerocopy_bytes_ = 0;
 };
 
 } // namespace
