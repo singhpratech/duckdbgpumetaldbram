@@ -280,3 +280,109 @@ kernel void radix_scatter(
         out_values[global_pos] = shm_values[pos];
     }
 }
+
+// ============================================================================
+// On-device exclusive scan for the radix sort scatter offsets.
+//
+// Goal: replace the host-side cache-friendly scan (which dominates wall time
+// at large N) with three GPU kernels that compute the bucket-major exclusive
+// prefix sum entirely on the GPU. With this, all 8 radix passes can stay in
+// a single command buffer and the wall converges to the kernel time.
+//
+// Layout: hist[bid * 256 + bucket]. Output: scan[bid * 256 + bucket] =
+//   sum over (b' < bucket, all bid') of hist[bid'][b']
+//   + sum over (bid' < bid) of hist[bid'][bucket]
+//
+// Three kernels:
+//   1. radix_bucket_totals: 256 threadgroups (one per bucket). Each reduces
+//      num_blocks values for its bucket to a single total.
+//   2. radix_bucket_offsets: one 256-thread threadgroup, exclusive scan over
+//      the 256 bucket totals → bucket_offset[256].
+//   3. radix_per_bucket_scan: 256 threadgroups (one per bucket). Each does an
+//      exclusive scan of hist[*][bucket] across all blocks, then adds
+//      bucket_offset[bucket]. Writes the final scan[bid * 256 + bucket].
+//
+// The per-bucket scan handles arbitrary num_blocks via chunked Hillis-Steele
+// in threadgroup memory: process 256 blocks at a time, accumulate a running
+// total across chunks. O(num_blocks / 256 * log(256)) cycles per bucket.
+
+kernel void radix_bucket_totals(
+    device const uint* hist        [[buffer(0)]],
+    constant uint&     num_blocks  [[buffer(1)]],
+    device uint*       bucket_total [[buffer(2)]],
+    uint               tid         [[thread_position_in_threadgroup]],
+    uint               b           [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[256];
+
+    uint running = 0;
+    for (uint chunk_start = 0; chunk_start < num_blocks; chunk_start += 256) {
+        const uint bid = chunk_start + tid;
+        running += (bid < num_blocks) ? hist[bid * 256u + b] : 0u;
+    }
+    shm[tid] = running;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Tree reduction
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) bucket_total[b] = shm[0];
+}
+
+kernel void radix_bucket_offsets(
+    device const uint* bucket_total [[buffer(0)]],
+    device uint*       bucket_offset [[buffer(1)]],
+    uint               tid          [[thread_position_in_threadgroup]])
+{
+    threadgroup uint shm[256];
+    shm[tid] = bucket_total[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Hillis-Steele inclusive scan
+    for (uint offset = 1; offset < 256; offset <<= 1) {
+        uint t = (tid >= offset) ? shm[tid - offset] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        shm[tid] += t;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Convert inclusive → exclusive
+    bucket_offset[tid] = shm[tid] - bucket_total[tid];
+}
+
+kernel void radix_per_bucket_scan(
+    device const uint* hist          [[buffer(0)]],
+    constant uint&     num_blocks    [[buffer(1)]],
+    device const uint* bucket_offset [[buffer(2)]],
+    device uint*       scan          [[buffer(3)]],
+    uint               tid           [[thread_position_in_threadgroup]],
+    uint               b             [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[256];
+
+    uint running = bucket_offset[b];
+    for (uint chunk_start = 0; chunk_start < num_blocks; chunk_start += 256) {
+        const uint bid = chunk_start + tid;
+        const uint val = (bid < num_blocks) ? hist[bid * 256u + b] : 0u;
+        shm[tid] = val;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inclusive Hillis-Steele scan within chunk
+        for (uint offset = 1; offset < 256; offset <<= 1) {
+            uint t = (tid >= offset) ? shm[tid - offset] : 0u;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            shm[tid] += t;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Exclusive within chunk = inclusive - own value. Plus running across chunks.
+        if (bid < num_blocks) {
+            scan[bid * 256u + b] = running + (shm[tid] - val);
+        }
+
+        // Pass running across chunks (chunk total = inclusive[255]).
+        running += shm[255];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}

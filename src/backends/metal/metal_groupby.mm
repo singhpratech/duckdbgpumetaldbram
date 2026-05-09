@@ -85,6 +85,9 @@ public:
             ps_radix_flip_      = make_pso(lib, @"radix_flip_sign_bit");
             ps_radix_histogram_ = make_pso(lib, @"radix_histogram");
             ps_radix_scatter_   = make_pso(lib, @"radix_scatter");
+            ps_radix_bucket_totals_  = make_pso(lib, @"radix_bucket_totals");
+            ps_radix_bucket_offsets_ = make_pso(lib, @"radix_bucket_offsets");
+            ps_radix_per_bucket_scan_ = make_pso(lib, @"radix_per_bucket_scan");
         }
     }
 
@@ -155,150 +158,102 @@ public:
             std::memcpy([b_keys_a   contents], keys,   bytes_kv);
             std::memcpy([b_values_a contents], values, bytes_kv);
 
-            // ---- Sign-bit flip on input (signed-radix → unsigned-radix) ----
-            {
-                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                [ce setComputePipelineState:ps_radix_flip_];
-                [ce setBuffer:b_keys_a offset:0 atIndex:0];
-                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
-                [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                [ce endEncoding];
-                [cb commit];
-                [cb waitUntilCompleted];
-            }
+            // ---- All 8 radix passes + sign-flips in ONE command buffer ----
+            // On-device GPU scan eliminates the host-scan bottleneck and lets
+            // every dispatch live in the same cb. One commit, one wait —
+            // wall converges to kernel time.
 
-            double kernel_ms_total = 0.0;
+            // Bucket-totals + bucket-offsets buffers (small; size lazily).
+            const std::size_t bytes_buckets = RADIX_BUCKETS * sizeof(std::uint32_t);
+            if (!b_bucket_total_  || [b_bucket_total_  length] < bytes_buckets) {
+                b_bucket_total_  = [device_ newBufferWithLength:bytes_buckets
+                                                        options:MTLResourceStorageModeShared];
+            }
+            if (!b_bucket_offset_ || [b_bucket_offset_ length] < bytes_buckets) {
+                b_bucket_offset_ = [device_ newBufferWithLength:bytes_buckets
+                                                        options:MTLResourceStorageModeShared];
+            }
+            id<MTLBuffer> b_bucket_total  = b_bucket_total_;
+            id<MTLBuffer> b_bucket_offset = b_bucket_offset_;
 
             id<MTLBuffer> in_keys   = b_keys_a,   in_values   = b_values_a;
             id<MTLBuffer> out_keys  = b_keys_b,   out_values  = b_values_b;
 
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+
+            // Sign-flip (initial, on b_keys_a)
+            [ce setComputePipelineState:ps_radix_flip_];
+            [ce setBuffer:b_keys_a offset:0 atIndex:0];
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+            [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
             for (std::uint32_t pass = 0; pass < 8; ++pass) {
                 const std::uint32_t shift = pass * 8u;
 
-                // ---- 1. Histogram (GPU) ----
-                {
-                    id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                    [ce setComputePipelineState:ps_radix_histogram_];
-                    [ce setBuffer:in_keys offset:0 atIndex:0];
-                    [ce setBytes:&n32   length:sizeof(n32)   atIndex:1];
-                    [ce setBytes:&shift length:sizeof(shift) atIndex:2];
-                    [ce setBuffer:b_hist offset:0 atIndex:3];
-                    [ce dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
-                    [ce endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    kernel_ms_total += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
-                }
+                // 1. Histogram
+                [ce setComputePipelineState:ps_radix_histogram_];
+                [ce setBuffer:in_keys offset:0 atIndex:0];
+                [ce setBytes:&n32   length:sizeof(n32)   atIndex:1];
+                [ce setBytes:&shift length:sizeof(shift) atIndex:2];
+                [ce setBuffer:b_hist offset:0 atIndex:3];
+                [ce dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
 
-                // ---- 2. Scatter offsets (multi-threaded host scan) ----
-                // The bucket_total reduction parallelizes cleanly across
-                // threads (per-thread private 256-bucket arrays merged at
-                // the end). The per-block running sum (step c) is sequential
-                // along the block axis but parallelizable across buckets;
-                // we keep it cache-friendly (sequential hist+scan walk) and
-                // single-threaded — the bucket_total dominates wall at scale.
-                {
-                    const std::uint32_t* hist_in =
-                        static_cast<const std::uint32_t*>([b_hist contents]);
-                    std::uint32_t*       scan_out =
-                        static_cast<std::uint32_t*>([b_scan contents]);
+                // 2a. Bucket totals (256 threadgroups, one per bucket)
+                [ce setComputePipelineState:ps_radix_bucket_totals_];
+                [ce setBuffer:b_hist          offset:0 atIndex:0];
+                [ce setBytes:&num_blocks      length:sizeof(num_blocks) atIndex:1];
+                [ce setBuffer:b_bucket_total  offset:0 atIndex:2];
+                [ce dispatchThreadgroups:MTLSizeMake(RADIX_BUCKETS, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
 
-                    constexpr int kHostThreads = 8;
-                    const std::uint64_t total_entries =
-                        static_cast<std::uint64_t>(num_blocks) * RADIX_BUCKETS;
+                // 2b. Bucket offsets (1 threadgroup, 256 threads)
+                [ce setComputePipelineState:ps_radix_bucket_offsets_];
+                [ce setBuffer:b_bucket_total  offset:0 atIndex:0];
+                [ce setBuffer:b_bucket_offset offset:0 atIndex:1];
+                [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
 
-                    // (a) bucket totals — parallel, per-thread private arrays
-                    std::uint32_t bucket_total[RADIX_BUCKETS] = {0};
-                    if (total_entries >= 65536) {
-                        std::vector<std::array<std::uint32_t, RADIX_BUCKETS>>
-                            per_thread(kHostThreads);
-                        for (auto& a : per_thread) a.fill(0);
-                        std::vector<std::thread> workers;
-                        workers.reserve(kHostThreads);
-                        for (int t = 0; t < kHostThreads; ++t) {
-                            workers.emplace_back([&, t] {
-                                const std::uint64_t lo = total_entries * t / kHostThreads;
-                                const std::uint64_t hi = total_entries * (t + 1) / kHostThreads;
-                                auto& local = per_thread[t];
-                                for (std::uint64_t i = lo; i < hi; ++i) {
-                                    local[i & (RADIX_BUCKETS - 1)] += hist_in[i];
-                                }
-                            });
-                        }
-                        for (auto& w : workers) w.join();
-                        for (int t = 0; t < kHostThreads; ++t) {
-                            for (std::uint32_t b = 0; b < RADIX_BUCKETS; ++b) {
-                                bucket_total[b] += per_thread[t][b];
-                            }
-                        }
-                    } else {
-                        for (std::uint64_t i = 0; i < total_entries; ++i) {
-                            bucket_total[i & (RADIX_BUCKETS - 1)] += hist_in[i];
-                        }
-                    }
+                // 2c. Per-bucket per-block scan (256 threadgroups, one per bucket)
+                [ce setComputePipelineState:ps_radix_per_bucket_scan_];
+                [ce setBuffer:b_hist          offset:0 atIndex:0];
+                [ce setBytes:&num_blocks      length:sizeof(num_blocks) atIndex:1];
+                [ce setBuffer:b_bucket_offset offset:0 atIndex:2];
+                [ce setBuffer:b_scan          offset:0 atIndex:3];
+                [ce dispatchThreadgroups:MTLSizeMake(RADIX_BUCKETS, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
 
-                    // (b) bucket offsets (256 elements, trivial)
-                    std::uint32_t bucket_offset[RADIX_BUCKETS];
-                    std::uint32_t running = 0;
-                    for (std::uint32_t b = 0; b < RADIX_BUCKETS; ++b) {
-                        bucket_offset[b] = running;
-                        running += bucket_total[b];
-                    }
-
-                    // (c) per-block-per-bucket offsets — sequential cache-friendly walk.
-                    // Tried per-bucket parallelization; the 256-byte stride
-                    // access pattern thrashes cache and ends up slower.
-                    std::uint32_t block_running[RADIX_BUCKETS] = {0};
-                    for (std::uint32_t bid = 0; bid < num_blocks; ++bid) {
-                        const std::uint32_t base = bid * RADIX_BUCKETS;
-                        for (std::uint32_t b = 0; b < RADIX_BUCKETS; ++b) {
-                            scan_out[base + b]   = bucket_offset[b] + block_running[b];
-                            block_running[b]    += hist_in[base + b];
-                        }
-                    }
-                }
-
-                // ---- 3. Scatter (GPU, stable) ----
-                {
-                    id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                    [ce setComputePipelineState:ps_radix_scatter_];
-                    [ce setBuffer:in_keys    offset:0 atIndex:0];
-                    [ce setBuffer:in_values  offset:0 atIndex:1];
-                    [ce setBytes:&n32   length:sizeof(n32)   atIndex:2];
-                    [ce setBytes:&shift length:sizeof(shift) atIndex:3];
-                    [ce setBuffer:b_scan     offset:0 atIndex:4];
-                    [ce setBuffer:out_keys   offset:0 atIndex:5];
-                    [ce setBuffer:out_values offset:0 atIndex:6];
-                    [ce dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
-                    [ce endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    kernel_ms_total += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
-                }
+                // 3. Scatter (stable)
+                [ce setComputePipelineState:ps_radix_scatter_];
+                [ce setBuffer:in_keys    offset:0 atIndex:0];
+                [ce setBuffer:in_values  offset:0 atIndex:1];
+                [ce setBytes:&n32   length:sizeof(n32)   atIndex:2];
+                [ce setBytes:&shift length:sizeof(shift) atIndex:3];
+                [ce setBuffer:b_scan     offset:0 atIndex:4];
+                [ce setBuffer:out_keys   offset:0 atIndex:5];
+                [ce setBuffer:out_values offset:0 atIndex:6];
+                [ce dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(RADIX_BLOCK_SIZE, 1, 1)];
 
                 std::swap(in_keys,   out_keys);
                 std::swap(in_values, out_values);
             }
 
-            // ---- Unflip sign on the now-sorted keys ----
-            {
-                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                [ce setComputePipelineState:ps_radix_flip_];
-                [ce setBuffer:in_keys offset:0 atIndex:0];
-                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
-                [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                [ce endEncoding];
-                [cb commit];
-                [cb waitUntilCompleted];
-            }
+            // Sign-unflip on the now-sorted keys (which are in `in_keys` after
+            // 8 swaps, so back to b_keys_a).
+            [ce setComputePipelineState:ps_radix_flip_];
+            [ce setBuffer:in_keys offset:0 atIndex:0];
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+            [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            const double kernel_ms_total = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
 
             // ---- Host segment-reduce (parallel) ----
             // Sorted (key, value) array. Divide into NTHREADS chunks; each
@@ -400,6 +355,11 @@ private:
     id<MTLComputePipelineState> ps_radix_flip_     = nil;
     id<MTLComputePipelineState> ps_radix_histogram_ = nil;
     id<MTLComputePipelineState> ps_radix_scatter_  = nil;
+    id<MTLComputePipelineState> ps_radix_bucket_totals_ = nil;
+    id<MTLComputePipelineState> ps_radix_bucket_offsets_ = nil;
+    id<MTLComputePipelineState> ps_radix_per_bucket_scan_ = nil;
+    id<MTLBuffer> b_bucket_total_  = nil;
+    id<MTLBuffer> b_bucket_offset_ = nil;
     // Buffer cache for radix's ping-pong + histogram / scan.
     id<MTLBuffer> b_keys_     = nil;
     id<MTLBuffer> b_values_   = nil;
