@@ -15,3 +15,9 @@ target_link_libraries(gpudb-csv2bin PRIVATE gpudb)
 set_target_properties(gpudb-csv2bin PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+add_executable(gpudb-groupby-bench groupby_bench_main.cpp)
+target_link_libraries(gpudb-groupby-bench PRIVATE gpudb)
+set_target_properties(gpudb-groupby-bench PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

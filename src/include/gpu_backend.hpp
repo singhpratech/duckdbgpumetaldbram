@@ -82,6 +82,35 @@ public:
 // in or no compatible device is present.
 std::unique_ptr<Aggregator> make_aggregator(Backend);
 
+// =========================================================================
+//  GROUP BY hash aggregate (i64 key, i64 sum value)
+// =========================================================================
+
+struct GroupByResult {
+    std::vector<std::int64_t> keys;       // unique keys (order may differ across backends)
+    std::vector<std::int64_t> sums;       // SUM(value) for each key
+    std::size_t input_rows = 0;
+    double      wall_ms     = 0.0;
+    double      kernel_ms   = 0.0;
+    double      transfer_ms = 0.0;
+};
+
+class GroupByAggregator {
+public:
+    virtual ~GroupByAggregator() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+
+    // SUM(values) GROUP BY keys.
+    // expected_groups is an optional hint; 0 means "guess from n".
+    virtual GroupByResult groupby_sum_i64(const std::int64_t* keys,
+                                          const std::int64_t* values,
+                                          std::size_t n,
+                                          std::size_t expected_groups = 0) = 0;
+};
+
+std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
+
 // Returns the best backend available at runtime: CUDA if compiled+device,
 // else METAL if compiled+device, else CPU.
 [[nodiscard]] Backend default_backend() noexcept;

@@ -2,13 +2,16 @@
 
 set(GPUDB_SOURCES
     backends/cpu/cpu_aggregator.cpp
+    backends/cpu/cpu_groupby.cpp
     backends/backend_factory.cpp
 )
 
 if(GPUDB_HAS_CUDA)
     list(APPEND GPUDB_SOURCES
         backends/cuda/cuda_aggregator.cpp
+        backends/cuda/cuda_groupby.cpp
         backends/cuda/kernels/sum_kernel.cu
+        backends/cuda/kernels/groupby_kernel.cu
     )
 endif()
 

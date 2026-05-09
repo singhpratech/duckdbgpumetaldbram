@@ -15,8 +15,10 @@ const char* to_string(Backend b) noexcept {
 
 // Forward declarations (impls live in their respective TUs)
 std::unique_ptr<Aggregator> make_cpu_aggregator();
+std::unique_ptr<GroupByAggregator> make_cpu_groupby_aggregator();
 #if GPUDB_HAVE_CUDA
 std::unique_ptr<Aggregator> make_cuda_aggregator();
+std::unique_ptr<GroupByAggregator> make_cuda_groupby_aggregator();
 bool cuda_runtime_available() noexcept;
 #endif
 #if GPUDB_HAVE_METAL
@@ -52,6 +54,23 @@ Backend default_backend() noexcept {
     if (metal_runtime_available()) return Backend::METAL;
 #endif
     return Backend::CPU;
+}
+
+std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend b) {
+    switch (b) {
+        case Backend::CPU:
+            return make_cpu_groupby_aggregator();
+        case Backend::CUDA:
+#if GPUDB_HAVE_CUDA
+            return make_cuda_groupby_aggregator();
+#else
+            throw std::runtime_error("CUDA backend not compiled in");
+#endif
+        case Backend::METAL:
+            // Metal GROUP BY: deferred to macOS branch; fall back to CPU for now.
+            return make_cpu_groupby_aggregator();
+    }
+    throw std::runtime_error("Unknown backend");
 }
 
 std::vector<Backend> available_backends() noexcept {
