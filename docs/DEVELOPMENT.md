@@ -88,7 +88,7 @@ The repo `singhpratech/duckdbgpumetaldb` already exists and is private. To start
 
 ```bash
 cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb
-git remote add origin https://github.com/singhpratech/duckdbgpumetaldb.git
+git remote add origin https://github.com/singhpratech/duckdbgpumetaldbram.git
 git push -u origin main
 ```
 
