@@ -76,11 +76,19 @@ public:
             ps_min_partials_i64_  = make_pso(lib, @"min_partials_i64");
             ps_max_i64_           = make_pso(lib, @"max_i64");
             ps_max_partials_i64_  = make_pso(lib, @"max_partials_i64");
+            ps_agg_all_i64_           = make_pso(lib, @"agg_all_i64");
+            ps_agg_all_partials_i64_  = make_pso(lib, @"agg_all_partials_i64");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
             out_buf_      = [device_ newBufferWithLength:sizeof(std::int64_t)
                                                  options:MTLResourceStorageModeShared];
+            // Multi-agg fusion needs 4 longs per block (sum/min/max/count)
+            // and 4 longs of output.
+            partials_quad_buf_ = [device_ newBufferWithLength:(kMaxGrid * 4 * sizeof(std::int64_t))
+                                                      options:MTLResourceStorageModeShared];
+            out_quad_buf_      = [device_ newBufferWithLength:(4 * sizeof(std::int64_t))
+                                                      options:MTLResourceStorageModeShared];
         }
     }
 
@@ -140,6 +148,23 @@ public:
     AggResult sum_resident_f64(const ResidentColumn& c) override {
         const auto& r = check_f64(c);
         return host_sum_f64(static_cast<const double*>([r.buffer() contents]), r.rows());
+    }
+
+    AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) override {
+        @autoreleasepool {
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            if (n == 0) return empty_agg_all(n, t_wall0);
+            id<MTLBuffer> in = stage_input(data, n * sizeof(std::int64_t));
+            return dispatch_agg_all_i64(in, n, t_wall0);
+        }
+    }
+    AggAllResult agg_all_resident_i64(const ResidentColumn& c) override {
+        @autoreleasepool {
+            const auto& r = check_i64(c);
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            if (r.rows() == 0) return empty_agg_all(0, t_wall0);
+            return dispatch_agg_all_i64(r.buffer(), r.rows(), t_wall0);
+        }
     }
 
 private:
@@ -330,6 +355,62 @@ private:
         return input_buf_;
     }
 
+    AggAllResult empty_agg_all(std::size_t n,
+                               std::chrono::steady_clock::time_point t_wall0) {
+        AggAllResult r{};
+        r.rows  = n;
+        r.count = 0;
+        r.sum   = 0;
+        r.min   = std::numeric_limits<std::int64_t>::max();
+        r.max   = std::numeric_limits<std::int64_t>::min();
+        r.wall_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_wall0).count();
+        return r;
+    }
+
+    AggAllResult dispatch_agg_all_i64(id<MTLBuffer> in, std::size_t n,
+                                      std::chrono::steady_clock::time_point t_wall0) {
+        const NSUInteger grid = pick_grid(n);
+        const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+
+        id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+        id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+
+        // ---- Pass 1: per-threadgroup reduction (4 partials per block) ----
+        [ce setComputePipelineState:ps_agg_all_i64_];
+        [ce setBuffer:in                 offset:0 atIndex:0];
+        [ce setBuffer:partials_quad_buf_ offset:0 atIndex:1];
+        [ce setBytes:&n32 length:sizeof(n32) atIndex:2];
+        [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
+        // ---- Pass 2: single-threadgroup reduction over partials ----
+        const std::uint32_t np = static_cast<std::uint32_t>(grid);
+        [ce setComputePipelineState:ps_agg_all_partials_i64_];
+        [ce setBuffer:partials_quad_buf_ offset:0 atIndex:0];
+        [ce setBuffer:out_quad_buf_      offset:0 atIndex:1];
+        [ce setBytes:&np length:sizeof(np) atIndex:2];
+        [ce dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
+        [ce endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+
+        const std::int64_t* out = static_cast<const std::int64_t*>([out_quad_buf_ contents]);
+        AggAllResult r{};
+        r.rows        = n;
+        r.sum         = out[0];
+        r.min         = out[1];
+        r.max         = out[2];
+        r.count       = static_cast<std::size_t>(out[3]);
+        r.kernel_ms   = cb_kernel_ms(cb);
+        r.transfer_ms = 0.0;  // UMA
+        r.wall_ms     = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_wall0).count();
+        return r;
+    }
+
     id<MTLDevice>       device_ = nil;
     id<MTLCommandQueue> queue_  = nil;
 
@@ -339,6 +420,8 @@ private:
     id<MTLComputePipelineState> ps_min_partials_i64_ = nil;
     id<MTLComputePipelineState> ps_max_i64_          = nil;
     id<MTLComputePipelineState> ps_max_partials_i64_ = nil;
+    id<MTLComputePipelineState> ps_agg_all_i64_          = nil;
+    id<MTLComputePipelineState> ps_agg_all_partials_i64_ = nil;
 
     id<MTLBuffer> input_buf_    = nil;  // grows on demand
     id<MTLBuffer> partials_buf_ = nil;  // sized for kMaxGrid * sizeof(int64)
@@ -347,6 +430,11 @@ private:
     id<MTLBuffer> zerocopy_buf_   = nil;
     const void*   zerocopy_src_   = nullptr;
     std::size_t   zerocopy_bytes_ = 0;
+    id<MTLBuffer> input_buf_         = nil;  // grows on demand
+    id<MTLBuffer> partials_buf_      = nil;  // sized for kMaxGrid * sizeof(int64)
+    id<MTLBuffer> out_buf_           = nil;  // single int64
+    id<MTLBuffer> partials_quad_buf_ = nil;  // 4 * kMaxGrid * sizeof(int64) for agg_all
+    id<MTLBuffer> out_quad_buf_      = nil;  // 4 longs (sum/min/max/count)
 };
 
 } // namespace
