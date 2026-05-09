@@ -37,6 +37,21 @@ struct AggResult {
     double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
 };
 
+// Returned by Aggregator::agg_all_i64 — fused SUM + MIN + MAX + COUNT in
+// a single pass over the input. The big win is that each int64 is read
+// from memory exactly ONCE, halving (or quartering) DRAM traffic vs the
+// "call sum/min/max separately" pattern.
+struct AggAllResult {
+    std::int64_t sum;           // SUM(values)
+    std::int64_t min;           // MIN(values), int64 max if rows == 0
+    std::int64_t max;           // MAX(values), int64 min if rows == 0
+    std::size_t  count;         // number of values read (== rows for non-null)
+    std::size_t  rows;          // input row count
+    double       wall_ms;       // total wall time
+    double       kernel_ms;     // GPU kernel time only (0 for CPU)
+    double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
+};
+
 // Opaque handle to a column resident in backend memory.
 // Owns the storage; destruction releases device memory.
 // Created by Aggregator::upload_*; must only be used with the SAME aggregator
@@ -76,6 +91,14 @@ public:
     virtual AggResult min_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult max_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult sum_resident_f64(const ResidentColumn&) = 0;
+
+    // ---- Multi-aggregate fusion (SUM + MIN + MAX + COUNT in one pass) ----
+    // Each int64 is read from memory ONCE; backends compute all four
+    // aggregates simultaneously. Wins over calling sum/min/max separately
+    // by 2-3x on memory-bandwidth-bound work, and proportionally more
+    // when more aggregates are fused.
+    virtual AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) = 0;
+    virtual AggAllResult agg_all_resident_i64(const ResidentColumn&) = 0;
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled
@@ -112,6 +135,39 @@ public:
 std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 
 // =========================================================================
+//  Window functions (v1: ROW_NUMBER() OVER (ORDER BY key ASC))
+// =========================================================================
+//
+// First window-function operator on the project. Sirius (CIDR 2026 GPU OLAP
+// paper) explicitly lacks window functions; shipping it differentiates us.
+// v1 covers the simplest meaningful case — ROW_NUMBER over a single ascending
+// key — to lock the interface shape. Later additions (RANK, DENSE_RANK,
+// LAG/LEAD, partitioning, frame clauses) extend this surface without churn.
+//
+// Output semantics:
+//   For input row i, output[i] is the 1-indexed rank that row i would have
+//   if the input were sorted by key ASC. Ties are broken by stable order
+//   (input position): earlier rows in the input get the smaller rank.
+//
+// Example:
+//   keys   = [40, 10, 30, 10, 20]
+//   sorted = [(10,1), (10,3), (20,4), (30,2), (40,0)]   // (key, orig_idx)
+//   ranks  =   1       2        3        4        5
+//   output[0] = 5  (key=40 → rank 5)
+//   output[1] = 1  (key=10, earliest → rank 1)
+//   output[2] = 4  (key=30 → rank 4)
+//   output[3] = 2  (key=10, later → rank 2)
+//   output[4] = 3  (key=20 → rank 3)
+
+struct WindowResult {
+    std::vector<std::int64_t> output;     // window function value per input row
+    std::size_t  rows = 0;
+    double       wall_ms     = 0.0;
+    double       kernel_ms   = 0.0;
+    double       transfer_ms = 0.0;
+};
+
+// =========================================================================
 //  HASH JOIN probe (i64 keys, inner equi-join)
 // =========================================================================
 //
@@ -137,6 +193,17 @@ struct JoinResult {
     double       transfer_ms = 0.0;
 };
 
+class WindowAggregator {
+public:
+    virtual ~WindowAggregator() = default;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    [[nodiscard]] virtual std::string device_name() const = 0;
+    // ROW_NUMBER() OVER (ORDER BY key ASC).
+    // Output row i contains the rank of input row i (1-indexed).
+    virtual WindowResult row_number_i64(const std::int64_t* keys, std::size_t n) = 0;
+};
+
+std::unique_ptr<WindowAggregator> make_window_aggregator(Backend);
 class HashJoinProbe {
 public:
     virtual ~HashJoinProbe() = default;

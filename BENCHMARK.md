@@ -58,6 +58,125 @@ also verified end-to-end on macOS**.
 
 ---
 
+## 2026-05-09 (night, macOS) — Window functions: ROW_NUMBER scaffold, CPU vs Metal stub
+
+Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, AppleClang 21.0.0.
+Code state: `feat/core-window-functions`. New `WindowAggregator` interface,
+CPU reference, Metal scaffold, and `gpudb-window-bench`.
+
+This is **GOAL.md item 8** — the operator Sirius (CIDR 2026 GPU OLAP paper)
+explicitly lacks. The v1 ships the interface and the CPU reference; the Metal
+scaffold reports `backend()==METAL` but delegates to the CPU implementation.
+Honest reporting: `device_name()` says "Metal scaffold — ROW_NUMBER delegates
+to CPU; real radix-sort + scatter kernel gated on PR #5".
+
+### Numbers (1 M random int64 keys over [0, 1e6], 3 runs, median)
+
+| Backend | wall (ms) | kernel (ms) | input throughput | Correctness |
+|---|---:|---:|---:|---|
+| CPU (`std::stable_sort` reference) | 42.19 | — | 0.18 GiB/s | OK vs oracle |
+| **Metal stub** (delegates to CPU)  | 42.22 | 0.00 | 0.18 GiB/s | OK vs oracle |
+
+Metal == CPU is expected and correct: the stub *is* the CPU code path, plus
+a constructor that opens the MTL device so the wiring is real. The bench
+verifies each output value against an independent stable-sort oracle living
+inside the bench binary, so a buggy aggregator can't validate itself.
+
+### What unblocks the real Metal kernel
+
+PR #5 (`feat/metal-radix-sort`) lands an LSD radix sort over int64 keys with
+a sibling int64 payload buffer. Once it merges to main:
+
+1. ROW_NUMBER reuses that radix sort with `payload[i] = i` (the original
+   row index as int64). The sort is stable by construction (per-bucket
+   relative-order preservation), which matches the CPU `std::stable_sort`
+   tie-break exactly.
+2. A trivial `row_number_scatter_i64` kernel writes `output[orig_index[p]]
+   = p + 1`. One dispatch, ceil(N/256) threadgroups, all UMA so the host
+   reads `output` with no D2H copy.
+3. Total expected GPU time: ~radix-sort time + a sub-millisecond scatter.
+   At the 1 M-rows × 1 M-groups sweet spot where `groupby_sum` already
+   wins 2.1× over CPU on this M4 Max, ROW_NUMBER should land in the same
+   neighborhood — both are bounded by the sort, not by what comes after.
+
+The full algorithm is documented in the long header comment of
+`src/backends/metal/metal_window.mm`. PR #5 is the only blocker.
+
+### Reproduce
+
+```bash
+export PATH="/Users/aiexplore369/Library/Python/3.9/bin:$PATH"
+cmake -S . -B build-macos
+cmake --build build-macos -j
+./build-macos/bin/gpudb-window-bench --rows 1000000 --runs 3
+```
+
+---
+
+## 2026-05-09 (night) — Multi-agg fusion (sum+min+max+count one pass)
+
+The wedge: most analytical queries compute several aggregates over the same
+column (`SELECT SUM(x), MIN(x), MAX(x), COUNT(x) FROM t`). Calling
+`sum_i64`, `min_i64`, `max_i64` separately reads the column from DRAM
+**three times**. The new `agg_all_i64` operator reads it ONCE and computes
+all four in a single pass.
+
+Per-block reduction produces 4 partials (sum/min/max/count); a final
+single-threadgroup pass tree-reduces over the partials. Same shape as the
+existing `sum_i64` / `sum_partials_i64` pair.
+
+### Hardware / build
+
+- macOS, Apple M4 Max (40-core GPU), Metal 3, UMA
+- Apple clang (no OpenMP available in this build → CPU baseline is single-threaded)
+- Release, MTLResourceStorageModeShared, threadgroup size 256
+- Reproduce: `./build-macos/bin/gpudb-bench --rows N --runs K --op all`
+
+### Results (synthetic int64, uniform [-1e6, 1e6])
+
+| Rows | Backend | Mode  | separate (3 calls) | fused (agg_all)  | speedup | fused kernel throughput |
+|---:|---|---|---:|---:|---:|---:|
+| 1M     | CPU (scalar) | both | 0.45 ms wall                | 0.23 ms wall                | **1.97×** | — (no kernel) |
+| 1M     | Metal        | cold | 2.45 ms wall / 0.59 ms kern | 0.83 ms wall / 0.22 ms kern | **2.95× wall · 2.71× kernel** | 34 GiB/s |
+| 1M     | Metal        | hot  | 0.99 ms wall / 0.57 ms kern | 0.36 ms wall / 0.21 ms kern | **2.78× wall · 2.69× kernel** | 35 GiB/s |
+| 100M   | CPU (scalar) | both | 30.97 ms                    | 15.51 ms                    | **2.00×** | — |
+| 100M   | Metal        | cold | 41.37 ms / 7.75 ms kern     | 13.62 ms / 2.43 ms kern     | **3.04× wall · 3.19× kernel** | 307 GiB/s |
+| 100M   | Metal        | hot  | 6.97 ms / 5.37 ms kern      | 1.75 ms / 1.60 ms kern      | **3.98× wall · 3.36× kernel** | **467 GiB/s** |
+| 1B     | CPU (scalar) | both | 315.2 ms                    | 157.3 ms                    | **2.00×** | — |
+| 1B     | Metal        | cold | 379.3 ms / 51.3 ms kern     | 124.5 ms / 17.0 ms kern     | **3.05× wall · 3.01× kernel** | 437 GiB/s |
+| 1B     | Metal        | hot  | 48.8 ms / 48.0 ms kern      | 16.1 ms / 15.9 ms kern      | **3.04× wall · 3.02× kernel** | **469 GiB/s** |
+
+### Interpretation
+
+- **CPU win plateaus at 2×.** The reduction here is "3 reads → 1.5 reads"
+  rather than "3 → 1" because MIN and MAX with negative+positive ranges
+  short-circuit poorly compared to SUM, and the scalar baseline has zero
+  ILP across the three loops. On a SIMD/parallel CPU the fusion win
+  would be smaller (because the CPU can already hide some bandwidth with
+  parallelism) but should still be 1.5–2×.
+- **Metal hits a clean 3× speedup at scale**, exactly what you'd expect
+  for a memory-bandwidth-bound workload that goes from 3 reads to 1.
+  The fused kernel sustains **~470 GiB/s** on M4 Max — within 90 % of
+  the device's measured single-pass `sum_i64` ceiling (~470 GiB/s on
+  this same M4 Max from the prior `feat/metal-real-kernels` run), which
+  is exactly what we want: fusing four ops into one pass costs zero
+  extra bandwidth, so per-op throughput effectively quadruples.
+- **Cold mode wins by 3× on Metal even at 1B rows** because UMA means
+  the "transfer" is just a memcpy that's done once across both bench
+  paths, so the 3× kernel reduction shows up directly in the wall.
+- The CPU 2× translates to a useful amount on real workloads because
+  3 SUM-class aggregates in one query is the median TPC-H pattern
+  (`l_quantity`, `l_extendedprice`, `l_discount` show up together in
+  Q1, Q3, Q5, Q6, Q14, Q19, …).
+
+### Implication for the planner
+
+Even before considering GPU vs CPU, the planner should always fuse
+multi-agg patterns when they target the same column. This is a free
+~3× on Metal and ~2× on CPU regardless of which backend wins the
+overall query. CUDA implementation is stubbed (throws) — Linux Claude
+to pick that up; the kernel pattern is identical to Metal so it should
+land in a single PR.
 ## 2026-05-09 (consolidated) — 4-column comparison: CPU/CUDA Linux vs CPU/Metal Mac
 
 Filled all matched-size gaps so SUM and GROUP BY can be compared
