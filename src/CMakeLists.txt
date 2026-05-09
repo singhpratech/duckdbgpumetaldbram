@@ -18,6 +18,18 @@ endif()
 if(GPUDB_HAS_METAL)
     list(APPEND GPUDB_SOURCES
         backends/metal/metal_aggregator.mm
+        backends/metal/metal_groupby.mm
+    )
+
+    # Embed .metal source as C strings so the Objective-C++ TUs can compile
+    # them at runtime via MTLDevice newLibraryWithSource:options:error:.
+    include(${CMAKE_SOURCE_DIR}/cmake/embed_metal_sources.cmake)
+    set(GPUDB_METAL_GENERATED_HEADER
+        ${CMAKE_CURRENT_BINARY_DIR}/generated/metal_kernel_sources.hpp)
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
+    gpudb_embed_metal_sources(${GPUDB_METAL_GENERATED_HEADER}
+        kSumKernelSource     ${CMAKE_CURRENT_SOURCE_DIR}/backends/metal/kernels/sum.metal
+        kGroupByKernelSource ${CMAKE_CURRENT_SOURCE_DIR}/backends/metal/kernels/groupby.metal
     )
 endif()
 
@@ -27,6 +39,11 @@ target_include_directories(gpudb
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
+
+if(GPUDB_HAS_METAL)
+    target_include_directories(gpudb PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}/generated)
+endif()
 
 # OpenMP for CPU backend (optional, falls back to scalar if not found)
 find_package(OpenMP)

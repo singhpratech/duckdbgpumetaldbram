@@ -23,6 +23,7 @@ bool cuda_runtime_available() noexcept;
 #endif
 #if GPUDB_HAVE_METAL
 std::unique_ptr<Aggregator> make_metal_aggregator();
+std::unique_ptr<GroupByAggregator> make_metal_groupby_aggregator();
 bool metal_runtime_available() noexcept;
 #endif
 
@@ -67,8 +68,11 @@ std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend b) {
             throw std::runtime_error("CUDA backend not compiled in");
 #endif
         case Backend::METAL:
-            // Metal GROUP BY: deferred to macOS branch; fall back to CPU for now.
-            return make_cpu_groupby_aggregator();
+#if GPUDB_HAVE_METAL
+            return make_metal_groupby_aggregator();
+#else
+            throw std::runtime_error("Metal backend not compiled in");
+#endif
     }
     throw std::runtime_error("Unknown backend");
 }
