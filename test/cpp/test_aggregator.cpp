@@ -3,6 +3,7 @@
 
 #include "gpu_backend.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -103,6 +104,63 @@ void test_backend(gpudb::Backend b) {
         const double expected = 1.5 * static_cast<double>(N);
         const double err = std::abs(r.value_f64 - expected);
         EXPECT(err < 1e-6 * expected);
+    }
+
+    // Multi-agg fusion: sum + min + max + count in one pass.
+    // CUDA throws (stub); skip there. CPU + Metal must match the reference.
+    if (b != gpudb::Backend::CUDA) {
+        // Empty
+        {
+            auto r = agg->agg_all_i64(nullptr, 0);
+            EXPECT_EQ(r.sum, 0);
+            EXPECT_EQ(r.count, std::size_t{0});
+            EXPECT_EQ(r.rows, std::size_t{0});
+        }
+        // Tiny deterministic
+        {
+            std::vector<std::int64_t> v{1, 2, 3, 4, 5};
+            auto r = agg->agg_all_i64(v.data(), v.size());
+            EXPECT_EQ(r.sum, 15);
+            EXPECT_EQ(r.min, 1);
+            EXPECT_EQ(r.max, 5);
+            EXPECT_EQ(r.count, std::size_t{5});
+        }
+        // Negative + positive
+        {
+            std::vector<std::int64_t> v{-100, 50, -25, 75, 0};
+            auto r = agg->agg_all_i64(v.data(), v.size());
+            EXPECT_EQ(r.sum, 0);
+            EXPECT_EQ(r.min, -100);
+            EXPECT_EQ(r.max, 75);
+            EXPECT_EQ(r.count, std::size_t{5});
+        }
+        // Larger random — match reference computed per-pass
+        {
+            std::mt19937_64 rng(0xDEADBEEFULL);
+            std::uniform_int_distribution<std::int64_t> dist(-1'000'000, 1'000'000);
+            const std::size_t N = 1'000'000;
+            std::vector<std::int64_t> v(N);
+            for (auto& x : v) x = dist(rng);
+            std::int64_t ref_sum = 0, ref_min = v[0], ref_max = v[0];
+            for (auto x : v) {
+                ref_sum += x;
+                if (x < ref_min) ref_min = x;
+                if (x > ref_max) ref_max = x;
+            }
+            auto r = agg->agg_all_i64(v.data(), N);
+            EXPECT_EQ(r.sum, ref_sum);
+            EXPECT_EQ(r.min, ref_min);
+            EXPECT_EQ(r.max, ref_max);
+            EXPECT_EQ(r.count, N);
+
+            // Resident path matches too.
+            auto col = agg->upload_i64(v.data(), N);
+            auto rr = agg->agg_all_resident_i64(*col);
+            EXPECT_EQ(rr.sum, ref_sum);
+            EXPECT_EQ(rr.min, ref_min);
+            EXPECT_EQ(rr.max, ref_max);
+            EXPECT_EQ(rr.count, N);
+        }
     }
 }
 

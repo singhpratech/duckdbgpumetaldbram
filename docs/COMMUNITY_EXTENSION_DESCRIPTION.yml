@@ -1,0 +1,82 @@
+# DRAFT description.yml for submission to duckdb/community-extensions.
+#
+# This file goes in the duckdb/community-extensions repo at
+# extensions/gpudb/description.yml when we're ready to submit.
+# See https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
+# for the canonical schema. Copy + adapt at submission time.
+#
+# Status: not yet submitted (see docs/RELEASE_READINESS.md for blockers).
+
+extension:
+  name: gpudb
+  description: |
+    GPU-accelerated analytical operators for DuckDB.
+    Backends: NVIDIA CUDA (Linux/Windows) and Apple Metal (macOS).
+    First-class Apple Silicon support — no other GPU SQL engine ships
+    Metal numbers.
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: Apache-2.0
+  excluded_platforms:
+    # FP64 SUM falls back to host on macOS; works correctly but no GPU
+    # acceleration since Apple GPUs lack IEEE-754 doubles.
+
+repo:
+  github: singhpratech/duckdbgpumetaldbram
+  ref: <pin to a release tag at submission time, e.g. v0.1.0>
+
+docs:
+  hello_world: |
+    LOAD gpudb;
+    -- GPU SUM aggregate, identical SQL semantics to native SUM
+    SELECT gpu_sum(value) FROM range(1000000) AS t(value);
+
+    -- Compare to native, get matching answer
+    SELECT
+      gpu_sum(value) AS gpu,
+      sum(value::BIGINT) AS native
+    FROM range(1000000) AS t(value);
+
+  extended_description: |
+    `gpudb` adds GPU-accelerated aggregates and operators that DuckDB
+    transparently dispatches to:
+
+      * `gpu_sum(BIGINT)`  — GPU SUM
+      * `gpu_min(BIGINT)`  — GPU MIN
+      * `gpu_max(BIGINT)`  — GPU MAX
+
+    On NVIDIA hardware (CUDA backend), these run on the device with
+    PCIe-amortized bandwidth. On Apple Silicon (Metal backend), they
+    use the unified memory architecture so transfer cost is zero and
+    sustained kernel bandwidth approaches LPDDR5X peak (we measure
+    ~92% of M4 Max's 546 GB/s on int64 SUM).
+
+    Performance highlights (vs single-thread CPU baseline):
+      * SUM 1B int64 HOT: Metal 5.28× (Apple M4 Max), CUDA ~22× (RTX 4090)
+      * GROUP BY 500M rows × 1M unique groups: Metal 4.89×, CUDA 21.8×
+      * TPC-H SF1 GROUP BY: Metal 2.08×, CUDA 4.8×
+      * Metal vs CUDA wall on TPC-H GROUP BY: essentially tied
+
+    The extension auto-selects the best available backend at install time.
+    If no GPU is available, it falls back to the CPU implementation
+    cleanly — same SQL surface either way.
+
+  hardware_requirements: |
+    NVIDIA CUDA: any GPU with sm_70 or later. Driver 525+ recommended.
+    Apple Metal: any Apple Silicon Mac (M1 or later). macOS 13+ for
+    int64 atomics; macOS 15+ for MSL 3.2.
+    Falls back to CPU otherwise.
+
+  known_limitations: |
+    * Float64 SUM on Apple Silicon falls back to the host loop because
+      Apple GPUs do not implement IEEE-754 double precision in MSL.
+      Same correctness; no GPU acceleration for that one type.
+    * GROUP BY currently supports BIGINT keys with BIGINT SUM. More
+      type coverage and operators (hash join, window functions) coming.
+    * NULL handling is supported; see test/sql/gpu_sum.test.
+
+# When submitting, also update CONTRIBUTING fields:
+# - maintainers: [@singhpratech]
+# - vcpkg dependencies: none (we use pre-built libduckdb-libs/)
+# - test paths: test/sql/*.test

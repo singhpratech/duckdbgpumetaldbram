@@ -217,6 +217,18 @@ public:
         return cpu_->sum_resident_f64(h.inner());
     }
 
+    // Multi-aggregate fusion (added in PR #8). Hybrid v1 delegates to CPU
+    // because the GPU side has agg_all as a stub-throw; once Linux Claude
+    // implements the CUDA fused kernel + Metal lands its own, this can
+    // mirror the sum_i64 dispatch policy.
+    AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) override {
+        return cpu_->agg_all_i64(data, n);
+    }
+    AggAllResult agg_all_resident_i64(const ResidentColumn& c) override {
+        const auto& h = check_hybrid(c);
+        return cpu_->agg_all_resident_i64(h.inner());
+    }
+
 private:
     // Wraps either a CPU- or GPU-side ResidentColumn. The hybrid uses the
     // `on_gpu_` flag to dispatch the resident query to the right aggregator.
