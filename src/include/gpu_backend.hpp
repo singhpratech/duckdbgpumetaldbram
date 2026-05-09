@@ -162,6 +162,12 @@ std::unique_ptr<GroupByAggregator> make_groupby_aggregator(Backend);
 struct WindowResult {
     std::vector<std::int64_t> output;     // window function value per input row
     std::size_t  rows = 0;
+    double       wall_ms     = 0.0;
+    double       kernel_ms   = 0.0;
+    double       transfer_ms = 0.0;
+};
+
+// =========================================================================
 //  HASH JOIN probe (i64 keys, inner equi-join)
 // =========================================================================
 //
