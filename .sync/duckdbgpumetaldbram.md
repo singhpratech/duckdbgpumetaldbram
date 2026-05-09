@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/metal-groupby-sort
-- working on: TPC-H SF1 + 1B-row sweep landed on PR #3. Honest numbers across the scale: Metal wins 2.1x at 1M sweet spot, CPU wins 1.5-2.2x at 10M-1B. Bitonic O(N log^2 N) is the bottleneck; GPU-resident radix sort is next.
+- branch: feat/metal-groupby-radix-gpu
+- working on: Metal GROUP BY peak 4.89x at 500M × 1M groups, wins every workload >= 10M rows, TPC-H 2.08x. Min-max pre-scan + GPU on-device scan are the unlocks.
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-05-09T20:27:32Z
+- last update: 2026-05-09T21:20:54Z
