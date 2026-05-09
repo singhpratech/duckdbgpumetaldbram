@@ -2,6 +2,96 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, Linux) — 1 billion int64 SUM + 200M/500M GROUP BY
+
+Hardware: NVIDIA GeForce RTX 4090 Laptop, sm_89 (Ada Lovelace), 16 GB GDDR6X.
+CUDA Toolkit 13.0.88, NVIDIA driver 580.142.
+Host: 20-thread x86_64 (Linux Mint 22.3 / Ubuntu 24.04 base), 32 GB DDR5.
+PCIe: Gen4 x16 (~32 GiB/s theoretical, ~10 GiB/s effective on these copies).
+
+**What's new:** scaled the SUM and GROUP BY benchmarks to 1B rows / 200M-500M
+GROUP BY workloads — the first numbers in this repo at sizes that approach
+typical analytical workloads. Required clearing the GPU first (Ollama had
+~15 GB VRAM parked); after `ollama stop`, the full 16 GB was available for
+the 8 GB int64 working set.
+
+### SUM int64 — 1 billion rows (7.6 GiB)
+
+`./build-linux/bin/gpudb-bench --input data/synth_1B_i64.gpudb --runs 3 --mode both`
+
+| Mode                                 |     Wall     |  Throughput  | Notes                                       |
+|--------------------------------------|-------------:|-------------:|---------------------------------------------|
+| CPU (20-thread OpenMP)               |   130.56 ms  |  57.07 GiB/s | DDR5 saturated                              |
+| CPU (re-run, "hot")                  |   169.01 ms  |  44.08 GiB/s | Cache thrashing on 8 GiB working set        |
+| CUDA cold (per-call upload)          |   812.96 ms  |   9.16 GiB/s | 98% PCIe transfer (796 ms)                  |
+| **CUDA resident (hot, no transfer)** | **14.19 ms** | **525.0 GiB/s** | **9.2× over CPU** end-to-end             |
+| CUDA kernel-only                     |    14.18 ms  | 525.5 GiB/s  | Same as wall; constant overhead is rounded  |
+
+### Why the cold path loses by 6.2× and the hot path wins by 9.2×
+
+This is the canonical Crystal-paper finding (Shanbhag/Madden/Yu, SIGMOD 2020)
+reproduced at billion-row scale on consumer hardware. The PCIe transfer of
+the 8 GiB column dominates everything: 796 ms out of 813 ms total, 97.9% of
+wall time. The kernel itself runs at **525 GiB/s**, half the GDDR6X ceiling
+of the 4090 Laptop and ~9× the CPU's saturated DDR5 bandwidth.
+
+The "hot" CPU re-run is *slower* than the cold CPU run (169 vs 131 ms) —
+8 GiB exceeds L3 by orders of magnitude, so each thread-pass faults pages
+back into cache from DRAM. There is no caching benefit for re-running CPU
+SUM on this size; CPU is purely DRAM-bandwidth-bound regardless.
+
+### GROUP BY hash aggregate — 200M and 500M rows
+
+`./build-linux/bin/gpudb-groupby-bench --rows N --groups G --runs 2`
+
+| Workload                | CPU wall (parallel/serial)  | CUDA wall    | CUDA kernel  | Speedup (wall / kernel) |
+|-------------------------|----------------------------:|-------------:|-------------:|-------------------------|
+| 200M rows × 1M groups   | 2004.7 ms (serial)          |  354.8 ms    |  36.7 ms     | **5.6× / 54.6×**        |
+| 500M rows × 100K groups | 2044.5 ms (parallel)        |  846.1 ms    |  37.5 ms     | **2.4× / 54.5×**        |
+
+Open-addressing hash table on device, splitmix64 hashing, atomicCAS for slot
+claim, atomicAdd for sum accumulation. Capacity = next_pow2(2·max(n, expected))
+bounded [1024, 256M]. CPU baseline switches between parallel per-thread-map
++merge and serial single-threaded based on cardinality (per the cardinality-
+aware switch landed in PR #3).
+
+### Why the kernel-only number is interesting at 199 GiB/s on 500M × 100K
+
+The kernel reports 198.6 GiB/s on the 500M × 100K case (8 GiB keys + 8 GiB
+values input). Kernel-time 37.5 ms across the entire 16 GiB workload is
+**memory-bandwidth-class throughput on a hash GROUP BY**, not just on a
+streaming reduction. The CPU equivalent (parallel `unordered_map`) saturates
+at ~3.6 GiB/s here because it's gated by random-access cache misses, not by
+sequential bandwidth. This is the regime where GPU GROUP BY pays off —
+exactly the macOS analog of the Metal bitonic-GROUP-BY's 2.1× win at the
+1M×1M sweet spot from the section below.
+
+### What this milestone proves
+
+1. **The 4090 Laptop kernels do real bandwidth work at billion-row scale.**
+   525 GiB/s on int64 SUM is roughly half the chip's GDDR6X spec — well within
+   the achievable range for a custom kernel and consistent with academic work.
+2. **GPU resident mode wins by ~10× even at 8 GiB working sets.** The
+   architectural choice (resident-column API + batched-finalize for grouped
+   queries) is empirically validated.
+3. **The PCIe wall is real and quantified.** 796 ms / 813 ms = 97.9% transfer.
+   Anyone evaluating GPU OLAP must have an answer for this — ours is "keep
+   the column resident; the API supports it."
+
+### Next-PR perf paths (in priority order)
+
+1. **Stream + overlap.** Use multiple CUDA streams to overlap PCIe transfer
+   with kernel execution. Should hide ~30–50% of the cold-mode transfer cost.
+2. **GPU Direct Storage (cuFile).** Read parquet → VRAM directly without host
+   bounce. Drops cold-path transfer entirely on systems with NVMe + GDS.
+3. **CUB-backed reductions.** Replace hand-rolled tree reduce with
+   `cub::DeviceReduce`. Probably +20–30% kernel throughput; worth measuring.
+4. **Multi-GPU striping** for >16 GB working sets. Out of scope on a single
+   4090 Laptop but the API is ready (each `Aggregator` can hold its own stream
+   + buffer set).
+
+---
+
 ## 2026-05-09 (late evening +) — first SQL→GPU through DuckDB
 
 The DuckDB extension `gpu_sum(BIGINT) -> BIGINT` is now wired up end-to-end.
