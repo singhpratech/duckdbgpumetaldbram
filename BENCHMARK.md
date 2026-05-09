@@ -2,6 +2,115 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (night, macOS) — first Metal GROUP BY: bitonic sort, correct but slow
+
+Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, unified memory).
+macOS 15.x, MSL 3.2.
+
+**What's new:** the Metal GROUP BY path is no longer a CPU fallback. The
+GPU does a real bitonic sort of `(key, value)` pairs, then the host does a
+trivial O(N) segment-reduce over the sorted output. This is the
+Apple-Silicon-native equivalent of the CUDA hash-table GROUP BY — it has
+to be different because Apple GPUs implement neither 64-bit
+`atomic_compare_exchange` nor 64-bit `atomic_fetch_add` on `device`
+storage (see the prior Metal SUM section / `metal_groupby.mm` for the
+full reasoning).
+
+### Correctness — verified
+
+`gpudb-groupby-bench` compares the GPU's output against the CPU
+`std::unordered_map` reference by sorting both `(key, sum)` lists. Pass at
+every cardinality tested: 1K, 100K, 1M rows × 100, 1K, 100K groups.
+`test_gpudb` 24/24 pass.
+
+### Performance — honest
+
+| Workload | CPU wall (single-thread `unordered_map`) | Metal wall | Metal kernel | Status |
+|---|---:|---:|---:|---|
+|  100K rows, 1K groups | 0.25 ms |  4.10 ms |  3.47 ms | CPU wins **16×** |
+|    1M rows, 1K groups | 1.84 ms | 13.66 ms | 12.25 ms | CPU wins **7×** |
+|    1M rows, 100K groups | 4.18 ms | 14.38 ms | 12.01 ms | CPU wins **3.4×** |
+
+Bitonic sort on the GPU is **dispatch-overhead-bound** at this code
+quality. For N rows we issue `log₂(N)·(log₂(N)+1)/2` separate kernel
+dispatches — for N=1M that's ~210 dispatches. Each pays ~30 µs of launch
+overhead before the actual sort math runs. The compute itself is fast;
+the launches aren't.
+
+### Why this still ships
+
+It's the architecture milestone GOAL.md item 5 calls for: **a real GPU
+GROUP BY on Apple Silicon, no CPU fallback, correct on every input
+tested**. The CUDA hash-table approach can't run here for documented
+hardware reasons; sort-then-reduce can, and now does. Speed is the next
+ticket.
+
+### Next-PR perf paths (in priority order)
+
+1. **Combine bitonic stages within threadgroup memory** when `j ≤ block_size`:
+   inner stages run in tg memory with `threadgroup_barrier` between them
+   instead of as separate dispatches. ~3× fewer dispatches expected.
+2. **Replace bitonic with radix sort** (8-bit buckets × 8 passes for
+   64-bit keys, ~25 dispatches total). 5–10× faster expected.
+3. **Move segment-reduce to GPU** via parallel scan + atomic-add via
+   32-bit halves (sidesteps the missing 64-bit `atomic_fetch_add`).
+   Eliminates the host loop.
+
+The Metal SUM numbers (1.7–3.8× HOT win) above show what's achievable
+with one well-shaped kernel and shared-memory data. Bitonic is the wrong
+shape; radix is the right one.
+
+---
+
+## 2026-05-09 (night, macOS) — first Metal numbers: Apple M4 Max, SUM int64
+
+Hardware: MacBook Pro, **Apple M4 Max** (Apple GPU family 9, 40-core GPU,
+unified memory). macOS 15.x (Darwin 25.4.0), AppleClang 21.0.0, MSL 3.2.
+
+Build: `cmake -B build-macos -DCMAKE_BUILD_TYPE=Release` (no CUDA on this
+box; Metal backend auto-enabled). Bench: `./build-macos/bin/gpudb-bench --rows
+N --runs K`.
+
+**Implementation:** `MTLComputePipelineState`s compiled at runtime from
+`src/backends/metal/kernels/sum.metal`. Two-pass tree reduction in
+threadgroup memory, threadgroup size 256, grid clamped to 4096. All buffers
+`MTLResourceStorageModeShared` (UMA — no host↔device transfer). Kernel
+time = `[cb GPUEndTime] - [cb GPUStartTime]`.
+
+### Synthetic int64 SUM
+
+| Rows | Bytes | CPU HOT (scalar) | Metal HOT wall | Metal kernel | Metal HOT throughput | Metal kernel throughput | Speedup (HOT) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10M  | 76.3 MiB | 0.833 ms |  0.491 ms |  0.356 ms |  151.7 GiB/s | 209.3 GiB/s | **1.7×** |
+| 50M  | 381.5 MiB | 4.257 ms |  1.165 ms |  0.988 ms |  319.6 GiB/s | 376.9 GiB/s | **3.7×** |
+| 200M | 1525.9 MiB | 17.007 ms |  4.458 ms |  3.990 ms |  334.3 GiB/s | 373.4 GiB/s | **3.8×** |
+
+CPU baseline here is single-threaded scalar (this aggregator path doesn't
+have OpenMP wired in — would close some gap; the parallel CPU work landed
+for GROUP BY only).
+
+Apple M4 Max peak memory bandwidth is ~546 GB/s (LPDDR5X). We hit ~70% of
+that on the kernel-only path, which is the right neighborhood for a tree
+reduction limited by global-memory load throughput.
+
+### COLD (per-call upload + buffer allocation)
+
+| Rows | CPU COLD | Metal COLD wall | Metal kernel | Why COLD loses |
+|---:|---:|---:|---:|---|
+| 10M  |  0.857 ms |  1.822 ms |  0.324 ms | first MTLBuffer allocation + memcpy |
+| 50M  |  4.184 ms |  7.951 ms |  1.706 ms | same, larger buffer |
+| 200M | 17.200 ms | 69.454 ms |  4.200 ms | same, much larger buffer |
+
+The Apple-Silicon version of the CUDA hot/cold story: COLD loses because
+the FIRST shared-buffer allocation pays a full page-table-mapping cost
+(`vm_allocate` for the buffer pages and the GPU MMU mapping). HOT wins
+because subsequent runs reuse the input buffer (handled inside
+`MetalAggregator::stage_input`). This matches the resident-column thesis
+from the CUDA section below: the GPU operator wins **when data stays
+resident across queries**, loses on one-shot cold uploads.
+
+---
+
 ## 2026-05-09 (late evening) — honest parallel CPU baseline + re-bench
 
 The earlier CPU baseline was single-threaded `std::unordered_map`. That's not
