@@ -2,6 +2,91 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (consolidated) — 4-column comparison: CPU/CUDA Linux vs CPU/Metal Mac
+
+Filled all matched-size gaps so SUM and GROUP BY can be compared
+side-by-side across all four backend lanes at the same workloads.
+
+- **CPU (Linux)** — 20-thread x86_64 / OpenMP / DDR5
+- **CUDA** — RTX 4090 Laptop, sm_89, 16 GB GDDR6X, CUDA 13.0.88, PCIe Gen4 x16
+- **CPU (Mac)** — Apple M4 Max single-thread scalar
+- **Metal** — Apple M4 Max, 40-core GPU, ~546 GB/s LPDDR5X, MSL 3.2 (UMA)
+
+`—` = "not yet measured on that lane".
+
+### SUM int64 — wall time (lower is better)
+
+| Workload | CPU (Linux 20-thr) | CUDA hot | CUDA kernel | CPU (Mac 1-thr) | Metal hot | Metal kernel |
+|---|---:|---:|---:|---:|---:|---:|
+| 10M rows / 76 MiB | 1.21 ms | 0.16 ms | 0.150 ms | 0.83 ms | 0.49 ms | 0.36 ms |
+| 50M rows / 382 MiB | 6.51 ms | 0.73 ms | 0.718 ms | 4.26 ms | 1.17 ms | 0.99 ms |
+| 200M rows / 1.5 GiB | 55.3 ms | 2.86 ms | 2.843 ms | 17.0 ms | 4.46 ms | 3.99 ms |
+| 1B rows / 7.6 GiB | 130.6 ms | 14.19 ms | 14.18 ms | — | — | — |
+
+### SUM int64 — kernel-only throughput (higher is better)
+
+| Workload | CUDA kernel | Metal kernel | CUDA / Metal | % of peak (CUDA / Metal) |
+|---|---:|---:|---:|---|
+| 10M rows | **496 GiB/s** | 209 GiB/s | 2.4× | 49% / 38% |
+| 50M rows | **519 GiB/s** | 377 GiB/s | 1.4× | 51% / 69% |
+| 200M rows | **524 GiB/s** | 373 GiB/s | 1.4× | 52% / 68% |
+| 1B rows | 525 GiB/s | (untested) | — | 52% / — |
+
+Theoretical peaks: RTX 4090 GDDR6X ≈ 1008 GB/s, M4 Max LPDDR5X ≈ 546 GB/s.
+Metal hits a higher fraction of memory bandwidth ceiling; CUDA wins
+absolutely because the chip ceiling is ~1.85× higher.
+
+### SUM int64 — cold mode (with PCIe / first-buffer-allocation cost)
+
+| Workload | CPU Linux | CUDA cold (incl PCIe) | CPU Mac | Metal cold (incl alloc) |
+|---|---:|---:|---:|---:|
+| 10M rows | 1.93 ms | 8.10 ms (PCIe) | 0.86 ms | 1.82 ms |
+| 50M rows | 7.48 ms | 40.5 ms (98% PCIe) | 4.18 ms | 7.95 ms |
+| 200M rows | 25.5 ms | 163 ms (98% PCIe) | 17.2 ms | 69.5 ms |
+
+### GROUP BY — wall time
+
+| Workload | CPU (Linux) | CUDA wall | CUDA kernel | CPU (Mac 1-thr) | Metal wall | Metal kernel |
+|---|---:|---:|---:|---:|---:|---:|
+| 1M × 1K | 0.93 ms (parallel) | 1.95 ms | 0.17 ms | 2.80 ms | 8.00 ms | 5.96 ms |
+| 1M × 100K | 8.26 ms (serial) | 2.14 ms | 0.09 ms | 4.12 ms | 6.77 ms | 4.66 ms |
+| **1M × 1M (632K unique)** | 43.1 ms (serial) | **3.56 ms** | **0.15 ms** | 21.8 ms | **10.4 ms** | 6.35 ms |
+| 10M × 1M | 254 ms (serial) | **19.97 ms** | **1.01 ms** | 96.3 ms | 148 ms | 130.6 ms |
+| 50M × 1M | 1067 ms (serial) | 130 ms | 43.7 ms | 406 ms | 756 ms | 683 ms |
+| 100M × 1M | 1440 ms (parallel) | **183 ms** | **14.8 ms** | 798 ms | 1676 ms | 1496 ms |
+| 200M × 1M | 2005 ms (serial) | **355 ms** | **36.7 ms** | — | — | — |
+| 500M × 100K | 2045 ms (parallel) | **846 ms** | **37.5 ms** | — | — | — |
+| TPC-H 6M × 1.5M | 81.7 ms | **16.9 ms** | **2.30 ms** | — | — | — |
+
+CUDA wins everywhere except low cardinality (1M × 1K). Metal has one
+narrow win at 1M × 1M (2.1× over Mac CPU). CUDA crushes Metal on shared
+GROUP BY sizes (3–8× wall, 6–60× kernel) because Apple GPUs lack 64-bit
+`atomicCAS`, forcing Metal into bitonic sort O(N log²N).
+
+### Hybrid CPU/GPU planner thresholds (empirically derived)
+
+| Operator | Backend | Use GPU when... |
+|---|---|---|
+| SUM | CUDA | Data resident in VRAM (cold loses 6–9× to CPU) |
+| SUM | Metal | Always (UMA = no transfer; auto-wins 1.5–4×) |
+| GROUP BY | CUDA | Cardinality > ~10K |
+| GROUP BY | Metal | Cardinality near 1M (bitonic sweet spot) |
+
+These are wired into `src/operators/planner.cpp` (this commit / next).
+
+### Gaps remaining (future sessions)
+
+| Gap | Owner | Effort |
+|---|---|---|
+| Mac CPU OpenMP baseline | macOS instance | 1 hr |
+| TPC-H lineitem on Metal | macOS instance | 1 hr (in flight) |
+| Metal radix sort for >10M rows | macOS instance (in flight on `feat/metal-groupby-radix-gpu`) | multi-session |
+| CUDA hash join probe | Linux instance | multi-session |
+| Window functions on CUDA | Linux instance | this PR (in flight) |
+| Hybrid planner wiring in extension | Linux instance | this PR (in flight) |
+
+---
+
 ## 2026-05-09 (night, macOS) — TPC-H SF1 + scale sweep to 1 billion rows
 
 Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, MSL 3.2.
