@@ -24,6 +24,8 @@ enum class Backend : std::uint8_t {
 
 [[nodiscard]] const char* to_string(Backend b) noexcept;
 
+enum class Dtype : std::uint8_t { I64 = 0, F64 = 1 };
+
 // Returned by Aggregator methods so backends can attach diagnostics
 // (kernel time, transfer time, etc.) without C++ exceptions on the hot path.
 struct AggResult {
@@ -32,7 +34,19 @@ struct AggResult {
     std::size_t  rows;          // input row count
     double       wall_ms;       // total wall time
     double       kernel_ms;     // GPU kernel time only (0 for CPU)
-    double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA)
+    double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
+};
+
+// Opaque handle to a column resident in backend memory.
+// Owns the storage; destruction releases device memory.
+// Created by Aggregator::upload_*; must only be used with the SAME aggregator
+// that created it (enforced via backend_tag()).
+class ResidentColumn {
+public:
+    virtual ~ResidentColumn() = default;
+    [[nodiscard]] virtual Backend     backend_tag() const noexcept = 0;
+    [[nodiscard]] virtual Dtype       dtype()       const noexcept = 0;
+    [[nodiscard]] virtual std::size_t rows()        const noexcept = 0;
 };
 
 // Minimal aggregator surface for week 1.
@@ -44,13 +58,24 @@ public:
     [[nodiscard]] virtual Backend backend() const noexcept = 0;
     [[nodiscard]] virtual std::string device_name() const = 0;
 
-    // Reductions over a contiguous int64 column. n may be 0.
+    // ---- One-shot API (transfer + kernel per call) ----
     virtual AggResult sum_i64(const std::int64_t* data, std::size_t n) = 0;
     virtual AggResult min_i64(const std::int64_t* data, std::size_t n) = 0;
     virtual AggResult max_i64(const std::int64_t* data, std::size_t n) = 0;
+    virtual AggResult sum_f64(const double*       data, std::size_t n) = 0;
 
-    // SUM over float64 (separate to avoid templating across backend boundary).
-    virtual AggResult sum_f64(const double* data, std::size_t n) = 0;
+    // ---- Resident-column API (transfer once, query many times) ----
+    // upload_* materializes the data in backend memory and returns a handle.
+    // *_resident operate on that handle without re-transfer.
+    virtual std::unique_ptr<ResidentColumn>
+        upload_i64(const std::int64_t* data, std::size_t n) = 0;
+    virtual std::unique_ptr<ResidentColumn>
+        upload_f64(const double* data, std::size_t n) = 0;
+
+    virtual AggResult sum_resident_i64(const ResidentColumn&) = 0;
+    virtual AggResult min_resident_i64(const ResidentColumn&) = 0;
+    virtual AggResult max_resident_i64(const ResidentColumn&) = 0;
+    virtual AggResult sum_resident_f64(const ResidentColumn&) = 0;
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled

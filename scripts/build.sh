@@ -4,6 +4,12 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Pick up CUDA toolkit even in non-interactive shells (~/.bashrc isn't read).
+if [ -f "$(dirname "$0")/env.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$(dirname "$0")/env.sh" >/dev/null 2>&1 || true
+fi
+
 OS="$(uname -s)"
 case "$OS" in
     Linux*)

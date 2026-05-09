@@ -4,6 +4,7 @@
 //   gpudb-gen --out data/sf1_f64.gpudb   --rows 100000000 --dtype f64
 
 #include "data_format.hpp"
+#include "gpu_backend.hpp"
 
 #include <cstdint>
 #include <cstdio>

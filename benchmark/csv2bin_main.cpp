@@ -2,6 +2,7 @@
 // into our flat .gpudb format. Used by scripts/gen_tpch.sh.
 
 #include "data_format.hpp"
+#include "gpu_backend.hpp"
 
 #include <cstdint>
 #include <cstdio>

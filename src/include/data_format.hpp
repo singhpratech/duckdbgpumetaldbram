@@ -22,10 +22,8 @@ namespace gpudb {
 inline constexpr char     kMagic[8]  = {'G','P','U','D','B','0','0','1'};
 inline constexpr std::size_t kHeaderBytes = 24;
 
-enum class Dtype : std::uint32_t {
-    I64 = 0,
-    F64 = 1,
-};
+// Note: the on-disk dtype field is stored as uint32_t.
+// The runtime enum lives in gpu_backend.hpp (uint8_t). Cast between them.
 
 struct DataHeader {
     char          magic[8];

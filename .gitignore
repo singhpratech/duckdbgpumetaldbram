@@ -80,3 +80,6 @@ logs/
 # OS
 Thumbs.db
 ehthumbs.db
+
+# Downloaded helper tools
+.tools/
