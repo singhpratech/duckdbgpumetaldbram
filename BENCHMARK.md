@@ -2,6 +2,105 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-10 (v0.1.3) — hybrid Metal GROUP BY + full TPC-H lineitem scorecard
+
+**Hardware:** Apple M4 Max, 40-core GPU, ~64 GiB UMA, ~546 GB/s LPDDR5X peak.
+macOS 15, MSL 3.2, AppleClang 21. **CPU baseline: DuckDB CLI v1.5.2 with `SET threads=16`** (the actual user-visible default — 12 P + 4 E cores). Median of 5 runs hot.
+
+**v0.1.3 ships a hybrid Metal GROUP BY** that auto-dispatches per workload:
+- **slot-lock path** (32,768 hash-partitions × 1024 threadgroup-memory slots, 32-bit CAS protecting non-atomic 64-bit sum) — wins for `expected_groups ∈ [1024, 16M]`
+- **radix-opt path** (vectorized 4× ulong4 loads, in-block 8-bit multi-split scatter via simdgroup prefix-sum, simdgroup-prefix-sum bucket scan) — wins for very low or very high cardinalities
+
+The 32K-partition slot-lock was the breakthrough that flipped TPC-H SF10 GROUP BY from CPU 1.78× faster (in v0.1.2) to **Metal 1.30× faster** in v0.1.3. Earlier 4K-partition variants saturated at ~3M unique due to per-partition Poisson tail clipping the 1024-slot table; doubling partitions twice to 32K gives mean 458 unique/partition (load 0.45) with worst case ~543 — comfortable headroom.
+
+### TPC-H lineitem scorecard — v0.1.3 (vs DuckDB CPU 16-thread)
+
+| Workload | DuckDB CPU mt | Metal (auto-dispatch) | **Speedup** |
+|---|---:|---:|:---:|
+| **SF10 multi-agg fusion `l_quantity`** (50 unique values) | 27 ms | **fused 1.06 ms** | **25.5×** 🚀 |
+| **SF10 multi-agg fusion `l_extendedprice`** (~unique-per-row) | 26 ms | **fused 1.18 ms** | **22.0×** 🚀 |
+| **SF10 multi-agg fusion `l_orderkey`** (15M unique) | 11 ms | **fused 1.13 ms** | **9.7×** 🚀 |
+| **SF10 SUM `l_quantity` HOT** | 5 ms | **1.16 ms** | **4.3×** ✅ |
+| **SF10 GROUP BY `l_extendedprice` (1.35M unique)** — slot-lock | 113 ms | **28.9 ms** | **3.9×** ✅ |
+| **SF10 SUM `l_extendedprice` HOT** | 5 ms | **2.23 ms** | **2.2×** ✅ |
+| **SF10 SUM `l_orderkey` HOT** | 3 ms | **1.68 ms** | **1.8×** ✅ |
+| **🆕 SF10 GROUP BY `l_orderkey` (15M unique)** — slot-lock 32K | **56 ms** | **42.95 ms** | **1.30×** ✅ |
+| **🆕 SF1 GROUP BY `l_orderkey` (1.5M unique)** — slot-lock 32K | **8 ms** | **5.71 ms** | **1.40×** ✅ |
+| SF10 GROUP BY `l_quantity` (50 unique) — slot-lock | 26 ms | 372 ms | CPU 14× faster ❌ structural |
+
+**9 wins, 1 loss on TPC-H lineitem.** The single loss (50-unique-group `l_quantity`) is a structural CPU advantage — the hash table fits in L1 cache and no GPU implementation can beat that. Documented limitation.
+
+### Synthetic GROUP BY at scale (vs DuckDB CPU 16-thread)
+
+| Workload | DuckDB CPU mt | Metal (auto-dispatch) | **Speedup** |
+|---|---:|---:|:---:|
+| **1B × 1M groups** (random keys) | 2500 ms | **radix-opt 770 ms** | **3.2×** ✅ |
+| **500M × 1M groups** | 820 ms | **slot-lock 242 ms** | **3.4×** ✅ |
+| **200M × 1M groups** | ~250 ms | radix-opt 156 ms | 1.6× ✅ |
+| **100M × 1M groups** | 124 ms | **slot-lock 47 ms** | **2.6×** ✅ |
+| **100M × 100K groups** | 124 ms | **slot-lock 50 ms** | **2.5×** ✅ |
+| 100M × 10K groups | 124 ms | radix-opt 60 ms | 2.05× ✅ |
+| 100M × 1K groups | ~60 ms | radix-opt 61 ms | ≈ ties |
+| 1B × 1K groups | 150 ms | radix-opt 637 ms | CPU 4.2× ❌ (low-card cache-resident) |
+
+### Streaming SUM at scale (vs DuckDB CPU 16-thread)
+
+| Workload | DuckDB CPU mt | Metal | **Speedup** |
+|---|---:|---:|:---:|
+| **1B int64 SUM HOT** | 42 ms | **16.16 ms** | **2.6×** ✅ |
+| **500M int64 SUM HOT** | 20 ms | **8.08 ms** | **2.5×** ✅ |
+| 100M int64 SUM HOT | 4 ms | 2.49 ms | 1.6× ✅ |
+| 1B int64 SUM COLD (zero-copy) | ~50 ms | 53 ms | ~ties |
+
+### Reproduce
+
+```bash
+# CPU mt baseline:
+echo "SET threads = 16; .timer on
+CREATE TABLE l10 AS SELECT * FROM read_parquet('data/tpch_sf10/lineitem_orderkey.parquet') t(l_orderkey);
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;" | duckdb
+
+# Metal hybrid GROUP BY:
+./build-macos/bin/gpudb-groupby-bench --input-keys data/tpch_sf1/lineitem_orderkey.gpudb --runs 5 --backend all
+./build-macos/bin/gpudb-groupby-bench --input-keys data/tpch_sf10/lineitem_orderkey.gpudb --runs 5 --backend all
+
+# Metal multi-agg fusion (the 9.7-25.5× headlines):
+./build-macos/bin/gpudb-bench --input data/tpch_sf10/lineitem_orderkey.gpudb --dtype i64 --runs 5 --mode hot --op all
+```
+
+### Reproduce the v0.1.3 wins
+
+```bash
+# CPU mt baseline (run in ONE persistent duckdb session for cache-warm timings):
+echo "SET threads = 16; .timer on
+CREATE TABLE l1  AS SELECT * FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet')  t(l_orderkey);
+CREATE TABLE l10 AS SELECT * FROM read_parquet('data/tpch_sf10/lineitem_orderkey.parquet') t(l_orderkey);
+SELECT l_orderkey, count(*) FROM l1  GROUP BY l_orderkey LIMIT 1;   -- 5x
+SELECT l_orderkey, count(*) FROM l10 GROUP BY l_orderkey LIMIT 1;   -- 5x
+SELECT sum(l_orderkey),min(l_orderkey),max(l_orderkey),count(*) FROM l10;  -- 5x
+" | duckdb
+
+# Metal hybrid GROUP BY (auto-dispatches slot-lock for 1.5M / 15M unique):
+./build-macos/bin/gpudb-groupby-bench --input-keys data/tpch_sf1/lineitem_orderkey.gpudb  --runs 5 --backend all
+./build-macos/bin/gpudb-groupby-bench --input-keys data/tpch_sf10/lineitem_orderkey.gpudb --runs 5 --backend all
+
+# Metal multi-agg fusion (the 9.7-25.5× headlines):
+./build-macos/bin/gpudb-bench --input data/tpch_sf10/lineitem_orderkey.gpudb     --dtype i64 --runs 5 --mode hot --op all
+./build-macos/bin/gpudb-bench --input data/tpch_sf10/lineitem_quantity.gpudb     --dtype i64 --runs 5 --mode hot --op all
+./build-macos/bin/gpudb-bench --input data/tpch_sf10/lineitem_extendedprice.gpudb --dtype i64 --runs 5 --mode hot --op all
+```
+
+### Documented limitations
+
+- **GROUP BY at very low cardinality (≤ 1K unique)**: CPU's hash table fits in L1 cache → CPU dominates and no GPU implementation can beat it. Auto-dispatch routes these to radix-opt anyway (slot-lock would lock-contend). For TPC-H `l_quantity` (50 unique) CPU is 14× faster — structural, won't fix.
+- **GROUP BY for cardinalities > 16M unique**: slot-lock falls back to radix-opt (~1.8× slower than CPU at 60M-row scale). No TPC-H workload we ship hits this; relevant only for synthetic stress-tests at 100M+ unique.
+
+---
+
 ## 2026-05-09 (v0.1.0 ship-day re-bench) — TPC-H Metal numbers, fresh on M4 Max
 
 Hardware: Apple M4 Max (40-core GPU, ~64 GiB unified memory, ~546 GB/s LPDDR5X peak),
