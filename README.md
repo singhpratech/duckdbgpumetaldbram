@@ -120,7 +120,7 @@ PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.1.0: 46 / 46 pass,
 0 fail, 0 expected fail. The window-function bugs that were previously
 xfail are now strict positive assertions (PR #22).
 
-CI runs on every push: Linux (Ubuntu 24.04, CPU-only) + macOS-14 (CPU + Metal scaffold).
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 77 unit tests → smoke benchmarks → 46-query SQL suite). The hosted CI workflow exists at [`.github/workflows/ci.yml.disabled`](.github/workflows/ci.yml.disabled) and is staged for re-enable; today the project relies on local validation against the dual-machine dev fleet (RTX 4090 + M4 Max).
 
 ## Roadmap
 
