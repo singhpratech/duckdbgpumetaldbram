@@ -30,7 +30,7 @@ What's open in 2026: **no published SQL engine targets Apple Silicon GPUs**. Sir
 | SUM 6M TPC-H lineitem.l_orderkey | 0.7 ms / 65 GiB/s | 4.9 ms | **0.04 ms / 1187 GiB/s** | 17.9× over CPU |
 | GROUP BY 50M × 1M groups | 1067 ms (serial) | 130 ms | n/a | **9.6× over CPU** |
 | GROUP BY 50M × 10M groups | 2321 ms | 188 ms | n/a | **13.7× over CPU** |
-| GROUP BY 6M TPC-H lineitem | 81.7 ms | 16.9 ms | n/a | **4.8× over CPU** |
+| GROUP BY 6M TPC-H lineitem (1.5M groups) | 54.1 ms | 15.0 ms | n/a | **3.6× over CPU** |
 
 Apple Silicon Metal kernels (M4 Max) hit 220 GiB/s kernel-only on i64 SUM with zero PCIe transfer thanks to unified memory. Full Metal numbers in [BENCHMARK.md](BENCHMARK.md).
 
