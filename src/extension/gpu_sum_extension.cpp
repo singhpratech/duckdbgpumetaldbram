@@ -400,10 +400,22 @@ void combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
 // finalize call dispatches to.
 //
 //   GROUP BY (count > 1):
-//     - Per-state path iff count < kBatchedGroupByThreshold (kernel-launch
-//       overhead would dominate; safe_sum_i64 internally picks CPU vs GPU).
-//     - Batched GPU GROUP BY iff count >= kBatchedGroupByThreshold (the
-//       regime where atomicCAS hash table beats CPU 5-14x per BENCHMARK).
+//     - Mid-cardinality (1 < count < kBatchedGroupByThreshold): per-state
+//       CPU sum. The grouped finalize hands us count buffers, each typically
+//       holding (total_rows / count) values. With ~100k rows per state
+//       (e.g. 10M rows / 100 groups), CPU sum is ~50us per state and the
+//       whole loop finishes in a few ms. Going to the GPU per-state in this
+//       regime would cost a kernel launch + H2D + D2H per state (~100us
+//       each) AND serialize on gpu_call_mutex() against any concurrent
+//       finalize calls — strictly worse than CPU AND historically a
+//       correctness footgun (intermittent wrong sums on busy systems with
+//       parallel finalize threads sharing the singleton CudaAggregator).
+//       The CPU path is bandwidth-bound and trivially correct, so we use
+//       it unconditionally for this regime.
+//     - High-cardinality (count >= kBatchedGroupByThreshold): batched
+//       single GPU GROUP BY call (state index = group key). One kernel
+//       launch instead of `count` launches; per BENCHMARK.md, this beats
+//       CPU 5-14x in the regime where atomicCAS hash table wins.
 //
 // Toggle via env var GPUDB_FORCE_BACKEND=cpu|gpu|auto (default auto)
 // for diagnostic / benchmark runs.
@@ -525,6 +537,37 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     }
 
     if (!used_batched) {
+        // Mid-cardinality (1 < count < kBatchedGroupByThreshold) and
+        // batched-GPU fallback paths. Sum each state's buffer on the CPU.
+        //
+        // Why CPU and not safe_sum_i64() (which dispatches to GPU above
+        // kSumGpuMinRows)? Three reasons, in order of importance:
+        //
+        //   1. Correctness. The original implementation looped calling
+        //      safe_sum_i64() per state. Each call grabs gpu_call_mutex()
+        //      and runs sum_i64 on the singleton CudaAggregator (which
+        //      reuses one set of d_in_/d_partials_/d_out_ buffers). When
+        //      DuckDB invokes finalize() in parallel from multiple threads
+        //      AND the GPU happens to be busy with a long reduction from
+        //      another agg, we observed intermittent wrong totals at
+        //      mid-cardinality (50–63 groups × ~100k rows/group on the
+        //      reproducer in test/sql/gpu_groupby.test:q7). The CPU path
+        //      has no shared state and no race surface.
+        //   2. Speed. ~100k int64s per state is ~800 KiB — fits in L2 on
+        //      modern x86. cpu_sum hits ~30 GB/s easily, finishing one
+        //      state in ~25us. Per-state GPU finalize pays a kernel launch
+        //      (~5us), H2D + D2H of 800 KiB (~50us each on PCIe gen4),
+        //      AND lock contention. CPU wins outright.
+        //   3. Predictability. The big GPU win for grouped aggregates
+        //      lives in the BATCHED path above (one kernel for ALL groups,
+        //      hash-table GROUP BY on device). Mid-cardinality is a "neither
+        //      regime is great" zone; CPU is trivially correct and good
+        //      enough.
+        //
+        // count == 1 still goes to safe_sum_i64() (single-state fast path
+        // above) so ungrouped SELECT gpu_sum(x) FROM big_tbl still hits the
+        // GPU; window functions (which call finalize with count=1 per row)
+        // also still benefit when individual partition buffers are big.
         for (idx_t i = 0; i < count; ++i) {
             const std::uint64_t bid = probe_buf_id(source[i]);
             if (bid == 0) { out[offset + i] = 0; continue; }

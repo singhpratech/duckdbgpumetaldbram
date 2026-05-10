@@ -1,11 +1,11 @@
-# DRAFT description.yml for submission to duckdb/community-extensions.
+# READY-TO-SUBMIT description.yml for duckdb/community-extensions.
 #
-# This file goes in the duckdb/community-extensions repo at
-# extensions/gpudb/description.yml when we're ready to submit.
-# See https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
-# for the canonical schema. Copy + adapt at submission time.
-#
-# Status: not yet submitted (see docs/RELEASE_READINESS.md for blockers).
+# v0.1.0 ship state (2026-05-09):
+#   ref pinned to v0.1.0 (released)
+#   To submit: copy this file to
+#     <fork-of-duckdb/community-extensions>/extensions/gpudb/description.yml
+#   then open a PR. Schema reference:
+#     https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
 
 extension:
   name: gpudb
@@ -24,7 +24,7 @@ extension:
 
 repo:
   github: singhpratech/duckdbgpumetaldbram
-  ref: <pin to a release tag at submission time, e.g. v0.1.0>
+  ref: v0.1.0
 
 docs:
   hello_world: |

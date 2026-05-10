@@ -125,15 +125,28 @@ CI runs on every push: Linux (Ubuntu 24.04, CPU-only) + macOS-14 (CPU + Metal sc
 
 ## Roadmap
 
-- [x] CUDA backend: SUM/MIN/MAX (one-shot + resident), GROUP BY hash aggregate
-- [x] Metal backend: SUM/MIN/MAX i64 (real compute pipelines on M4 Max)
-- [x] DuckDB extension: gpu_sum / gpu_min / gpu_max via in-process registration
-- [ ] DuckDB loadable extension format (metadata footer; required for `LOAD '...'`)
+### Shipped on `main` (v0.1.0 launch candidate)
+- [x] CUDA backend: SUM/MIN/MAX (one-shot + resident)
+- [x] CUDA GROUP BY hash aggregate (open-addressing + atomicCAS, ~520 GiB/s on RTX 4090)
+- [x] **CUDA hash join probe** (1M build × 10M probe @ 97% sel: 3.7× wall, 107× kernel over CPU)
+- [x] Metal backend: SUM/MIN/MAX i64 with real compute pipelines (~470 GiB/s on M4 Max)
+- [x] **Metal GROUP BY** via GPU-resident radix sort (wins 4.4–4.8× over CPU at 100M-500M × 1M groups)
+- [x] **Multi-aggregate fusion** (SUM+MIN+MAX+COUNT in one pass, 5.3× over CPU fused)
+- [x] **Hybrid CPU/GPU planner** (HybridAggregator + DispatchDecision, beats both pure-CPU and pure-GPU at the 1M×1M sweet spot)
+- [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
+- [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
+
+### In flight (v0.1.1, target one week from launch)
+- [ ] Fixes for the 4 bugs in `KNOWN_ISSUES.md` (window+PARTITION BY non-determinism, OVER () segfault, OVER (ORDER BY) chunk-boundary state loss, mid-cardinality GROUP BY wrong totals)
+- [ ] DuckDB loadable extension metadata footer (required for `LOAD '...so'` from CLI)
 - [ ] Submission to [DuckDB Community Extensions](https://github.com/duckdb/community-extensions) → `INSTALL gpudb FROM community`
-- [ ] CUDA hash-join probe
-- [ ] Metal GROUP BY (currently falls back to CPU)
-- [ ] Hybrid CPU/GPU planner (the cardinality threshold is empirically known; needs to be wired)
-- [ ] Window functions (the operator Sirius lacks)
+
+### Roadmap (v0.2.0+)
+- [ ] Real Metal hash-join sort-merge (currently a CPU-fallback scaffold; CUDA hash-join is real)
+- [ ] GPU-resident segment reduce for Metal GROUP BY at 1B+ rows (the cell where we currently lose 1.5×)
+- [ ] Resident-column SQL hooks: `gpu_cache(table, col)` table function so `gpu_sum` can run on data already loaded
+- [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
+- [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
 
 ## Why DuckDB? Why not a new database?
 
