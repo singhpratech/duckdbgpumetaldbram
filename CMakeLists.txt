@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(gpudb
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "GPU-accelerated operators for DuckDB (CUDA + Metal)"
     LANGUAGES CXX
 )
