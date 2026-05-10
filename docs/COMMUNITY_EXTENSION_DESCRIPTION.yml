@@ -52,11 +52,13 @@ docs:
     sustained kernel bandwidth approaches LPDDR5X peak (we measure
     ~92% of M4 Max's 546 GB/s on int64 SUM).
 
-    Performance highlights (vs single-thread CPU baseline):
-      * SUM 1B int64 HOT: Metal 5.28× (Apple M4 Max), CUDA ~22× (RTX 4090)
-      * GROUP BY 500M rows × 1M unique groups: Metal 4.89×, CUDA 21.8×
-      * TPC-H SF1 GROUP BY: Metal 2.08×, CUDA 4.8×
-      * Metal vs CUDA wall on TPC-H GROUP BY: essentially tied
+    Performance highlights (vs single-thread CPU baseline; each row pinned
+    to a specific BENCHMARK.md cell, no cross-cell glue):
+      * SUM 1B int64 HOT (resident column) on M4 Max: Metal 5.28×
+      * Peak SUM ratio on RTX 4090: CUDA ~22.8× (size-dependent)
+      * GROUP BY 500M rows × 1M unique groups on M4 Max: Metal 4.89×
+      * GROUP BY 50M rows × 10M unique groups on RTX 4090: CUDA 21.8×
+      * TPC-H SF1 GROUP BY (6M × 1.5M unique) on M4 Max: Metal 2.08×
 
     The extension auto-selects the best available backend at install time.
     If no GPU is available, it falls back to the CPU implementation
