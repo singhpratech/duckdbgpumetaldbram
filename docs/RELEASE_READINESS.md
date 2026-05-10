@@ -128,7 +128,7 @@ On Linux:
 
 On macOS (currently — needs build-dir fix in local_check.sh):
 ```
-export PATH="/Users/aiexplore369/Library/Python/3.9/bin:$PATH"  # cmake from pip
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"  # cmake from pip --user
 ./scripts/get_duckdb_libs.sh                  # downloads libduckdb.dylib
 cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release -DGPUDB_BUILD_EXT=ON
 cmake --build build-macos -j

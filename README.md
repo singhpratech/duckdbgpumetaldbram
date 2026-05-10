@@ -72,13 +72,15 @@ brew install cmake
 
 ## What you get
 
-After build, three CLI tools:
+After build, five CLI tools:
 
 | Tool | What it does |
 |---|---|
 | **`gpudb-sql`** | Embeds DuckDB, registers `gpu_sum` / `gpu_min` / `gpu_max`, runs SQL from `--sql` or stdin. **Demo this.** |
 | `gpudb-bench` | Microbench SUM/MIN/MAX across CPU + CUDA + Metal, cold vs hot resident, on synthetic or `.gpudb` files |
 | `gpudb-groupby-bench` | Microbench GROUP BY hash aggregate at varying cardinality |
+| `gpudb-window-bench` | Microbench window functions (running sum, partitioned, unbounded frame) |
+| `gpudb-hashjoin-bench` | Microbench inner equi-join build × probe across CPU + CUDA |
 
 And a static library `libgpudb` you can embed in any C++ project. See `src/extension/gpu_sum_extension.{cpp,hpp}` for the DuckDB-aware wrapper.
 
@@ -109,7 +111,7 @@ Backend selection is automatic: CUDA if a device is found at runtime, else Metal
 
 ## Testing
 ```bash
-./build-linux/test/test_gpudb        # 24 unit tests across CPU + CUDA backends
+./build-linux/test/test_gpudb        # 77 unit checks across CPU + CUDA backends
 ./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window
 ./scripts/local_check.sh             # everything CI would run, end to end
 ```

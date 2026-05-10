@@ -350,7 +350,7 @@ The full algorithm is documented in the long header comment of
 ### Reproduce
 
 ```bash
-export PATH="/Users/aiexplore369/Library/Python/3.9/bin:$PATH"
+export PATH="$HOME/Library/Python/3.9/bin:$PATH"  # cmake from pip --user
 cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release
 cmake --build build-macos -j
 ./build-macos/test/test_gpudb                         # 58/58
