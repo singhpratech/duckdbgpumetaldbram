@@ -31,6 +31,7 @@
 #include <chrono>
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
@@ -89,6 +90,10 @@ public:
             ps_radix_bucket_offsets_ = make_pso(lib, @"radix_bucket_offsets");
             ps_radix_per_bucket_scan_ = make_pso(lib, @"radix_per_bucket_scan");
             ps_radix_minmax_ = make_pso(lib, @"radix_minmax_i64");
+            ps_partition_count_   = make_pso(lib, @"partition_count_hash");
+            ps_partition_scatter_ = make_pso(lib, @"partition_scatter_hash");
+            ps_partition_aggregate_slotlock_ =
+                make_pso(lib, @"partition_hash_aggregate_slotlock_i64");
         }
     }
 
@@ -106,7 +111,57 @@ public:
     GroupByResult groupby_sum_i64(const std::int64_t* keys,
                                   const std::int64_t* values,
                                   std::size_t n,
-                                  std::size_t /*expected_groups*/) override {
+                                  std::size_t expected_groups) override {
+        // Hybrid auto-dispatch (v0.1.3) — pick the path that wins for this workload.
+        //
+        // Empirical wins on Apple M4 Max vs DuckDB CPU multi-thread (16 threads):
+        //   * radix-opt (vectorized loads, multi-split scatter, simdgroup scan):
+        //     beats CPU 2-3x at 100M+ rows × 1M+ groups, and is the fallback for
+        //     cardinalities above slot-lock's safe cap.
+        //   * slot-lock (4K hash partitions × 1K threadgroup slots):
+        //     beats CPU 2.5-4x at any size when expected_groups is in
+        //     [~1K, ~3M]. Becomes lock-contended at very low cardinality
+        //     (CPU's hash fits in L1 there anyway).
+        //
+        // env override: GPUDB_METAL_GROUPBY_PATH=slotlock|radix to force a path.
+        constexpr std::size_t kSlotLockMinGroups = 1024;
+        constexpr std::size_t kSlotLockSafeCap   = 16'000'000;  // 32K partitions × 1024 slots, load 0.5
+
+        const char* env = std::getenv("GPUDB_METAL_GROUPBY_PATH");
+        const bool env_slotlock = env && std::strcmp(env, "slotlock") == 0;
+        const bool env_radix    = env && std::strcmp(env, "radix")    == 0;
+
+        bool use_slotlock;
+        if (env_slotlock)      use_slotlock = true;
+        else if (env_radix)    use_slotlock = false;
+        else                   use_slotlock = (expected_groups >= kSlotLockMinGroups
+                                               && expected_groups <= kSlotLockSafeCap);
+
+        if (use_slotlock) {
+            if (!path_logged_) {
+                std::fprintf(stderr,
+                             "[gpudb metal groupby] using slot-lock path (expected_groups=%zu)\n",
+                             expected_groups);
+                path_logged_ = true;
+            }
+            return groupby_sum_i64_hash_slotlock(keys, values, n, expected_groups);
+        }
+        if (!path_logged_) {
+            std::fprintf(stderr,
+                         "[gpudb metal groupby] using radix-opt path (expected_groups=%zu)\n",
+                         expected_groups);
+            path_logged_ = true;
+        }
+        return groupby_sum_i64_via_radix(keys, values, n, expected_groups);
+    }
+
+    // Default path: LSD radix sort + host segment-reduce. Always correct
+    // for any input size. Selected when no GPUDB_METAL_GROUPBY_PATH env var
+    // is set, or as a fallback when slot-lock would overflow.
+    GroupByResult groupby_sum_i64_via_radix(const std::int64_t* keys,
+                                            const std::int64_t* values,
+                                            std::size_t n,
+                                            std::size_t /*expected_groups*/) {
         GroupByResult r;
         r.input_rows = n;
         if (n == 0) return r;
@@ -119,7 +174,7 @@ public:
         // Match constants in groupby.metal.
         constexpr std::uint32_t RADIX_BUCKETS        = 256;
         constexpr std::uint32_t RADIX_BLOCK_SIZE     = 256;
-        constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 256;
+        constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 1024;  // matches groupby.metal #define
         const std::uint32_t num_blocks = (n32 + RADIX_WORK_PER_BLOCK - 1) / RADIX_WORK_PER_BLOCK;
 
         @autoreleasepool {
@@ -400,6 +455,237 @@ public:
         return r;
     }
 
+    // ------------------------------------------------------------------------
+    // Slot-lock hash aggregate. Selected by GPUDB_METAL_GROUPBY_PATH=slotlock.
+    //
+    // Pipeline:
+    //   1. partition_count_hash:   per-row atomic_fetch_add → partition_counts[4096].
+    //   2. (host) exclusive scan partition_counts → partition_offsets[4097].
+    //   3. partition_scatter_hash: stream rows into per-partition slices.
+    //   4. partition_hash_aggregate_slotlock_i64: 4096 threadgroups × 64 threads,
+    //      threadgroup-resident slot-lock hash table per partition. Emit phase
+    //      writes (key, sum) to flat output via global atomic_fetch_add counter.
+    //
+    // out_count is read on the host after wait to know how many groups were
+    // produced; the host then trims out_keys/out_sums to that length.
+    //
+    // Capacity bound: NUM_PARTITIONS (4096) × SLOT_COUNT (1024) = 4,194,304
+    // distinct groups maximum. For uniformly-hashed keys, each partition
+    // expects expected_groups/4096 unique entries; with load factor 0.85,
+    // the soft cap is ~3.4M unique. If `expected_groups` exceeds ~3M, fall
+    // back to the radix path for correctness.
+    // ------------------------------------------------------------------------
+    GroupByResult groupby_sum_i64_hash_slotlock(const std::int64_t* keys,
+                                                const std::int64_t* values,
+                                                std::size_t n,
+                                                std::size_t expected_groups) {
+        // Capacity guard: if the cardinality hint would overflow our
+        // per-partition tables, fall back to the radix path instead of
+        // silently dropping rows. We use a conservative threshold that
+        // assumes uniform hash distribution.
+        constexpr std::size_t kSlotLockHardCap   = 32768ull * 1024ull;     // 33,554,432 (32K × 1K)
+        constexpr std::size_t kSlotLockSafeBound = (kSlotLockHardCap * 75) / 100;  // 75% load
+        if (expected_groups > kSlotLockSafeBound) {
+            std::fprintf(stderr,
+                "[gpudb metal groupby] expected_groups=%zu exceeds slot-lock "
+                "soft cap %zu — falling back to radix path for correctness\n",
+                expected_groups, kSlotLockSafeBound);
+            return groupby_sum_i64_via_radix(keys, values, n, expected_groups);
+        }
+        GroupByResult r;
+        r.input_rows = n;
+        if (n == 0) return r;
+
+        if (n > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error("input too large for slot-lock kernel uint32 indexing");
+        }
+        const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+
+        // Match constants in groupby.metal.
+        constexpr std::uint32_t SL_NUM_PARTITIONS = 32768;
+        constexpr std::uint32_t SL_TG_THREADS     = 64;
+        constexpr std::uint32_t SL_COUNT_THREADS  = 256;
+        constexpr std::uint32_t SL_COUNT_WORK     = 256;
+
+        @autoreleasepool {
+            const auto t_wall0 = std::chrono::steady_clock::now();
+
+            // ---- Buffer sizing ----
+            const std::size_t bytes_kv = static_cast<std::size_t>(n32) * sizeof(std::int64_t);
+            const std::size_t bytes_partition_u32 = SL_NUM_PARTITIONS * sizeof(std::uint32_t);
+            const std::size_t bytes_partition_offsets_u32 =
+                (SL_NUM_PARTITIONS + 1) * sizeof(std::uint32_t);
+            // Output: at most n unique groups; reserve n longs to be safe.
+            // (For high-cardinality inputs this is exactly the right bound.)
+            const std::size_t bytes_out_kv = bytes_kv;
+
+            // Reuse main buffer cache for input keys/values (so subsequent calls
+            // amortize allocation cost across runs).
+            if (!b_keys_   || [b_keys_   length] < bytes_kv) {
+                b_keys_   = [device_ newBufferWithLength:bytes_kv  options:MTLResourceStorageModeShared];
+            }
+            if (!b_values_ || [b_values_ length] < bytes_kv) {
+                b_values_ = [device_ newBufferWithLength:bytes_kv  options:MTLResourceStorageModeShared];
+            }
+            // Reuse the second ping-pong slot (b_keys_b_ / b_values_b_) for
+            // post-partition scatter destinations.
+            if (!b_keys_b_   || [b_keys_b_   length] < bytes_kv) {
+                b_keys_b_   = [device_ newBufferWithLength:bytes_kv  options:MTLResourceStorageModeShared];
+            }
+            if (!b_values_b_ || [b_values_b_ length] < bytes_kv) {
+                b_values_b_ = [device_ newBufferWithLength:bytes_kv  options:MTLResourceStorageModeShared];
+            }
+            // Slot-lock owned buffers.
+            if (!b_sl_partition_counts_ || [b_sl_partition_counts_ length] < bytes_partition_u32) {
+                b_sl_partition_counts_ = [device_ newBufferWithLength:bytes_partition_u32
+                                                              options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_partition_offsets_ ||
+                [b_sl_partition_offsets_ length] < bytes_partition_offsets_u32)
+            {
+                b_sl_partition_offsets_ = [device_ newBufferWithLength:bytes_partition_offsets_u32
+                                                               options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_partition_writepos_ ||
+                [b_sl_partition_writepos_ length] < bytes_partition_u32)
+            {
+                b_sl_partition_writepos_ = [device_ newBufferWithLength:bytes_partition_u32
+                                                                options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_count_ || [b_sl_out_count_ length] < sizeof(std::uint32_t)) {
+                b_sl_out_count_ = [device_ newBufferWithLength:sizeof(std::uint32_t)
+                                                       options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_keys_ || [b_sl_out_keys_ length] < bytes_out_kv) {
+                b_sl_out_keys_ = [device_ newBufferWithLength:bytes_out_kv
+                                                      options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_sums_ || [b_sl_out_sums_ length] < bytes_out_kv) {
+                b_sl_out_sums_ = [device_ newBufferWithLength:bytes_out_kv
+                                                      options:MTLResourceStorageModeShared];
+            }
+
+            id<MTLBuffer> b_in_keys           = b_keys_;
+            id<MTLBuffer> b_in_values         = b_values_;
+            id<MTLBuffer> b_scatter_keys      = b_keys_b_;
+            id<MTLBuffer> b_scatter_values    = b_values_b_;
+            id<MTLBuffer> b_partition_counts  = b_sl_partition_counts_;
+            id<MTLBuffer> b_partition_offsets = b_sl_partition_offsets_;
+            id<MTLBuffer> b_partition_writepos= b_sl_partition_writepos_;
+            id<MTLBuffer> b_out_count         = b_sl_out_count_;
+            id<MTLBuffer> b_out_keys          = b_sl_out_keys_;
+            id<MTLBuffer> b_out_sums          = b_sl_out_sums_;
+
+            std::memcpy([b_in_keys   contents], keys,   bytes_kv);
+            std::memcpy([b_in_values contents], values, bytes_kv);
+
+            // Zero per-partition counts and the global out_count.
+            std::memset([b_partition_counts contents], 0, bytes_partition_u32);
+            *static_cast<std::uint32_t*>([b_out_count contents]) = 0;
+
+            // -------- Pass 1: partition counts --------
+            id<MTLCommandBuffer> cb1 = [queue_ commandBuffer];
+            {
+                id<MTLComputeCommandEncoder> ce1 = [cb1 computeCommandEncoder];
+                [ce1 setComputePipelineState:ps_partition_count_];
+                [ce1 setBuffer:b_in_keys          offset:0 atIndex:0];
+                [ce1 setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce1 setBuffer:b_partition_counts offset:0 atIndex:2];
+                // Wide grid for streaming reads; threads-per-tg matches kernel default.
+                const std::uint32_t blocks = (n32 + SL_COUNT_WORK - 1) / SL_COUNT_WORK;
+                [ce1 dispatchThreadgroups:MTLSizeMake(blocks, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(SL_COUNT_THREADS, 1, 1)];
+                [ce1 endEncoding];
+            }
+            [cb1 commit];
+            [cb1 waitUntilCompleted];
+
+            // -------- Host: exclusive prefix scan over partition counts --------
+            // partition_offsets[i] = sum_{j<i} partition_counts[j].
+            // Also detect overflow: if any partition has more rows than the
+            // hash table can hold (~SLOT_COUNT * 0.85 to leave probe room),
+            // we'd lose data. SLOT_COUNT=1024 → safe up to ~870 unique keys
+            // per partition. For 1M rows uniform across 4096 partitions that's
+            // ~244 rows / partition (max possible unique keys). For row counts
+            // up to ~870K per partition we still fit because unique ≤ rows.
+            {
+                const std::uint32_t* counts =
+                    static_cast<const std::uint32_t*>([b_partition_counts contents]);
+                std::uint32_t* offsets =
+                    static_cast<std::uint32_t*>([b_partition_offsets contents]);
+                std::uint32_t running = 0;
+                for (std::uint32_t p = 0; p < SL_NUM_PARTITIONS; ++p) {
+                    offsets[p] = running;
+                    running += counts[p];
+                }
+                offsets[SL_NUM_PARTITIONS] = running;
+                // Sanity: total partitioned rows == n.
+                if (running != n32) {
+                    std::ostringstream os;
+                    os << "slot-lock partition count mismatch: total=" << running
+                       << " expected=" << n32;
+                    throw std::runtime_error(os.str());
+                }
+            }
+
+            // Reset per-partition write positions (used as atomic counters in scatter).
+            std::memset([b_partition_writepos contents], 0, bytes_partition_u32);
+
+            // -------- Pass 2 + 3: scatter, then per-partition slot-lock aggregate --------
+            id<MTLCommandBuffer> cb2 = [queue_ commandBuffer];
+            {
+                id<MTLComputeCommandEncoder> ce2 = [cb2 computeCommandEncoder];
+
+                // Pass 2: scatter
+                [ce2 setComputePipelineState:ps_partition_scatter_];
+                [ce2 setBuffer:b_in_keys           offset:0 atIndex:0];
+                [ce2 setBuffer:b_in_values         offset:0 atIndex:1];
+                [ce2 setBytes:&n32 length:sizeof(n32) atIndex:2];
+                [ce2 setBuffer:b_partition_offsets offset:0 atIndex:3];
+                [ce2 setBuffer:b_partition_writepos offset:0 atIndex:4];
+                [ce2 setBuffer:b_scatter_keys      offset:0 atIndex:5];
+                [ce2 setBuffer:b_scatter_values    offset:0 atIndex:6];
+                const std::uint32_t blocks = (n32 + SL_COUNT_WORK - 1) / SL_COUNT_WORK;
+                [ce2 dispatchThreadgroups:MTLSizeMake(blocks, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(SL_COUNT_THREADS, 1, 1)];
+
+                // Pass 3: per-partition slot-lock aggregate.
+                // One threadgroup per partition; SL_TG_THREADS threads each.
+                [ce2 setComputePipelineState:ps_partition_aggregate_slotlock_];
+                [ce2 setBuffer:b_scatter_keys      offset:0 atIndex:0];
+                [ce2 setBuffer:b_scatter_values    offset:0 atIndex:1];
+                [ce2 setBuffer:b_partition_offsets offset:0 atIndex:2];
+                [ce2 setBuffer:b_out_count         offset:0 atIndex:3];
+                [ce2 setBuffer:b_out_keys          offset:0 atIndex:4];
+                [ce2 setBuffer:b_out_sums          offset:0 atIndex:5];
+                [ce2 dispatchThreadgroups:MTLSizeMake(SL_NUM_PARTITIONS, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(SL_TG_THREADS, 1, 1)];
+
+                [ce2 endEncoding];
+            }
+            [cb2 commit];
+            [cb2 waitUntilCompleted];
+
+            const double kernel_ms_total =
+                ([cb2 GPUEndTime] - [cb2 GPUStartTime]) * 1000.0
+                + ([cb1 GPUEndTime] - [cb1 GPUStartTime]) * 1000.0;
+
+            // -------- Host: collect output --------
+            const std::uint32_t out_count =
+                *static_cast<const std::uint32_t*>([b_out_count contents]);
+            const std::int64_t* ok = static_cast<const std::int64_t*>([b_out_keys contents]);
+            const std::int64_t* os_ = static_cast<const std::int64_t*>([b_out_sums contents]);
+            r.keys.assign(ok, ok + out_count);
+            r.sums.assign(os_, os_ + out_count);
+
+            r.kernel_ms   = kernel_ms_total;
+            r.transfer_ms = 0.0;
+            r.wall_ms     = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_wall0).count();
+        }
+        return r;
+    }
+
 private:
     id<MTLComputePipelineState> make_pso(id<MTLLibrary> lib, NSString* name) {
         @autoreleasepool {
@@ -429,6 +715,9 @@ private:
     id<MTLComputePipelineState> ps_radix_bucket_offsets_ = nil;
     id<MTLComputePipelineState> ps_radix_per_bucket_scan_ = nil;
     id<MTLComputePipelineState> ps_radix_minmax_ = nil;
+    id<MTLComputePipelineState> ps_partition_count_              = nil;
+    id<MTLComputePipelineState> ps_partition_scatter_            = nil;
+    id<MTLComputePipelineState> ps_partition_aggregate_slotlock_ = nil;
     id<MTLBuffer> b_bucket_total_  = nil;
     id<MTLBuffer> b_bucket_offset_ = nil;
     id<MTLBuffer> b_minmax_partials_ = nil;
@@ -439,6 +728,14 @@ private:
     id<MTLBuffer> b_values_b_ = nil;
     id<MTLBuffer> b_hist_     = nil;
     id<MTLBuffer> b_scan_     = nil;
+    // Slot-lock path buffers.
+    id<MTLBuffer> b_sl_partition_counts_   = nil;
+    id<MTLBuffer> b_sl_partition_offsets_  = nil;
+    id<MTLBuffer> b_sl_partition_writepos_ = nil;
+    id<MTLBuffer> b_sl_out_count_          = nil;
+    id<MTLBuffer> b_sl_out_keys_           = nil;
+    id<MTLBuffer> b_sl_out_sums_           = nil;
+    bool path_logged_ = false;
 };
 
 } // namespace

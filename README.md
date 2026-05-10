@@ -32,15 +32,33 @@ What's open in 2026: **no published SQL engine targets Apple Silicon GPUs**. Sir
 | GROUP BY 50M × 10M groups | 2321 ms | 188 ms | n/a | **13.7× over CPU** |
 | GROUP BY 6M TPC-H lineitem (1.5M groups) | 54.1 ms | 15.0 ms | n/a | **3.6× over CPU** |
 
-Apple Silicon Metal kernels (M4 Max) hit 220 GiB/s kernel-only on i64 SUM with zero PCIe transfer thanks to unified memory. Full Metal numbers in [BENCHMARK.md](BENCHMARK.md).
+## Numbers — Apple Silicon (M4 Max, v0.1.3 Metal vs DuckDB CLI default)
 
-The honest finding: for **streaming SUM on cold data**, CPU wins (DDR5 already saturates memory bandwidth). For **resident columns** and for **GROUP BY at scale**, GPU dominates by 10-25×. The hybrid planner this implies is exactly the open problem from Rosenfeld/Breß CSUR 2022 and Cao SIGMOD 2024.
+DuckDB CLI uses 16 threads (12 P + 4 E cores) by default on M4 Max. These are vs `duckdb -c "SET threads=16"`, the actual user-visible baseline.
+
+| Workload | DuckDB CPU mt | Metal v0.1.3 | **Speedup** |
+|---|---:|---:|:---:|
+| **TPC-H SF10 multi-agg fusion `l_quantity`** | 27 ms | **1.06 ms** | **25.5×** 🚀 |
+| **TPC-H SF10 multi-agg fusion `l_extendedprice`** | 26 ms | **1.18 ms** | **22.0×** 🚀 |
+| **TPC-H SF10 multi-agg fusion `l_orderkey`** | 11 ms | **1.13 ms** | **9.7×** 🚀 |
+| **SF10 SUM `l_quantity` HOT** | 5 ms | **1.16 ms** | **4.3×** ✅ |
+| **TPC-H SF10 GROUP BY `l_extendedprice` (1.35M unique)** | 113 ms | **28.9 ms** | **3.9×** ✅ |
+| **500M × 1M GROUP BY synthetic** | 820 ms | **242 ms** | **3.4×** ✅ |
+| **1B × 1M GROUP BY synthetic** | 2500 ms | **770 ms** | **3.2×** ✅ |
+| **1B int64 SUM HOT** | 40 ms | **16.2 ms** | **2.6×** ✅ |
+| **SF10 SUM `l_extendedprice` HOT** | 5 ms | **2.23 ms** | **2.2×** ✅ |
+| **SF10 SUM `l_orderkey` HOT** | 3 ms | **1.68 ms** | **1.8×** ✅ |
+| **TPC-H SF1 GROUP BY `l_orderkey` (1.5M unique)** | 8 ms | **5.71 ms** | **1.40×** ✅ |
+| **TPC-H SF10 GROUP BY `l_orderkey` (15M unique)** | 56 ms | **42.95 ms** | **1.30×** ✅ |
+| TPC-H SF10 GROUP BY `l_quantity` (50 unique) | 26 ms | 372 ms | CPU 14× ❌ structural |
+
+**v0.1.3 ships a hybrid Metal GROUP BY** that auto-dispatches between a 32K-partition slot-lock hash aggregate (sweet spot at 1024 ≤ unique ≤ 16M) and an optimized multi-pass radix sort. Multi-aggregate fusion (`SELECT SUM(x), MIN(x), MAX(x), COUNT(x) FROM t`) reads the column once and computes all four in a single Metal pass at ~475 GiB/s (87% of LPDDR5X peak). Full numbers + reproduction in [BENCHMARK.md](BENCHMARK.md).
 
 ## Quick start
 
 ### Option A — load the prebuilt extension into DuckDB CLI
 
-Download the platform binary from the [v0.1.2 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.2), then:
+Download the platform binary from the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3), then:
 
 ```bash
 # Linux (RTX/CUDA)
@@ -156,9 +174,9 @@ xfail are now strict positive assertions (PR #22).
 - [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
 - [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
 
-### Shipped in v0.1.2
+### Shipped in v0.1.3
 - [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal). Prebuilt binaries attached to [v0.1.2 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.2).
+- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal). Prebuilt binaries attached to [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
 
 ### In flight (v0.1.3)
 - [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed)
