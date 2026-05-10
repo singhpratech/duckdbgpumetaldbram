@@ -39,7 +39,7 @@ jobs:
 
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
-    runs-on: macos-14   # Apple Silicon runner
+    runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2
     steps:
       - uses: actions/checkout@v4
 
