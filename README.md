@@ -70,6 +70,31 @@ brew install cmake
 # -> backend=METAL
 ```
 
+### Loading the extension into stock DuckDB CLI
+
+The build produces a real `.duckdb_extension` file with the proper metadata
+footer — load it from any DuckDB CLI ≥ v1.5 that allows unsigned extensions:
+
+```bash
+# macOS / Apple Silicon (Metal backend)
+duckdb -unsigned -c "
+  LOAD '$(pwd)/build-macos/src/extension/gpudb_duckdb.duckdb_extension';
+  SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
+"
+# -> [gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=Metal)
+# -> 499999500000
+
+# Linux (CUDA backend if a GPU is available, else CPU fallback)
+duckdb -unsigned -c "
+  LOAD '$(pwd)/build-linux/src/extension/gpudb_duckdb.duckdb_extension';
+  SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
+"
+```
+
+Inside an interactive DuckDB session: `SET allow_unsigned_extensions=true;`
+once, then `LOAD '...';`. Pre-built artifacts are attached to the
+[GitHub release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/latest).
+
 ## What you get
 
 After build, five CLI tools:
@@ -139,7 +164,7 @@ xfail are now strict positive assertions (PR #22).
 
 ### In flight (v0.1.1)
 - [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [ ] DuckDB loadable extension metadata footer (required for `LOAD '...so'` from CLI)
+- [x] **DuckDB loadable extension metadata footer** — `.duckdb_extension` files are now loadable via stock `duckdb -unsigned -c "LOAD '...';"`
 - [ ] Submission to [DuckDB Community Extensions](https://github.com/duckdb/community-extensions) → `INSTALL gpudb FROM community`
 
 ### Roadmap (v0.2.0+)
