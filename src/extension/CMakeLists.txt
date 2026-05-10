@@ -37,10 +37,51 @@ set_target_properties(gpudb_duckdb PROPERTIES
     INSTALL_RPATH "${DUCKDB_LIBS_DIR}"
 )
 
-# Also produce the same .so under the .duckdb_extension suffix DuckDB recognizes,
-# so users can do LOAD 'libgpudb_duckdb.duckdb_extension' or just LOAD '...so'.
-add_custom_command(TARGET gpudb_duckdb POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-        $<TARGET_FILE:gpudb_duckdb>
-        $<TARGET_FILE_DIR:gpudb_duckdb>/gpudb_duckdb.duckdb_extension
-    COMMENT "Aliasing .so as .duckdb_extension")
+# Produce a real, LOADABLE .duckdb_extension by appending DuckDB's required
+# metadata footer to the .so. Without this, DuckDB CLI rejects the file as
+# "The metadata at the end of the file is invalid".
+#
+# Implementation: call scripts/build_helpers/append_extension_metadata.py
+# (the upstream DuckDB extension-template helper, vendored at PR #36) so
+# both `cmake --build` and `./scripts/build.sh` produce the same loadable
+# artifact at gpudb.<platform>.duckdb_extension.
+
+if(APPLE)
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64" OR CMAKE_OSX_ARCHITECTURES MATCHES "arm64")
+        set(DUCKDB_PLATFORM "osx_arm64")
+    else()
+        set(DUCKDB_PLATFORM "osx_amd64")
+    endif()
+elseif(UNIX)
+    if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "aarch64" OR CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "arm64")
+        set(DUCKDB_PLATFORM "linux_arm64")
+    else()
+        set(DUCKDB_PLATFORM "linux_amd64")
+    endif()
+else()
+    set(DUCKDB_PLATFORM "unknown")
+endif()
+
+set(GPUDB_EXT_VERSION "v${PROJECT_VERSION}")
+set(GPUDB_DUCKDB_C_API_VERSION "v1.2.0")
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(NOT Python3_Interpreter_FOUND)
+    set(Python3_EXECUTABLE python3)
+endif()
+
+set(GPUDB_HELPER "${CMAKE_SOURCE_DIR}/scripts/build_helpers/append_extension_metadata.py")
+set(GPUDB_LOADABLE_OUT "$<TARGET_FILE_DIR:gpudb_duckdb>/gpudb.${DUCKDB_PLATFORM}.duckdb_extension")
+
+if(EXISTS "${GPUDB_HELPER}" AND NOT "${DUCKDB_PLATFORM}" STREQUAL "unknown")
+    add_custom_command(TARGET gpudb_duckdb POST_BUILD
+        COMMAND ${Python3_EXECUTABLE} ${GPUDB_HELPER}
+            --library-file       $<TARGET_FILE:gpudb_duckdb>
+            --extension-name     gpudb
+            --duckdb-platform    ${DUCKDB_PLATFORM}
+            --duckdb-version     ${GPUDB_DUCKDB_C_API_VERSION}
+            --extension-version  ${GPUDB_EXT_VERSION}
+            --abi-type           C_STRUCT
+            --out-file           ${GPUDB_LOADABLE_OUT}
+        COMMENT "Packaging gpudb.${DUCKDB_PLATFORM}.duckdb_extension (loadable via duckdb -unsigned -c \"LOAD '...';\")")
+endif()
