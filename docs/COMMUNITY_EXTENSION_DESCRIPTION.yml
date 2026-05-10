@@ -14,7 +14,7 @@ extension:
     Backends: NVIDIA CUDA (Linux/Windows) and Apple Metal (macOS).
     First-class Apple Silicon support — no other GPU SQL engine ships
     Metal numbers.
-  version: 0.1.0
+  version: 0.1.1
   language: C++
   build: cmake
   license: Apache-2.0
@@ -24,7 +24,7 @@ extension:
 
 repo:
   github: singhpratech/duckdbgpumetaldbram
-  ref: v0.1.0
+  ref: v0.1.1
 
 docs:
   hello_world: |
