@@ -100,24 +100,38 @@ hit it, where we don't, and the structural reason for each.
 
 ### Why the 1B GROUP BY drops to 1.5×
 
-At 1B rows, the wall breaks down approximately as:
-- GPU radix sort kernel: ~1.6 s (467 GiB/s, near peak, similar to SUM)
-- Host segment-reduce (parallel 8-thread, scanning 1B sorted i64): ~3 s
-- Memcpy of input + small bookkeeping: ~1 s
-- Total: ~5.6 s
+Re-measured 2026-05-09 night on M4 Max (`gpudb-groupby-bench --rows 1000000000
+--groups 1000000 --runs 3 --backend all`):
 
-The kernel is fine. **The bottleneck is host-side work on 1B elements**.
-This is the same lesson the host-scan for radix offsets taught us
-earlier — when the dataset gets huge, anything sequential on the host
-caps the wins.
+- CPU wall: **8800 ms**
+- Metal wall: **6115 ms** (speedup **1.44×**)
+- Metal kernel time: **1668 ms** (radix sort + GPU scan)
+- Host work (wall − kernel): **4447 ms = 73% of wall**
+
+The radix kernel processes 1B int64 keys + 1B int64 values across 8
+LSD passes; each pass reads + writes both buffers (~40 GB of memory
+traffic per pass × 8 passes ≈ 320 GB total). Effective memory bandwidth
+is ~190 GB/s — about 35% of the M4 Max LPDDR5X ceiling.
+
+**Important: this is NOT the 467 GiB/s figure from the 1B SUM kernel
+above.** Radix sort is multi-pass and more compute-heavy than streaming
+SUM, so the per-kernel sustained bandwidth is roughly 40% of SUM's
+single-pass ceiling. Earlier revisions of this doc mis-attributed
+SUM's 467 GiB/s to the GROUP BY kernel; that was wrong.
+
+**The kernel is fast; the real bottleneck is host work.** 73% of Metal
+wall is the post-kernel host parallel segment-reduce on 1B sorted
+(k,v) pairs. Same lesson the host-scan for radix offsets taught us —
+when the dataset gets huge, anything sequential on the host caps the
+wins.
 
 **The fix:** GPU-resident segment-reduce. After radix sort produces
 sorted (key, value) pairs, run a second compute kernel that walks the
 sorted output in parallel, identifies run boundaries via a prefix scan,
 and emits unique (key, sum) pairs. Same pattern as what we already do
 for the bucket-major scan inside radix — just one more stage. Estimated
-3-4 hours of focused work; would push 1B GROUP BY from 5.6 s → ~2 s,
-flipping the 1.51× into ~4×.
+3-4 hours of focused work; would push 1B GROUP BY from 6.1 s → ~2 s,
+flipping the 1.44× into ~4×.
 
 Filed as the next-step ticket.
 
