@@ -2,6 +2,76 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (v0.1.0 ship-day re-bench) — TPC-H Metal numbers, fresh on M4 Max
+
+Hardware: Apple M4 Max (40-core GPU, ~64 GiB unified memory, ~546 GB/s LPDDR5X peak),
+macOS 15.x, AppleClang 21.0.0, MSL 3.2. Built with `cmake --build build-linux -j` from
+`main` at tag `v0.1.0`. Single-thread scalar CPU baseline (no OpenMP on AppleClang).
+Median of 5 runs each.
+
+Reproduce:
+```
+./build-linux/bin/gpudb-bench --input data/tpch_sf1/lineitem_orderkey.gpudb \
+    --dtype i64 --runs 5 --mode both --op sum --backend hybrid
+./build-linux/bin/gpudb-groupby-bench --input-keys data/tpch_sf1/lineitem_orderkey.gpudb \
+    --runs 5 --backend all
+./build-linux/bin/gpudb-bench --input data/tpch_sf1/lineitem_orderkey.gpudb \
+    --dtype i64 --runs 5 --mode hot --op all --backend all
+# Same for tpch_sf10/...
+```
+
+### TPC-H SUM (lineitem.l_orderkey)
+
+| Scale | Op | CPU wall | Metal wall | Metal kernel | Metal-only thru | **Metal vs CPU** |
+|---|---|---:|---:|---:|---:|:---:|
+| **SF1** (6,001,215 rows / 45.8 MiB) | SUM HOT  | 0.467 ms | **0.364 ms** | 0.223 ms | 200 GiB/s | **1.28×** |
+| **SF1** | SUM COLD | 0.505 ms | 0.849 ms | 0.366 ms | 53 GiB/s | CPU 1.68× (planner picks CPU) |
+| **SF10** (59,986,052 rows / 457.7 MiB) | SUM HOT  | 4.825 ms | **1.679 ms** | 1.475 ms | **303 GiB/s** | **2.87×** |
+| **SF10** | SUM COLD | 4.908 ms | **2.314 ms** | 1.813 ms | **193 GiB/s** | **2.12×** ✅ wins cold too |
+
+The hybrid planner routes SF1 SUM COLD to CPU as expected
+(`reason=Cold_BelowGpuBreakeven`) and SF1+SF10 HOT to Metal
+(`reason=Hot_GpuAlwaysWins`).
+
+### TPC-H GROUP BY (lineitem.l_orderkey)
+
+| Scale | Unique groups | CPU wall | Metal wall | Metal kernel | **Metal vs CPU** |
+|---|---:|---:|---:|---:|:---:|
+| **SF1** | 1,500,000 | 31.43 ms | **16.31 ms** | 8.14 ms | **1.93×** |
+| **SF10** | 15,000,000 | 335.65 ms | **173.53 ms** | 107.88 ms | **1.93×** ✅ scale-stable |
+
+Algorithm: LSD radix sort (8 × 8-bit passes) + GPU on-device scan +
+host parallel segment-reduce. Metal kernel sustains 8–11 GiB/s of input;
+the scaling gap to the SUM kernel reflects the additional sort+scan
+work, not the bandwidth ceiling.
+
+### Multi-agg fusion (sum + min + max + count, single pass)
+
+| Scale | Backend | Separate (3 calls) | Fused (`agg_all`) | **Fused speedup** |
+|---|---|---:|---:|:---:|
+| **SF1** | CPU   | 2.032 ms | 0.989 ms | 2.05× (CPU intrinsic) |
+| **SF1** | Metal | 2.031 ms | **0.446 ms** | **4.56× wall · 3.19× kernel** |
+| **SF10** | CPU   | 18.573 ms | 8.945 ms | 2.08× |
+| **SF10** | Metal | 5.632 ms | **1.131 ms** | **4.98× wall · 4.23× kernel** |
+
+Cross-backend headlines at SF10:
+- Metal **fused** vs CPU **separate**: **16.4×** 🚀
+- Metal **fused** vs CPU **fused**: **7.9×**
+- Metal fused kernel = **473 GiB/s = 87% of M4 Max LPDDR5X peak**
+
+### Headline summary for v0.1.0 ship
+
+- **SUM SF10 HOT**: 2.87× (266 GiB/s sustained wall throughput)
+- **SUM SF10 COLD**: 2.12× — Metal wins cold at scale (zero-copy + UMA pays off)
+- **GROUP BY**: 1.93× consistent at both SF1 and SF10
+- **Multi-agg fusion at SF10**: 4.98× wall, **87% of memory-bandwidth ceiling**
+- **Hybrid planner correctly routes** SF1 SUM COLD → CPU based on the
+  small-N cold breakeven thresholds derived in the original consolidated bench
+
+These are the numbers in the v0.1.0 GitHub release notes.
+
+---
+
 ## 2026-05-09 (5× honest) — where we hit 5×, where we don't, and the path forward
 
 Re-bench summary on Apple M4 Max with the latest main. The user's
