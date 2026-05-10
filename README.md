@@ -38,36 +38,55 @@ The honest finding: for **streaming SUM on cold data**, CPU wins (DDR5 already s
 
 ## Quick start
 
-### Linux (CUDA)
+### Option A — load the prebuilt extension into DuckDB CLI
+
+Download the platform binary from the [v0.1.1 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.1), then:
+
+```bash
+# Linux (RTX/CUDA)
+duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
+  SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);"
+# -> [gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=CUDA)
+# -> 499999500000
+```
+
+Requires DuckDB v1.5.x (C API v1.2.0). `LOAD` needs `-unsigned` because the
+extension is unsigned community code; `INSTALL gpudb FROM community`
+(no `-unsigned` needed) lights up after [community-extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merges.
+
+### Option B — build from source
+
 ```bash
 git clone https://github.com/singhpratech/duckdbgpumetaldbram.git
 cd duckdbgpumetaldbram
 
-# one-time: CUDA toolkit
-# wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-# sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt update
+# Linux (CUDA): one-time toolkit install if needed
 # sudo apt install -y cuda-toolkit-13-0
-# ~/.bashrc: export PATH=/usr/local/cuda/bin:$PATH
+# export PATH=/usr/local/cuda/bin:$PATH
 
-# build (auto-detects CUDA; falls back to CPU-only if absent)
+# macOS (Metal): brew install cmake
+
+# build (auto-detects CUDA on Linux, Metal on macOS, CPU-only otherwise).
+# Produces a loadable .duckdb_extension with metadata footer attached.
 ./scripts/build.sh
 
+# load + query via DuckDB CLI
+duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.duckdb_extension'; \
+  SELECT gpu_sum(range::BIGINT) FROM range(1000000);"
+
+# OR run via the embedded SQL CLI shipped in this repo
+./build-linux/bin/gpudb-sql --sql "SELECT gpu_sum(range::BIGINT) FROM range(1000000);"
+```
+
+### Option C (TPC-H reproducibility)
+
+```bash
 # get TPC-H SF1 data (downloads DuckDB CLI to .tools/, ~1 GB lineitem)
 SF=1 ./scripts/gen_tpch.sh
 
-# run a SQL query against the GPU
-./build-linux/bin/gpudb-sql --sql \
-  "SELECT gpu_sum(v) FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet');"
-# -> [gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=CUDA)
+duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.duckdb_extension'; \
+  SELECT gpu_sum(v) FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet') t(v);"
 # -> 18005322964949
-```
-
-### macOS (Metal)
-```bash
-brew install cmake
-./scripts/build.sh
-./build-macos/bin/gpudb-sql --sql "SELECT gpu_sum(range::BIGINT) FROM range(100000000);"
-# -> backend=METAL
 ```
 
 ## What you get
@@ -139,8 +158,8 @@ xfail are now strict positive assertions (PR #22).
 
 ### In flight (v0.1.1)
 - [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [ ] DuckDB loadable extension metadata footer (required for `LOAD '...so'` from CLI)
-- [ ] Submission to [DuckDB Community Extensions](https://github.com/duckdb/community-extensions) → `INSTALL gpudb FROM community`
+- [x] **DuckDB loadable extension metadata footer** — works with `duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'"`
+- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community`
 
 ### Roadmap (v0.2.0+)
 - [ ] Real Metal hash-join sort-merge (currently a CPU-fallback scaffold; CUDA hash-join is real)
