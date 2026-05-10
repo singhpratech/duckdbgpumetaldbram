@@ -40,7 +40,7 @@ The honest finding: for **streaming SUM on cold data**, CPU wins (DDR5 already s
 
 ### Option A — load the prebuilt extension into DuckDB CLI
 
-Download the platform binary from the [v0.1.1 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.1), then:
+Download the platform binary from the [v0.1.2 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.2), then:
 
 ```bash
 # Linux (RTX/CUDA)
@@ -156,10 +156,12 @@ xfail are now strict positive assertions (PR #22).
 - [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
 - [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
 
-### In flight (v0.1.1)
+### Shipped in v0.1.2
 - [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [x] **DuckDB loadable extension metadata footer** — works with `duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'"`
-- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community`
+- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal). Prebuilt binaries attached to [v0.1.2 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.2).
+
+### In flight (v0.1.3)
+- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed)
 
 ### Roadmap (v0.2.0+)
 - [ ] Real Metal hash-join sort-merge (currently a CPU-fallback scaffold; CUDA hash-join is real)
