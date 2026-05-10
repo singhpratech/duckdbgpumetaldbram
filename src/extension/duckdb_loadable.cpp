@@ -1,17 +1,15 @@
 // duckdb_loadable.cpp — DuckDB C API loadable-extension entry point.
 //
-// Status: the entry point function compiles and is exported from the .so,
-// BUT direct `LOAD '...'` from the DuckDB CLI requires a metadata footer
-// (296 bytes: signature + length + 8x32-byte fields) appended to the .so.
-// That packaging is normally done by the official DuckDB extension-template
-// build pipeline. We ship the entry point + .duckdb_extension alias so it's
-// ready for that template; the next PR will add the footer-append step.
+// LOADABLE: yes. The .duckdb_extension file is produced by appending the
+// 528-byte metadata footer (scripts/build_helpers/append_extension_metadata.py)
+// to the libgpudb_duckdb.so. Resulting file works with `LOAD '/path/...'`
+// from the DuckDB CLI when launched with `-unsigned`.
 //
-// In the meantime, the working demo is the `gpudb-sql` CLI (benchmark/
-// sql_demo_main.cpp) which embeds DuckDB in-process and registers the
-// same functions via gpudb_ext::register_gpu_sum. The PUBLIC-facing way
-// (INSTALL FROM community + LOAD) lights up once the metadata footer is
-// added and we submit to https://github.com/duckdb/community-extensions.
+// DuckDB looks up two C symbols by extension-name convention:
+//   <name>_init_c_api   — registers the extension's functions
+//   <name>_version      — DuckDB-version compatibility stamp
+// The extension name in description.yml is `gpudb`, so the symbols are
+// gpudb_init_c_api and gpudb_version (NOT gpudb_duckdb_*).
 
 #include "gpu_sum_extension.hpp"
 #include "duckdb.h"
@@ -22,7 +20,7 @@
 extern "C" {
 
 // Standard C API extension entry. DuckDB calls this once on LOAD.
-DUCKDB_EXTENSION_API bool gpudb_duckdb_init_c_api(
+DUCKDB_EXTENSION_API bool gpudb_init_c_api(
         duckdb_extension_info info,
         const struct duckdb_extension_access *access) {
     if (!access || !access->get_database) {
@@ -56,7 +54,7 @@ DUCKDB_EXTENSION_API bool gpudb_duckdb_init_c_api(
 }
 
 // Required version stamp for unsigned-LOAD compatibility checks.
-DUCKDB_EXTENSION_API const char *gpudb_duckdb_version() {
+DUCKDB_EXTENSION_API const char *gpudb_version() {
     return duckdb_library_version();
 }
 
