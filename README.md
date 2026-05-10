@@ -116,10 +116,9 @@ Backend selection is automatic: CUDA if a device is found at runtime, else Metal
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. A few cases are currently
-documented as expected fails and are tracked on `fix/window-partition-bug`:
-the partitioned running-sum window, the unbounded `OVER ()` window, the
-running-sum across chunk boundaries, and mid-cardinality GROUP BY totals.
+PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.1.0: 46 / 46 pass,
+0 fail, 0 expected fail. The window-function bugs that were previously
+xfail are now strict positive assertions (PR #22).
 
 CI runs on every push: Linux (Ubuntu 24.04, CPU-only) + macOS-14 (CPU + Metal scaffold).
 
@@ -136,8 +135,8 @@ CI runs on every push: Linux (Ubuntu 24.04, CPU-only) + macOS-14 (CPU + Metal sc
 - [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
 - [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
 
-### In flight (v0.1.1, target one week from launch)
-- [ ] Fixes for the 4 bugs in `KNOWN_ISSUES.md` (window+PARTITION BY non-determinism, OVER () segfault, OVER (ORDER BY) chunk-boundary state loss, mid-cardinality GROUP BY wrong totals)
+### In flight (v0.1.1)
+- [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
 - [ ] DuckDB loadable extension metadata footer (required for `LOAD '...so'` from CLI)
 - [ ] Submission to [DuckDB Community Extensions](https://github.com/duckdb/community-extensions) → `INSTALL gpudb FROM community`
 
