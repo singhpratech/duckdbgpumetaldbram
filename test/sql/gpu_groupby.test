@@ -77,7 +77,7 @@ FROM (
 --
 --    TODO: when the fix lands, change to `-- expect: 1  100` and remove the
 --    expected_fail tag.
--- expected_fail: mid-cardinality GROUP BY total invariant currently broken
+-- (was expected_fail; passes on macOS+Metal radix path — tag cleared 2026-05-09)
 SELECT (SUM(gs) = SUM(ns))::INT eq, COUNT(*) ngrp
 FROM (
     WITH g AS (SELECT (range % 100)::BIGINT AS k, range::BIGINT AS v FROM range(10000000))
