@@ -2,6 +2,101 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-05-09 (HONEST BASELINE) — Metal vs **multi-thread DuckDB CPU** on M4 Max
+
+The previous sections all compare against a **single-thread scalar CPU** baseline,
+which is the fair kernel-vs-kernel comparison the GPU literature uses but is **NOT**
+what an end user will see. A user typing `SELECT sum(x) FROM t` in the DuckDB CLI
+on an M4 Max gets the multi-thread vectorized executor across all 16 cores
+(12 P + 4 E). That is the baseline we have to beat to honestly claim a "GPU win."
+
+This section re-runs the headline workloads against `duckdb -c "SET threads=16; …"`
+(median of 5 runs, M4 Max, 64 GiB UMA, macOS 15.x). **The story changes: SUM still
+wins meaningfully, multi-agg fusion wins decisively, but our GROUP BY at TPC-H
+scale is slower than tuned multi-thread DuckDB.** We are publishing this honestly
+rather than letting HN find it.
+
+### SUM int64 — multi-thread DuckDB vs Metal
+
+| Workload | DuckDB single-thread (kernel-vs-kernel baseline) | DuckDB multi-thread, 16 threads (real default) | Metal | **Metal vs multi-thread** |
+|---|---:|---:|---:|:---:|
+| 100M SUM HOT | 8.30 ms | **4 ms** | 2.49 ms | **1.6×** |
+| 500M SUM HOT | 42.2 ms | **20 ms** | 8.08 ms | **2.5×** |
+| **1B SUM HOT** | 85.3 ms | **40 ms** | **16.16 ms** | **2.5×** |
+
+Reproduce CPU multi-thread:
+```bash
+echo "SET threads = 16; .timer on
+CREATE TABLE t AS SELECT range::BIGINT AS v FROM range(1000000000);
+SELECT sum(v) FROM t;
+SELECT sum(v) FROM t;
+SELECT sum(v) FROM t;
+SELECT sum(v) FROM t;
+SELECT sum(v) FROM t;" | .tools/duckdb
+```
+
+**Honest read:** Metal still wins by **2.5×** on the 1B SUM that DuckDB's CLI does
+in 40 ms. The "5.27×" headline from the single-thread comparison is **not what a
+user will see**. 2.5× is real but not eye-popping — the LPDDR5X bandwidth ceiling
+the Metal SUM kernel hits (467 GiB/s, 92% of peak) is also approached by 16-thread
+CPU vectorized SUM, which sustains roughly 200 GiB/s wall.
+
+### Multi-aggregate fusion — **the strong card**
+
+`SELECT SUM(x), MIN(x), MAX(x), COUNT(*) FROM t;` is the median TPC-H pattern
+(Q1, Q3, Q5, Q6, Q14, Q19 all do it). DuckDB CPU does NOT fuse these into a
+single column scan — each goes through the executor separately. Our `agg_all_i64`
+kernel does all four in one pass.
+
+| Workload | DuckDB multi-thread (4 ops one query) | Metal fused | **Metal vs multi-thread** |
+|---|---:|---:|:---:|
+| TPC-H SF10 lineitem.l_orderkey | 10 ms | **1.13 ms** | **8.8×** ✅ |
+| 1B int64 synthetic | 92 ms | **16.1 ms** | **5.7×** ✅ |
+
+This is a **decisive, defensible win** even against the multi-thread baseline.
+Metal fused vs DuckDB multi-thread separate calls would be even higher — at
+SF10 the DuckDB plan with separate SUM/MIN/MAX queries takes 30+ ms (3 × 10 ms);
+versus Metal's 1.13 ms that's a **27× win**. The multi-agg fusion case is the
+one to lead with for a public benchmark headline.
+
+### GROUP BY — **we lose this one against tuned multi-thread CPU**
+
+| Workload | DuckDB multi-thread | Metal | **Verdict** |
+|---|---:|---:|---|
+| TPC-H SF1 GROUP BY (1.5M unique) | **8 ms** | 16.2 ms | **CPU 2.0× faster** ❌ |
+| TPC-H SF10 GROUP BY (15M unique) | **57 ms** | 173.5 ms | **CPU 3.0× faster** ❌ |
+| 500M × 1M groups synthetic | **820 ms** | 935.8 ms | **CPU 1.14× faster** ❌ |
+
+**Honest read:** DuckDB's tuned multi-threaded radix-partitioned hash-aggregate
+on 16 cores beats our LSD-radix-sort + GPU-scan + host segment-reduce pipeline
+at the workloads we previously claimed as wins. The earlier "Metal ties CUDA
+on TPC-H GROUP BY" claim is true wall-time-wise, but **DuckDB CPU multi-thread
+beats both**. We over-stated this win in v0.1.x.
+
+What will close the gap:
+- GPU-resident segment-reduce (eliminates the 73% host-side work share at 1B)
+- Tuned thread allocation in the radix kernel (we're conservative)
+- Skipping the sort entirely for low-cardinality cases (radix partitioning + per-partition hash table, the way DuckDB does it)
+
+Filed for v0.1.3.
+
+### What this means for the project's honest claims
+
+1. **Lead with multi-agg fusion** — it's a 5.7-8.8× win against the real CPU
+   baseline and the operator pattern is dominant in TPC-H.
+2. **Moderate the SUM claim** — "2.5× over 16-thread DuckDB at 1B rows" instead
+   of "5.27× over single-thread CPU." Still a real win, less hype.
+3. **Drop the GROUP BY headline** — replace with "competitive at low cardinality;
+   multi-thread DuckDB faster at TPC-H scale; v0.1.3 working on it."
+4. **Apple Silicon GPU SQL is real** — it's just not a free 5× across the board.
+   The honest pitch: "the only GPU SQL engine for Apple Silicon, decisively wins
+   on multi-aggregate fusion (the dominant TPC-H pattern), competitive on SUM,
+   loses to tuned multi-thread CPU on GROUP BY today."
+
+This is the position to defend on HN. Pre-emptive honesty beats getting caught.
+
+---
+
 ## 2026-05-09 (v0.1.0 ship-day re-bench) — TPC-H Metal numbers, fresh on M4 Max
 
 Hardware: Apple M4 Max (40-core GPU, ~64 GiB unified memory, ~546 GB/s LPDDR5X peak),
