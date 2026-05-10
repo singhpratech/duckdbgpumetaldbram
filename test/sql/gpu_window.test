@@ -1,15 +1,10 @@
 # gpu_window SQL test — exercises gpu_sum used as a window function.
 #
-# State of the art (as of branch test/sql-suite-expand):
-#   * `gpu_sum(x) OVER (ORDER BY k)` running-sum: works
-#   * `gpu_sum(x) OVER ()` ungrouped scalar: SEGFAULTS (full-frame path
-#     not implemented in the aggregate state machine)
-#   * `gpu_sum(x) OVER (PARTITION BY g)` no order: produces the right total
-#     when invoked solo, but goes non-deterministic when another window
-#     function shares the same partition spec
-#   * `gpu_sum(x) OVER (PARTITION BY g ORDER BY k)` partitioned running
-#     sum: NON-DETERMINISTIC — sometimes wrong values, sometimes segfault.
-#     Memory corruption suspect. Tracked on branch fix/window-partition-bug.
+# All three previously-failing cases were fixed in fix/window-bugs-followup
+# by routing the per-state buffer through a process-global BufferPool indexed
+# by an opaque uint64 inside the state. That isolates the data from
+# DuckDB's raw-byte state copies (RadixPartitionedTupleData repartition)
+# and from CONSTANT_VECTOR-state OOB reads (WindowConstantAggregator).
 #
 # Run via:
 #   ./scripts/run_sql_tests.sh gpu_window
@@ -33,14 +28,8 @@ FROM range(5);
 -- expect: 3  6   6
 -- expect: 4  10  10
 
--- 3. Running sum, larger range — gpu_sum loses its running state across
---    DuckDB chunk boundaries (default chunk size is 2048 but the window
---    plan splits into smaller frames). After ~15 rows the running sum
---    "resets" instead of accumulating. Documented as expected fail.
---
---    TODO when fixed: this should produce a clean ascending sequence
---    matching `sum(...) OVER (ORDER BY range)` row-for-row.
--- expected_fail: gpu_sum running sum loses state across chunk boundaries
+-- 3. Running sum, larger range. Verify the running sum does not reset
+--    across chunk boundaries on a 20-row input.
 SELECT r, gs, ns FROM (
     SELECT range AS r,
            gpu_sum(range::BIGINT) OVER (ORDER BY range) AS gs,
@@ -49,63 +38,31 @@ SELECT r, gs, ns FROM (
 ) WHERE r = 19;
 -- expect: 19  190  190
 
--- 4. SUM OVER () — gpu_sum SEGFAULTS on the unbounded-frame case.
---    The aggregate function callback does not have a window/finalize path
---    for "all rows, scalar broadcast", and DuckDB ends up dereferencing a
---    state that was never combined.
---
---    TODO: when finalize-for-window lands, swap to:
---      -- expect: 0  10  10
---      -- expect: 1  10  10
---      -- expect: 2  10  10
---      -- expect: 3  10  10
---      -- expect: 4  10  10
---    and remove the expected_fail tag.
--- expected_fail: gpu_sum OVER () segfaults — unbounded-frame window unimplemented
+-- 4. SUM OVER () — unbounded-frame window. DuckDB picks the
+--    WindowConstantAggregator for this, which calls our update() with a
+--    CONSTANT_VECTOR state pointer — the C API doesn't flatten that, so
+--    we must defend against it via the magic-word probe in the state.
 SELECT range AS r,
        gpu_sum(range::BIGINT) OVER () AS gs,
        sum(range::BIGINT)     OVER () AS ns
-FROM range(5);
+FROM range(5)
+ORDER BY r;
 -- expect: 0  10  10
 -- expect: 1  10  10
 -- expect: 2  10  10
 -- expect: 3  10  10
 -- expect: 4  10  10
 
--- 5. KNOWN BUG: SUM OVER (PARTITION BY g ORDER BY k).
---
--- Reproducer (10 rows, 3 partitions = range % 3, partition-running sum):
---   Native (correct) output, ordered by r:
---     r  partition  ns
---     0  0          0
---     1  1          1
---     2  2          2
---     3  0          3   = 0+3
---     4  1          5   = 1+4
---     5  2          7   = 2+5
---     6  0          9   = 0+3+6
---     7  1         12   = 1+4+7
---     8  2         15   = 2+5+8
---     9  0         18   = 0+3+6+9
---
---   gpu_sum output:
---     - Sometimes the first row of each partition shows 0 instead of the
---       value (e.g. r=2 → gs=0 not 2)
---     - Sometimes wildly wrong values across the whole result set
---     - Sometimes the process SEGFAULTs
---   The behaviour is NON-DETERMINISTIC — likely uninitialised state or
---   an out-of-bounds write in the partition-walk path.
---
--- Other agent on branch `fix/window-partition-bug` is investigating.
--- DO NOT delete this test when fixing — convert it to a strict positive
--- assertion (every row matches native) once stable.
---
--- TODO when fixed: replace expected_fail with the 10 expect: lines below.
--- expected_fail: PARTITION BY g ORDER BY k — non-deterministic wrong / segfault
+-- 5. SUM OVER (PARTITION BY g ORDER BY k). 10 rows, 3 partitions.
+--    Each partition has its own running sum. Verify gpu_sum matches
+--    native sum row-for-row. NOTE: ORDER BY r is required because the
+--    window operator parallelises across partitions and the row order
+--    out of the window pipeline is otherwise nondeterministic.
 SELECT range AS r,
        gpu_sum(range::BIGINT) OVER (PARTITION BY (range % 3) ORDER BY range) AS gs,
        sum(range::BIGINT)     OVER (PARTITION BY (range % 3) ORDER BY range) AS ns
-FROM range(10);
+FROM range(10)
+ORDER BY r;
 -- expect: 0  0   0
 -- expect: 1  1   1
 -- expect: 2  2   2

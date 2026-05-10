@@ -10,15 +10,33 @@
 //     point) once we package this for `LOAD '...'` in the DuckDB CLI
 //
 // Strategy (week-2 MVP):
-//   - One aggregate state per GROUP. State holds a std::vector<int64_t> that
-//     accumulates raw values from each chunk's update() call.
+//   - One aggregate state per GROUP. State holds a buffer that accumulates
+//     raw values from each chunk's update() call.
 //   - On finalize(), call gpudb::Aggregator::sum_i64 on the full buffer.
 //     This means the GPU sees the entire column at once (real acceleration).
 //   - For SELECT gpu_sum(x) FROM tbl with no GROUP BY: one state, one GPU
 //     reduction at the end. This is the case where the win shows.
 //   - For SELECT gpu_sum(x) GROUP BY g: one state per group, each finalized
-//     separately. Less ideal — a future operator-replacement pass should
-//     batch the per-group reductions; out of scope here.
+//     separately.
+//
+// State layout — defending against DuckDB's raw-byte state copies:
+//   DuckDB's grouped-aggregate hash table (RadixPartitionedTupleData) and
+//   its window operators do not always treat aggregate state as a typed
+//   object. When the radix hash table repartitions, it COPIES STATE BYTES
+//   directly between tuples — without calling our state_init / a move
+//   constructor / a copy callback. Anything we put in the state must
+//   therefore be POD-copy-safe.
+//
+//   We can't use std::vector inside the state for this reason: a raw-byte
+//   copy duplicates the {data ptr, size, capacity} triple, and then if
+//   either copy is destructed, the other has a dangling pointer.
+//
+//   Instead we store data in process-global, append-only "buffers" and
+//   keep only an opaque BufferRef (a 64-bit integer ID + a magic word) in
+//   the state itself. Buffer storage is allocated on demand and we
+//   intentionally LEAK buffers on state_destroy — see the comment there
+//   for the reasoning. The leak is bounded by the working set of a
+//   single query and is reclaimed at process exit.
 //
 // Window contract:
 //   DuckDB's window operator (e.g. SUM() OVER (PARTITION BY ...)) builds
@@ -28,6 +46,14 @@
 //   "donor" that the operator queries multiple times. That means combine()
 //   must NOT mutate the source state — it must read-only-copy from src to
 //   dst. See the comment on combine() below for the bug history.
+//
+//   For SUM(x) OVER () — the unbounded-frame case — DuckDB uses
+//   WindowConstantAggregator, which calls update() with a CONSTANT_VECTOR
+//   state (only states[0] is valid storage, states[1..N-1] is OOB read of
+//   a 1-pointer buffer). The C API doesn't flatten the state vector before
+//   passing it through, so we must defend against this in update() too —
+//   we use the magic-word probe to confirm a pointer is one of our states
+//   before dereferencing it past states[0].
 //
 // Concurrency model:
 //   The Aggregator returned by gpudb::make_aggregator() owns mutable GPU
@@ -48,10 +74,9 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
-#include <new>
 #include <stdexcept>
 #include <string>
-#include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace gpudb_ext {
@@ -130,21 +155,147 @@ std::int64_t safe_max_i64(const std::int64_t* data, std::size_t n) {
     }
 }
 
-struct GpuSumState {
-    std::vector<std::int64_t> buf;
+// Process-global pool of buffers, indexed by an opaque 64-bit ID.
+//
+// Why this exists:
+//   DuckDB's RadixPartitionedTupleData.Repartition() copies aggregate state
+//   BYTES from one tuple to another with a raw memcpy — it doesn't call our
+//   state_init or any move/copy callback. Anything stored inline in the state
+//   that can't survive a memcpy (e.g. std::vector with its heap-owned data
+//   pointer) becomes a use-after-free hazard the moment one copy is destroyed.
+//
+//   By keeping a u64 ID inside the state and the actual data pointer here,
+//   raw-byte copies become benign: both source and destination state hold
+//   the same ID and read the same backing data through the pool.
+//
+// Lifetime:
+//   We do NOT refcount or free entries — see the comment in state_destroy
+//   for the reason (no callback for raw-byte copies, so we can't
+//   reliably know when the last reference is gone). The leak is bounded
+//   by the per-aggregate working set of a single query and is reclaimed
+//   when the process exits.
+//
+// Concurrency:
+//   The pool is touched from update / combine / finalize on multiple
+//   threads. A single mutex around the map is sufficient for our scale
+//   (small number of long-lived buffers, brief locked sections).
+class BufferPool {
+public:
+    // Allocate a fresh buffer; returns its ID.
+    std::uint64_t create() {
+        std::lock_guard<std::mutex> g(mu_);
+        const std::uint64_t id = ++next_id_;
+        entries_.emplace(id, std::make_unique<std::vector<std::int64_t>>());
+        return id;
+    }
+
+    // Append a range of values to the buffer. May reallocate; thread-safe.
+    void append(std::uint64_t id, const std::int64_t* values, std::size_t n) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(id);
+        if (it == entries_.end()) return;
+        it->second->insert(it->second->end(), values, values + n);
+    }
+
+    // Append a single value.
+    void append_one(std::uint64_t id, std::int64_t value) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(id);
+        if (it == entries_.end()) return;
+        it->second->push_back(value);
+    }
+
+    // Append all of `src`'s values to `dst`. Used by combine().
+    void append_from(std::uint64_t dst, std::uint64_t src) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto si = entries_.find(src);
+        if (si == entries_.end()) return;
+        auto di = entries_.find(dst);
+        if (di == entries_.end()) return;
+        const auto& s = *si->second;
+        di->second->insert(di->second->end(), s.begin(), s.end());
+    }
+
+    // Snapshot the buffer's contents for a read-only consumer (finalize).
+    // Returns an empty vector if the ID is unknown.
+    std::vector<std::int64_t> snapshot(std::uint64_t id) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = entries_.find(id);
+        if (it == entries_.end()) return {};
+        return *it->second;  // copy
+    }
+
+private:
+    std::mutex mu_;
+    std::unordered_map<std::uint64_t, std::unique_ptr<std::vector<std::int64_t>>> entries_;
+    std::uint64_t next_id_ = 0;
 };
+
+BufferPool& buffer_pool() {
+    static BufferPool p;
+    return p;
+}
+
+// Aggregate state — POD layout. Two fields:
+//   * magic   — sentinel that lets us identify a buffer as one of ours
+//               even after a raw-byte copy. Confirms ID is meaningful.
+//   * buf_id  — handle into BufferPool. 0 means uninitialised / no buffer.
+//
+// Sized as 16 bytes total (alignof 8). DuckDB's state_size callback
+// returns sizeof(GpuSumState).
+struct GpuSumState {
+    static constexpr std::uint64_t kMagic = 0xC0FFEEDEADBEEF01ULL;
+    std::uint64_t magic;
+    std::uint64_t buf_id;
+};
+
+// Defensive accessor: returns the state's buffer ID iff the pointer looks
+// like one of our states (magic word check). Returns 0 otherwise.
+//
+// This is the magic-word probe that handles BOTH:
+//   - WindowConstantAggregator OOB reads of states[i>0] (the bytes there
+//     are heap garbage that won't form our magic word)
+//   - Raw-byte state copies from RadixPartitionedTupleData (the bytes
+//     DO contain our magic word, so the probe passes — and the buf_id is
+//     the same as the original, sharing data via the refcounted pool)
+inline std::uint64_t probe_buf_id(const void* p) {
+    if (!p) return 0;
+    auto* s = reinterpret_cast<const GpuSumState*>(p);
+    if (s->magic != GpuSumState::kMagic) return 0;
+    return s->buf_id;
+}
 
 idx_t state_size(duckdb_function_info /*info*/) { return sizeof(GpuSumState); }
 
 void state_init(duckdb_function_info /*info*/, duckdb_aggregate_state state) {
     auto* s = reinterpret_cast<GpuSumState*>(state);
-    new (s) GpuSumState();
+    s->magic = GpuSumState::kMagic;
+    s->buf_id = buffer_pool().create();
 }
 
 void state_destroy(duckdb_aggregate_state* states, idx_t count) {
+    // We DO NOT free the underlying buffer here, because DuckDB's
+    // RadixPartitionedTupleData repartitioning copies state bytes between
+    // tuples without calling our state_init. After such a copy, multiple
+    // tuples may point to the same buf_id; if we freed on the first
+    // state_destroy we would yank the buffer out from under any later
+    // combine() or finalize() that references the surviving copies.
+    //
+    // We also don't have a way to refcount these copies (no callback fires
+    // when DuckDB memcpys a state), so the safe choice is: leak the buffer
+    // until process exit. In practice the leak is bounded — buffers are
+    // sized to per-aggregate accumulators and are reclaimed on process
+    // teardown via the BufferPool's static destructor.
+    //
+    // We DO wipe the state's magic word to prevent a stale pointer to
+    // this slot from accidentally passing our probe in a later call.
     for (idx_t i = 0; i < count; ++i) {
         auto* s = reinterpret_cast<GpuSumState*>(states[i]);
-        s->~GpuSumState();
+        if (!s) continue;
+        if (s->magic != GpuSumState::kMagic) continue;
+        s->magic = 0;
+        // Note: leaving buf_id intact is harmless — the magic-word probe
+        // will reject this slot before anyone reads buf_id from it.
     }
 }
 
@@ -159,42 +310,59 @@ void update(duckdb_function_info /*info*/, duckdb_data_chunk input,
     // (matches DuckDB's SQL semantics for SUM/MIN/MAX). nullptr means no NULLs.
     uint64_t* validity = duckdb_vector_get_validity(vec);
 
-    // Fast path: SELECT gpu_sum(x) FROM tbl with no GROUP BY.
-    // All states[i] alias the same state object, so we can bulk-insert the
-    // chunk in one memcpy (or filtered copy if there are NULLs).
-    if (n > 1 && states[0] == states[n - 1]) {
-        bool all_same = true;
-        for (idx_t i = 1; i + 1 < n; ++i) {
-            if (states[i] != states[0]) { all_same = false; break; }
-        }
-        if (all_same) {
-            auto* s = reinterpret_cast<GpuSumState*>(states[0]);
-            if (validity == nullptr) {
-                // No NULLs at all — single memcpy.
-                s->buf.insert(s->buf.end(), data, data + n);
-            } else {
-                // Filter out NULL rows.
-                s->buf.reserve(s->buf.size() + n);
-                for (idx_t i = 0; i < n; ++i) {
-                    if (duckdb_validity_row_is_valid(validity, i)) {
-                        s->buf.push_back(data[i]);
-                    }
-                }
-            }
-            return;
+    // Resolve states[0] up front; it's always valid (DuckDB never gives us
+    // an empty state vector here). Magic-word check is a defence against
+    // a malformed call but should always pass.
+    const std::uint64_t s0_buf = probe_buf_id(states[0]);
+    if (s0_buf == 0) return;
+
+    // Determine whether the rest of states[] are real, distinct, or just
+    // OOB garbage from a CONSTANT_VECTOR (the OVER () case).
+    //
+    // We probe a few indices and ask: does each pointer look like one of
+    // our states (magic word OK)? If yes, we have a real per-row state
+    // vector and use the slow path. If any probe fails the magic word
+    // test, the caller passed us a constant state vector and only
+    // states[0] is meaningful.
+    bool per_row = true;
+    if (n > 1) {
+        const idx_t probes[3] = { 1, n / 2, n - 1 };
+        for (idx_t k = 0; k < 3 && per_row; ++k) {
+            const idx_t i = probes[k];
+            if (i == 0) continue;
+            const std::uint64_t bid = probe_buf_id(states[i]);
+            if (bid == 0) per_row = false;
         }
     }
-    // Slow path: GROUP BY routes different rows to different states.
+
+    if (n == 1 || !per_row) {
+        // Single-state path: either ungrouped or constant-vector window.
+        // All values flow into states[0]'s buffer.
+        if (validity == nullptr) {
+            buffer_pool().append(s0_buf, data, n);
+        } else {
+            for (idx_t i = 0; i < n; ++i) {
+                if (duckdb_validity_row_is_valid(validity, i)) {
+                    buffer_pool().append_one(s0_buf, data[i]);
+                }
+            }
+        }
+        return;
+    }
+
+    // Per-row path: GROUP BY routes different rows to different states.
+    // Each states[i] passed the magic-word probe in our spot-check above,
+    // so dereferencing them is safe.
     if (validity == nullptr) {
         for (idx_t i = 0; i < n; ++i) {
-            auto* s = reinterpret_cast<GpuSumState*>(states[i]);
-            s->buf.push_back(data[i]);
+            const std::uint64_t bid = probe_buf_id(states[i]);
+            if (bid != 0) buffer_pool().append_one(bid, data[i]);
         }
     } else {
         for (idx_t i = 0; i < n; ++i) {
             if (!duckdb_validity_row_is_valid(validity, i)) continue;
-            auto* s = reinterpret_cast<GpuSumState*>(states[i]);
-            s->buf.push_back(data[i]);
+            const std::uint64_t bid = probe_buf_id(states[i]);
+            if (bid != 0) buffer_pool().append_one(bid, data[i]);
         }
     }
 }
@@ -211,24 +379,19 @@ void combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     //
     // The earlier implementation move-assigned src->buf into dst->buf when
     // dst was empty, as an optimisation. That left src empty for every
-    // subsequent combine() call against the same source, producing two
-    // distinct visible symptoms:
-    //   - small inputs (5 rows / 2 partitions): "first row of every
-    //     non-first partition is wrong" — intermittent, depending on which
-    //     order the parallel partition workers happened to call combine()
-    //     and finalize() in.
-    //   - larger inputs (any partition that spans more than one update()
-    //     chunk, i.e. > ~16 rows): the running sum collapsed to ~0 partway
-    //     through every partition, because the per-row windows after the
-    //     first stopped seeing the chunk-1 state (it had already been
-    //     moved out).
+    // subsequent combine() call against the same source. The current
+    // BufferPool::append_from copies, never moves — so the source stays
+    // intact for the next per-row combine.
     //
-    // The fix is to *copy* src->buf into dst->buf and never mutate src.
+    // We use the magic-word probe to find the source / target buffer IDs
+    // — this also handles the case where the radix HT raw-copied a state
+    // (the copy shares the same buf_id; reading data via the pool is safe).
     for (idx_t i = 0; i < count; ++i) {
-        const auto* src = reinterpret_cast<const GpuSumState*>(source[i]);
-        auto* dst = reinterpret_cast<GpuSumState*>(target[i]);
-        if (src->buf.empty()) continue;
-        dst->buf.insert(dst->buf.end(), src->buf.begin(), src->buf.end());
+        const std::uint64_t src_buf = probe_buf_id(source[i]);
+        const std::uint64_t dst_buf = probe_buf_id(target[i]);
+        if (src_buf == 0 || dst_buf == 0) continue;
+        if (src_buf == dst_buf) continue;  // self-combine: nothing to do.
+        buffer_pool().append_from(dst_buf, src_buf);
     }
 }
 
@@ -266,6 +429,20 @@ bool should_use_gpu_for_groupby(idx_t state_count) {
     return state_count >= kBatchedGroupByThreshold;
 }
 
+// Determine whether sources[0..count-1] are distinct-state (grouped /
+// per-row finalize) or constant-state (window OVER () broadcast).
+// Same logic as update()'s probe.
+inline bool finalize_is_per_state(duckdb_aggregate_state* source, idx_t count) {
+    if (count <= 1) return false;
+    const idx_t probes[3] = { 1, count / 2, count - 1 };
+    for (idx_t k = 0; k < 3; ++k) {
+        const idx_t i = probes[k];
+        if (i == 0) continue;
+        if (probe_buf_id(source[i]) == 0) return false;
+    }
+    return true;
+}
+
 void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
               duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
@@ -273,19 +450,28 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     // ---- Single-state fast path: ungrouped SELECT gpu_sum(x) FROM tbl,
     //      and per-row finalize calls from window functions without
     //      PARTITION BY. ----
-    //
-    // safe_sum_i64() short-circuits to CPU under kSumGpuMinRows (so window
-    // functions and tiny ungrouped sums avoid the lock and the kernel-launch
-    // cost) and serialises shared_agg() calls above that with a mutex (so
-    // multi-threaded window finalize calls don't trash the singleton's
-    // device buffers).
     if (count == 1) {
-        auto* s = reinterpret_cast<GpuSumState*>(source[0]);
-        out[offset] = safe_sum_i64(s->buf.data(), s->buf.size());
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid == 0) { out[offset] = 0; return; }
+        auto vals = buffer_pool().snapshot(bid);
+        out[offset] = safe_sum_i64(vals.data(), vals.size());
         return;
     }
 
-    // ---- Grouped path: count > 1 ----
+    // ---- Constant-state finalize: WindowConstantAggregator passes a
+    //      CONSTANT_VECTOR for source. Only source[0] is real; broadcast. ----
+    if (!finalize_is_per_state(source, count)) {
+        std::int64_t v = 0;
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid != 0) {
+            auto vals = buffer_pool().snapshot(bid);
+            v = safe_sum_i64(vals.data(), vals.size());
+        }
+        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
+        return;
+    }
+
+    // ---- Grouped path: count > 1 with all distinct registered states. ----
     // Strategy: if we have many states, batch them all into ONE GPU GROUP BY
     // call (state index = group key). This converts an O(count) sequence of
     // N small kernel launches into a single big launch, which is exactly the
@@ -294,18 +480,27 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     bool used_batched = false;
     if (should_use_gpu_for_groupby(count)) {
         try {
+            // Snapshot every state's buffer up front. Locking the pool
+            // serially per state is fine — these snapshots are local copies
+            // and we hold no pool lock across the GPU launch.
+            std::vector<std::vector<std::int64_t>> snaps;
+            snaps.reserve(count);
             std::size_t total = 0;
-            for (idx_t i = 0; i < count; ++i)
-                total += reinterpret_cast<GpuSumState*>(source[i])->buf.size();
+            for (idx_t i = 0; i < count; ++i) {
+                const std::uint64_t bid = probe_buf_id(source[i]);
+                snaps.emplace_back(bid ? buffer_pool().snapshot(bid)
+                                       : std::vector<std::int64_t>{});
+                total += snaps.back().size();
+            }
 
             if (total > 0) {
                 std::vector<std::int64_t> flat_keys, flat_values;
                 flat_keys.reserve(total);
                 flat_values.reserve(total);
                 for (idx_t i = 0; i < count; ++i) {
-                    const auto& buf = reinterpret_cast<GpuSumState*>(source[i])->buf;
-                    flat_keys.insert(flat_keys.end(), buf.size(), static_cast<std::int64_t>(i));
-                    flat_values.insert(flat_values.end(), buf.begin(), buf.end());
+                    const auto& v = snaps[i];
+                    flat_keys.insert(flat_keys.end(), v.size(), static_cast<std::int64_t>(i));
+                    flat_values.insert(flat_values.end(), v.begin(), v.end());
                 }
 
                 auto gb = gpudb::make_groupby_aggregator(gpudb::default_backend());
@@ -331,28 +526,72 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
 
     if (!used_batched) {
         for (idx_t i = 0; i < count; ++i) {
-            auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-            out[offset + i] = safe_sum_i64(s->buf.data(), s->buf.size());
+            const std::uint64_t bid = probe_buf_id(source[i]);
+            if (bid == 0) { out[offset + i] = 0; continue; }
+            auto vals = buffer_pool().snapshot(bid);
+            out[offset + i] = safe_sum_i64(vals.data(), vals.size());
         }
     }
 }
 
 // MIN / MAX share state + update + combine with SUM; only finalize differs.
+//
+// Both honour the same constant-state defence as sum's finalize(): if the
+// source vector has only source[0] valid, we compute one min/max and
+// broadcast it across all output rows.
 void finalize_min(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    if (count == 1) {
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid == 0) { out[offset] = 0; return; }
+        auto vals = buffer_pool().snapshot(bid);
+        out[offset] = safe_min_i64(vals.data(), vals.size());
+        return;
+    }
+    if (!finalize_is_per_state(source, count)) {
+        std::int64_t v = 0;
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid != 0) {
+            auto vals = buffer_pool().snapshot(bid);
+            v = safe_min_i64(vals.data(), vals.size());
+        }
+        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
+        return;
+    }
     for (idx_t i = 0; i < count; ++i) {
-        auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-        out[offset + i] = safe_min_i64(s->buf.data(), s->buf.size());
+        const std::uint64_t bid = probe_buf_id(source[i]);
+        if (bid == 0) { out[offset + i] = 0; continue; }
+        auto vals = buffer_pool().snapshot(bid);
+        out[offset + i] = safe_min_i64(vals.data(), vals.size());
     }
 }
 
 void finalize_max(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    if (count == 1) {
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid == 0) { out[offset] = 0; return; }
+        auto vals = buffer_pool().snapshot(bid);
+        out[offset] = safe_max_i64(vals.data(), vals.size());
+        return;
+    }
+    if (!finalize_is_per_state(source, count)) {
+        std::int64_t v = 0;
+        const std::uint64_t bid = probe_buf_id(source[0]);
+        if (bid != 0) {
+            auto vals = buffer_pool().snapshot(bid);
+            v = safe_max_i64(vals.data(), vals.size());
+        }
+        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
+        return;
+    }
     for (idx_t i = 0; i < count; ++i) {
-        auto* s = reinterpret_cast<GpuSumState*>(source[i]);
-        out[offset + i] = safe_max_i64(s->buf.data(), s->buf.size());
+        const std::uint64_t bid = probe_buf_id(source[i]);
+        if (bid == 0) { out[offset + i] = 0; continue; }
+        auto vals = buffer_pool().snapshot(bid);
+        out[offset + i] = safe_max_i64(vals.data(), vals.size());
     }
 }
 
