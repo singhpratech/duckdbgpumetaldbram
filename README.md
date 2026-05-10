@@ -159,11 +159,11 @@ PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.1.0: 46 / 46 pass,
 0 fail, 0 expected fail. The window-function bugs that were previously
 xfail are now strict positive assertions (PR #22).
 
-**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 77 unit tests → smoke benchmarks → 46-query SQL suite). The hosted CI workflow exists at [`.github/workflows/ci.yml.disabled`](.github/workflows/ci.yml.disabled) and is staged for re-enable; today the project relies on local validation against the dual-machine dev fleet (RTX 4090 + M4 Max).
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 46-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Roadmap
 
-### Shipped on `main` (v0.1.0 launch candidate)
+### Shipped on `main` (v0.1.0 – v0.1.2)
 - [x] CUDA backend: SUM/MIN/MAX (one-shot + resident)
 - [x] CUDA GROUP BY hash aggregate (open-addressing + atomicCAS, ~520 GiB/s on RTX 4090)
 - [x] **CUDA hash join probe** (1M build × 10M probe @ 97% sel: 3.7× wall, 107× kernel over CPU)
@@ -174,11 +174,15 @@ xfail are now strict positive assertions (PR #22).
 - [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
 - [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
 
-### Shipped in v0.1.3
+### Shipped in v0.1.2
 - [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal). Prebuilt binaries attached to [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
+- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal).
 
-### In flight (v0.1.3)
+### Shipped in v0.1.3
+- [x] **Hybrid Metal GROUP BY** — 32K-partition slot-lock + radix-opt with auto-dispatch (env override `GPUDB_METAL_GROUPBY_PATH`). Flipped TPC-H SF10 `l_orderkey` (15M unique) from CPU 1.78× faster to Metal 1.30× faster vs DuckDB CPU 16-thread. 9 wins / 1 honest loss on the lineitem scorecard.
+- [x] Prebuilt v0.1.3 binaries (Linux CUDA + macOS Metal) attached to the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
+
+### In flight (v0.1.4)
 - [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed)
 
 ### Roadmap (v0.2.0+)
