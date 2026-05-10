@@ -1483,3 +1483,30 @@ cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb
 ./scripts/build.sh
 ./build-linux/bin/gpudb-bench --rows 100000000 --runs 5
 ```
+
+---
+
+## 2026-05-09 (post-launch verification) — TPC-H SF1 CUDA GROUP BY re-bench
+
+Triggered while reviewing community-extensions PR #1898. The README had
+listed "GROUP BY 6M TPC-H lineitem | 81.7 ms | 16.9 ms | 4.8× over CPU"
+in the headline numbers table; the 81.7 ms CPU baseline did not match
+recent SF1 re-bench rows. Fresh run on Linux/RTX 4090 to settle it.
+
+Hardware: Linux, NVIDIA RTX 4090 Laptop (sm_89), CUDA 13.0, 20-core CPU.
+Data: data/tpch_sf1/lineitem_orderkey.gpudb (6,001,215 rows, 1.5M unique).
+Command: `./build-linux/bin/gpudb-groupby-bench --input-keys data/tpch_sf1/lineitem_orderkey.gpudb --backend all --runs 5`
+
+| Backend                              | wall (median, 5 runs) | kernel | xfer  | input throughput |
+|---|---:|---:|---:|---:|
+| CPU (OpenMP, 20 threads)             | 53.28 ms              | —      | —     | 1.68 GiB/s       |
+| CPU (OpenMP, 1 thread; OMP_NUM_THREADS=1) | 54.08 ms        | —      | —     | 1.65 GiB/s       |
+| CUDA (RTX 4090 Laptop)               | **14.98 ms**          | 1.27 ms | 9.53 ms | 5.99 GiB/s (kernel 70.35 GiB/s) |
+
+**CUDA wall over CPU: 3.56× (single-thread baseline) / 3.56× (20-thread).**
+
+Note: at 1.5M groups, OpenMP CPU does not scale with threads — the
+mid-cardinality regime fix (PR #21) routes per-state work to a serial
+path because the inter-thread coordination overhead dominates. The README
+"4.8× over CPU" line was from a pre-PR #21 baseline (81.7 ms CPU) and
+has been updated to **3.6× over CPU** (54.1 ms CPU vs 15.0 ms CUDA).
