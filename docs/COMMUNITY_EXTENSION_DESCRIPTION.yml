@@ -1,68 +1,89 @@
 # READY-TO-SUBMIT description.yml for duckdb/community-extensions.
 #
-# v0.1.0 ship state (2026-05-09):
-#   ref pinned to v0.1.0 (released)
+# v0.1.3 ship state (2026-05-10):
+#   ref pinned to v0.1.3 = 3ebcd764d28d16848cb11c49ad85d2a93819747d
 #   To submit: copy this file to
 #     <fork-of-duckdb/community-extensions>/extensions/gpudb/description.yml
 #   then open a PR. Schema reference:
 #     https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
+#
+# All Metal numbers below are vs DuckDB CPU multi-thread baseline
+# (`duckdb -c "SET threads=16"` on M4 Max), the actual user-visible CLI default.
+# CUDA numbers are vs single-thread CPU (clean kernel comparison).
 
 extension:
   name: gpudb
-  description: |
-    GPU-accelerated analytical operators for DuckDB.
-    Backends: NVIDIA CUDA (Linux/Windows) and Apple Metal (macOS).
-    First-class Apple Silicon support — no other GPU SQL engine ships
-    Metal numbers.
+  description: GPU-accelerated analytical operators for DuckDB on NVIDIA CUDA and Apple Silicon Metal. First SQL execution engine that targets Apple Silicon GPUs.
   version: 0.1.3
   language: C++
   build: cmake
   license: Apache-2.0
-  excluded_platforms:
-    # FP64 SUM falls back to host on macOS; works correctly but no GPU
-    # acceleration since Apple GPUs lack IEEE-754 doubles.
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw"
+  maintainers:
+    - singhpratech
 
 repo:
   github: singhpratech/duckdbgpumetaldbram
-  ref: 87e70adcee913d721e8d029a6d5b99911799405f  # v0.1.2
+  ref: 3ebcd764d28d16848cb11c49ad85d2a93819747d  # v0.1.3
 
 docs:
   hello_world: |
     LOAD gpudb;
-    -- GPU SUM aggregate, identical SQL semantics to native SUM
-    SELECT gpu_sum(value) FROM range(1000000) AS t(value);
+    -- GPU-accelerated SUM (CUDA on NVIDIA, Metal on Apple Silicon, CPU fallback otherwise)
+    SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 
-    -- Compare to native, get matching answer
+    -- Verify against native sum
     SELECT
-      gpu_sum(value) AS gpu,
+      gpu_sum(value::BIGINT) AS gpu,
       sum(value::BIGINT) AS native
     FROM range(1000000) AS t(value);
-
   extended_description: |
-    `gpudb` adds GPU-accelerated aggregates and operators that DuckDB
-    transparently dispatches to:
+    `gpudb` adds GPU-accelerated aggregate operators that DuckDB transparently
+    dispatches to:
 
-      * `gpu_sum(BIGINT)`  — GPU SUM
-      * `gpu_min(BIGINT)`  — GPU MIN
-      * `gpu_max(BIGINT)`  — GPU MAX
+      * `gpu_sum(BIGINT)` — GPU SUM
+      * `gpu_min(BIGINT)` — GPU MIN
+      * `gpu_max(BIGINT)` — GPU MAX
 
-    On NVIDIA hardware (CUDA backend), these run on the device with
-    PCIe-amortized bandwidth. On Apple Silicon (Metal backend), they
-    use the unified memory architecture so transfer cost is zero and
-    sustained kernel bandwidth approaches LPDDR5X peak (we measure
-    ~92% of M4 Max's 546 GB/s on int64 SUM).
+    On NVIDIA hardware (CUDA backend, sm_70+) these run on the device with
+    PCIe-amortized transfer. On Apple Silicon (Metal backend, M1+) they use
+    the unified memory architecture so transfer cost is zero.
 
-    Performance highlights (vs single-thread CPU baseline; each row pinned
-    to a specific BENCHMARK.md cell, no cross-cell glue):
-      * SUM 1B int64 HOT (resident column) on M4 Max: Metal 5.28×
-      * Peak SUM ratio on RTX 4090: CUDA ~22.8× (size-dependent)
-      * GROUP BY 500M rows × 1M unique groups on M4 Max: Metal 4.89×
-      * GROUP BY 50M rows × 10M unique groups on RTX 4090: CUDA 21.8×
-      * TPC-H SF1 GROUP BY (6M × 1.5M unique) on M4 Max: Metal 2.08×
+    **v0.1.3** ships a hybrid Metal GROUP BY that auto-dispatches between two
+    paths per query: a 32K-partition slot-lock hash aggregate (sweet spot at
+    1024 ≤ unique ≤ 16M) and an optimized multi-pass radix sort (very low or
+    very high cardinality). This flipped TPC-H SF10 GROUP BY l_orderkey from
+    CPU 1.78× faster (v0.1.2) to Metal 1.30× faster.
 
-    The extension auto-selects the best available backend at install time.
-    If no GPU is available, it falls back to the CPU implementation
-    cleanly — same SQL surface either way.
+    A hybrid CPU/GPU planner picks the backend that wins for each cardinality
+    regime — this addresses the open problem from Rosenfeld/Breß CSUR 2022
+    and Cao SIGMOD 2024.
+
+    Apple Silicon (M4 Max) vs DuckDB CPU 16-thread (the actual CLI default,
+    not single-thread). All cells trace to BENCHMARK.md rows:
+      * TPC-H SF10 multi-agg fusion l_quantity: Metal 25.5×
+      * TPC-H SF10 multi-agg fusion l_extendedprice: Metal 22.0×
+      * TPC-H SF10 multi-agg fusion l_orderkey: Metal 9.7×
+      * 1B int64 SUM HOT (resident column): Metal 2.6×
+      * 500M × 1M GROUP BY synthetic: Metal 3.4×
+      * 1B × 1M GROUP BY synthetic: Metal 3.2×
+      * TPC-H SF10 GROUP BY l_extendedprice (1.35M unique): Metal 3.9×
+      * TPC-H SF10 GROUP BY l_orderkey (15M unique): Metal 1.30×
+      * TPC-H SF1 GROUP BY l_orderkey (1.5M unique): Metal 1.40×
+      * Honest loss documented: TPC-H SF10 GROUP BY l_quantity (50 unique):
+        CPU 14× faster (structural — L1-resident hash table on CPU)
+
+    NVIDIA RTX 4090 (CUDA, vs single-thread CPU baseline):
+      * Peak SUM ratio: ~22.8× (size-dependent, resident column)
+      * GROUP BY 50M rows × 10M unique groups: 21.8×
+      * TPC-H SF1 GROUP BY (6M × 1.5M unique): 3.56× (re-bench post-launch)
+
+    The extension auto-selects the best backend at load time. If no GPU is
+    available it falls back cleanly to the CPU implementation — same SQL
+    surface either way. Honest benchmark notes (where GPU loses to CPU)
+    are documented in the project's BENCHMARK.md (append-only log).
+
+    Source: https://github.com/singhpratech/duckdbgpumetaldbram
 
   hardware_requirements: |
     NVIDIA CUDA: any GPU with sm_70 or later. Driver 525+ recommended.
@@ -71,12 +92,18 @@ docs:
     Falls back to CPU otherwise.
 
   known_limitations: |
-    * Float64 SUM on Apple Silicon falls back to the host loop because
-      Apple GPUs do not implement IEEE-754 double precision in MSL.
-      Same correctness; no GPU acceleration for that one type.
-    * GROUP BY currently supports BIGINT keys with BIGINT SUM. More
-      type coverage and operators (hash join, window functions) coming.
-    * NULL handling is supported; see test/sql/gpu_sum.test.
+    * Float64 SUM on Apple Silicon falls back to host loop (Apple GPUs
+      do not implement IEEE-754 doubles in MSL); same correctness, no
+      GPU speedup for that one type.
+    * GROUP BY currently supports BIGINT keys + BIGINT SUM; broader
+      type coverage planned in v0.2.
+    * Window functions: SUM OVER (), SUM OVER (ORDER BY), and
+      SUM OVER (PARTITION BY ... ORDER BY ...) all supported and
+      verified against native sum() in the SQL test suite.
+    * GROUP BY at very low cardinality (≤ 1K unique): CPU dominates
+      structurally (L1-resident hash). Auto-dispatch routes these to the
+      radix-opt path; for the bottom of the curve CPU still wins (e.g.,
+      TPC-H SF10 l_quantity at 50 unique groups: CPU 14× faster).
 
 # When submitting, also update CONTRIBUTING fields:
 # - maintainers: [@singhpratech]
