@@ -67,7 +67,15 @@
 #include "gpu_sum_extension.hpp"
 #include "gpu_backend.hpp"
 
-#include "duckdb.h"
+// gpu_sum_extension.hpp already pulled in the right DuckDB header:
+//   - GPUDB_C_STRUCT_ABI defined  -> duckdb_extension.h (C_STRUCT stable ABI).
+//     In that mode every duckdb_* call is a macro that dereferences the global
+//     duckdb_ext_api struct, which the entrypoint TU (duckdb_loadable.cpp)
+//     defines and populates. This TU only *references* it, so declare it extern.
+//   - otherwise                   -> duckdb.h (real symbols from libduckdb).
+#if defined(GPUDB_C_STRUCT_ABI)
+DUCKDB_EXTENSION_EXTERN
+#endif
 
 #include <cstdint>
 #include <cstdio>

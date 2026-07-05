@@ -14,6 +14,30 @@ Apple clang 21.0.0, CMake 4.3.2, DuckDB CLI v1.5.2 (Variegata), DuckDB
 pre-built libs from upstream `libduckdb-osx-universal.zip` (universal2,
 ships `libduckdb.dylib`).
 
+## Two build entrypoints
+
+There are now **two independent ways** to build this project, for two different
+purposes. They do not interfere with each other:
+
+1. **`./scripts/build.sh`** — the local developer flow. Builds everything: the
+   `gpudb` core lib, unit tests (`test_gpudb`), benchmarks, the embedded
+   `gpudb-sql` CLI, and the loadable extension. Requires `third_party/duckdb-libs/`
+   (run `./scripts/get_duckdb_libs.sh` first) for the `gpudb-sql` path; the
+   loadable extension itself does not. Custom SQL suite: `./scripts/run_sql_tests.sh`.
+
+2. **`make release`** (root `Makefile`) — the **community-extensions CI** flow.
+   Mirrors `duckdb/extension-template-c`: includes the `extension-ci-tools`
+   `c_api_extensions` makefiles and builds ONLY the loadable extension via the
+   stable **C_STRUCT ABI** (no `libduckdb` link, no DuckDB submodule). Targets:
+   `make set_duckdb_version` (no-op) → `make configure_ci` → `make release` →
+   `make test_release` (SQLLogicTest suite in `test/sqllogic/`). The final
+   artifact lands at `build/release/gpudb.duckdb_extension` (staged copy at
+   `build/release/extension/gpudb/gpudb.duckdb_extension`). CUDA is off in this
+   path (phase 2); Metal stays auto-on for the `osx_arm64` job.
+
+The vendored DuckDB C API headers used by path 2 live in
+`third_party/duckdb_capi/` (committed); `extension-ci-tools` is a git submodule.
+
 ## TL;DR — status matrix
 
 | Path                                                         | Status on macOS  |

@@ -1,0 +1,57 @@
+# name: test/sqllogic/gpudb.test
+# description: gpudb loadable extension — gpu_sum / gpu_min / gpu_max (CPU-safe)
+# group: [gpudb]
+#
+# This is the SQLLogicTest-format suite run by the community-extensions CI
+# (extension-ci-tools duckdb_sqllogictest runner, pointed here via the root
+# Makefile's TEST_RUNNER_BASE override). It is intentionally separate from the
+# repo's custom-format test/sql/*.test suite (run by scripts/run_sql_tests.sh).
+#
+# All assertions are deterministic and backend-independent: integer sums/min/max
+# on small inputs return identical results on the CPU, CUDA and Metal backends,
+# so this passes in CI where no GPU is available.
+
+# The functions do not exist until the extension is loaded.
+statement error
+SELECT gpu_sum(42::BIGINT);
+----
+
+# Loads gpudb (provided to the runner via --external-extension).
+require gpudb
+
+# Trivial range: 0+1+...+9 = 45
+query I
+SELECT gpu_sum(range::BIGINT) FROM range(10);
+----
+45
+
+# Larger range: sum of 0..999999 = 499999500000
+query I
+SELECT gpu_sum(range::BIGINT) FROM range(1000000);
+----
+499999500000
+
+# gpu_min / gpu_max over range(5, 15) = {5..14}
+query I
+SELECT gpu_min(range::BIGINT) FROM range(5, 15);
+----
+5
+
+query I
+SELECT gpu_max(range::BIGINT) FROM range(5, 15);
+----
+14
+
+# Matches native SUM on an explicit value set.
+query II
+SELECT gpu_sum(v::BIGINT), sum(v::BIGINT)
+FROM (VALUES (1), (2), (3), (10)) t(v);
+----
+16	16
+
+# NULLs are ignored, like native aggregates.
+query I
+SELECT gpu_sum(v::BIGINT)
+FROM (VALUES (1), (NULL), (3), (NULL), (6)) t(v);
+----
+10
