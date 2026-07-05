@@ -89,3 +89,8 @@ ehthumbs.db
 
 # DuckDB pre-built shared libs (~140 MB; downloaded by scripts/get_duckdb_libs.sh)
 third_party/duckdb-libs/
+
+# community-extensions CI build dirs (created by the root Makefile / extension-ci-tools)
+cmake_build/
+configure/
+duckdb_unittest_tempdir/
