@@ -91,17 +91,19 @@ if(GPUDB_BUILD_TESTS)
 endif()
 
 # -------------------------------------------------------------------
+# DuckDB extension (loadable .so)
+# -------------------------------------------------------------------
+# Added BEFORE benchmark so the optional gpudb_ext target (embedded CLI helper)
+# is known when benchmark/CMakeLists.txt decides whether to build gpudb-sql.
+if(GPUDB_BUILD_EXT)
+    add_subdirectory(src/extension)
+endif()
+
+# -------------------------------------------------------------------
 # Benchmarks
 # -------------------------------------------------------------------
 if(GPUDB_BUILD_BENCH)
     add_subdirectory(benchmark)
-endif()
-
-# -------------------------------------------------------------------
-# DuckDB extension (loadable .so)
-# -------------------------------------------------------------------
-if(GPUDB_BUILD_EXT)
-    add_subdirectory(src/extension)
 endif()
 
 # -------------------------------------------------------------------

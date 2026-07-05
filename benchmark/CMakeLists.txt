@@ -33,7 +33,9 @@ target_link_libraries(gpudb-hashjoin-bench PRIVATE gpudb)
 set_target_properties(gpudb-hashjoin-bench PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
-if(GPUDB_BUILD_EXT)
+# gpudb-sql links the embedded gpudb_ext helper, which only exists when
+# third_party/duckdb-libs/ is present (see src/extension/CMakeLists.txt).
+if(GPUDB_BUILD_EXT AND TARGET gpudb_ext)
     add_executable(gpudb-sql sql_demo_main.cpp)
     target_link_libraries(gpudb-sql PRIVATE gpudb_ext)
     set_target_properties(gpudb-sql PROPERTIES

@@ -37,6 +37,15 @@ if [[ "${GPUDB_NO_METAL:-}" == "1" ]]; then
     CMAKE_ARGS+=(-DGPUDB_ENABLE_METAL=OFF)
 fi
 
+# Auto-enable the DuckDB extension wrapper (loadable .so + embedded gpudb-sql)
+# when the pre-built libs are present (fetched by ./scripts/get_duckdb_libs.sh).
+# This is what makes the footer-append step below fire and lets
+# ./scripts/run_sql_tests.sh find gpudb-sql. The community-CI path uses the root
+# Makefile (`make release`) instead and does not need this.
+if [ -f "third_party/duckdb-libs/duckdb.h" ]; then
+    CMAKE_ARGS+=(-DGPUDB_BUILD_EXT=ON)
+fi
+
 echo "==> configure ($OS) into $BUILD_DIR"
 cmake "${CMAKE_ARGS[@]}"
 

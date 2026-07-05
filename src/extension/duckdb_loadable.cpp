@@ -1,61 +1,45 @@
 // duckdb_loadable.cpp — DuckDB C API loadable-extension entry point.
 //
-// LOADABLE: yes. The .duckdb_extension file is produced by appending the
-// 528-byte metadata footer (scripts/build_helpers/append_extension_metadata.py)
-// to the libgpudb_duckdb.so. Resulting file works with `LOAD '/path/...'`
-// from the DuckDB CLI when launched with `-unsigned`.
+// Built ONLY into the loadable extension (libgpudb → gpudb.duckdb_extension),
+// always with -DGPUDB_C_STRUCT_ABI and -DDUCKDB_EXTENSION_NAME=gpudb.
 //
-// DuckDB looks up two C symbols by extension-name convention:
-//   <name>_init_c_api   — registers the extension's functions
-//   <name>_version      — DuckDB-version compatibility stamp
-// The extension name in description.yml is `gpudb`, so the symbols are
-// gpudb_init_c_api and gpudb_version (NOT gpudb_duckdb_*).
+// Uses the stable C_STRUCT ABI via duckdb_extension.h:
+//   * DUCKDB_EXTENSION_ENTRYPOINT generates the exported C symbol
+//     `gpudb_init_c_api`, defines and populates the global `duckdb_ext_api`
+//     function-pointer struct (from access->get_api), opens a connection, and
+//     forwards it to the body below. All duckdb_* calls (here and in
+//     gpu_sum_extension.cpp) route through that struct, so the shared object
+//     links NO libduckdb — there are no undefined duckdb_* symbols.
+//   * The extension metadata footer (ABI type = C_STRUCT, duckdb_version =
+//     v1.2.0) is appended after the build (by extension-ci-tools in CI, or by
+//     scripts/build.sh / the CMake POST_BUILD step locally). No `_version`
+//     symbol is needed under the C_STRUCT ABI.
+//
+// The entrypoint macro requires DUCKDB_EXTENSION_NAME to be defined; CMake sets
+// it on this target.
+
+#include "duckdb_extension.h"
 
 #include "gpu_sum_extension.hpp"
-#include "duckdb.h"
 
-#include <cstdio>
 #include <exception>
 
-extern "C" {
-
-// Standard C API extension entry. DuckDB calls this once on LOAD.
-DUCKDB_EXTENSION_API bool gpudb_init_c_api(
-        duckdb_extension_info info,
-        const struct duckdb_extension_access *access) {
-    if (!access || !access->get_database) {
-        return false;
-    }
-    duckdb_database *db_ptr = access->get_database(info);
-    if (!db_ptr || !*db_ptr) {
-        if (access->set_error) {
-            access->set_error(info, "gpudb extension: failed to retrieve database handle");
-        }
-        return false;
-    }
-    duckdb_connection con;
-    if (duckdb_connect(*db_ptr, &con) == DuckDBError) {
-        if (access->set_error) {
-            access->set_error(info, "gpudb extension: duckdb_connect failed");
-        }
-        return false;
-    }
+DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection,
+                            duckdb_extension_info info,
+                            struct duckdb_extension_access *access) {
     try {
-        gpudb_ext::register_gpu_sum(con);   // registers gpu_sum, gpu_min, gpu_max
+        // Registers gpu_sum / gpu_min / gpu_max on the auto-opened connection.
+        gpudb_ext::register_gpu_sum(connection);
     } catch (const std::exception &e) {
-        if (access->set_error) {
+        if (access && access->set_error) {
             access->set_error(info, e.what());
         }
-        duckdb_disconnect(&con);
+        return false;
+    } catch (...) {
+        if (access && access->set_error) {
+            access->set_error(info, "gpudb extension: unknown error during registration");
+        }
         return false;
     }
-    duckdb_disconnect(&con);
     return true;
 }
-
-// Required version stamp for unsigned-LOAD compatibility checks.
-DUCKDB_EXTENSION_API const char *gpudb_version() {
-    return duckdb_library_version();
-}
-
-} // extern "C"
