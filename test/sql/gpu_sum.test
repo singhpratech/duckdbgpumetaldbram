@@ -40,16 +40,15 @@ SELECT
 FROM (VALUES (-100::BIGINT), (50::BIGINT), (-25::BIGINT), (75::BIGINT), (0::BIGINT)) t(x);
 -- expect: 0  0
 
--- 4. Empty table — gpu_sum returns 0; native returns NULL.
---    This is a documented divergence: extension returns a 0 sentinel for
---    the empty-state finalize, while DuckDB's native SUM follows the SQL
---    spec and returns NULL. See src/extension/gpu_sum_extension.cpp.
+-- 4. Empty table — gpu_sum and native SUM both return NULL (SQL spec).
+--    Fixed in v0.2.0: the empty-state finalize marks the output row invalid
+--    via the validity mask instead of writing a 0 sentinel.
 SELECT gpu_sum(x) AS gpu, sum(x) AS native FROM (SELECT NULL::BIGINT WHERE FALSE) t(x);
--- expect: 0  NULL
+-- expect: NULL  NULL
 
--- 5. All-NULL column — gpu_sum returns 0; native returns NULL (same rationale as #4).
+-- 5. All-NULL column — gpu_sum and native SUM both return NULL (same as #4).
 SELECT gpu_sum(x) AS gpu, sum(x) AS native FROM (VALUES (NULL::BIGINT), (NULL::BIGINT), (NULL::BIGINT)) t(x);
--- expect: 0  NULL
+-- expect: NULL  NULL
 
 -- 6. Large NULL mix — every even row is NULL, odds carry the value.
 --    1 + 3 + 5 + ... + 99 = 50^2 = 2500

@@ -1,6 +1,6 @@
 # gpu_min_max SQL test — verifies gpu_min / gpu_max produce identical results
 # to DuckDB's native MIN / MAX on integer ranges, NULL-bearing data, and
-# pseudo-random samples; pins the documented "empty / all-NULL → 0" sentinel.
+# pseudo-random samples; empty / all-NULL input returns SQL NULL (v0.2.0).
 #
 # Run via:
 #   ./scripts/run_sql_tests.sh gpu_min_max
@@ -47,19 +47,19 @@ SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
 FROM (SELECT CASE WHEN range % 3 = 0 THEN NULL ELSE range::BIGINT END AS x FROM range(100));
 -- expect: 1  1  98  98
 
--- 8. MIN(empty) — gpu_min returns 0; native returns NULL.
---    Documented divergence, same as gpu_sum on empty (see gpu_sum.test).
+-- 8. MIN(empty) — gpu_min and native MIN both return NULL (v0.2.0).
+--    Empty-state finalize marks the output row invalid, same as gpu_sum.
 SELECT gpu_min(x) gmin, min(x) nmin FROM (SELECT NULL::BIGINT WHERE FALSE) t(x);
--- expect: 0  NULL
+-- expect: NULL  NULL
 
--- 9. MAX(empty) — same divergence as MIN.
+-- 9. MAX(empty) — same as MIN.
 SELECT gpu_max(x) gmax, max(x) nmax FROM (SELECT NULL::BIGINT WHERE FALSE) t(x);
--- expect: 0  NULL
+-- expect: NULL  NULL
 
--- 10. MIN/MAX over an all-NULL column — same divergence (gpu returns 0).
+-- 10. MIN/MAX over an all-NULL column — both return NULL.
 SELECT gpu_min(x) gmin, min(x) nmin, gpu_max(x) gmax, max(x) nmax
 FROM (VALUES (NULL::BIGINT), (NULL::BIGINT), (NULL::BIGINT)) t(x);
--- expect: 0  NULL  0  NULL
+-- expect: NULL  NULL  NULL  NULL
 
 -- 11. 1M-row range — wide span correctness
 SELECT gpu_min(range::BIGINT) gmin, min(range::BIGINT) nmin,

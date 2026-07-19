@@ -55,3 +55,57 @@ SELECT gpu_sum(v::BIGINT)
 FROM (VALUES (1), (NULL), (3), (NULL), (6)) t(v);
 ----
 10
+
+# Empty input — SUM over zero rows is SQL NULL (v0.2.0), matching native SUM.
+query I
+SELECT gpu_sum(v::BIGINT) FROM (SELECT 1 AS v WHERE false) t;
+----
+NULL
+
+# All-NULL input — SUM over zero non-NULL values is SQL NULL.
+query I
+SELECT gpu_sum(NULL::BIGINT);
+----
+NULL
+
+# Mixed NULL + values — NULLs skipped, sum of the remainder.
+query I
+SELECT gpu_sum(v::BIGINT) FROM (VALUES (1), (2), (NULL)) t(v);
+----
+3
+
+# GROUP BY with an all-NULL group — that group is NULL; others aggregate normally.
+query II
+SELECT k, gpu_sum(v) FROM (VALUES (1, NULL), (1, NULL), (2, 10)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	NULL
+2	10
+
+# MIN / MAX over empty input — SQL NULL.
+query I
+SELECT gpu_min(v::BIGINT) FROM (SELECT 1 AS v WHERE false) t;
+----
+NULL
+
+query I
+SELECT gpu_max(v::BIGINT) FROM (SELECT 1 AS v WHERE false) t;
+----
+NULL
+
+# MIN / MAX over all-NULL input — SQL NULL.
+query I
+SELECT gpu_min(NULL::BIGINT);
+----
+NULL
+
+query I
+SELECT gpu_max(NULL::BIGINT);
+----
+NULL
+
+# IS NULL is true for an empty / all-NULL aggregate (was false before v0.2.0).
+query T
+SELECT gpu_sum(NULL::BIGINT) IS NULL;
+----
+true
