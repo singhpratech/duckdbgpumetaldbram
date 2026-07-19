@@ -467,27 +467,42 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
               duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
 
+    // SUM over zero non-NULL values (empty input, or a group whose every row
+    // was NULL) is SQL NULL, not 0. A state's buffer is empty in exactly that
+    // case (update() skips NULL rows). Make the output validity mask writable
+    // once up front; the paths below mark the relevant rows invalid.
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
+
     // ---- Single-state fast path: ungrouped SELECT gpu_sum(x) FROM tbl,
     //      and per-row finalize calls from window functions without
     //      PARTITION BY. ----
     if (count == 1) {
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid == 0) { out[offset] = 0; return; }
-        auto vals = buffer_pool().snapshot(bid);
-        out[offset] = safe_sum_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            out[offset] = 0;
+            duckdb_validity_set_row_invalid(validity, offset);
+        } else {
+            out[offset] = safe_sum_i64(vals.data(), vals.size());
+        }
         return;
     }
 
     // ---- Constant-state finalize: WindowConstantAggregator passes a
     //      CONSTANT_VECTOR for source. Only source[0] is real; broadcast. ----
     if (!finalize_is_per_state(source, count)) {
-        std::int64_t v = 0;
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid != 0) {
-            auto vals = buffer_pool().snapshot(bid);
-            v = safe_sum_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            for (idx_t i = 0; i < count; ++i) {
+                out[offset + i] = 0;
+                duckdb_validity_set_row_invalid(validity, offset + i);
+            }
+        } else {
+            std::int64_t v = safe_sum_i64(vals.data(), vals.size());
+            for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         }
-        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         return;
     }
 
@@ -527,8 +542,13 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                 auto r = gb->groupby_sum_i64(flat_keys.data(), flat_values.data(),
                                               flat_keys.size(), count);
 
-                // Default outputs to 0 for empty groups; then fill those that had data.
-                for (idx_t i = 0; i < count; ++i) out[offset + i] = 0;
+                // A group with zero non-NULL values (empty state buffer) is
+                // SQL NULL; the rest are filled from the kernel result below.
+                for (idx_t i = 0; i < count; ++i) {
+                    out[offset + i] = 0;
+                    if (snaps[i].empty())
+                        duckdb_validity_set_row_invalid(validity, offset + i);
+                }
                 for (std::size_t i = 0; i < r.keys.size(); ++i) {
                     const std::int64_t k = r.keys[i];
                     if (k >= 0 && static_cast<idx_t>(k) < count)
@@ -536,7 +556,11 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                 }
                 used_batched = true;
             } else {
-                for (idx_t i = 0; i < count; ++i) out[offset + i] = 0;
+                // Every group was empty (all-NULL / empty input) → all NULL.
+                for (idx_t i = 0; i < count; ++i) {
+                    out[offset + i] = 0;
+                    duckdb_validity_set_row_invalid(validity, offset + i);
+                }
                 used_batched = true;
             }
         } catch (const std::exception&) {
@@ -578,9 +602,13 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
         // also still benefit when individual partition buffers are big.
         for (idx_t i = 0; i < count; ++i) {
             const std::uint64_t bid = probe_buf_id(source[i]);
-            if (bid == 0) { out[offset + i] = 0; continue; }
-            auto vals = buffer_pool().snapshot(bid);
-            out[offset + i] = safe_sum_i64(vals.data(), vals.size());
+            auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+            if (vals.empty()) {
+                out[offset + i] = 0;
+                duckdb_validity_set_row_invalid(validity, offset + i);
+            } else {
+                out[offset + i] = safe_sum_i64(vals.data(), vals.size());
+            }
         }
     }
 }
@@ -593,56 +621,86 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
 void finalize_min(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    // MIN over zero non-NULL values is SQL NULL, not 0 (see finalize()).
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
     if (count == 1) {
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid == 0) { out[offset] = 0; return; }
-        auto vals = buffer_pool().snapshot(bid);
-        out[offset] = safe_min_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            out[offset] = 0;
+            duckdb_validity_set_row_invalid(validity, offset);
+        } else {
+            out[offset] = safe_min_i64(vals.data(), vals.size());
+        }
         return;
     }
     if (!finalize_is_per_state(source, count)) {
-        std::int64_t v = 0;
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid != 0) {
-            auto vals = buffer_pool().snapshot(bid);
-            v = safe_min_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            for (idx_t i = 0; i < count; ++i) {
+                out[offset + i] = 0;
+                duckdb_validity_set_row_invalid(validity, offset + i);
+            }
+        } else {
+            std::int64_t v = safe_min_i64(vals.data(), vals.size());
+            for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         }
-        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         return;
     }
     for (idx_t i = 0; i < count; ++i) {
         const std::uint64_t bid = probe_buf_id(source[i]);
-        if (bid == 0) { out[offset + i] = 0; continue; }
-        auto vals = buffer_pool().snapshot(bid);
-        out[offset + i] = safe_min_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            out[offset + i] = 0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+        } else {
+            out[offset + i] = safe_min_i64(vals.data(), vals.size());
+        }
     }
 }
 
 void finalize_max(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
                   duckdb_vector result, idx_t count, idx_t offset) {
     std::int64_t* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    // MAX over zero non-NULL values is SQL NULL, not 0 (see finalize()).
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
     if (count == 1) {
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid == 0) { out[offset] = 0; return; }
-        auto vals = buffer_pool().snapshot(bid);
-        out[offset] = safe_max_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            out[offset] = 0;
+            duckdb_validity_set_row_invalid(validity, offset);
+        } else {
+            out[offset] = safe_max_i64(vals.data(), vals.size());
+        }
         return;
     }
     if (!finalize_is_per_state(source, count)) {
-        std::int64_t v = 0;
         const std::uint64_t bid = probe_buf_id(source[0]);
-        if (bid != 0) {
-            auto vals = buffer_pool().snapshot(bid);
-            v = safe_max_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            for (idx_t i = 0; i < count; ++i) {
+                out[offset + i] = 0;
+                duckdb_validity_set_row_invalid(validity, offset + i);
+            }
+        } else {
+            std::int64_t v = safe_max_i64(vals.data(), vals.size());
+            for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         }
-        for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
         return;
     }
     for (idx_t i = 0; i < count; ++i) {
         const std::uint64_t bid = probe_buf_id(source[i]);
-        if (bid == 0) { out[offset + i] = 0; continue; }
-        auto vals = buffer_pool().snapshot(bid);
-        out[offset + i] = safe_max_i64(vals.data(), vals.size());
+        auto vals = bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+        if (vals.empty()) {
+            out[offset + i] = 0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+        } else {
+            out[offset + i] = safe_max_i64(vals.data(), vals.size());
+        }
     }
 }
 
@@ -657,6 +715,11 @@ void register_one(duckdb_connection con, const char* name,
     duckdb_aggregate_function_set_functions(fn,
         state_size, state_init, update, combine, fin);
     duckdb_aggregate_function_set_destructor(fn, state_destroy);
+    // We handle NULL semantics ourselves (empty / all-NULL input -> SQL NULL
+    // via the output validity mask in finalize). Special handling tells DuckDB
+    // not to short-circuit our aggregate on NULL input; update() already skips
+    // NULL rows via the input validity bitmap.
+    duckdb_aggregate_function_set_special_handling(fn);
     duckdb_state st = duckdb_register_aggregate_function(con, fn);
     duckdb_destroy_aggregate_function(&fn);
     if (st == DuckDBError) {
