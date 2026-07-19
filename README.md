@@ -5,12 +5,12 @@
 ```sql
 -- Real query, real GPU, real result on RTX 4090 + Apple M4 Max
 SELECT gpu_sum(l_orderkey) FROM read_parquet('lineitem.parquet');
-[gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=CUDA)
+[gpudb] registered gpu_sum (BIGINT,DOUBLE) / gpu_min / gpu_max  (backend=CUDA)
 gpu_sum(l_orderkey)
 18005322964949
 ```
 
-Apache-2.0 · Pre-alpha · Linux + macOS · DuckDB ≥ 1.0
+Apache-2.0 · Pre-alpha · Linux + macOS · DuckDB ≥ 1.2
 
 ---
 
@@ -58,17 +58,17 @@ DuckDB CLI uses 16 threads (12 P + 4 E cores) by default on M4 Max. These are vs
 
 ### Option A — load the prebuilt extension into DuckDB CLI
 
-Download the platform binary from the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3), then:
+Download the platform binary from the [latest release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/latest), then:
 
 ```bash
 # Linux (RTX/CUDA)
 duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
   SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);"
-# -> [gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=CUDA)
+# -> [gpudb] registered gpu_sum (BIGINT,DOUBLE) / gpu_min / gpu_max  (backend=CUDA)
 # -> 499999500000
 ```
 
-Requires DuckDB v1.5.x (C API v1.2.0). `LOAD` needs `-unsigned` because the
+Requires DuckDB ≥ 1.2 (C API v1.2.0); community CI builds against v1.5.x. `LOAD` needs `-unsigned` because the
 extension is unsigned community code; `INSTALL gpudb FROM community`
 (no `-unsigned` needed) lights up after [community-extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merges.
 
@@ -148,18 +148,18 @@ Backend selection is automatic: CUDA if a device is found at runtime, else Metal
 
 ## Testing
 ```bash
-./build-linux/test/test_gpudb        # 77 unit checks across CPU + CUDA backends
+./build-linux/test/test_gpudb        # 96 unit checks across the backends present at build time
 ./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window
 ./scripts/local_check.sh             # everything CI would run, end to end
 ```
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.1.0: 46 / 46 pass,
+PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.2.0: 50 / 50 pass,
 0 fail, 0 expected fail. The window-function bugs that were previously
 xfail are now strict positive assertions (PR #22).
 
-**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 46-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 50-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Roadmap
 
@@ -182,15 +182,26 @@ xfail are now strict positive assertions (PR #22).
 - [x] **Hybrid Metal GROUP BY** — 32K-partition slot-lock + radix-opt with auto-dispatch (env override `GPUDB_METAL_GROUPBY_PATH`). Flipped TPC-H SF10 `l_orderkey` (15M unique) from CPU 1.78× faster to Metal 1.30× faster vs DuckDB CPU 16-thread. 9 wins / 1 honest loss on the lineitem scorecard.
 - [x] Prebuilt v0.1.3 binaries (Linux CUDA + macOS Metal) attached to the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
 
-### In flight (v0.1.4)
-- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed)
+### Shipped in v0.2.0
+- [x] **SQL-correct NULL semantics** (PR #44) — `gpu_sum`/`gpu_min`/`gpu_max` over empty or all-NULL input now return SQL `NULL` (not 0), matching native DuckDB on every path: plain aggregate, GROUP BY groups, and window frames.
+- [x] **`gpu_sum(DOUBLE) -> DOUBLE`** (PR #45) — a real second overload via the C API aggregate function set. Doubles ride the existing int64 state machinery as raw bit patterns (zero state-layout change); only the finalize differs. `INTEGER`/`SMALLINT`/`TINYINT` work via DuckDB's implicit widening to the `BIGINT` overload (locked in by tests). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-### Roadmap (v0.2.0+)
-- [ ] Real Metal hash-join sort-merge (currently a CPU-fallback scaffold; CUDA hash-join is real)
-- [ ] GPU-resident segment reduce for Metal GROUP BY at 1B+ rows (the cell where we currently lose 1.5×)
+### In flight
+- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed). The submission is deliberately frozen at the v0.1.3-era ref while it awaits maintainer review; v0.2.0 ships as a follow-up bump after the first merge.
+
+### Roadmap (v0.3.0)
+Near-term, scoped against what the DuckDB C extension API actually allows:
+- [ ] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — needs `min_f64`/`max_f64` added to the backend interface (`gpu_backend.hpp`); the registration side is ready (function sets already carry the sum overloads).
+- [ ] **Batched GPU GROUP BY for DOUBLE** — a `groupby_sum_f64` backend entry point so high-cardinality DOUBLE GROUP BY takes the batched GPU path the BIGINT path already has.
+- [ ] **Real Metal hash-join** (currently a CPU-fallback scaffold; CUDA hash-join is real).
+- [ ] **GPU-resident segment reduce** for Metal GROUP BY at 1B+ rows (the cell where we currently lose 1.5×).
+- [ ] **Community packaging phase 2** — add `cuda` to `requires_toolchains` so Linux community binaries ship the CUDA backend.
+
+### Beyond (v0.4.0+)
 - [ ] Resident-column SQL hooks: `gpu_cache(table, col)` table function so `gpu_sum` can run on data already loaded
 - [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
 - [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
+- [ ] Transparent GPU operator substitution — **blocked upstream**: the DuckDB C API exposes no optimizer/planner/physical-operator hooks, so a loadable extension cannot silently replace plan operators today. A table-function-based `gpu_group_by(...)` is possible but doesn't compose with normal SQL; parked until the C API grows the needed hooks.
 
 ## Why DuckDB? Why not a new database?
 
