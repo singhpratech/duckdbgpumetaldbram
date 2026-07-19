@@ -109,3 +109,49 @@ query T
 SELECT gpu_sum(NULL::BIGINT) IS NULL;
 ----
 true
+
+# ---------------------------------------------------------------------------
+# Type widening (v0.2.0)
+# ---------------------------------------------------------------------------
+
+# Smaller integer types (INTEGER here) carry NO dedicated overload — they
+# widen to the gpu_sum(BIGINT) overload via DuckDB's implicit integer cast, so
+# the result type is BIGINT. 1 + 2 + 3 = 6.
+query I
+SELECT gpu_sum(v) FROM (VALUES (1::INTEGER), (2::INTEGER), (3::INTEGER)) t(v);
+----
+6
+
+# ...and the widened result is BIGINT, not the input's INTEGER.
+query T
+SELECT typeof(gpu_sum(1::INTEGER));
+----
+BIGINT
+
+# gpu_sum(DOUBLE) — the second, real overload. Returns DOUBLE. 1.5 + 2.25 =
+# 3.75 (both exact in binary). On Apple Silicon the double sum runs on the host
+# (Apple GPUs lack IEEE-754 doubles); the result is identical on every backend.
+query R
+SELECT gpu_sum(v) FROM (VALUES (1.5::DOUBLE), (2.25::DOUBLE)) t(v);
+----
+3.75
+
+# All-NULL DOUBLE input — SUM over zero non-NULL values is SQL NULL.
+query R
+SELECT gpu_sum(NULL::DOUBLE);
+----
+NULL
+
+# Empty DOUBLE input — SQL NULL via the output validity mask, matching native SUM.
+query R
+SELECT gpu_sum(v::DOUBLE) FROM (SELECT 1.0 AS v WHERE false) t;
+----
+NULL
+
+# GROUP BY over DOUBLE — group 1 sums to 3.75; group 2 is all-NULL -> NULL.
+query IR
+SELECT k, gpu_sum(v) FROM (VALUES (1, 1.5::DOUBLE), (1, 2.25::DOUBLE), (2, NULL::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	3.75
+2	NULL

@@ -91,3 +91,38 @@ SELECT
     sum((range - 50000)::BIGINT)     AS native
 FROM range(100000);
 -- expect: -50000  -50000
+
+-- ---------------------------------------------------------------------------
+-- gpu_sum(DOUBLE) overload (v0.2.0). DOUBLE does not implicitly cast to BIGINT
+-- (lossy), so this is a real second overload — gpu_sum(DOUBLE) -> DOUBLE. All
+-- values below are exact in IEEE-754 binary so the assertions are stable.
+-- On Apple Silicon the double sum runs on the host (Apple GPUs lack doubles);
+-- the result matches native SUM on every backend.
+-- ---------------------------------------------------------------------------
+
+-- 13. DOUBLE sum with a NULL mixed in — NULL skipped, 1.5 + 2.25 = 3.75.
+SELECT
+    gpu_sum(v)             AS gpu,
+    sum(v)                 AS native
+FROM (VALUES (1.5::DOUBLE), (NULL), (2.25::DOUBLE)) t(v);
+-- expect: 3.75  3.75
+
+-- 14. DOUBLE mixed sign — exact cancellation: -0.5 + 1.25 - 0.25 = 0.5.
+SELECT
+    gpu_sum(v)             AS gpu,
+    sum(v)                 AS native
+FROM (VALUES (-0.5::DOUBLE), (1.25::DOUBLE), (-0.25::DOUBLE)) t(v);
+-- expect: 0.5  0.5
+
+-- 15. Empty DOUBLE input — SUM over zero rows is SQL NULL (matches native).
+SELECT gpu_sum(v) AS gpu, sum(v) AS native
+FROM (SELECT 1.0::DOUBLE AS v WHERE FALSE) t(v);
+-- expect: NULL  NULL
+
+-- 16. Large DOUBLE set — 100k values in 0.5 steps (each exact). The sum path
+--     goes through the host reduction; result matches native SUM exactly.
+SELECT
+    gpu_sum(v)             AS gpu,
+    sum(v)                 AS native
+FROM (SELECT (range * 0.5)::DOUBLE AS v FROM range(100000)) t(v);
+-- expect: 2499975000.0  2499975000.0

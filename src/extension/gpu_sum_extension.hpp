@@ -17,8 +17,12 @@
 
 namespace gpudb_ext {
 
-// Register gpu_sum / gpu_min / gpu_max (BIGINT) -> BIGINT on the given open
-// DuckDB connection. Throws std::runtime_error if registration fails.
+// Register gpu_sum / gpu_min / gpu_max on the given open DuckDB connection.
+//   gpu_sum: overload set — (BIGINT) -> BIGINT and (DOUBLE) -> DOUBLE.
+//   gpu_min / gpu_max: (BIGINT) -> BIGINT only (v0.2.0; DOUBLE deferred).
+// Smaller integer types (INTEGER/SMALLINT/TINYINT) resolve to the BIGINT
+// overloads via DuckDB's implicit integer widening. Throws std::runtime_error
+// if registration fails.
 void register_gpu_sum(duckdb_connection con);
 
 } // namespace gpudb_ext
