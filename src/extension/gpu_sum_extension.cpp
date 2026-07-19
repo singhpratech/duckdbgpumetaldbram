@@ -80,6 +80,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -160,6 +161,32 @@ std::int64_t safe_max_i64(const std::int64_t* data, std::size_t n) {
         return shared_agg().max_i64(data, n).value_i64;
     } catch (const std::exception&) {
         return cpu_max(data, n);
+    }
+}
+
+// DOUBLE sum. Plain (non-Kahan) accumulation, matching DuckDB's native SUM
+// semantics. Used by the gpu_sum(DOUBLE) overload's finalize.
+inline double cpu_sum_f64(const double* data, std::size_t n) {
+    double acc = 0.0;
+    for (std::size_t i = 0; i < n; ++i) acc += data[i];
+    return acc;
+}
+
+// Thread-safe f64 sum, mirroring safe_sum_i64: tiny inputs short-circuit to
+// CPU; larger inputs dispatch through the singleton aggregator under the
+// shared lock. On Apple Silicon the Metal backend's sum_f64 is itself a host
+// fallback (Apple GPUs lack IEEE-754 doubles — see metal_aggregator.mm), so
+// this is host summation there; on CUDA it is a real device reduction. Either
+// way the result is a plain double sum, and any backend exception falls back
+// to cpu_sum_f64.
+double safe_sum_f64(const double* data, std::size_t n) {
+    if (n == 0) return 0.0;
+    if (n < kSumGpuMinRows) return cpu_sum_f64(data, n);
+    try {
+        std::lock_guard<std::mutex> lock(gpu_call_mutex());
+        return shared_agg().sum_f64(data, n).value_f64;
+    } catch (const std::exception&) {
+        return cpu_sum_f64(data, n);
     }
 }
 
@@ -613,6 +640,91 @@ void finalize(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     }
 }
 
+// ==========================================================================
+//  gpu_sum(DOUBLE) -> DOUBLE overload
+//
+// The DOUBLE overload reuses the ENTIRE i64 state machinery unchanged:
+// state_size / state_init / state_destroy / update / combine are shared. The
+// trick is that a double and an int64 are both 8 bytes, so update() appends
+// the raw 8-byte bit patterns of the incoming doubles into the same
+// BufferPool<int64> (reinterpreting the DOUBLE vector's data as int64 copies
+// the bits verbatim; NULL-skipping via the validity bitmap is byte-width
+// agnostic and works identically). combine() shuffles those bit patterns
+// between buffers without interpreting them. Only finalize differs: it must
+// read the stored bits back AS doubles and sum in double precision.
+//
+// This means zero change to the POD-state layout / magic-word probe / window
+// (CONSTANT_VECTOR) defences that PR #22 hardened — the DOUBLE path inherits
+// all of it for free.
+// ==========================================================================
+
+// Snapshot a state's buffer and reinterpret the stored int64 bit patterns
+// back into doubles via a blessed memcpy bit-cast (correct regardless of
+// strict-aliasing). Empty exactly when the state accumulated zero non-NULL
+// values (empty input / all-NULL group) — the SQL-NULL case.
+inline std::vector<double> snapshot_as_f64(std::uint64_t bid) {
+    std::vector<std::int64_t> raw =
+        bid ? buffer_pool().snapshot(bid) : std::vector<std::int64_t>{};
+    std::vector<double> vals(raw.size());
+    if (!raw.empty())
+        std::memcpy(vals.data(), raw.data(), raw.size() * sizeof(double));
+    return vals;
+}
+
+void finalize_f64(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
+                  duckdb_vector result, idx_t count, idx_t offset) {
+    double* out = reinterpret_cast<double*>(duckdb_vector_get_data(result));
+
+    // SUM over zero non-NULL values is SQL NULL, not 0 — identical semantics
+    // to the i64 finalize(). Empty state buffer <=> that case.
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
+
+    // ---- Single-state fast path: ungrouped gpu_sum(x), and per-row window
+    //      finalize calls without PARTITION BY. ----
+    if (count == 1) {
+        auto vals = snapshot_as_f64(probe_buf_id(source[0]));
+        if (vals.empty()) {
+            out[offset] = 0.0;
+            duckdb_validity_set_row_invalid(validity, offset);
+        } else {
+            out[offset] = safe_sum_f64(vals.data(), vals.size());
+        }
+        return;
+    }
+
+    // ---- Constant-state finalize: WindowConstantAggregator passes a
+    //      CONSTANT_VECTOR for source. Only source[0] is real; broadcast. ----
+    if (!finalize_is_per_state(source, count)) {
+        auto vals = snapshot_as_f64(probe_buf_id(source[0]));
+        if (vals.empty()) {
+            for (idx_t i = 0; i < count; ++i) {
+                out[offset + i] = 0.0;
+                duckdb_validity_set_row_invalid(validity, offset + i);
+            }
+        } else {
+            double v = safe_sum_f64(vals.data(), vals.size());
+            for (idx_t i = 0; i < count; ++i) out[offset + i] = v;
+        }
+        return;
+    }
+
+    // ---- Grouped path: count > 1 with all distinct registered states. ----
+    // There is no groupby_sum_f64 in the backend interface (deferred), so we
+    // do NOT take the batched-GPU branch the i64 path uses. Sum each group's
+    // buffer independently — trivially correct, and the mid-cardinality regime
+    // the i64 path also handles on the host.
+    for (idx_t i = 0; i < count; ++i) {
+        auto vals = snapshot_as_f64(probe_buf_id(source[i]));
+        if (vals.empty()) {
+            out[offset + i] = 0.0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+        } else {
+            out[offset + i] = safe_sum_f64(vals.data(), vals.size());
+        }
+    }
+}
+
 // MIN / MAX share state + update + combine with SUM; only finalize differs.
 //
 // Both honour the same constant-state defence as sum's finalize(): if the
@@ -704,14 +816,21 @@ void finalize_max(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
     }
 }
 
-void register_one(duckdb_connection con, const char* name,
-                  duckdb_aggregate_finalize_t fin) {
+// Build (but do not register) one aggregate overload: (param_type) ->
+// param_type, wired to the shared state/update/combine machinery and the
+// given finalize. The return type mirrors the parameter type (BIGINT->BIGINT,
+// DOUBLE->DOUBLE); update/combine/state are byte-width agnostic and shared
+// across both overloads (see the gpu_sum(DOUBLE) section above). Caller owns
+// the returned handle and must duckdb_destroy_aggregate_function() it.
+duckdb_aggregate_function make_agg_function(const char* name,
+                                            duckdb_type param_type,
+                                            duckdb_aggregate_finalize_t fin) {
     duckdb_aggregate_function fn = duckdb_create_aggregate_function();
     duckdb_aggregate_function_set_name(fn, name);
-    duckdb_logical_type bigint = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
-    duckdb_aggregate_function_add_parameter(fn, bigint);
-    duckdb_aggregate_function_set_return_type(fn, bigint);
-    duckdb_destroy_logical_type(&bigint);
+    duckdb_logical_type t = duckdb_create_logical_type(param_type);
+    duckdb_aggregate_function_add_parameter(fn, t);
+    duckdb_aggregate_function_set_return_type(fn, t);
+    duckdb_destroy_logical_type(&t);
     duckdb_aggregate_function_set_functions(fn,
         state_size, state_init, update, combine, fin);
     duckdb_aggregate_function_set_destructor(fn, state_destroy);
@@ -720,6 +839,13 @@ void register_one(duckdb_connection con, const char* name,
     // not to short-circuit our aggregate on NULL input; update() already skips
     // NULL rows via the input validity bitmap.
     duckdb_aggregate_function_set_special_handling(fn);
+    return fn;
+}
+
+// Register a single BIGINT-typed aggregate (gpu_min / gpu_max).
+void register_one(duckdb_connection con, const char* name,
+                  duckdb_aggregate_finalize_t fin) {
+    duckdb_aggregate_function fn = make_agg_function(name, DUCKDB_TYPE_BIGINT, fin);
     duckdb_state st = duckdb_register_aggregate_function(con, fn);
     duckdb_destroy_aggregate_function(&fn);
     if (st == DuckDBError) {
@@ -727,13 +853,42 @@ void register_one(duckdb_connection con, const char* name,
     }
 }
 
+// Register gpu_sum as an aggregate function SET carrying two overloads:
+//   gpu_sum(BIGINT) -> BIGINT   (existing i64 finalize)
+//   gpu_sum(DOUBLE) -> DOUBLE   (new f64 finalize)
+// A function set is the C API's mechanism for same-name overloads; DuckDB's
+// binder then resolves the overload per call (INTEGER/SMALLINT/TINYINT keep
+// widening to the BIGINT overload as before — that implicit integer widening
+// is cheaper than the integer->double cast, so it wins overload resolution).
+void register_sum_overloads(duckdb_connection con) {
+    duckdb_aggregate_function_set set =
+        duckdb_create_aggregate_function_set("gpu_sum");
+    duckdb_aggregate_function fn_i64 =
+        make_agg_function("gpu_sum", DUCKDB_TYPE_BIGINT, finalize);
+    duckdb_aggregate_function fn_f64 =
+        make_agg_function("gpu_sum", DUCKDB_TYPE_DOUBLE, finalize_f64);
+    duckdb_state a1 = duckdb_add_aggregate_function_to_set(set, fn_i64);
+    duckdb_state a2 = duckdb_add_aggregate_function_to_set(set, fn_f64);
+    duckdb_destroy_aggregate_function(&fn_i64);
+    duckdb_destroy_aggregate_function(&fn_f64);
+    if (a1 == DuckDBError || a2 == DuckDBError) {
+        duckdb_destroy_aggregate_function_set(&set);
+        throw std::runtime_error("gpu_sum overload set assembly failed");
+    }
+    duckdb_state st = duckdb_register_aggregate_function_set(con, set);
+    duckdb_destroy_aggregate_function_set(&set);
+    if (st == DuckDBError) {
+        throw std::runtime_error("gpu_sum function set registration failed");
+    }
+}
+
 } // namespace
 
 void register_gpu_sum(duckdb_connection con) {
-    register_one(con, "gpu_sum", finalize);
-    register_one(con, "gpu_min", finalize_min);
-    register_one(con, "gpu_max", finalize_max);
-    std::fprintf(stderr, "[gpudb] registered gpu_sum / gpu_min / gpu_max  (backend=%s)\n",
+    register_sum_overloads(con);            // gpu_sum: BIGINT + DOUBLE overloads
+    register_one(con, "gpu_min", finalize_min);  // BIGINT only (v0.2.0)
+    register_one(con, "gpu_max", finalize_max);  // BIGINT only (v0.2.0)
+    std::fprintf(stderr, "[gpudb] registered gpu_sum (BIGINT,DOUBLE) / gpu_min / gpu_max  (backend=%s)\n",
                  gpudb::to_string(shared_agg().backend()));
 }
 
