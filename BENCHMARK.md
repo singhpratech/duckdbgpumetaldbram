@@ -784,31 +784,44 @@ These are wired into `src/operators/planner.cpp` (this commit / next).
 | Gap | Owner | Effort |
 |---|---|---|
 | Mac CPU OpenMP baseline | macOS instance | 1 hr |
-| TPC-H lineitem on Metal | macOS instance | 1 hr (in flight) |
-| Metal radix sort for >10M rows | macOS instance (in flight on `feat/metal-groupby-radix-gpu`) | multi-session |
-| CUDA hash join probe | Linux instance | multi-session |
-| Window functions on CUDA | Linux instance | this PR (in flight) |
-| Hybrid planner wiring in extension | Linux instance | this PR (in flight) |
+| TPC-H lineitem on Metal | macOS instance | 1 hr |
+| Window functions on CUDA | Linux instance | multi-session |
 
 ---
 
-## 2026-05-09 (night) — Metal hash-join SCAFFOLD landed
+## 2026-07-07 — Metal hash join: adaptive global + partitioned TG hash
 
-`HashJoinProbe` abstract interface + CPU reference (`std::unordered_map`) +
-Metal STUB are in. The Metal stub currently delegates to CPU work under the
-hood (Backend::METAL with CPU-shaped reduction), the same pattern the
-original Metal groupby used before being replaced with a real GPU kernel.
+Metal inner equi-join on int64 keys. Small builds (≤500k rows) use a fused
+global slot-lock hash table (one command buffer). Larger builds use full radix
+hash join: partition both sides, per-partition threadgroup hash build+probe
+(same pattern as Metal GROUP BY slot-lock). Sort-merge remains when
+`2 × n_build` exceeds the 256M-slot cap. Override: `GPUDB_METAL_HASHJOIN_PATH`.
 
-**Numbers will therefore match the CPU baseline** — that's expected. The
-real Metal sort-merge implementation will replace the stub when the CUDA
-hash-join (in flight on `feat/cuda-hashjoin`) lands on main and the
-abstract contract is locked in.
+### Apple M4, 1M build × 10M probe (96.9% selectivity)
 
-Why sort-merge for Metal (not a direct CUDA port): Apple Silicon GPUs have
-no 64-bit `atomic_compare_exchange`, so the CUDA open-addressing hash table
-can't be mirrored. Sort + binary-search merge reuses the radix-sort kernels
-already in `groupby.metal`. See `src/backends/metal/metal_hashjoin.mm`
-header for the planned algorithm.
+```
+gpudb-hashjoin-bench  build=1,000,000  probe=10,000,000  runs=5  skew=0.0
+
+[CPU]   median wall=191 ms    0.43 GiB/s
+[Metal] median wall= 38 ms    2.17 GiB/s   kernel 22 ms (4.9× wall, partitioned TG hash)
+```
+
+100k × 500k: Metal 2.1 ms wall vs CPU 3.5 ms (auto-selects global path).
+Build scatter is cached when the same build table is probed repeatedly.
+
+---
+
+## 2026-07-07 (earlier) — Metal hash join: global slot-lock only
+
+First landing used a single global slot-lock table (4.4× wall @ 1M×10M).
+Superseded by the adaptive + partitioned TG hash path above for large builds.
+
+---
+
+## 2026-05-09 (night) — Metal hash-join SCAFFOLD landed (superseded)
+
+~~`HashJoinProbe` abstract interface + CPU reference + Metal STUB.~~
+Superseded by the Metal hash join paths above.
 
 ### Apple M4 Max, scaffold sanity run (Metal == CPU until kernel lands)
 
@@ -869,8 +882,8 @@ that compete with CUDA on real workloads. Achieved.
 3. ✅ Resident-column workloads with many queries per upload —
    already implicit in HOT vs COLD (200M COLD 69.5 ms vs HOT 4.46 ms = 15.6×
    amortization, in addition to the GPU vs CPU win).
-4. ⏳ Sort-based hash join (when CUDA hash-join lands on main) —
-   another high-cardinality regime where Metal should win 3-5× over CPU.
+4. ✅ Hash join — adaptive global + partitioned TG hash on Metal (4.9× wall @ 1M×10M);
+   CUDA slot-lock path ships separately.
 
 ---
 

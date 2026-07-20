@@ -10,6 +10,10 @@
 #include <random>
 #include <vector>
 
+void test_hashjoin();
+int test_hashjoin_failures();
+int test_hashjoin_total();
+
 namespace {
 
 int failures = 0;
@@ -351,6 +355,10 @@ int main() {
 
     test_hybrid_aggregator();
     test_hybrid_groupby();
+    test_hashjoin();
+
+    failures += test_hashjoin_failures();
+    total += test_hashjoin_total();
 
     std::printf("\n%d / %d checks passed\n", total - failures, total);
     return failures == 0 ? 0 : 1;

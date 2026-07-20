@@ -94,6 +94,9 @@ public:
             ps_partition_scatter_ = make_pso(lib, @"partition_scatter_hash");
             ps_partition_aggregate_slotlock_ =
                 make_pso(lib, @"partition_hash_aggregate_slotlock_i64");
+            ps_seg_flags_  = make_pso(lib, @"segment_run_flags_i64");
+            ps_seg_mark_   = make_pso(lib, @"segment_run_mark_starts_i64");
+            ps_seg_sum_    = make_pso(lib, @"segment_run_sum_i64");
         }
     }
 
@@ -103,7 +106,7 @@ public:
         @autoreleasepool {
             std::ostringstream os;
             os << [[device_ name] UTF8String]
-               << " (Metal, LSD radix sort + host segment-reduce)";
+               << " (Metal, LSD radix sort + GPU segment-reduce)";
             return os.str();
         }
     }
@@ -374,80 +377,82 @@ public:
             [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
 
+            // ---- GPU segment-reduce (replaces host scan at large N) ----
+            const std::size_t bytes_flags = static_cast<std::size_t>(n32) * sizeof(std::uint32_t);
+            if (!b_seg_flags_ || [b_seg_flags_ length] < bytes_flags) {
+                b_seg_flags_ = [device_ newBufferWithLength:bytes_flags
+                                                    options:MTLResourceStorageModeShared];
+            }
+            if (!b_seg_starts_ || [b_seg_starts_ length] < bytes_flags) {
+                b_seg_starts_ = [device_ newBufferWithLength:bytes_flags
+                                                     options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_count_ || [b_sl_out_count_ length] < sizeof(std::uint32_t)) {
+                b_sl_out_count_ = [device_ newBufferWithLength:sizeof(std::uint32_t)
+                                                       options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_keys_ || [b_sl_out_keys_ length] < bytes_kv) {
+                b_sl_out_keys_ = [device_ newBufferWithLength:bytes_kv
+                                                      options:MTLResourceStorageModeShared];
+            }
+            if (!b_sl_out_sums_ || [b_sl_out_sums_ length] < bytes_kv) {
+                b_sl_out_sums_ = [device_ newBufferWithLength:bytes_kv
+                                                      options:MTLResourceStorageModeShared];
+            }
+
+            [ce setComputePipelineState:ps_seg_flags_];
+            [ce setBuffer:in_keys offset:0 atIndex:0];
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+            [ce setBuffer:b_seg_flags_ offset:0 atIndex:2];
+            [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
+            std::memset([b_sl_out_count_ contents], 0, sizeof(std::uint32_t));
+
+            [ce setComputePipelineState:ps_seg_mark_];
+            [ce setBuffer:b_seg_flags_ offset:0 atIndex:0];
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+            [ce setBuffer:b_seg_starts_ offset:0 atIndex:2];
+            [ce setBuffer:b_sl_out_count_ offset:0 atIndex:3];
+            [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+
             [ce endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
 
-            const double kernel_ms_total = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+            const double kernel_ms_radix = ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
 
-            // ---- Host segment-reduce (parallel) ----
-            // Sorted (key, value) array. Divide into NTHREADS chunks; each
-            // thread emits (key, sum) pairs for the runs entirely inside its
-            // chunk. Boundary keys (a run that spans the chunk edge) are
-            // stitched together in a final single-thread pass over the
-            // per-thread results.
-            const std::int64_t* sk = static_cast<const std::int64_t*>([in_keys   contents]);
-            const std::int64_t* sv = static_cast<const std::int64_t*>([in_values contents]);
+            const std::uint32_t num_segs =
+                *static_cast<const std::uint32_t*>([b_sl_out_count_ contents]);
 
-            constexpr int kSegThreads = 8;
-            if (n >= 16384) {
-                std::vector<std::vector<std::int64_t>> tk(kSegThreads), ts(kSegThreads);
-
-                // Align each chunk start to a run boundary so no run is split.
-                std::array<std::size_t, kSegThreads + 1> starts;
-                starts[0] = 0;
-                for (int t = 1; t < kSegThreads; ++t) {
-                    std::size_t s = (n / kSegThreads) * t;
-                    while (s < n && s > 0 && sk[s] == sk[s - 1]) ++s;
-                    starts[t] = s;
-                }
-                starts[kSegThreads] = n;
-
-                std::vector<std::thread> workers;
-                workers.reserve(kSegThreads);
-                for (int t = 0; t < kSegThreads; ++t) {
-                    workers.emplace_back([&, t] {
-                        const std::size_t lo = starts[t];
-                        const std::size_t hi = starts[t + 1];
-                        std::size_t i = lo;
-                        while (i < hi) {
-                            const std::int64_t k = sk[i];
-                            std::int64_t sum = 0;
-                            std::size_t j = i;
-                            while (j < hi && sk[j] == k) { sum += sv[j]; ++j; }
-                            tk[t].push_back(k);
-                            ts[t].push_back(sum);
-                            i = j;
-                        }
-                    });
-                }
-                for (auto& w : workers) w.join();
-
-                // Concatenate (no boundary stitching needed: starts[] aligned to runs).
-                std::size_t total = 0;
-                for (int t = 0; t < kSegThreads; ++t) total += tk[t].size();
-                r.keys.reserve(total);
-                r.sums.reserve(total);
-                for (int t = 0; t < kSegThreads; ++t) {
-                    r.keys.insert(r.keys.end(), tk[t].begin(), tk[t].end());
-                    r.sums.insert(r.sums.end(), ts[t].begin(), ts[t].end());
-                }
-            } else {
-                r.keys.reserve(64);
-                r.sums.reserve(64);
-                std::size_t i = 0;
-                while (i < n) {
-                    const std::int64_t k = sk[i];
-                    std::int64_t sum = 0;
-                    std::size_t j = i;
-                    while (j < n && sk[j] == k) { sum += sv[j]; ++j; }
-                    r.keys.push_back(k);
-                    r.sums.push_back(sum);
-                    i = j;
-                }
+            double kernel_ms_seg = 0.0;
+            if (num_segs > 0) {
+                id<MTLCommandBuffer> cb_seg = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce_seg = [cb_seg computeCommandEncoder];
+                [ce_seg setComputePipelineState:ps_seg_sum_];
+                [ce_seg setBuffer:in_keys offset:0 atIndex:0];
+                [ce_seg setBuffer:in_values offset:0 atIndex:1];
+                [ce_seg setBuffer:b_seg_starts_ offset:0 atIndex:2];
+                [ce_seg setBytes:&num_segs length:sizeof(num_segs) atIndex:3];
+                [ce_seg setBytes:&n32 length:sizeof(n32) atIndex:4];
+                [ce_seg setBuffer:b_sl_out_keys_ offset:0 atIndex:5];
+                [ce_seg setBuffer:b_sl_out_sums_ offset:0 atIndex:6];
+                const NSUInteger seg_tg = (num_segs + kBlock - 1) / kBlock;
+                [ce_seg dispatchThreadgroups:MTLSizeMake(seg_tg, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce_seg endEncoding];
+                [cb_seg commit];
+                [cb_seg waitUntilCompleted];
+                kernel_ms_seg = ([cb_seg GPUEndTime] - [cb_seg GPUStartTime]) * 1000.0;
             }
 
-            r.kernel_ms   = kernel_ms_total;
+            const std::int64_t* ok = static_cast<const std::int64_t*>([b_sl_out_keys_ contents]);
+            const std::int64_t* os_ = static_cast<const std::int64_t*>([b_sl_out_sums_ contents]);
+            r.keys.assign(ok, ok + num_segs);
+            r.sums.assign(os_, os_ + num_segs);
+
+            r.kernel_ms   = kernel_ms_radix + kernel_ms_seg;
             r.transfer_ms = 0.0;
             r.wall_ms     = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_wall0).count();
@@ -718,6 +723,9 @@ private:
     id<MTLComputePipelineState> ps_partition_count_              = nil;
     id<MTLComputePipelineState> ps_partition_scatter_            = nil;
     id<MTLComputePipelineState> ps_partition_aggregate_slotlock_ = nil;
+    id<MTLComputePipelineState> ps_seg_flags_ = nil;
+    id<MTLComputePipelineState> ps_seg_mark_ = nil;
+    id<MTLComputePipelineState> ps_seg_sum_ = nil;
     id<MTLBuffer> b_bucket_total_  = nil;
     id<MTLBuffer> b_bucket_offset_ = nil;
     id<MTLBuffer> b_minmax_partials_ = nil;
@@ -735,6 +743,8 @@ private:
     id<MTLBuffer> b_sl_out_count_          = nil;
     id<MTLBuffer> b_sl_out_keys_           = nil;
     id<MTLBuffer> b_sl_out_sums_           = nil;
+    id<MTLBuffer> b_seg_flags_           = nil;
+    id<MTLBuffer> b_seg_starts_            = nil;
     bool path_logged_ = false;
 };
 

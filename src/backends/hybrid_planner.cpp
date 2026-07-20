@@ -104,6 +104,13 @@ constexpr std::size_t kGroupByGpuMinN       = 500'000;   // below: CPU wins (has
 constexpr std::size_t kGroupByGpuMaxN       = 2'000'000; // above: bitonic O(N log²N) collapses past hash O(N)
 constexpr std::size_t kGroupByLowCardGroups = 10'000;    // below: CPU's hash table is cache-resident
 
+// Hash join thresholds (Apple M4, adaptive Metal path, 2026-07-07):
+//   100k×500k: Metal 2.1 ms wall vs CPU 3.6 ms (auto → global)
+//   1M×10M:    Metal 38 ms wall vs CPU 191 ms (partitioned TG hash, 4.9×)
+// Below ~50k total rows GPU launch overhead wins for CPU.
+constexpr std::size_t kJoinSmallTotal  = 50'000;
+constexpr std::size_t kJoinMinProbe    = 10'000;
+
 // =========================================================================
 //  HybridAggregator (SUM/MIN/MAX + resident path)
 // =========================================================================
@@ -472,6 +479,84 @@ private:
     DispatchDecision                   last_{};
 };
 
+// =========================================================================
+//  HybridHashJoinProbe
+// =========================================================================
+
+class HybridHashJoinProbeImpl final : public HybridHashJoinProbe {
+public:
+    HybridHashJoinProbeImpl()
+        : cpu_(make_hashjoin_probe(Backend::CPU))
+    {
+        const Backend gpu = default_backend();
+        if (gpu != Backend::CPU) {
+            try {
+                gpu_ = make_hashjoin_probe(gpu);
+                gpu_backend_ = gpu;
+            } catch (const std::exception&) {
+                gpu_ = nullptr;
+                gpu_backend_ = Backend::CPU;
+            }
+        } else {
+            gpu_backend_ = Backend::CPU;
+        }
+    }
+
+    Backend backend() const noexcept override { return Backend::CPU; }
+
+    std::string device_name() const override {
+        std::string s = "Hybrid hash join (CPU=";
+        s += cpu_->device_name();
+        s += ", GPU=";
+        s += gpu_ ? gpu_->device_name() : std::string("<none>");
+        s += ")";
+        return s;
+    }
+
+    Backend gpu_backend() const noexcept override { return gpu_backend_; }
+    const DispatchDecision& last_decision() const noexcept override { return last_; }
+
+    JoinResult inner_join_i64(const std::int64_t* build_keys, std::size_t n_build,
+                              const std::int64_t* probe_keys, std::size_t n_probe) override {
+        const std::size_t total = n_build + n_probe;
+
+        if (!gpu_) {
+            last_ = make_decision(Backend::CPU, DispatchReason::GpuUnavailable,
+                                  total, 0, false, false);
+            return cpu_->inner_join_i64(build_keys, n_build, probe_keys, n_probe);
+        }
+
+        if (total < kJoinSmallTotal || n_probe < kJoinMinProbe) {
+            last_ = make_decision(Backend::CPU, DispatchReason::Join_SmallN_CpuWins,
+                                  total, 0, false, false);
+            return cpu_->inner_join_i64(build_keys, n_build, probe_keys, n_probe);
+        }
+
+        last_ = make_decision(gpu_backend_, DispatchReason::Join_LargeProbe_GpuWins,
+                              total, 0, false, false);
+        return gpu_->inner_join_i64(build_keys, n_build, probe_keys, n_probe);
+    }
+
+private:
+    static DispatchDecision make_decision(Backend chosen, DispatchReason reason,
+                                          std::size_t n, std::size_t eg,
+                                          bool resident, bool borderline) {
+        DispatchDecision d;
+        d.chosen          = chosen;
+        d.reason          = reason;
+        d.n               = n;
+        d.expected_groups = eg;
+        d.was_resident    = resident;
+        d.borderline      = borderline;
+        return d;
+    }
+
+    std::unique_ptr<HashJoinProbe> cpu_;
+    std::unique_ptr<HashJoinProbe> gpu_;
+    Backend                        gpu_backend_ = Backend::CPU;
+    DispatchDecision               last_{};
+};
+
 } // namespace
 
 const char* to_string(DispatchReason r) noexcept {
@@ -486,6 +571,8 @@ const char* to_string(DispatchReason r) noexcept {
         case DispatchReason::GroupBy_HighCard_GpuWins: return "GroupBy_HighCard_GpuWins";
         case DispatchReason::GroupBy_Borderline_GpuTry:return "GroupBy_Borderline_GpuTry";
         case DispatchReason::GroupBy_HugeN_CpuWins:    return "GroupBy_HugeN_CpuWins";
+        case DispatchReason::Join_SmallN_CpuWins:      return "Join_SmallN_CpuWins";
+        case DispatchReason::Join_LargeProbe_GpuWins:  return "Join_LargeProbe_GpuWins";
     }
     return "?";
 }
@@ -496,6 +583,10 @@ std::unique_ptr<HybridAggregator> make_hybrid_aggregator() {
 
 std::unique_ptr<HybridGroupByAggregator> make_hybrid_groupby_aggregator() {
     return std::make_unique<HybridGroupByAggregatorImpl>();
+}
+
+std::unique_ptr<HybridHashJoinProbe> make_hybrid_hashjoin_probe() {
+    return std::make_unique<HybridHashJoinProbeImpl>();
 }
 
 } // namespace gpudb
