@@ -2,6 +2,69 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-07-19 (v0.3.0) — streaming aggregate rewrite: end-to-end parity with native
+
+Re-run of the exact end-to-end suite from the v0.2.0 section below (same queries, same
+methodology: DuckDB CLI v1.5.2 `-unsigned -readonly`, `SET threads TO 16`, `.timer on`,
+warm OS cache, median of 5 timed runs after 1 warm-up, both sides cast `::DOUBLE` where
+noted), against the v0.3.0 streaming-aggregate implementation. Numbers below are from
+the record run on the final v0.3.0 binary. Hardware: Apple M4 Max, 16 threads.
+
+**What changed:** the extension's aggregate path was rewritten from "buffer every value
+into per-state vectors, reduce at finalize" to streaming running accumulators — the same
+algorithmic shape as a native DuckDB aggregate. The 4-point analysis in the v0.2.0
+section predicted the buffered design's 3×–110× loss was structural (the copy itself was
+the cost, not the reduction); this run confirms it. The aggregate path no longer
+dispatches to the GPU at all — on unified memory, shipping a column to the GPU just to
+sum it is pure overhead. Device reductions remain at operator level (the standalone
+benchmark sections below); GPU value on the SQL path moves to the join track (PR #43).
+
+### Correctness (gates before any timing counted)
+
+- Q6 revenue total matches native to the printed digit at SF1 and SF10 (last-ulp
+  summation-order difference only, as documented in the v0.2.0 section):
+  SF1 `123141078.2283` (TPC-H reference), SF10 `1230113636.0101`.
+- Q1 row set matches native row-for-row; SF1 group counts A/F 1,478,493 · N/F 38,854 ·
+  N/O 2,920,374 · R/F 1,478,870 (= reference), SF10 counts identical on both sides.
+- GROUP BY `l_orderkey`: row counts (1.5M / 15M), `sum(s)` checksum, and `max(s)`
+  identical on both sides at both scale factors.
+
+### Results (medians, seconds)
+
+| Query | Scale | native | v0.3.0 gpu | v0.3.0 ratio | v0.2.0 gpu | v0.2.0 ratio |
+|---|---|---:|---:|:---:|---:|:---:|
+| Q6 | SF1 | 0.002 | **0.002** | **1.00×** | 0.006 | ~3× |
+| Q6 | SF10 | 0.017 | **0.018** | **1.06×** | 0.057 | ~3.4× |
+| Q1 | SF1 | 0.011 | **0.012** | **1.09×** | 0.33 | ~30× |
+| Q1 | SF10 | 0.098 | **0.101** | **1.03×** | 3.45 | ~35× |
+| GROUP BY l_orderkey | SF1 | 0.010 | **0.012** | **1.20×** | 0.944 | ~86× |
+| GROUP BY l_orderkey | SF10 | 0.092 | **0.109** | **1.18×** | 11.05 | ~109× |
+
+Every cell is now within 0–20% of native (worst: SF1 GROUP BY at 1.20×), versus 3×–109×
+slower in v0.2.0. The SF10 GROUP BY cell alone went from 11.05 s to 0.109 s (~100×
+improvement) — with identical results. The remaining 0–20% has not been separately
+profiled; plausible contributors are the defensive magic-word probes, the extension
+callback indirection, and native's fused specializations. Small enough that `gpu_*`
+aggregates are no longer a footgun in real queries; not zero, and recorded as such.
+
+### New in v0.3.0: DOUBLE min/max (not part of the v0.2.0 suite)
+
+The six cells above call `gpu_sum` only (as documented in the v0.2.0 section), so they
+never touch the new `gpu_min(DOUBLE)` / `gpu_max(DOUBLE)` overloads. Their hot loop
+carries NaN-aware comparisons (NaN sorts greatest, matching native — see
+KNOWN_ISSUES.md), so it is timed separately. Query:
+`SELECT gpu_min(l_extendedprice::DOUBLE), gpu_max(l_extendedprice::DOUBLE) FROM lineitem`
+vs the native `min`/`max` twin; results match native exactly as printed at both scales
+(SF1 `901.0 / 104949.5`, SF10 `900.91 / 104949.5`).
+
+| Cell | native | gpu | ratio |
+|---|---:|---:|:---:|
+| min/max DOUBLE · SF1 | 0.004 | 0.006 | 1.50× |
+| min/max DOUBLE · SF10 | 0.032 | 0.050 | 1.56× |
+
+Native leads ~1.5× here — recorded honestly: these are correct-but-slower overloads
+whose value is completeness (they existed in no prior version), not speed.
+
 ## 2026-07-19 (v0.2.0) — end-to-end rewritten TPC-H queries through the DuckDB CLI (honest: native CPU wins)
 
 Prompted by a fair methodology question on community-extensions PR #1898.

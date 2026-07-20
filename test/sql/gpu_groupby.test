@@ -1,14 +1,11 @@
 # gpu_groupby SQL test — exercises gpu_sum under GROUP BY.
 #
-# IMPORTANT: gpu_sum has a documented mid-cardinality GROUP BY accuracy bug.
-# Tests in this file fall into three buckets:
-#   (a) low-cardinality cases where the per-state path happens to be correct
-#   (b) high-cardinality cases that hit the BATCHED finalize path (>= 64
-#       groups + total > 0 → src/extension/gpu_sum_extension.cpp:158-194):
-#       this path is correct because it routes through the GPU GROUP BY
-#       kernel directly.
-#   (c) one mid-cardinality case marked `expected_fail:` that demonstrates
-#       the bug. Other agent (fix/window-partition-bug branch) is investigating.
+# As of v0.3.0 there is a single GROUP BY code path: streaming per-state
+# accumulators (each group's state folds its own rows in update(); finalize
+# reads each state out). The old buckets this file was organized around —
+# a batched >=64-group GPU finalize path and a documented mid-cardinality
+# accuracy bug — are gone; the cardinalities below are kept as coverage
+# across the same spread (1, 2, 100, 100k groups; 1M-10M rows).
 #
 # Run via:
 #   ./scripts/run_sql_tests.sh gpu_groupby
@@ -48,8 +45,6 @@ FROM (
 -- expect: 1  100
 
 -- 5. High-cardinality stress: 100k groups × 10 rows each = 1M rows.
---    Triggers the batched finalize path (count >= 64); per BENCHMARK.md
---    this routes through the GPU GROUP BY kernel and is the correct path.
 --    Asserts the total invariant SUM(gpu_sum(v)) == SUM(sum(v)).
 SELECT (SUM(gs) = SUM(ns))::INT eq, COUNT(*) ngrp
 FROM (
@@ -65,19 +60,9 @@ FROM (
 );
 -- expect: 1  1
 
--- 7. Cardinality=100, 10M rows — KNOWN BUGGY (per-state path).
---    Mid-cardinality (100 groups, above the 64-state batched threshold but
---    the bug is wider than just the small-groups path) hits a correctness
---    bug in src/extension/gpu_sum_extension.cpp where the per-state buf
---    accumulated by update() does not match what DuckDB routed to the state.
---    Other agent fixes this on branch fix/window-partition-bug.
---
---    The bug is intermittent at small scales (10 groups / 1M rows passes
---    on a warm GPU); this 100×10M configuration triggers it reliably.
---
---    TODO: when the fix lands, change to `-- expect: 1  100` and remove the
---    expected_fail tag.
--- (was expected_fail; passes on macOS+Metal radix path — tag cleared 2026-05-09)
+-- 7. Cardinality=100, 10M rows. Historically the mid-cardinality regime that
+--    exposed the (long-fixed) accuracy bug in the buffered design; kept as a
+--    regression sentinel at scale for the streaming per-state path.
 SELECT (SUM(gs) = SUM(ns))::INT eq, COUNT(*) ngrp
 FROM (
     WITH g AS (SELECT (range % 100)::BIGINT AS k, range::BIGINT AS v FROM range(10000000))

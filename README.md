@@ -5,7 +5,7 @@
 ```sql
 -- Real query, real GPU, real result on RTX 4090 + Apple M4 Max
 SELECT gpu_sum(l_orderkey) FROM read_parquet('lineitem.parquet');
-[gpudb] registered gpu_sum (BIGINT,DOUBLE) / gpu_min / gpu_max  (backend=CUDA)
+[gpudb] registered gpu_sum / gpu_min / gpu_max (BIGINT,DOUBLE) streaming aggregates (backend=CUDA)
 gpu_sum(l_orderkey)
 18005322964949
 ```
@@ -64,7 +64,7 @@ Download the platform binary from the [latest release](https://github.com/singhp
 # Linux (RTX/CUDA)
 duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
   SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);"
-# -> [gpudb] registered gpu_sum (BIGINT,DOUBLE) / gpu_min / gpu_max  (backend=CUDA)
+# -> [gpudb] registered gpu_sum / gpu_min / gpu_max (BIGINT,DOUBLE) streaming aggregates (backend=CUDA)
 # -> 499999500000
 ```
 
@@ -132,8 +132,8 @@ And a static library `libgpudb` you can embed in any C++ project. See `src/exten
 │  ┌────────────────────────────────────┐  │
 │  │  gpudb extension                   │  │
 │  │  - gpu_sum / gpu_min / gpu_max     │  │
-│  │  - batched finalize for GROUP BY   │  │
-│  │      ↓                             │  │
+│  │  - streaming aggregate states      │  │
+│  │      ↓ (operator-level / join)     │  │
 │  │  ┌───────────────────────────────┐ │  │
 │  │  │  libgpudb backend dispatch    │ │  │
 │  │  │  ┌───────┐ ┌──────┐ ┌──────┐  │ │  │
@@ -146,6 +146,8 @@ And a static library `libgpudb` you can embed in any C++ project. See `src/exten
 
 Backend selection is automatic: CUDA if a device is found at runtime, else Metal if compiled-in, else CPU.
 
+As of v0.3.0 the SQL aggregate path is deliberately CPU-shaped: the aggregates stream running accumulators (the same shape as native DuckDB) instead of shipping chunks to the GPU — the v0.2.0 end-to-end numbers in [BENCHMARK.md](BENCHMARK.md) showed why buffering-for-GPU can't win through this interface on unified memory. The GPU backends serve the operator-level tools above and the SQL join path in development.
+
 ## Testing
 ```bash
 ./build-linux/test/test_gpudb        # 96 unit checks across the backends present at build time
@@ -155,11 +157,11 @@ Backend selection is automatic: CUDA if a device is found at runtime, else Metal
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.2.0: 50 / 50 pass,
+PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.3.0: 60 / 60 pass,
 0 fail, 0 expected fail. The window-function bugs that were previously
 xfail are now strict positive assertions (PR #22).
 
-**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 50-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 60-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Roadmap
 
@@ -186,18 +188,19 @@ xfail are now strict positive assertions (PR #22).
 - [x] **SQL-correct NULL semantics** (PR #44) — `gpu_sum`/`gpu_min`/`gpu_max` over empty or all-NULL input now return SQL `NULL` (not 0), matching native DuckDB on every path: plain aggregate, GROUP BY groups, and window frames.
 - [x] **`gpu_sum(DOUBLE) -> DOUBLE`** (PR #45) — a real second overload via the C API aggregate function set. Doubles ride the existing int64 state machinery as raw bit patterns (zero state-layout change); only the finalize differs. `INTEGER`/`SMALLINT`/`TINYINT` work via DuckDB's implicit widening to the `BIGINT` overload (locked in by tests). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-### In flight
-- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed). The submission is deliberately frozen at the v0.1.3-era ref while it awaits maintainer review; v0.2.0 ships as a follow-up bump after the first merge.
+### Shipped in v0.3.0
+- [x] **Streaming aggregate states** — the SQL aggregate path rewritten from "buffer every value, reduce at finalize" to running accumulators, the same algorithmic shape as native DuckDB. End-to-end on rewritten TPC-H Q6/Q1 and high-cardinality GROUP BY: parity with native (the v0.2.0 buffered path lost 3×–110×; the SF10 GROUP BY cell alone went from 11.05 s to 0.110 s). Full before/after in [BENCHMARK.md](BENCHMARK.md). `GPUDB_FORCE_BACKEND` is a no-op on this path now (it routed the deleted machinery).
+- [x] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — all three aggregates are now overload sets carrying `(BIGINT)->BIGINT` and `(DOUBLE)->DOUBLE`. No backend-interface change was needed under the streaming design. NaN ordering matches native (NaN sorts greatest). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-### Roadmap (v0.3.0)
-Near-term, scoped against what the DuckDB C extension API actually allows:
-- [ ] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — needs `min_f64`/`max_f64` added to the backend interface (`gpu_backend.hpp`); the registration side is ready (function sets already carry the sum overloads).
-- [ ] **Batched GPU GROUP BY for DOUBLE** — a `groupby_sum_f64` backend entry point so high-cardinality DOUBLE GROUP BY takes the batched GPU path the BIGINT path already has.
-- [ ] **Real Metal hash-join** (currently a CPU-fallback scaffold; CUDA hash-join is real).
-- [ ] **GPU-resident segment reduce** for Metal GROUP BY at 1B+ rows (the cell where we currently lose 1.5×).
+### In flight
+- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed). The submission is deliberately frozen at the v0.1.3-era ref while it awaits maintainer review; newer releases ship as a follow-up bump after the first merge.
+- [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
+
+### Roadmap (v0.4.0)
+- [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
 - [ ] **Community packaging phase 2** — add `cuda` to `requires_toolchains` so Linux community binaries ship the CUDA backend.
 
-### Beyond (v0.4.0+)
+### Beyond (v0.5.0+)
 - [ ] Resident-column SQL hooks: `gpu_cache(table, col)` table function so `gpu_sum` can run on data already loaded
 - [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
 - [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
