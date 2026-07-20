@@ -2,6 +2,110 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-07-19 (v0.2.0) — end-to-end rewritten TPC-H queries through the DuckDB CLI (honest: native CPU wins)
+
+Prompted by a fair methodology question on community-extensions PR #1898.
+The operator-level scorecards below measure the aggregate operator on
+resident data. This section answers a different question: what does a user
+actually see when they rewrite a whole query around `gpu_sum` and run it
+through the full DuckDB pipeline (scan → filter → project → aggregate)?
+
+Measured honestly: **on v0.2.0 the native CPU pipeline wins every
+end-to-end query shape tested, by ~3× to ~110×.** The gap is the
+extension's execution path, not the kernels — details below.
+
+**Hardware:** Apple M4 Max, 40-core GPU, ~64 GiB UMA. macOS 15.
+**Setup:** DuckDB CLI v1.5.2 (`-unsigned -readonly`), `SET threads=16`,
+`LOAD` of `gpudb.osx_arm64.duckdb_extension` built at v0.2.0 (main
+@ 6c1cc9d), `.timer on`, 1 warm-up + 5 timed runs per cell (3 for the
+GROUP BY cell), median reported, warm OS cache. Data: full TPC-H DuckDB
+databases `data/tpch_sf1/tpch.duckdb` (lineitem 6,001,215 rows) and
+`data/tpch_sf10/tpch.duckdb` (lineitem 59,986,052 rows). lineitem money
+columns are DECIMAL, so **both** sides cast `::DOUBLE` — identical casts,
+apples-to-apples.
+
+**Correctness first:** the SF1 Q6-shaped total (123141078.2283…) matches
+the published TPC-H reference answer. `gpu_sum(DOUBLE)` and native `sum`
+differ only in the last ulps (different summation order — expected for
+floating point). Q1-shaped per-group counts match native exactly
+(A/F 1,478,493 · N/F 38,854 · N/O 2,920,374 · R/F 1,478,870).
+
+### Q6-shaped — filter → single scalar DOUBLE SUM
+
+```sql
+SELECT sum((l_extendedprice * l_discount)::DOUBLE) FROM lineitem
+WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
+  AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24;
+-- gpu variant: identical, with gpu_sum(...) in place of sum(...)
+```
+
+| Scale | native `sum` | `gpu_sum` | native advantage |
+|---|---:|---:|:---:|
+| SF1  | 0.002 s | 0.006 s | ~3× |
+| SF10 | 0.017 s | 0.057 s | ~3.4× |
+
+### Q1-shaped — filter → 4-group aggregate, three DOUBLE SUMs + count
+
+```sql
+SELECT l_returnflag, l_linestatus, sum(l_quantity::DOUBLE),
+       sum(l_extendedprice::DOUBLE),
+       sum((l_extendedprice*(1-l_discount))::DOUBLE), count(*)
+FROM lineitem WHERE l_shipdate <= DATE '1998-09-02'
+GROUP BY l_returnflag, l_linestatus ORDER BY 1, 2;
+```
+
+| Scale | native `sum` | `gpu_sum` | native advantage |
+|---|---:|---:|:---:|
+| SF1  | 0.011 s | 0.33 s | ~30× |
+| SF10 | 0.099 s | 3.45 s | ~35× |
+
+### High-cardinality GROUP BY `l_orderkey` — BIGINT batched path
+
+The same workload where the operator scorecard shows Metal winning 1.30×
+(SF10, 15M unique groups) — deliberately chosen to isolate the extension
+path from the kernel.
+
+```sql
+SELECT count(*), max(s) FROM (
+  SELECT l_orderkey, sum((l_extendedprice*100)::BIGINT) AS s
+  FROM lineitem GROUP BY l_orderkey) t;
+-- gpu variant: gpu_sum in the inner query
+```
+
+| Scale | native `sum` | `gpu_sum` | native advantage |
+|---|---:|---:|:---:|
+| SF1 (1.5M groups)  | 0.011 s | 0.944 s | ~86× |
+| SF10 (15M groups)  | 0.101 s | 11.05 s | ~109× |
+
+### Why the extension path loses where the operator scorecard wins
+
+The SF10 GROUP BY row above and the scorecard's "Metal 1.30×" row are the
+same data and the same kernel. The ~140× swing between them is entirely
+the v0.2.0 extension execution path:
+
+1. **Buffering, twice.** DuckDB drives aggregates through per-chunk
+   `update` callbacks; the extension appends every input value into a
+   `BufferPool` state (a full serialized copy of the column) before the
+   GPU ever sees a byte, then `finalize` snapshots that buffered state
+   into another vector. The scorecard benches skip all of this — data is
+   already resident.
+2. **A global mutex** serializes every GPU dispatch, and grouped
+   aggregation finalizes per-state (one tiny reduction per group — 15M
+   dispatch decisions at SF10 — instead of one batched kernel).
+3. **DOUBLE on Metal never reaches the GPU.** `sum_f64` is a host-loop
+   fallback (Apple GPUs don't implement IEEE-754 doubles), so the Q6/Q1
+   gpu numbers on this box are: full buffering overhead, zero GPU upside.
+4. **Q1's 4-group regime is the documented structural CPU win** (L1-resident
+   hash table) regardless of the path.
+
+Conclusion, stated plainly: **in v0.2.0, `gpu_sum` is not a way to make
+whole queries faster.** The wins in this log are operator-level, on
+resident data. Closing the gap is exactly the v0.3.0 roadmap: a batched
+`groupby_sum_f64`-style streaming path that feeds chunks to the backend
+as they arrive instead of buffer→snapshot→per-state finalize. The
+distance between the 1.13 ms fused kernel and the 11 s end-to-end number
+is the size of that opportunity.
+
 ## 2026-05-10 (v0.1.3) — hybrid Metal GROUP BY + full TPC-H lineitem scorecard
 
 **Hardware:** Apple M4 Max, 40-core GPU, ~64 GiB UMA, ~546 GB/s LPDDR5X peak.
