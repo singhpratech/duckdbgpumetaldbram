@@ -155,3 +155,102 @@ GROUP BY k ORDER BY k;
 ----
 1	3.75
 2	NULL
+
+# ---------------------------------------------------------------------------
+# gpu_min(DOUBLE) / gpu_max(DOUBLE) overloads (v0.3.0)
+# ---------------------------------------------------------------------------
+
+# gpu_min(DOUBLE) — the second, real overload. Returns DOUBLE. Over
+# {0.25, 3.5, -1.5} (all exact in binary) the minimum is -1.5.
+query R
+SELECT gpu_min(v) FROM (VALUES (0.25::DOUBLE), (3.5::DOUBLE), (-1.5::DOUBLE)) t(v);
+----
+-1.5
+
+# gpu_max(DOUBLE) over the same set — the maximum is 3.5.
+query R
+SELECT gpu_max(v) FROM (VALUES (0.25::DOUBLE), (3.5::DOUBLE), (-1.5::DOUBLE)) t(v);
+----
+3.5
+
+# All-NULL DOUBLE input — MIN / MAX over zero non-NULL values is SQL NULL.
+query R
+SELECT gpu_min(NULL::DOUBLE);
+----
+NULL
+
+query R
+SELECT gpu_max(NULL::DOUBLE);
+----
+NULL
+
+# GROUP BY over DOUBLE — group 1: min=-1.5 max=3.5; group 2 is all-NULL -> NULL.
+query IR
+SELECT k, gpu_min(v) FROM (VALUES (1, 0.25::DOUBLE), (1, 3.5::DOUBLE), (1, -1.5::DOUBLE), (2, NULL::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	-1.5
+2	NULL
+
+query IR
+SELECT k, gpu_max(v) FROM (VALUES (1, 0.25::DOUBLE), (1, 3.5::DOUBLE), (1, -1.5::DOUBLE), (2, NULL::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	3.5
+2	NULL
+
+# ---------------------------------------------------------------------------
+# NaN / Infinity total-order semantics (v0.3.0). DuckDB orders NaN as the
+# GREATEST double; +/-inf are ordinary ordered values. gpu_min/gpu_max(DOUBLE)
+# match native MIN/MAX exactly — a NaN is never dropped, an all-NaN group is
+# NaN (not the fold identity), and +/-inf appear verbatim.
+# ---------------------------------------------------------------------------
+
+# All-NaN input — MIN and MAX are both NaN.
+query R
+SELECT gpu_min(v) FROM (VALUES ('nan'::DOUBLE), ('nan'::DOUBLE)) t(v);
+----
+nan
+
+query R
+SELECT gpu_max(v) FROM (VALUES ('nan'::DOUBLE), ('nan'::DOUBLE)) t(v);
+----
+nan
+
+# NaN is greatest: MAX({nan, 5.0, -2.5}) = nan, MIN = -2.5 (the least finite).
+query R
+SELECT gpu_max(v) FROM (VALUES ('nan'::DOUBLE), (5.0::DOUBLE), (-2.5::DOUBLE)) t(v);
+----
+nan
+
+query R
+SELECT gpu_min(v) FROM (VALUES ('nan'::DOUBLE), (5.0::DOUBLE), (-2.5::DOUBLE)) t(v);
+----
+-2.5
+
+# +/-Infinity are ordinary ordered values — no identity leak.
+query R
+SELECT gpu_min(v) FROM (VALUES ('inf'::DOUBLE), ('-inf'::DOUBLE), (1.0::DOUBLE)) t(v);
+----
+-inf
+
+query R
+SELECT gpu_max(v) FROM (VALUES ('inf'::DOUBLE), ('-inf'::DOUBLE), (1.0::DOUBLE)) t(v);
+----
+inf
+
+# GROUP BY with an all-NaN group beside a finite group — group 1 is nan/nan,
+# group 2 aggregates normally.
+query IR
+SELECT k, gpu_min(v) FROM (VALUES (1, 'nan'::DOUBLE), (1, 'nan'::DOUBLE), (2, 5.0::DOUBLE), (2, -2.5::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	nan
+2	-2.5
+
+query IR
+SELECT k, gpu_max(v) FROM (VALUES (1, 'nan'::DOUBLE), (1, 'nan'::DOUBLE), (2, 5.0::DOUBLE), (2, -2.5::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+----
+1	nan
+2	5.0

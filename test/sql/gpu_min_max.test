@@ -66,3 +66,79 @@ SELECT gpu_min(range::BIGINT) gmin, min(range::BIGINT) nmin,
        gpu_max(range::BIGINT) gmax, max(range::BIGINT) nmax
 FROM range(1000000);
 -- expect: 0  0  999999  999999
+
+-- ---------------------------------------------------------------------------
+-- gpu_min(DOUBLE) / gpu_max(DOUBLE) overloads (v0.3.0). DOUBLE does not
+-- implicitly cast to BIGINT (lossy), so these are real second overloads —
+-- gpu_min(DOUBLE)/gpu_max(DOUBLE) -> DOUBLE. All values below are exact in
+-- IEEE-754 binary (halves/quarters) so the assertions are stable regardless
+-- of streaming order.
+-- ---------------------------------------------------------------------------
+
+-- 12. DOUBLE mixed values with a NULL mixed in — NULL skipped.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES (1.5::DOUBLE), (NULL), (-2.25::DOUBLE), (0.75::DOUBLE), (3.5::DOUBLE)) t(v);
+-- expect: -2.25  -2.25  3.5  3.5
+
+-- 13. Negative doubles only — min/max both negative.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES (-0.25::DOUBLE), (-4.5::DOUBLE), (-1.75::DOUBLE)) t(v);
+-- expect: -4.5  -4.5  -0.25  -0.25
+
+-- 14. All-NULL DOUBLE column — gpu_min / gpu_max both return SQL NULL.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES (NULL::DOUBLE), (NULL::DOUBLE), (NULL::DOUBLE)) t(v);
+-- expect: NULL  NULL  NULL  NULL
+
+-- 15. Empty DOUBLE input — gpu_min / gpu_max and native both return NULL.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (SELECT 1.0::DOUBLE AS v WHERE FALSE) t(v);
+-- expect: NULL  NULL  NULL  NULL
+
+-- 16. GROUP BY over DOUBLE with one all-NULL group — that group is NULL;
+--     the others aggregate normally. Group 1: min=-0.5 max=1.5; group 2: NULL.
+SELECT k, gpu_min(v) gmin, gpu_max(v) gmax
+FROM (VALUES (1, 1.5::DOUBLE), (1, -0.5::DOUBLE), (1, 0.25::DOUBLE), (2, NULL::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+-- expect: 1  -0.5  1.5
+-- expect: 2  NULL  NULL
+
+-- 17. gpu_min/gpu_max(DOUBLE) vs native MIN/MAX agreement on a generated
+--     series of doubles in 0.25 steps straddling zero (each value exact).
+SELECT gpu_min((range * 0.25 - 500.0)::DOUBLE) gmin, min((range * 0.25 - 500.0)::DOUBLE) nmin,
+       gpu_max((range * 0.25 - 500.0)::DOUBLE) gmax, max((range * 0.25 - 500.0)::DOUBLE) nmax
+FROM range(10000);
+-- expect: -500.0  -500.0  1999.75  1999.75
+
+-- ---------------------------------------------------------------------------
+-- NaN / Infinity total-order semantics (v0.3.0). DuckDB orders NaN as the
+-- GREATEST double (NaN sorts last, like ORDER BY), and +/-inf are ordinary
+-- ordered values. gpu_min/gpu_max(DOUBLE) reproduce native MIN/MAX exactly on
+-- these — a NaN is never dropped, and an all-NaN group returns NaN (NOT the
+-- fold identity). Each case checks gpu vs native side by side.
+-- ---------------------------------------------------------------------------
+
+-- 18. All-NaN column — MIN and MAX are both NaN (matches native).
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES ('nan'::DOUBLE), ('nan'::DOUBLE), ('nan'::DOUBLE)) t(v);
+-- expect: nan  nan  nan  nan
+
+-- 19. NaN mixed with finite values — NaN is greatest, so MAX is NaN and MIN
+--     is the least finite value. Matches native.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES ('nan'::DOUBLE), (5.0::DOUBLE), (-2.5::DOUBLE), (1.25::DOUBLE)) t(v);
+-- expect: -2.5  -2.5  nan  nan
+
+-- 20. +/-Infinity are ordinary ordered values (no identity leak) — MIN is
+--     -inf, MAX is +inf. Matches native.
+SELECT gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES ('inf'::DOUBLE), ('-inf'::DOUBLE), (1.0::DOUBLE)) t(v);
+-- expect: -inf  -inf  inf  inf
+
+-- 21. GROUP BY with an all-NaN group beside a finite group — group 1 is
+--     NaN/NaN; group 2 aggregates normally. Matches native per group.
+SELECT k, gpu_min(v) gmin, min(v) nmin, gpu_max(v) gmax, max(v) nmax
+FROM (VALUES (1, 'nan'::DOUBLE), (1, 'nan'::DOUBLE), (2, 5.0::DOUBLE), (2, -2.5::DOUBLE)) t(k, v)
+GROUP BY k ORDER BY k;
+-- expect: 1  nan  nan  nan  nan
+-- expect: 2  -2.5  -2.5  5.0  5.0
