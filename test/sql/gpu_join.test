@@ -1,0 +1,19 @@
+# gpu_inner_join SQL test — inner equi-join via extension table function.
+#
+# Requires the loadable extension (LOAD gpudb). Run via scripts/run_sql_tests.sh
+# when GPUDB_BUILD_EXT=ON.
+
+-- Simple list join
+SELECT probe_idx, build_idx
+FROM gpu_inner_join([10, 20, 30], [20, 40, 99])
+ORDER BY probe_idx;
+-- expect: 0  1
+-- expect: 1  2
+
+-- No matches
+SELECT count(*)::BIGINT FROM gpu_inner_join([1, 2], [3, 4]);
+-- expect: 0
+
+-- All match
+SELECT count(*)::BIGINT FROM gpu_inner_join([5, 6, 7], [5, 6, 7]);
+-- expect: 3

@@ -16,10 +16,6 @@
 //   - Run on Backend::CPU once to get the reference JoinResult.
 //   - Run on every other available backend; canonicalize the matched-pair
 //     vectors via std::sort and compare. Mismatch is exit code 2.
-//
-// The Metal backend currently delegates to CPU work (scaffold), so its
-// numbers will match CPU. That is the expected state until the real Metal
-// sort-merge kernel lands. See BENCHMARK.md.
 
 #include "gpu_backend.hpp"
 
@@ -198,6 +194,41 @@ int main(int argc, char** argv) {
     }
 
     for (auto b : backends) run_backend(b, build, probe, a.runs, &reference, a.verify);
+
+    // Hybrid planner dispatch (CPU vs GPU threshold).
+    {
+        const std::size_t bytes = (build.size() + probe.size()) * sizeof(std::int64_t);
+        std::printf("\n[Hybrid]\n");
+        try {
+            auto hj = gpudb::make_hybrid_hashjoin_probe();
+            std::printf("  device: %s\n", hj->device_name().c_str());
+            auto first = hj->inner_join_i64(build.data(), build.size(),
+                                            probe.data(), probe.size());
+            std::printf("  matched: %zu / %zu probe rows (%.1f%%)\n",
+                        first.matched, probe.size(),
+                        probe.empty() ? 0.0
+                                      : 100.0 * static_cast<double>(first.matched) / probe.size());
+            std::printf("  dispatch: %s (%s)\n",
+                        gpudb::to_string(hj->last_decision().chosen),
+                        gpudb::to_string(hj->last_decision().reason));
+            if (!join_equals(first, reference)) {
+                std::fprintf(stderr, "  CORRECTNESS FAIL: hybrid differs from CPU reference\n");
+                std::exit(2);
+            }
+            std::vector<double> wall, kernel;
+            for (int i = 0; i < a.runs; ++i) {
+                auto r = hj->inner_join_i64(build.data(), build.size(),
+                                            probe.data(), probe.size());
+                wall.push_back(r.wall_ms);
+                kernel.push_back(r.kernel_ms);
+            }
+            const double w = median(wall), k = median(kernel);
+            std::printf("  median wall=%8.3f ms  kernel=%8.3f ms  throughput=%6.2f GiB/s\n",
+                        w, k, gibps(bytes, w));
+        } catch (const std::exception& e) {
+            std::printf("  unavailable: %s\n", e.what());
+        }
+    }
 
     std::printf("\ndone.\n");
     return 0;

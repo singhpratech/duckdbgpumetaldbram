@@ -21,6 +21,7 @@
 #include "duckdb_extension.h"
 
 #include "gpu_sum_extension.hpp"
+#include "gpu_join_extension.hpp"
 
 #include <exception>
 
@@ -28,8 +29,9 @@ DUCKDB_EXTENSION_ENTRYPOINT(duckdb_connection connection,
                             duckdb_extension_info info,
                             struct duckdb_extension_access *access) {
     try {
-        // Registers gpu_sum / gpu_min / gpu_max on the auto-opened connection.
+        // Registers gpu_sum / gpu_min / gpu_max / gpu_inner_join on the auto-opened connection.
         gpudb_ext::register_gpu_sum(connection);
+        gpudb_ext::register_gpu_join(connection);
     } catch (const std::exception &e) {
         if (access && access->set_error) {
             access->set_error(info, e.what());

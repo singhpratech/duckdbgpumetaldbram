@@ -977,3 +977,338 @@ kernel void partition_hash_aggregate_slotlock_i64(
         }
     }
 }
+
+// ============================================================================
+// Sort-merge hash join: probe keys against sorted build keys (build must be sorted).
+// Probe order is arbitrary — gid indexes probe rows directly.
+kernel void hashjoin_merge_sorted_i64(
+    device const long*  probe_keys     [[buffer(0)]],
+    device const long*  probe_orig     [[buffer(1)]],
+    device const long*  build_keys     [[buffer(2)]],
+    device const long*  build_orig     [[buffer(3)]],
+    constant uint&      n_probe        [[buffer(4)]],
+    constant uint&      n_build        [[buffer(5)]],
+    device long*        out_probe_idx  [[buffer(6)]],
+    device long*        out_build_idx  [[buffer(7)]],
+    device atomic_uint* out_count      [[buffer(8)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n_probe) return;
+    const long pk = probe_keys[gid];
+
+    uint lo = 0u;
+    uint hi = n_build;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (build_keys[mid] < pk) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo >= n_build || build_keys[lo] != pk) return;
+
+    const uint slot = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+    out_probe_idx[slot] = probe_orig[gid];
+    out_build_idx[slot] = build_orig[lo];
+}
+
+// ============================================================================
+// Device-resident open-addressing hash join (slot-lock build, read-only probe).
+// Mirrors the slot-lock GROUP BY pattern but stores (key, build_row_idx).
+// v1: first build row wins on duplicate keys; at most one match per probe row.
+// ============================================================================
+
+constant uint HJ_SLOT_EMPTY     = 0u;
+constant uint HJ_SLOT_LOCKED    = 1u;
+constant uint HJ_SLOT_COMMITTED = 2u;
+constant long HJ_KEY_EMPTY      = (long)0x8000000000000000UL;
+
+inline uint hashjoin_slot(long key, uint cap_mask) {
+    const ulong h = slotlock_hash(key);
+    return (uint)(h & cap_mask);
+}
+
+// ----------------------------------------------------------------------------
+// Partitioned hash join (full radix join): one threadgroup per partition.
+//   1. Build TG hash from scattered build slice (key -> first build row index).
+//   2. Probe scattered probe slice via O(1) TG hash lookup per key.
+// Mirrors partition_hash_aggregate_slotlock_i64 but join semantics (no sum).
+// ----------------------------------------------------------------------------
+kernel void partition_hashjoin_i64(
+    device const long*  build_scatter_keys [[buffer(0)]],
+    device const long*  build_scatter_idx  [[buffer(1)]],
+    device const uint*  build_offsets      [[buffer(2)]],
+    device const long*  probe_scatter_keys [[buffer(3)]],
+    device const long*  probe_scatter_idx  [[buffer(4)]],
+    device const uint*  probe_offsets      [[buffer(5)]],
+    device atomic_uint* out_count          [[buffer(6)]],
+    device long*        out_probe          [[buffer(7)]],
+    device long*        out_build          [[buffer(8)]],
+    uint                tid                [[thread_position_in_threadgroup]],
+    uint                pid                [[threadgroup_position_in_grid]])
+{
+    threadgroup atomic_uint slot_state[SLOTLOCK_SLOT_COUNT];
+    threadgroup long        slot_keys[SLOTLOCK_SLOT_COUNT];
+    threadgroup long        slot_idx [SLOTLOCK_SLOT_COUNT];
+
+    for (uint s = tid; s < SLOTLOCK_SLOT_COUNT; s += SLOTLOCK_TG_THREADS) {
+        atomic_store_explicit(&slot_state[s], SLOT_EMPTY, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint build_lo = build_offsets[pid];
+    const uint build_hi = build_offsets[pid + 1u];
+
+    for (uint i = build_lo + tid; i < build_hi; i += SLOTLOCK_TG_THREADS) {
+        const long  k = build_scatter_keys[i];
+        const long  bidx = build_scatter_idx[i];
+        const ulong h = slotlock_hash(k);
+        uint slot = slotlock_slot_start(h);
+        for (uint attempt = 0; attempt < SLOTLOCK_SLOT_COUNT * 4u; ++attempt) {
+            const uint state = atomic_load_explicit(&slot_state[slot],
+                                                    memory_order_relaxed);
+            if (state == SLOT_EMPTY) {
+                uint expected = SLOT_EMPTY;
+                if (atomic_compare_exchange_weak_explicit(
+                        &slot_state[slot], &expected, SLOT_LOCKED,
+                        memory_order_relaxed, memory_order_relaxed))
+                {
+                    slot_keys[slot] = k;
+                    slot_idx[slot] = bidx;
+                    atomic_store_explicit(&slot_state[slot], SLOT_COMMITTED,
+                                          memory_order_relaxed);
+                    break;
+                }
+                continue;
+            }
+            if (state == SLOT_COMMITTED) {
+                if (slot_keys[slot] == k) {
+                    break; // first build row wins
+                }
+                slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;
+                continue;
+            }
+            continue;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint probe_lo = probe_offsets[pid];
+    const uint probe_hi = probe_offsets[pid + 1u];
+
+    for (uint i = probe_lo + tid; i < probe_hi; i += SLOTLOCK_TG_THREADS) {
+        const long  k = probe_scatter_keys[i];
+        const long  pidx = probe_scatter_idx[i];
+        const ulong h = slotlock_hash(k);
+        uint slot = slotlock_slot_start(h);
+        for (uint attempt = 0; attempt < SLOTLOCK_SLOT_COUNT * 4u; ++attempt) {
+            const uint state = atomic_load_explicit(&slot_state[slot],
+                                                    memory_order_relaxed);
+            if (state == SLOT_EMPTY) {
+                break;
+            }
+            if (state == SLOT_COMMITTED) {
+                if (slot_keys[slot] == k) {
+                    const uint pos = atomic_fetch_add_explicit(out_count, 1u,
+                                                               memory_order_relaxed);
+                    out_probe[pos] = pidx;
+                    out_build[pos] = slot_idx[slot];
+                    break;
+                }
+                slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;
+                continue;
+            }
+            continue;
+        }
+    }
+}
+
+kernel void hashjoin_probe_partition_i64(
+    device const long*  probe_keys        [[buffer(0)]],
+    constant uint&      n_probe           [[buffer(1)]],
+    device const long*  scatter_keys      [[buffer(2)]],
+    device const long*  scatter_build_idx [[buffer(3)]],
+    device const uint*  partition_offsets [[buffer(4)]],
+    device long*        out_probe         [[buffer(5)]],
+    device long*        out_build         [[buffer(6)]],
+    device atomic_uint* out_count         [[buffer(7)]],
+    uint                gid               [[thread_position_in_grid]],
+    uint                gsize             [[threads_per_grid]])
+{
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        const ulong h = slotlock_hash(k);
+        const uint  p = slotlock_partition(h);
+        const uint  lo = partition_offsets[p];
+        const uint  hi = partition_offsets[p + 1u];
+        for (uint j = lo; j < hi; ++j) {
+            if (scatter_keys[j] == k) {
+                const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                out_probe[pos] = (long)i;
+                out_build[pos] = scatter_build_idx[j];
+                break;
+            }
+        }
+    }
+}
+
+kernel void hashjoin_fill_iota_i64(
+    device long*   out  [[buffer(0)]],
+    constant uint& n    [[buffer(1)]],
+    uint           gid  [[thread_position_in_grid]],
+    uint           gsize [[threads_per_grid]])
+{
+    for (uint i = gid; i < n; i += gsize) {
+        out[i] = (long)i;
+    }
+}
+
+kernel void hashjoin_init_table(
+    device atomic_uint* slot_state [[buffer(0)]],
+    device long*        slot_keys  [[buffer(1)]],
+    constant uint&      cap        [[buffer(2)]],
+    uint                gid        [[thread_position_in_grid]],
+    uint                gsize      [[threads_per_grid]])
+{
+    for (uint i = gid; i < cap; i += gsize) {
+        atomic_store_explicit(&slot_state[i], HJ_SLOT_EMPTY, memory_order_relaxed);
+        slot_keys[i] = HJ_KEY_EMPTY;
+    }
+}
+
+kernel void hashjoin_build_slotlock_i64(
+    device const long*  build_keys  [[buffer(0)]],
+    constant uint&      n_build     [[buffer(1)]],
+    device atomic_uint* slot_state  [[buffer(2)]],
+    device long*        slot_keys   [[buffer(3)]],
+    device long*        slot_idx    [[buffer(4)]],
+    constant uint&      cap         [[buffer(5)]],
+    uint                gid         [[thread_position_in_grid]],
+    uint                gsize       [[threads_per_grid]])
+{
+    const uint cap_mask = cap - 1u;
+    for (uint i = gid; i < n_build; i += gsize) {
+        const long k = build_keys[i];
+        if (k == HJ_KEY_EMPTY) continue;
+        uint slot = hashjoin_slot(k, cap_mask);
+        for (uint attempt = 0; attempt < cap; ++attempt) {
+            const uint state = atomic_load_explicit(&slot_state[slot], memory_order_relaxed);
+            if (state == HJ_SLOT_EMPTY) {
+                uint expected = HJ_SLOT_EMPTY;
+                if (atomic_compare_exchange_weak_explicit(
+                        &slot_state[slot], &expected, HJ_SLOT_LOCKED,
+                        memory_order_relaxed, memory_order_relaxed))
+                {
+                    slot_keys[slot] = k;
+                    slot_idx[slot] = (long)i;
+                    atomic_store_explicit(&slot_state[slot], HJ_SLOT_COMMITTED,
+                                          memory_order_relaxed);
+                    break;
+                }
+                continue;
+            }
+            if (state == HJ_SLOT_COMMITTED) {
+                if (slot_keys[slot] == k) {
+                    break; // first build row wins (v1 unique-build contract)
+                }
+                slot = (slot + 1u) & cap_mask;
+                continue;
+            }
+            // HJ_SLOT_LOCKED — spin on this slot
+        }
+    }
+}
+
+kernel void hashjoin_probe_slotlock_i64(
+    device const long*        probe_keys  [[buffer(0)]],
+    constant uint&            n_probe     [[buffer(1)]],
+    device const atomic_uint* slot_state  [[buffer(2)]],
+    device const long*        slot_keys   [[buffer(3)]],
+    device const long*        slot_idx    [[buffer(4)]],
+    constant uint&            cap         [[buffer(5)]],
+    device long*              out_probe   [[buffer(6)]],
+    device long*              out_build   [[buffer(7)]],
+    device atomic_uint*       out_count   [[buffer(8)]],
+    uint                      gid         [[thread_position_in_grid]],
+    uint                      gsize       [[threads_per_grid]])
+{
+    const uint cap_mask = cap - 1u;
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        if (k == HJ_KEY_EMPTY) continue;
+        uint slot = hashjoin_slot(k, cap_mask);
+        for (uint probe = 0; probe < cap; ++probe) {
+            const uint state = atomic_load_explicit(&slot_state[slot], memory_order_relaxed);
+            if (state == HJ_SLOT_EMPTY) {
+                break;
+            }
+            if (state == HJ_SLOT_COMMITTED) {
+                const long tk = slot_keys[slot];
+                if (tk == k) {
+                    const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+                    out_probe[pos] = (long)i;
+                    out_build[pos] = slot_idx[slot];
+                    break;
+                }
+                if (tk == HJ_KEY_EMPTY) {
+                    break;
+                }
+            }
+            slot = (slot + 1u) & cap_mask;
+        }
+    }
+}
+
+// ============================================================================
+// GPU segment-reduce after radix sort (SUM GROUP BY).
+// Replaces the host O(N) scan over sorted (key, value) pairs at large N.
+// ============================================================================
+
+kernel void segment_run_flags_i64(
+    device const long* keys [[buffer(0)]],
+    constant uint&     n    [[buffer(1)]],
+    device uint*       flags [[buffer(2)]],
+    uint               gid  [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    if (gid == 0u) {
+        flags[0] = 1u;
+        return;
+    }
+    flags[gid] = (keys[gid] != keys[gid - 1u]) ? 1u : 0u;
+}
+
+kernel void segment_run_mark_starts_i64(
+    device const uint* flags     [[buffer(0)]],
+    constant uint&     n          [[buffer(1)]],
+    device uint*       starts     [[buffer(2)]],
+    device atomic_uint* out_count [[buffer(3)]],
+    uint               gid        [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    if (flags[gid] != 0u) {
+        const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+        starts[pos] = gid;
+    }
+}
+
+kernel void segment_run_sum_i64(
+    device const long* keys   [[buffer(0)]],
+    device const long* values [[buffer(1)]],
+    device const uint* starts [[buffer(2)]],
+    constant uint&     num_segs [[buffer(3)]],
+    constant uint&     n        [[buffer(4)]],
+    device long*       out_keys [[buffer(5)]],
+    device long*       out_sums [[buffer(6)]],
+    uint               gid      [[thread_position_in_grid]])
+{
+    if (gid >= num_segs) return;
+    uint i = starts[gid];
+    const long k = keys[i];
+    long sum = 0;
+    while (i < n && keys[i] == k) {
+        sum += values[i];
+        ++i;
+    }
+    out_keys[gid] = k;
+    out_sums[gid] = sum;
+}

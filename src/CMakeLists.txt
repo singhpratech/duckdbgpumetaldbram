@@ -26,6 +26,7 @@ if(GPUDB_HAS_METAL)
         backends/metal/metal_groupby.mm
         backends/metal/metal_window.mm
         backends/metal/metal_hashjoin.mm
+        backends/metal/metal_radix_sort.mm
     )
 
     # Embed .metal source as C strings so the Objective-C++ TUs can compile
