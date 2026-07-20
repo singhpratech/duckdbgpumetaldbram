@@ -28,7 +28,8 @@ endif()
 
 add_library(gpudb_duckdb SHARED
     duckdb_loadable.cpp
-    gpu_sum_extension.cpp)
+    gpu_sum_extension.cpp
+    gpu_join_extension.cpp)
 
 target_include_directories(gpudb_duckdb PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

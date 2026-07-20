@@ -177,11 +177,9 @@ struct WindowResult {
 //
 // Backend implementation strategy varies:
 //   - CPU:   std::unordered_map<int64,int64> on the build side.
-//   - CUDA:  open-addressing hash table with atomicCAS<int64> (in flight on
-//            feat/cuda-hashjoin).
-//   - Metal: SORT-MERGE join (Apple Silicon GPUs lack 64-bit atomic CAS, so
-//            the CUDA approach cannot be mirrored — see
-//            src/backends/metal/metal_hashjoin.mm header for details).
+//   - CUDA:  open-addressing hash table with atomicCAS<int64>.
+//   - Metal: slot-lock open-addressing hash (32-bit CAS); sort-merge fallback
+//            when build exceeds table capacity (see metal_hashjoin.mm).
 struct JoinResult {
     std::vector<std::int64_t> probe_indices;   // matched probe-side row indices
     std::vector<std::int64_t> build_indices;   // matched build-side row indices
@@ -255,6 +253,9 @@ enum class DispatchReason : std::uint8_t {
     GroupBy_HighCard_GpuWins = 11, // expected_groups >= n / 10 → high cardinality regime
     GroupBy_Borderline_GpuTry= 12, // mid regime: try GPU but flag for tuning
     GroupBy_HugeN_CpuWins    = 13, // n above bitonic O(N log²N) crossover
+    // Hash join reasons
+    Join_SmallN_CpuWins      = 20, // build+probe too small for GPU launch
+    Join_LargeProbe_GpuWins  = 21, // probe-heavy FK join → GPU hash path
 };
 
 [[nodiscard]] const char* to_string(DispatchReason r) noexcept;
@@ -289,9 +290,16 @@ public:
     [[nodiscard]] virtual Backend gpu_backend() const noexcept = 0;
 };
 
+class HybridHashJoinProbe : public HashJoinProbe {
+public:
+    [[nodiscard]] virtual const DispatchDecision& last_decision() const noexcept = 0;
+    [[nodiscard]] virtual Backend gpu_backend() const noexcept = 0;
+};
+
 // Factories. Each internally constructs a CPU aggregator AND a GPU
 // aggregator (GPU = default_backend() if available, else CPU=fallback).
 std::unique_ptr<HybridAggregator>        make_hybrid_aggregator();
 std::unique_ptr<HybridGroupByAggregator> make_hybrid_groupby_aggregator();
+std::unique_ptr<HybridHashJoinProbe>     make_hybrid_hashjoin_probe();
 
 } // namespace gpudb

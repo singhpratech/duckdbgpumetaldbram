@@ -56,13 +56,11 @@ real query (TPC-H or ClickBench).
 
 **Status:** shipped on Metal with **GPU-resident radix sort + on-device scan + min-max pre-scan**. Peak 4.89× over CPU at 500M × 1M groups. Ties CUDA on TPC-H wall.
 
-### 2.4 Hash join (the next big op)
+### 2.4 Hash join
 - `inner_join(build_keys, probe_keys)` → matched (probe_idx, build_idx) pairs
 - Future: outer joins, anti/semi-joins
 
-**Status:**
-- CUDA: in flight on `feat/cuda-hashjoin` (Linux Claude)
-- Metal: scaffold in flight on `feat/metal-hashjoin-scaffold` (CPU+stub today; sort-merge real impl when CUDA lands)
+**Status:** shipped on CUDA and Metal. Metal uses adaptive global slot-lock (small build) plus partitioned TG hash radix join (4.9× wall vs CPU @ 1M×10M M4). SQL: `gpu_inner_join`.
 
 ### 2.5 Window functions (the GOAL.md item 8 differentiator)
 - `RANK()`, `ROW_NUMBER()` over partition
@@ -157,6 +155,6 @@ Where we lose, we **say so in BENCHMARK.md** and explain why. Honesty buys credi
 | SUM f64 | ✅ | ✅ | host fallback | Q1 (SUM(l_extendedprice)) | same |
 | `agg_all_i64` (multi-agg) | 🔜 | — | 🔜 (`feat/metal-multiagg`) | derived from Q1 | (incoming) |
 | GROUP BY hash | ✅ | ✅ | ✅ (radix sort) | Q1 GROUP BY l_returnflag | "Metal GROUP BY" / matrix |
-| Hash join probe | ✅ | ⏳ (`feat/cuda-hashjoin`) | scaffold (`feat/metal-hashjoin-scaffold`) | Q3, Q5, Q12 | (incoming) |
+| Hash join probe | ✅ | ✅ | ✅ adaptive + partitioned TG hash | Q3, Q5, Q12 | Metal hash join (2026-07-07) |
 | Window functions | — | — | — | Q8 (window) — future | — |
 | DuckDB extension wrapper | — | — | scaffold + `gpu_sum`, `gpu_min`, `gpu_max` (Linux-built; macOS validation: `feat/ext-macos-validate`) | All TPC-H | (when end-to-end) |

@@ -82,7 +82,7 @@ needed by 'src/extension/libgpudb_duckdb.dylib'.  Stop.
 This breaks both `libgpudb_duckdb` (the loadable) and `gpudb-sql` (which
 transitively links `gpudb_ext`).
 
-**Suggested fix (one line, applied on this branch):**
+**Fix (landed in main):**
 
 ```cmake
 target_link_libraries(gpudb_ext PUBLIC
@@ -94,7 +94,7 @@ target_link_libraries(gpudb_ext PUBLIC
 `CMAKE_SHARED_LIBRARY_SUFFIX` resolves to `.so` on Linux and `.dylib` on
 macOS, matching what `scripts/get_duckdb_libs.sh` already extracts on each
 platform (the script handles both suffixes correctly — only the CMake
-side was Linux-specific). Same fix is needed on `feat/ext-duckdb-stub`.
+side was Linux-specific). Same fix is needed anywhere extension CMake still hard-codes `.so`.
 
 After this change:
 
@@ -257,10 +257,8 @@ cmake --build build-macos -j
 
 ## Suggested follow-ups for the Linux Claude
 
-1. Apply the `CMAKE_SHARED_LIBRARY_SUFFIX` fix to
-   `src/extension/CMakeLists.txt` on `feat/ext-duckdb-stub` so it stays
-   in sync with main once both branches converge. (Already applied to
-   main via this PR.)
+1. The `CMAKE_SHARED_LIBRARY_SUFFIX` fix in `src/extension/CMakeLists.txt`
+   is landed — keep it when merging other extension work.
 2. When integrating the official DuckDB extension-template (the path
    `scripts/append_extension_footer.py` recommends), build `.duckdb_extension`
    artifacts for both `linux_amd64` and `osx_arm64` so the
