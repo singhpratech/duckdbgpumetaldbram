@@ -1,6 +1,21 @@
 # gpudb — GPU-accelerated DuckDB on **NVIDIA CUDA + Apple Silicon Metal**
 
+[![DuckDB Community Extension](https://img.shields.io/badge/DuckDB_Community_Extension-gpudb-FFF100?logo=duckdb&logoColor=black)](https://duckdb.org/community_extensions/extensions/gpudb)
+[![Latest release](https://img.shields.io/github/v/release/singhpratech/duckdbgpumetaldbram?label=release)](https://github.com/singhpratech/duckdbgpumetaldbram/releases/latest)
+[![CI](https://github.com/singhpratech/duckdbgpumetaldbram/actions/workflows/ci.yml/badge.svg)](https://github.com/singhpratech/duckdbgpumetaldbram/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Apple_Silicon_Metal_%7C_Linux_CUDA-8A2BE2)](#quick-start)
+[![GitHub stars](https://img.shields.io/github/stars/singhpratech/duckdbgpumetaldbram?style=social)](https://github.com/singhpratech/duckdbgpumetaldbram/stargazers)
+
 > **The first SQL execution engine for Apple Silicon GPUs**, built as a DuckDB extension that *also* runs on NVIDIA CUDA. One codebase, two backends, your existing DuckDB queries.
+
+Now an official [**DuckDB Community Extension**](https://duckdb.org/community_extensions/extensions/gpudb) — install it straight from any DuckDB ≥ 1.5.5, no flags, no downloads:
+
+```sql
+INSTALL gpudb FROM community;
+LOAD gpudb;
+SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
+```
 
 ```sql
 -- Real query, real GPU, real result on RTX 4090 + Apple M4 Max
@@ -10,7 +25,7 @@ gpu_sum(l_orderkey)
 18005322964949
 ```
 
-Apache-2.0 · Pre-alpha · Linux + macOS · DuckDB ≥ 1.2
+Apache-2.0 · Early stage (v0.3.0) · Linux + macOS · DuckDB ≥ 1.2
 
 ---
 
@@ -56,7 +71,23 @@ DuckDB CLI uses 16 threads (12 P + 4 E cores) by default on M4 Max. These are vs
 
 ## Quick start
 
-### Option A — load the prebuilt extension into DuckDB CLI
+### Option A — install from the DuckDB community repo (recommended)
+
+```sql
+INSTALL gpudb FROM community;
+LOAD gpudb;
+SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
+-- -> 499999500000
+```
+
+Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
+Community binaries ship the full Metal backend on Apple Silicon and a clean CPU
+fallback on Linux (the CUDA backend needs a source build for now). The registry
+currently serves the v0.1.3 submission;
+[community-extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404)
+bumps it to v0.3.0.
+
+### Option B — load a prebuilt release binary
 
 Download the platform binary from the [latest release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/latest), then:
 
@@ -68,11 +99,11 @@ duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
 # -> 499999500000
 ```
 
-Requires DuckDB ≥ 1.2 (C API v1.2.0); community CI builds against v1.5.x. `LOAD` needs `-unsigned` because the
-extension is unsigned community code; `INSTALL gpudb FROM community`
-(no `-unsigned` needed) lights up after [community-extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merges.
+Requires DuckDB ≥ 1.2 (C API v1.2.0); release binaries track the latest tag.
+`LOAD` needs `-unsigned` here because release-page binaries are unsigned —
+the community install above doesn't.
 
-### Option B — build from source
+### Option C — build from source
 
 ```bash
 git clone https://github.com/singhpratech/duckdbgpumetaldbram.git
@@ -96,7 +127,7 @@ duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.du
 ./build-linux/bin/gpudb-sql --sql "SELECT gpu_sum(range::BIGINT) FROM range(1000000);"
 ```
 
-### Option C (TPC-H reproducibility)
+### Option D (TPC-H reproducibility)
 
 ```bash
 # get TPC-H SF1 data (downloads DuckDB CLI to .tools/, ~1 GB lineitem)
@@ -192,8 +223,11 @@ xfail are now strict positive assertions (PR #22).
 - [x] **Streaming aggregate states** — the SQL aggregate path rewritten from "buffer every value, reduce at finalize" to running accumulators, the same algorithmic shape as native DuckDB. End-to-end on rewritten TPC-H Q6/Q1 and high-cardinality GROUP BY: parity with native (the v0.2.0 buffered path lost 3×–110×; the SF10 GROUP BY cell alone went from 11.05 s to 0.110 s). Full before/after in [BENCHMARK.md](BENCHMARK.md). `GPUDB_FORCE_BACKEND` is a no-op on this path now (it routed the deleted machinery).
 - [x] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — all three aggregates are now overload sets carrying `(BIGINT)->BIGINT` and `(DOUBLE)->DOUBLE`. No backend-interface change was needed under the streaming design. NaN ordering matches native (NaN sorts greatest). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
+### Shipped: DuckDB Community Extension
+- [x] [Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) **merged** — `INSTALL gpudb FROM community` is live (no `-unsigned` flag needed), and gpudb is [listed on duckdb.org](https://duckdb.org/community_extensions/extensions/gpudb).
+
 ### In flight
-- [ ] [DuckDB Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) merged → `INSTALL gpudb FROM community` (no `-unsigned` flag needed). The submission is deliberately frozen at the v0.1.3-era ref while it awaits maintainer review; newer releases ship as a follow-up bump after the first merge.
+- [ ] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) — bump the community build from the frozen v0.1.3 submission to v0.3.0 (in review; pre-validated green on all four platforms).
 - [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
 
 ### Roadmap (v0.4.0)
