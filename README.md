@@ -83,9 +83,9 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
 Community binaries ship the full Metal backend on Apple Silicon and a clean CPU
 fallback on Linux (the CUDA backend needs a source build for now). The registry
-currently serves the v0.1.3 submission;
-[community-extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404)
-bumps it to v0.3.0.
+serves the current **v0.3.0** build
+([community-extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404)).
+Installed an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
 
 ### Option B — load a prebuilt release binary
 
@@ -225,9 +225,9 @@ xfail are now strict positive assertions (PR #22).
 
 ### Shipped: DuckDB Community Extension
 - [x] [Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) **merged** — `INSTALL gpudb FROM community` is live (no `-unsigned` flag needed), and gpudb is [listed on duckdb.org](https://duckdb.org/community_extensions/extensions/gpudb).
+- [x] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) **merged** — the community build now ships **v0.3.0** (streaming aggregates + DOUBLE overloads on all four platforms).
 
 ### In flight
-- [ ] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) — bump the community build from the frozen v0.1.3 submission to v0.3.0 (in review; pre-validated green on all four platforms).
 - [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
 
 ### Roadmap (v0.4.0)
