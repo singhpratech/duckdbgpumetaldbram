@@ -28,12 +28,29 @@ USE_UNSTABLE_C_API=0
 # into the extension metadata footer (FIELD3 duckdb_version).
 TARGET_DUCKDB_VERSION=v1.2.0
 
+# CUDA: auto-detected via nvcc. The registry's linux_amd64 build container
+# installs the CUDA toolchain when description.yml lists "cuda" in
+# requires_toolchains (extension-ci-tools docker/linux_amd64, ARG
+# extra_toolchains); plain containers and macOS have no nvcc and keep CUDA off,
+# so this is a no-op for every other job.
+#
+# GPUDB_CUDA_STATIC_RUNTIME=ON is the load-safety requirement, not an
+# optimization: the shipped .so must have NO dynamic dependency on
+# libcudart.so/libcuda.so (verify with ldd) so it LOADs on GPU-less machines;
+# cudart_static dlopens the driver at runtime and backend_factory falls back
+# to CPU when no device/driver is present. CUDA archs come from the CMake
+# default (75;80;86;89;90).
+NVCC := $(shell command -v nvcc 2>/dev/null)
+ifeq ($(NVCC),)
+GPUDB_CUDA_FLAGS=-DGPUDB_ENABLE_CUDA=OFF
+else
+GPUDB_CUDA_FLAGS=-DGPUDB_ENABLE_CUDA=ON -DGPUDB_CUDA_STATIC_RUNTIME=ON
+endif
+
 # CMake flags for the loadable-extension build path only.
 #   - GPUDB_BUILD_EXT=ON    : build the loadable extension target
 #   - TESTS/BENCH=OFF       : CI only wants the extension artifact
-#   - ENABLE_CUDA=OFF       : no CUDA toolchain wired into CI yet (phase 2);
-#                             Metal stays auto-on for APPLE (osx_arm64 job)
-CMAKE_EXTRA_BUILD_FLAGS=-DGPUDB_BUILD_EXT=ON -DGPUDB_BUILD_TESTS=OFF -DGPUDB_BUILD_BENCH=OFF -DGPUDB_ENABLE_CUDA=OFF
+CMAKE_EXTRA_BUILD_FLAGS=-DGPUDB_BUILD_EXT=ON -DGPUDB_BUILD_TESTS=OFF -DGPUDB_BUILD_BENCH=OFF $(GPUDB_CUDA_FLAGS)
 
 all: configure release
 

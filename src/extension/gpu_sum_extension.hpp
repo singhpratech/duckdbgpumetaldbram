@@ -28,4 +28,12 @@ namespace gpudb_ext {
 // std::runtime_error if registration fails.
 void register_gpu_sum(duckdb_connection con);
 
+// Register the resident-column SQL surface (gpu_upload, gpu_sum_resident,
+// gpu_min_resident, gpu_max_resident, gpu_sum_resident_f64, gpu_resident_info,
+// gpu_last_stats, gpu_drop_resident) — the upload-once/query-many path where
+// reductions actually run on the GPU (via HybridAggregator; transparently CPU
+// on GPU-less machines). Called by register_gpu_sum; exposed separately for
+// tests. Implementation: gpu_resident.cpp.
+void register_gpu_resident(duckdb_connection con);
+
 } // namespace gpudb_ext

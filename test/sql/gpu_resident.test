@@ -1,0 +1,66 @@
+# gpu_resident SQL test — resident-column SQL surface (gpu_upload +
+# gpu_*_resident + gpu_drop_resident).
+#
+# The suite runs each query in a FRESH gpudb-sql process, so the resident
+# registry does not survive between queries. Every test therefore uploads and
+# queries in ONE statement: the FROM subquery aggregates (upload completes)
+# before the outer projection reads the resident column.
+#
+# IMPORTANT: every outer query MUST reference the subquery's upload count `u`.
+# If `u` is unused, DuckDB's unused-column elimination prunes the gpu_upload
+# aggregate expression entirely and the resident column is never created.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_resident
+
+-- 1. Upload + resident SUM over 100k rows (matches native sum(range) value)
+SELECT gpu_sum_resident('t1') AS s, u AS uploaded
+FROM (SELECT gpu_upload('t1', range::BIGINT) AS u FROM range(100000)) up;
+-- expect: 4999950000  100000
+
+-- 2. Resident MIN and MAX in one projection (both read the same column)
+SELECT gpu_min_resident('t2') AS mn, gpu_max_resident('t2') AS mx, u AS uploaded
+FROM (SELECT gpu_upload('t2', (range - 500)::BIGINT) AS u FROM range(1000)) up;
+-- expect: -500  499  1000
+
+-- 3. DOUBLE column: upload + resident f64 SUM (sum of 0..999 halved = 249750)
+SELECT gpu_sum_resident_f64('t3')::BIGINT AS s, u AS uploaded
+FROM (SELECT gpu_upload('t3', (range / 2.0)::DOUBLE) AS u FROM range(1000)) up;
+-- expect: 249750  1000
+
+-- 4. NULLs are skipped at upload: only non-NULL values reach the column
+SELECT gpu_sum_resident('t4') AS s, u AS uploaded
+FROM (SELECT gpu_upload('t4', CASE WHEN range % 2 = 0 THEN range ELSE NULL END::BIGINT) AS u
+      FROM range(10)) up;
+-- expect: 20  5
+
+-- 5. Resident result equals the native aggregate over the same data
+SELECT gpu_sum_resident('t5') = (SELECT sum(range::BIGINT) FROM range(50000)) AS matches,
+       u AS uploaded
+FROM (SELECT gpu_upload('t5', range::BIGINT) AS u FROM range(50000)) up;
+-- expect: true  50000
+
+-- 6. gpu_resident_info reports dtype and row count (prefix-checked via LIKE)
+SELECT gpu_resident_info('t6') LIKE 'dtype=I64 rows=777 %' AS ok, u AS uploaded
+FROM (SELECT gpu_upload('t6', range::BIGINT) AS u FROM range(777)) up;
+-- expect: true  777
+
+-- 7. gpu_drop_resident frees the column and reports whether it existed
+SELECT gpu_drop_resident('t7') AS dropped,
+       gpu_drop_resident('never_uploaded') AS missing,
+       u AS uploaded
+FROM (SELECT gpu_upload('t7', range::BIGINT) AS u FROM range(10)) up;
+-- expect: true  false  10
+
+-- 8. gpu_last_stats records the dispatch of the most recent resident reduction
+--    (100k rows: CUDA box → backend=CUDA reason=Hot_GpuAlwaysWins; GPU-less →
+--    backend=CPU. Only assert the stats string has the expected shape.)
+SELECT s AS sum_100k, gpu_last_stats() LIKE 'op=resident_i64 backend=%' AS stats_ok,
+       u AS uploaded
+FROM (SELECT gpu_sum_resident('t8') AS s, u
+      FROM (SELECT gpu_upload('t8', (range + 1)::BIGINT) AS u FROM range(100000)) up) q;
+-- expect: 5000050000  true  100000
+
+-- 9. Empty upload (zero non-NULL values) returns SQL NULL and registers nothing
+SELECT u IS NULL AS was_null
+FROM (SELECT gpu_upload('t9', range::BIGINT) AS u FROM range(0)) up;
+-- expect: true

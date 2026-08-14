@@ -189,7 +189,19 @@ public:
             Backend::CPU, std::move(handle), n, Dtype::I64, /*on_gpu=*/false);
     }
     std::unique_ptr<ResidentColumn> upload_f64(const double* d, std::size_t n) override {
-        // f64 always lives on CPU side (no GPU dispatch for f64 anyway).
+        // CUDA supports f64 end-to-end (sum_f64 kernel + resident path), so
+        // f64 columns go to the device there. Metal has no IEEE-754 doubles —
+        // f64 stays CPU-side on that backend, same as before.
+        if (gpu_ && gpu_backend_ == Backend::CUDA) {
+            try {
+                auto handle = gpu_->upload_f64(d, n);
+                return std::make_unique<HybridResidentColumn>(
+                    Backend::CPU /* unused */, std::move(handle), n, Dtype::F64,
+                    /*on_gpu=*/true);
+            } catch (const std::exception&) {
+                // fall through to CPU upload
+            }
+        }
         auto handle = cpu_->upload_f64(d, n);
         return std::make_unique<HybridResidentColumn>(
             Backend::CPU, std::move(handle), n, Dtype::F64, /*on_gpu=*/false);
@@ -211,10 +223,13 @@ public:
         });
     }
     AggResult sum_resident_f64(const ResidentColumn& c) override {
-        const auto& h = check_hybrid(c);
-        last_ = make_decision(Backend::CPU, DispatchReason::F64_NoGpuDoubles,
-                              h.rows(), 0, /*resident*/true, /*borderline*/false);
-        return cpu_->sum_resident_f64(h.inner());
+        // The resident dispatch rule is dtype-agnostic: it routes to wherever
+        // the column lives. On Metal, upload_f64 never places data on the GPU
+        // (no doubles), so this still resolves to CPU there; on CUDA a
+        // GPU-resident f64 column dispatches GPU (Hot_GpuAlwaysWins).
+        return dispatch_resident_i64(c, [&](Aggregator& a, const ResidentColumn& cc){
+            return a.sum_resident_f64(cc);
+        });
     }
 
     // Multi-aggregate fusion (added in PR #8). Hybrid v1 delegates to CPU

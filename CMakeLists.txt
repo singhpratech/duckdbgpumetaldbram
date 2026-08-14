@@ -20,6 +20,12 @@ option(GPUDB_ENABLE_METAL  "Enable Metal backend (auto on macOS)" ON)
 option(GPUDB_BUILD_TESTS   "Build unit tests"                     ON)
 option(GPUDB_BUILD_BENCH   "Build CLI benchmark tool"             ON)
 option(GPUDB_BUILD_EXT     "Build DuckDB extension wrapper"       OFF)
+# Static cudart => the produced binaries have NO dynamic dependency on
+# libcudart.so/libcuda.so, so a CUDA-enabled loadable extension still LOADs on
+# GPU-less/driver-less machines (cudart_static dlopens the driver at runtime;
+# backend_factory falls back to CPU when that fails). The community-CI Makefile
+# turns this ON; the local ./scripts/build.sh flow keeps the shared runtime.
+option(GPUDB_CUDA_STATIC_RUNTIME "Link the CUDA runtime statically" OFF)
 
 # -------------------------------------------------------------------
 # Compiler flags
@@ -48,19 +54,25 @@ if(GPUDB_ENABLE_CUDA)
     include(CheckLanguage)
     check_language(CUDA)
     if(CMAKE_CUDA_COMPILER)
+        # RTX 4090 is sm_89 (Ada). Sirius requires sm_70+.
+        # CUDA 13 dropped sm_70 (Volta) — start at sm_75 (Turing).
+        # MUST be set BEFORE enable_language(CUDA): enable_language initializes
+        # CMAKE_CUDA_ARCHITECTURES to nvcc's single default arch, after which a
+        # `if(NOT ...)` guard never fires (that bug shipped sm_75-only fatbins).
+        # Overridable via -DCMAKE_CUDA_ARCHITECTURES or the CUDAARCHS env var.
+        if(NOT CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+            set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
+        endif()
         enable_language(CUDA)
         set(CMAKE_CUDA_STANDARD 17)
         set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-        # RTX 4090 is sm_89 (Ada). Sirius requires sm_70+.
-        # CUDA 13 dropped sm_70 (Volta) — start at sm_75 (Turing).
-        # Build for a reasonable range; user can override via -DCMAKE_CUDA_ARCHITECTURES.
-        if(NOT CMAKE_CUDA_ARCHITECTURES)
-            set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
-        endif()
         # Need the runtime library + headers for the .cpp host wrapper too.
         find_package(CUDAToolkit REQUIRED)
+        if(GPUDB_CUDA_STATIC_RUNTIME)
+            set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+        endif()
         set(GPUDB_HAS_CUDA ON)
-        message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES}, toolkit: ${CUDAToolkit_VERSION})")
+        message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES}, toolkit: ${CUDAToolkit_VERSION}, static runtime: ${GPUDB_CUDA_STATIC_RUNTIME})")
     else()
         message(STATUS "CUDA toolkit not found — CUDA backend disabled")
     endif()

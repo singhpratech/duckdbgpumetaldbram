@@ -70,7 +70,11 @@ if(GPUDB_HAS_CUDA)
     # calls, flip this to ON and add CUDA_RESOLVE_DEVICE_SYMBOLS to consumers.
     set_target_properties(gpudb PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
     # cudart is needed by the .cpp host wrapper (cuda_runtime.h, cudaMalloc, ...)
-    target_link_libraries(gpudb PUBLIC CUDA::cudart)
+    if(GPUDB_CUDA_STATIC_RUNTIME)
+        target_link_libraries(gpudb PUBLIC CUDA::cudart_static)
+    else()
+        target_link_libraries(gpudb PUBLIC CUDA::cudart)
+    endif()
     # Suppress diagnostics that nvcc's generated stubs trip on, only for .cu files.
     target_compile_options(gpudb PRIVATE
         $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wno-pedantic>
