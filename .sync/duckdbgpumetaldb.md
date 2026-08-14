@@ -1,6 +1,6 @@
 # duckdbgpumetaldb
-- branch: main
-- working on: all PRs merged into main; CUDA hashjoin landed; hybrid planner landed; build green 77/77 tests; ready for tonight launch
+- branch: docs/claude-md-build-and-arch
+- working on: docs branch off v0.3.0 main: adding build/test commands + architecture sections to CLAUDE.md (shared file, PR-only)
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-05-09T22:19:27Z
+- last update: 2026-08-14T18:05:17Z

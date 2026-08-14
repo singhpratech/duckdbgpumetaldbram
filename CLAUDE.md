@@ -105,12 +105,55 @@ Do not commit directly to `main`. Do not force-push to `main`. Do not merge your
 - You **must not** write `.cu`/`.cuh`, attempt `nvcc`, or modify `src/backends/cuda/`.
 - Build directory: `build-macos/` (gitignored).
 
+## Build, test, benchmark
+
+```bash
+./scripts/build.sh                   # configure + build into build-linux/ (or build-macos/);
+                                     # auto-enables the DuckDB extension if third_party/duckdb-libs/
+                                     # is present, and packages gpudb.<platform>.duckdb_extension
+./scripts/local_check.sh             # everything CI runs: configure → build → unit tests →
+                                     # smoke benchmarks → SQL suite. Run BEFORE pushing.
+./scripts/local_check.sh --no-bench  # fast variant (skip benchmarks)
+
+./build-linux/test/test_gpudb        # unit tests (CPU + CUDA backends; single binary, no per-test filter)
+./scripts/run_sql_tests.sh           # full SQL suite (test/sql/*.test)
+./scripts/run_sql_tests.sh gpu_sum   # single SQL test file by basename
+```
+
+- Unit tests are one hand-rolled binary (`test/cpp/test_aggregator.cpp`) — no gtest, no filter flag. To run "one test", use the SQL suite's per-file selection instead.
+- `test/sql/*.test` format: plain SQL separated by `;`, with `-- expect:` lines after each query; other directives are `-- env: K=V`, `-- requires_file: <path>`, `-- expected_fail: <reason>`. See the header of `scripts/run_sql_tests.sh`. `test/sqllogic/` is a SEPARATE suite in DuckDB sqllogictest format (incompatible with `test/sql/`), run only by the community-CI `make test` path.
+- Embedded-CLI/extension prerequisite: `./scripts/get_duckdb_libs.sh` fetches pre-built libduckdb + headers into `third_party/duckdb-libs/` (that's what flips `build.sh` into building the extension and `gpudb-sql`).
+- TPC-H data for benchmarks/SQL tests: `SF=1 ./scripts/gen_tpch.sh` → `data/tpch_sf1/`.
+- On Linux, `scripts/env.sh` puts `/usr/local/cuda/bin` on PATH; `build.sh` and `local_check.sh` source it automatically.
+- Benchmark CLIs land in `build-*/bin/`: `gpudb-sql` (embedded DuckDB + gpu_* functions), `gpudb-bench`, `gpudb-groupby-bench`, `gpudb-window-bench`, `gpudb-hashjoin-bench`.
+
+### The second build path: root Makefile (community-extensions CI)
+
+The root `Makefile` is the entrypoint the DuckDB community-extensions pipeline drives (`make configure && make release`, sqllogictests via `make test`). It builds ONLY the loadable `gpudb.duckdb_extension` against the stable C_STRUCT ABI — no libduckdb link, no `duckdb-libs` needed — and requires the `extension-ci-tools` submodule (`git submodule update --init`). It is fully independent from `./scripts/build.sh`; day-to-day development uses the scripts, not the Makefile.
+
 ## CMake flags reference
 - `-DGPUDB_ENABLE_CUDA=ON/OFF`  (default ON; auto-disabled if no nvcc)
 - `-DGPUDB_ENABLE_METAL=ON/OFF` (default ON on macOS; ignored on Linux)
-- `-DGPUDB_BUILD_TESTS=ON/OFF`
-- `-DGPUDB_BUILD_BENCH=ON/OFF`
-- `-DGPUDB_BUILD_EXT=ON/OFF`    (DuckDB extension; OFF until DuckDB submodule wired in)
+- `-DGPUDB_BUILD_TESTS=ON/OFF`  (default ON)
+- `-DGPUDB_BUILD_BENCH=ON/OFF`  (default ON)
+- `-DGPUDB_BUILD_EXT=ON/OFF`    (default OFF, but `build.sh` auto-enables it when `third_party/duckdb-libs/duckdb.h` exists)
+- `-DCMAKE_CUDA_ARCHITECTURES`  (default `75;80;86;89;90`; RTX 4090 = sm_89)
+
+## Architecture
+
+Everything hangs off one abstract interface: **`src/include/gpu_backend.hpp`**. It defines per-operator interfaces (`Aggregator` for SUM/MIN/MAX + fused `agg_all`, `GroupByAggregator`, `WindowAggregator`, `HashJoinProbe`), a `ResidentColumn` opaque handle (upload once, query many times without re-transfer), result structs carrying timing diagnostics (`wall_ms` / `kernel_ms` / `transfer_ms`), and `make_*` factories keyed on `Backend {CPU, CUDA, METAL}`. This file is the cross-platform ABI — changes must be coordinated between the Linux and macOS instances via PR.
+
+Layers, top to bottom:
+
+1. **`src/extension/`** — DuckDB integration, with TWO independent targets (see the comment atop `src/extension/CMakeLists.txt`):
+   - *Loadable extension* (`gpudb_duckdb`): what users `LOAD` in the DuckDB CLI. Registers `gpu_sum`/`gpu_min`/`gpu_max` (BIGINT + DOUBLE) as streaming aggregates. Built against ONLY the vendored C API headers in `third_party/duckdb_capi/` (stable C_STRUCT ABI) — links no libduckdb.
+   - *Embedded CLI helper* (`gpudb_ext` + `gpudb-sql`): genuinely links libduckdb from `third_party/duckdb-libs/`; silently skipped if those libs are absent.
+   - Note: `GPUDB_FORCE_BACKEND` is NOT currently honored — `test/sql/gpu_force_backend.test` only pins that setting it doesn't crash. The one real env override is `GPUDB_METAL_GROUPBY_PATH` (Metal GROUP BY algorithm selection).
+2. **`src/backends/backend_factory.cpp`** — runtime dispatch: `default_backend()` picks CUDA if compiled + device present, else Metal, else CPU.
+3. **`src/backends/hybrid_planner.cpp`** — `HybridAggregator` / `HybridGroupByAggregator` wrap a CPU and a GPU implementation and pick per call using deterministic thresholds (row count, expected groups, residency) derived from BENCHMARK.md; each call records a `DispatchDecision` (inspectable via `last_decision()`) explaining why.
+4. **Backend implementations** — `src/backends/{cpu,cuda,metal}/`, one file per operator (`*_aggregator`, `*_groupby`, `*_hashjoin`, `*_window`). CUDA kernels in `cuda/kernels/*.cu`; Metal shaders in `metal/kernels/*.metal` hosted by `.mm` files. Backends differ algorithmically where hardware demands it (e.g. Metal lacks 64-bit atomic CAS, so its hash join is sort-merge while CUDA's is open-addressing atomicCAS; Metal GROUP BY auto-dispatches slot-lock vs radix-sort paths).
+
+The DuckDB dependency is deliberately NOT a submodule of DuckDB source: the loadable extension uses committed vendored headers (`third_party/duckdb_capi/`), and the embedded CLI uses pre-built binaries fetched by script (`third_party/duckdb-libs/`, gitignored).
 
 ## Conflict-avoidance checklist before every commit
 1. `./scripts/sync.sh check` — confirm no peer is mid-edit on the files you touched.
