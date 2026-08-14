@@ -424,8 +424,10 @@ void register_gpu_sum(duckdb_connection con) {
     register_set<OpSumI64, OpSumF64>(con, "gpu_sum");
     register_set<OpMinI64, OpMinF64>(con, "gpu_min");
     register_set<OpMaxI64, OpMaxF64>(con, "gpu_max");
+    register_gpu_resident(con);
     std::fprintf(stderr,
-        "[gpudb] registered gpu_sum / gpu_min / gpu_max (BIGINT,DOUBLE) streaming aggregates (backend=%s)\n",
+        "[gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates "
+        "+ resident-column functions (gpu_upload, gpu_*_resident) (backend=%s)\n",
         gpudb::to_string(gpudb::default_backend()));
 }
 
