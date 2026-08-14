@@ -5,6 +5,7 @@
 [![CI](https://github.com/singhpratech/duckdbgpumetaldbram/actions/workflows/ci.yml/badge.svg)](https://github.com/singhpratech/duckdbgpumetaldbram/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Apple_Silicon_Metal_%7C_Linux_CUDA-8A2BE2)](#quick-start)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/singhpratech/duckdbgpumetaldbram/blob/main/examples/gpudb_quickstart.ipynb)
 [![GitHub stars](https://img.shields.io/github/stars/singhpratech/duckdbgpumetaldbram?style=social)](https://github.com/singhpratech/duckdbgpumetaldbram/stargazers)
 
 > **The first SQL execution engine for Apple Silicon GPUs**, built as a DuckDB extension that *also* runs on NVIDIA CUDA. One codebase, two backends, your existing DuckDB queries.
@@ -137,6 +138,19 @@ duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.du
   SELECT gpu_sum(v) FROM read_parquet('data/tpch_sf1/lineitem_orderkey.parquet') t(v);"
 # -> 18005322964949
 ```
+
+## Run it in CI or a notebook
+
+GitHub's `macos-14`/`macos-15` hosted runners are **Apple Silicon machines** —
+gpudb's Metal path runs in free GitHub Actions with zero setup, which makes it
+(as far as we know) the only DuckDB extension that does anything special
+there. Copy-paste workflows for Apple Silicon runners, Linux runners, Docker,
+and self-hosted CUDA boxes: **[docs/CI_RECIPES.md](docs/CI_RECIPES.md)**.
+
+Prefer a notebook? **[examples/gpudb_quickstart.ipynb](examples/gpudb_quickstart.ipynb)**
+opens directly in Google Colab — registry install + parity checks anywhere,
+plus an optional build-from-source section that runs the CUDA benchmarks on
+Colab's free T4 GPU.
 
 ## What you get
 
