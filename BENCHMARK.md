@@ -17,6 +17,8 @@ Built from `feat/ext-resident-hardening` (includes the parallel host f64 path).
 
 | Query (whole column) | Scale | native | resident e2e | internal wall / kernel | ratio |
 |---|---|---:|---:|---|:---:|
+| `sum(l_quantity::BIGINT)` | SF25 (150.0M) | 23 ms | **3 ms** | 2.88 ms / 2.69 ms (Metal) | **7.7×** |
+| `sum(l_extendedprice::DOUBLE)` | SF25 | 28 ms | **8 ms** | 9.1 ms (host, parallel) | **3.5×** |
 | `sum(l_quantity::BIGINT)` | SF10 (60.0M) | 9 ms | **2 ms** | 1.48 ms / 1.31 ms (Metal) | **4.5×** |
 | `sum(l_extendedprice::DOUBLE)` | SF10 | 11 ms | **3 ms** | 3.46 ms (host, parallel) | **3.4×** |
 | `sum(l_quantity::BIGINT)` | SF1 (6.0M) | 1 ms | 1 ms | 0.34 ms / 0.20 ms (Metal) | parity e2e* |
@@ -25,9 +27,14 @@ Built from `feat/ext-resident-hardening` (includes the parallel host f64 path).
 \* at SF1 both sides finish ≈1 ms — per-statement CLI overhead dominates; the
 internal wall shows the reduction itself is ~3–5× faster.
 
-One-time `gpu_upload` cost: SF1 70 ms · SF10 i64 725 ms / f64 725 ms →
-break-even vs native ≈ **110 repeated sums at SF10**, then every query is
-~7–8 ms cheaper forever. Honest losing rows: unfiltered `min`/`max` on
+The gap WIDENS with scale — native's scan grows linearly while the Metal
+kernel tracks VRAM bandwidth: SF25's 150M-row sum runs the kernel at
+~446 GB/s (2.69 ms for 1.2 GB), approaching the M4 Max's ~546 GB/s ceiling.
+Ratio progression: ~1× (SF1, overhead-bound) → 4.5× (SF10) → 7.7× (SF25).
+
+One-time `gpu_upload` cost: SF1 70 ms · SF10 725 ms · SF25 i64 1.99 s /
+f64 2.09 s → break-even vs native ≈ **110 repeated sums at SF10, ~100 at
+SF25**, then every query is ~7–20 ms cheaper forever. Honest losing rows: unfiltered `min`/`max` on
 persistent tables (native answers from zonemap statistics without scanning —
 resident min/max still run a real 1–2 ms reduction) and any one-shot query
 (that is what the streaming parity path is for).
