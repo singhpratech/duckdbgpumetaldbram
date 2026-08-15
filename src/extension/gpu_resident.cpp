@@ -504,14 +504,12 @@ void last_stats_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
 }
 
 // gpu_build_info(): which backends are COMPILED into this binary and which
-// one dispatch selected at load. This is the activation tripwire for the
-// registry's CUDA rollout: description.yml lists the cuda toolchain now
-// (future-ready), but the registry's pinned extension-ci-tools branch does
-// not provide nvcc yet — when its pin moves, the registry binary silently
-// starts compiling CUDA in, and this function is how CI (and users) see it:
-//   compiled=cpu           → today's registry linux binary
-//   compiled=cpu,cuda      → the moment upstream flips; time to announce
-//   compiled=cpu,metal     → registry osx_arm64 binary
+// one dispatch selected at load. Build environments differ (toolchains,
+// platforms, CI containers), so this is how CI and users verify what a
+// given binary actually carries:
+//   compiled=cpu           → built without a GPU toolchain
+//   compiled=cpu,cuda      → CUDA backend present (nvcc at build time)
+//   compiled=cpu,metal     → Metal backend present (macOS build)
 void build_info_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
                      duckdb_vector output) {
     std::string info = "compiled=cpu";

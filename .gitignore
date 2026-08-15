@@ -94,3 +94,6 @@ third_party/duckdb-libs/
 cmake_build/
 configure/
 duckdb_unittest_tempdir/
+
+# Private working notes — never committed (strategy, drafts, plans)
+.private/
