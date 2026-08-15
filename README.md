@@ -1,4 +1,4 @@
-# gpudb — GPU-accelerated DuckDB on **NVIDIA CUDA + Apple Silicon Metal**
+# gpudb — GPU-accelerated DuckDB on **Apple Silicon Metal + NVIDIA CUDA**
 
 [![DuckDB Community Extension](https://img.shields.io/badge/DuckDB_Community_Extension-gpudb-FFF100?logo=duckdb&logoColor=black)](https://duckdb.org/community_extensions/extensions/gpudb)
 [![Latest release](https://img.shields.io/github/v/release/singhpratech/duckdbgpumetaldbram?label=release)](https://github.com/singhpratech/duckdbgpumetaldbram/releases/latest)
