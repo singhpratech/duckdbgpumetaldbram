@@ -2,6 +2,66 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-08-15 (v0.4.0) — resident-column SQL surface: the GPU wins from SQL
+
+First benchmark of the `gpu_upload` / `gpu_*_resident` SQL functions (merged in
+PR #57, hardened in the follow-up PRs). Methodology as always: DuckDB CLI
+`-unsigned -readonly`, `SET threads TO 16`, `.timer on`, warm OS cache, median
+of 5 timed runs after 1 warm-up. The resident model: `gpu_upload` pays the
+transfer once; every later reduction runs against device/host-resident memory
+with `transfer_ms=0.000` (assert with `gpu_last_stats()`).
+
+### Apple M4 Max (Metal), DuckDB CLI v1.5.5, TPC-H `lineitem`
+
+Built from `feat/ext-resident-hardening` (includes the parallel host f64 path).
+
+| Query (whole column) | Scale | native | resident e2e | internal wall / kernel | ratio |
+|---|---|---:|---:|---|:---:|
+| `sum(l_quantity::BIGINT)` | SF10 (60.0M) | 9 ms | **2 ms** | 1.48 ms / 1.31 ms (Metal) | **4.5×** |
+| `sum(l_extendedprice::DOUBLE)` | SF10 | 11 ms | **3 ms** | 3.46 ms (host, parallel) | **3.4×** |
+| `sum(l_quantity::BIGINT)` | SF1 (6.0M) | 1 ms | 1 ms | 0.34 ms / 0.20 ms (Metal) | parity e2e* |
+| `sum(l_extendedprice::DOUBLE)` | SF1 | 1 ms | 1 ms | 0.39 ms (host, parallel) | parity e2e* |
+
+\* at SF1 both sides finish ≈1 ms — per-statement CLI overhead dominates; the
+internal wall shows the reduction itself is ~3–5× faster.
+
+One-time `gpu_upload` cost: SF1 70 ms · SF10 i64 725 ms / f64 725 ms →
+break-even vs native ≈ **110 repeated sums at SF10**, then every query is
+~7–8 ms cheaper forever. Honest losing rows: unfiltered `min`/`max` on
+persistent tables (native answers from zonemap statistics without scanning —
+resident min/max still run a real 1–2 ms reduction) and any one-shot query
+(that is what the streaming parity path is for).
+
+f64-on-Metal note: resident f64 runs on the host (no doubles in MSL). Before
+the parallel host path this LOST to native 29 ms vs 11 ms; the chunked
+parallel reduction in this branch flipped it to 3 ms. `gpu_last_stats()` now
+reports `reason=Resident_OnCpu` for this case (was misleadingly
+`Hot_GpuAlwaysWins`).
+
+### NVIDIA RTX 4090 Laptop (sm_89, 16 GB, CUDA 13), DuckDB CLI v1.5.2
+
+Reported by the Linux instance from `fix/core-cuda-ci-hardening` (extension
+code identical to `main` @ c7e0db5); same methodology, 5-run medians.
+
+| Query (whole column) | Rows | native | resident e2e | internal wall / kernel | ratio |
+|---|---|---:|---:|---|:---:|
+| `sum(BIGINT)` | 100M | 40 ms | **2 ms** | 1.48 ms / 1.45 ms | **~20×** |
+| TPC-H SF1 `sum(l_quantity)` | 6M | 10 ms | **~1 ms** | 0.087 ms / 0.042 ms | **~10×** |
+| `sum(DOUBLE)` | 10M | 10 ms | **~1 ms** | 0.20 ms / 0.17 ms | **~10×** (f64 on-GPU, unlike Metal) |
+| `min`+`max(BIGINT)` | 10M | 10–22 ms | **~1 ms** | — | **~10–20×** |
+| `sum(BIGINT)` | 10M | 8 ms | ~6 ms | 0.20 ms / 0.16 ms | parity e2e* |
+
+\* same SF1-class caveat: ~5 ms per-statement CLI overhead hides a 40× kernel win.
+
+Upload cost: 6M 196 ms · 10M i64 618 ms · 10M f64 390 ms · 100M 3.39 s →
+break-even ≈ 22 queries (6M) to ≈ 90 queries (100M).
+
+Library-level (`gpudb-bench`, no SQL overhead): 100M HOT CPU (OpenMP, 20T)
+30–42 ms vs CUDA 1.44 ms at 522 GiB/s ≈ spec VRAM bandwidth — **21–29×**.
+COLD still loses on CUDA exactly as documented since v0.2.0 (100M: 81.5 ms,
+of which 80 ms is PCIe) — the hybrid planner correctly dispatches cold
+one-shot reductions to the CPU.
+
 ## 2026-07-19 (v0.3.0) — streaming aggregate rewrite: end-to-end parity with native
 
 Re-run of the exact end-to-end suite from the v0.2.0 section below (same queries, same

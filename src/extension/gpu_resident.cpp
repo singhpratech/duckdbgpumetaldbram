@@ -30,9 +30,21 @@
 //
 // Usage shape (single statement — the FROM subquery aggregates first, so the
 // upload completes before the projection reads it):
-//   SELECT gpu_sum_resident('l_qty') AS s
-//   FROM (SELECT gpu_upload('l_qty', l_quantity::BIGINT) FROM lineitem) u;
+//   SELECT u.n, gpu_sum_resident('l_qty') AS s
+//   FROM (SELECT gpu_upload('l_qty', l_quantity::BIGINT) AS n FROM lineitem) u;
 // or interactively: upload once, then query the name many times.
+// WARNING: the outer query MUST reference the subquery's upload count (u.n
+// above) — an unreferenced gpu_upload column is pruned by DuckDB's optimizer
+// and the upload silently never runs.
+//
+// Guardrails (each was a shipped footgun caught by adversarial review):
+//   - one gpu_upload state = one name; mixed names in one call error out
+//   - NULL names error at upload (read side emits SQL NULL per NULL row)
+//   - total buffered bytes capped (default 4 GB, GPUDB_UPLOAD_POOL_MAX_MB):
+//     gpu_upload in a running window frame buffers O(n²) and must hit a wall
+//     before it OOMs the host
+//   - i64 sums wrap on overflow (uint64 accumulate — defined behavior),
+//     unlike native sum(BIGINT) which promotes to HUGEINT; see KNOWN_ISSUES
 //
 // Dispatch goes through HybridAggregator: on a CUDA box the resident
 // reductions run on the GPU (DispatchReason::Hot_GpuAlwaysWins); on a
@@ -56,6 +68,7 @@ DUCKDB_EXTENSION_EXTERN
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -75,10 +88,13 @@ namespace {
 
 struct UploadBuf {
     std::string               name;    // registry key, from the VARCHAR arg
+    bool                      name_set = false; // '' is a legal explicit name
     gpudb::Dtype              dtype = gpudb::Dtype::I64;
     std::vector<std::int64_t> i64;
     std::vector<double>       f64;
     std::size_t size() const { return dtype == gpudb::Dtype::I64 ? i64.size() : f64.size(); }
+    std::size_t bytes() const { return i64.size() * sizeof(std::int64_t)
+                                     + f64.size() * sizeof(double); }
 };
 
 struct Globals {
@@ -87,9 +103,33 @@ struct Globals {
     std::unordered_map<std::string,
         std::unique_ptr<gpudb::ResidentColumn>> registry;         // name -> column
     std::unordered_map<std::uint64_t, UploadBuf> pool;            // buf_id -> buffer
+    std::size_t   pool_bytes = 0;   // sum of bytes() over pool, kept exact
     std::uint64_t next_id = 1;
     std::string   last_stats = "no resident reduction has run yet";
 };
+
+// Cap on total host memory buffered by in-flight gpu_upload states. Without
+// it, gpu_upload inside a running window frame (combine() per output row,
+// every state's buffer live until query end) amplifies a KB-scale input into
+// tens of GB and OOMs the host — measured n²/2 growth. Default 4 GB,
+// override via GPUDB_UPLOAD_POOL_MAX_MB.
+std::size_t pool_cap_bytes() {
+    static const std::size_t cap = [] {
+        unsigned long long mb = 4096;
+        if (const char* s = std::getenv("GPUDB_UPLOAD_POOL_MAX_MB")) {
+            char* end = nullptr;
+            const unsigned long long v = std::strtoull(s, &end, 10);
+            if (end && *end == '\0' && v > 0) mb = v;
+        }
+        return static_cast<std::size_t>(mb) << 20;
+    }();
+    return cap;
+}
+
+constexpr const char* kPoolCapHint =
+    " (gpu_upload buffers exceed the pool cap; raise GPUDB_UPLOAD_POOL_MAX_MB"
+    " if intentional — note gpu_upload inside a window frame buffers"
+    " quadratically and is almost never what you want)";
 
 Globals& g() {
     static Globals instance;
@@ -134,10 +174,17 @@ void upload_state_init(duckdb_function_info /*info*/, duckdb_aggregate_state sta
 
 void upload_state_destroy(duckdb_aggregate_state* states, idx_t count) {
     std::lock_guard<std::mutex> lock(g().mu);
+    auto& G = g();
     for (idx_t i = 0; i < count; ++i) {
         auto* s = reinterpret_cast<UploadState*>(states[i]);
         if (!s || s->magic != UploadState::kMagic) continue;
-        if (s->buf_id != 0) g().pool.erase(s->buf_id);  // double-erase is a no-op
+        if (s->buf_id != 0) {
+            auto it = G.pool.find(s->buf_id);   // double-erase is a no-op
+            if (it != G.pool.end()) {
+                G.pool_bytes -= it->second.bytes();
+                G.pool.erase(it);
+            }
+        }
         s->magic = 0;
     }
 }
@@ -166,7 +213,7 @@ inline std::string read_name(duckdb_string_t* names, idx_t row) {
 }
 
 template <class T, gpudb::Dtype DT>
-void upload_update_t(duckdb_function_info /*info*/, duckdb_data_chunk input,
+void upload_update_t(duckdb_function_info info, duckdb_data_chunk input,
                      duckdb_aggregate_state* states) {
     duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
     duckdb_vector val_vec  = duckdb_data_chunk_get_vector(input, 1);
@@ -194,28 +241,56 @@ void upload_update_t(duckdb_function_info /*info*/, duckdb_data_chunk input,
     }
 
     std::lock_guard<std::mutex> lock(g().mu);
-    auto append_row = [&](UploadState* s, idx_t i) {
-        if (val_validity && !duckdb_validity_row_is_valid(val_validity, i)) return;
-        UploadBuf& b = state_buf_locked(s, DT);
-        if (b.name.empty() &&
-            (!name_validity || duckdb_validity_row_is_valid(name_validity, i))) {
-            b.name = read_name(names, i);
+    auto& G = g();
+    // Returns false after setting a function error (aborts the chunk).
+    auto append_row = [&](UploadState* s, idx_t i) -> bool {
+        // NULL values are skipped (standard aggregate semantics).
+        if (val_validity && !duckdb_validity_row_is_valid(val_validity, i)) return true;
+        // A NULL name on a contributing row is a user error, not data: the
+        // old code silently registered the column under '' instead.
+        if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload: name may not be NULL");
+            return false;
         }
+        UploadBuf& b = state_buf_locked(s, DT);
+        const char*       nm_data = duckdb_string_t_data(&names[i]);
+        const std::size_t nm_len  = duckdb_string_t_length(names[i]);
+        if (!b.name_set) {
+            b.name.assign(nm_data, nm_len);
+            b.name_set = true;
+        } else if (b.name.size() != nm_len ||
+                   std::memcmp(b.name.data(), nm_data, nm_len) != 0) {
+            // One state buffer = one column. Mixed names used to silently
+            // merge different names' values into the first row's column.
+            duckdb_aggregate_function_set_error(info,
+                ("gpu_upload: one aggregate received two different names ('" +
+                 b.name + "' and '" + std::string(nm_data, nm_len) +
+                 "') — use a constant name, or GROUP BY the name column").c_str());
+            return false;
+        }
+        if (G.pool_bytes + sizeof(T) > pool_cap_bytes()) {
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload: out of buffer memory") + kPoolCapHint).c_str());
+            return false;
+        }
+        G.pool_bytes += (DT == gpudb::Dtype::I64) ? sizeof(std::int64_t) : sizeof(double);
         if (DT == gpudb::Dtype::I64) b.i64.push_back(static_cast<std::int64_t>(data[i]));
         else                         b.f64.push_back(static_cast<double>(data[i]));
+        return true;
     };
 
     if (n == 1 || !per_row) {
-        for (idx_t i = 0; i < n; ++i) append_row(s0, i);
+        for (idx_t i = 0; i < n; ++i) if (!append_row(s0, i)) return;
     } else {
         for (idx_t i = 0; i < n; ++i) {
             UploadState* s = probe_upload_state(states[i]);
-            if (s) append_row(s, i);
+            if (s && !append_row(s, i)) return;
         }
     }
 }
 
-void upload_combine(duckdb_function_info /*info*/, duckdb_aggregate_state* source,
+void upload_combine(duckdb_function_info info, duckdb_aggregate_state* source,
                     duckdb_aggregate_state* target, idx_t count) {
     // Contract #3: source is read-only (window donor states are combined into
     // many targets). We COPY the source buffer's contents into the target's.
@@ -229,7 +304,24 @@ void upload_combine(duckdb_function_info /*info*/, duckdb_aggregate_state* sourc
         if (it == G.pool.end() || it->second.size() == 0) continue;
         const UploadBuf& sb = it->second;
         UploadBuf& db = state_buf_locked(dst, sb.dtype);
-        if (db.name.empty()) db.name = sb.name;
+        if (!db.name_set && sb.name_set) {
+            db.name = sb.name;
+            db.name_set = true;
+        } else if (db.name_set && sb.name_set && db.name != sb.name) {
+            duckdb_aggregate_function_set_error(info,
+                ("gpu_upload: combine merged two different names ('" + db.name +
+                 "' and '" + sb.name + "')").c_str());
+            return;
+        }
+        const std::size_t delta = sb.bytes();
+        if (G.pool_bytes + delta > pool_cap_bytes()) {
+            // This is the window-frame quadratic-buffering path: each output
+            // row's state receives a copy of its whole frame prefix.
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload: out of buffer memory") + kPoolCapHint).c_str());
+            return;
+        }
+        G.pool_bytes += delta;
         db.i64.insert(db.i64.end(), sb.i64.begin(), sb.i64.end());
         db.f64.insert(db.f64.end(), sb.f64.begin(), sb.f64.end());
     }
@@ -296,14 +388,11 @@ duckdb_aggregate_function make_upload_fn(duckdb_type value_type,
 // ---------------------------------------------------------------------------
 
 // Look up a registry column by the VARCHAR cell in input vector 0, row `row`.
-// Returns nullptr after setting a function error. Callers hold g().mu.
+// Returns nullptr after setting a function error. Callers hold g().mu and
+// have already skipped NULL-name rows (those produce SQL NULL, mirroring
+// what DuckDB's default NULL handling does for constant NULL arguments).
 gpudb::ResidentColumn* lookup_locked(duckdb_function_info info,
-                                     duckdb_string_t* names, uint64_t* validity,
-                                     idx_t row) {
-    if (validity && !duckdb_validity_row_is_valid(validity, row)) {
-        duckdb_scalar_function_set_error(info, "resident column name may not be NULL");
-        return nullptr;
-    }
+                                     duckdb_string_t* names, idx_t row) {
     std::string name = read_name(names, row);
     auto it = g().registry.find(name);
     if (it == g().registry.end()) {
@@ -326,10 +415,16 @@ void resident_i64_exec(duckdb_function_info info, duckdb_data_chunk input,
     uint64_t* validity = duckdb_vector_get_validity(name_vec);
     const idx_t n = duckdb_data_chunk_get_size(input);
     auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
 
     std::lock_guard<std::mutex> lock(g().mu);
     for (idx_t i = 0; i < n; ++i) {
-        gpudb::ResidentColumn* col = lookup_locked(info, names, validity, i);
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        gpudb::ResidentColumn* col = lookup_locked(info, names, i);
         if (!col) return;
         if (col->dtype() != gpudb::Dtype::I64) {
             duckdb_scalar_function_set_error(info,
@@ -351,10 +446,16 @@ void sum_resident_f64_exec(duckdb_function_info info, duckdb_data_chunk input,
     uint64_t* validity = duckdb_vector_get_validity(name_vec);
     const idx_t n = duckdb_data_chunk_get_size(input);
     auto* out = reinterpret_cast<double*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
 
     std::lock_guard<std::mutex> lock(g().mu);
     for (idx_t i = 0; i < n; ++i) {
-        gpudb::ResidentColumn* col = lookup_locked(info, names, validity, i);
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        gpudb::ResidentColumn* col = lookup_locked(info, names, i);
         if (!col) return;
         if (col->dtype() != gpudb::Dtype::F64) {
             duckdb_scalar_function_set_error(info,
@@ -374,10 +475,16 @@ void resident_info_exec(duckdb_function_info info, duckdb_data_chunk input,
     auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
     uint64_t* validity = duckdb_vector_get_validity(name_vec);
     const idx_t n = duckdb_data_chunk_get_size(input);
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
 
     std::lock_guard<std::mutex> lock(g().mu);
     for (idx_t i = 0; i < n; ++i) {
-        gpudb::ResidentColumn* col = lookup_locked(info, names, validity, i);
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        gpudb::ResidentColumn* col = lookup_locked(info, names, i);
         if (!col) return;
         char buf[256];
         std::snprintf(buf, sizeof(buf), "dtype=%s rows=%zu device=%s",
@@ -403,12 +510,15 @@ void drop_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
     uint64_t* validity = duckdb_vector_get_validity(name_vec);
     const idx_t n = duckdb_data_chunk_get_size(input);
     auto* out = reinterpret_cast<bool*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+    (void)info;
 
     std::lock_guard<std::mutex> lock(g().mu);
     for (idx_t i = 0; i < n; ++i) {
         if (validity && !duckdb_validity_row_is_valid(validity, i)) {
-            duckdb_scalar_function_set_error(info, "resident column name may not be NULL");
-            return;
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
         }
         out[i] = g().registry.erase(read_name(names, i)) > 0;
     }

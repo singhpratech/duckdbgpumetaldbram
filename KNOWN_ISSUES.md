@@ -1,6 +1,6 @@
 # Known issues
 
-Status as of 2026-07-19, `v0.3.0`. **All known functional bugs resolved.**
+Status as of 2026-08-15, `v0.4.0`. **All known functional bugs resolved.**
 
 If you do hit something here, fall back to native DuckDB `sum()` / `min()` / `max()` / window functions for that query.
 
@@ -25,6 +25,18 @@ matching native DuckDB, and `IS NULL` on such a result is now `true`.
 | The SQL aggregate path (`gpu_sum`/`gpu_min`/`gpu_max` called from SQL) does not dispatch to the GPU | Deliberate v0.3.0 design, not a fallback. DuckDB feeds aggregates pre-grouped 2048-row chunks; on unified memory, copying those out to feed a GPU reduction is pure overhead (measured 3×–110× end-to-end loss in v0.2.0 — see BENCHMARK.md). v0.3.0 streams running accumulators instead and reaches parity with native. GPU reductions remain at operator level (`gpudb-bench` etc.); GPU value on the SQL path moves to the join track. |
 | Apple GPUs have no IEEE-754 double precision in MSL | Still true and still relevant to operator-level f64 work on Metal (runs on host there). No longer affects the SQL aggregate path (see row above). |
 | `GPUDB_FORCE_BACKEND` no longer affects SQL aggregates | The env var routed the deleted buffered/batched path; it is a silent no-op on the aggregate path as of v0.3.0. Operator-level tools still honor backend selection. |
+
+### Design notes — resident-column surface (v0.4.0)
+
+| Behavior | Reason |
+|---|---|
+| `gpu_sum_resident` (and the streaming `gpu_sum`) wrap on int64 overflow where native `sum(BIGINT)` promotes to `HUGEINT` | The GPU kernels and the C ABI accumulate in 64-bit; wrap is two's-complement (uint64 accumulate — defined behavior, identical on CPU/CUDA/Metal). Use native `sum()` if your column can exceed int64. |
+| One `gpu_upload` call = one column name; a name column with mixed values errors | Values from different names silently merging into one column is data corruption; use a constant name or `GROUP BY` the name column. |
+| `gpu_upload` names may not be NULL; read-side NULL names yield SQL `NULL` rows | Upload with NULL name used to silently register the column under `''`. |
+| Total memory buffered by in-flight `gpu_upload` states is capped (default 4 GB, `GPUDB_UPLOAD_POOL_MAX_MB`) | `gpu_upload` inside a running window frame buffers O(n²) (combine per output row) and would otherwise OOM the host from a KB-scale input. The cap turns that into a clean error. |
+| An unreferenced `gpu_upload` subquery column is pruned and the upload never runs | DuckDB's unused-column elimination; always reference the upload count in the outer query (see `src/extension/gpu_resident.cpp` header). |
+| Resident f64 columns run on the host on Apple Silicon (`reason=Resident_OnCpu`) | No IEEE-754 doubles in MSL. The host path is parallel (chunked reduction) as of v0.4.0 — measured faster than a native DuckDB scan on M4 Max — and f64 sums are deterministic per upload, not per dataset (parallel upload order affects rounding, same as native). |
+| Whole-column `gpu_min_resident`/`gpu_max_resident` are slower than native `min()`/`max()` on unfiltered persistent tables | Native answers those from zonemap statistics without scanning — a metadata lookup no engine can beat. The resident path wins where a real reduction happens (sums, or data DuckDB has no stats for). |
 
 ### Type support (v0.3.0)
 

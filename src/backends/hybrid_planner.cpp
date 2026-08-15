@@ -346,8 +346,8 @@ private:
                                   n, 0, /*resident*/true, /*borderline*/false);
             return run(*gpu_, h.inner());
         }
-        // Resident on CPU (rare; only happens if upload fell back) → CPU.
-        last_ = make_decision(Backend::CPU, DispatchReason::Hot_GpuAlwaysWins,
+        // Resident on CPU (f64 on Metal, or a GPU upload that fell back) → CPU.
+        last_ = make_decision(Backend::CPU, DispatchReason::Resident_OnCpu,
                               n, 0, /*resident*/true, /*borderline*/false);
         return run(*cpu_, h.inner());
     }
@@ -497,6 +497,7 @@ const char* to_string(DispatchReason r) noexcept {
         case DispatchReason::Hot_GpuAlwaysWins:        return "Hot_GpuAlwaysWins";
         case DispatchReason::GpuUnavailable:           return "GpuUnavailable";
         case DispatchReason::F64_NoGpuDoubles:         return "F64_NoGpuDoubles";
+        case DispatchReason::Resident_OnCpu:           return "Resident_OnCpu";
         case DispatchReason::GroupBy_LowCard_CpuWins:  return "GroupBy_LowCard_CpuWins";
         case DispatchReason::GroupBy_HighCard_GpuWins: return "GroupBy_HighCard_GpuWins";
         case DispatchReason::GroupBy_Borderline_GpuTry:return "GroupBy_Borderline_GpuTry";

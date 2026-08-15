@@ -254,3 +254,141 @@ GROUP BY k ORDER BY k;
 ----
 1	nan
 2	5.0
+
+# ---------------------------------------------------------------------------
+# Resident-column surface (v0.4.0): gpu_upload / gpu_*_resident /
+# gpu_resident_info / gpu_drop_resident / gpu_last_stats.
+# The sqllogictest connection persists across queries, so a column uploaded in
+# one statement is queryable in the next. All assertions are deterministic and
+# backend-independent (CPU fallback in CI, CUDA/Metal on GPU boxes).
+# ---------------------------------------------------------------------------
+
+# Upload 0..999 under a name; the aggregate returns the uploaded row count.
+query I
+SELECT gpu_upload('r1', range::BIGINT) FROM range(1000);
+----
+1000
+
+# Resident reductions, no re-scan: sum/min/max of 0..999.
+query I
+SELECT gpu_sum_resident('r1');
+----
+499500
+
+query I
+SELECT gpu_min_resident('r1');
+----
+0
+
+query I
+SELECT gpu_max_resident('r1');
+----
+999
+
+# Resident result matches the native aggregate over the same data.
+query T
+SELECT gpu_sum_resident('r1') = (SELECT sum(range::BIGINT) FROM range(1000));
+----
+true
+
+# gpu_last_stats records the reduction (backend varies; shape does not).
+query T
+SELECT gpu_last_stats() LIKE 'op=resident_i64 backend=%rows=1000%';
+----
+true
+
+# DOUBLE column: resident f64 sum. 0..99 halved sums to 2475.
+query I
+SELECT gpu_upload('r2', (range / 2.0)::DOUBLE) FROM range(100);
+----
+100
+
+query R
+SELECT gpu_sum_resident_f64('r2');
+----
+2475.0
+
+# Dtype mismatch is a clean error, not a wrong answer.
+statement error
+SELECT gpu_sum_resident('r2');
+----
+
+statement error
+SELECT gpu_sum_resident_f64('r1');
+----
+
+# NULL values are skipped at upload (2 of 4 rows survive).
+query I
+SELECT gpu_upload('r3', CASE WHEN range % 2 = 0 THEN range ELSE NULL END::BIGINT)
+FROM range(4);
+----
+2
+
+query I
+SELECT gpu_sum_resident('r3');
+----
+2
+
+# A NULL name at upload is an error (never silently registered under '').
+statement error
+SELECT gpu_upload(NULL::VARCHAR, v) FROM (VALUES (5::BIGINT)) t(v);
+----
+
+# Mixed names within one upload are an error (values never cross columns).
+statement error
+SELECT gpu_upload(nm, v) FROM (VALUES ('a', 1::BIGINT), ('b', 2::BIGINT)) t(nm, v);
+----
+
+# A NULL name on the read side yields SQL NULL for that row, not a query error.
+query I
+SELECT gpu_sum_resident(NULL::VARCHAR);
+----
+NULL
+
+# Unknown names are a clean error.
+statement error
+SELECT gpu_sum_resident('never_uploaded');
+----
+
+# i64 sum WRAPS on overflow (documented; native sum(BIGINT) promotes instead).
+query I
+SELECT gpu_upload('r4', v) FROM (VALUES (9223372036854775807::BIGINT), (1::BIGINT)) t(v);
+----
+2
+
+query I
+SELECT gpu_sum_resident('r4');
+----
+-9223372036854775808
+
+# Re-upload under an existing name replaces the column.
+query I
+SELECT gpu_upload('r1', range::BIGINT) FROM range(10);
+----
+10
+
+query I
+SELECT gpu_sum_resident('r1');
+----
+45
+
+# gpu_resident_info reports dtype and rows.
+query T
+SELECT gpu_resident_info('r1') LIKE 'dtype=I64 rows=10 %';
+----
+true
+
+# Drop frees the column; a second drop reports it is gone.
+query T
+SELECT gpu_drop_resident('r1');
+----
+true
+
+query T
+SELECT gpu_drop_resident('r1');
+----
+false
+
+statement error
+SELECT gpu_sum_resident('r1');
+----
