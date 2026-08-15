@@ -49,6 +49,15 @@ set_target_properties(gpudb_duckdb PROPERTIES
     CXX_VISIBILITY_PRESET hidden
     VISIBILITY_INLINES_HIDDEN ON)
 
+# Visibility presets only cover our own TUs. Statically linked archives —
+# cudart_static above all — would still export their whole API from the .so,
+# and under ELF interposition a host process with its own libcudart (any
+# python CUDA stack) could cross-bind into ours. Strip them from the dynamic
+# symbol table wholesale.
+if(UNIX AND NOT APPLE)
+    target_link_options(gpudb_duckdb PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
+
 # Output naming / location.
 #   - CI path (extension-ci-tools Makefile passes -DEXTENSION_NAME): emit
 #     lib<EXTENSION_NAME>.<suffix> at the top-level build dir, exactly where the

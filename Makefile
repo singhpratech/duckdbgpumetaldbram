@@ -28,11 +28,17 @@ USE_UNSTABLE_C_API=0
 # into the extension metadata footer (FIELD3 duckdb_version).
 TARGET_DUCKDB_VERSION=v1.2.0
 
-# CUDA: auto-detected via nvcc. The registry's linux_amd64 build container
-# installs the CUDA toolchain when description.yml lists "cuda" in
-# requires_toolchains (extension-ci-tools docker/linux_amd64, ARG
-# extra_toolchains); plain containers and macOS have no nvcc and keep CUDA off,
-# so this is a no-op for every other job.
+# CUDA: auto-detected via nvcc, x86_64 only. NOTE the registry does NOT
+# currently provide nvcc: community-extensions pins extension-ci-tools to a
+# branch (v1.5-variegata) with no CUDA toolchain support, so its containers
+# never have nvcc and this stays OFF there. The "cuda" extra_toolchains token
+# exists only on extension-ci-tools main (unreleased); when the registry's pin
+# moves and description.yml lists cuda in requires_toolchains, this auto-flips
+# ON with no further changes here.
+#
+# The uname gate exists because a future cuda-capable ci-tools would also
+# install the sbsa toolkit on linux_arm64 — an aarch64 CUDA build we have
+# never validated. Lift the gate once sbsa is actually tested.
 #
 # GPUDB_CUDA_STATIC_RUNTIME=ON is the load-safety requirement, not an
 # optimization: the shipped .so must have NO dynamic dependency on
@@ -41,7 +47,10 @@ TARGET_DUCKDB_VERSION=v1.2.0
 # to CPU when no device/driver is present. CUDA archs come from the CMake
 # default (75;80;86;89;90).
 NVCC := $(shell command -v nvcc 2>/dev/null)
+UNAME_M := $(shell uname -m)
 ifeq ($(NVCC),)
+GPUDB_CUDA_FLAGS=-DGPUDB_ENABLE_CUDA=OFF
+else ifneq ($(UNAME_M),x86_64)
 GPUDB_CUDA_FLAGS=-DGPUDB_ENABLE_CUDA=OFF
 else
 GPUDB_CUDA_FLAGS=-DGPUDB_ENABLE_CUDA=ON -DGPUDB_CUDA_STATIC_RUNTIME=ON

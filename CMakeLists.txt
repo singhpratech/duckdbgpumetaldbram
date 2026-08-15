@@ -60,7 +60,11 @@ if(GPUDB_ENABLE_CUDA)
         # CMAKE_CUDA_ARCHITECTURES to nvcc's single default arch, after which a
         # `if(NOT ...)` guard never fires (that bug shipped sm_75-only fatbins).
         # Overridable via -DCMAKE_CUDA_ARCHITECTURES or the CUDAARCHS env var.
-        if(NOT CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+        # CUDAARCHS must be treated as unset when DEFINED-BUT-EMPTY: the
+        # extension-ci-tools pipeline injects an empty CUDAARCHS into the build
+        # container, and CMake ignores an empty value — a `NOT DEFINED` guard
+        # would then skip our default and ship a single-arch fatbin again.
+        if(NOT CMAKE_CUDA_ARCHITECTURES AND "$ENV{CUDAARCHS}" STREQUAL "")
             set(CMAKE_CUDA_ARCHITECTURES "75;80;86;89;90")
         endif()
         enable_language(CUDA)
