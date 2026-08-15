@@ -250,6 +250,8 @@ enum class DispatchReason : std::uint8_t {
     Hot_GpuAlwaysWins     = 3,  // resident column → GPU
     GpuUnavailable        = 4,  // no GPU compiled in / no device
     F64_NoGpuDoubles      = 5,  // Metal lacks IEEE-754 doubles, prefer CPU
+    Resident_OnCpu        = 6,  // column resides in host memory (f64 on Metal,
+                                // or a GPU upload that fell back) → CPU runs it
     // GROUP BY reasons
     GroupBy_LowCard_CpuWins  = 10, // expected_groups < threshold and small n
     GroupBy_HighCard_GpuWins = 11, // expected_groups >= n / 10 → high cardinality regime

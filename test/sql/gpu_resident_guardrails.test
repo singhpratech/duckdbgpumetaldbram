@@ -1,0 +1,57 @@
+# gpu_resident_guardrails SQL test — the failure modes adversarial review
+# found in the v0.4.0 resident surface, pinned so they stay fixed:
+#   - mixed names in one gpu_upload error instead of silently merging
+#   - NULL upload names error instead of registering under ''
+#   - the buffer pool cap turns the window-frame quadratic blowup into a
+#     clean error instead of an OOM
+#   - NULL name rows on the read side produce SQL NULL rows, not query aborts
+#   - i64 overflow wraps (documented, deterministic, no UB)
+#   - the stats line never claims the GPU won when the CPU ran
+#
+# Same single-statement upload shape as gpu_resident.test: the outer query
+# must reference the upload count u or DuckDB prunes the aggregate.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_resident_guardrails
+
+-- 1. Mixed names in one upload: hard error, values never cross columns
+-- expected_fail: one aggregate received two different names
+SELECT u FROM (SELECT gpu_upload(nm, v) AS u
+               FROM (VALUES ('a', 1::BIGINT), ('b', 2::BIGINT)) t(nm, v)) up;
+
+-- 2. NULL name at upload: hard error (was silently registered under '')
+-- expected_fail: gpu_upload name may not be NULL
+SELECT u FROM (SELECT gpu_upload(NULL::VARCHAR, v) AS u
+               FROM (VALUES (5::BIGINT)) t(v)) up;
+
+-- 3. Window-frame quadratic buffering hits the pool cap as a clean error
+--    (1 MB cap; 5000 rows would otherwise buffer ~n^2/2 * 8B ≈ 100 MB)
+-- env: GPUDB_UPLOAD_POOL_MAX_MB=1
+-- expected_fail: out of buffer memory
+SELECT count(*) FROM (SELECT gpu_upload('w', v) OVER (ORDER BY v) AS r
+                      FROM (SELECT range AS v FROM range(5000)) t) q;
+
+-- 4. NULL name rows on the read side: SQL NULL for those rows, query succeeds
+SELECT s IS NULL AS null_row, u
+FROM (SELECT gpu_sum_resident(NULL::VARCHAR) AS s, u
+      FROM (SELECT gpu_upload('g4', range::BIGINT) AS u FROM range(10)) up) q;
+-- expect: true  10
+
+-- 5. i64 sum wraps at overflow (uint64 accumulate: deterministic, documented)
+SELECT gpu_sum_resident('g5') AS wrapped, u
+FROM (SELECT gpu_upload('g5', v) AS u
+      FROM (VALUES (9223372036854775807::BIGINT), (1::BIGINT)) t(v)) up;
+-- expect: -9223372036854775808  2
+
+-- 6. Re-upload under an existing name replaces the column (10 rows -> 3 rows)
+SELECT gpu_sum_resident('g6') AS s, gpu_resident_info('g6') LIKE 'dtype=I64 rows=3 %' AS rows_ok, u2
+FROM (SELECT gpu_upload('g6', range::BIGINT) AS u2
+      FROM (SELECT u1 FROM (SELECT gpu_upload('g6', range::BIGINT) AS u1
+                            FROM range(10)) a) b, range(3)) up;
+-- expect: 3  true  3
+
+-- 7. The stats line never pairs backend=CPU with reason=Hot_GpuAlwaysWins
+--    (f64 columns are CPU-resident on Metal; reason must say Resident_OnCpu)
+SELECT gpu_last_stats() NOT LIKE '%backend=CPU reason=Hot_GpuAlwaysWins%' AS truthful, s > 0 AS sum_ok, u
+FROM (SELECT gpu_sum_resident_f64('g7') AS s, u
+      FROM (SELECT gpu_upload('g7', (range + 1)::DOUBLE) AS u FROM range(2000000)) up) q;
+-- expect: true  true  2000000

@@ -2,6 +2,112 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-08-15 (v0.4.0) — resident-column SQL surface: the GPU wins from SQL
+
+First benchmark of the `gpu_upload` / `gpu_*_resident` SQL functions (merged in
+PR #57, hardened in the follow-up PRs). Methodology as always: DuckDB CLI
+`-unsigned -readonly`, `SET threads TO 16`, `.timer on`, warm OS cache, median
+of 5 timed runs after 1 warm-up. The resident model: `gpu_upload` pays the
+transfer once; every later reduction runs against device/host-resident memory
+with `transfer_ms=0.000` (assert with `gpu_last_stats()`).
+
+### Apple M4 Max (Metal), DuckDB CLI v1.5.5, TPC-H `lineitem`, SF1→SF100
+
+Built from `feat/ext-resident-hardening`. Six scale levels (6M → 600M rows,
+stepwise dbgen for SF50/SF100), six columns, mean of 5 warm runs per cell
+after 1 warm-up; every level passed a correctness gate (resident == native
+for every measured column) before its timings counted. SF100 ran with
+`GPUDB_UPLOAD_POOL_MAX_MB=32768` (the 4.8 GB per-column upload exceeds the
+default 4 GB pool cap — the guardrail and its documented escape hatch both
+work end-to-end).
+
+`sum` — native / resident e2e / ratio, per level (ms):
+
+| Column | SF1 · 6M | SF5 · 30M | SF10 · 60M | SF25 · 150M | SF50 · 300M | SF100 · 600M |
+|---|---|---|---|---|---|---|
+| `l_quantity::BIGINT`¹ | 1.2 / 0.6 / **2.0×** | 5.0 / 1.0 / **5.0×** | 9.6 / 1.4 / **6.9×** | 23.2 / 3.4 / **6.8×** | 45.8 / 5.4 / **8.5×** | 99.0 / 10.0 / **9.9×** |
+| `l_orderkey` (BIGINT) | 0.6 / 0.6 / 1.0× | 2.0 / 1.0 / **2.0×** | 3.8 / 1.6 / **2.4×** | 9.4 / 2.6 / **3.6×** | 18.6 / 5.0 / **3.7×** | — |
+| `l_partkey` (BIGINT) | 0.4 / 0.4 / 1.0× | 1.8 / 1.0 / **1.8×** | 3.4 / 1.6 / **2.1×** | 8.8 / 2.6 / **3.4×** | 16.6 / 5.0 / **3.3×** | — |
+| `l_extendedprice::DOUBLE`¹ | 1.4 / 0.6 / **2.3×** | 5.6 / 1.8 / **3.1×** | 12.6 / 3.4 / **3.7×** | 28.4 / 8.8 / **3.2×** | 54.8 / 15.6 / **3.5×** | 116.8 / 28.2 / **4.1×** |
+| `l_discount::DOUBLE`¹ | 1.2 / 0.4 / **3.0×** | 5.2 / 1.8 / **2.9×** | 10.2 / 3.4 / **3.0×** | 26.0 / 7.6 / **3.4×** | 50.4 / 15.4 / **3.3×** | — |
+| `l_tax::DOUBLE`¹ | 1.4 / 0.4 / **3.5×** | 5.2 / 1.6 / **3.2×** | 10.2 / 3.6 / **2.8×** | 26.4 / 7.6 / **3.5×** | 50.4 / 15.2 / **3.3×** | — |
+
+¹ these TPC-H columns are stored DECIMAL; the native query pays the
+DECIMAL→BIGINT/DOUBLE cast on every scan, while `gpu_upload` stores the cast
+result once — avoiding the recast is part of the resident model's win, and
+it is why `l_quantity` (cast per query) shows a higher ratio than the
+already-BIGINT `l_orderkey`/`l_partkey` (pure reduction: 3.3–3.7×). Both
+rows are the truth; pick the one that matches your schema.
+
+**Losing row, stated plainly:** whole-column `min`/`max` — native answers
+from zonemap statistics in 0.2–2.2 ms at every scale without scanning (our
+attempted scan-forcing via `+ 0` was constant-folded away, so there is no
+honest scan-race to report). Resident min+max runs a real reduction
+(2 × ~5 ms at SF50). If DuckDB has statistics for your column, use native
+min/max.
+
+The i64 kernel tracks the memory ceiling as scale grows: 370 GB/s (SF10) →
+446 (SF25) → 496 (SF50) → **503 GB/s at SF100** (600M rows, kernel 9.53 ms)
+vs the M4 Max's ~546 GB/s spec. Ratio curve: 2× → 5× → 6.9× → 6.8× → 8.5×
+→ **9.9×**.
+
+One-time `gpu_upload` (i64, ms): SF1 87 · SF5 417 · SF10 831 · SF25 2,140 ·
+SF50 4,358 · SF100 9,469 → break-even ≈ 90–110 repeated sums at every level;
+after that each query is 8–107 ms cheaper forever. Honest losing rows: unfiltered `min`/`max` on
+persistent tables (native answers from zonemap statistics without scanning —
+resident min/max still run a real 1–2 ms reduction) and any one-shot query
+(that is what the streaming parity path is for).
+
+f64-on-Metal note: resident f64 runs on the host (no doubles in MSL). Before
+the parallel host path this LOST to native 29 ms vs 11 ms; the chunked
+parallel reduction in this branch flipped it to 3 ms. `gpu_last_stats()` now
+reports `reason=Resident_OnCpu` for this case (was misleadingly
+`Hot_GpuAlwaysWins`).
+
+### NVIDIA RTX 4090 Laptop (sm_89, 16 GB, CUDA 13.0.88, driver 580.178.04), DuckDB CLI v1.5.5, TPC-H `lineitem`, SF1→SF100
+
+Reported by the Linux instance; extension built from `feat/ext-resident-hardening`
+(PR #59), medians of 5 after warm-up, `-readonly`, threads 16. Correctness
+gates: **0 mismatches at every SF**. `gpu_last_stats` at every level and both
+dtypes: `backend=CUDA reason=Hot_GpuAlwaysWins transfer_ms=0.000`.
+
+`sum` — native / resident e2e / ratio, per level (ms; `<1` printed as 1):
+
+| Column | SF1 · 6M | SF5 · 30M | SF10 · 60M | SF25 · 150M | SF50 · 300M | SF100 · 600M |
+|---|---|---|---|---|---|---|
+| `l_quantity::BIGINT`¹ | 4 / <1 / **4×** | 10 / 1 / **10×** | 20 / 1 / **20×** | 48 / 2 / **24×** | 99 / 4 / **25×** | 192 / 9 / **21×** |
+| `l_orderkey` (BIGINT) | 1 / <1 / ~1× | 3 / <1 / **~3×** | 9 / 1 / **9×** | 13 / 2 / **6.5×** | 25 / 4 / **6.3×** | 50 / 9 / **5.6×** |
+| `l_partkey` (BIGINT) | 1 / <1 / ~1× | 3 / 1 / **3×** | 10 / 1 / **10×** | 14 / 2 / **7×** | 27 / 4 / **6.8×** | 56 / 9 / **6.2×** |
+| `l_extendedprice::DOUBLE`¹ | 6 / <1 / **6×** | 10 / 1 / **10×** | 21 / 1 / **21×** | 49 / 2 / **24×** | 98 / 4 / **24×** | 196 / 9 / **22×** |
+| `l_discount::DOUBLE`¹ | 5 / <1 / **5×** | 10 / 1 / **10×** | 21 / 1 / **21×** | 45 / 2 / **22×** | 89 / 4 / **22×** | 176 / 9 / **20×** |
+| `l_tax::DOUBLE`¹ | 3 / <1 / **3×** | 9 / 1 / **9×** | 19 / 1 / **19×** | 44 / 2 / **22×** | 88 / 4 / **22×** | 177 / 9 / **20×** |
+
+¹ same DECIMAL-cast structure as the Metal table: native re-casts stored
+DECIMAL per scan, the resident column stores the cast once — cast-heavy
+columns hit 20–25×, already-BIGINT columns are the pure reduction race at
+5.6–10×. Kernel-level SF100 ratios (net of ~0.5–1 ms CLI per-statement
+overhead): 22.4× cast, 5.8× raw. Unlike Metal, DOUBLE runs **on the GPU**
+here — f64 ratios match the i64 cast rows.
+
+Kernel times SF1→SF100: 0.045 / 0.460 / 0.882 / 2.155 / 4.278 / **8.528 ms**
+— SF100 = **563 GB/s ≈ the 4090 Laptop's VRAM ceiling**. Same
+bandwidth-convergence story as Metal, higher ceiling.
+
+**Losing row, stated plainly:** whole-column `min`/`max` — native's zonemap
+statistics answer in 0–10 ms at every SF (the `+ 0` scan-forcing attempt was
+constant-folded on v1.5.5 too; 10 ms at SF100 is impossible DRAM bandwidth
+for a real 4.8 GB scan, so that IS the stats path). Resident min+max (two
+kernel launches) loses this row at every SF. Native wins; documented.
+
+One-time `gpu_upload` (ms, per column): SF1 ~200–425 → SF100 ~25,000–29,800.
+Break-even at SF100 ≈ 150 repeated sums for cast-heavy columns, ≈ 600 for
+raw-BIGINT. SF100 note: the 4.8 GB per-column host buffer exceeds the default
+4 GB pool cap — the sweep reproduced the clean cap error, then ran with the
+documented `GPUDB_UPLOAD_POOL_MAX_MB=16384` override (guardrail + escape
+hatch verified on both platforms). SF100 resident cells ran as per-column CLI
+processes (`SET memory_limit='4GB'`) on the 31 GB box; native SF100 numbers
+came from the main run at loadavg 2–3.
+
 ## 2026-07-19 (v0.3.0) — streaming aggregate rewrite: end-to-end parity with native
 
 Re-run of the exact end-to-end suite from the v0.2.0 section below (same queries, same

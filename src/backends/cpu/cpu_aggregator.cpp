@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if GPUDB_HAVE_OPENMP
@@ -15,6 +17,35 @@
 
 namespace gpudb {
 namespace {
+
+// Portable parallel chunking for builds without OpenMP (Apple clang ships no
+// libomp, so the macOS loadable extension otherwise reduces single-threaded).
+// Splits [0,n) into one contiguous chunk per worker and combines the partials
+// in chunk order — deterministic for a given (n, worker count), which matters
+// for f64 sums where the combine order changes the rounding.
+template <class Partial, class ChunkFn, class CombineFn>
+Partial parallel_chunks(std::size_t n, ChunkFn chunk, CombineFn combine) {
+    constexpr std::size_t kMinPerWorker = std::size_t(1) << 19; // 512k elems
+    const unsigned hw = std::thread::hardware_concurrency();
+    std::size_t workers = std::min<std::size_t>(hw ? hw : 1, n / kMinPerWorker);
+    if (workers <= 1) return chunk(std::size_t(0), n);
+
+    std::vector<Partial> parts(workers);
+    std::vector<std::thread> threads;
+    threads.reserve(workers);
+    const std::size_t per = n / workers;
+    for (std::size_t w = 0; w < workers; ++w) {
+        const std::size_t begin = w * per;
+        const std::size_t end   = (w + 1 == workers) ? n : begin + per;
+        threads.emplace_back([&parts, &chunk, w, begin, end] {
+            parts[w] = chunk(begin, end);
+        });
+    }
+    for (auto& t : threads) t.join();
+    Partial acc = parts[0];
+    for (std::size_t w = 1; w < workers; ++w) acc = combine(acc, parts[w]);
+    return acc;
+}
 
 // CPU resident column = a copy of the host data the aggregator owns.
 // (Could just hold a const pointer, but a copy matches GPU semantics so
@@ -115,12 +146,25 @@ private:
         std::int64_t v = (n == 0) ? 0 : init;
         switch (kind) {
             case ReduceKind::Sum: {
+                // Accumulate in uint64: overflow wraps (two's complement),
+                // matching the documented gpu_sum semantics, instead of the
+                // signed-overflow UB the old code had.
+                std::uint64_t uv = 0;
 #if GPUDB_HAVE_OPENMP
-                #pragma omp parallel for reduction(+:v) schedule(static)
-                for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) v += data[i];
+                #pragma omp parallel for reduction(+:uv) schedule(static)
+                for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i)
+                    uv += static_cast<std::uint64_t>(data[i]);
 #else
-                for (std::size_t i = 0; i < n; ++i) v += data[i];
+                uv = parallel_chunks<std::uint64_t>(n,
+                    [data](std::size_t b, std::size_t e) {
+                        std::uint64_t acc = 0;
+                        for (std::size_t i = b; i < e; ++i)
+                            acc += static_cast<std::uint64_t>(data[i]);
+                        return acc;
+                    },
+                    [](std::uint64_t a, std::uint64_t b) { return a + b; });
 #endif
+                v = static_cast<std::int64_t>(uv);
                 break;
             }
             case ReduceKind::Min: {
@@ -129,7 +173,13 @@ private:
                 for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i)
                     if (data[i] < v) v = data[i];
 #else
-                for (std::size_t i = 0; i < n; ++i) if (data[i] < v) v = data[i];
+                if (n > 0) v = parallel_chunks<std::int64_t>(n,
+                    [data](std::size_t b, std::size_t e) {
+                        std::int64_t m = std::numeric_limits<std::int64_t>::max();
+                        for (std::size_t i = b; i < e; ++i) if (data[i] < m) m = data[i];
+                        return m;
+                    },
+                    [](std::int64_t a, std::int64_t b) { return a < b ? a : b; });
 #endif
                 break;
             }
@@ -139,7 +189,13 @@ private:
                 for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i)
                     if (data[i] > v) v = data[i];
 #else
-                for (std::size_t i = 0; i < n; ++i) if (data[i] > v) v = data[i];
+                if (n > 0) v = parallel_chunks<std::int64_t>(n,
+                    [data](std::size_t b, std::size_t e) {
+                        std::int64_t m = std::numeric_limits<std::int64_t>::min();
+                        for (std::size_t i = b; i < e; ++i) if (data[i] > m) m = data[i];
+                        return m;
+                    },
+                    [](std::int64_t a, std::int64_t b) { return a > b ? a : b; });
 #endif
                 break;
             }
@@ -166,7 +222,9 @@ private:
             return r;
         }
 
-        std::int64_t sum_v = 0;
+        // uint64 accumulate: overflow wraps (documented gpu_sum semantics)
+        // instead of signed-overflow UB.
+        std::uint64_t sum_v = 0;
         std::int64_t min_v = std::numeric_limits<std::int64_t>::max();
         std::int64_t max_v = std::numeric_limits<std::int64_t>::min();
 #if GPUDB_HAVE_OPENMP
@@ -174,19 +232,19 @@ private:
                                  reduction(max:max_v) schedule(static)
         for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) {
             const std::int64_t x = data[i];
-            sum_v += x;
+            sum_v += static_cast<std::uint64_t>(x);
             if (x < min_v) min_v = x;
             if (x > max_v) max_v = x;
         }
 #else
         for (std::size_t i = 0; i < n; ++i) {
             const std::int64_t x = data[i];
-            sum_v += x;
+            sum_v += static_cast<std::uint64_t>(x);
             if (x < min_v) min_v = x;
             if (x > max_v) max_v = x;
         }
 #endif
-        r.sum = sum_v;
+        r.sum = static_cast<std::int64_t>(sum_v);
         r.min = min_v;
         r.max = max_v;
         r.wall_ms = elapsed_ms(t0);
@@ -200,7 +258,13 @@ private:
         #pragma omp parallel for reduction(+:acc) schedule(static)
         for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(n); ++i) acc += data[i];
 #else
-        for (std::size_t i = 0; i < n; ++i) acc += data[i];
+        acc = parallel_chunks<double>(n,
+            [data](std::size_t b, std::size_t e) {
+                double a = 0.0;
+                for (std::size_t i = b; i < e; ++i) a += data[i];
+                return a;
+            },
+            [](double a, double b) { return a + b; });
 #endif
         AggResult r{};
         r.value_f64 = acc; r.rows = n;
