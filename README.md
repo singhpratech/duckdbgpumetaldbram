@@ -251,7 +251,49 @@ resident-surface coverage in the community-CI sqllogic suite.
 
 ## Roadmap
 
-### Shipped on `main` (v0.1.0 – v0.1.2)
+### Latest — shipped in v0.4.0
+- [x] **Resident-column SQL surface** — `gpu_upload` / `gpu_sum_resident` / `gpu_min_resident` / `gpu_max_resident` / `gpu_sum_resident_f64` / `gpu_resident_info` / `gpu_last_stats` / `gpu_drop_resident` / `gpu_build_info`. The GPU genuinely executes SQL reductions on both CUDA and Metal — up to **25×** over native (see Numbers). Hardened by a three-reviewer adversarial pass pre-release: buffer-pool cap (window-frame O(n²) OOM → clean error), mixed-name/NULL-name guards, defined overflow wrap, truthful dispatch stats.
+- [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
+- [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
+
+### In flight
+- [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
+- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` is the tripwire).
+
+### Next (v0.5.0 — directional, we'll see what the data says)
+- [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
+- [ ] Resident GROUP BY from SQL (`gpu_groupby_resident`) riding the same upload-once model
+- [ ] Resident f64 min/max (needs a v2 backend ABI entry)
+
+### Beyond (v0.6.0+ — exploratory)
+- [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
+- [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
+- [ ] Transparent GPU operator substitution — **blocked upstream**: the DuckDB C API exposes no optimizer/planner/physical-operator hooks, so a loadable extension cannot silently replace plan operators today. A table-function-based `gpu_group_by(...)` is possible but doesn't compose with normal SQL; parked until the C API grows the needed hooks.
+
+<details>
+<summary><b>Earlier releases</b> (v0.1.0 → v0.3.0 + community-extension milestones)</summary>
+
+### Shipped in v0.3.0
+- [x] **Streaming aggregate states** — the SQL aggregate path rewritten from "buffer every value, reduce at finalize" to running accumulators, the same algorithmic shape as native DuckDB. End-to-end on rewritten TPC-H Q6/Q1 and high-cardinality GROUP BY: parity with native (the v0.2.0 buffered path lost 3×–110×; the SF10 GROUP BY cell alone went from 11.05 s to 0.110 s). Full before/after in [BENCHMARK.md](BENCHMARK.md). `GPUDB_FORCE_BACKEND` is a no-op on this path now (it routed the deleted machinery).
+- [x] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — all three aggregates are now overload sets carrying `(BIGINT)->BIGINT` and `(DOUBLE)->DOUBLE`. No backend-interface change was needed under the streaming design. NaN ordering matches native (NaN sorts greatest). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+### DuckDB Community Extension milestones
+- [x] [Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) **merged** — `INSTALL gpudb FROM community` is live (no `-unsigned` flag needed), and gpudb is [listed on duckdb.org](https://duckdb.org/community_extensions/extensions/gpudb).
+- [x] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) **merged** — the community build ships **v0.3.0** (streaming aggregates + DOUBLE overloads on all four platforms).
+
+### Shipped in v0.2.0
+- [x] **SQL-correct NULL semantics** (PR #44) — `gpu_sum`/`gpu_min`/`gpu_max` over empty or all-NULL input now return SQL `NULL` (not 0), matching native DuckDB on every path: plain aggregate, GROUP BY groups, and window frames.
+- [x] **`gpu_sum(DOUBLE) -> DOUBLE`** (PR #45) — a real second overload via the C API aggregate function set. Doubles ride the existing int64 state machinery as raw bit patterns (zero state-layout change); only the finalize differs. `INTEGER`/`SMALLINT`/`TINYINT` work via DuckDB's implicit widening to the `BIGINT` overload (locked in by tests). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+### Shipped in v0.1.3
+- [x] **Hybrid Metal GROUP BY** — 32K-partition slot-lock + radix-opt with auto-dispatch (env override `GPUDB_METAL_GROUPBY_PATH`). Flipped TPC-H SF10 `l_orderkey` (15M unique) from CPU 1.78× faster to Metal 1.30× faster vs DuckDB CPU 16-thread. 9 wins / 1 honest loss on the lineitem scorecard.
+- [x] Prebuilt v0.1.3 binaries (Linux CUDA + macOS Metal) attached to the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
+
+### Shipped in v0.1.2
+- [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
+- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal).
+
+### Shipped v0.1.0 – v0.1.2 (foundation)
 - [x] CUDA backend: SUM/MIN/MAX (one-shot + resident)
 - [x] CUDA GROUP BY hash aggregate (open-addressing + atomicCAS, ~520 GiB/s on RTX 4090)
 - [x] **CUDA hash join probe** (1M build × 10M probe @ 97% sel: 3.7× wall, 107× kernel over CPU)
@@ -262,44 +304,7 @@ resident-surface coverage in the community-CI sqllogic suite.
 - [x] DuckDB extension: gpu_sum / gpu_min / gpu_max with NULL handling + GPUDB_FORCE_BACKEND env var
 - [x] CLI: gpudb-bench, gpudb-groupby-bench, gpudb-window-bench, gpudb-hashjoin-bench, gpudb-sql
 
-### Shipped in v0.1.2
-- [x] **All 4 known window/GROUP BY bugs fixed** (PR #18, #20, #21, #22 — see KNOWN_ISSUES.md)
-- [x] **DuckDB loadable extension actually loads** — `duckdb -unsigned -c "LOAD '/path/to/gpudb.<platform>.duckdb_extension'"` works on Linux (CUDA) and macOS (Metal).
-
-### Shipped in v0.1.3
-- [x] **Hybrid Metal GROUP BY** — 32K-partition slot-lock + radix-opt with auto-dispatch (env override `GPUDB_METAL_GROUPBY_PATH`). Flipped TPC-H SF10 `l_orderkey` (15M unique) from CPU 1.78× faster to Metal 1.30× faster vs DuckDB CPU 16-thread. 9 wins / 1 honest loss on the lineitem scorecard.
-- [x] Prebuilt v0.1.3 binaries (Linux CUDA + macOS Metal) attached to the [v0.1.3 release](https://github.com/singhpratech/duckdbgpumetaldbram/releases/tag/v0.1.3).
-
-### Shipped in v0.2.0
-- [x] **SQL-correct NULL semantics** (PR #44) — `gpu_sum`/`gpu_min`/`gpu_max` over empty or all-NULL input now return SQL `NULL` (not 0), matching native DuckDB on every path: plain aggregate, GROUP BY groups, and window frames.
-- [x] **`gpu_sum(DOUBLE) -> DOUBLE`** (PR #45) — a real second overload via the C API aggregate function set. Doubles ride the existing int64 state machinery as raw bit patterns (zero state-layout change); only the finalize differs. `INTEGER`/`SMALLINT`/`TINYINT` work via DuckDB's implicit widening to the `BIGINT` overload (locked in by tests). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
-### Shipped in v0.3.0
-- [x] **Streaming aggregate states** — the SQL aggregate path rewritten from "buffer every value, reduce at finalize" to running accumulators, the same algorithmic shape as native DuckDB. End-to-end on rewritten TPC-H Q6/Q1 and high-cardinality GROUP BY: parity with native (the v0.2.0 buffered path lost 3×–110×; the SF10 GROUP BY cell alone went from 11.05 s to 0.110 s). Full before/after in [BENCHMARK.md](BENCHMARK.md). `GPUDB_FORCE_BACKEND` is a no-op on this path now (it routed the deleted machinery).
-- [x] **`gpu_min(DOUBLE)` / `gpu_max(DOUBLE)`** — all three aggregates are now overload sets carrying `(BIGINT)->BIGINT` and `(DOUBLE)->DOUBLE`. No backend-interface change was needed under the streaming design. NaN ordering matches native (NaN sorts greatest). Type matrix in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
-
-### Shipped: DuckDB Community Extension
-- [x] [Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) **merged** — `INSTALL gpudb FROM community` is live (no `-unsigned` flag needed), and gpudb is [listed on duckdb.org](https://duckdb.org/community_extensions/extensions/gpudb).
-- [x] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) **merged** — the community build now ships **v0.3.0** (streaming aggregates + DOUBLE overloads on all four platforms).
-
-### Shipped in v0.4.0
-- [x] **Resident-column SQL surface** — `gpu_upload` / `gpu_sum_resident` / `gpu_min_resident` / `gpu_max_resident` / `gpu_sum_resident_f64` / `gpu_resident_info` / `gpu_last_stats` / `gpu_drop_resident` / `gpu_build_info`. The GPU genuinely executes SQL reductions on both CUDA and Metal — up to **25×** over native (see Numbers). Hardened by a three-reviewer adversarial pass pre-release: buffer-pool cap (window-frame O(n²) OOM → clean error), mixed-name/NULL-name guards, defined overflow wrap, truthful dispatch stats.
-- [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
-- [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
-
-### In flight
-- [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
-- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` is the tripwire).
-
-### Roadmap (v0.5.0)
-- [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
-- [ ] Resident GROUP BY from SQL (`gpu_groupby_resident`) riding the same upload-once model
-- [ ] Resident f64 min/max (needs a v2 backend ABI entry)
-
-### Beyond (v0.6.0+)
-- [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
-- [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
-- [ ] Transparent GPU operator substitution — **blocked upstream**: the DuckDB C API exposes no optimizer/planner/physical-operator hooks, so a loadable extension cannot silently replace plan operators today. A table-function-based `gpu_group_by(...)` is possible but doesn't compose with normal SQL; parked until the C API grows the needed hooks.
+</details>
 
 ## Why DuckDB? Why not a new database?
 
