@@ -1,0 +1,71 @@
+name: registry-smoke
+
+# Nightly canary against the LIVE community registry: installs whatever
+# binary `INSTALL gpudb FROM community` actually serves today and gates it on
+# parity with native DuckDB. Catches registry/DuckDB breakage within a day,
+# on both platforms users actually install on. The build-info step is the
+# CUDA-rollout tripwire: the day the registry's toolchain ships CUDA, the
+# linux job's gpu_build_info() output flips from compiled=cpu to
+# compiled=cpu,cuda.
+#
+# Deliberately version-agnostic in its hard gates (gpu_sum/min/max exist
+# since v0.1); resident-surface probes are soft until the registry serves
+# v0.4.0+.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"   # nightly, 05:17 UTC
+  workflow_dispatch: {}
+
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15      # Apple Silicon runner -> real Metal path
+            label: metal
+          - os: ubuntu-latest # CPU fallback today; CUDA-ready tripwire
+            label: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install DuckDB CLI
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install duckdb
+          else
+            curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o duckdb.zip
+            unzip -o duckdb.zip && sudo mv duckdb /usr/local/bin/
+          fi
+          duckdb --version
+
+      - name: Install gpudb from the community registry
+        run: duckdb -c "INSTALL gpudb FROM community; LOAD gpudb; SELECT 'load ok';"
+
+      - name: Parity gate (hard fail on mismatch)
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          SELECT CASE WHEN gpu_sum(v) = sum(v) AND gpu_min(v) = min(v) AND gpu_max(v) = max(v)
+                 THEN 'parity ok'
+                 ELSE error('gpu/native mismatch') END
+          FROM (SELECT (range * 7 - 500000)::BIGINT AS v FROM range(1000000)) t;
+          SELECT CASE WHEN abs(gpu_sum(d) - sum(d)) < 1e-6 THEN 'f64 parity ok'
+                 ELSE error('gpu/native f64 mismatch') END
+          FROM (SELECT (range / 3.0)::DOUBLE AS d FROM range(1000000)) t;
+          "
+
+      - name: Build-info tripwire (soft — needs registry v0.4.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "LOAD gpudb; SELECT gpu_build_info();" || echo "gpu_build_info not in served version yet (registry < v0.4.0)"
+
+      - name: Resident-surface probe (soft — needs registry v0.4.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          SELECT u.n, gpu_sum_resident('smoke') AS s
+          FROM (SELECT gpu_upload('smoke', range::BIGINT) AS n FROM range(100000)) u;
+          SELECT gpu_last_stats();
+          " || echo "resident surface not in served version yet (registry < v0.4.0)"
