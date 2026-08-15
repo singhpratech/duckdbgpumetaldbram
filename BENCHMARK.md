@@ -64,29 +64,49 @@ parallel reduction in this branch flipped it to 3 ms. `gpu_last_stats()` now
 reports `reason=Resident_OnCpu` for this case (was misleadingly
 `Hot_GpuAlwaysWins`).
 
-### NVIDIA RTX 4090 Laptop (sm_89, 16 GB, CUDA 13), DuckDB CLI v1.5.2
+### NVIDIA RTX 4090 Laptop (sm_89, 16 GB, CUDA 13.0.88, driver 580.178.04), DuckDB CLI v1.5.5, TPC-H `lineitem`, SF1→SF100
 
-Reported by the Linux instance from `fix/core-cuda-ci-hardening` (extension
-code identical to `main` @ c7e0db5); same methodology, 5-run medians.
+Reported by the Linux instance; extension built from `feat/ext-resident-hardening`
+(PR #59), medians of 5 after warm-up, `-readonly`, threads 16. Correctness
+gates: **0 mismatches at every SF**. `gpu_last_stats` at every level and both
+dtypes: `backend=CUDA reason=Hot_GpuAlwaysWins transfer_ms=0.000`.
 
-| Query (whole column) | Rows | native | resident e2e | internal wall / kernel | ratio |
-|---|---|---:|---:|---|:---:|
-| `sum(BIGINT)` | 100M | 40 ms | **2 ms** | 1.48 ms / 1.45 ms | **~20×** |
-| TPC-H SF1 `sum(l_quantity)` | 6M | 10 ms | **~1 ms** | 0.087 ms / 0.042 ms | **~10×** |
-| `sum(DOUBLE)` | 10M | 10 ms | **~1 ms** | 0.20 ms / 0.17 ms | **~10×** (f64 on-GPU, unlike Metal) |
-| `min`+`max(BIGINT)` | 10M | 10–22 ms | **~1 ms** | — | **~10–20×** |
-| `sum(BIGINT)` | 10M | 8 ms | ~6 ms | 0.20 ms / 0.16 ms | parity e2e* |
+`sum` — native / resident e2e / ratio, per level (ms; `<1` printed as 1):
 
-\* same SF1-class caveat: ~5 ms per-statement CLI overhead hides a 40× kernel win.
+| Column | SF1 · 6M | SF5 · 30M | SF10 · 60M | SF25 · 150M | SF50 · 300M | SF100 · 600M |
+|---|---|---|---|---|---|---|
+| `l_quantity::BIGINT`¹ | 4 / <1 / **4×** | 10 / 1 / **10×** | 20 / 1 / **20×** | 48 / 2 / **24×** | 99 / 4 / **25×** | 192 / 9 / **21×** |
+| `l_orderkey` (BIGINT) | 1 / <1 / ~1× | 3 / <1 / **~3×** | 9 / 1 / **9×** | 13 / 2 / **6.5×** | 25 / 4 / **6.3×** | 50 / 9 / **5.6×** |
+| `l_partkey` (BIGINT) | 1 / <1 / ~1× | 3 / 1 / **3×** | 10 / 1 / **10×** | 14 / 2 / **7×** | 27 / 4 / **6.8×** | 56 / 9 / **6.2×** |
+| `l_extendedprice::DOUBLE`¹ | 6 / <1 / **6×** | 10 / 1 / **10×** | 21 / 1 / **21×** | 49 / 2 / **24×** | 98 / 4 / **24×** | 196 / 9 / **22×** |
+| `l_discount::DOUBLE`¹ | 5 / <1 / **5×** | 10 / 1 / **10×** | 21 / 1 / **21×** | 45 / 2 / **22×** | 89 / 4 / **22×** | 176 / 9 / **20×** |
+| `l_tax::DOUBLE`¹ | 3 / <1 / **3×** | 9 / 1 / **9×** | 19 / 1 / **19×** | 44 / 2 / **22×** | 88 / 4 / **22×** | 177 / 9 / **20×** |
 
-Upload cost: 6M 196 ms · 10M i64 618 ms · 10M f64 390 ms · 100M 3.39 s →
-break-even ≈ 22 queries (6M) to ≈ 90 queries (100M).
+¹ same DECIMAL-cast structure as the Metal table: native re-casts stored
+DECIMAL per scan, the resident column stores the cast once — cast-heavy
+columns hit 20–25×, already-BIGINT columns are the pure reduction race at
+5.6–10×. Kernel-level SF100 ratios (net of ~0.5–1 ms CLI per-statement
+overhead): 22.4× cast, 5.8× raw. Unlike Metal, DOUBLE runs **on the GPU**
+here — f64 ratios match the i64 cast rows.
 
-Library-level (`gpudb-bench`, no SQL overhead): 100M HOT CPU (OpenMP, 20T)
-30–42 ms vs CUDA 1.44 ms at 522 GiB/s ≈ spec VRAM bandwidth — **21–29×**.
-COLD still loses on CUDA exactly as documented since v0.2.0 (100M: 81.5 ms,
-of which 80 ms is PCIe) — the hybrid planner correctly dispatches cold
-one-shot reductions to the CPU.
+Kernel times SF1→SF100: 0.045 / 0.460 / 0.882 / 2.155 / 4.278 / **8.528 ms**
+— SF100 = **563 GB/s ≈ the 4090 Laptop's VRAM ceiling**. Same
+bandwidth-convergence story as Metal, higher ceiling.
+
+**Losing row, stated plainly:** whole-column `min`/`max` — native's zonemap
+statistics answer in 0–10 ms at every SF (the `+ 0` scan-forcing attempt was
+constant-folded on v1.5.5 too; 10 ms at SF100 is impossible DRAM bandwidth
+for a real 4.8 GB scan, so that IS the stats path). Resident min+max (two
+kernel launches) loses this row at every SF. Native wins; documented.
+
+One-time `gpu_upload` (ms, per column): SF1 ~200–425 → SF100 ~25,000–29,800.
+Break-even at SF100 ≈ 150 repeated sums for cast-heavy columns, ≈ 600 for
+raw-BIGINT. SF100 note: the 4.8 GB per-column host buffer exceeds the default
+4 GB pool cap — the sweep reproduced the clean cap error, then ran with the
+documented `GPUDB_UPLOAD_POOL_MAX_MB=16384` override (guardrail + escape
+hatch verified on both platforms). SF100 resident cells ran as per-column CLI
+processes (`SET memory_limit='4GB'`) on the 31 GB box; native SF100 numbers
+came from the main run at loadavg 2–3.
 
 ## 2026-07-19 (v0.3.0) — streaming aggregate rewrite: end-to-end parity with native
 
