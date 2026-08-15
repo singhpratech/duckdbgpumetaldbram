@@ -3,10 +3,9 @@ name: registry-smoke
 # Nightly canary against the LIVE community registry: installs whatever
 # binary `INSTALL gpudb FROM community` actually serves today and gates it on
 # parity with native DuckDB. Catches registry/DuckDB breakage within a day,
-# on both platforms users actually install on. The build-info step is the
-# CUDA-rollout tripwire: the day the registry's toolchain ships CUDA, the
-# linux job's gpu_build_info() output flips from compiled=cpu to
-# compiled=cpu,cuda.
+# on both platforms users actually install on. The build-info step logs
+# which backends the served binary carries, so any change in the registry
+# build shows up in the job history.
 #
 # Deliberately version-agnostic in its hard gates (gpu_sum/min/max exist
 # since v0.1); resident-surface probes are soft until the registry serves
@@ -25,7 +24,7 @@ jobs:
         include:
           - os: macos-15      # Apple Silicon runner -> real Metal path
             label: metal
-          - os: ubuntu-latest # CPU fallback today; CUDA-ready tripwire
+          - os: ubuntu-latest # CPU fallback (no GPU on hosted runners)
             label: linux
     runs-on: ${{ matrix.os }}
     steps:
@@ -55,7 +54,7 @@ jobs:
           FROM (SELECT (range / 3.0)::DOUBLE AS d FROM range(1000000)) t;
           "
 
-      - name: Build-info tripwire (soft — needs registry v0.4.0+)
+      - name: Build info (soft — needs registry v0.4.0+)
         continue-on-error: true
         run: |
           duckdb -c "LOAD gpudb; SELECT gpu_build_info();" || echo "gpu_build_info not in served version yet (registry < v0.4.0)"

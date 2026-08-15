@@ -258,7 +258,7 @@ resident-surface coverage in the community-CI sqllogic suite.
 
 ### In flight
 - [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
-- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` is the tripwire).
+- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` shows what any given binary carries).
 
 ### Next (v0.5.0 — directional, we'll see what the data says)
 - [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
