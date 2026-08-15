@@ -503,6 +503,36 @@ void last_stats_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
     }
 }
 
+// gpu_build_info(): which backends are COMPILED into this binary and which
+// one dispatch selected at load. This is the activation tripwire for the
+// registry's CUDA rollout: description.yml lists the cuda toolchain now
+// (future-ready), but the registry's pinned extension-ci-tools branch does
+// not provide nvcc yet — when its pin moves, the registry binary silently
+// starts compiling CUDA in, and this function is how CI (and users) see it:
+//   compiled=cpu           → today's registry linux binary
+//   compiled=cpu,cuda      → the moment upstream flips; time to announce
+//   compiled=cpu,metal     → registry osx_arm64 binary
+void build_info_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
+                     duckdb_vector output) {
+    std::string info = "compiled=cpu";
+#if defined(GPUDB_HAVE_CUDA)
+    info += ",cuda";
+#endif
+#if defined(GPUDB_HAVE_METAL)
+    info += ",metal";
+#endif
+    info += " runtime=";
+    switch (gpudb::default_backend()) {
+        case gpudb::Backend::CUDA:  info += "cuda";  break;
+        case gpudb::Backend::METAL: info += "metal"; break;
+        default:                    info += "cpu";   break;
+    }
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    for (idx_t i = 0; i < n; ++i) {
+        duckdb_vector_assign_string_element(output, i, info.c_str());
+    }
+}
+
 void drop_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
                         duckdb_vector output) {
     duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
@@ -586,6 +616,8 @@ void register_gpu_resident(duckdb_connection con) {
         drop_resident_exec, DUCKDB_TYPE_BOOLEAN, true);
     register_scalar(con, "gpu_last_stats",
         last_stats_exec, DUCKDB_TYPE_VARCHAR, false);
+    register_scalar(con, "gpu_build_info",
+        build_info_exec, DUCKDB_TYPE_VARCHAR, false);
 }
 
 } // namespace gpudb_ext

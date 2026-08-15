@@ -392,3 +392,10 @@ false
 statement error
 SELECT gpu_sum_resident('r1');
 ----
+
+# gpu_build_info: compiled-backend tripwire. CPU is always compiled; the CI
+# runner has no GPU so runtime resolves to cpu there (cuda/metal on GPU boxes).
+query T
+SELECT gpu_build_info() LIKE 'compiled=cpu%runtime=%';
+----
+true
