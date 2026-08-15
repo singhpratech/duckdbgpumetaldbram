@@ -19,16 +19,78 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 ```
 
 ```sql
--- Real query, real GPU, real result on RTX 4090 + Apple M4 Max
-SELECT gpu_sum(l_orderkey) FROM read_parquet('lineitem.parquet');
-[gpudb] registered gpu_sum / gpu_min / gpu_max (BIGINT,DOUBLE) streaming aggregates (backend=CUDA)
-gpu_sum(l_orderkey)
-18005322964949
+-- upload a column to GPU memory once, then every query runs at silicon speed
+SELECT gpu_upload('qty', l_quantity::BIGINT) FROM lineitem;   -- once
+SELECT gpu_sum_resident('qty');                               -- 600M rows: 10 ms vs 99 ms native
+SELECT gpu_last_stats();                                      -- proof: which processor ran, kernel time
+-- op=resident_i64 backend=Metal reason=Hot_GpuAlwaysWins rows=600037902
+--   wall_ms=9.702 kernel_ms=9.533 transfer_ms=0.000
 ```
 
-Apache-2.0 · Early stage (v0.3.0) · Linux + macOS · DuckDB ≥ 1.2
+Apache-2.0 · v0.4.0 · Linux + macOS · DuckDB ≥ 1.2
 
 ---
+
+## What you'd use it for
+
+gpudb is for workloads that **ask the same aggregate questions of the same big data, over and over**. Upload a column to GPU memory once; every query after runs at memory-bandwidth speed with zero transfer.
+
+- **📊 Dashboards & monitoring** — a metrics dashboard re-runs `SUM`s every few seconds. Resident columns turn a 99 ms scan into 10 ms (measured, 600M rows). Refresh every 5 s and the one-time upload pays for itself inside 10 minutes — then every refresh is 4–25× cheaper, forever.
+- **🔬 Notebook exploration** — an analyst slicing data re-aggregates on every idea. Upload at the top of the notebook; the whole session runs GPU-speed. On a Mac this is capability that exists nowhere else: no other SQL engine uses the Apple Silicon GPU.
+- **⚡ Serving APIs** — endpoints answering "total X for Y" thousands of times a day. The resident column is a cache that never goes stale-wrong: exact answers, 5–25× lower latency, re-upload in seconds when data refreshes.
+- **💰 DECIMAL/financial data** — money columns are stored DECIMAL, and native DuckDB re-casts every value on every scan. `gpu_upload` stores the cast once — it's why our biggest measured wins (9.9× Metal, 25× CUDA) came from the most accounting-shaped column in TPC-H.
+
+**Not for:** one-shot queries on cold data (transfer loses — the streaming `gpu_sum/min/max` deliberately match native there), or `min`/`max` where DuckDB's statistics answer without scanning. [KNOWN_ISSUES.md](KNOWN_ISSUES.md) lists every trade-off honestly.
+
+## Numbers — measured, not promised
+
+TPC-H `lineitem`, DuckDB CLI **v1.5.5**, warm cache, 5-run medians/means, every
+result verified equal to native before timing counted. Full grid (six scale
+factors, six columns, both platforms) + reproduction: **[BENCHMARK.md](BENCHMARK.md)**.
+
+| TPC-H | Workload | Hardware | Native | gpudb | |
+|---|---|---|---:|---:|:---|
+| **SF50** (300M rows) | `SUM` BIGINT | RTX 4090 Laptop · CUDA | 99 ms | **4 ms** | **25× 🚀** |
+| **SF100** (600M rows) | `SUM` DOUBLE | RTX 4090 Laptop · CUDA | 196 ms | **9 ms** | **22× 🚀** |
+| **SF100** (600M rows) | `SUM` BIGINT | MacBook M4 Max · Metal | 99 ms | **10 ms** | **9.9× 🚀** |
+| **SF50** (300M rows) | `SUM` BIGINT | MacBook M4 Max · Metal | 46 ms | **5 ms** | **8.5× 🚀** |
+| **SF10** (60M rows) | `SUM` BIGINT | MacBook M4 Max · Metal | 9.6 ms | **1.4 ms** | **6.9× 🚀** |
+
+**The bigger the scale factor, the bigger the win** — the resident kernel runs
+at the memory-bandwidth ceiling of the silicon (563 GB/s CUDA, 503 GB/s
+Metal) while native's scan grows linearly. Ratio curve on Metal:
+2× (SF1) → 5× → 6.9× → 6.8× → 8.5× → 9.9× (SF100); on CUDA: 4× → 10× →
+20× → 24× → 25× → 21×.
+
+Honest asterisks, on the table not under it: TPC-H's DECIMAL-stored columns
+make native pay a cast per scan while the resident column stores it once —
+already-BIGINT columns win 3.3–3.7× (Metal) / 5.6–10× (CUDA). Whole-column
+`min`/`max` on stored tables stays a **native win** (zonemap statistics answer
+without scanning). One-time upload breaks even after ~100–150 repeated
+queries. All in [BENCHMARK.md](BENCHMARK.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+
+## The resident model in 20 seconds
+
+```sql
+INSTALL gpudb FROM community; LOAD gpudb;
+
+SELECT gpu_upload('sales', amount::BIGINT) FROM orders;  -- pay the transfer once
+SELECT gpu_sum_resident('sales');                        -- every query after: GPU speed
+SELECT gpu_min_resident('sales'), gpu_max_resident('sales');
+SELECT gpu_sum_resident_f64('price');                    -- DOUBLE flavor
+SELECT gpu_resident_info('sales');                       -- dtype / rows / device
+SELECT gpu_last_stats();                                 -- which backend ran + kernel time
+SELECT gpu_build_info();                                 -- which backends this binary carries
+SELECT gpu_drop_resident('sales');                       -- free device memory
+```
+
+⚠️ **One footgun:** in a single-statement upload-and-query, the outer query
+must reference the upload's result column (e.g. `SELECT u.n, gpu_sum_resident('x') FROM (SELECT gpu_upload('x', col) AS n FROM t) u`) —
+an unreferenced `gpu_upload` is pruned by DuckDB's optimizer and never runs.
+Uploads are capped at 4 GB of buffering by default
+(`GPUDB_UPLOAD_POOL_MAX_MB` to raise); the streaming `gpu_sum/min/max`
+aggregates work in any query shape (GROUP BY, windows, FILTER) at native
+parity.
 
 ## Why this exists
 
@@ -36,39 +98,7 @@ Every standalone GPU database from 2013-2024 was acqui-hired or pivoted (HEAVY.A
 
 What's open in 2026: **no published SQL engine targets Apple Silicon GPUs**. Sirius (UW + NVIDIA, CIDR 2026) is CUDA-only. cuDF is CUDA-only. So is everything else. Apple Silicon's unified memory architecture (up to 512 GB at 819 GB/s on M3 Ultra) is a genuine architectural advantage that nobody has wired into a database.
 
-`gpudb` is a DuckDB *extension* (not a fork, not a new database) that closes that gap with a real dual-backend implementation.
-
-## Numbers (RTX 4090 Laptop, sm_89, CUDA 13.0)
-
-| Workload | CPU baseline | CUDA cold | CUDA resident | Speedup |
-|---|---:|---:|---:|---|
-| SUM 100M int64 | 13.8 ms / 54 GiB/s | 80.6 ms (PCIe-bound) | **0.04 ms / 1187 GiB/s** | 17.9× over CPU |
-| SUM 6M TPC-H lineitem.l_orderkey | 0.7 ms / 65 GiB/s | 4.9 ms | **0.04 ms / 1187 GiB/s** | 17.9× over CPU |
-| GROUP BY 50M × 1M groups | 1067 ms (serial) | 130 ms | n/a | **9.6× over CPU** |
-| GROUP BY 50M × 10M groups | 2321 ms | 188 ms | n/a | **13.7× over CPU** |
-| GROUP BY 6M TPC-H lineitem (1.5M groups) | 54.1 ms | 15.0 ms | n/a | **3.6× over CPU** |
-
-## Numbers — Apple Silicon (M4 Max, v0.1.3 Metal vs DuckDB CLI default)
-
-DuckDB CLI uses 16 threads (12 P + 4 E cores) by default on M4 Max. These are vs `duckdb -c "SET threads=16"`, the actual user-visible baseline.
-
-| Workload | DuckDB CPU mt | Metal v0.1.3 | **Speedup** |
-|---|---:|---:|:---:|
-| **TPC-H SF10 multi-agg fusion `l_quantity`** | 27 ms | **1.06 ms** | **25.5×** 🚀 |
-| **TPC-H SF10 multi-agg fusion `l_extendedprice`** | 26 ms | **1.18 ms** | **22.0×** 🚀 |
-| **TPC-H SF10 multi-agg fusion `l_orderkey`** | 11 ms | **1.13 ms** | **9.7×** 🚀 |
-| **SF10 SUM `l_quantity` HOT** | 5 ms | **1.16 ms** | **4.3×** ✅ |
-| **TPC-H SF10 GROUP BY `l_extendedprice` (1.35M unique)** | 113 ms | **28.9 ms** | **3.9×** ✅ |
-| **500M × 1M GROUP BY synthetic** | 820 ms | **242 ms** | **3.4×** ✅ |
-| **1B × 1M GROUP BY synthetic** | 2500 ms | **770 ms** | **3.2×** ✅ |
-| **1B int64 SUM HOT** | 40 ms | **16.2 ms** | **2.6×** ✅ |
-| **SF10 SUM `l_extendedprice` HOT** | 5 ms | **2.23 ms** | **2.2×** ✅ |
-| **SF10 SUM `l_orderkey` HOT** | 3 ms | **1.68 ms** | **1.8×** ✅ |
-| **TPC-H SF1 GROUP BY `l_orderkey` (1.5M unique)** | 8 ms | **5.71 ms** | **1.40×** ✅ |
-| **TPC-H SF10 GROUP BY `l_orderkey` (15M unique)** | 56 ms | **42.95 ms** | **1.30×** ✅ |
-| TPC-H SF10 GROUP BY `l_quantity` (50 unique) | 26 ms | 372 ms | CPU 14× ❌ structural |
-
-**v0.1.3 ships a hybrid Metal GROUP BY** that auto-dispatches between a 32K-partition slot-lock hash aggregate (sweet spot at 1024 ≤ unique ≤ 16M) and an optimized multi-pass radix sort. Multi-aggregate fusion (`SELECT SUM(x), MIN(x), MAX(x), COUNT(x) FROM t`) reads the column once and computes all four in a single Metal pass at ~475 GiB/s (87% of LPDDR5X peak). Full numbers + reproduction in [BENCHMARK.md](BENCHMARK.md).
+`gpudb` is a DuckDB *extension* (not a fork, not a new database) that closes that gap with a real dual-backend implementation. Operator-level benchmarks (GROUP BY, multi-aggregate fusion, hash join) live in [BENCHMARK.md](BENCHMARK.md)'s earlier entries.
 
 ## Quick start
 
@@ -83,10 +113,12 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 
 Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
 Community binaries ship the full Metal backend on Apple Silicon and a clean CPU
-fallback on Linux (the CUDA backend needs a source build for now). The registry
-serves the current **v0.3.0** build
-([community-extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404)).
-Installed an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
+fallback on Linux. The Linux build is **CUDA-ready**: gpudb's build auto-enables
+the CUDA backend the moment the registry's build tooling ships its CUDA
+toolchain (already merged upstream in extension-ci-tools `main`); until then,
+build from source for CUDA. Check any binary with `SELECT gpu_build_info();`.
+The registry serves the **v0.3.0** build (v0.4.0 update in review); installed
+an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
 
 ### Option B — load a prebuilt release binary
 
@@ -191,7 +223,16 @@ And a static library `libgpudb` you can embed in any C++ project. See `src/exten
 
 Backend selection is automatic: CUDA if a device is found at runtime, else Metal if compiled-in, else CPU.
 
-As of v0.3.0 the SQL aggregate path is deliberately CPU-shaped: the aggregates stream running accumulators (the same shape as native DuckDB) instead of shipping chunks to the GPU — the v0.2.0 end-to-end numbers in [BENCHMARK.md](BENCHMARK.md) showed why buffering-for-GPU can't win through this interface on unified memory. The GPU backends serve the operator-level tools above and the SQL join path in development.
+Two SQL paths, by design (v0.4.0):
+
+- **Streaming** `gpu_sum/min/max` — CPU-shaped running accumulators, native
+  parity in any query shape. Deliberate: the v0.2.0 numbers in
+  [BENCHMARK.md](BENCHMARK.md) showed per-query buffering-for-GPU loses
+  3×–110× through this interface.
+- **Resident** `gpu_upload` + `gpu_*_resident` — the GPU path with substance:
+  pay the transfer once, then reductions run on-device (CUDA and Metal) at
+  memory-bandwidth speed with `transfer_ms=0.000`. This is where the
+  4–25× numbers above come from. The SQL join path is in development.
 
 ## Testing
 ```bash
@@ -202,11 +243,11 @@ As of v0.3.0 the SQL aggregate path is deliberately CPU-shaped: the aggregates s
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.3.0: 60 / 60 pass,
-0 fail, 0 expected fail. The window-function bugs that were previously
-xfail are now strict positive assertions (PR #22).
+PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.4.0: 76 queries green
+(69 pass + 7 guardrail cases whose expected errors are asserted), plus full
+resident-surface coverage in the community-CI sqllogic suite.
 
-**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → 60-query SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Roadmap
 
@@ -241,15 +282,21 @@ xfail are now strict positive assertions (PR #22).
 - [x] [Community Extensions PR #1898](https://github.com/duckdb/community-extensions/pull/1898) **merged** — `INSTALL gpudb FROM community` is live (no `-unsigned` flag needed), and gpudb is [listed on duckdb.org](https://duckdb.org/community_extensions/extensions/gpudb).
 - [x] [Community Extensions PR #2404](https://github.com/duckdb/community-extensions/pull/2404) **merged** — the community build now ships **v0.3.0** (streaming aggregates + DOUBLE overloads on all four platforms).
 
+### Shipped in v0.4.0
+- [x] **Resident-column SQL surface** — `gpu_upload` / `gpu_sum_resident` / `gpu_min_resident` / `gpu_max_resident` / `gpu_sum_resident_f64` / `gpu_resident_info` / `gpu_last_stats` / `gpu_drop_resident` / `gpu_build_info`. The GPU genuinely executes SQL reductions on both CUDA and Metal — up to **25×** over native (see Numbers). Hardened by a three-reviewer adversarial pass pre-release: buffer-pool cap (window-frame O(n²) OOM → clean error), mixed-name/NULL-name guards, defined overflow wrap, truthful dispatch stats.
+- [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
+- [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
+
 ### In flight
 - [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
+- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` is the tripwire).
 
-### Roadmap (v0.4.0)
+### Roadmap (v0.5.0)
 - [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
-- [ ] **Community packaging phase 2** — add `cuda` to `requires_toolchains` so Linux community binaries ship the CUDA backend.
+- [ ] Resident GROUP BY from SQL (`gpu_groupby_resident`) riding the same upload-once model
+- [ ] Resident f64 min/max (needs a v2 backend ABI entry)
 
-### Beyond (v0.5.0+)
-- [ ] Resident-column SQL hooks: `gpu_cache(table, col)` table function so `gpu_sum` can run on data already loaded
+### Beyond (v0.6.0+)
 - [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
 - [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
 - [ ] Transparent GPU operator substitution — **blocked upstream**: the DuckDB C API exposes no optimizer/planner/physical-operator hooks, so a loadable extension cannot silently replace plan operators today. A table-function-based `gpu_group_by(...)` is possible but doesn't compose with normal SQL; parked until the C API grows the needed hooks.
