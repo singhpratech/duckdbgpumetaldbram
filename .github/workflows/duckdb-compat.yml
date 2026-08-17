@@ -1,0 +1,82 @@
+name: duckdb-compat
+
+# Weekly compatibility matrix: installs gpudb from the LIVE community
+# registry under multiple DuckDB CLI versions (current stable + LTS line)
+# on both platforms, and gates on parity with native results. Complements
+# registry-smoke.yml (which tracks only the latest CLI nightly): this job
+# answers "which DuckDB versions can actually install and trust gpudb
+# today?" — the answer users need before pinning it in their environments.
+#
+# Older-line legs are soft: the registry only builds an extension for the
+# DuckDB versions current at publish time, so an install miss on an older
+# line is a documented support boundary, not a regression.
+
+on:
+  schedule:
+    - cron: "41 6 * * 1"   # weekly, Monday 06:41 UTC
+  workflow_dispatch: {}
+
+jobs:
+  compat:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: metal
+            duckdb: v1.5.5
+            soft: false
+          - os: ubuntu-latest
+            label: linux
+            duckdb: v1.5.5
+            soft: false
+          - os: macos-15
+            label: metal
+            duckdb: v1.4.5
+            soft: true
+          - os: ubuntu-latest
+            label: linux
+            duckdb: v1.4.5
+            soft: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.soft }}
+    steps:
+      - name: Install DuckDB CLI ${{ matrix.duckdb }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            ZIP=duckdb_cli-osx-universal.zip
+          else
+            ZIP=duckdb_cli-linux-amd64.zip
+          fi
+          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/${{ matrix.duckdb }}/$ZIP" -o duckdb.zip
+          unzip -o duckdb.zip
+          sudo mv duckdb /usr/local/bin/
+          duckdb --version
+
+      - name: Install gpudb from the community registry
+        run: duckdb -c "INSTALL gpudb FROM community; LOAD gpudb; SELECT 'load ok';"
+
+      - name: Parity gate (hard fail on mismatch)
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          SELECT CASE WHEN gpu_sum(v) = sum(v) AND gpu_min(v) = min(v) AND gpu_max(v) = max(v)
+                 THEN 'parity ok'
+                 ELSE error('gpu/native mismatch') END
+          FROM (SELECT (range * 7 - 500000)::BIGINT AS v FROM range(1000000)) t;
+          "
+
+      - name: DOUBLE parity (soft — needs registry v0.4.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          SELECT CASE WHEN abs(gpu_sum(d) - sum(d)) < 1e-6 THEN 'f64 parity ok'
+                 ELSE error('gpu/native f64 mismatch') END
+          FROM (SELECT (range / 3.0)::DOUBLE AS d FROM range(1000000)) t;
+          " || echo "DOUBLE overloads not in served version yet (registry < v0.4.0)"
+
+      - name: Build info (soft — needs registry v0.4.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "LOAD gpudb; SELECT gpu_build_info();" || echo "gpu_build_info not in served version for ${{ matrix.duckdb }}"

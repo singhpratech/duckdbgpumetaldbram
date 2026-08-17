@@ -13,6 +13,56 @@ missing.
 
 ---
 
+## 0. The parity gate — a drop-in correctness check for your data
+
+If you already aggregate data with DuckDB in CI, this workflow adds an
+independent second opinion: every aggregate is computed twice — once by
+DuckDB's native engine, once by gpudb's separately-implemented backend
+(Metal on macOS runners, CPU elsewhere) — and the job fails if they ever
+disagree. Two independent implementations agreeing on your real data is a
+stronger check than either alone, and on `macos-15` the second opinion runs
+on the GPU for free.
+
+Copy, point `FILES` at your data, done:
+
+```yaml
+name: aggregate-parity-gate
+on:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * *"   # nightly, against fresh data
+
+jobs:
+  parity:
+    runs-on: macos-15       # Apple Silicon: gpudb's second opinion runs on Metal
+    env:
+      FILES: "data/*.parquet"   # <-- your data here
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install DuckDB CLI
+        run: brew install duckdb
+      - name: Aggregate parity gate (native vs gpudb)
+        run: |
+          duckdb -c "
+          INSTALL gpudb FROM community; LOAD gpudb;
+          SELECT CASE
+            WHEN gpu_sum(x) = sum(x)
+             AND gpu_min(x) = min(x)
+             AND gpu_max(x) = max(x)
+            THEN 'parity ok: ' || count(*) || ' rows'
+            ELSE error('native and gpudb disagree — investigate before merging')
+          END
+          FROM (SELECT amount::BIGINT AS x FROM read_parquet(getenv('FILES'))) t;
+          "
+```
+
+Adapt the inner `SELECT` to the columns you actually gate on; add one
+`CASE` block per column. For `DOUBLE` columns compare with a tolerance
+(`abs(gpu_sum(d) - sum(d)) < 1e-6 * greatest(abs(sum(d)), 1)`) — float
+summation order differs between engines. Read the
+[semantics section](#semantics-worth-knowing-before-you-gate-ci-on-gpudb)
+below before gating on columns near int64 range.
+
 ## 1. GitHub Actions on Apple Silicon (the fun one)
 
 Data checks with the Metal backend on a free hosted runner:
