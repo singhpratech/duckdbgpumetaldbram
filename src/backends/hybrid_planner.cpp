@@ -251,6 +251,34 @@ public:
         return cpu_->agg_all_resident_i64(h.inner());
     }
 
+    // Fused resident join: all three columns must live on the same side —
+    // uploads route deterministically (i64 → GPU when present), so mixed
+    // placement only happens after a partial upload failure; surface that
+    // clearly rather than silently copying columns across.
+    JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys) override {
+        const auto& hp = check_hybrid(probe_keys);
+        const auto& hl = check_hybrid(payload);
+        const auto& hb = check_hybrid(build_keys);
+        const std::size_t n = hp.rows();
+        const bool on_gpu = hp.on_gpu();
+        if (hl.on_gpu() != on_gpu || hb.on_gpu() != on_gpu)
+            throw std::runtime_error(
+                "join_sum_resident_i64: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        if (gpu_ && on_gpu) {
+            last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
+                                  n, 0, /*resident*/true, /*borderline*/false);
+            return gpu_->join_sum_resident_i64(hp.inner(), hl.inner(), hb.inner());
+        }
+        last_ = make_decision(Backend::CPU,
+                              gpu_ ? DispatchReason::Resident_OnCpu
+                                   : DispatchReason::GpuUnavailable,
+                              n, 0, /*resident*/true, /*borderline*/false);
+        return cpu_->join_sum_resident_i64(hp.inner(), hl.inner(), hb.inner());
+    }
+
 private:
     // Wraps either a CPU- or GPU-side ResidentColumn. The hybrid uses the
     // `on_gpu_` flag to dispatch the resident query to the right aggregator.

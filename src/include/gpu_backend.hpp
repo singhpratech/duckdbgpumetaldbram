@@ -52,6 +52,29 @@ struct AggAllResult {
     double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
 };
 
+// Returned by Aggregator::join_sum_resident_i64 — fused inner equi-join +
+// SUM over resident columns. Multiplicity-aware: a probe row matching m
+// build rows contributes payload*m to sum and m to matched (standard SQL
+// inner-join semantics for SELECT sum(p.payload) FROM probe p JOIN build b
+// ON p.key = b.key).
+// Cross-backend binding rules (CPU is the executable reference):
+//   - matched = TOTAL matched pairs, i.e. the join's COUNT(*) — directly
+//     checkable against native.
+//   - Both the per-row multiply (m * payload[i]) and the accumulate are
+//     performed in uint64 two's-complement arithmetic (signed overflow is UB;
+//     unsigned wrap is the defined behavior, same rule as sum_i64).
+//   - matched == 0 means "no joined rows": the SQL layer must surface SUM as
+//     NULL in that case (sum is 0 here but carries no meaning).
+struct JoinAggResult {
+    std::int64_t sum;           // Σ payload[i] * multiplicity(probe_keys[i])
+    std::int64_t matched;       // Σ multiplicity(probe_keys[i]) (= joined COUNT(*))
+    std::size_t  rows_probe;    // probe-side row count
+    std::size_t  rows_build;    // build-side row count
+    double       wall_ms;       // total wall time
+    double       kernel_ms;     // GPU kernel time only (0 for CPU)
+    double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
+};
+
 // Opaque handle to a column resident in backend memory.
 // Owns the storage; destruction releases device memory.
 // Created by Aggregator::upload_*; must only be used with the SAME aggregator
@@ -99,6 +122,25 @@ public:
     // when more aggregates are fused.
     virtual AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) = 0;
     virtual AggAllResult agg_all_resident_i64(const ResidentColumn&) = 0;
+
+    // ---- Fused resident join-aggregate (v0.5) ----
+    // Inner equi-join with full build-side multiplicity, fused with SUM.
+    // payload is probe-side and must have the same row count as probe_keys
+    // (throws std::runtime_error otherwise, as do dtype/backend-tag
+    // mismatches — same error style as the other resident ops). Resident
+    // columns carry no NULLs, so no NULL-key semantics apply here.
+    // Backends may cache derived build-side structures (sorted copy, hash
+    // table) privately on the ResidentColumn; such caches die with the
+    // column (gpu_drop_resident) and do NOT count against the host-side
+    // GPUDB_UPLOAD_POOL_MAX_MB cap; a device-OOM while building one must
+    // surface as a clean std::runtime_error.
+    // Default implementation throws: backends opt in by overriding (CPU and
+    // Metal implement it; CUDA pending — keeping this non-pure means the
+    // CUDA backend builds unchanged until its implementation lands). The
+    // hybrid planner catches the throw and falls back to CPU.
+    virtual JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
+                                                const ResidentColumn& payload,
+                                                const ResidentColumn& build_keys);
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled

@@ -384,6 +384,134 @@ duckdb_aggregate_function make_upload_fn(duckdb_type value_type,
 }
 
 // ---------------------------------------------------------------------------
+// gpu_upload_pair aggregate — upload a (key, payload) column pair in ONE scan.
+//
+// Two separate gpu_upload calls CANNOT be used as a join's probe keys +
+// payload: each upload is an independent aggregate over an independent table
+// scan, and DuckDB's parallel scan/combine order differs between them, so
+// row i of one column need not correspond to row i of the other. (This is
+// invisible to single-column reductions, which are order-insensitive — it
+// only bites operations that pair two columns positionally, like the fused
+// join.) gpu_upload_pair(name, k, v) buffers the pair interleaved in one
+// aggregate state, so whatever order DuckDB delivers, k[i] and v[i] stay
+// together. Finalize registers TWO resident columns: '<name>.k' and
+// '<name>.v'. Rows where either value is NULL are skipped as a pair.
+// ---------------------------------------------------------------------------
+
+void upload_pair_update(duckdb_function_info info, duckdb_data_chunk input,
+                        duckdb_aggregate_state* states) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector k_vec    = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector v_vec    = duckdb_data_chunk_get_vector(input, 2);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    const auto* kd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(k_vec));
+    const auto* vd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(v_vec));
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    if (!names || !kd || !vd || n == 0) return;
+
+    uint64_t* name_validity = duckdb_vector_get_validity(name_vec);
+    uint64_t* k_validity    = duckdb_vector_get_validity(k_vec);
+    uint64_t* v_validity    = duckdb_vector_get_validity(v_vec);
+
+    UploadState* s0 = probe_upload_state(states[0]);
+    if (!s0) return;
+    bool per_row = true;
+    if (n > 1) {
+        const idx_t probes[3] = { 1, n / 2, n - 1 };
+        for (idx_t k = 0; k < 3 && per_row; ++k) {
+            const idx_t i = probes[k];
+            if (i == 0) continue;
+            if (probe_upload_state(states[i]) == nullptr) per_row = false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lock(g().mu);
+    auto& G = g();
+    auto append_row = [&](UploadState* s, idx_t i) -> bool {
+        // Either half NULL -> skip the PAIR (keeps k/v aligned).
+        if ((k_validity && !duckdb_validity_row_is_valid(k_validity, i)) ||
+            (v_validity && !duckdb_validity_row_is_valid(v_validity, i))) return true;
+        if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_pair: name may not be NULL");
+            return false;
+        }
+        UploadBuf& b = state_buf_locked(s, gpudb::Dtype::I64);
+        const char*       nm_data = duckdb_string_t_data(&names[i]);
+        const std::size_t nm_len  = duckdb_string_t_length(names[i]);
+        if (!b.name_set) {
+            b.name.assign(nm_data, nm_len);
+            b.name_set = true;
+        } else if (b.name.size() != nm_len ||
+                   std::memcmp(b.name.data(), nm_data, nm_len) != 0) {
+            duckdb_aggregate_function_set_error(info,
+                ("gpu_upload_pair: one aggregate received two different names ('" +
+                 b.name + "' and '" + std::string(nm_data, nm_len) +
+                 "') — use a constant name").c_str());
+            return false;
+        }
+        if (G.pool_bytes + 2 * sizeof(std::int64_t) > pool_cap_bytes()) {
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload_pair: out of buffer memory") + kPoolCapHint).c_str());
+            return false;
+        }
+        G.pool_bytes += 2 * sizeof(std::int64_t);
+        b.i64.push_back(kd[i]);   // interleaved (k, v) — combine() concatenates
+        b.i64.push_back(vd[i]);   // whole buffers, so pairs never split
+        return true;
+    };
+
+    if (n == 1 || !per_row) {
+        for (idx_t i = 0; i < n; ++i) if (!append_row(s0, i)) return;
+    } else {
+        for (idx_t i = 0; i < n; ++i) {
+            UploadState* s = probe_upload_state(states[i]);
+            if (s && !append_row(s, i)) return;
+        }
+    }
+}
+
+void upload_pair_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
+                          duckdb_vector result, idx_t count, idx_t offset) {
+    if (count == 0) return;
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
+
+    std::lock_guard<std::mutex> lock(g().mu);
+    auto& G = g();
+    for (idx_t i = 0; i < count; ++i) {
+        UploadState* s = probe_upload_state(source[i]);
+        auto it = (s && s->buf_id != 0) ? G.pool.find(s->buf_id) : G.pool.end();
+        if (it == G.pool.end() || it->second.i64.empty()) {
+            out[offset + i] = 0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+            continue;
+        }
+        UploadBuf& b = it->second;
+        const std::size_t rows = b.i64.size() / 2;
+        try {
+            // De-interleave and upload both columns.
+            std::vector<std::int64_t> keys(rows), vals(rows);
+            for (std::size_t r = 0; r < rows; ++r) {
+                keys[r] = b.i64[2 * r];
+                vals[r] = b.i64[2 * r + 1];
+            }
+            auto& a = agg_locked();
+            auto kcol = a.upload_i64(keys.data(), rows);
+            auto vcol = a.upload_i64(vals.data(), rows);
+            G.registry[b.name + ".k"] = std::move(kcol);
+            G.registry[b.name + ".v"] = std::move(vcol);
+            out[offset + i] = static_cast<std::int64_t>(rows);
+        } catch (const std::exception& e) {
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload_pair failed: ") + e.what()).c_str());
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Resident scalar functions.
 // ---------------------------------------------------------------------------
 
@@ -552,15 +680,99 @@ void drop_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused resident join-aggregate (v0.5).
+//   gpu_join_sum_resident(probe_keys, payload, build_keys) -> BIGINT
+//     SELECT sum(p.payload) FROM probe p JOIN build b ON p.key = b.key,
+//     full build-side multiplicity; NULL when no rows join (SQL SUM semantics).
+//   gpu_join_count_resident(probe_keys, build_keys) -> BIGINT
+//     the same join's COUNT(*); 0 when no rows join.
+// count_only reuses the probe-key column as its own payload — the sum is
+// discarded, only `matched` is read.
+// ---------------------------------------------------------------------------
+
+void record_join_stats_locked(const char* op, const gpudb::JoinAggResult& r) {
+    auto& G = g();
+    const auto& d = G.agg->last_decision();
+    char buf[320];
+    std::snprintf(buf, sizeof(buf),
+        "op=%s backend=%s reason=%s rows_probe=%zu rows_build=%zu matched=%lld "
+        "wall_ms=%.3f kernel_ms=%.3f transfer_ms=%.3f",
+        op, gpudb::to_string(d.chosen), gpudb::to_string(d.reason),
+        r.rows_probe, r.rows_build, static_cast<long long>(r.matched),
+        r.wall_ms, r.kernel_ms, r.transfer_ms);
+    G.last_stats = buf;
+}
+
+template <bool COUNT_ONLY>
+void join_sum_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
+                            duckdb_vector output) {
+    constexpr int kArgs = COUNT_ONLY ? 2 : 3;
+    duckdb_vector    vecs[3] = {};
+    duckdb_string_t* names[3] = {};
+    uint64_t*        valid[3] = {};
+    for (int a = 0; a < kArgs; ++a) {
+        vecs[a]  = duckdb_data_chunk_get_vector(input, a);
+        names[a] = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(vecs[a]));
+        valid[a] = duckdb_vector_get_validity(vecs[a]);
+    }
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+
+    std::lock_guard<std::mutex> lock(g().mu);
+    for (idx_t i = 0; i < n; ++i) {
+        bool null_arg = false;
+        for (int a = 0; a < kArgs; ++a) {
+            if (valid[a] && !duckdb_validity_row_is_valid(valid[a], i)) { null_arg = true; break; }
+        }
+        if (null_arg) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        gpudb::ResidentColumn* cols[3] = {};
+        for (int a = 0; a < kArgs; ++a) {
+            cols[a] = lookup_locked(info, names[a], i);
+            if (!cols[a]) return;
+            if (cols[a]->dtype() != gpudb::Dtype::I64) {
+                duckdb_scalar_function_set_error(info,
+                    "gpu_join_*_resident operates on BIGINT resident columns "
+                    "(f64 keys/payloads are not in the v0.5 join ABI)");
+                return;
+            }
+        }
+        gpudb::ResidentColumn* probe   = cols[0];
+        gpudb::ResidentColumn* payload = COUNT_ONLY ? cols[0] : cols[1];
+        gpudb::ResidentColumn* build   = COUNT_ONLY ? cols[1] : cols[2];
+        try {
+            auto& a = agg_locked();
+            gpudb::JoinAggResult r = a.join_sum_resident_i64(*probe, *payload, *build);
+            record_join_stats_locked(COUNT_ONLY ? "join_count_resident"
+                                                : "join_sum_resident", r);
+            if (COUNT_ONLY) {
+                out[i] = r.matched;
+            } else if (r.matched == 0) {
+                duckdb_validity_set_row_invalid(out_validity, i);  // SUM over ∅ = NULL
+            } else {
+                out[i] = r.sum;
+            }
+        } catch (const std::exception& e) {
+            duckdb_scalar_function_set_error(info, e.what());
+            return;
+        }
+    }
+}
+
 // Build + register one scalar function. All of these are volatile: their
 // result depends on the mutable resident registry, so DuckDB must not
 // constant-fold or cache them across calls.
 void register_scalar(duckdb_connection con, const char* name,
                      duckdb_scalar_function_t exec,
-                     duckdb_type ret, bool takes_name) {
+                     duckdb_type ret, int n_name_params) {
     duckdb_scalar_function fn = duckdb_create_scalar_function();
     duckdb_scalar_function_set_name(fn, name);
-    if (takes_name) {
+    for (int p = 0; p < n_name_params; ++p) {
         duckdb_logical_type t_name = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
         duckdb_scalar_function_add_parameter(fn, t_name);
         duckdb_destroy_logical_type(&t_name);
@@ -600,22 +812,55 @@ void register_gpu_resident(duckdb_connection con) {
         throw std::runtime_error("gpu_upload function set registration failed");
     }
 
+    // gpu_upload_pair(name, k BIGINT, v BIGINT) -> BIGINT, registers
+    // '<name>.k' and '<name>.v' with guaranteed positional alignment.
+    {
+        duckdb_aggregate_function pfn = duckdb_create_aggregate_function();
+        duckdb_aggregate_function_set_name(pfn, "gpu_upload_pair");
+        duckdb_logical_type t_name = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+        duckdb_logical_type t_i64a = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+        duckdb_logical_type t_i64b = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+        duckdb_logical_type t_ret  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+        duckdb_aggregate_function_add_parameter(pfn, t_name);
+        duckdb_aggregate_function_add_parameter(pfn, t_i64a);
+        duckdb_aggregate_function_add_parameter(pfn, t_i64b);
+        duckdb_aggregate_function_set_return_type(pfn, t_ret);
+        duckdb_destroy_logical_type(&t_name);
+        duckdb_destroy_logical_type(&t_i64a);
+        duckdb_destroy_logical_type(&t_i64b);
+        duckdb_destroy_logical_type(&t_ret);
+        duckdb_aggregate_function_set_functions(pfn,
+            upload_state_size, upload_state_init, upload_pair_update,
+            upload_combine, upload_pair_finalize);
+        duckdb_aggregate_function_set_destructor(pfn, upload_state_destroy);
+        duckdb_aggregate_function_set_special_handling(pfn);
+        duckdb_state pst = duckdb_register_aggregate_function(con, pfn);
+        duckdb_destroy_aggregate_function(&pfn);
+        if (pst == DuckDBError) {
+            throw std::runtime_error("gpu_upload_pair registration failed");
+        }
+    }
+
     register_scalar(con, "gpu_sum_resident",
-        resident_i64_exec<&gpudb::Aggregator::sum_resident_i64>, DUCKDB_TYPE_BIGINT, true);
+        resident_i64_exec<&gpudb::Aggregator::sum_resident_i64>, DUCKDB_TYPE_BIGINT, 1);
     register_scalar(con, "gpu_min_resident",
-        resident_i64_exec<&gpudb::Aggregator::min_resident_i64>, DUCKDB_TYPE_BIGINT, true);
+        resident_i64_exec<&gpudb::Aggregator::min_resident_i64>, DUCKDB_TYPE_BIGINT, 1);
     register_scalar(con, "gpu_max_resident",
-        resident_i64_exec<&gpudb::Aggregator::max_resident_i64>, DUCKDB_TYPE_BIGINT, true);
+        resident_i64_exec<&gpudb::Aggregator::max_resident_i64>, DUCKDB_TYPE_BIGINT, 1);
     register_scalar(con, "gpu_sum_resident_f64",
-        sum_resident_f64_exec, DUCKDB_TYPE_DOUBLE, true);
+        sum_resident_f64_exec, DUCKDB_TYPE_DOUBLE, 1);
     register_scalar(con, "gpu_resident_info",
-        resident_info_exec, DUCKDB_TYPE_VARCHAR, true);
+        resident_info_exec, DUCKDB_TYPE_VARCHAR, 1);
     register_scalar(con, "gpu_drop_resident",
-        drop_resident_exec, DUCKDB_TYPE_BOOLEAN, true);
+        drop_resident_exec, DUCKDB_TYPE_BOOLEAN, 1);
     register_scalar(con, "gpu_last_stats",
-        last_stats_exec, DUCKDB_TYPE_VARCHAR, false);
+        last_stats_exec, DUCKDB_TYPE_VARCHAR, 0);
     register_scalar(con, "gpu_build_info",
-        build_info_exec, DUCKDB_TYPE_VARCHAR, false);
+        build_info_exec, DUCKDB_TYPE_VARCHAR, 0);
+    register_scalar(con, "gpu_join_sum_resident",
+        join_sum_resident_exec</*count_only=*/false>, DUCKDB_TYPE_BIGINT, 3);
+    register_scalar(con, "gpu_join_count_resident",
+        join_sum_resident_exec</*count_only=*/true>, DUCKDB_TYPE_BIGINT, 2);
 }
 
 } // namespace gpudb_ext
