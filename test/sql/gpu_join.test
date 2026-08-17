@@ -3,12 +3,18 @@
 # Requires the loadable extension (LOAD gpudb). Run via scripts/run_sql_tests.sh
 # when GPUDB_BUILD_EXT=ON.
 
--- Simple list join
+-- Simple list join: build=[10,20,30], probe=[20,40,99] — only probe[0]=20
+-- matches (build index 1).
 SELECT probe_idx, build_idx
 FROM gpu_inner_join([10, 20, 30], [20, 40, 99])
 ORDER BY probe_idx;
 -- expect: 0  1
--- expect: 1  2
+
+-- Duplicate build keys: first-match semantics (v1 interface contract) —
+-- probe[0]=7 matches build index 0, not both duplicates.
+SELECT probe_idx, build_idx
+FROM gpu_inner_join([7, 7], [7]);
+-- expect: 0  0
 
 -- No matches
 SELECT count(*)::BIGINT FROM gpu_inner_join([1, 2], [3, 4]);
