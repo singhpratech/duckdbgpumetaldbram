@@ -137,9 +137,21 @@ public:
     // Same algorithm as the Metal path (sorted build keys + per-probe-element
     // binary search) so the two backends are directly comparable and produce
     // identical results: sum accumulates in uint64 for defined wrap.
+    // Per-JoinKind contribution multiplier (see the table in gpu_backend.hpp).
+    static std::uint64_t join_multiplier(std::uint64_t m, JoinKind kind) {
+        switch (kind) {
+            case JoinKind::INNER: return m;
+            case JoinKind::LEFT:  return m ? m : 1;
+            case JoinKind::SEMI:  return m ? 1 : 0;
+            case JoinKind::ANTI:  return m ? 0 : 1;
+        }
+        return 0;
+    }
+
     JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
                                         const ResidentColumn& payload,
-                                        const ResidentColumn& build_keys) override {
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
         const auto t0 = std::chrono::steady_clock::now();
         const auto& pk = check_i64(probe_keys);
         const auto& pl = check_i64(payload);
@@ -151,7 +163,9 @@ public:
         JoinAggResult r{};
         r.rows_probe = pk.rows();
         r.rows_build = bk.rows();
-        if (pk.rows() == 0 || bk.rows() == 0) {
+        if (pk.rows() == 0 ||
+            (bk.rows() == 0 && kind == JoinKind::INNER) ||
+            (bk.rows() == 0 && kind == JoinKind::SEMI)) {
             r.wall_ms = elapsed_ms(t0);
             return r;
         }
@@ -168,10 +182,11 @@ public:
                 Part p;
                 for (std::size_t i = begin; i < end; ++i) {
                     auto [lo, hi] = std::equal_range(sorted.begin(), sorted.end(), keys[i]);
-                    const std::uint64_t m = static_cast<std::uint64_t>(hi - lo);
-                    if (m) {
-                        p.sum += m * static_cast<std::uint64_t>(pay[i]);
-                        p.matched += static_cast<std::int64_t>(m);
+                    const std::uint64_t c =
+                        join_multiplier(static_cast<std::uint64_t>(hi - lo), kind);
+                    if (c) {
+                        p.sum += c * static_cast<std::uint64_t>(pay[i]);
+                        p.matched += static_cast<std::int64_t>(c);
                     }
                 }
                 return p;
@@ -181,6 +196,57 @@ public:
             });
 
         r.sum     = static_cast<std::int64_t>(total.sum);
+        r.matched = total.matched;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    JoinAggResult join_sum_resident_f64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64(probe_keys);
+        const auto& pl = check_f64(payload);
+        const auto& bk = check_i64(build_keys);
+        if (pk.rows() != pl.rows())
+            throw std::runtime_error(
+                "join_sum_resident_f64: probe_keys and payload row counts differ");
+
+        JoinAggResult r{};
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+        if (pk.rows() == 0) {
+            r.wall_ms = elapsed_ms(t0);
+            return r;
+        }
+
+        std::vector<std::int64_t> sorted(bk.as_i64(), bk.as_i64() + bk.rows());
+        std::sort(sorted.begin(), sorted.end());
+
+        const std::int64_t* keys = pk.as_i64();
+        const double*       pay  = pl.as_f64();
+        struct Part { double sum = 0.0; std::int64_t matched = 0; };
+        Part total = parallel_chunks<Part>(
+            pk.rows(),
+            [&](std::size_t begin, std::size_t end) {
+                Part p;
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto [lo, hi] = std::equal_range(sorted.begin(), sorted.end(), keys[i]);
+                    const std::uint64_t c =
+                        join_multiplier(static_cast<std::uint64_t>(hi - lo), kind);
+                    if (c) {
+                        p.sum += static_cast<double>(c) * pay[i];
+                        p.matched += static_cast<std::int64_t>(c);
+                    }
+                }
+                return p;
+            },
+            [](Part a, const Part& b) {
+                a.sum += b.sum; a.matched += b.matched; return a;
+            });
+
+        r.sum_f64 = total.sum;
         r.matched = total.matched;
         r.wall_ms = elapsed_ms(t0);
         return r;

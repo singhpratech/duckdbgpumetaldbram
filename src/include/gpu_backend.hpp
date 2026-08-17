@@ -52,10 +52,22 @@ struct AggAllResult {
     double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
 };
 
-// Returned by Aggregator::join_sum_resident_i64 — fused inner equi-join +
-// SUM over resident columns. Multiplicity-aware: a probe row matching m
-// build rows contributes payload*m to sum and m to matched (standard SQL
-// inner-join semantics for SELECT sum(p.payload) FROM probe p JOIN build b
+// Join flavor for the fused resident join-aggregates. With a PROBE-SIDE
+// payload, every SQL join type reduces to one formula: each probe row's
+// contribution multiplier c is a function of its build-side match count m —
+//   INNER c = m          (payload repeated per matching build row)
+//   LEFT  c = max(m, 1)  (unmatched probe rows keep their payload once)
+//   SEMI  c = (m > 0)    (EXISTS: payload once if any match)
+//   ANTI  c = (m == 0)   (NOT EXISTS: payload once if no match)
+// sum += c * payload[i]; matched += c. RIGHT and FULL OUTER compose from
+// these: their probe-payload sum equals INNER's / LEFT's respectively
+// (unmatched build rows contribute NULL payload), and the extra COUNT(*)
+// term (# unmatched build rows) is an ANTI count with probe/build swapped.
+enum class JoinKind : std::uint8_t { INNER = 0, LEFT = 1, SEMI = 2, ANTI = 3 };
+
+// Returned by Aggregator::join_sum_resident_* — fused equi-join + SUM over
+// resident columns. Multiplicity-aware per the JoinKind table above
+// (INNER matches SELECT sum(p.payload) FROM probe p JOIN build b
 // ON p.key = b.key).
 // Cross-backend binding rules (CPU is the executable reference):
 //   - matched = TOTAL matched pairs, i.e. the join's COUNT(*) — directly
@@ -66,7 +78,8 @@ struct AggAllResult {
 //   - matched == 0 means "no joined rows": the SQL layer must surface SUM as
 //     NULL in that case (sum is 0 here but carries no meaning).
 struct JoinAggResult {
-    std::int64_t sum;           // Σ payload[i] * multiplicity(probe_keys[i])
+    std::int64_t sum;           // Σ payload[i] * multiplicity(probe_keys[i]) (i64 op)
+    double       sum_f64;       // same, for the f64-payload op (0.0 otherwise)
     std::int64_t matched;       // Σ multiplicity(probe_keys[i]) (= joined COUNT(*))
     std::size_t  rows_probe;    // probe-side row count
     std::size_t  rows_build;    // build-side row count
@@ -140,7 +153,20 @@ public:
     // hybrid planner catches the throw and falls back to CPU.
     virtual JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
                                                 const ResidentColumn& payload,
-                                                const ResidentColumn& build_keys);
+                                                const ResidentColumn& build_keys,
+                                                JoinKind kind = JoinKind::INNER);
+
+    // f64-payload flavor: keys are still I64 (join keys are integers in
+    // practice); payload is an F64 resident column, result in sum_f64.
+    // Multiplicity contributes as m * payload[i] in double arithmetic; the
+    // accumulation order is backend-defined, so cross-engine comparisons use
+    // a relative tolerance, not equality (same caveat as sum_resident_f64).
+    // On Metal this runs as a parallel host pass over UMA buffers (no fp64
+    // in MSL); CUDA can run it natively on device.
+    virtual JoinAggResult join_sum_resident_f64(const ResidentColumn& probe_keys,
+                                                const ResidentColumn& payload,
+                                                const ResidentColumn& build_keys,
+                                                JoinKind kind = JoinKind::INNER);
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled

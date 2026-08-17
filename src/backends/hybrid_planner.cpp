@@ -197,9 +197,11 @@ public:
     }
     std::unique_ptr<ResidentColumn> upload_f64(const double* d, std::size_t n) override {
         // CUDA supports f64 end-to-end (sum_f64 kernel + resident path), so
-        // f64 columns go to the device there. Metal has no IEEE-754 doubles —
-        // f64 stays CPU-side on that backend, same as before.
-        if (gpu_ && gpu_backend_ == Backend::CUDA) {
+        // f64 columns go to the device there. Metal has no IEEE-754 doubles in
+        // MSL, but its f64 resident ops run as host math over UMA buffers, so
+        // the column still lives on the Metal side — which also keeps joins
+        // (i64 keys on GPU + f64 payload) on one backend.
+        if (gpu_) {
             try {
                 auto handle = gpu_->upload_f64(d, n);
                 return std::make_unique<HybridResidentColumn>(
@@ -257,7 +259,30 @@ public:
     // clearly rather than silently copying columns across.
     JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
                                         const ResidentColumn& payload,
-                                        const ResidentColumn& build_keys) override {
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        return dispatch_join(probe_keys, payload, build_keys,
+            [&](Aggregator& a, const ResidentColumn& p, const ResidentColumn& v,
+                const ResidentColumn& b) {
+                return a.join_sum_resident_i64(p, v, b, kind);
+            });
+    }
+
+    JoinAggResult join_sum_resident_f64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        return dispatch_join(probe_keys, payload, build_keys,
+            [&](Aggregator& a, const ResidentColumn& p, const ResidentColumn& v,
+                const ResidentColumn& b) {
+                return a.join_sum_resident_f64(p, v, b, kind);
+            });
+    }
+
+    template <class Op>
+    JoinAggResult dispatch_join(const ResidentColumn& probe_keys,
+                                const ResidentColumn& payload,
+                                const ResidentColumn& build_keys, Op&& run) {
         const auto& hp = check_hybrid(probe_keys);
         const auto& hl = check_hybrid(payload);
         const auto& hb = check_hybrid(build_keys);
@@ -265,18 +290,18 @@ public:
         const bool on_gpu = hp.on_gpu();
         if (hl.on_gpu() != on_gpu || hb.on_gpu() != on_gpu)
             throw std::runtime_error(
-                "join_sum_resident_i64: columns are resident on different backends "
+                "resident join: columns are resident on different backends "
                 "(one upload fell back to CPU) — re-upload and retry");
         if (gpu_ && on_gpu) {
             last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
                                   n, 0, /*resident*/true, /*borderline*/false);
-            return gpu_->join_sum_resident_i64(hp.inner(), hl.inner(), hb.inner());
+            return run(*gpu_, hp.inner(), hl.inner(), hb.inner());
         }
         last_ = make_decision(Backend::CPU,
                               gpu_ ? DispatchReason::Resident_OnCpu
                                    : DispatchReason::GpuUnavailable,
                               n, 0, /*resident*/true, /*borderline*/false);
-        return cpu_->join_sum_resident_i64(hp.inner(), hl.inner(), hb.inner());
+        return run(*cpu_, hp.inner(), hl.inner(), hb.inner());
     }
 
 private:

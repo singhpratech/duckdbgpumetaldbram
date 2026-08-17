@@ -268,6 +268,8 @@ kernel void agg_all_partials_i64(
 // Multiply and accumulate are ulong (unsigned wrap — the cross-backend rule;
 // the CPU reference does the same, so results are bit-identical).
 
+// mode: 0=INNER (c=m), 1=LEFT (c=max(m,1)), 2=SEMI (c=m?1:0), 3=ANTI (c=m?0:1)
+// — mirrors gpudb::JoinKind; see the multiplier table in gpu_backend.hpp.
 kernel void join_sum_i64(
     device const long*  probe_keys   [[buffer(0)]],
     device const long*  payload      [[buffer(1)]],
@@ -275,6 +277,7 @@ kernel void join_sum_i64(
     device long*        partials     [[buffer(3)]],   // 2 per block: sum, matched
     constant uint&      n_probe      [[buffer(4)]],
     constant uint&      n_build      [[buffer(5)]],
+    constant uint&      mode         [[buffer(6)]],
     uint                tid          [[thread_position_in_threadgroup]],
     uint                gid          [[thread_position_in_grid]],
     uint                gsize        [[threads_per_grid]],
@@ -301,9 +304,16 @@ kernel void join_sum_i64(
             if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
         }
         const uint m = lo - first;
-        if (m != 0) {
-            local_sum += (ulong)m * (ulong)payload[i];
-            local_cnt += (long)m;
+        uint c;
+        switch (mode) {
+            case 1:  c = m ? m : 1; break;   // LEFT
+            case 2:  c = m ? 1 : 0; break;   // SEMI
+            case 3:  c = m ? 0 : 1; break;   // ANTI
+            default: c = m;         break;   // INNER
+        }
+        if (c != 0) {
+            local_sum += (ulong)c * (ulong)payload[i];
+            local_cnt += (long)c;
         }
     }
     shm_sum[tid] = (long)local_sum;
@@ -348,5 +358,44 @@ kernel void join_sum_partials_i64(
     if (tid == 0) {
         out[0] = shm_sum[0];
         out[1] = shm_cnt[0];
+    }
+}
+
+// Multiplicity-only variant for the f64-payload join: the GPU performs the
+// binary searches (the random-access part it is fast at) and writes each
+// probe element's per-kind contribution count c[i]; the host then streams
+// sum += c[i] * payload_f64[i] in one sequential pass (no doubles in MSL).
+kernel void join_mult_i64(
+    device const long*  probe_keys   [[buffer(0)]],
+    device const long*  build_sorted [[buffer(1)]],
+    device uint*        mult         [[buffer(2)]],
+    constant uint&      n_probe      [[buffer(3)]],
+    constant uint&      n_build      [[buffer(4)]],
+    constant uint&      mode         [[buffer(5)]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                gsize        [[threads_per_grid]])
+{
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        uint lo = 0, hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+        }
+        const uint first = lo;
+        hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+        }
+        const uint m = lo - first;
+        uint c;
+        switch (mode) {
+            case 1:  c = m ? m : 1; break;   // LEFT
+            case 2:  c = m ? 1 : 0; break;   // SEMI
+            case 3:  c = m ? 0 : 1; break;   // ANTI
+            default: c = m;         break;   // INNER
+        }
+        mult[i] = c;
     }
 }

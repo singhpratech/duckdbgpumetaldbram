@@ -22,11 +22,14 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 namespace gpudb {
 
@@ -81,6 +84,7 @@ public:
             ps_agg_all_partials_i64_  = make_pso(lib, @"agg_all_partials_i64");
             ps_join_sum_i64_          = make_pso(lib, @"join_sum_i64");
             ps_join_sum_partials_i64_ = make_pso(lib, @"join_sum_partials_i64");
+            ps_join_mult_i64_         = make_pso(lib, @"join_mult_i64");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
@@ -170,9 +174,37 @@ public:
         }
     }
 
+    // Get (or lazily build + cache) the radix-sorted copy of a build-key
+    // column. Sort cost is reported through *sort_kernel_ms on the call that
+    // pays it; later calls reuse the cache for free.
+    id<MTLBuffer> ensure_sorted_cache(const ResidentColumn& build_col,
+                                      double* sort_kernel_ms) {
+        const auto& bk = check_i64(build_col);
+        id<MTLBuffer> sorted = bk.sorted_cache();
+        if (sorted) return sorted;
+        if (bk.rows() > 0xFFFFFFFFull)
+            throw std::runtime_error("resident join: > 2^32 build rows unsupported");
+        if (!sorter_)
+            sorter_ = std::make_unique<metal_detail::MetalRadixSort>(device_, queue_);
+        const auto* keys = static_cast<const std::int64_t*>([bk.buffer() contents]);
+        auto view = sorter_->sort_device(keys, keys,
+                                         static_cast<std::uint32_t>(bk.rows()));
+        sorted = [device_ newBufferWithLength:bk.rows() * sizeof(std::int64_t)
+                                      options:MTLResourceStorageModeShared];
+        if (!sorted)
+            throw std::runtime_error(
+                "resident join: device allocation for sorted build cache failed");
+        std::memcpy([sorted contents], [view.keys contents],
+                    bk.rows() * sizeof(std::int64_t));
+        bk.set_sorted_cache(sorted);
+        *sort_kernel_ms += view.kernel_ms;
+        return sorted;
+    }
+
     JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
                                         const ResidentColumn& payload,
-                                        const ResidentColumn& build_keys) override {
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
         @autoreleasepool {
             const auto t_wall0 = std::chrono::steady_clock::now();
             const auto& pk = check_i64(probe_keys);
@@ -185,7 +217,7 @@ public:
             JoinAggResult r{};
             r.rows_probe = pk.rows();
             r.rows_build = bk.rows();
-            if (pk.rows() == 0 || bk.rows() == 0) {
+            if (pk.rows() == 0) {
                 r.wall_ms = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_wall0).count();
                 return r;
@@ -194,32 +226,13 @@ public:
             if (pk.rows() > 0xFFFFFFFFull || bk.rows() > 0xFFFFFFFFull)
                 throw std::runtime_error("join_sum_resident_i64: > 2^32 rows unsupported");
 
-            // Sorted build-key cache: radix-sort once, reuse on every later
-            // join against this build column. The sort cost lands on the first
-            // call's wall/kernel time — the amortization is the whole point.
             double sort_kernel_ms = 0.0;
-            id<MTLBuffer> sorted = bk.sorted_cache();
-            if (!sorted) {
-                if (!sorter_)
-                    sorter_ = std::make_unique<metal_detail::MetalRadixSort>(device_, queue_);
-                const auto* keys =
-                    static_cast<const std::int64_t*>([bk.buffer() contents]);
-                auto view = sorter_->sort_device(keys, keys,
-                                                 static_cast<std::uint32_t>(bk.rows()));
-                sorted = [device_ newBufferWithLength:bk.rows() * sizeof(std::int64_t)
-                                              options:MTLResourceStorageModeShared];
-                if (!sorted)
-                    throw std::runtime_error(
-                        "join_sum_resident_i64: device allocation for sorted build cache failed");
-                std::memcpy([sorted contents], [view.keys contents],
-                            bk.rows() * sizeof(std::int64_t));
-                bk.set_sorted_cache(sorted);
-                sort_kernel_ms = view.kernel_ms;
-            }
+            id<MTLBuffer> sorted = ensure_sorted_cache(bk, &sort_kernel_ms);
 
             const NSUInteger grid = pick_grid(pk.rows());
             const std::uint32_t np32 = static_cast<std::uint32_t>(pk.rows());
             const std::uint32_t nb32 = static_cast<std::uint32_t>(bk.rows());
+            const std::uint32_t mode = static_cast<std::uint32_t>(kind);
 
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -233,6 +246,7 @@ public:
             [ce setBuffer:partials_quad_buf_ offset:0 atIndex:3];
             [ce setBytes:&np32 length:sizeof(np32) atIndex:4];
             [ce setBytes:&nb32 length:sizeof(nb32) atIndex:5];
+            [ce setBytes:&mode length:sizeof(mode) atIndex:6];
             [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
 
@@ -254,6 +268,111 @@ public:
             r.matched     = out[1];
             r.kernel_ms   = cb_kernel_ms(cb) + sort_kernel_ms;
             r.transfer_ms = 0.0;  // UMA
+            r.wall_ms     = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_wall0).count();
+            return r;
+        }
+    }
+
+    // f64 payload: no doubles in MSL, so the probe pass runs as a parallel
+    // HOST loop over the UMA buffers — but it still reuses the GPU-built
+    // sorted-key cache, so repeated f64 joins skip the sort like i64 ones.
+    // Same pattern as sum_resident_f64 (host math on device-held data).
+    JoinAggResult join_sum_resident_f64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        @autoreleasepool {
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            const auto& pk = check_i64(probe_keys);
+            const auto& pl = check_f64(payload);
+            const auto& bk = check_i64(build_keys);
+            if (pk.rows() != pl.rows())
+                throw std::runtime_error(
+                    "join_sum_resident_f64: probe_keys and payload row counts differ");
+
+            JoinAggResult r{};
+            r.rows_probe = pk.rows();
+            r.rows_build = bk.rows();
+            if (pk.rows() == 0) {
+                r.wall_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_wall0).count();
+                return r;
+            }
+
+            if (pk.rows() > 0xFFFFFFFFull || bk.rows() > 0xFFFFFFFFull)
+                throw std::runtime_error("join_sum_resident_f64: > 2^32 rows unsupported");
+
+            double sort_kernel_ms = 0.0;
+            id<MTLBuffer> sorted_buf = ensure_sorted_cache(bk, &sort_kernel_ms);
+            const std::size_t n_probe = pk.rows();
+            const std::size_t n_build = bk.rows();
+
+            // Stage 1 (GPU): per-element contribution counts — the random-
+            // access binary searches the GPU is fast at.
+            const std::size_t mult_bytes = n_probe * sizeof(std::uint32_t);
+            if (!mult_buf_ || [mult_buf_ length] < mult_bytes) {
+                mult_buf_ = [device_ newBufferWithLength:mult_bytes
+                                                 options:MTLResourceStorageModeShared];
+                if (!mult_buf_)
+                    throw std::runtime_error(
+                        "join_sum_resident_f64: multiplicity buffer allocation failed");
+            }
+            const NSUInteger grid = pick_grid(n_probe);
+            const std::uint32_t np32 = static_cast<std::uint32_t>(n_probe);
+            const std::uint32_t nb32 = static_cast<std::uint32_t>(n_build);
+            const std::uint32_t mode = static_cast<std::uint32_t>(kind);
+
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:ps_join_mult_i64_];
+            [ce setBuffer:pk.buffer() offset:0 atIndex:0];
+            [ce setBuffer:sorted_buf  offset:0 atIndex:1];
+            [ce setBuffer:mult_buf_   offset:0 atIndex:2];
+            [ce setBytes:&np32 length:sizeof(np32) atIndex:3];
+            [ce setBytes:&nb32 length:sizeof(nb32) atIndex:4];
+            [ce setBytes:&mode length:sizeof(mode) atIndex:5];
+            [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            // Stage 2 (host, parallel): one sequential multiply-add stream —
+            // no random access, saturates memory bandwidth.
+            const auto* mult = static_cast<const std::uint32_t*>([mult_buf_ contents]);
+            const auto* pay  = static_cast<const double*>([pl.buffer() contents]);
+            const unsigned hw = std::thread::hardware_concurrency();
+            const std::size_t workers =
+                std::max<std::size_t>(1, std::min<std::size_t>(hw ? hw : 1,
+                                                               n_probe / 65536 + 1));
+            std::vector<double>       sums(workers, 0.0);
+            std::vector<std::int64_t> cnts(workers, 0);
+            std::vector<std::thread>  threads;
+            const std::size_t per = n_probe / workers;
+            for (std::size_t w = 0; w < workers; ++w) {
+                const std::size_t begin = w * per;
+                const std::size_t end   = (w + 1 == workers) ? n_probe : begin + per;
+                threads.emplace_back([&, w, begin, end] {
+                    double s = 0.0; std::int64_t c_total = 0;
+                    for (std::size_t i = begin; i < end; ++i) {
+                        const std::uint32_t c = mult[i];
+                        if (c) {
+                            s += static_cast<double>(c) * pay[i];
+                            c_total += c;
+                        }
+                    }
+                    sums[w] = s; cnts[w] = c_total;
+                });
+            }
+            for (auto& t : threads) t.join();
+            double sum = 0.0; std::int64_t matched = 0;
+            for (std::size_t w = 0; w < workers; ++w) { sum += sums[w]; matched += cnts[w]; }
+
+            r.sum_f64     = sum;
+            r.matched     = matched;
+            r.kernel_ms   = cb_kernel_ms(cb) + sort_kernel_ms;
+            r.transfer_ms = 0.0;
             r.wall_ms     = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - t_wall0).count();
             return r;
@@ -524,9 +643,14 @@ private:
     id<MTLComputePipelineState> ps_agg_all_partials_i64_ = nil;
     id<MTLComputePipelineState> ps_join_sum_i64_          = nil;
     id<MTLComputePipelineState> ps_join_sum_partials_i64_ = nil;
+    id<MTLComputePipelineState> ps_join_mult_i64_         = nil;
 
     // Lazily constructed: only joins pay for the radix-sort pipelines.
     std::unique_ptr<metal_detail::MetalRadixSort> sorter_;
+
+    // Per-probe-element multiplicity scratch for the f64 join path (u32 per
+    // row); grown on demand, reused across calls.
+    id<MTLBuffer> mult_buf_ = nil;
 
     id<MTLBuffer> input_buf_         = nil;  // grows on demand (slow-path memcpy)
     id<MTLBuffer> partials_buf_      = nil;  // sized for kMaxGrid * sizeof(int64)
