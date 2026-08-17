@@ -30,7 +30,7 @@ namespace gpudb {
 
 extern "C" {
 std::int64_t gpudb_cuda_hashjoin_empty_sentinel();
-cudaError_t gpudb_cuda_hashjoin_init(std::int64_t*, std::uint32_t, cudaStream_t);
+cudaError_t gpudb_cuda_hashjoin_init(std::int64_t*, std::int64_t*, std::uint32_t, cudaStream_t);
 cudaError_t gpudb_cuda_hashjoin_build(const std::int64_t*, std::size_t,
                                       std::int64_t*, std::int64_t*,
                                       std::uint32_t, cudaStream_t);
@@ -168,7 +168,8 @@ public:
         GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
 
         GPUDB_CUDA_CHECK(gpudb_cuda_hashjoin_init(
-            static_cast<std::int64_t*>(d_table_keys_), cap, stream_), "init");
+            static_cast<std::int64_t*>(d_table_keys_),
+            static_cast<std::int64_t*>(d_table_idx_), cap, stream_), "init");
         GPUDB_CUDA_CHECK(gpudb_cuda_hashjoin_build(
             static_cast<const std::int64_t*>(d_build_keys_), n_build,
             static_cast<std::int64_t*>(d_table_keys_),
