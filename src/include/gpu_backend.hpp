@@ -77,6 +77,14 @@ enum class JoinKind : std::uint8_t { INNER = 0, LEFT = 1, SEMI = 2, ANTI = 3 };
 //     unsigned wrap is the defined behavior, same rule as sum_i64).
 //   - matched == 0 means "no joined rows": the SQL layer must surface SUM as
 //     NULL in that case (sum is 0 here but carries no meaning).
+//   - `matched` counts the CONTRIBUTING rows/pairs for the given JoinKind —
+//     the result cardinality of that kind's SQL query (for ANTI that is the
+//     number of NON-matching probe rows; do not read it as "pairs").
+//   - f64 sums are tolerance-checked across backends (relative epsilon,
+//     ~1e-9 on warm data), never bit-compared: accumulation order is
+//     backend-defined (CUDA atomic/tree reductions are nondeterministic
+//     run-to-run; Metal streams sequentially). i64 wrap arithmetic is exact
+//     and must bit-match everywhere.
 struct JoinAggResult {
     std::int64_t sum;           // Σ payload[i] * multiplicity(probe_keys[i]) (i64 op)
     double       sum_f64;       // same, for the f64-payload op (0.0 otherwise)
@@ -151,6 +159,9 @@ public:
     // Metal implement it; CUDA pending — keeping this non-pure means the
     // CUDA backend builds unchanged until its implementation lands). The
     // hybrid planner catches the throw and falls back to CPU.
+    // NOTE: the `kind = INNER` default argument binds by STATIC type in C++;
+    // overrides must not declare a different default (callers always go
+    // through this base interface, so the base default is the only one used).
     virtual JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
                                                 const ResidentColumn& payload,
                                                 const ResidentColumn& build_keys,
