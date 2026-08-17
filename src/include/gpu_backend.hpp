@@ -96,6 +96,22 @@ struct JoinAggResult {
     double       transfer_ms;   // host<->device transfer time (0 for CPU/Metal-UMA/resident)
 };
 
+// Returned by Aggregator::join_rows_resident — the row-returning join.
+// One entry per OUTPUT ROW of the kind's SQL query, in unspecified order:
+//   INNER: (probe_idx, build_idx) per matching pair (full multiplicity)
+//   LEFT:  matching pairs, plus (probe_idx, -1) for unmatched probe rows
+//   SEMI:  (probe_idx, -1) for each probe row with >= 1 match
+//   ANTI:  (probe_idx, -1) for each probe row with no match
+// build_idx -1 encodes SQL NULL. Indices refer to the ORIGINAL upload order
+// of each resident column.
+struct JoinRowsResult {
+    std::vector<std::int64_t> probe_idx;
+    std::vector<std::int64_t> build_idx;   // -1 = NULL (no build match)
+    std::size_t rows_probe  = 0;
+    std::size_t rows_build  = 0;
+    double wall_ms = 0.0, kernel_ms = 0.0, transfer_ms = 0.0;
+};
+
 // Opaque handle to a column resident in backend memory.
 // Owns the storage; destruction releases device memory.
 // Created by Aggregator::upload_*; must only be used with the SAME aggregator
@@ -178,6 +194,15 @@ public:
                                                 const ResidentColumn& payload,
                                                 const ResidentColumn& build_keys,
                                                 JoinKind kind = JoinKind::INNER);
+
+    // Row-returning resident join (see JoinRowsResult for per-kind output).
+    // max_rows caps the materialized output; exceeding it throws a clean
+    // error naming the actual row count (never silently truncates). Same
+    // default-throwing / default-arg rules as the fused variants above.
+    virtual JoinRowsResult join_rows_resident(const ResidentColumn& probe_keys,
+                                              const ResidentColumn& build_keys,
+                                              JoinKind kind,
+                                              std::size_t max_rows);
 };
 
 // Factory. Throws std::runtime_error if the requested backend wasn't compiled

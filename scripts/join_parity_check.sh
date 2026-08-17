@@ -96,6 +96,38 @@ run_case "build much larger than probe (1k vs 1M)" \
   "SELECT (range * 31 % 2000000)::BIGINT AS k, (range % 999)::BIGINT AS v FROM range(1000)" \
   "SELECT ((range * 2654435761) % 2000000)::BIGINT AS k FROM range($I)"
 
+# --- Row-returning join (gpu_join_rows_resident) — needs --multi so the
+# uploads and the table function run as sequential statements in one process.
+# Small single-threaded sizes: probe_idx refers to UPLOAD order, which only
+# matches table order when the scan isn't parallel — keep n small so the
+# sum(idx) comparisons stay deterministic.
+rows_out=$("$SQL" --multi --sql "
+CREATE TABLE probe AS SELECT (range % 200)::BIGINT AS k, range::BIGINT AS idx FROM range(4000);
+CREATE TABLE build AS SELECT ((range * 3) % 300)::BIGINT AS k, range::BIGINT AS idx FROM range(900);
+SELECT u.n FROM (SELECT gpu_upload('pk', k) AS n FROM probe) u;
+SELECT u.n FROM (SELECT gpu_upload('bk', k) AS n FROM build) u;
+SELECT CASE WHEN
+  (SELECT count(*) || '|' || coalesce(sum(probe_idx),0) FROM gpu_join_rows_resident('pk','bk','inner')) =
+  (SELECT count(*) || '|' || coalesce(sum(p.idx),0)     FROM probe p JOIN build b ON p.k=b.k)
+ AND
+  (SELECT count(*) || '|' || sum(probe_idx) || '|' || count(build_idx) FROM gpu_join_rows_resident('pk','bk','left')) =
+  (SELECT count(*) || '|' || sum(p.idx) || '|' || count(b.idx)         FROM probe p LEFT JOIN build b ON p.k=b.k)
+ AND
+  (SELECT count(*) || '|' || coalesce(sum(probe_idx),0) FROM gpu_join_rows_resident('pk','bk','semi')) =
+  (SELECT count(*) || '|' || coalesce(sum(idx),0)       FROM probe p WHERE EXISTS(SELECT 1 FROM build b WHERE b.k=p.k))
+ AND
+  (SELECT count(*) || '|' || coalesce(sum(probe_idx),0) FROM gpu_join_rows_resident('pk','bk','anti')) =
+  (SELECT count(*) || '|' || coalesce(sum(idx),0)       FROM probe p WHERE NOT EXISTS(SELECT 1 FROM build b WHERE b.k=p.k))
+ THEN 'PASS' ELSE 'FAIL' END AS rows_verdict;
+" 2>/dev/null | tail -1)
+runs=$((runs+1))
+if [ "$rows_out" = "PASS" ]; then
+  echo "[pass] row-returning join, all kinds (dup keys, upload-order indices)"
+else
+  fails=$((fails+1))
+  echo "[FAIL] row-returning join: $rows_out"
+fi
+
 echo "----"
 echo "$runs scenarios, $fails failed"
 [ "$fails" -eq 0 ]

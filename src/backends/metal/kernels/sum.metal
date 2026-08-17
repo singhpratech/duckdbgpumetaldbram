@@ -399,3 +399,36 @@ kernel void join_mult_i64(
         mult[i] = c;
     }
 }
+
+// Lookup variant for the row-returning join: per probe element, write the
+// build-side match count m[i] and the first-match position first[i] in the
+// SORTED build keys (meaningful only when m[i] > 0). Kind-independent —
+// the host applies the JoinKind emission rules using these two arrays plus
+// the sort permutation.
+kernel void join_lookup_i64(
+    device const long*  probe_keys   [[buffer(0)]],
+    device const long*  build_sorted [[buffer(1)]],
+    device uint*        mcount       [[buffer(2)]],
+    device uint*        first        [[buffer(3)]],
+    constant uint&      n_probe      [[buffer(4)]],
+    constant uint&      n_build      [[buffer(5)]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                gsize        [[threads_per_grid]])
+{
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        uint lo = 0, hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+        }
+        const uint f = lo;
+        hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+        }
+        mcount[i] = lo - f;
+        first[i]  = f;
+    }
+}

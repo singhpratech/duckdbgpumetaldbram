@@ -872,6 +872,20 @@ void register_scalar(duckdb_connection con, const char* name,
 
 } // namespace
 
+// Bridge for gpu_join_extension.cpp (declared in gpu_join_extension.hpp):
+// expose the registry, aggregator, and stats line under the same mutex the
+// scalar functions use.
+std::mutex& resident_mutex() { return g().mu; }
+
+gpudb::ResidentColumn* find_resident_column(const std::string& name) {
+    auto it = g().registry.find(name);
+    return it == g().registry.end() ? nullptr : it->second.get();
+}
+
+gpudb::HybridAggregator& resident_aggregator() { return agg_locked(); }
+
+void resident_set_last_stats(const std::string& s) { g().last_stats = s; }
+
 void register_gpu_resident(duckdb_connection con) {
     // gpu_upload overload set: (VARCHAR, BIGINT) and (VARCHAR, DOUBLE).
     duckdb_aggregate_function_set set = duckdb_create_aggregate_function_set("gpu_upload");

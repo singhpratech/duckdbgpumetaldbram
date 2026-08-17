@@ -30,6 +30,12 @@ JoinAggResult Aggregator::join_sum_resident_f64(const ResidentColumn&,
     throw std::runtime_error("join_sum_resident_f64: not implemented on this backend");
 }
 
+JoinRowsResult Aggregator::join_rows_resident(const ResidentColumn&,
+                                              const ResidentColumn&,
+                                              JoinKind, std::size_t) {
+    throw std::runtime_error("join_rows_resident: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

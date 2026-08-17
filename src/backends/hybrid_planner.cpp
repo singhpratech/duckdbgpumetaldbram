@@ -279,6 +279,28 @@ public:
             });
     }
 
+    JoinRowsResult join_rows_resident(const ResidentColumn& probe_keys,
+                                      const ResidentColumn& build_keys,
+                                      JoinKind kind, std::size_t max_rows) override {
+        const auto& hp = check_hybrid(probe_keys);
+        const auto& hb = check_hybrid(build_keys);
+        const std::size_t n = hp.rows();
+        if (hb.on_gpu() != hp.on_gpu())
+            throw std::runtime_error(
+                "resident join: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        if (gpu_ && hp.on_gpu()) {
+            last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
+                                  n, 0, /*resident*/true, /*borderline*/false);
+            return gpu_->join_rows_resident(hp.inner(), hb.inner(), kind, max_rows);
+        }
+        last_ = make_decision(Backend::CPU,
+                              gpu_ ? DispatchReason::Resident_OnCpu
+                                   : DispatchReason::GpuUnavailable,
+                              n, 0, /*resident*/true, /*borderline*/false);
+        return cpu_->join_rows_resident(hp.inner(), hb.inner(), kind, max_rows);
+    }
+
     template <class Op>
     JoinAggResult dispatch_join(const ResidentColumn& probe_keys,
                                 const ResidentColumn& payload,
