@@ -117,8 +117,9 @@ fallback on Linux. The Linux build is **CUDA-ready**: gpudb's build auto-enables
 the CUDA backend the moment the registry's build tooling ships its CUDA
 toolchain (already merged upstream in extension-ci-tools `main`); until then,
 build from source for CUDA. Check any binary with `SELECT gpu_build_info();`.
-The registry serves the **v0.3.0** build (v0.4.0 update in review); installed
-an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
+The registry serves the **v0.4.0** build (merged 2026-08-17), including the
+full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
+…). Installed an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
 
 ### Option B — load a prebuilt release binary
 
@@ -255,6 +256,7 @@ resident-surface coverage in the community-CI sqllogic suite.
 - [x] **Resident-column SQL surface** — `gpu_upload` / `gpu_sum_resident` / `gpu_min_resident` / `gpu_max_resident` / `gpu_sum_resident_f64` / `gpu_resident_info` / `gpu_last_stats` / `gpu_drop_resident` / `gpu_build_info`. The GPU genuinely executes SQL reductions on both CUDA and Metal — up to **25×** over native (see Numbers). Hardened by a three-reviewer adversarial pass pre-release: buffer-pool cap (window-frame O(n²) OOM → clean error), mixed-name/NULL-name guards, defined overflow wrap, truthful dispatch stats.
 - [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
 - [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
+- [x] [Community Extensions PR #2503](https://github.com/duckdb/community-extensions/pull/2503) **merged** (2026-08-17) — the registry now serves **v0.4.0**, resident-column surface included.
 
 ### In flight
 - [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
