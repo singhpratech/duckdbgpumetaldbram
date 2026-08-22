@@ -20,6 +20,7 @@ option(GPUDB_ENABLE_METAL  "Enable Metal backend (auto on macOS)" ON)
 option(GPUDB_BUILD_TESTS   "Build unit tests"                     ON)
 option(GPUDB_BUILD_BENCH   "Build CLI benchmark tool"             ON)
 option(GPUDB_BUILD_EXT     "Build DuckDB extension wrapper"       OFF)
+option(GPUDB_REQUIRE_CUDA  "Fail configure if the CUDA toolkit is not found (no silent CPU fallback)" OFF)
 # Static cudart => the produced binaries have NO dynamic dependency on
 # libcudart.so/libcuda.so, so a CUDA-enabled loadable extension still LOADs on
 # GPU-less/driver-less machines (cudart_static dlopens the driver at runtime;
@@ -78,6 +79,9 @@ if(GPUDB_ENABLE_CUDA)
         set(GPUDB_HAS_CUDA ON)
         message(STATUS "CUDA enabled (compiler: ${CMAKE_CUDA_COMPILER}, archs: ${CMAKE_CUDA_ARCHITECTURES}, toolkit: ${CUDAToolkit_VERSION}, static runtime: ${GPUDB_CUDA_STATIC_RUNTIME})")
     else()
+        if(GPUDB_REQUIRE_CUDA)
+            message(FATAL_ERROR "GPUDB_REQUIRE_CUDA=ON but no CUDA compiler was found. Put nvcc on PATH (e.g. export PATH=/usr/local/cuda/bin:$PATH) or set CUDACXX=/path/to/nvcc, or build without the flag to get the CPU-only fallback.")
+        endif()
         message(STATUS "CUDA toolkit not found — CUDA backend disabled")
     endif()
 endif()

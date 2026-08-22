@@ -33,6 +33,9 @@ CMAKE_ARGS=(
 if [[ "${GPUDB_NO_CUDA:-}" == "1" ]]; then
     CMAKE_ARGS+=(-DGPUDB_ENABLE_CUDA=OFF)
 fi
+if [[ "${GPUDB_REQUIRE_CUDA:-}" == "1" ]]; then
+    CMAKE_ARGS+=(-DGPUDB_REQUIRE_CUDA=ON)
+fi
 if [[ "${GPUDB_NO_METAL:-}" == "1" ]]; then
     CMAKE_ARGS+=(-DGPUDB_ENABLE_METAL=OFF)
 fi
