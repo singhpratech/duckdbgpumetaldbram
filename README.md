@@ -27,7 +27,18 @@ SELECT gpu_last_stats();                                      -- proof: which pr
 --   wall_ms=9.702 kernel_ms=9.533 transfer_ms=0.000
 ```
 
-Apache-2.0 · v0.4.0 · Linux + macOS · DuckDB ≥ 1.2
+```sql
+-- v0.5.0: joins. Upload key+payload pairs once; the GPU joins and reduces
+-- in one pass against a cached sorted build side — no join output materialised.
+SELECT gpu_upload_pair('l', l_orderkey, (l_extendedprice*100)::BIGINT) FROM lineitem;  -- once
+SELECT gpu_upload('o', o_orderkey) FROM orders;                                          -- once
+SELECT gpu_join_sum_resident('l.k', 'l.v', 'o');   -- = sum(...) FROM lineitem JOIN orders
+--   SF50: 37 ms vs 429 ms native on M4 Max (11.7×), 27-37 ms vs 998 ms on RTX 4090 (~30×)
+-- inner / left / semi / anti × sum(BIGINT) / sum(DOUBLE) / count — all bit-exact
+-- or within 1e-9 of native, verified by scripts/join_parity_check.sh
+```
+
+Apache-2.0 · v0.5.0 · Linux + macOS · DuckDB ≥ 1.2
 
 ---
 
@@ -50,6 +61,10 @@ factors, six columns, both platforms) + reproduction: **[BENCHMARK.md](BENCHMARK
 
 | TPC-H | Workload | Hardware | Native | gpudb | |
 |---|---|---|---:|---:|:---|
+| **SF50** (300M ⋈ 75M) | `JOIN` + `SUM` BIGINT | RTX 4090 Laptop · CUDA | 998 ms | **27–37 ms** | **27–37× 🚀** |
+| **SF10** (60M ⋈ 15M) | `EXISTS` semi-join + `SUM` DOUBLE | RTX 4090 Laptop · CUDA | 640 ms | **1.7 ms** | **~376× 🚀** |
+| **SF50** (300M ⋈ 75M) | `JOIN` + `SUM` BIGINT | MacBook M4 Max · Metal | 429 ms | **37 ms** | **11.7× 🚀** |
+| **SF10** (60M ⋈ 15M) | `EXISTS` semi-join + `SUM` DOUBLE | MacBook M4 Max · Metal | 182 ms | **8.2 ms** | **22.2× 🚀** |
 | **SF50** (300M rows) | `SUM` BIGINT | RTX 4090 Laptop · CUDA | 99 ms | **4 ms** | **25× 🚀** |
 | **SF100** (600M rows) | `SUM` DOUBLE | RTX 4090 Laptop · CUDA | 196 ms | **9 ms** | **22× 🚀** |
 | **SF100** (600M rows) | `SUM` BIGINT | MacBook M4 Max · Metal | 99 ms | **10 ms** | **9.9× 🚀** |
@@ -233,38 +248,50 @@ Two SQL paths, by design (v0.4.0):
 - **Resident** `gpu_upload` + `gpu_*_resident` — the GPU path with substance:
   pay the transfer once, then reductions run on-device (CUDA and Metal) at
   memory-bandwidth speed with `transfer_ms=0.000`. This is where the
-  4–25× numbers above come from. The SQL join path is in development.
+  4–25× numbers above come from.
+- **Resident joins (v0.5.0)** `gpu_upload_pair` + `gpu_[left_|semi_|anti_]join_{sum,count}_resident[_f64]`
+  — fused join + reduction against a device-cached sorted build side; the
+  11–376× join rows above. Row-returning `gpu_join_rows_resident` exists as
+  the composability primitive (wins on unified memory, loses to native across
+  PCIe — [BENCHMARK.md](BENCHMARK.md) states both).
 
 ## Testing
 ```bash
-./build-linux/test/test_gpudb        # 96 unit checks across the backends present at build time
-./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window
+./build-linux/test/test_gpudb        # unit checks across the backends present at build time (118 CUDA / 137 Metal)
+./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window / resident / joins
+./scripts/join_parity_check.sh       # 11 adversarial join scenarios, native vs gpudb in the same statement
 ./scripts/local_check.sh             # everything CI would run, end to end
 ```
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.4.0: 76 queries green
-(69 pass + 7 guardrail cases whose expected errors are asserted), plus full
+PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.5.0: 91 queries green
+(87 pass + 4 guardrail cases whose expected errors are asserted), plus full
 resident-surface coverage in the community-CI sqllogic suite.
 
-**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → 96 unit tests → smoke benchmarks → SQL suite). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
+**Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → unit tests → smoke benchmarks → SQL suite → join parity harness). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Roadmap
 
-### Latest — shipped in v0.4.0
+### Latest — shipped in v0.5.0
+- [x] **GPU joins from SQL, both backends** — `gpu_upload_pair` + fused `gpu_[left_|semi_|anti_]join_{sum,count}_resident[_f64]` (inner / left / semi / anti; right / full as documented compositions) and the row-returning `gpu_join_rows_resident`. Sorted-build + binary-search probe with the sorted side cached on the device. Verified against native DuckDB's hash join end-to-end on TPC-H SF10/SF50: **11.7× (Metal) / 27–37× (CUDA)** inner join-sum at SF50, **22× / ~376×** on the EXISTS semi-join; i64 bit-exact, f64 within 1e-11. Honest losing row kept: row materialisation across PCIe loses to native on discrete GPUs.
+- [x] **Adversarial parity harness** — `scripts/join_parity_check.sh`: 11 scenarios × 12 checks (dup-heavy, Knuth-hash, Zipf skew, int64 boundaries, negative keys, no-match, all-match, inverted sizes), native and gpudb computed in the same statement; passes on both machines.
+- [x] **Metal hash join + hybrid join planner + on-device segment reduce** — contributed by [@lmangani](https://github.com/lmangani) ([PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43)); this release lands that commit as the base of the join stack.
+- [x] **Colab notebook runs real CUDA** — requests a T4 runtime automatically, builds with `GPUDB_REQUIRE_CUDA=1` (configure fails loudly instead of silently falling back to CPU), and the test cell asserts the CUDA backend actually ran.
+
+### Shipped in v0.4.0
 - [x] **Resident-column SQL surface** — `gpu_upload` / `gpu_sum_resident` / `gpu_min_resident` / `gpu_max_resident` / `gpu_sum_resident_f64` / `gpu_resident_info` / `gpu_last_stats` / `gpu_drop_resident` / `gpu_build_info`. The GPU genuinely executes SQL reductions on both CUDA and Metal — up to **25×** over native (see Numbers). Hardened by a three-reviewer adversarial pass pre-release: buffer-pool cap (window-frame O(n²) OOM → clean error), mixed-name/NULL-name guards, defined overflow wrap, truthful dispatch stats.
 - [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
 - [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
 - [x] [Community Extensions PR #2503](https://github.com/duckdb/community-extensions/pull/2503) **merged** (2026-08-17) — the registry now serves **v0.4.0**, resident-column surface included.
 
 ### In flight
-- [ ] **Real Metal hash join + on-device segment reduce + `gpu_inner_join`** — contributed by [@lmangani](https://github.com/lmangani) in [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43) (verified 9.9× on a 1M×10M inner join on M4 Max); landing after a rebase/split pass.
 - [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` shows what any given binary carries).
 
-### Next (v0.5.0 — directional, we'll see what the data says)
-- [ ] **GPU join as the SQL-path GPU story** — land and extend PR #43's join stack; benchmark against DuckDB's 16-thread hash join end-to-end.
-- [ ] Resident GROUP BY from SQL (`gpu_groupby_resident`) riding the same upload-once model
+### Next (v0.6.0 — directional, we'll see what the data says)
+- [ ] Resident GROUP BY from SQL returning (key, aggregate) rows, riding the same upload-once model and the cached radix sort
+- [ ] `ORDER BY` / top-k on resident columns
+- [ ] GROUP BY over join results; composite join keys
 - [ ] Resident f64 min/max (needs a v2 backend ABI entry)
 
 ### Beyond (v0.6.0+ — exploratory)
