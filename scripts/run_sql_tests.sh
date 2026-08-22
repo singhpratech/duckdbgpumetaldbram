@@ -15,8 +15,10 @@
 #       -- expect: <line>           expected output line, one per result row
 #       -- requires_file: <path>    skip query if file missing (relative root)
 #       -- env: KEY=VAL             set env var for this query only
-#       -- expected_fail: <reason>  query is allowed to error/segfault/mismatch;
-#                                   the suite reports it but treats overall as PASS
+#       -- expected_fail: <reason>  GUARDRAIL case: the query is EXPECTED to
+#                                   error (a misuse the extension must reject);
+#                                   reported as GUARDRAIL, counts as passing —
+#                                   if it unexpectedly succeeds, the suite fails
 #
 # Comparison is whitespace-tolerant: header row is dropped, runs of
 # whitespace are collapsed, leading/trailing space is stripped.
@@ -142,7 +144,7 @@ execute_query() {
     # would stall. 30s is generous for everything currently in tree.
     local TLIMIT="${GPUDB_SQL_TIMEOUT_SECS:-30}"
     # Suppress bash's "Segmentation fault" diagnostic when the child dies
-    # by SIGSEGV — we want our own XFAIL/FAIL line, not noise. Putting the
+    # by SIGSEGV — we want our own GUARDRAIL/FAIL line, not noise. Putting the
     # call inside { ... } 2>/dev/null with the redirection on the GROUP
     # silences the diagnostic without dropping our captured stderr (which
     # is going to $err_f via the inner redirection).
@@ -208,7 +210,7 @@ execute_query() {
         fi
     else
         if [ -n "$xfail" ]; then
-            printf "  %-32s  %sXFAIL%s  (%s)\n" \
+            printf "  %-32s  %sGUARDRAIL%s  (%s)\n" \
                 "$label" "$C_YEL" "$C_OFF" "$xfail"
             efail=$((efail + 1))
         else
@@ -342,7 +344,7 @@ run_file() {
         i=$((i + 1))
     done
 
-    echo "  ${C_DIM}-> ${pass} pass / ${fail} fail / ${efail} xfail / ${skip} skip${C_OFF}"
+    echo "  ${C_DIM}-> ${pass} pass / ${fail} fail / ${efail} guardrail / ${skip} skip${C_OFF}"
     if [ "$unexpected_pass" -gt 0 ]; then
         echo "  ${C_DIM}-> ${unexpected_pass} unexpected-pass (consider clearing expected_fail tag)${C_OFF}"
     fi
@@ -366,7 +368,7 @@ echo "${C_BOLD}== summary ==${C_OFF}"
 echo "  files:           $TOTAL_FILES"
 echo "  pass:            ${C_GREEN}$TOTAL_PASS${C_OFF}"
 echo "  fail:            ${C_RED}$TOTAL_FAIL${C_OFF}"
-echo "  xfail (expected):${C_YEL}$TOTAL_EXPECTED_FAIL${C_OFF}"
+echo "  guardrail (expected error):${C_YEL}$TOTAL_EXPECTED_FAIL${C_OFF}"
 echo "  skip:            ${C_YEL}$TOTAL_SKIP${C_OFF}"
 echo "  unexpected pass: ${C_YEL}$TOTAL_UNEXPECTED_PASS${C_OFF}"
 

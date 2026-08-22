@@ -283,6 +283,9 @@ private:
                 [ce_build01 setBytes:&n_build length:sizeof(n_build) atIndex:1];
                 [ce_build01 dispatchThreadgroups:MTLSizeMake(blocks_build, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+                // Make this dispatch's buffer writes visible to the next dispatch in the
+                // same encoder (not guaranteed on every device without a barrier).
+                [ce_build01 memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
                 [ce_build01 setComputePipelineState:ps_partition_count_];
                 [ce_build01 setBuffer:b_build_keys_ offset:0 atIndex:0];
@@ -290,6 +293,9 @@ private:
                 [ce_build01 setBuffer:b_partition_counts_ offset:0 atIndex:2];
                 [ce_build01 dispatchThreadgroups:MTLSizeMake(blocks_build, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+                // Make this dispatch's buffer writes visible to the next dispatch in the
+                // same encoder (not guaranteed on every device without a barrier).
+                [ce_build01 memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [ce_build01 endEncoding];
                 [cb_build01 commit];
                 [cb_build01 waitUntilCompleted];
@@ -313,6 +319,9 @@ private:
                 [ce_build2 setBuffer:b_scatter_build_idx_ offset:0 atIndex:6];
                 [ce_build2 dispatchThreadgroups:MTLSizeMake(blocks_build, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+                // Make this dispatch's buffer writes visible to the next dispatch in the
+                // same encoder (not guaranteed on every device without a barrier).
+                [ce_build2 memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [ce_build2 endEncoding];
                 [cb_build2 commit];
                 [cb_build2 waitUntilCompleted];
@@ -332,6 +341,9 @@ private:
             [ce_probe01 setBytes:&n_probe length:sizeof(n_probe) atIndex:1];
             [ce_probe01 dispatchThreadgroups:MTLSizeMake(blocks_probe, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce_probe01 memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             [ce_probe01 setComputePipelineState:ps_partition_count_];
             [ce_probe01 setBuffer:b_probe_keys_ offset:0 atIndex:0];
@@ -339,6 +351,9 @@ private:
             [ce_probe01 setBuffer:b_partition_counts_ offset:0 atIndex:2];
             [ce_probe01 dispatchThreadgroups:MTLSizeMake(blocks_probe, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce_probe01 memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [ce_probe01 endEncoding];
             [cb_probe01 commit];
             [cb_probe01 waitUntilCompleted];
@@ -363,6 +378,9 @@ private:
             [ce_final setBuffer:b_scatter_probe_idx_ offset:0 atIndex:6];
             [ce_final dispatchThreadgroups:MTLSizeMake(blocks_probe, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce_final memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             if (linear_scan) {
                 [ce_final setComputePipelineState:ps_probe_partition_];
@@ -376,6 +394,9 @@ private:
                 [ce_final setBuffer:b_out_count_ offset:0 atIndex:7];
                 [ce_final dispatchThreadgroups:MTLSizeMake(blocks_probe, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kCountThreads, 1, 1)];
+                // Make this dispatch's buffer writes visible to the next dispatch in the
+                // same encoder (not guaranteed on every device without a barrier).
+                [ce_final memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
                 [ce_final setComputePipelineState:ps_partition_hashjoin_];
                 [ce_final setBuffer:b_scatter_build_keys_ offset:0 atIndex:0];
@@ -389,6 +410,9 @@ private:
                 [ce_final setBuffer:b_out_build_ offset:0 atIndex:8];
                 [ce_final dispatchThreadgroups:MTLSizeMake(kNumPartitions, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kTgThreads, 1, 1)];
+                // Make this dispatch's buffer writes visible to the next dispatch in the
+                // same encoder (not guaranteed on every device without a barrier).
+                [ce_final memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
 
             [ce_final endEncoding];
@@ -452,6 +476,9 @@ private:
             [ce setBytes:&table_cap length:sizeof(table_cap) atIndex:2];
             [ce dispatchThreadgroups:MTLSizeMake(init_tg, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             const NSUInteger build_tg = std::min<NSUInteger>((n_build + kBlock - 1) / kBlock, 4096);
             [ce setComputePipelineState:ps_build_];
@@ -463,6 +490,9 @@ private:
             [ce setBytes:&table_cap length:sizeof(table_cap) atIndex:5];
             [ce dispatchThreadgroups:MTLSizeMake(build_tg, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             const NSUInteger probe_tg = std::min<NSUInteger>((n_probe + kBlock - 1) / kBlock, 4096);
             [ce setComputePipelineState:ps_probe_global_];
@@ -477,6 +507,9 @@ private:
             [ce setBuffer:b_out_count_ offset:0 atIndex:8];
             [ce dispatchThreadgroups:MTLSizeMake(probe_tg, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             [ce endEncoding];
             [cb commit];
@@ -548,6 +581,9 @@ private:
 
             const NSUInteger tg = (n_probe + 255) / 256;
             [ce dispatchThreadgroups:MTLSizeMake(tg, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            // Make this dispatch's buffer writes visible to the next dispatch in the
+            // same encoder (not guaranteed on every device without a barrier).
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [ce endEncoding];
             [cb commit];
             [cb waitUntilCompleted];

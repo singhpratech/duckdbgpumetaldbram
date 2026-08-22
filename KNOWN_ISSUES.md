@@ -71,6 +71,7 @@ matching native DuckDB, and `IS NULL` on such a result is now `true`.
 
 | Issue | Fixed in |
 |---|---|
+| Metal v1 `HashJoinProbe` lost a small number of matches on GitHub's macOS runner (`Apple Paravirtual device`): 199,973 vs 199,998 on a 50k×200k join | v0.5.0 — the slot-lock tables spun on a locked slot for a bounded number of attempts (a GPU gives no cross-threadgroup forward-progress guarantee, so the spinner could give up and silently drop its row), read another thread's key through relaxed atomics, and chained init → build → probe in one compute encoder with no memory barrier. Now: wait-free insert (never spin, never read a foreign key during build), probe scans the whole run and keeps the smallest build index (exact first-row-wins on both paths), `memoryBarrierWithScope:MTLBarrierScopeBuffers` between dependent dispatches. Regression tests: duplicate-heavy 97-key build and a 700k-row 5-key build on the partitioned path |
 | CUDA v1 `HashJoinProbe` (operator-level, `gpudb-hashjoin-bench`) emitted every build row for duplicate build keys, diverging from the CPU reference and the header contract (first build row wins) | v0.5.0 — one slot per key, `atomicMin` on the smallest build index. Behaviour change only for callers relying on the old multimap output of the v1 probe; the v0.5 fused joins carry full multiplicity by design and are unaffected |
 | `gpu_min/gpu_max(DOUBLE)` leaked the fold identity (`+inf`/`-inf`) on all-NaN groups, and `gpu_max` dropped NaN where native returns NaN | v0.3.0 — caught by pre-release adversarial review, fixed before the overloads ever shipped: f64 min/max folds now use a NaN-aware total order matching native (NaN sorts greatest) |
 | `MIN/MAX/SUM(empty input)` returned `0` instead of SQL `NULL` | v0.2.0 (PR #44) — finalize marks the output row invalid via `duckdb_vector_ensure_validity_writable` + `duckdb_validity_set_row_invalid` when a state accumulated zero non-NULL values; `set_special_handling` registered so DuckDB does not short-circuit our NULL handling |
@@ -92,6 +93,6 @@ cd duckdbgpumetaldbram
 ./scripts/get_duckdb_libs.sh
 ./scripts/build.sh
 ./scripts/local_check.sh        # builds + cpp tests + smoke benchmarks
-./scripts/run_sql_tests.sh      # 9 .test files, 0 fail (guardrail cases are asserted expected-fails)
+./scripts/run_sql_tests.sh      # 9 .test files, 0 fail (4 GUARDRAIL cases assert that misuse is rejected)
 ./scripts/join_parity_check.sh  # 11 adversarial join scenarios, native vs gpudb in the same statement
 ```

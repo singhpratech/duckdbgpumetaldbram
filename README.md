@@ -265,8 +265,10 @@ Two SQL paths, by design (v0.4.0):
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / XFAIL (expected fail) / SKIP. As of v0.5.0: 91 queries green
-(87 pass + 4 guardrail cases whose expected errors are asserted), plus full
+PASS / FAIL / GUARDRAIL / SKIP. As of v0.5.0: 91 queries, 0 failures — 87
+result checks plus 4 GUARDRAIL cases (deliberate misuse such as a `DOUBLE` join
+key or a `NULL` upload name, which the extension must reject with a clear
+error; the suite fails if one of them unexpectedly succeeds) — plus full
 resident-surface coverage in the community-CI sqllogic suite.
 
 **Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → unit tests → smoke benchmarks → SQL suite → join parity harness). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.

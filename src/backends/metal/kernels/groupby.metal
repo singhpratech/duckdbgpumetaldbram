@@ -1045,12 +1045,23 @@ kernel void partition_hashjoin_i64(
     uint                tid                [[thread_position_in_threadgroup]],
     uint                pid                [[threadgroup_position_in_grid]])
 {
+    // Per-partition open-addressing table in threadgroup memory.
+    //  - No spinning: a LOCKED slot is skipped like a COMMITTED one (a bounded
+    //    spin on a descheduled locker silently drops the row).
+    //  - Equal keys collapse into one slot via atomic_fetch_min on the build
+    //    index, so "first build row wins" is the SMALLEST index regardless of
+    //    thread scheduling (the owner uses fetch_min too — store vs min would
+    //    race). If a stale key read (relaxed atomics) makes a thread miss the
+    //    collapse, the key simply takes another slot; the probe scans the
+    //    whole run and keeps the minimum, so the result is still exact.
     threadgroup atomic_uint slot_state[SLOTLOCK_SLOT_COUNT];
     threadgroup long        slot_keys[SLOTLOCK_SLOT_COUNT];
-    threadgroup long        slot_idx [SLOTLOCK_SLOT_COUNT];
+    threadgroup atomic_uint slot_idx [SLOTLOCK_SLOT_COUNT];
 
     for (uint s = tid; s < SLOTLOCK_SLOT_COUNT; s += SLOTLOCK_TG_THREADS) {
         atomic_store_explicit(&slot_state[s], SLOT_EMPTY, memory_order_relaxed);
+        atomic_store_explicit(&slot_idx[s], 0xFFFFFFFFu, memory_order_relaxed);
+        slot_keys[s] = HJ_KEY_EMPTY;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1059,7 +1070,7 @@ kernel void partition_hashjoin_i64(
 
     for (uint i = build_lo + tid; i < build_hi; i += SLOTLOCK_TG_THREADS) {
         const long  k = build_scatter_keys[i];
-        const long  bidx = build_scatter_idx[i];
+        const uint  bidx = (uint)build_scatter_idx[i];
         const ulong h = slotlock_hash(k);
         uint slot = slotlock_slot_start(h);
         for (uint attempt = 0; attempt < SLOTLOCK_SLOT_COUNT * 4u; ++attempt) {
@@ -1072,21 +1083,18 @@ kernel void partition_hashjoin_i64(
                         memory_order_relaxed, memory_order_relaxed))
                 {
                     slot_keys[slot] = k;
-                    slot_idx[slot] = bidx;
+                    atomic_fetch_min_explicit(&slot_idx[slot], bidx, memory_order_relaxed);
                     atomic_store_explicit(&slot_state[slot], SLOT_COMMITTED,
                                           memory_order_relaxed);
                     break;
                 }
-                continue;
+                continue;   // lost the CAS (or spurious failure): re-read this slot
             }
-            if (state == SLOT_COMMITTED) {
-                if (slot_keys[slot] == k) {
-                    break; // first build row wins
-                }
-                slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;
-                continue;
+            if (state == SLOT_COMMITTED && slot_keys[slot] == k) {
+                atomic_fetch_min_explicit(&slot_idx[slot], bidx, memory_order_relaxed);
+                break;      // collapsed into the existing slot, smallest index kept
             }
-            continue;
+            slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;   // occupied (locked or other key)
         }
     }
 
@@ -1100,24 +1108,24 @@ kernel void partition_hashjoin_i64(
         const long  pidx = probe_scatter_idx[i];
         const ulong h = slotlock_hash(k);
         uint slot = slotlock_slot_start(h);
-        for (uint attempt = 0; attempt < SLOTLOCK_SLOT_COUNT * 4u; ++attempt) {
+        uint best = 0xFFFFFFFFu;
+        for (uint attempt = 0; attempt < SLOTLOCK_SLOT_COUNT; ++attempt) {
             const uint state = atomic_load_explicit(&slot_state[slot],
                                                     memory_order_relaxed);
             if (state == SLOT_EMPTY) {
                 break;
             }
-            if (state == SLOT_COMMITTED) {
-                if (slot_keys[slot] == k) {
-                    const uint pos = atomic_fetch_add_explicit(out_count, 1u,
-                                                               memory_order_relaxed);
-                    out_probe[pos] = pidx;
-                    out_build[pos] = slot_idx[slot];
-                    break;
-                }
-                slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;
-                continue;
+            if (slot_keys[slot] == k) {
+                const uint bi = atomic_load_explicit(&slot_idx[slot], memory_order_relaxed);
+                if (bi < best) best = bi;
             }
-            continue;
+            slot = (slot + 1u) & SLOTLOCK_SLOT_MASK;
+        }
+        if (best != 0xFFFFFFFFu) {
+            const uint pos = atomic_fetch_add_explicit(out_count, 1u,
+                                                       memory_order_relaxed);
+            out_probe[pos] = pidx;
+            out_build[pos] = (long)best;
         }
     }
 }
@@ -1190,30 +1198,28 @@ kernel void hashjoin_build_slotlock_i64(
         const long k = build_keys[i];
         if (k == HJ_KEY_EMPTY) continue;
         uint slot = hashjoin_slot(k, cap_mask);
+        // Wait-free insert: every build row claims its own slot. A slot that
+        // is LOCKED or COMMITTED by another thread is simply skipped — we never
+        // spin (GPUs give no cross-threadgroup forward-progress guarantee, so a
+        // bounded spin can give up while the locker is descheduled and the row
+        // is silently lost) and we never read slot_keys here (all MSL atomics
+        // are relaxed, so a key written by another thread may not be visible
+        // yet). Duplicate keys therefore occupy several slots; the probe scans
+        // the whole run and keeps the smallest build index (first row wins).
         for (uint attempt = 0; attempt < cap; ++attempt) {
-            const uint state = atomic_load_explicit(&slot_state[slot], memory_order_relaxed);
-            if (state == HJ_SLOT_EMPTY) {
-                uint expected = HJ_SLOT_EMPTY;
-                if (atomic_compare_exchange_weak_explicit(
-                        &slot_state[slot], &expected, HJ_SLOT_LOCKED,
-                        memory_order_relaxed, memory_order_relaxed))
-                {
-                    slot_keys[slot] = k;
-                    slot_idx[slot] = (long)i;
-                    atomic_store_explicit(&slot_state[slot], HJ_SLOT_COMMITTED,
-                                          memory_order_relaxed);
-                    break;
-                }
-                continue;
+            uint expected = HJ_SLOT_EMPTY;
+            if (atomic_compare_exchange_weak_explicit(
+                    &slot_state[slot], &expected, HJ_SLOT_LOCKED,
+                    memory_order_relaxed, memory_order_relaxed))
+            {
+                slot_keys[slot] = k;
+                slot_idx[slot] = (long)i;
+                atomic_store_explicit(&slot_state[slot], HJ_SLOT_COMMITTED,
+                                      memory_order_relaxed);
+                break;
             }
-            if (state == HJ_SLOT_COMMITTED) {
-                if (slot_keys[slot] == k) {
-                    break; // first build row wins (v1 unique-build contract)
-                }
-                slot = (slot + 1u) & cap_mask;
-                continue;
-            }
-            // HJ_SLOT_LOCKED — spin on this slot
+            if (expected == HJ_SLOT_EMPTY) continue;   // spurious CAS failure: retry this slot
+            slot = (slot + 1u) & cap_mask;              // occupied (locked or committed): next
         }
     }
 }
@@ -1236,24 +1242,26 @@ kernel void hashjoin_probe_slotlock_i64(
         const long k = probe_keys[i];
         if (k == HJ_KEY_EMPTY) continue;
         uint slot = hashjoin_slot(k, cap_mask);
+        // The build kernel finished before this dispatch, so every non-EMPTY
+        // slot is COMMITTED and its key/idx are visible. Duplicate build keys
+        // may sit in several slots of the same run: scan the whole run (up to
+        // the first EMPTY slot) and keep the smallest build index.
+        long best = -1;
         for (uint probe = 0; probe < cap; ++probe) {
             const uint state = atomic_load_explicit(&slot_state[slot], memory_order_relaxed);
             if (state == HJ_SLOT_EMPTY) {
                 break;
             }
-            if (state == HJ_SLOT_COMMITTED) {
-                const long tk = slot_keys[slot];
-                if (tk == k) {
-                    const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
-                    out_probe[pos] = (long)i;
-                    out_build[pos] = slot_idx[slot];
-                    break;
-                }
-                if (tk == HJ_KEY_EMPTY) {
-                    break;
-                }
+            if (slot_keys[slot] == k) {
+                const long bi = slot_idx[slot];
+                if (best < 0 || bi < best) best = bi;
             }
             slot = (slot + 1u) & cap_mask;
+        }
+        if (best >= 0) {
+            const uint pos = atomic_fetch_add_explicit(out_count, 1u, memory_order_relaxed);
+            out_probe[pos] = (long)i;
+            out_build[pos] = best;
         }
     }
 }

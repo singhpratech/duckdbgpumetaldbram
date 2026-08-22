@@ -177,6 +177,38 @@ void test_hashjoin_backend(gpudb::Backend b) {
                     got.wall_ms, got.kernel_ms);
     }
 
+    // Duplicate-heavy build (97 distinct keys x ~2k rows each): every probe
+    // must map to the SMALLEST build index of its key (first build row wins),
+    // whatever order GPU threads inserted in. Regression for the lost-insert /
+    // wrong-index races in the slot-lock tables (CI paravirtual GPU, 2026-08).
+    {
+        const std::size_t n_build = 200'000;
+        const std::size_t n_probe = 100'000;
+        std::vector<std::int64_t> build(n_build);
+        for (std::size_t j = 0; j < n_build; ++j) build[j] = static_cast<std::int64_t>((j * 7919) % 97);
+        std::vector<std::int64_t> probe(n_probe);
+        for (std::size_t i = 0; i < n_probe; ++i) probe[i] = static_cast<std::int64_t>(i % 120); // 97..119 miss
+        auto ref = cpu_reference(build.data(), n_build, probe.data(), n_probe);
+        auto got = hj->inner_join_i64(build.data(), n_build, probe.data(), n_probe);
+        expect_join_eq(got, ref, "dup-heavy 97 keys x 200k build");
+        EXPECT_EQ(got.matched, ref.matched);
+    }
+
+    // Large build (above the global/partitioned switch) with few distinct keys:
+    // the per-partition table must collapse duplicates instead of overflowing.
+    {
+        const std::size_t n_build = 700'000;
+        const std::size_t n_probe = 50'000;
+        std::vector<std::int64_t> build(n_build);
+        for (std::size_t j = 0; j < n_build; ++j) build[j] = static_cast<std::int64_t>(j % 5);
+        std::vector<std::int64_t> probe(n_probe);
+        for (std::size_t i = 0; i < n_probe; ++i) probe[i] = static_cast<std::int64_t>(i % 8);
+        auto ref = cpu_reference(build.data(), n_build, probe.data(), n_probe);
+        auto got = hj->inner_join_i64(build.data(), n_build, probe.data(), n_probe);
+        expect_join_eq(got, ref, "5 keys x 700k build (partitioned path)");
+        EXPECT_EQ(got.matched, ref.matched);
+    }
+
     // GPU backends must execute kernels (not CPU fallback)
     if (b == gpudb::Backend::METAL || b == gpudb::Backend::CUDA) {
         const std::size_t n_build = 10'000;
@@ -208,7 +240,11 @@ void test_hybrid_hashjoin() {
     auto ref = ref_cpu->inner_join_i64(build.data(), n_build, probe.data(), n_probe);
     auto got = hybrid->inner_join_i64(build.data(), n_build, probe.data(), n_probe);
     expect_join_eq(got, ref, "hybrid 100k×500k");
-    EXPECT(got.kernel_ms > 0.0);
+    // kernel_ms is only meaningful when the planner dispatched to a GPU; on a
+    // CPU-only build (CI linux job) the hybrid probe runs the CPU path (0.0).
+    if (hybrid->last_decision().chosen != gpudb::Backend::CPU) {
+        EXPECT(got.kernel_ms > 0.0);
+    }
     std::printf("  hybrid 100k×500k: matched=%zu dispatch=%s wall=%.3f ms\n",
                 got.matched, gpudb::to_string(hybrid->last_decision().chosen), got.wall_ms);
 }
