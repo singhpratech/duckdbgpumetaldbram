@@ -22,9 +22,12 @@ namespace {
 
 void usage(const char* a0) {
     std::fprintf(stderr,
-        "usage: %s [--db FILE] [--sql QUERY]\n"
+        "usage: %s [--db FILE] [--sql QUERY] [--multi]\n"
         "  --db FILE    use FILE as the DuckDB database (default: in-memory)\n"
-        "  --sql QUERY  run this single SQL statement (default: read stdin)\n", a0);
+        "  --sql QUERY  run this single SQL statement (default: read stdin)\n"
+        "  --multi      split input on ';' and run statements sequentially in\n"
+        "               ONE connection (resident columns persist between\n"
+        "               statements); prints each result + per-statement time\n", a0);
 }
 
 void die(const char* what) {
@@ -57,12 +60,15 @@ int main(int argc, char** argv) {
     std::string db_path = ":memory:";
     std::string sql;
 
+    bool multi = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--db" && i + 1 < argc) {
             db_path = argv[++i];
         } else if (a == "--sql" && i + 1 < argc) {
             sql = argv[++i];
+        } else if (a == "--multi") {
+            multi = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]); return 0;
         } else {
@@ -87,6 +93,42 @@ int main(int argc, char** argv) {
     } catch (const std::exception& e) {
         std::fprintf(stderr, "registration failed: %s\n", e.what());
         duckdb_disconnect(&con); duckdb_close(&db); return 2;
+    }
+
+    if (multi) {
+        // Naive ';' split — good enough for test scripts (no ';' inside
+        // string literals). Statements run on the SAME connection so
+        // resident columns persist between them.
+        std::size_t pos = 0;
+        int stmt_no = 0;
+        int rc = 0;
+        while (pos < sql.size()) {
+            std::size_t semi = sql.find(';', pos);
+            std::string stmt = sql.substr(pos, semi == std::string::npos
+                                                   ? std::string::npos : semi - pos);
+            pos = (semi == std::string::npos) ? sql.size() : semi + 1;
+            // Skip empty/whitespace-only fragments.
+            const std::size_t nonws = stmt.find_first_not_of(" \t\r\n");
+            if (nonws == std::string::npos) continue;
+            ++stmt_no;
+            const auto s0 = std::chrono::steady_clock::now();
+            duckdb_result sr;
+            if (duckdb_query(con, stmt.c_str(), &sr) == DuckDBError) {
+                std::fprintf(stderr, "statement %d failed: %s\n",
+                             stmt_no, duckdb_result_error(&sr));
+                duckdb_destroy_result(&sr);
+                rc = 3;
+                break;
+            }
+            const auto s1 = std::chrono::steady_clock::now();
+            print_result(sr);
+            duckdb_destroy_result(&sr);
+            std::fprintf(stderr, "[gpudb-sql] stmt %d elapsed %.3f ms\n", stmt_no,
+                std::chrono::duration<double, std::milli>(s1 - s0).count());
+        }
+        duckdb_disconnect(&con);
+        duckdb_close(&db);
+        return rc;
     }
 
     const auto t0 = std::chrono::steady_clock::now();

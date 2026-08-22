@@ -14,6 +14,28 @@ const char* to_string(Backend b) noexcept {
     return "?";
 }
 
+// Default for backends that haven't opted into the fused resident join yet
+// (CUDA today). Non-pure so adding the op doesn't break their builds.
+JoinAggResult Aggregator::join_sum_resident_i64(const ResidentColumn&,
+                                                const ResidentColumn&,
+                                                const ResidentColumn&,
+                                                JoinKind) {
+    throw std::runtime_error("join_sum_resident_i64: not implemented on this backend");
+}
+
+JoinAggResult Aggregator::join_sum_resident_f64(const ResidentColumn&,
+                                                const ResidentColumn&,
+                                                const ResidentColumn&,
+                                                JoinKind) {
+    throw std::runtime_error("join_sum_resident_f64: not implemented on this backend");
+}
+
+JoinRowsResult Aggregator::join_rows_resident(const ResidentColumn&,
+                                              const ResidentColumn&,
+                                              JoinKind, std::size_t) {
+    throw std::runtime_error("join_rows_resident: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

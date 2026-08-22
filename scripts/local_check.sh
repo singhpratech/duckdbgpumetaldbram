@@ -85,6 +85,10 @@ if [ "$NO_BENCH" = "0" ]; then
     hr "smoke groupby (1M rows × 1K groups)"
     ./build-linux/bin/gpudb-groupby-bench --rows 1000000 --groups 1000 --runs 2
     green "groupby smoke OK"
+
+    hr "smoke hashjoin (100k build × 500k probe)"
+    ./build-linux/bin/gpudb-hashjoin-bench --build 100000 --probe 500000 --runs 2
+    green "hashjoin smoke OK"
 fi
 
 if [ "$NO_EXT" = "0" ]; then

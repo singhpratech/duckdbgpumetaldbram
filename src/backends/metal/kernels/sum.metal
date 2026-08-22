@@ -258,3 +258,177 @@ kernel void agg_all_partials_i64(
 // CPU path inside metal_aggregator.mm (transfer cost is zero on UMA, so the
 // overhead is just the host-side reduction). See the host file for the
 // fallback implementation.
+
+// ===================== fused join-sum (v0.5) =====================
+//
+// Inner equi-join + SUM in one pass, against a build-side key column that
+// has been radix-sorted once and cached on its resident column. Each probe
+// element binary-searches its multiplicity m in the sorted build keys and
+// contributes m * payload[i]; probe keys and payload stream sequentially.
+// Multiply and accumulate are ulong (unsigned wrap — the cross-backend rule;
+// the CPU reference does the same, so results are bit-identical).
+
+// mode: 0=INNER (c=m), 1=LEFT (c=max(m,1)), 2=SEMI (c=m?1:0), 3=ANTI (c=m?0:1)
+// — mirrors gpudb::JoinKind; see the multiplier table in gpu_backend.hpp.
+kernel void join_sum_i64(
+    device const long*  probe_keys   [[buffer(0)]],
+    device const long*  payload      [[buffer(1)]],
+    device const long*  build_sorted [[buffer(2)]],
+    device long*        partials     [[buffer(3)]],   // 2 per block: sum, matched
+    constant uint&      n_probe      [[buffer(4)]],
+    constant uint&      n_build      [[buffer(5)]],
+    constant uint&      mode         [[buffer(6)]],
+    uint                tid          [[thread_position_in_threadgroup]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                gsize        [[threads_per_grid]],
+    uint                block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup long shm_sum[BLOCK];
+    threadgroup long shm_cnt[BLOCK];
+
+    ulong local_sum = 0;
+    long  local_cnt = 0;
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        // lower_bound
+        uint lo = 0, hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+        }
+        const uint first = lo;
+        // upper_bound, resuming from lower_bound
+        hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+        }
+        const uint m = lo - first;
+        uint c;
+        switch (mode) {
+            case 1:  c = m ? m : 1; break;   // LEFT
+            case 2:  c = m ? 1 : 0; break;   // SEMI
+            case 3:  c = m ? 0 : 1; break;   // ANTI
+            default: c = m;         break;   // INNER
+        }
+        if (c != 0) {
+            local_sum += (ulong)c * (ulong)payload[i];
+            local_cnt += (long)c;
+        }
+    }
+    shm_sum[tid] = (long)local_sum;
+    shm_cnt[tid] = local_cnt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shm_sum[tid] += shm_sum[tid + s];
+            shm_cnt[tid] += shm_cnt[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        partials[2 * block_id]     = shm_sum[0];
+        partials[2 * block_id + 1] = shm_cnt[0];
+    }
+}
+
+kernel void join_sum_partials_i64(
+    device const long* partials [[buffer(0)]],
+    device long*       out      [[buffer(1)]],    // out[0]=sum, out[1]=matched
+    constant uint&     n_blocks [[buffer(2)]],
+    uint               tid      [[thread_position_in_threadgroup]])
+{
+    threadgroup long shm_sum[BLOCK];
+    threadgroup long shm_cnt[BLOCK];
+    long ls = 0, lc = 0;
+    for (uint i = tid; i < n_blocks; i += BLOCK) {
+        ls += partials[2 * i];
+        lc += partials[2 * i + 1];
+    }
+    shm_sum[tid] = ls;
+    shm_cnt[tid] = lc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shm_sum[tid] += shm_sum[tid + s];
+            shm_cnt[tid] += shm_cnt[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        out[0] = shm_sum[0];
+        out[1] = shm_cnt[0];
+    }
+}
+
+// Multiplicity-only variant for the f64-payload join: the GPU performs the
+// binary searches (the random-access part it is fast at) and writes each
+// probe element's per-kind contribution count c[i]; the host then streams
+// sum += c[i] * payload_f64[i] in one sequential pass (no doubles in MSL).
+kernel void join_mult_i64(
+    device const long*  probe_keys   [[buffer(0)]],
+    device const long*  build_sorted [[buffer(1)]],
+    device uint*        mult         [[buffer(2)]],
+    constant uint&      n_probe      [[buffer(3)]],
+    constant uint&      n_build      [[buffer(4)]],
+    constant uint&      mode         [[buffer(5)]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                gsize        [[threads_per_grid]])
+{
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        uint lo = 0, hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+        }
+        const uint first = lo;
+        hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+        }
+        const uint m = lo - first;
+        uint c;
+        switch (mode) {
+            case 1:  c = m ? m : 1; break;   // LEFT
+            case 2:  c = m ? 1 : 0; break;   // SEMI
+            case 3:  c = m ? 0 : 1; break;   // ANTI
+            default: c = m;         break;   // INNER
+        }
+        mult[i] = c;
+    }
+}
+
+// Lookup variant for the row-returning join: per probe element, write the
+// build-side match count m[i] and the first-match position first[i] in the
+// SORTED build keys (meaningful only when m[i] > 0). Kind-independent —
+// the host applies the JoinKind emission rules using these two arrays plus
+// the sort permutation.
+kernel void join_lookup_i64(
+    device const long*  probe_keys   [[buffer(0)]],
+    device const long*  build_sorted [[buffer(1)]],
+    device uint*        mcount       [[buffer(2)]],
+    device uint*        first        [[buffer(3)]],
+    constant uint&      n_probe      [[buffer(4)]],
+    constant uint&      n_build      [[buffer(5)]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                gsize        [[threads_per_grid]])
+{
+    for (uint i = gid; i < n_probe; i += gsize) {
+        const long k = probe_keys[i];
+        uint lo = 0, hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+        }
+        const uint f = lo;
+        hi = n_build;
+        while (lo < hi) {
+            const uint mid = (lo + hi) >> 1;
+            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+        }
+        mcount[i] = lo - f;
+        first[i]  = f;
+    }
+}

@@ -134,6 +134,195 @@ public:
         return run_agg_all_i64(r.as_i64(), r.rows());
     }
 
+    // Same algorithm as the Metal path (sorted build keys + per-probe-element
+    // binary search) so the two backends are directly comparable and produce
+    // identical results: sum accumulates in uint64 for defined wrap.
+    // Per-JoinKind contribution multiplier (see the table in gpu_backend.hpp).
+    static std::uint64_t join_multiplier(std::uint64_t m, JoinKind kind) {
+        switch (kind) {
+            case JoinKind::INNER: return m;
+            case JoinKind::LEFT:  return m ? m : 1;
+            case JoinKind::SEMI:  return m ? 1 : 0;
+            case JoinKind::ANTI:  return m ? 0 : 1;
+        }
+        return 0;
+    }
+
+    JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64(probe_keys);
+        const auto& pl = check_i64(payload);
+        const auto& bk = check_i64(build_keys);
+        if (pk.rows() != pl.rows())
+            throw std::runtime_error(
+                "join_sum_resident_i64: probe_keys and payload row counts differ");
+
+        JoinAggResult r{};
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+        if (pk.rows() == 0 ||
+            (bk.rows() == 0 && kind == JoinKind::INNER) ||
+            (bk.rows() == 0 && kind == JoinKind::SEMI)) {
+            r.wall_ms = elapsed_ms(t0);
+            return r;
+        }
+
+        std::vector<std::int64_t> sorted(bk.as_i64(), bk.as_i64() + bk.rows());
+        std::sort(sorted.begin(), sorted.end());
+
+        const std::int64_t* keys = pk.as_i64();
+        const std::int64_t* pay  = pl.as_i64();
+        struct Part { std::uint64_t sum = 0; std::int64_t matched = 0; };
+        Part total = parallel_chunks<Part>(
+            pk.rows(),
+            [&](std::size_t begin, std::size_t end) {
+                Part p;
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto [lo, hi] = std::equal_range(sorted.begin(), sorted.end(), keys[i]);
+                    const std::uint64_t c =
+                        join_multiplier(static_cast<std::uint64_t>(hi - lo), kind);
+                    if (c) {
+                        p.sum += c * static_cast<std::uint64_t>(pay[i]);
+                        p.matched += static_cast<std::int64_t>(c);
+                    }
+                }
+                return p;
+            },
+            [](Part a, const Part& b) {
+                a.sum += b.sum; a.matched += b.matched; return a;
+            });
+
+        r.sum     = static_cast<std::int64_t>(total.sum);
+        r.matched = total.matched;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    JoinAggResult join_sum_resident_f64(const ResidentColumn& probe_keys,
+                                        const ResidentColumn& payload,
+                                        const ResidentColumn& build_keys,
+                                        JoinKind kind) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64(probe_keys);
+        const auto& pl = check_f64(payload);
+        const auto& bk = check_i64(build_keys);
+        if (pk.rows() != pl.rows())
+            throw std::runtime_error(
+                "join_sum_resident_f64: probe_keys and payload row counts differ");
+
+        JoinAggResult r{};
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+        if (pk.rows() == 0) {
+            r.wall_ms = elapsed_ms(t0);
+            return r;
+        }
+
+        std::vector<std::int64_t> sorted(bk.as_i64(), bk.as_i64() + bk.rows());
+        std::sort(sorted.begin(), sorted.end());
+
+        const std::int64_t* keys = pk.as_i64();
+        const double*       pay  = pl.as_f64();
+        struct Part { double sum = 0.0; std::int64_t matched = 0; };
+        Part total = parallel_chunks<Part>(
+            pk.rows(),
+            [&](std::size_t begin, std::size_t end) {
+                Part p;
+                for (std::size_t i = begin; i < end; ++i) {
+                    auto [lo, hi] = std::equal_range(sorted.begin(), sorted.end(), keys[i]);
+                    const std::uint64_t c =
+                        join_multiplier(static_cast<std::uint64_t>(hi - lo), kind);
+                    if (c) {
+                        p.sum += static_cast<double>(c) * pay[i];
+                        p.matched += static_cast<std::int64_t>(c);
+                    }
+                }
+                return p;
+            },
+            [](Part a, const Part& b) {
+                a.sum += b.sum; a.matched += b.matched; return a;
+            });
+
+        r.sum_f64 = total.sum;
+        r.matched = total.matched;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    JoinRowsResult join_rows_resident(const ResidentColumn& probe_keys,
+                                      const ResidentColumn& build_keys,
+                                      JoinKind kind, std::size_t max_rows) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64(probe_keys);
+        const auto& bk = check_i64(build_keys);
+
+        JoinRowsResult r{};
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+        const std::size_t n_probe = pk.rows();
+        const std::size_t n_build = bk.rows();
+        if (n_probe == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        // Sort (key, original index) pairs so emitted build indices refer to
+        // upload order — the same contract as the Metal perm cache.
+        std::vector<std::pair<std::int64_t, std::int64_t>> sorted(n_build);
+        for (std::size_t j = 0; j < n_build; ++j)
+            sorted[j] = { bk.as_i64()[j], static_cast<std::int64_t>(j) };
+        std::sort(sorted.begin(), sorted.end());
+
+        const std::int64_t* keys = pk.as_i64();
+        auto run_of = [&](std::int64_t k) {
+            auto lo = std::lower_bound(sorted.begin(), sorted.end(),
+                                       std::make_pair(k, std::numeric_limits<std::int64_t>::min()));
+            auto hi = std::upper_bound(sorted.begin(), sorted.end(),
+                                       std::make_pair(k, std::numeric_limits<std::int64_t>::max()));
+            return std::make_pair(lo, hi);
+        };
+
+        // Pass 1: per-row output count (the JoinKind multiplier).
+        std::size_t total = 0;
+        std::vector<std::uint32_t> cnt(n_probe);
+        for (std::size_t i = 0; i < n_probe; ++i) {
+            auto [lo, hi] = run_of(keys[i]);
+            const std::uint64_t m = static_cast<std::uint64_t>(hi - lo);
+            const std::uint64_t c = join_multiplier(m, kind);
+            cnt[i] = static_cast<std::uint32_t>(c);
+            total += c;
+        }
+        if (total > max_rows)
+            throw std::runtime_error(
+                "join_rows_resident: result has " + std::to_string(total) +
+                " rows, above the cap of " + std::to_string(max_rows) +
+                " (raise GPUDB_JOIN_ROWS_MAX_M if intentional)");
+
+        // Pass 2: fill.
+        r.probe_idx.resize(total);
+        r.build_idx.resize(total);
+        std::size_t off = 0;
+        for (std::size_t i = 0; i < n_probe; ++i) {
+            if (!cnt[i]) continue;
+            auto [lo, hi] = run_of(keys[i]);
+            const bool has_match = lo != hi;
+            if ((kind == JoinKind::INNER || kind == JoinKind::LEFT) && has_match) {
+                for (auto it = lo; it != hi; ++it) {
+                    r.probe_idx[off] = static_cast<std::int64_t>(i);
+                    r.build_idx[off] = it->second;
+                    ++off;
+                }
+            } else {
+                // LEFT-unmatched, SEMI, ANTI: single row, NULL build side.
+                r.probe_idx[off] = static_cast<std::int64_t>(i);
+                r.build_idx[off] = -1;
+                ++off;
+            }
+        }
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
 private:
     enum class ReduceKind { Sum, Min, Max };
 

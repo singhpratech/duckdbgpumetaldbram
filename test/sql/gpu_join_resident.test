@@ -1,0 +1,102 @@
+# gpu_join_resident SQL test — fused resident joins (v0.5.0):
+#   gpu_join_sum_resident / gpu_join_count_resident / gpu_join_sum_resident_f64
+#   and the left / semi / anti variants, all over gpu_upload_pair'd columns.
+#
+# Same one-statement pattern as gpu_resident.test: the suite runs every query
+# in a fresh gpudb-sql process, so uploads and the join read happen in ONE
+# statement. Every outer query references each upload's count column (u1.n1,
+# u2.n2) — an unreferenced upload subquery is pruned and never runs.
+#
+# Fixture (used by tests 1-8):
+#   probe (k, v) = (1,10) (2,20) (3,30) (2,25)      build (k) = 2, 2, 5
+#   Key 2 appears twice on the build side, so INNER/LEFT carry multiplicity 2.
+#
+# Row-returning gpu_join_rows_resident needs sequential statements (--multi)
+# and is covered by scripts/join_parity_check.sh instead.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_join_resident
+
+-- 1. INNER sum: matched rows (20+25) x build multiplicity 2 = 90
+SELECT gpu_join_sum_resident('p1.k', 'p1.v', 'b1') AS s, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p1', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b1', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 90  4  3
+
+-- 2. INNER count: 2 probe rows x 2 build rows = 4 joined pairs
+SELECT gpu_join_count_resident('p2.k', 'b2') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p2', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b2', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 4  4  3
+
+-- 3. LEFT sum: unmatched rows once (10+30) + matched with multiplicity (90) = 130
+SELECT gpu_left_join_sum_resident('p3.k', 'p3.v', 'b3') AS s, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p3', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b3', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 130  4  3
+
+-- 4. LEFT count: 1 + 2 + 1 + 2 = 6 output rows
+SELECT gpu_left_join_count_resident('p4.k', 'b4') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p4', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b4', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 6  4  3
+
+-- 5. SEMI sum / count: each matching probe row once, regardless of build dups
+SELECT gpu_semi_join_sum_resident('p5.k', 'p5.v', 'b5') AS s,
+       gpu_semi_join_count_resident('p5.k', 'b5') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p5', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b5', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 45  2  4  3
+
+-- 6. ANTI sum / count: probe rows with no build match (10+30)
+SELECT gpu_anti_join_sum_resident('p6.k', 'p6.v', 'b6') AS s,
+       gpu_anti_join_count_resident('p6.k', 'b6') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p6', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b6', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 40  2  4  3
+
+-- 7. DOUBLE payload: INNER f64 sum = 90 / 4 = 22.5 (payload uploaded as v/4.0)
+SELECT gpu_join_sum_resident_f64('p7.k', 'p7.v', 'b7') AS s, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p7', k, (v / 4.0)::DOUBLE) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b7', k) AS n2 FROM (VALUES (2),(2),(5)) t(k)) u2;
+-- expect: 22.5  4  3
+
+-- 8. No rows join: sum is SQL NULL (like native sum over an empty join), count is 0
+SELECT gpu_join_sum_resident('p8.k', 'p8.v', 'b8') IS NULL AS sum_is_null,
+       gpu_join_count_resident('p8.k', 'b8') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p8', k, v) AS n1 FROM (VALUES (1,10),(2,20),(3,30),(2,25)) t(k,v)) u1,
+     (SELECT gpu_upload('b8', k) AS n2 FROM (VALUES (9),(11)) t(k)) u2;
+-- expect: true  0  4  2
+
+-- 9. Parity with native DuckDB, dup keys both sides (100k probe, build keys 0..2 x3)
+SELECT gpu_join_sum_resident('p9.k', 'p9.v', 'b9')
+         IS NOT DISTINCT FROM (SELECT sum(p.v) FROM (SELECT (range % 5)::BIGINT AS k, range::BIGINT AS v FROM range(100000)) p
+                                                  JOIN (SELECT (range % 3)::BIGINT AS k FROM range(9)) b ON p.k = b.k) AS sum_matches,
+       gpu_join_count_resident('p9.k', 'b9')
+         IS NOT DISTINCT FROM (SELECT count(*) FROM (SELECT (range % 5)::BIGINT AS k FROM range(100000)) p
+                                                   JOIN (SELECT (range % 3)::BIGINT AS k FROM range(9)) b ON p.k = b.k) AS count_matches,
+       u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p9', (range % 5)::BIGINT, range::BIGINT) AS n1 FROM range(100000)) u1,
+     (SELECT gpu_upload('b9', (range % 3)::BIGINT) AS n2 FROM range(9)) u2;
+-- expect: true  true  100000  9
+
+-- 10. All four kinds vs native in one statement, negative keys, ~50% match
+SELECT gpu_left_join_sum_resident('p10.k', 'p10.v', 'b10')
+         IS NOT DISTINCT FROM (SELECT sum(p.v) FROM (SELECT (range % 1000 - 500)::BIGINT AS k, (range % 33 - 16)::BIGINT AS v FROM range(20000)) p
+                                                  LEFT JOIN (SELECT (range % 800 - 400)::BIGINT AS k FROM range(5000)) b ON p.k = b.k) AS left_ok,
+       gpu_semi_join_sum_resident('p10.k', 'p10.v', 'b10')
+         IS NOT DISTINCT FROM (SELECT sum(v) FROM (SELECT (range % 1000 - 500)::BIGINT AS k, (range % 33 - 16)::BIGINT AS v FROM range(20000)) p
+                               WHERE EXISTS (SELECT 1 FROM (SELECT (range % 800 - 400)::BIGINT AS k FROM range(5000)) b WHERE b.k = p.k)) AS semi_ok,
+       gpu_anti_join_count_resident('p10.k', 'b10')
+         IS NOT DISTINCT FROM (SELECT count(*) FROM (SELECT (range % 1000 - 500)::BIGINT AS k FROM range(20000)) p
+                               WHERE NOT EXISTS (SELECT 1 FROM (SELECT (range % 800 - 400)::BIGINT AS k FROM range(5000)) b WHERE b.k = p.k)) AS anti_ok,
+       u1.n1, u2.n2
+FROM (SELECT gpu_upload_pair('p10', (range % 1000 - 500)::BIGINT, (range % 33 - 16)::BIGINT) AS n1 FROM range(20000)) u1,
+     (SELECT gpu_upload('b10', (range % 800 - 400)::BIGINT) AS n2 FROM range(5000)) u2;
+-- expect: true  true  true  20000  5000
+
+-- 11. Guardrail: f64 keys are rejected with a clear error (keys must be BIGINT)
+-- expected_fail: gpu_join_*_resident operates on BIGINT resident columns
+SELECT gpu_join_count_resident('p11', 'b11') AS c, u1.n1, u2.n2
+FROM (SELECT gpu_upload('p11', (range / 2.0)::DOUBLE) AS n1 FROM range(10)) u1,
+     (SELECT gpu_upload('b11', range::BIGINT) AS n2 FROM range(10)) u2;
+-- expect: (error)

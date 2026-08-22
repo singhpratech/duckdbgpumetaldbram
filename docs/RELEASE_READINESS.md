@@ -63,7 +63,7 @@ target_link_libraries(gpudb_ext PUBLIC
 )
 ```
 
-This is being addressed by `feat/ext-macos-validate` (in flight). Owner: Linux Claude per CLAUDE.md ownership of `src/extension/`.
+This is documented in [MACOS_EXTENSION_BUILD.md](docs/MACOS_EXTENSION_BUILD.md). Resolved for current builds.
 
 ### 2. CI workflow is disabled
 
@@ -107,14 +107,17 @@ Our local builds cover Linux x86_64 and macOS arm64. Need CI matrix to cover the
 
 ---
 
-## 📋 Open PRs that affect release readiness
+## 📋 Recently landed (v0.1.4)
 
-| PR | Branch | What it adds | Merge order |
-|---|---|---|---|
-| #5 | `feat/metal-groupby-radix-gpu` | Metal GROUP BY radix sort + GPU scan + min-max (peak 4.89×) | merge first |
-| (in flight) | `feat/metal-multiagg` | `agg_all_i64` operator (sum+min+max+count one pass) | parallel agent — under review |
-| (in flight) | `feat/ext-macos-validate` | macOS extension build validation + fixes | **MUST land for macOS in submission** |
-| (in flight) | `feat/metal-hashjoin-scaffold` | Hash-join interface + CPU + Metal stub | optional for v1 |
+| Feature | What it adds |
+|---|---|
+| Metal hash join | Adaptive global slot-lock + partitioned TG hash; `gpu_inner_join` SQL |
+| Hybrid hash join | `HybridHashJoinProbe` size-based CPU/GPU dispatch |
+| GPU segment-reduce | On-device segment boundaries after Metal radix GROUP BY sort |
+| Extension hybrid | `gpu_sum` / `gpu_min` / `gpu_max` and GROUP BY use hybrid planner |
+
+Older release-track items (community extension submission, multi-agg fusion, etc.)
+are tracked in GitHub issues and prior release notes.
 
 ---
 
