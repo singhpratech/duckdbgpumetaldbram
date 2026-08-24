@@ -134,9 +134,11 @@ fallback on Linux. The Linux build is **CUDA-ready**: gpudb's build auto-enables
 the CUDA backend the moment the registry's build tooling ships its CUDA
 toolchain (already merged upstream in extension-ci-tools `main`); until then,
 build from source for CUDA. Check any binary with `SELECT gpu_build_info();`.
-The registry serves the **v0.4.0** build (merged 2026-08-17), including the
+The registry serves the **v0.5.0** build (merged 2026-08-24), including the
 full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
-…). Installed an earlier version? `UPDATE EXTENSIONS;` pulls the latest.
+…) and the GPU join functions (`gpu_upload_pair`, `gpu_join_*_resident`,
+`gpu_join_rows_resident`). Installed an earlier version? `UPDATE EXTENSIONS;`
+pulls the latest.
 
 ### Option B — load a prebuilt release binary
 
@@ -177,6 +179,19 @@ duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.du
 # OR run via the embedded SQL CLI shipped in this repo
 ./build-linux/bin/gpudb-sql --sql "SELECT gpu_sum(range::BIGINT) FROM range(1000000);"
 ```
+
+#### CUDA requirements (build from source on Linux)
+
+| | Supported | Notes |
+|---|---|---|
+| **CUDA Toolkit** | **13.0** (verified: 13.0.88, all benchmarks) | Only standard runtime APIs are used (`cudaMalloc`/`cudaMemcpyAsync`/streams, no CUB/Thrust/cooperative groups), so 12.x toolkits are expected to build too — untested by us; if you build on one, please open an issue with your `nvcc --version` either way. C++17 host + device. |
+| **NVIDIA driver** | **580.x** (verified) | Any driver that supports your toolkit (NVIDIA's minimum for 13.0 is R580; for 12.x, R525+). Runtime linking: `-DGPUDB_CUDA_STATIC_RUNTIME=ON` (what the registry build in the root `Makefile` uses; off by default in `scripts/build.sh`) bakes `cudart` into the extension, so the only runtime dependency is `libcuda.so` from the driver — and the extension still loads on machines with no GPU/driver, falling back to CPU. |
+| **GPUs** | **sm_75 – sm_90**: Turing (T4, RTX 20xx), Ampere (A100, RTX 30xx), Ada (RTX 40xx, L4/L40), Hopper (H100) | Default fatbin: `75;80;86;89;90`, each with SASS + PTX. Newer parts (Blackwell / RTX 50xx, sm_100+) load via PTX JIT from `compute_90` — should work, not yet measured. **Volta (sm_70) and older are not supported**: CUDA 13 dropped them from `nvcc`. Override with `-DCMAKE_CUDA_ARCHITECTURES=...` or `CUDAARCHS=...` (the Colab notebook builds `CUDAARCHS=75` for its T4). |
+
+Verified configuration: RTX 4090 Laptop (sm_89, 16 GB), CUDA 13.0.88, driver
+580.x, Linux — every CUDA number in this README and BENCHMARK.md comes from
+that box. `SELECT gpu_build_info();` reports whether any given binary was
+compiled with CUDA and which backend it picked at runtime.
 
 ### Option D (TPC-H reproducibility)
 
