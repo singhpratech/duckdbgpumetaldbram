@@ -170,7 +170,7 @@ docker run --rm duckdb-gpudb -c "LOAD gpudb; SELECT gpu_sum(value::BIGINT) FROM 
 
 ## 4. Self-hosted CUDA runner (full GPU on Linux)
 
-If you have a self-hosted runner with an NVIDIA GPU (sm_70+), build once and
+If you have a self-hosted runner with an NVIDIA GPU (sm_75+, Turing or newer), build once and
 cache the artifact:
 
 ```yaml
