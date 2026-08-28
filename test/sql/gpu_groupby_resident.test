@@ -196,3 +196,21 @@ SELECT * FROM gpu_groupby_sum_resident_topk('h', 0, 'desc');
 SELECT * FROM gpu_groupby_sum_resident_having('h', '>', 15);
 -- expect: 2  20  1
 -- expect: 3  30  1
+
+-- 32. DOUBLE top-k: NaN sums are the greatest (DuckDB ORDER BY rule), listed first DESC
+-- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
+SELECT key, isnan(sum) FROM gpu_groupby_sum_resident_f64_topk('nan', 2, 'desc') ORDER BY key;
+-- expect: 3  true
+-- expect: 6  true
+
+-- 33. DOUBLE top-k ASC: NaN last, -inf first
+-- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
+SELECT key, sum FROM gpu_groupby_sum_resident_f64_topk('nan', 3, 'asc');
+-- expect: 2  -inf
+-- expect: 5  -10.0
+-- expect: 4  10.0
+
+-- 34. DOUBLE HAVING drops NaN groups: sum >= -inf keeps everything except the two NaN groups
+-- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
+SELECT count(*), min(key), max(key) FROM gpu_groupby_sum_resident_f64_having('nan', '>=', '-inf'::DOUBLE);
+-- expect: 4  1  5
