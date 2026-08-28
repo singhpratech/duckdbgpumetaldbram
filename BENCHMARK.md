@@ -212,10 +212,17 @@ LIMIT 10` over the same GROUP BY.
 With the filter on the device the transfer column is 20–60 µs and the
 statement is the kernel plus DuckDB's fixed per-statement cost: the on-device
 number has become the end-to-end number, which is the point of the feature.
-(B′) and (G) at SF50 are bimodal (42 ↔ 78 ms and 86 ↔ 123 ms; the SM clock
-was sampled between 1665 and 2400 MHz across the runs — laptop boost, same
-pattern as the v0.5 joins); the ranges above span both modes, from a second
-clean-rebuild pass on 07706c4. (G) pays a full radix sort of the aggregates
+(B′) and (G) at SF50 are bimodal (42 ↔ 78 ms and 86 ↔ 123 ms). Clock note
+from the second, clean-rebuild pass on 07706c4 (`nvidia-smi` sampled
+between sets): SM clock 1815 MHz idle, 1665–2400 MHz across the sets
+(laptop boost, not pinned), memory clock 9001 MHz throughout, GPU
+temperature 42 → 51 °C over the pass — the same pattern as the v0.5 joins.
+The ranges above span both modes. Raw lines for (G) SF50 from that pass
+(statement ms, then `gpu_last_stats`): native 1023.1 / 1037.7 / 1025.9;
+gpudb 86.0 / 122.9 / 115.1 with `wall_ms` 78.3 / 115.2 / 107.4, `kernel_ms`
+78.3 / 115.2 / 107.4, `transfer_ms` 0.044 / 0.026 / 0.030, `rows_out=10`,
+`groups=75000000`; SF10: native 221.6 / 215.6 / 211.1, gpudb 22.5 / 24.6 /
+25.7 (`kernel_ms` 18.0 / 20.2 / 21.4). (G) pays a full radix sort of the aggregates
 (15M ≈ 17 ms, 75M ≈ 80–115 ms) before taking the first 10 — a radix-select
 would cut that; measured and shipped as is.
 
