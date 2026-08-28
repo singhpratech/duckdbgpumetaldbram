@@ -158,10 +158,15 @@ host. `DOUBLE` sums are finished on the host (no doubles in MSL), so their
 filter runs on the host through the reference implementation — the win
 there is only the row streaming.
 
-CUDA: `count_if` on the survivors → cap check → `copy_if` into the output
-(key order preserved); top-k sorts `(aggregate, index)` pairs with a radix
-sort and gathers the first k. The device→host copy is the survivors only,
-which on PCIe is the whole point.
+CUDA: CUB on explicit temp storage throughout — survivors counted and
+selected with `DeviceSelect` (key order preserved) after the cap check;
+top-k is the same 8-pass radix select over order keys (i64 sign flip; f64
+sign-magnitude fold with every NaN greatest) plus a compaction of the
+strictly-better class and exactly enough ties, falling back to a full
+`DeviceRadixSort` when k ≥ groups/8. The device→host copy is the survivors
+only, which on PCIe is the whole point. Because every step owns its scratch,
+a device fault inside a primitive surfaces as a SQL error instead of
+aborting the process (pinned by a re-exec fault-injection unit test).
 
 CPU: sort + run-length reduce as before, then the reference filter.
 
