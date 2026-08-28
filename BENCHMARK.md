@@ -162,51 +162,64 @@ build cache for such key sets — see KNOWN_ISSUES); every row above is from
 the fixed build, and the shape is now a regression scenario in both parity
 harnesses.
 
-### NVIDIA RTX 4090 Laptop (CUDA) — sm_89, 16 GB, driver 580.178.04, CUDA 13.0.88, CUB 3.0.1; native DuckDB CLI v1.5.5
+### NVIDIA RTX 4090 Laptop (CUDA) — sm_89, 16 GB, driver 580.178.04, CUDA 13.0.88, CUB 3.0.1; native and embedded engine both DuckDB v1.5.2
 
-Branch `feat/cuda-groupby-resident`, clean rebuild. Native: DuckDB CLI
-v1.5.5 (d8cdaa33fd) `-readonly`, 20 threads, `.timer on`, each query 5× in
-one process, run 1 discarded, min–max of the rest. gpudb: `gpudb-sql
---multi`, uploads as earlier statements, `gpu_last_stats()` `wall_ms` of the
-warm calls (min–max of 2–4 calls; the cold first call, which includes the
-one-time key sort, listed separately). The statement time DuckDB itself
-measures is in brackets — it is higher than `wall_ms` because the table
-function's rows still stream through DuckDB's pipeline. Every row
-`backend=CUDA reason=Hot_GpuAlwaysWins`. SF50 used
-`GPUDB_UPLOAD_POOL_MAX_MB=12288`.
+Branch `feat/cuda-groupby-resident` @ 71d9321, clean rebuild. Native and
+gpudb timed by the **same clock in the same process**: `gpudb-sql --multi`
+(embedded libduckdb v1.5.2) runs each native shape 3× as plain SQL, then
+the upload, then the gpudb shape 3×; the per-statement time gpudb-sql prints
+is the number in both columns (first run of each discarded, min–max of the
+other two). So "end-to-end" is statement-vs-statement and includes streaming
+the table function's rows through DuckDB's pipeline; `wall_ms` /
+`kernel_ms` / `transfer_ms` from `gpu_last_stats()` are the breakdown of the
+operator inside that statement. Every row `backend=CUDA
+reason=Hot_GpuAlwaysWins`. SF50 used `GPUDB_UPLOAD_POOL_MAX_MB=12288`, with
+(C), (E), (F), (F′) in separate processes from (A)/(B)/(D) (memory budget,
+below). Both ratios are always printed together: **end-to-end = native
+statement / gpudb statement; on-device = native statement / `kernel_ms`.**
 
-| measurement | SF | native (ms) | gpudb warm `wall_ms` [stmt] | `kernel_ms` | `transfer_ms` | cold first call | end-to-end / on-device | result check |
-|---|---|---:|---:|---:|---:|---:|---:|---|
-| (A) sum i64, 15M groups | 10 | 130–137 | 73.4–75.5 [95–99] | 4.5–4.6 | 68.8–71.0 | 117 [139] | **1.8× / 29×** | 15,000,000 groups == native |
-| (A) sum i64, 75M groups | 50 | 631–646 | 362–368 [457–459] | 21.3 | 341–347 | 544 [636] | **1.75× / 30×** | 75,000,000 == native |
-| (B) HAVING sum > 300 | 10 | 195–200 | 74.6–74.8 [102] | 4.5 | 70.0–70.3 | — | **2.6× / 43×** | 624 groups == native |
-| (B) HAVING sum > 300 | 50 | 959–988 | 365–368 [495–498] | 21.3 | 343–346 | — | **2.65× / 45×** | 3,182 == native |
-| (C) sum f64 | 10 | 189–199 | 72.9–74.5 [102] | 4.6 | 68.3–70.0 | 117 | **2.6× / 42×** | sum-of-sums rel-diff 9e-14 |
-| (C) sum f64 | 50 | 942–955 | 364–371 [491–500] | 21.3–21.4 | 342–350 | 553 | **2.6× / 44×** | rel-diff 1.1e-13 |
-| (D) count | 10 | 130–132 | 48.3–50.0 [63–64] | 2.5–2.6 | 45.8–47.4 | — | **2.7× / 51×** | 15,000,000 == native |
-| (D) count | 50 | 635–654 | 235–244 [298–308] | 11.6–11.7 | 223–232 | — | **2.7× / 55×** | 75,000,000 == native |
-| (E) top-10 DESC | 10 | 25–29 | 0.022–0.028 [0.2] | 0.002 | 0.015 | 33.9 (the sort) | cold **0.8× — native wins**; warm ~1000× | values == native |
-| (E) top-10 DESC | 50 | 121–127 | 0.022–0.027 [0.2] | 0.002 | 0.015 | 170.5 (the sort) | cold **0.7× — native wins**; warm ~5000× | values == native |
-| (F) 4 groups, hashed key | 10 | 167–172 | 4.5 [4.8] | 4.4 | 0.02 | 44.4 | **37× / 38×** (see note) | 4 groups, 1,529,738,036 == native |
-| (F) 4 groups, hashed key | 50 | 731–759 | 26.6 [28] | 26.6 | 0.02 | 200 | **28× / 28×** (see note) | 4 groups, 7,650,052,980 == native |
-| (F′) 7 groups, plain BIGINT key (`l_linenumber`) | 10 | 31–32 | 5.9 | 5.9 | 0.02 | 47 | **5.3× / 5.3×** | 1,529,738,036 == native |
-| (F′) 7 groups, plain BIGINT key | 50 | 151–158 | 28.8 | 28.8 | 0.02 | 208 | **5.3× / 5.3×** | 7,650,052,980 == native |
+| measurement | SF | native stmt (ms) | gpudb stmt (ms) | `wall_ms` | `kernel_ms` | `transfer_ms` | cold first stmt | end-to-end / on-device | result check |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| (A) sum i64, 15M groups | 10 | 135–138 | 96.4–97.4 | 75–76 | 4.5–4.7 | 70.5–71.7 | 141 | **1.4× / 29×** | 15,000,000 groups == native |
+| (A) sum i64, 75M groups | 50 | 684–693 | 458–464 | 362–368 | 21.4 | 340–347 | 651 | **1.5× / 32×** | 75,000,000 == native |
+| (B) HAVING sum > 300 | 10 | 204–209 | 105–106 | 76.5–76.8 | 4.5–4.7 | 72.0–72.2 | — | **2.0× / 45×** | 624 groups == native |
+| (B) HAVING sum > 300 | 50 | 991–1013 | 491–505 | 364–371 | 21.3–21.4 | 343–349 | — | **2.0× / 47×** | 3,182 == native |
+| (C) sum f64 | 10 | 206–213 | 104–106 | 76–77 | 4.6 | 71.5–72.4 | 149 | **2.0× / 45×** | sum-of-sums rel-diff 9e-14 |
+| (C) sum f64 | 50 | 982–994 | 498–503 | 368–369 | 21.4 | 347 | 674 | **2.0× / 46×** | rel-diff 1.1e-13 |
+| (D) count | 10 | 135–140 | 64.5–66.0 | 49–50 | 2.5–2.7 | 46.7–47.4 | — | **2.1× / 52×** | 15,000,000 == native |
+| (D) count | 50 | 672–687 | 309–314 | 246–248 | 11.6–11.7 | 234–236 | — | **2.2× / 58×** | 75,000,000 == native |
+| (E) top-10 DESC | 10 | 31.0–31.5 | 0.14–0.27 | 0.03 | 0.002 | 0.015 | 34.6 (the sort) | cold **0.9× — native wins**; warm ≈120–220× | values == native |
+| (E) top-10 DESC | 50 | 145–146 | 0.16–0.28 | 0.03 | 0.002 | 0.02 | 169 (the sort) | cold **0.85× — native wins**; warm ≈500–900× | values == native |
+| (F) 4 groups, packed-ascii key | 10 | 106–110 | 4.7–7.5 | 4.4–7.1 | 4.4–7.1 | 0.015 | 46.6 | **14–23× / 15–25×** | 4 groups, 1,529,738,036 == native |
+| (F) 4 groups, packed-ascii key | 50 | 433–439 | 28.0–28.2 | 26.7–26.9 | 26.6–26.9 | 0.017 | 197 | **15.5× / 16×** | 4 groups, 7,650,052,980 == native |
+| (F′) 7 groups, `l_linenumber` | 10 | 34.4–35.8 | 6.3–9.2 | 6.0–8.8 | 6.0–8.8 | 0.016 | 48.7 | **3.7–5.6× / 3.9–6×** | 7 groups, 1,529,738,036 == native |
+| (F′) 7 groups, `l_linenumber` | 50 | 185–186 | 34.1–38.2 | 33.4–36.9 | 33.3–36.8 | 0.017 | 209 | **4.9–5.4× / 5–5.6×** | 7 groups, 7,650,052,980 == native |
 
-One-time costs, stated plainly: the upload statement is 4.6–4.7 s for a
-pair at SF10 (3.5 s for a single column) and 19.7–24.4 s at SF50 (15.6 s
+Headline for this machine: **≈1.5–2.2× end-to-end, ≈30–58× on-device** for
+the high-cardinality shapes (A)–(D) — both numbers, always together. The
+earlier draft of this subsection compared native statement time against
+the operator's `wall_ms`, which omits the ≈20–30 % of the statement DuckDB
+spends streaming 15M–75M result rows out of the table function; the
+corrected column is the statement time. (F) uses the same packed-ascii key
+as the Metal rows, `(ascii(l_returnflag)*256+ascii(l_linestatus))::BIGINT`.
+
+One-time costs, stated plainly: the upload statement is 3.4–3.9 s for a
+pair at SF10 (2.1 s for a single column) and 15.9–18.4 s at SF50 (7.6 s
 single); the first call on a key column pays its sort (≈35 ms at SF10,
 ≈170 ms at SF50) once, after which every GROUP BY / top-k on that key skips
-it. Break-even for (A) is ≈80 repeated calls at either scale (≈57 ms saved per call at SF10, ≈275 ms at SF50).
+it. Break-even for (A) is ≈95 repeated statements at SF10 (≈40 ms saved
+each), ≈80 at SF50 (≈230 ms each).
 
-**Where the wall time goes (A–D).** The kernel is 4–5% of the end-to-end
-number; the rest is the result crossing device→host: 15M × 24 B = 360 MB
-at SF10, 1.8 GB at SF50. Measured on this box for a 120 MB result array:
-the PCIe copy itself is ≈12 ms (≈10 GB/s), but first-touch page-faulting of
-the freshly allocated `std::vector` was ≈27 ms — more than the copy.
-Reserving the vector, advising transparent huge pages on the untouched
-range, then resizing brings the fault cost to ≈11 ms (in this branch;
-Linux-only, no-op where THP is disabled). A pinned, double-buffered staging
-path was implemented, measured (no change: the copy was never the
+**Where the statement time goes (A–D).** The kernel is 3–5 % of the
+statement; ≈75 % is the result crossing device→host (15M × 24 B = 360 MB at
+SF10, 1.8 GB at SF50) and ≈20–25 % is DuckDB streaming those rows out of
+the table function. Measured on this box for a 120 MB result array: the
+PCIe copy itself is ≈12 ms (≈10 GB/s), but first-touch page-faulting of the
+freshly allocated `std::vector` was ≈27 ms — more than the copy. Reserving
+the vector, advising transparent huge pages on the untouched range, then
+resizing brings the fault cost to ≈11 ms (in this branch; Linux-only,
+page-size-aware, no-op where THP is disabled). A pinned, double-buffered
+staging path was implemented, measured (no change: the copy was never the
 bottleneck) and dropped. On a unified-memory machine the transfer column is
 what disappears — see the Metal rows. Whether a result this size should
 leave the device at all is the question v0.7's GROUP BY-over-join work will
@@ -217,31 +230,27 @@ the cold call (a full sort of the column) on both scales. Every subsequent
 top-k on that column is a 10-row slice of the cached sort. Sort the column
 once only if you will ask for it more than once.
 
-**(F) is not the losing row it was expected to be.** The hashed key
-expression is evaluated once, at upload; native re-evaluates
-`hash(l_returnflag||l_linestatus)` per row on every query (167 ms at SF10).
-(F′) is the true low-cardinality reference: a plain `BIGINT` key,
-`sum(l_quantity::BIGINT) GROUP BY l_linenumber` (7 groups, measured with the
-standalone driver, columns resident). Still a win with the data resident,
-but 5×, not 30×: with few groups the value gather through the permutation
-is fully random, and there is no result to save. This is where the two
-backends differ — on Metal the same shape loses to native (see the Metal
-rows): the sorted gather of 60M values costs more than DuckDB's hash
-aggregate there. The real losing rows on this machine are the cold (E) call
-and the upload itself.
+**(F) and (F′).** With few groups there is no result to move, so the gap is
+the kernel alone: the value gather through the permutation is fully random
+when the sort has scattered the rows (15–23× on the packed key, whose native
+side still evaluates two `ascii()` calls per row; 4–5.6× on the plain
+`BIGINT` `l_linenumber` key, the true low-cardinality reference). This is
+where the two backends differ — on Metal the same shape loses to native
+(see the Metal rows). The real losing rows on this machine are the cold (E)
+call and the upload itself.
 
 **Memory budget (SF50).** A resident pair is 4.8 GB; each sorted key column
 adds 16 B/row (4.8 GB) plus ≈16 B/row of transient radix scratch during the
 sort. Two pairs plus one cache fit in 16 GB; the second cache build fails
 with a clean `cudaMalloc join cache (sorted keys) failed: out of memory`
-error (no partial results). The (C) and (F) runs above therefore ran in
-separate processes from (A)/(B)/(D).
+error (no partial results).
 
 **v0.5 (f) revisited.** The same page-fault fix applies to the
 row-returning join: `gpu_join_rows_resident` over 60M pairs at SF10 now
-measures wall 195–215 ms = kernel 13–14 + transfer 182–189 ms (was 356.6 =
-14.8 + 341.8) against the same native 232–272 ms — ≈1.1× instead of 0.5×;
-the v0.5 table above is left as measured on that branch.
+measures operator wall 195–215 ms = kernel 13–14 + transfer 182–189 ms
+(was 356.6 = 14.8 + 341.8), statement 255–275 ms, against the v0.5 native
+232–272 ms — roughly a tie instead of 0.5×; the v0.5 table above is left as
+measured on that branch.
 
 ### Reproduce
 
