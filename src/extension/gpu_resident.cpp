@@ -67,6 +67,8 @@ DUCKDB_EXTENSION_EXTERN
 #endif
 
 #include <cstdint>
+#include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,8 +120,11 @@ std::size_t pool_cap_bytes() {
         unsigned long long mb = 4096;
         if (const char* s = std::getenv("GPUDB_UPLOAD_POOL_MAX_MB")) {
             char* end = nullptr;
+            errno = 0;
             const unsigned long long v = std::strtoull(s, &end, 10);
-            if (end && *end == '\0' && v > 0) mb = v;
+            if (errno == 0 && end && end != s && *end == '\0' && v > 0 &&
+                v <= (static_cast<unsigned long long>(SIZE_MAX) >> 20)) mb = v;
+            else std::fprintf(stderr, "[gpudb] ignoring GPUDB_UPLOAD_POOL_MAX_MB='%s'; using %llu\n", s, mb);
         }
         return static_cast<std::size_t>(mb) << 20;
     }();

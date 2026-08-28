@@ -16,7 +16,7 @@ output already sorted by key, no hash table, no atomics.
 **Correctness gates before any timing counted** (identical on both backends):
 `(key, sum)` sets equal to native `GROUP BY` both ways (`EXCEPT`), counts
 exact, `DOUBLE` sums within the 1e-9 relative contract (measured ≤ 5e-16 on
-Metal, ≤ 1e-13 on CUDA), top-k value multiset equal to native `ORDER BY …
+Metal, ≤ 2e-13 on CUDA), top-k value multiset equal to native `ORDER BY …
 LIMIT`. `scripts/groupby_parity_check.sh` (11 adversarial scenarios × 5
 checks, native and gpudb in the same process) passes on both machines. Data:
 TPC-H dbgen `lineitem`; SF1 = 6,001,215 rows / 1,500,000 orderkeys; SF10 =
@@ -100,7 +100,7 @@ SF=10 ./scripts/gen_tpch.sh                                # data/tpch_sf10/
 # uploads as earlier statements, reads after (gpudb-sql --multi):
 ./build-macos/bin/gpudb-sql --db data/tpch_sf10/tpch.duckdb --multi --sql "
 SELECT gpu_upload_pair('l', l_orderkey, l_quantity::BIGINT) FROM lineitem;
-SELECT count(*) FROM gpu_groupby_sum_resident('l');                       -- (A); first call pays the sort
+SELECT count(*) FROM gpu_groupby_sum_resident('l');                       -- (A) first call pays the sort
 SELECT count(*) FROM gpu_groupby_sum_resident('l');  SELECT gpu_last_stats();   -- warm
 SELECT count(*) FROM gpu_groupby_sum_resident('l') WHERE sum > 300;       -- (B)
 SELECT gpu_upload_pair('lf', l_orderkey, l_extendedprice::DOUBLE) FROM lineitem;

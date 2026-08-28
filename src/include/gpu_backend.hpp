@@ -246,6 +246,10 @@ public:
     // sorted-key + permutation structure where they have one; that cache
     // dies with the column and is outside the upload-pool accounting.
     // Same default-throwing / hybrid-fallback rules as the join ops.
+    // Not thread-safe: an Aggregator's resident ops share scratch buffers
+    // and lazily build the per-column sort cache, so concurrent calls on
+    // one Aggregator (even on different columns) must be serialised by the
+    // caller — the SQL extension holds one mutex around every resident op.
     virtual GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
                                                            const ResidentColumn& vals,
                                                            std::size_t max_groups);

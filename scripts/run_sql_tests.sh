@@ -208,6 +208,33 @@ execute_query() {
     elif [ "$actual_norm" != "$expected_norm" ]; then
         matched=0
     fi
+    # A GUARDRAIL (expected_fail) only counts when the QUERY failed: with
+    # `-- setup:` statements, gpudb-sql reports "statement N failed" and N
+    # must be the last statement, otherwise a broken setup would mask a
+    # guardrail regression. The reason text is additionally expected in
+    # stderr (case-insensitive) — a mismatch is reported, not tolerated.
+    if [ "$matched" = "0" ] && [ -n "$xfail" ] && [ "$rc" -ne 0 ]; then
+        local guard_ok=1
+        if [ -n "$setup" ]; then
+            local n_setup
+            n_setup=$(printf '%s' "$setup" | grep -c ';')
+            local failed_no
+            failed_no=$(grep -oE 'statement [0-9]+ failed' "$err_f" | tail -1 | grep -oE '[0-9]+')
+            if [ -z "$failed_no" ] || [ "$failed_no" -ne $((n_setup + 1)) ]; then
+                guard_ok=0
+                echo "    ${C_DIM}setup statement failed before the query (statement ${failed_no:-?} of $((n_setup + 1))):${C_OFF}"
+                tail -2 "$err_f" 2>/dev/null | sed 's/^/      /'
+            fi
+        fi
+        if ! grep -qiF -- "$xfail" "$err_f"; then
+            guard_ok=0
+            echo "    ${C_DIM}expected_fail reason not found in stderr: '$xfail'${C_OFF}"
+            tail -2 "$err_f" 2>/dev/null | sed 's/^/      /'
+        fi
+        if [ "$guard_ok" = "0" ]; then
+            xfail=""   # treat as a plain FAIL below
+        fi
+    fi
 
     if [ "$matched" = "1" ]; then
         if [ -n "$xfail" ]; then

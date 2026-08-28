@@ -24,6 +24,8 @@ DUCKDB_EXTENSION_EXTERN
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -40,8 +42,16 @@ std::size_t groupby_rows_cap() {
         unsigned long long m = 100;   // 100M groups ≈ 2.4 GB of (key,sum,count)
         if (const char* s = std::getenv("GPUDB_GROUPBY_ROWS_MAX_M")) {
             char* end = nullptr;
+            errno = 0;
             const unsigned long long v = std::strtoull(s, &end, 10);
-            if (end && *end == '\0' && v > 0) m = v;
+            if (errno == 0 && end && end != s && *end == '\0' && v > 0 &&
+                v <= static_cast<unsigned long long>(SIZE_MAX / 1000000)) {
+                m = v;
+            } else {
+                std::fprintf(stderr,
+                    "[gpudb] ignoring GPUDB_GROUPBY_ROWS_MAX_M='%s' (not a positive "
+                    "integer in range); using %llu\n", s, m);
+            }
         }
         return static_cast<std::size_t>(m) * 1000000;
     }();
@@ -106,8 +116,9 @@ const char* gb_fn_name(GbOp op) {
 template <GbOp OP>
 void gb_bind(duckdb_bind_info info) {
     duckdb_value nv = duckdb_bind_get_parameter(info, 0);
-    if (!nv) {
-        duckdb_bind_set_error(info, "resident group by: null name argument");
+    if (!nv || duckdb_is_null_value(nv)) {
+        if (nv) duckdb_destroy_value(&nv);
+        duckdb_bind_set_error(info, (std::string(gb_fn_name(OP)) + ": name may not be NULL").c_str());
         return;
     }
     auto* bind = new GbBindData();
@@ -232,11 +243,12 @@ void tk_bind(duckdb_bind_info info) {
     duckdb_value nv = duckdb_bind_get_parameter(info, 0);
     duckdb_value kv = duckdb_bind_get_parameter(info, 1);
     duckdb_value ov = duckdb_bind_get_parameter(info, 2);
-    if (!nv || !kv || !ov) {
+    if (!nv || !kv || !ov || duckdb_is_null_value(nv) || duckdb_is_null_value(kv) ||
+        duckdb_is_null_value(ov)) {
         if (nv) duckdb_destroy_value(&nv);
         if (kv) duckdb_destroy_value(&kv);
         if (ov) duckdb_destroy_value(&ov);
-        duckdb_bind_set_error(info, "gpu_topk_resident: null argument");
+        duckdb_bind_set_error(info, "gpu_topk_resident: name, k and order may not be NULL");
         return;
     }
     auto* bind = new TkBindData();
@@ -276,8 +288,14 @@ void tk_init(duckdb_init_info info) {
     init->dtype = bind->dtype;
     try {
         std::lock_guard<std::mutex> lock(resident_mutex());
-        Resolved cols = resolve_pair(bind->name, /*need_vals*/false, "gpu_topk_resident");
-        gpudb::ResidentColumn* target = cols.vals ? cols.vals : cols.keys;
+        // A pair name ranks its payload ('p' -> p.v); otherwise a bare column.
+        // Never silently fall back to a pair's key column.
+        gpudb::ResidentColumn* target = find_resident_column(bind->name + ".v");
+        if (!target) target = find_resident_column(bind->name);
+        if (!target)
+            throw std::runtime_error(
+                "gpu_topk_resident: no resident pair or column named '" + bind->name +
+                "' — create it with gpu_upload_pair or gpu_upload");
         if (target->dtype() != bind->dtype)
             throw std::runtime_error(
                 std::string(bind->dtype == gpudb::Dtype::F64 ? "gpu_topk_resident_f64" : "gpu_topk_resident") +

@@ -92,3 +92,32 @@ SELECT value FROM gpu_topk_resident('cf', 1, 'desc');
 -- env: GPUDB_GROUPBY_ROWS_MAX_M=1
 -- expected_fail: above the cap
 SELECT count(*) FROM gpu_groupby_count_resident('big');
+
+-- 14. NULL semantics (documented divergence): a pair row is skipped when its key OR payload is NULL,
+--     so there is no NULL-key group and count is COUNT(payload), not COUNT(*)
+-- setup: SELECT gpu_upload_pair('nul', k, v) FROM (VALUES (1,10),(1,NULL),(NULL,5),(2,20),(NULL,NULL)) t(k,v)
+SELECT key, sum, count FROM gpu_groupby_sum_resident('nul');
+-- expect: 1  10  1
+-- expect: 2  20  1
+
+-- 15. GUARDRAIL: NULL name is a clean bind error, not an internal error
+-- expected_fail: name may not be NULL
+SELECT * FROM gpu_groupby_sum_resident(NULL);
+
+-- 16. GUARDRAIL: NULL k in top-k is a clean bind error
+-- setup: SELECT gpu_upload('c', v) FROM (VALUES (7),(-2)) t(v)
+-- expected_fail: may not be NULL
+SELECT * FROM gpu_topk_resident('c', NULL, 'desc');
+
+-- 17. GUARDRAIL: top-k over a pair whose payload was dropped does not silently rank the key
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20)) t(k,v)
+-- setup: SELECT gpu_drop_resident('p.v')
+-- expected_fail: no resident pair or column named 'p'
+SELECT * FROM gpu_topk_resident('p', 1, 'desc');
+
+-- 18. setup statements may contain ';' inside a string literal
+-- setup: SELECT gpu_upload_pair('semi;colon', k, v) FROM (VALUES (3,10),(1,20),(3,5)) t(k,v)
+SELECT key, sum FROM gpu_groupby_sum_resident('semi;colon');
+-- expect: 1  20
+-- expect: 3  15
+

@@ -502,6 +502,33 @@ int main() {
     test_hybrid_groupby();
     test_hashjoin();
 
+#if GPUDB_HAVE_METAL
+    // Regression: the non-resident Metal GROUP BY's radix path (expected
+    // groups < 1024) once skipped byte passes whenever min and max agreed
+    // on that byte. Keys uniform in [0, 257): min=0 and max=256 share the
+    // low byte, every key in between differs there.
+    {
+        std::printf("\n--- Metal non-resident GROUP BY radix path (keys 0..256) ---\n");
+        const std::size_t N = 200'000;
+        std::vector<std::int64_t> k(N), v(N);
+        std::map<std::int64_t, std::int64_t> ref;
+        for (std::size_t i = 0; i < N; ++i) {
+            k[i] = static_cast<std::int64_t>((i * 2654435761ull) % 257);
+            v[i] = static_cast<std::int64_t>(i % 1000) - 500;
+            ref[k[i]] += v[i];
+        }
+        auto gb = gpudb::make_groupby_aggregator(gpudb::Backend::METAL);
+        auto r = gb->groupby_sum_i64(k.data(), v.data(), N, /*expected_groups*/257);
+        EXPECT_EQ(r.keys.size(), ref.size());
+        bool ok = r.keys.size() == ref.size();
+        for (std::size_t i = 0; ok && i < r.keys.size(); ++i) {
+            auto it = ref.find(r.keys[i]);
+            ok = it != ref.end() && it->second == r.sums[i];
+        }
+        EXPECT(ok);
+    }
+#endif
+
     failures += test_hashjoin_failures();
     total += test_hashjoin_total();
 

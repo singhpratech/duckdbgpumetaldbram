@@ -14,6 +14,8 @@ DUCKDB_EXTENSION_EXTERN
 #endif
 
 #include <cctype>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -153,8 +155,11 @@ std::size_t join_rows_cap() {
         unsigned long long m = 100;   // 100M rows ≈ 1.6 GB of index pairs
         if (const char* s = std::getenv("GPUDB_JOIN_ROWS_MAX_M")) {
             char* end = nullptr;
+            errno = 0;
             const unsigned long long v = std::strtoull(s, &end, 10);
-            if (end && *end == '\0' && v > 0) m = v;
+            if (errno == 0 && end && end != s && *end == '\0' && v > 0 &&
+                v <= static_cast<unsigned long long>(SIZE_MAX / 1000000)) m = v;
+            else std::fprintf(stderr, "[gpudb] ignoring GPUDB_JOIN_ROWS_MAX_M='%s'; using %llu\n", s, m);
         }
         return static_cast<std::size_t>(m) * 1000000;
     }();
@@ -177,11 +182,12 @@ void rows_bind(duckdb_bind_info info) {
     duckdb_value pv = duckdb_bind_get_parameter(info, 0);
     duckdb_value bv = duckdb_bind_get_parameter(info, 1);
     duckdb_value kv = duckdb_bind_get_parameter(info, 2);
-    if (!pv || !bv || !kv) {
+    if (!pv || !bv || !kv || duckdb_is_null_value(pv) || duckdb_is_null_value(bv) ||
+        duckdb_is_null_value(kv)) {
         if (pv) duckdb_destroy_value(&pv);
         if (bv) duckdb_destroy_value(&bv);
         if (kv) duckdb_destroy_value(&kv);
-        duckdb_bind_set_error(info, "gpu_join_rows_resident: null argument");
+        duckdb_bind_set_error(info, "gpu_join_rows_resident: arguments may not be NULL");
         return;
     }
     auto* bind = new RowsBindData();

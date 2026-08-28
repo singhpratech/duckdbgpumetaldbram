@@ -25,10 +25,10 @@ void usage(const char* a0) {
         "usage: %s [--db FILE] [--sql QUERY] [--multi]\n"
         "  --db FILE    use FILE as the DuckDB database (default: in-memory)\n"
         "  --sql QUERY  run this single SQL statement (default: read stdin)\n"
-        "  --multi      split input on ';' and run statements sequentially in\n"
-        "               ONE connection (resident columns persist between\n"
-        "  --multi-last same as --multi but print only the LAST statement's result\n"
-        "               statements); prints each result + per-statement time\n", a0);
+        "  --multi      split input on ';' (outside quotes and -- comments) and run\n"
+        "               statements sequentially in ONE connection (resident columns\n"
+        "               persist between statements); prints each result + time\n"
+        "  --multi-last same as --multi but print only the LAST statement's result\n", a0);
 }
 
 void die(const char* what) {
@@ -100,14 +100,28 @@ int main(int argc, char** argv) {
     }
 
     if (multi) {
-        // Naive ';' split — good enough for test scripts (no ';' inside
-        // string literals). Statements run on the SAME connection so
-        // resident columns persist between them.
+        // Split on ';' outside single-quoted strings, double-quoted
+        // identifiers and -- line comments. Statements run on the SAME
+        // connection so resident columns persist between them.
+        auto next_semi = [&](std::size_t from) -> std::size_t {
+            bool sq = false, dq = false, cmt = false;
+            for (std::size_t i = from; i < sql.size(); ++i) {
+                const char c = sql[i];
+                if (cmt) { if (c == '\n') cmt = false; continue; }
+                if (sq) { if (c == '\'') sq = false; continue; }
+                if (dq) { if (c == '"') dq = false; continue; }
+                if (c == '\'') sq = true;
+                else if (c == '"') dq = true;
+                else if (c == '-' && i + 1 < sql.size() && sql[i + 1] == '-') cmt = true;
+                else if (c == ';') return i;
+            }
+            return std::string::npos;
+        };
         std::size_t pos = 0;
         int stmt_no = 0;
         int rc = 0;
         while (pos < sql.size()) {
-            std::size_t semi = sql.find(';', pos);
+            std::size_t semi = next_semi(pos);
             std::string stmt = sql.substr(pos, semi == std::string::npos
                                                    ? std::string::npos : semi - pos);
             pos = (semi == std::string::npos) ? sql.size() : semi + 1;
@@ -125,7 +139,8 @@ int main(int argc, char** argv) {
                 break;
             }
             const auto s1 = std::chrono::steady_clock::now();
-            const bool is_last = sql.find_first_not_of(" \t\r\n;", pos) == std::string::npos;
+            const bool is_last = next_semi(pos) == std::string::npos &&
+                                 sql.find_first_not_of(" \t\r\n;", pos) == std::string::npos;
             if (!multi_last || is_last) print_result(sr);
             duckdb_destroy_result(&sr);
             std::fprintf(stderr, "[gpudb-sql] stmt %d elapsed %.3f ms\n", stmt_no,

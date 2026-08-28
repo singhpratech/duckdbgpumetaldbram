@@ -27,7 +27,12 @@ query many times, no output materialised beyond the groups themselves.
 | `gpu_topk_resident_f64(name, k, 'asc'\|'desc')` | `(idx BIGINT, value DOUBLE)` | same over a DOUBLE payload / column |
 
 Rows come out **sorted by key ascending** on every backend; top-k rows come
-out in the requested order. `gpu_last_stats()` reports the backend, dispatch
+out in the requested order. **NULLs:** resident columns carry none —
+`gpu_upload_pair` skips a row when either the key or the payload is NULL, so
+`gpu_groupby_sum_resident('p')` equals native
+`SELECT k, sum(v), count(v) FROM t WHERE k IS NOT NULL AND v IS NOT NULL GROUP BY k`:
+no NULL-key group, `count` is `COUNT(payload)` rather than `COUNT(*)`, and
+top-k never returns a NULL row (KNOWN_ISSUES.md states this). `gpu_last_stats()` reports the backend, dispatch
 reason, `rows_in`, `groups`, and the wall / kernel / transfer split for the
 last call, as for the other resident ops. Group count is capped at `GPUDB_GROUPBY_ROWS_MAX_M`
 million (default 100) with a clean error naming the actual count — checked
@@ -114,9 +119,12 @@ top-k. Not a performance path.
 - **High-cardinality GROUP BY** (Q18's `GROUP BY l_orderkey`: 15M groups at
   SF10, 75M at SF50) is the target: native DuckDB's hash aggregate thrashes
   caches; the GPU sort is bandwidth-bound and already cached.
-- **Low-cardinality GROUP BY** (Q1's 4 groups) will not beat native's
-  streaming aggregate on any backend — the sort is wasted work — and we say
-  so in BENCHMARK.md rather than hide the row.
+- **Low-cardinality GROUP BY** (Q1's 4 groups, `GROUP BY l_linenumber`'s 7)
+  is not the target shape — the sort is wasted work — and the backends
+  differ: CUDA still wins with the data resident (the gather runs on the
+  device), Metal loses (the gather of every payload through the permutation
+  is the cost, and native's streaming aggregate is scan-bound). Both rows
+  are in BENCHMARK.md.
 - On discrete GPUs the output copy is the ceiling; on unified memory it is
   free. Same honest split as the row-returning join.
 
@@ -138,10 +146,11 @@ DuckDB's pipeline ordering — the SQL suite uses `-- setup:` statements
   top-k both directions, k clamping.
 - `test/sql/gpu_groupby_resident.test` — SQL surface, composition with
   WHERE/ORDER BY/LIMIT, same-statement parity with native, guardrails.
-- `scripts/groupby_parity_check.sh` — 10 adversarial scenarios × 5 checks
+- `scripts/groupby_parity_check.sh` — 11 adversarial scenarios × 5 checks
   against native in the same process (dup-heavy, all-unique, single group,
-  Knuth-hash, Zipf skew, negatives, int64 boundaries, tiny, and runs placed
-  exactly on the 64-chunk / 256-block boundaries the Metal kernels use).
+  Knuth-hash, Zipf skew, negatives, int64 boundary keys, the min/max-share-a-
+  byte radix regression, tiny, and runs placed exactly on the 64-chunk /
+  256-block boundaries the Metal kernels use).
 
 ## Deferred (v0.7)
 
