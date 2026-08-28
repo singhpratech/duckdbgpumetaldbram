@@ -705,7 +705,7 @@ private:
         if (!o.aliased && !vec.empty())
             std::memcpy(vec.data(), [o.buf contents], vec.size() * sizeof(std::int64_t));
     }
-    id<MTLBuffer> grow(id<MTLBuffer>& b, std::size_t bytes, const char* what) {
+    id<MTLBuffer> grow(__strong id<MTLBuffer>& b, std::size_t bytes, const char* what) {
         if (!b || [b length] < bytes) {
             b = [device_ newBufferWithLength:std::max<std::size_t>(bytes, 16)
                                      options:MTLResourceStorageModeShared];
@@ -728,8 +728,8 @@ private:
                             std::chrono::steady_clock::now() - t_wall0).count();
             return r;
         }
-        if (n > 0xFFFFFFFFull)
-            throw std::runtime_error(std::string(op) + ": > 2^32 rows unsupported");
+        if (n > 0xFFFFFFFFull - 64)
+            throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
 
         double kernel_ms = 0.0;
         id<MTLBuffer> sorted = ensure_sorted_cache(k, &kernel_ms);

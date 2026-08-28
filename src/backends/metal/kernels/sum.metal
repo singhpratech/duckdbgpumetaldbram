@@ -513,7 +513,7 @@ kernel void gb_chunk_sum_i64(
 {
     const uint a = gid * GB_CHUNK;
     if (a >= n) return;
-    const uint b = min(a + GB_CHUNK, n);
+    const uint b = (n - a < GB_CHUNK) ? n : a + GB_CHUNK;   // no uint wrap near 2^32
     // segment containing position a: upper_bound(starts, a) - 1
     uint lo = 0, hi = num_segs;
     while (lo < hi) {

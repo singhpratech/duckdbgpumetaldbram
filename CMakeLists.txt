@@ -43,6 +43,10 @@ add_compile_options(
     $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
     $<$<COMPILE_LANGUAGE:OBJCXX>:-Wall>
     $<$<COMPILE_LANGUAGE:OBJCXX>:-Wextra>
+    # Metal host code relies on ARC to release MTLBuffer / pipeline objects
+    # (resident columns, sort caches, scratch); without it every device
+    # allocation leaks for the life of the process.
+    $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>
     $<$<CONFIG:Release>:-O3>
     $<$<CONFIG:Debug>:-g>
 )

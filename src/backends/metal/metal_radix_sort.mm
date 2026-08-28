@@ -96,8 +96,8 @@ void MetalRadixSort::ensure_sort_buffers(std::uint32_t n, std::uint32_t num_bloc
     }
 }
 
-double MetalRadixSort::run_sort_on_staged(std::uint32_t n, id<MTLBuffer>& in_keys,
-                                          id<MTLBuffer>& in_vals) {
+double MetalRadixSort::run_sort_on_staged(std::uint32_t n, __strong id<MTLBuffer>& in_keys,
+                                          __strong id<MTLBuffer>& in_vals) {
     constexpr std::uint32_t RADIX_BUCKETS = 256;
     constexpr std::uint32_t RADIX_BLOCK_SIZE = 256;
     constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 1024;
