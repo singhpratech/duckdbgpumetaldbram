@@ -195,8 +195,32 @@ statement / gpudb statement; on-device = native statement / `kernel_ms`.**
 | (F′) 7 groups, `l_linenumber` | 10 | 34.4–35.8 | 6.3–9.2 | 6.0–8.8 | 6.0–8.8 | 0.016 | 48.7 | **3.7–5.6× / 3.9–6×** | 7 groups, 1,529,738,036 == native |
 | (F′) 7 groups, `l_linenumber` | 50 | 185–186 | 34.1–38.2 | 33.4–36.9 | 33.3–36.8 | 0.017 | 209 | **4.9–5.4× / 5–5.6×** | 7 groups, 7,650,052,980 == native |
 
+Device-side filter (`GroupByFilter`, same harness, branch @ 04896b3): the
+HAVING / top-k is applied on the device and only the survivors are copied —
+(B′) is (B) with the filter inside `gpu_groupby_sum_resident_having('l',
+'>', 300)`, (G) is "top 10 groups by sum" via
+`gpu_groupby_sum_resident_topk('l', 10, 'desc')` vs native `ORDER BY s DESC
+LIMIT 10` over the same GROUP BY.
+
+| measurement | SF | native stmt (ms) | gpudb stmt (ms) | `wall_ms` | `kernel_ms` | `transfer_ms` | cold first stmt | end-to-end / on-device | result check |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| (B′) HAVING sum > 300 on the device | 10 | 209 | 11.8–12.0 | 8.3–8.4 | 8.2–8.4 | 0.02 | 59 | **17× / 25×** | 624 rows == native |
+| (B′) HAVING sum > 300 on the device | 50 | 1012–1022 | 42–78 | 37–72 | 37–72 | 0.04–0.06 | 228 | **13–24× / 14–27×** | 3,182 rows == native |
+| (G) top-10 groups by sum | 10 | 211–213 | 26.6–26.8 | 21.1–21.3 | 21.1–21.3 | 0.02 | 23 | **8× / 10×** | rows == native |
+| (G) top-10 groups by sum | 50 | 1018–1042 | 95–97 | 88 | 88 | 0.03 | 94 | **10.6× / 11.6×** | rows == native |
+
+With the filter on the device the transfer column is 20–60 µs and the
+statement is the kernel plus DuckDB's fixed per-statement cost: the on-device
+number has become the end-to-end number, which is the point of the feature.
+(B′) at SF50 is bimodal (42 ↔ 78 ms, laptop clocks, same pattern as the v0.5
+joins); both values are in the range. (G) pays a full radix sort of the
+aggregates (15M ≈ 17 ms, 75M ≈ 85 ms) before taking the first 10 — a
+radix-select would cut that; measured and shipped as is.
+
 Headline for this machine: **≈1.5–2.2× end-to-end, ≈30–58× on-device** for
-the high-cardinality shapes (A)–(D) — both numbers, always together. The
+the high-cardinality shapes (A)–(D) when the whole result comes back, and
+**13–24× end-to-end** once the HAVING runs on the device ((B′) below) — both
+numbers, always together. The
 earlier draft of this subsection compared native statement time against
 the operator's `wall_ms`, which omits the ≈20–30 % of the statement DuckDB
 spends streaming 15M–75M result rows out of the table function; the
