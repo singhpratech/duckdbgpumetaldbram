@@ -147,6 +147,9 @@ struct GroupByResidentResult {
 // f64 comparisons use the backend-ordered sum, so a group whose f64 sum
 // sits within rounding of the threshold may be kept by one backend and
 // dropped by another (same tolerance caveat as the sums themselves).
+// NaN rule (as DuckDB ORDER BY): for top-k every NaN sum, whatever its sign
+// bit, is the GREATEST value — DESC lists NaN groups first, ASC last;
+// -0.0 and 0.0 are equal; cmp drops NaN groups (every comparison is false).
 // max_groups bounds the rows RETURNED (the survivors), not the number of
 // groups; GroupByResidentResult::groups_total reports the unfiltered count.
 struct GroupByFilter {

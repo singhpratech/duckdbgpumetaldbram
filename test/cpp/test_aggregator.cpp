@@ -416,6 +416,36 @@ void test_backend(gpudb::Backend b) {
                 EXPECT_EQ(got.keys.size(), ref.keys.size());
                 EXPECT(got.sums_f64 == ref.sums_f64);
             }
+            // f64 NaN / inf contract: NaN is the greatest for top-k (any sign bit),
+            // dropped by every cmp; +inf/-inf compare normally.
+            {
+                const double inf = std::numeric_limits<double>::infinity();
+                const double qnan = std::numeric_limits<double>::quiet_NaN();
+                std::vector<std::int64_t> nk{1, 2, 3, 4, 5, 5, 6, 7, 8};
+                std::vector<double> nv{inf, -inf, qnan, -qnan, inf, -inf, 10.0, -10.0, 0.0};
+                auto nkc = agg->upload_i64(nk.data(), nk.size());
+                auto nfc = agg->upload_f64(nv.data(), nv.size());
+                gpudb::GroupByFilter d3; d3.topk = 3; d3.topk_desc = true;
+                auto top = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, d3);
+                bool ok = top.keys.size() == 3;
+                for (double v : top.sums_f64) ok = ok && std::isnan(v);   // keys 3, 4, 5 (inf + -inf)
+                EXPECT(ok);
+                gpudb::GroupByFilter a3; a3.topk = 3; a3.topk_desc = false;
+                auto bot = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, a3);
+                EXPECT(bot.sums_f64 == std::vector<double>({-inf, -10.0, 0.0}));
+                gpudb::GroupByFilter d8; d8.topk = 8; d8.topk_desc = true;
+                auto all = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, d8);
+                ok = all.keys.size() == 8 && std::isnan(all.sums_f64[0]) && std::isnan(all.sums_f64[1]) &&
+                     std::isnan(all.sums_f64[2]) && all.sums_f64[3] == inf && all.sums_f64[4] == 10.0 &&
+                     all.sums_f64[5] == 0.0 && all.sums_f64[6] == -10.0 && all.sums_f64[7] == -inf;
+                EXPECT(ok);
+                gpudb::GroupByFilter ge; ge.cmp = Cmp::GE; ge.threshold_f64 = -inf;   // everything but NaN
+                auto kept = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, ge);
+                EXPECT_EQ(kept.keys.size(), std::size_t(5));
+                gpudb::GroupByFilter le; le.cmp = Cmp::LE; le.threshold_f64 = 0.0;
+                auto low = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, le);
+                EXPECT_EQ(low.keys.size(), std::size_t(3));   // -inf, -10, 0
+            }
         } catch (const std::runtime_error& e) {
             if (std::string(e.what()).find("not implemented") != std::string::npos) {
                 implemented = false;

@@ -1,10 +1,13 @@
 // groupby_filter.hpp — host reference implementation of GroupByFilter
-// (HAVING on the aggregate, then top-k of groups). Executable contract for
+// (HAVING on the aggregate, then top-k of groups). f64: every NaN sum is the
+// greatest value for top-k (DESC first, ASC last) and fails every cmp; -0.0 == 0.0.
+// Executable contract for
 // every backend; also used where a backend finishes an aggregate on the
 // host (Metal f64 sums) and by unit/parity checks.
 #pragma once
 #include "gpu_backend.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -55,7 +58,9 @@ inline void apply_group_filter_host(GroupByResidentResult& r, const GroupByFilte
         auto better = [&](std::size_t a, std::size_t b) {   // strict "a ranks before b"
             if (is_f64) {
                 const double x = r.sums_f64[a], y = r.sums_f64[b];
-                if (x != y) return f.topk_desc ? (x > y) : (x < y);
+                const bool nx = std::isnan(x), ny = std::isnan(y);
+                if (nx != ny) return f.topk_desc ? nx : ny;      // NaN is greatest (DuckDB order)
+                if (!nx && x != y) return f.topk_desc ? (x > y) : (x < y);
             } else {
                 const std::int64_t x = agg_i64(a), y = agg_i64(b);
                 if (x != y) return f.topk_desc ? (x > y) : (x < y);
@@ -69,7 +74,9 @@ inline void apply_group_filter_host(GroupByResidentResult& r, const GroupByFilte
         auto better = [&](std::size_t a, std::size_t b) {
             if (is_f64) {
                 const double x = r.sums_f64[a], y = r.sums_f64[b];
-                if (x != y) return f.topk_desc ? (x > y) : (x < y);
+                const bool nx = std::isnan(x), ny = std::isnan(y);
+                if (nx != ny) return f.topk_desc ? nx : ny;      // NaN is greatest (DuckDB order)
+                if (!nx && x != y) return f.topk_desc ? (x > y) : (x < y);
             } else {
                 const std::int64_t x = agg_i64(a), y = agg_i64(b);
                 if (x != y) return f.topk_desc ? (x > y) : (x < y);
