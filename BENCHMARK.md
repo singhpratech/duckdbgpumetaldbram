@@ -181,7 +181,7 @@ statement / gpudb statement; on-device = native statement / `kernel_ms`.**
 | measurement | SF | native stmt (ms) | gpudb stmt (ms) | `wall_ms` | `kernel_ms` | `transfer_ms` | cold first stmt | end-to-end / on-device | result check |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
 | (A) sum i64, 15M groups | 10 | 135–138 | 96.4–97.4 | 75–76 | 4.5–4.7 | 70.5–71.7 | 141 | **1.4× / 29×** | 15,000,000 groups == native |
-| (A) sum i64, 75M groups | 50 | 684–693 | 458–464 | 362–368 | 21.4 | 340–347 | 651 | **1.5× / 32×** | 75,000,000 == native |
+| (A) sum i64, 75M groups | 50 | 681–718 | 458–471 | 362–372 | 21.4 | 340–351 | 651–928 | **1.45–1.53× / 32×** | 75,000,000 == native |
 | (B) HAVING sum > 300 | 10 | 204–209 | 105–106 | 76.5–76.8 | 4.5–4.7 | 72.0–72.2 | — | **2.0× / 45×** | 624 groups == native |
 | (B) HAVING sum > 300 | 50 | 991–1013 | 491–505 | 364–371 | 21.3–21.4 | 343–349 | — | **2.0× / 47×** | 3,182 == native |
 | (C) sum f64 | 10 | 206–213 | 104–106 | 76–77 | 4.6 | 71.5–72.4 | 149 | **2.0× / 45×** | sum-of-sums rel-diff 9e-14 |
@@ -204,18 +204,20 @@ LIMIT 10` over the same GROUP BY.
 
 | measurement | SF | native stmt (ms) | gpudb stmt (ms) | `wall_ms` | `kernel_ms` | `transfer_ms` | cold first stmt | end-to-end / on-device | result check |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---|
-| (B′) HAVING sum > 300 on the device | 10 | 209 | 11.8–12.0 | 8.3–8.4 | 8.2–8.4 | 0.02 | 59 | **17× / 25×** | 624 rows == native |
-| (B′) HAVING sum > 300 on the device | 50 | 1012–1022 | 42–78 | 37–72 | 37–72 | 0.04–0.06 | 228 | **13–24× / 14–27×** | 3,182 rows == native |
+| (B′) HAVING sum > 300 on the device | 10 | 208–210 | 11.7–12.9 | 8.3–10.4 | 8.2–10.4 | 0.02 | 57–59 | **16–18× / 20–25×** | 624 rows == native |
+| (B′) HAVING sum > 300 on the device | 50 | 1012–1039 | 42–78 | 37–72 | 37–72 | 0.04–0.06 | 223–228 | **13–24× / 14–28×** | 3,182 rows == native |
 | (G) top-10 groups by sum | 10 | 211–213 | 26.6–26.8 | 21.1–21.3 | 21.1–21.3 | 0.02 | 23 | **8× / 10×** | rows == native |
-| (G) top-10 groups by sum | 50 | 1018–1042 | 95–97 | 88 | 88 | 0.03 | 94 | **10.6× / 11.6×** | rows == native |
+| (G) top-10 groups by sum | 50 | 1018–1042 | 86–123 | 78–115 | 78–115 | 0.03–0.04 | 86–94 | **8.3–12× / 8.9–13×** | sums == native (tie keys differ) |
 
 With the filter on the device the transfer column is 20–60 µs and the
 statement is the kernel plus DuckDB's fixed per-statement cost: the on-device
 number has become the end-to-end number, which is the point of the feature.
-(B′) at SF50 is bimodal (42 ↔ 78 ms, laptop clocks, same pattern as the v0.5
-joins); both values are in the range. (G) pays a full radix sort of the
-aggregates (15M ≈ 17 ms, 75M ≈ 85 ms) before taking the first 10 — a
-radix-select would cut that; measured and shipped as is.
+(B′) and (G) at SF50 are bimodal (42 ↔ 78 ms and 86 ↔ 123 ms; the SM clock
+was sampled between 1665 and 2400 MHz across the runs — laptop boost, same
+pattern as the v0.5 joins); the ranges above span both modes, from a second
+clean-rebuild pass on 07706c4. (G) pays a full radix sort of the aggregates
+(15M ≈ 17 ms, 75M ≈ 80–115 ms) before taking the first 10 — a radix-select
+would cut that; measured and shipped as is.
 
 Headline for this machine: **≈1.5–2.2× end-to-end, ≈30–58× on-device** for
 the high-cardinality shapes (A)–(D) when the whole result comes back, and
