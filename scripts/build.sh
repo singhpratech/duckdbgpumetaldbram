@@ -71,7 +71,10 @@ if [ -n "$RAW_EXT" ] && [ -f "$(dirname "$0")/build_helpers/append_extension_met
         *)       PLATFORM="" ;;
     esac
     DUCKDB_C_API_VERSION="${DUCKDB_C_API_VERSION:-v1.2.0}"
-    EXT_VERSION="${EXT_VERSION:-v0.1.1}"
+    # Stamp the version from CMakeLists.txt (project VERSION) unless overridden;
+    # a stale default here used to overwrite CMake's own stamp with v0.1.1.
+    CMAKE_VERSION_STR="$(sed -n 's/^[[:space:]]*VERSION[[:space:]][[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$(dirname "$0")/../CMakeLists.txt" | head -1)"
+    EXT_VERSION="${EXT_VERSION:-v${CMAKE_VERSION_STR:-0.0.0}}"
     OUT_FILE="$BUILD_DIR/src/extension/gpudb.${PLATFORM}.duckdb_extension"
     if [ -n "$PLATFORM" ]; then
         echo "==> packaging loadable extension ($PLATFORM, ABI=$DUCKDB_C_API_VERSION, ext=$EXT_VERSION)"
