@@ -71,14 +71,6 @@ struct F64OrderKey {
     }
 };
 
-// Whole-buffer RAII for Thrust's own temp needs is internal to Thrust; this
-// is for the explicit key buffer of the f64 sort.
-struct DevBuf {
-    void* p = nullptr;
-    cudaError_t alloc(std::size_t bytes) { return cudaMalloc(&p, bytes); }
-    ~DevBuf() { if (p) cudaFree(p); }
-};
-
 } // namespace
 
 extern "C" {
@@ -156,14 +148,14 @@ cudaError_t gpudb_cuda_groupby_count(const i64* d_sorted, std::size_t n,
 }
 
 // f64 sort cache: d_sorted <- vals sorted ascending (NaN last), d_perm <- the
-// original indices in that order. Radix sort on order-preserving u64 keys.
+// original indices in that order. Radix sort on order-preserving u64 keys
+// built in d_sorted itself; the sorted doubles are then gathered over the
+// (no longer needed) keys in place, so no extra n-sized buffer is required —
+// peak extra memory is the sort's own scratch.
 cudaError_t gpudb_cuda_sort_f64_perm(const double* d_vals, double* d_sorted,
                                      i64* d_perm, std::size_t n, cudaStream_t s) {
-    DevBuf keys;
-    cudaError_t e = keys.alloc(n * sizeof(u64));
-    if (e != cudaSuccess) return e;
     try {
-        auto* k = static_cast<u64*>(keys.p);
+        auto* k = reinterpret_cast<u64*>(d_sorted);
         thrust::transform(thrust::cuda::par.on(s), d_vals, d_vals + n, k, F64OrderKey());
         thrust::sequence(thrust::cuda::par.on(s), d_perm, d_perm + n);
         thrust::sort_by_key(thrust::cuda::par.on(s), k, k + n, d_perm);
