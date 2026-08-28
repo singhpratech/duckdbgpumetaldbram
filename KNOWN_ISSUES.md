@@ -54,7 +54,21 @@ matching native DuckDB, and `IS NULL` on such a result is now `true`.
 | TPC-H SF50-scale pair uploads need `GPUDB_UPLOAD_POOL_MAX_MB` raised (10–12 GB) | Default 4 GB pool refuses with the documented error; same guardrail as resident columns. |
 | `gpu_join_rows_resident` needs the uploads to run as earlier statements (`gpudb-sql --multi`, or separate statements on one connection) | A table function's bind/init cannot be sequenced after an upload in the same statement. The scalar join-aggregate functions have no such restriction. |
 | `probe_idx` / `build_idx` from `gpu_join_rows_resident` refer to **upload order**, which equals table order only when the upload scan was not parallel | Same ordering caveat as any parallel scan; use the indices to look up rows, not as row numbers of the source table. |
-| Multi-table join chains, `GROUP BY` over join results, and `ORDER BY` are not on the GPU path | Roadmap (v0.6). Unsupported shapes run natively — gpudb never breaks a query. |
+| Multi-table join chains and `GROUP BY` over join results are not on the GPU path | Roadmap (v0.7). `GROUP BY` and `ORDER BY … LIMIT k` over resident columns are on it as of v0.6.0 (next table). Unsupported shapes run natively — gpudb never breaks a query. |
+
+### Design notes — resident GROUP BY / top-k (v0.6.0)
+
+| Behavior | Reason |
+|---|---|
+| `gpu_groupby_*_resident` / `gpu_topk_resident[_f64]` are table functions; the uploads they read must run as earlier statements on the same connection | A table function's bind/init cannot be ordered after an aggregate in the same statement (a single cross-product reference happens to work, two do not — DuckDB's pipeline ordering gives no guarantee). The result types are fixed per function (`_f64` variants) for the same reason: bind cannot inspect a column that a same-statement upload has not produced yet. |
+| Rows come out sorted by key ascending on every backend | The GROUP BY is a sort + segmented reduce over the cached radix sort (the join build cache), so order is free and cross-backend parity is a plain row diff. Need a different order? `ORDER BY` the result — it is small. |
+| `sum` of a `BIGINT` payload wraps on int64 overflow where native `sum()` promotes to `HUGEINT` | Same uint64 wrap rule as `gpu_sum_resident` and the join sums; bit-identical on CPU/CUDA/Metal. Use native `sum()` if a group can exceed int64. |
+| `DOUBLE` group sums compare to native within a relative tolerance (1e-9 contract), never bit-for-bit; on Apple Silicon they run on the host after the GPU sorts and gathers | Summation order is backend-defined; no IEEE-754 doubles in MSL. Same rule as the f64 join. |
+| Top-k tie order among equal values is unspecified | Same as SQL `ORDER BY` without a tiebreaker; the sort is not stable across backends. Cross-backend checks compare the multiset of values, not `idx`. |
+| Group count is capped at `GPUDB_GROUPBY_ROWS_MAX_M` million (default 100) with a clean error naming the actual count | Checked before any device→host copy on every backend, never truncated — the same guardrail as `GPUDB_JOIN_ROWS_MAX_M`. |
+| The sort cache costs 16 bytes per row per sorted column on the device (sorted keys + permutation), plus ~16 bytes/row of transient radix scratch, outside the `GPUDB_UPLOAD_POOL_MAX_MB` accounting | Built lazily on the first GROUP BY / top-k / join-build use of a column, shared by all of them, freed with the column. Device OOM surfaces as a clean error on that first call. At SF50 keep this in mind when several columns are resident on a 16 GB GPU. |
+| On discrete GPUs (CUDA) the device→host copy of the `(key, sum, count)` result dominates wall time for high-cardinality outputs (24 bytes/group); the kernel is a few percent of wall | Same honest split as `gpu_join_rows_resident`. `gpu_last_stats()` shows `kernel_ms` vs `wall_ms`. On unified memory (Metal) there is no copy: the GPU writes the result vectors in place. |
+| Low-cardinality GROUP BY (a handful of groups over tens of millions of rows) is not the target shape | The sort is wasted work there; native's streaming aggregate is scan-bound and very fast. Measured rows for both shapes are in BENCHMARK.md — pick by cardinality. |
 
 ### Type support (v0.3.0)
 
