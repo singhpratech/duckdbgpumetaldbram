@@ -9,7 +9,7 @@
 # Checks per scenario:
 #   sum_i64   (key, sum) sets equal both ways (EXCEPT) — bit-exact
 #   count     (key, count) sets equal both ways
-#   sum_f64   every group within relative 1e-9 of native sum(v/3.0)
+#   sum_f64   every group within relative 1e-9 of native sum(v/4.0)
 #   ordered   gpu rows arrive sorted by key ascending
 #   topk      multiset of the 50 largest / smallest payloads equals native
 #   having    (key, sum) sets equal both ways for HAVING sum > 0 / <= 0,
@@ -35,7 +35,7 @@ run_case() {
   out=$("$SQL" --multi --sql "
 CREATE TABLE src AS $pair;
 SELECT gpu_upload_pair('p',  k, v)               FROM src;
-SELECT gpu_upload_pair('pf', k, (v/3.0)::DOUBLE) FROM src;
+SELECT gpu_upload_pair('pf', k, (v/4.0)::DOUBLE) FROM src;
 SELECT
   CASE WHEN (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident('p')) EXCEPT (SELECT k, sum(v) FROM src GROUP BY k))) = 0
         AND (SELECT count(*) FROM ((SELECT k, sum(v) FROM src GROUP BY k) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident('p')))) = 0
@@ -43,7 +43,7 @@ SELECT
   CASE WHEN (SELECT count(*) FROM ((SELECT key, count FROM gpu_groupby_count_resident('p')) EXCEPT (SELECT k, count(*) FROM src GROUP BY k))) = 0
         AND (SELECT count(*) FROM ((SELECT k, count(*) FROM src GROUP BY k) EXCEPT (SELECT key, count FROM gpu_groupby_count_resident('p')))) = 0
        THEN 'PASS' ELSE 'FAIL' END AS count,
-  CASE WHEN (SELECT count(*) FROM gpu_groupby_sum_resident_f64('pf') g JOIN (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k) n ON g.key = n.k
+  CASE WHEN (SELECT count(*) FROM gpu_groupby_sum_resident_f64('pf') g JOIN (SELECT k, sum(v/4.0) AS s FROM src GROUP BY k) n ON g.key = n.k
              WHERE abs(g.sum - n.s) > 1e-9 * greatest(abs(n.s), 1)) = 0
         AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64('pf')) = (SELECT count(DISTINCT k) FROM src)
        THEN 'PASS' ELSE 'FAIL' END AS sum_f64,
@@ -58,15 +58,15 @@ SELECT
         AND (SELECT count(*) FROM ((SELECT k, sum(v) s FROM src GROUP BY k HAVING s <= 0) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '<=', 0)))) = 0
         AND (SELECT count(*) FROM ((SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)) EXCEPT (SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2))) = 0
         AND (SELECT count(*) FROM ((SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2) EXCEPT (SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)))) = 0
-        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0)) = (SELECT count(*) FROM (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0))
-        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0) g JOIN (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0) n ON g.key = n.k
-             WHERE abs(g.sum - n.s) <= 1e-9 * greatest(abs(n.s), 1)) = (SELECT count(*) FROM (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0))
+        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0)) = (SELECT count(*) FROM (SELECT k, sum(v/4.0) AS s FROM src GROUP BY k HAVING s > 0.0))
+        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0) g JOIN (SELECT k, sum(v/4.0) AS s FROM src GROUP BY k HAVING s > 0.0) n ON g.key = n.k
+             WHERE abs(g.sum - n.s) <= 1e-9 * greatest(abs(n.s), 1)) = (SELECT count(*) FROM (SELECT k, sum(v/4.0) AS s FROM src GROUP BY k HAVING s > 0.0))
        THEN 'PASS' ELSE 'FAIL' END AS having,
   CASE WHEN (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'desc')) = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
         AND (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'asc'))  = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s ASC  LIMIT 50))
         AND (SELECT list_sort(list(count)) FROM gpu_groupby_count_resident_topk('p', 50, 'desc')) = (SELECT list_sort(list(c)) FROM (SELECT count(*) c FROM src GROUP BY k ORDER BY c DESC LIMIT 50))
         AND (SELECT count(*) FROM (SELECT sum, lag(sum) OVER () AS prev FROM gpu_groupby_sum_resident_topk('p', 50, 'desc')) WHERE prev IS NOT NULL AND prev < sum) = 0
-        AND (SELECT list_sort(list(round(sum, 6))) FROM gpu_groupby_sum_resident_f64_topk('pf', 50, 'desc')) = (SELECT list_sort(list(round(s, 6))) FROM (SELECT sum(v/3.0) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
+        AND (SELECT list_sort(list(round(sum, 6))) FROM gpu_groupby_sum_resident_f64_topk('pf', 50, 'desc')) = (SELECT list_sort(list(round(s, 6))) FROM (SELECT sum(v/4.0) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
        THEN 'PASS' ELSE 'FAIL' END AS group_topk;
 " 2>&1 | tail -1)
   runs=$((runs+1))
