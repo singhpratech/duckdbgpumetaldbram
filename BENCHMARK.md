@@ -36,51 +36,73 @@ never printed; what is timed is the aggregation.
 
 ### Apple M4 Max (Metal, 64 GB) — native and embedded engine both DuckDB v1.5.2
 
-Branch `feat/core-groupby-abi`, clean rebuild; native = the same embedded
-engine (`gpudb-sql`) running the plain SQL, warm, 16 threads, best of 2–3
-after a warm-up; gpudb = `gpu_last_stats()` `wall_ms` of the warm call
-(uploads and the one-time sort paid earlier);
-`backend=Metal reason=Hot_GpuAlwaysWins transfer_ms=0.000` on every row.
-SF50 ran with `GPUDB_UPLOAD_POOL_MAX_MB=12288`.
+Branch `feat/core-groupby-abi` at `e77b2e3` (the ARC build), clean rebuild.
+**Both sides are the statement time reported by the same process**
+(`gpudb-sql --multi`, per-statement elapsed), warm: native = min–max of the
+runs after the first (the first run of each native statement is discarded
+as cold); gpudb = min–max of the warm calls, with the one-time upload and
+sort paid by earlier statements and listed separately. The `wall_ms` and
+`kernel_ms` columns are `gpu_last_stats()` for the same calls: `wall_ms` is
+the operator alone and is *not* the number the speedup is computed from —
+the statement also streams the result rows through DuckDB's pipeline into
+the `count(*)` (≈ 7 ms at SF10, ≈ 33 ms at SF50 for 15M / 75M rows).
+`backend=Metal reason=Hot_GpuAlwaysWins transfer_ms=0.000` on every row;
+16 threads; SF50 ran with `GPUDB_UPLOAD_POOL_MAX_MB=12288`.
 
-| measurement | SF | native (ms) | gpudb warm (ms) | of which kernel | speedup | result check |
-|---|---|---:|---:|---:|---:|---|
-| (A) sum by orderkey | 1 | 6.9–9.5 | 2.3–2.7 | 1.5–1.9 | **~3×** | `EXCEPT` both ways = 0, 1,500,000 groups |
-| (A) sum by orderkey | 10 | 60–65 | 18.1 | 13.8 | **3.4×** | `EXCEPT` both ways = 0, 15,000,000 groups |
-| (A) sum by orderkey | 50 | 349–411 | 87–98 | 69–79 | **3.6–4.7×** | `EXCEPT` both ways = 0, 75,000,000 groups |
-| (B) Q18 inner, HAVING | 10 | 89–94 | 18.1 | 13.8 | **5.0×** | 624 groups == native |
-| (B) Q18 inner, HAVING | 50 | 460–521 | 88–97 | 69–78 | **5.0–5.6×** | 3,182 == native |
-| (C) sum DOUBLE by orderkey | 1 | 6.7–6.8 | 3.9–4.4 | 1.6–1.8 | 1.6× | rel-diff 4.4e-16 |
-| (C) sum DOUBLE by orderkey | 10 | 58 | 22.6–24.3 | 11.1 | **2.5×** | rel-diff 4.4e-16 |
-| (C) sum DOUBLE by orderkey | 50 | 347–350 | 117–126 | 67–71 | **2.8–3.0×** | rel-diff 4.5e-16 |
-| (D) count by orderkey | 10 | (as A) | 11.2 | 8.1 | — | 15,000,000 == native |
-| (D) count by orderkey | 50 | (as A) | 54 | 41 | — | 75,000,000 == native |
-| (E) top-10, first call (= the sort) | 10 | 0.5–2.0 | 129 | 29 | native wins | values == native |
-| (E) top-10, every call after | 10 / 50 | 0.5–9 | 0.001 | 0 | — | values == native |
-| (F) 4-group low-cardinality | 10 | 31–35 | 47 | 47 | **0.7× — native wins** | `EXCEPT` both ways = 0 |
-| (F) 4-group low-cardinality | 50 | 149–167 | 274 | 273 | **0.55× — native wins** | `EXCEPT` both ways = 0 |
+| measurement | SF | native stmt (ms) | gpudb stmt (ms) | operator `wall_ms` | `kernel_ms` | speedup (stmt / stmt) | result check |
+|---|---|---:|---:|---:|---:|---:|---|
+| (A) sum by orderkey | 1 | 8.6–8.8 | 3.2–3.7 | 2.3–2.9 | 1.5–1.7 | **2.3–2.7×** | `EXCEPT` both ways = 0, 1,500,000 groups |
+| (A) sum by orderkey | 10 | 60–62 | 25.4–26.0 | 18.7–19.2 | 13.9–14.0 | **2.3–2.4×** | `EXCEPT` both ways = 0, 15,000,000 groups |
+| (A) sum by orderkey | 50 | 347–355 | 120–123 | 87–90 | 68.5–69.4 | **2.8–2.9×** | `EXCEPT` both ways = 0, 75,000,000 groups |
+| (B) Q18 inner, HAVING | 1 | 11.2 | 4.0–4.6 | 2.3–2.9 | 1.5–1.7 | **2.4–2.8×** | 57 groups == native |
+| (B) Q18 inner, HAVING | 10 | 91 | 29.7–30.0 | 18.8–19.0 | 13.9 | **3.0–3.1×** | 624 groups == native |
+| (B) Q18 inner, HAVING | 50 | 466 | 147 | 88–90 | 68.5–68.7 | **3.2×** | 3,182 == native |
+| (C) sum DOUBLE by orderkey | 1 | 7.5–7.6 | 4.5 | 3.5 | 1.1 | 1.7× | rel-diff 4.4e-16 |
+| (C) sum DOUBLE by orderkey | 10 | 60 | 31.8–32.9 | 25.0–25.9 | 11.2 | **1.8–1.9×** | rel-diff 4.4e-16 |
+| (C) sum DOUBLE by orderkey | 50 | 348 | 144–158 | 109–123 | 56–65 | **2.2–2.4×** | rel-diff 4.5e-16 |
+| (D) count by orderkey | 1 | (as A) | 2.0–2.6 | 1.4–1.9 | 0.8 | **3.3–4.4×** | 1,500,000 == native |
+| (D) count by orderkey | 10 | (as A) | 16.1–16.5 | 11.7–12.0 | 8.2 | **3.7–3.8×** | 15,000,000 == native |
+| (D) count by orderkey | 50 | (as A) | 81 | 58 | 41 | **4.3–4.4×** | 75,000,000 == native |
+| (E) top-10, first call (= the sort) | 1 / 10 / 50 | 0.7 / 0.6 / 1.0 | 11 / 131 / 1,302 | 11 / 131 / 1,301 | 2.9 / 29 / 154 | **native wins** | values == native |
+| (E) top-10, every call after | 1 / 10 / 50 | 0.7 / 0.6 / 1.0 | 0.11 / 0.12 / 0.27 | 0.001 | 0 | 3.6–6× (sub-ms either way) | values == native |
+| (F) 4-group low-cardinality | 1 | 4.5 | 4.6 | 4.6 | 4.3 | **1.0× — tie** | `EXCEPT` both ways = 0 |
+| (F) 4-group low-cardinality | 10 | 31.5–32.3 | 48.4 | 48.2 | 47.8 | **0.65× — native wins** | `EXCEPT` both ways = 0 |
+| (F) 4-group low-cardinality | 50 | 153–154 | 274 | 274 | 273 | **0.56× — native wins** | `EXCEPT` both ways = 0 |
+
+Correction, stated plainly: the first version of this section (commit
+`2f75309`, same day) computed the speedups from the operator's `wall_ms`
+against native's statement time and reported 3.4–4.7× for (A) and 5.0–5.6×
+for (B). That compared unlike quantities. The rows above were re-measured
+on the final build with both sides on the same clock; the operator column
+itself did not change.
 
 One-time costs, stated plainly: the first GROUP BY on a pair pays the sort —
-38 ms at SF1, 0.27 s at SF10, 2.9 s at SF50 (sort + building the cache
-buffers) — after which that pair, and any join that uses it as a build
-side, never sorts again. Break-even after ~6 repeated queries at SF10, ~10
-at SF50. The uploads themselves are 1.1 s (SF10) / 6 s (SF50) per pair.
+33 ms at SF1, 0.28 s at SF10, 2.9 s at SF50 (statement time; sort + building
+the cache buffers) — after which that pair, and any join that uses it as a
+build side, never sorts again. Break-even against native (A) after ~7
+repeated queries at SF1, ~8 at SF10, ~13 at SF50. The uploads themselves
+are 0.06–0.09 s (SF1), 0.8–1.1 s (SF10), 4.3–6.0 s (SF50) per pair.
 
-Where the time goes: kernel is 75–85% of wall on the high-cardinality rows
-(the rest is the host scan of ~n/256 block counts and the in-place output
-write into page-aligned vectors — no copy-back on unified memory). (F) is
-slow for a structural reason, not a tuning one: with four groups the
-segmented reduce gathers all 60M–300M payload values through the sort
-permutation (random access), and native's streaming hash aggregate is
-scan-bound. Pick by cardinality; the row stays. (E) after the first call is
-a slice of the cached sort — 10 rows, ~0 ms — but the first call loses to
-native's zonemap + heap top-k, which never sorts at all.
+Where the time goes on the high-cardinality rows: the kernel is 74–79% of
+the operator's `wall_ms` and 54–57% of the statement; the rest is the host
+scan of ~n/256 block counts, the in-place output write into page-aligned
+vectors (no copy-back on unified memory), and DuckDB consuming the result
+rows (≈ 0.4 ns per result row — the same cost native pays to emit them —
+which is why (B), whose `WHERE sum > 300` runs natively over the GPU rows,
+costs ≈ 25 ms more than (A) at SF50 on the gpudb side and ≈ 115 ms more on
+the native side). (F) is slow for a structural reason, not a tuning one:
+with four groups the segmented reduce gathers all 60M–300M payload values
+through the sort permutation (random access), and native's streaming hash
+aggregate is scan-bound. Pick by cardinality; the row stays. (E) after the
+first call is a slice of the cached sort — 10 rows, sub-millisecond — but
+the first call loses to native's zonemap + heap top-k, which never sorts at
+all, and at SF50 loses by 1.3 s.
 
 `DOUBLE` on Metal: no doubles in MSL, so the GPU sorts and gathers the
 payload into key order (`gb_gather_i64`, raw 64-bit words) and the host
 streams one sequential sum per segment in parallel — the same
-"GPU sorts, host streams" split as the f64 join. It costs (C) ≈ 5 ms over
-(A) at SF10 and ≈ 30 ms at SF50.
+"GPU sorts, host streams" split as the f64 join. It costs (C) ≈ 6–8 ms over
+(A) at SF10 and ≈ 20–40 ms at SF50 (statement time).
 
 Found while benchmarking (F): the Metal radix sort skipped a byte pass
 whenever min and max agreed on that byte, which is wrong for keys between
