@@ -1,4 +1,5 @@
 #include "gpu_backend.hpp"
+#include "../groupby_filter.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -329,7 +330,8 @@ public:
     // ascending; i64 sums in uint64 wrap arithmetic (bit-exact contract).
     GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         const auto t0 = std::chrono::steady_clock::now();
         const auto& k = check_i64(keys);
         const auto& v = check_i64(vals);
@@ -344,7 +346,7 @@ public:
         for (std::size_t i = 0; i < k.rows(); ++i) p[i] = { k.as_i64()[i], v.as_i64()[i] };
         std::sort(p.begin(), p.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
-        check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_i64");
+        if (!filter.active()) check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_i64");
 
         std::size_t i = 0;
         while (i < p.size()) {
@@ -357,13 +359,15 @@ public:
             r.sums.push_back(static_cast<std::int64_t>(sum));
             r.counts.push_back(cnt);
         }
+        apply_group_filter_host(r, filter, FilterAgg::SumI64, max_groups, "groupby_sum_resident_i64");
         r.wall_ms = elapsed_ms(t0);
         return r;
     }
 
     GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         const auto t0 = std::chrono::steady_clock::now();
         const auto& k = check_i64(keys);
         const auto& v = check_f64(vals);
@@ -378,7 +382,7 @@ public:
         for (std::size_t i = 0; i < k.rows(); ++i) p[i] = { k.as_i64()[i], v.as_f64()[i] };
         std::stable_sort(p.begin(), p.end(),
                          [](const auto& a, const auto& b) { return a.first < b.first; });
-        check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_f64");
+        if (!filter.active()) check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_f64");
 
         std::size_t i = 0;
         while (i < p.size()) {
@@ -389,12 +393,14 @@ public:
             r.sums_f64.push_back(sum);
             r.counts.push_back(cnt);
         }
+        apply_group_filter_host(r, filter, FilterAgg::SumF64, max_groups, "groupby_sum_resident_f64");
         r.wall_ms = elapsed_ms(t0);
         return r;
     }
 
     GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
-                                                 std::size_t max_groups) override {
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
         const auto t0 = std::chrono::steady_clock::now();
         const auto& k = check_i64(keys);
         GroupByResidentResult r{};
@@ -405,7 +411,7 @@ public:
         std::sort(s.begin(), s.end());
         std::size_t groups = 1;
         for (std::size_t i = 1; i < s.size(); ++i) groups += (s[i] != s[i - 1]);
-        check_group_cap(groups, max_groups, "groupby_count_resident");
+        if (!filter.active()) check_group_cap(groups, max_groups, "groupby_count_resident");
 
         std::size_t i = 0;
         while (i < s.size()) {
@@ -415,6 +421,7 @@ public:
             r.keys.push_back(key);
             r.counts.push_back(cnt);
         }
+        apply_group_filter_host(r, filter, FilterAgg::Count, max_groups, "groupby_count_resident");
         r.wall_ms = elapsed_ms(t0);
         return r;
     }

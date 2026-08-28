@@ -304,27 +304,30 @@ public:
     // ---- Resident GROUP BY / top-k (v0.6): same placement rule as joins ----
     GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         return dispatch_resident_pair<GroupByResidentResult>(keys, vals,
             [&](Aggregator& a, const ResidentColumn& k, const ResidentColumn& v) {
-                return a.groupby_sum_resident_i64(k, v, max_groups);
+                return a.groupby_sum_resident_i64(k, v, max_groups, filter);
             });
     }
 
     GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         return dispatch_resident_pair<GroupByResidentResult>(keys, vals,
             [&](Aggregator& a, const ResidentColumn& k, const ResidentColumn& v) {
-                return a.groupby_sum_resident_f64(k, v, max_groups);
+                return a.groupby_sum_resident_f64(k, v, max_groups, filter);
             });
     }
 
     GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
-                                                 std::size_t max_groups) override {
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
         return dispatch_resident_single<GroupByResidentResult>(keys,
             [&](Aggregator& a, const ResidentColumn& k) {
-                return a.groupby_count_resident(k, max_groups);
+                return a.groupby_count_resident(k, max_groups, filter);
             });
     }
 

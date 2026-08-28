@@ -16,6 +16,7 @@
 //     IEEE-754 double precision in MSL.
 
 #include "gpu_backend.hpp"
+#include "../groupby_filter.hpp"
 #include "metal_kernel_sources.hpp"
 #include "metal_radix_sort.hpp"
 
@@ -532,35 +533,38 @@ public:
     // pipeline comment in sum.metal. Output sorted by key ascending.
     GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         @autoreleasepool {
             const auto& k = check_i64(keys);
             const auto& v = check_i64(vals);
             if (k.rows() != v.rows())
                 throw std::runtime_error(
                     "groupby_sum_resident_i64: keys and vals row counts differ");
-            return groupby_impl(k, &v, GbMode::SumI64, max_groups, "groupby_sum_resident_i64");
+            return groupby_impl(k, &v, GbMode::SumI64, max_groups, filter, "groupby_sum_resident_i64");
         }
     }
 
     GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
                                                    const ResidentColumn& vals,
-                                                   std::size_t max_groups) override {
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
         @autoreleasepool {
             const auto& k = check_i64(keys);
             const auto& v = check_f64(vals);
             if (k.rows() != v.rows())
                 throw std::runtime_error(
                     "groupby_sum_resident_f64: keys and vals row counts differ");
-            return groupby_impl(k, &v, GbMode::SumF64, max_groups, "groupby_sum_resident_f64");
+            return groupby_impl(k, &v, GbMode::SumF64, max_groups, filter, "groupby_sum_resident_f64");
         }
     }
 
     GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
-                                                 std::size_t max_groups) override {
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
         @autoreleasepool {
             const auto& k = check_i64(keys);
-            return groupby_impl(k, nullptr, GbMode::Count, max_groups, "groupby_count_resident");
+            return groupby_impl(k, nullptr, GbMode::Count, max_groups, filter, "groupby_count_resident");
         }
     }
 
@@ -718,7 +722,7 @@ private:
     GroupByResidentResult groupby_impl(const MetalResidentColumn& k,
                                        const MetalResidentColumn* v,
                                        GbMode mode, std::size_t max_groups,
-                                       const char* op) {
+                                       const GroupByFilter& filter, const char* op) {
         const auto t_wall0 = std::chrono::steady_clock::now();
         GroupByResidentResult r{};
         r.rows_in = k.rows();
@@ -764,7 +768,7 @@ private:
                 num_segs += c;
             }
         }
-        if (num_segs > max_groups)
+        if (!filter.active() && num_segs > max_groups)
             throw std::runtime_error(
                 std::string(op) + ": result has " + std::to_string(num_segs) +
                 " groups, above the cap of " + std::to_string(max_groups) +
@@ -868,6 +872,12 @@ private:
             }
             for (auto& t : ts) t.join();
         }
+
+        // Filter (interim: host reference; device kernels follow).
+        apply_group_filter_host(r, filter,
+                                mode == GbMode::SumI64 ? FilterAgg::SumI64 :
+                                mode == GbMode::SumF64 ? FilterAgg::SumF64 : FilterAgg::Count,
+                                max_groups, op);
 
         r.kernel_ms   = kernel_ms;
         r.transfer_ms = 0.0;

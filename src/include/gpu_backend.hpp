@@ -124,7 +124,39 @@ struct GroupByResidentResult {
     std::vector<double>       sums_f64;   // backend-ordered, tolerance-checked
     std::vector<std::int64_t> counts;
     std::size_t rows_in = 0;
+    std::size_t groups_total = 0;         // distinct keys BEFORE any GroupByFilter
     double wall_ms = 0.0, kernel_ms = 0.0, transfer_ms = 0.0;
+};
+
+// Optional device-side post-filter for the resident GROUP BY ops: HAVING on
+// the aggregate and/or "the k groups with the largest / smallest aggregate".
+// Applied BEFORE any device→host copy, so a 75M-group GROUP BY that keeps
+// 3,000 groups moves 3,000 rows. The aggregate compared is the op's own:
+// the i64 sum (groupby_sum_resident_i64, threshold_i64), the f64 sum
+// (groupby_sum_resident_f64, threshold_f64), the count
+// (groupby_count_resident, threshold_i64).
+//   cmp   : keep groups whose aggregate satisfies  aggregate <cmp> threshold
+//           (None = keep all);
+//   topk  : after cmp, keep only the k groups with the largest (topk_desc)
+//           or smallest aggregate; 0 = all survivors. k > survivors returns
+//           every survivor.
+// Output order: sorted by key ASCENDING when topk == 0 (as without a
+// filter); when topk > 0, sorted by aggregate (descending iff topk_desc),
+// with tie order among equal aggregates UNSPECIFIED and backend-defined —
+// cross-backend checks compare the multiset of (key, aggregate) rows.
+// f64 comparisons use the backend-ordered sum, so a group whose f64 sum
+// sits within rounding of the threshold may be kept by one backend and
+// dropped by another (same tolerance caveat as the sums themselves).
+// max_groups bounds the rows RETURNED (the survivors), not the number of
+// groups; GroupByResidentResult::groups_total reports the unfiltered count.
+struct GroupByFilter {
+    enum class Cmp : std::uint8_t { None, GT, GE, LT, LE };
+    Cmp          cmp = Cmp::None;
+    std::int64_t threshold_i64 = 0;
+    double       threshold_f64 = 0.0;
+    std::size_t  topk = 0;
+    bool         topk_desc = true;
+    bool active() const { return cmp != Cmp::None || topk != 0; }
 };
 
 // Returned by Aggregator::topk_resident — k rows in the requested order.
@@ -239,10 +271,12 @@ public:
     //     compared under the ~1e-9 relative tolerance; counts are exact;
     //   - keys/vals row counts must match (std::runtime_error otherwise, as
     //     do dtype / backend-tag mismatches);
-    //   - the number of groups is checked against max_groups BEFORE any
-    //     device→host copy; exceeding it throws a clean error naming the
-    //     actual count (never truncates).
-    // groupby_count_resident is keys-only. Backends reuse the join's cached
+    //   - the number of rows to return (groups, or the GroupByFilter
+    //     survivors) is checked against max_groups BEFORE any device→host
+    //     copy; exceeding it throws a clean error naming the actual count
+    //     (never truncates).
+    // groupby_count_resident is keys-only. `filter` (see GroupByFilter) is
+    // applied on the device; the default keeps every group. Backends reuse the join's cached
     // sorted-key + permutation structure where they have one; that cache
     // dies with the column and is outside the upload-pool accounting.
     // Same default-throwing / hybrid-fallback rules as the join ops.
@@ -252,12 +286,15 @@ public:
     // caller — the SQL extension holds one mutex around every resident op.
     virtual GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
                                                            const ResidentColumn& vals,
-                                                           std::size_t max_groups);
+                                                           std::size_t max_groups,
+                                                           const GroupByFilter& filter = GroupByFilter{});
     virtual GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
                                                            const ResidentColumn& vals,
-                                                           std::size_t max_groups);
+                                                           std::size_t max_groups,
+                                                           const GroupByFilter& filter = GroupByFilter{});
     virtual GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
-                                                         std::size_t max_groups);
+                                                         std::size_t max_groups,
+                                                         const GroupByFilter& filter = GroupByFilter{});
 
     // ORDER BY col [DESC] LIMIT k over a resident column (I64 or F64).
     // Returns the k smallest (descending=false) or largest values with their

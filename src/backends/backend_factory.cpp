@@ -39,18 +39,18 @@ JoinRowsResult Aggregator::join_rows_resident(const ResidentColumn&,
 // Same opt-in rule for the v0.6 resident GROUP BY / top-k ops.
 GroupByResidentResult Aggregator::groupby_sum_resident_i64(const ResidentColumn&,
                                                            const ResidentColumn&,
-                                                           std::size_t) {
+                                                           std::size_t, const GroupByFilter&) {
     throw std::runtime_error("groupby_sum_resident_i64: not implemented on this backend");
 }
 
 GroupByResidentResult Aggregator::groupby_sum_resident_f64(const ResidentColumn&,
                                                            const ResidentColumn&,
-                                                           std::size_t) {
+                                                           std::size_t, const GroupByFilter&) {
     throw std::runtime_error("groupby_sum_resident_f64: not implemented on this backend");
 }
 
 GroupByResidentResult Aggregator::groupby_count_resident(const ResidentColumn&,
-                                                         std::size_t) {
+                                                         std::size_t, const GroupByFilter&) {
     throw std::runtime_error("groupby_count_resident: not implemented on this backend");
 }
 
