@@ -18,6 +18,7 @@ if(GPUDB_HAS_CUDA)
         backends/cuda/kernels/groupby_kernel.cu
         backends/cuda/kernels/hashjoin_kernel.cu
         backends/cuda/kernels/join_kernel.cu
+        backends/cuda/kernels/groupby_resident_kernel.cu
     )
 endif()
 

@@ -8,7 +8,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
+#include <string>
+#include <vector>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -56,6 +59,23 @@ cudaError_t gpudb_cuda_join_rows_fill(const std::int64_t* d_probe,
                                       int kind, const unsigned long long* d_offs,
                                       std::int64_t* d_out_pidx, std::int64_t* d_out_bidx,
                                       int grid, cudaStream_t s);
+cudaError_t gpudb_cuda_sorted_run_count(const std::int64_t* d_sorted, std::size_t n,
+                                        std::size_t* h_runs, cudaStream_t s);
+cudaError_t gpudb_cuda_groupby_sum_i64(const std::int64_t* d_sorted, const std::int64_t* d_perm,
+                                       const std::int64_t* d_vals, std::size_t n,
+                                       std::int64_t* out_keys, std::int64_t* out_sums,
+                                       std::int64_t* out_counts,
+                                       std::size_t* h_runs, cudaStream_t s);
+cudaError_t gpudb_cuda_groupby_sum_f64(const std::int64_t* d_sorted, const std::int64_t* d_perm,
+                                       const double* d_vals, std::size_t n,
+                                       std::int64_t* out_keys, double* out_sums,
+                                       std::int64_t* out_counts,
+                                       std::size_t* h_runs, cudaStream_t s);
+cudaError_t gpudb_cuda_groupby_count(const std::int64_t* d_sorted, std::size_t n,
+                                     std::int64_t* out_keys, std::int64_t* out_counts,
+                                     std::size_t* h_runs, cudaStream_t s);
+cudaError_t gpudb_cuda_sort_f64_perm(const double* d_vals, double* d_sorted,
+                                     std::int64_t* d_perm, std::size_t n, cudaStream_t s);
 }
 
 namespace {
@@ -113,8 +133,32 @@ public:
         d_sorted_ = sorted;
         d_perm_   = perm;
     }
+    // Sort cache for any dtype (v0.6 top-k): I64 shares the join cache above;
+    // F64 sorts through order-preserving u64 keys (NaN greatest) and stores
+    // the sorted doubles in the same slot.
+    void ensure_sort_cache(cudaStream_t s) const {
+        if (dtype_ == Dtype::I64) { ensure_join_cache(s); return; }
+        if (d_sorted_ || rows_ == 0) return;
+        void* sorted = nullptr;
+        void* perm   = nullptr;
+        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, bytes_), "cudaMalloc sort cache (sorted f64)");
+        cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
+        if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc sort cache (perm)"); }
+        e = gpudb_cuda_sort_f64_perm(static_cast<const double*>(dptr_),
+                                     static_cast<double*>(sorted),
+                                     static_cast<std::int64_t*>(perm), rows_, s);
+        if (e != cudaSuccess) {
+            cudaFree(sorted); cudaFree(perm);
+            cuda_throw(e, "sort cache build (f64 sort_by_key)");
+        }
+        d_sorted_ = sorted;
+        d_perm_   = perm;
+    }
     const std::int64_t* sorted_keys() const noexcept {
         return static_cast<const std::int64_t*>(d_sorted_);
+    }
+    const double* sorted_f64() const noexcept {
+        return static_cast<const double*>(d_sorted_);
     }
     const std::int64_t* perm() const noexcept {
         return static_cast<const std::int64_t*>(d_perm_);
@@ -442,8 +486,212 @@ public:
         return r;
     }
 
+    // ---- resident GROUP BY / top-k (v0.6) ----
+    // Keys reuse the v0.5 sort cache (sorted keys + permutation); values are
+    // read through the permutation and reduced per key run. The group count
+    // comes from a cheap run-count pass first, so the cap is checked before
+    // any output is allocated or transferred.
+    GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        const auto& v = check_i64(vals);
+        if (k.rows() != v.rows())
+            throw std::runtime_error(
+                "groupby_sum_resident_i64: keys and vals row counts differ");
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        k.ensure_join_cache(stream_);
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const std::size_t groups = checked_group_count("groupby_sum_resident_i64", k, max_groups);
+        DeviceOut<std::int64_t> d_keys(groups, "groupby out keys");
+        DeviceOut<std::int64_t> d_sums(groups, "groupby out sums");
+        DeviceOut<std::int64_t> d_cnts(groups, "groupby out counts");
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_groupby_sum_i64(
+                             k.sorted_keys(), k.perm(),
+                             static_cast<const std::int64_t*>(v.device_ptr()), k.rows(),
+                             d_keys.p, d_sums.p, d_cnts.p, &runs, stream_),
+                         "groupby_sum_i64 reduce_by_key");
+        r.kernel_ms = stop_kernel_timer();
+        check_runs("groupby_sum_resident_i64", runs, groups);
+
+        const auto tx = std::chrono::steady_clock::now();
+        d2h(r.keys,   d_keys, groups, "groupby keys D2H");
+        d2h(r.sums,   d_sums, groups, "groupby sums D2H");
+        d2h(r.counts, d_cnts, groups, "groupby counts D2H");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
+        r.transfer_ms = elapsed_ms(tx);
+        r.wall_ms     = elapsed_ms(t0);
+        return r;
+    }
+
+    GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        const auto& v = check_f64(vals);
+        if (k.rows() != v.rows())
+            throw std::runtime_error(
+                "groupby_sum_resident_f64: keys and vals row counts differ");
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        k.ensure_join_cache(stream_);
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const std::size_t groups = checked_group_count("groupby_sum_resident_f64", k, max_groups);
+        DeviceOut<std::int64_t> d_keys(groups, "groupby out keys");
+        DeviceOut<double>       d_sums(groups, "groupby out sums (f64)");
+        DeviceOut<std::int64_t> d_cnts(groups, "groupby out counts");
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_groupby_sum_f64(
+                             k.sorted_keys(), k.perm(),
+                             static_cast<const double*>(v.device_ptr()), k.rows(),
+                             d_keys.p, d_sums.p, d_cnts.p, &runs, stream_),
+                         "groupby_sum_f64 reduce_by_key");
+        r.kernel_ms = stop_kernel_timer();
+        check_runs("groupby_sum_resident_f64", runs, groups);
+
+        const auto tx = std::chrono::steady_clock::now();
+        d2h(r.keys,     d_keys, groups, "groupby keys D2H");
+        d2h(r.sums_f64, d_sums, groups, "groupby sums D2H");
+        d2h(r.counts,   d_cnts, groups, "groupby counts D2H");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
+        r.transfer_ms = elapsed_ms(tx);
+        r.wall_ms     = elapsed_ms(t0);
+        return r;
+    }
+
+    GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
+                                                 std::size_t max_groups) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        k.ensure_join_cache(stream_);
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const std::size_t groups = checked_group_count("groupby_count_resident", k, max_groups);
+        DeviceOut<std::int64_t> d_keys(groups, "groupby out keys");
+        DeviceOut<std::int64_t> d_cnts(groups, "groupby out counts");
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_groupby_count(k.sorted_keys(), k.rows(),
+                                                  d_keys.p, d_cnts.p, &runs, stream_),
+                         "groupby_count reduce_by_key");
+        r.kernel_ms = stop_kernel_timer();
+        check_runs("groupby_count_resident", runs, groups);
+
+        const auto tx = std::chrono::steady_clock::now();
+        d2h(r.keys,   d_keys, groups, "groupby keys D2H");
+        d2h(r.counts, d_cnts, groups, "groupby counts D2H");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
+        r.transfer_ms = elapsed_ms(tx);
+        r.wall_ms     = elapsed_ms(t0);
+        return r;
+    }
+
+    // top-k = a slice of the cached sort. kernel_ms covers the sort on the
+    // first call for a column and is ~0 on later calls (cache hit); the
+    // descending order is the tail of the ascending run, reversed on the host.
+    TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
+                             bool descending) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (col.backend_tag() != Backend::CUDA)
+            throw std::runtime_error("ResidentColumn from wrong backend");
+        const auto& c = static_cast<const CudaResidentColumn&>(col);
+        TopKResult r{};
+        r.rows_in = c.rows();
+        const std::size_t n = c.rows();
+        if (k > n) k = n;
+        if (k == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        c.ensure_sort_cache(stream_);
+        r.kernel_ms = stop_kernel_timer();
+
+        const std::size_t off = descending ? n - k : 0;
+        const auto tx = std::chrono::steady_clock::now();
+        r.idx.resize(k);
+        GPUDB_CUDA_CHECK(cudaMemcpyAsync(r.idx.data(), c.perm() + off, k * sizeof(std::int64_t),
+                                         cudaMemcpyDeviceToHost, stream_), "topk idx D2H");
+        if (c.dtype() == Dtype::I64) {
+            r.values_i64.resize(k);
+            GPUDB_CUDA_CHECK(cudaMemcpyAsync(r.values_i64.data(), c.sorted_keys() + off,
+                                             k * sizeof(std::int64_t),
+                                             cudaMemcpyDeviceToHost, stream_), "topk values D2H");
+        } else {
+            r.values_f64.resize(k);
+            GPUDB_CUDA_CHECK(cudaMemcpyAsync(r.values_f64.data(), c.sorted_f64() + off,
+                                             k * sizeof(double),
+                                             cudaMemcpyDeviceToHost, stream_), "topk values D2H");
+        }
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
+        r.transfer_ms = elapsed_ms(tx);
+        if (descending) {
+            std::reverse(r.idx.begin(), r.idx.end());
+            std::reverse(r.values_i64.begin(), r.values_i64.end());
+            std::reverse(r.values_f64.begin(), r.values_f64.end());
+        }
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
 private:
     enum class ReduceKind { Sum, Min, Max };
+
+    // Per-call device output buffer (freed on scope exit, including throws).
+    template <typename T>
+    struct DeviceOut {
+        T* p = nullptr;
+        DeviceOut(std::size_t n, const char* what) {
+            if (n) GPUDB_CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)), what);
+        }
+        ~DeviceOut() { if (p) cudaFree(p); }
+        DeviceOut(const DeviceOut&) = delete;
+        DeviceOut& operator=(const DeviceOut&) = delete;
+    };
+
+    template <typename T>
+    void d2h(std::vector<T>& dst, const DeviceOut<T>& src, std::size_t n, const char* what) {
+        dst.resize(n);
+        GPUDB_CUDA_CHECK(cudaMemcpyAsync(dst.data(), src.p, n * sizeof(T),
+                                         cudaMemcpyDeviceToHost, stream_), what);
+    }
+
+    double stop_kernel_timer() {
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_stop_, stream_), "ev_stop");
+        GPUDB_CUDA_CHECK(cudaEventSynchronize(ev_stop_), "ev_sync");
+        float ms = 0.0f;
+        GPUDB_CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start_, ev_stop_), "elapsed");
+        return static_cast<double>(ms);
+    }
+
+    // Distinct-key count over the cached sorted keys, checked against the cap
+    // before any output allocation or transfer.
+    std::size_t checked_group_count(const char* op, const CudaResidentColumn& k,
+                                    std::size_t max_groups) {
+        std::size_t groups = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_sorted_run_count(k.sorted_keys(), k.rows(), &groups, stream_),
+                         "groupby run count");
+        if (groups > max_groups)
+            throw std::runtime_error(
+                std::string(op) + ": result has " + std::to_string(groups) +
+                " groups, above the cap of " + std::to_string(max_groups) +
+                " (raise GPUDB_GROUPBY_ROWS_MAX_M if intentional)");
+        return groups;
+    }
+    static void check_runs(const char* op, std::size_t runs, std::size_t groups) {
+        if (runs != groups)
+            throw std::runtime_error(std::string(op) + ": reduce produced " +
+                                     std::to_string(runs) + " runs, expected " +
+                                     std::to_string(groups));
+    }
 
     static double elapsed_ms(std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration<double, std::milli>(
