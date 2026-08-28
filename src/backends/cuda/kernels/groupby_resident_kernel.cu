@@ -27,6 +27,8 @@
 #include <thrust/tuple.h>
 #include <thrust/unique.h>
 
+#include "thrust_errors.cuh"
+
 namespace {
 
 using u64 = unsigned long long;
@@ -84,7 +86,7 @@ cudaError_t gpudb_cuda_sorted_run_count(const i64* d_sorted, std::size_t n,
         *h_runs = static_cast<std::size_t>(
             thrust::unique_count(thrust::cuda::par.on(s), d_sorted, d_sorted + n));
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaGetLastError();
 }
@@ -106,7 +108,7 @@ cudaError_t gpudb_cuda_groupby_sum_i64(const i64* d_sorted, const i64* d_perm,
                                           thrust::equal_to<i64>(), AddU64Pair());
         *h_runs = static_cast<std::size_t>(ends.first - out_keys);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaGetLastError();
 }
@@ -126,7 +128,7 @@ cudaError_t gpudb_cuda_groupby_sum_f64(const i64* d_sorted, const i64* d_perm,
                                           thrust::equal_to<i64>(), AddF64Pair());
         *h_runs = static_cast<std::size_t>(ends.first - out_keys);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaGetLastError();
 }
@@ -142,7 +144,7 @@ cudaError_t gpudb_cuda_groupby_count(const i64* d_sorted, std::size_t n,
                                           out_keys, reinterpret_cast<u64*>(out_counts));
         *h_runs = static_cast<std::size_t>(ends.first - out_keys);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaGetLastError();
 }
@@ -161,7 +163,7 @@ cudaError_t gpudb_cuda_sort_f64_perm(const double* d_vals, double* d_sorted,
         thrust::sort_by_key(thrust::cuda::par.on(s), k, k + n, d_perm);
         thrust::gather(thrust::cuda::par.on(s), d_perm, d_perm + n, d_vals, d_sorted);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaStreamSynchronize(s);
 }

@@ -18,6 +18,8 @@
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 
+#include "thrust_errors.cuh"
+
 namespace {
 
 constexpr int BLOCK = 256;
@@ -196,7 +198,7 @@ cudaError_t gpudb_cuda_join_build_sort(const std::int64_t* d_keys,
         thrust::sequence(thrust::cuda::par.on(s), d_perm, d_perm + n);
         thrust::sort_by_key(thrust::cuda::par.on(s), d_sorted, d_sorted + n, d_perm);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaStreamSynchronize(s);
 }
@@ -247,7 +249,7 @@ cudaError_t gpudb_cuda_join_rows_scan(u64* d_cnt, std::size_t n,
         *h_total = thrust::reduce(thrust::cuda::par.on(s), d_cnt, d_cnt + n, u64{0});
         thrust::exclusive_scan(thrust::cuda::par.on(s), d_cnt, d_cnt + n, d_cnt);
     } catch (...) {
-        return cudaErrorMemoryAllocation;
+        return gpudb_cuda_detail::map_exception();
     }
     return cudaStreamSynchronize(s);
 }
