@@ -261,11 +261,13 @@ void test_backend(gpudb::Backend b) {
             auto tk = agg->topk_resident(*vc, N + 10, false);   // k clamps to rows
             EXPECT_EQ(tk.idx.size(), N);
 
-            // gpudb::GroupByFilter (device-side HAVING + top-k of groups) vs the host
-            // reference on adversarial filters: threshold equal to a sum (all
-            // four comparisons), everything filtered, k > survivors, k == 1,
-            // negative thresholds, heavy ties, cmp + top-k, count and f64 ops.
+            // GroupByFilter, adversarial cases (CUDA-side additions to the
+            // "resident group by filter" block below): threshold equal to a
+            // sum for all four comparisons, everything filtered, k > survivors,
+            // k == 1, negative thresholds, heavy ties, cmp + top-k, f64 top-k,
+            // count op, and the filtered cap wording.
             {
+                std::printf("  resident group by filter, adversarial cases:\n");
                 using Cmp = gpudb::GroupByFilter::Cmp;
                 const std::size_t cap = std::size_t(100) * 1000000;
                 auto base_i = agg->groupby_sum_resident_i64(*kc, *vc, cap);
