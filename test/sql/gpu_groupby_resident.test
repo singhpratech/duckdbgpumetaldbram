@@ -1,0 +1,94 @@
+# gpu_groupby_resident SQL test — resident GROUP BY / top-k table functions
+# (v0.6.0): gpu_groupby_sum_resident / gpu_groupby_sum_resident_f64 /
+# gpu_groupby_count_resident / gpu_topk_resident / gpu_topk_resident_f64.
+#
+# Table functions read resident columns that must exist before the
+# statement initialises, so each test uploads via `-- setup:` statements
+# (run first on the same connection; the runner passes gpudb-sql
+# --multi-last) and then queries — the documented sequential usage.
+#
+# Fixture: (k, v) = (3,10) (1,20) (3,30) (2,25) (1,-5)
+#   groups: 1 -> 15 (2 rows), 2 -> 25 (1 row), 3 -> 40 (2 rows)
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_groupby_resident
+
+-- 1. SUM BIGINT + COUNT per key, sorted by key ascending
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20),(3,30),(2,25),(1,-5)) t(k,v)
+SELECT key, sum, count FROM gpu_groupby_sum_resident('p');
+-- expect: 1  15  2
+-- expect: 2  25  1
+-- expect: 3  40  2
+
+-- 2. SUM DOUBLE per key
+-- setup: SELECT gpu_upload_pair('pf', k, v::DOUBLE / 4) FROM (VALUES (3,10),(1,20),(3,30),(2,25),(1,-5)) t(k,v)
+SELECT key, sum, count FROM gpu_groupby_sum_resident_f64('pf');
+-- expect: 1  3.75  2
+-- expect: 2  6.25  1
+-- expect: 3  10.0  2
+
+-- 3. COUNT per key over a pair name
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20),(3,30),(2,25),(1,-5)) t(k,v)
+SELECT key, count FROM gpu_groupby_count_resident('p');
+-- expect: 1  2
+-- expect: 2  1
+-- expect: 3  2
+
+-- 4. COUNT per key over a bare gpu_upload column (no pair)
+-- setup: SELECT gpu_upload('c', v) FROM (VALUES (7),(-2),(9),(9),(0)) t(v)
+SELECT key, count FROM gpu_groupby_count_resident('c');
+-- expect: -2  1
+-- expect: 0  1
+-- expect: 7  1
+-- expect: 9  2
+
+-- 5. The GPU result composes with ordinary SQL downstream
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20),(3,30),(2,25),(1,-5)) t(k,v)
+SELECT key, sum FROM gpu_groupby_sum_resident('p') WHERE sum > 20 ORDER BY sum DESC LIMIT 1;
+-- expect: 3  40
+
+-- 6. Parity with native GROUP BY (EXCEPT both ways = 0 rows) and the stats line
+-- setup: CREATE TABLE src AS SELECT (range * 7919) % 101 AS k, (range * 104729) % 1000 - 500 AS v FROM range(20000)
+-- setup: SELECT gpu_upload_pair('s', k, v) FROM src
+SELECT (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident('s')) EXCEPT (SELECT k, sum(v) FROM src GROUP BY k))) +
+       (SELECT count(*) FROM ((SELECT k, sum(v) FROM src GROUP BY k) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident('s')))) AS diff,
+       (SELECT count(*) FROM gpu_groupby_sum_resident('s')) AS groups,
+       gpu_last_stats() LIKE 'op=groupby_sum_resident backend=% rows_in=20000 groups=101 %' AS stats_ok;
+-- expect: 0  101  true
+
+-- 7. top-k descending over a bare BIGINT column (ties: both 9s)
+-- setup: SELECT gpu_upload('c', v) FROM (VALUES (7),(-2),(9),(9),(0)) t(v)
+SELECT value FROM gpu_topk_resident('c', 3, 'desc');
+-- expect: 9
+-- expect: 9
+-- expect: 7
+
+-- 8. top-k ascending over a pair ranks the payload and returns upload indices
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20),(3,30),(2,25),(1,-5)) t(k,v)
+SELECT idx, value FROM gpu_topk_resident('p', 2, 'asc');
+-- expect: 4  -5
+-- expect: 0  10
+
+-- 9. top-k over DOUBLE; k larger than the column clamps to the row count
+-- setup: SELECT gpu_upload('cf', v::DOUBLE) FROM (VALUES (1.5),(-2.25),(9.0)) t(v)
+SELECT count(*), min(value), max(value) FROM gpu_topk_resident_f64('cf', 10, 'desc');
+-- expect: 3  -2.25  9.0
+
+-- 10. GUARDRAIL: unknown name is a clean error
+-- expected_fail: no resident pair named 'nope'
+SELECT * FROM gpu_groupby_sum_resident('nope');
+
+-- 11. GUARDRAIL: DOUBLE payload through the BIGINT function is rejected
+-- setup: SELECT gpu_upload_pair('pd', k, v::DOUBLE) FROM (VALUES (1,1.5)) t(k,v)
+-- expected_fail: use gpu_groupby_sum_resident_f64
+SELECT key FROM gpu_groupby_sum_resident('pd');
+
+-- 12. GUARDRAIL: DOUBLE column through the BIGINT top-k is rejected
+-- setup: SELECT gpu_upload('cf', v::DOUBLE) FROM (VALUES (1.5)) t(v)
+-- expected_fail: use gpu_topk_resident_f64
+SELECT value FROM gpu_topk_resident('cf', 1, 'desc');
+
+-- 13. GUARDRAIL: group cap is enforced with a clean error naming the count
+-- setup: SELECT gpu_upload_pair('big', range, range) FROM range(1500000)
+-- env: GPUDB_GROUPBY_ROWS_MAX_M=1
+-- expected_fail: above the cap
+SELECT count(*) FROM gpu_groupby_count_resident('big');

@@ -432,3 +432,150 @@ kernel void join_lookup_i64(
         first[i]  = f;
     }
 }
+
+// ===================== resident GROUP BY / top-k (v0.6) =====================
+//
+// Input is a key column already radix-sorted by the join build cache
+// (sorted keys + perm = original upload indices). A "run" of equal sorted
+// keys is one group. Pipeline (host orchestrates, see metal_aggregator.mm):
+//   gb_block_counts_i64  per-256-block count of run starts
+//   (host: exclusive scan of the block counts → block offsets, num_segs)
+//   gb_run_starts_i64    starts[seg] = sorted position of each run start,
+//                        in key order (block offset + in-block prefix scan)
+//   gb_chunk_sum_i64     chunked segmented sum of vals[perm[i]]: runs fully
+//                        inside a 64-element chunk are written directly by
+//                        their exclusive owner; boundary-crossing runs leave
+//                        a head / tail partial per chunk
+//   gb_finalize_i64      keys + counts for every segment; sums for the
+//                        boundary-crossing segments (tail of the first chunk
+//                        + heads of the chunks it spans)
+// Sums are ulong wrap-adds (the cross-backend rule). No atomics, no 64-bit
+// CAS needed, output already sorted by key.
+
+constant uint GB_CHUNK = 64;
+
+kernel void gb_block_counts_i64(
+    device const long* keys         [[buffer(0)]],
+    constant uint&     n            [[buffer(1)]],
+    device uint*       block_counts [[buffer(2)]],
+    uint               tid          [[thread_position_in_threadgroup]],
+    uint               gid          [[thread_position_in_grid]],
+    uint               block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    uint f = 0u;
+    if (gid < n) f = (gid == 0u || keys[gid] != keys[gid - 1u]) ? 1u : 0u;
+    shm[tid] = f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
+}
+
+kernel void gb_run_starts_i64(
+    device const long* keys          [[buffer(0)]],
+    constant uint&     n             [[buffer(1)]],
+    device const uint* block_offsets [[buffer(2)]],
+    device uint*       starts        [[buffer(3)]],
+    uint               tid           [[thread_position_in_threadgroup]],
+    uint               gid           [[thread_position_in_grid]],
+    uint               block_id      [[threadgroup_position_in_grid]],
+    uint               lane          [[thread_index_in_simdgroup]],
+    uint               sg            [[simdgroup_index_in_threadgroup]],
+    uint               sg_size       [[threads_per_simdgroup]])
+{
+    threadgroup uint sg_tot[BLOCK];
+    uint f = 0u;
+    if (gid < n) f = (gid == 0u || keys[gid] != keys[gid - 1u]) ? 1u : 0u;
+    const uint lane_ex = simd_prefix_exclusive_sum(f);
+    const uint sg_sum  = simd_sum(f);
+    if (lane == 0) sg_tot[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint sg_off = 0u;
+    for (uint s = 0; s < sg; ++s) sg_off += sg_tot[s];
+    if (f) starts[block_offsets[block_id] + sg_off + lane_ex] = gid;
+    (void)tid; (void)sg_size;
+}
+
+kernel void gb_chunk_sum_i64(
+    device const long* keys     [[buffer(0)]],   // sorted
+    device const long* perm     [[buffer(1)]],   // sorted pos -> original index
+    device const long* vals     [[buffer(2)]],   // original order
+    device const uint* starts   [[buffer(3)]],
+    constant uint&     n        [[buffer(4)]],
+    constant uint&     num_segs [[buffer(5)]],
+    device long*       out_sums [[buffer(6)]],
+    device long*       head_sum [[buffer(7)]],
+    device long*       tail_sum [[buffer(8)]],
+    uint               gid      [[thread_position_in_grid]])
+{
+    const uint a = gid * GB_CHUNK;
+    if (a >= n) return;
+    const uint b = min(a + GB_CHUNK, n);
+    // segment containing position a: upper_bound(starts, a) - 1
+    uint lo = 0, hi = num_segs;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (starts[mid] <= a) lo = mid + 1; else hi = mid;
+    }
+    uint seg = lo - 1;
+    uint i = a;
+    ulong hs = 0, ts = 0;
+    while (i < b) {
+        const uint rs = starts[seg];
+        const uint re = (seg + 1 < num_segs) ? starts[seg + 1] : n;
+        const uint e  = min(re, b);
+        ulong s = 0;
+        for (uint j = i; j < e; ++j) s += (ulong)vals[perm[j]];
+        if (rs < a)      hs = s;                  // started before this chunk
+        else if (re > b) ts = s;                  // started here, continues past
+        else             out_sums[seg] = (long)s; // interior: exclusive owner
+        i = e; ++seg;
+    }
+    head_sum[gid] = (long)hs;
+    tail_sum[gid] = (long)ts;
+    (void)keys;
+}
+
+kernel void gb_finalize_i64(
+    device const long* keys       [[buffer(0)]],
+    device const uint* starts     [[buffer(1)]],
+    constant uint&     n          [[buffer(2)]],
+    constant uint&     num_segs   [[buffer(3)]],
+    device const long* head_sum   [[buffer(4)]],
+    device const long* tail_sum   [[buffer(5)]],
+    device long*       out_keys   [[buffer(6)]],
+    device long*       out_sums   [[buffer(7)]],
+    device long*       out_counts [[buffer(8)]],
+    constant uint&     with_sums  [[buffer(9)]],
+    uint               gid        [[thread_position_in_grid]])
+{
+    if (gid >= num_segs) return;
+    const uint rs = starts[gid];
+    const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
+    out_keys[gid]   = keys[rs];
+    out_counts[gid] = (long)(re - rs);
+    if (with_sums != 0u) {
+        const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
+        if (c0 < c1) {
+            ulong s = (ulong)tail_sum[c0];
+            for (uint t = c0 + 1u; t <= c1; ++t) s += (ulong)head_sum[t];
+            out_sums[gid] = (long)s;
+        }
+    }
+}
+
+// dst[i] = src[perm[i]] as raw 64-bit words — used to lay an f64 payload out
+// in sorted-key order so the host can stream per-segment double sums
+// sequentially (no doubles in MSL; the gather is the random-access part).
+kernel void gb_gather_i64(
+    device const long* perm [[buffer(0)]],
+    device const long* src  [[buffer(1)]],
+    device long*       dst  [[buffer(2)]],
+    constant uint&     n    [[buffer(3)]],
+    uint               gid  [[thread_position_in_grid]])
+{
+    if (gid < n) dst[gid] = src[perm[gid]];
+}

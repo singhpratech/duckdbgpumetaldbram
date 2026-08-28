@@ -27,6 +27,7 @@ void usage(const char* a0) {
         "  --sql QUERY  run this single SQL statement (default: read stdin)\n"
         "  --multi      split input on ';' and run statements sequentially in\n"
         "               ONE connection (resident columns persist between\n"
+        "  --multi-last same as --multi but print only the LAST statement's result\n"
         "               statements); prints each result + per-statement time\n", a0);
 }
 
@@ -61,6 +62,7 @@ int main(int argc, char** argv) {
     std::string sql;
 
     bool multi = false;
+    bool multi_last = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--db" && i + 1 < argc) {
@@ -69,6 +71,8 @@ int main(int argc, char** argv) {
             sql = argv[++i];
         } else if (a == "--multi") {
             multi = true;
+        } else if (a == "--multi-last") {
+            multi = true; multi_last = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]); return 0;
         } else {
@@ -121,7 +125,8 @@ int main(int argc, char** argv) {
                 break;
             }
             const auto s1 = std::chrono::steady_clock::now();
-            print_result(sr);
+            const bool is_last = sql.find_first_not_of(" \t\r\n;", pos) == std::string::npos;
+            if (!multi_last || is_last) print_result(sr);
             duckdb_destroy_result(&sr);
             std::fprintf(stderr, "[gpudb-sql] stmt %d elapsed %.3f ms\n", stmt_no,
                 std::chrono::duration<double, std::milli>(s1 - s0).count());

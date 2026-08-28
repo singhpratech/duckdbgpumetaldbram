@@ -4,10 +4,15 @@
 #include "gpu_backend.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
+#include <map>
 #include <random>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 void test_hashjoin();
@@ -165,6 +170,104 @@ void test_backend(gpudb::Backend b) {
             EXPECT_EQ(rr.max, ref_max);
             EXPECT_EQ(rr.count, N);
         }
+    }
+
+    // ---- Resident GROUP BY / top-k (v0.6) vs a host reference ----
+    // Backends opt in; a "not implemented" throw is reported as SKIP so a
+    // backend builds green before its implementation lands.
+    {
+        std::printf("  resident group by / top-k:\n");
+        std::mt19937_64 rng(0x6B0BULL);
+        const std::size_t N = 300'007;              // odd, > one chunk
+        const std::int64_t K = 4'999;               // dup-heavy keys
+        std::vector<std::int64_t> keys(N), vals(N);
+        std::vector<double> dv(N);
+        std::uniform_int_distribution<std::int64_t> kd(-K, K), vd(-1'000'000, 1'000'000);
+        for (std::size_t i = 0; i < N; ++i) {
+            keys[i] = kd(rng); vals[i] = vd(rng); dv[i] = static_cast<double>(vals[i]) / 7.0;
+        }
+        // int64 boundary keys + values that wrap
+        keys[0] = std::numeric_limits<std::int64_t>::min(); vals[0] = std::numeric_limits<std::int64_t>::max();
+        keys[1] = std::numeric_limits<std::int64_t>::min(); vals[1] = 5;   // wraps
+        keys[2] = std::numeric_limits<std::int64_t>::max(); vals[2] = -3;
+        std::map<std::int64_t, std::pair<std::uint64_t, std::int64_t>> ref;
+        std::map<std::int64_t, double> ref_f;
+        for (std::size_t i = 0; i < N; ++i) {
+            auto& e = ref[keys[i]];
+            e.first += static_cast<std::uint64_t>(vals[i]); e.second += 1;
+            ref_f[keys[i]] += dv[i];
+        }
+        auto kc = agg->upload_i64(keys.data(), N);
+        auto vc = agg->upload_i64(vals.data(), N);
+        auto fc = agg->upload_f64(dv.data(), N);
+        bool implemented = true;
+        try {
+            auto r = agg->groupby_sum_resident_i64(*kc, *vc, std::size_t(100) * 1000000);
+            EXPECT_EQ(r.keys.size(), ref.size());
+            EXPECT_EQ(r.rows_in, N);
+            bool ok = r.keys.size() == ref.size();
+            std::size_t j = 0;
+            for (auto it = ref.begin(); ok && it != ref.end(); ++it, ++j) {
+                ok = r.keys[j] == it->first &&
+                     r.sums[j] == static_cast<std::int64_t>(it->second.first) &&
+                     r.counts[j] == it->second.second;
+            }
+            EXPECT(ok);   // sorted ascending, bit-exact sums, exact counts
+
+            auto c = agg->groupby_count_resident(*kc, std::size_t(100) * 1000000);
+            ok = c.keys.size() == ref.size();
+            j = 0;
+            for (auto it = ref.begin(); ok && it != ref.end(); ++it, ++j)
+                ok = c.keys[j] == it->first && c.counts[j] == it->second.second;
+            EXPECT(ok);
+
+            auto f = agg->groupby_sum_resident_f64(*kc, *fc, std::size_t(100) * 1000000);
+            ok = f.keys.size() == ref_f.size();
+            j = 0;
+            for (auto it = ref_f.begin(); ok && it != ref_f.end(); ++it, ++j) {
+                const double tol = 1e-9 * std::max(1.0, std::abs(it->second));
+                ok = f.keys[j] == it->first && std::abs(f.sums_f64[j] - it->second) <= tol;
+            }
+            EXPECT(ok);
+
+            // cap: must throw naming the count, never truncate
+            bool threw = false;
+            try { (void)agg->groupby_count_resident(*kc, 10); }
+            catch (const std::runtime_error& e) {
+                threw = std::string(e.what()).find(std::to_string(ref.size())) != std::string::npos;
+            }
+            EXPECT(threw);
+
+            // top-k: multiset of values equals the reference's k extremes
+            std::vector<std::int64_t> sv(vals);
+            std::sort(sv.begin(), sv.end());
+            auto t = agg->topk_resident(*vc, 100, /*descending*/true);
+            ok = t.values_i64.size() == 100;
+            for (std::size_t i = 0; ok && i < 100; ++i)
+                ok = t.values_i64[i] == sv[N - 1 - i] && vals[static_cast<std::size_t>(t.idx[i])] == t.values_i64[i];
+            EXPECT(ok);
+            auto ta = agg->topk_resident(*vc, 5, /*descending*/false);
+            ok = ta.values_i64.size() == 5;
+            for (std::size_t i = 0; ok && i < 5; ++i) ok = ta.values_i64[i] == sv[i];
+            EXPECT(ok);
+            auto tf = agg->topk_resident(*fc, 3, /*descending*/true);
+            std::vector<double> sdv(dv);
+            std::sort(sdv.begin(), sdv.end());
+            ok = tf.values_f64.size() == 3;
+            for (std::size_t i = 0; ok && i < 3; ++i) ok = tf.values_f64[i] == sdv[N - 1 - i];
+            EXPECT(ok);
+            auto tk = agg->topk_resident(*vc, N + 10, false);   // k clamps to rows
+            EXPECT_EQ(tk.idx.size(), N);
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                std::printf("    FAIL: %s\n", e.what());
+                ++failures; ++total;
+            }
+        }
+        if (implemented) std::printf("    ok\n");
     }
 }
 

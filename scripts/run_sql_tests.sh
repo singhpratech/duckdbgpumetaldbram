@@ -15,6 +15,10 @@
 #       -- expect: <line>           expected output line, one per result row
 #       -- requires_file: <path>    skip query if file missing (relative root)
 #       -- env: KEY=VAL             set env var for this query only
+#       -- setup: <statement>       run <statement> before the query on the
+#                                   SAME connection (repeatable; uploads that
+#                                   a table function reads); only the query's
+#                                   output is compared
 #       -- expected_fail: <reason>  GUARDRAIL case: the query is EXPECTED to
 #                                   error (a misuse the extension must reject);
 #                                   reported as GUARDRAIL, counts as passing —
@@ -127,8 +131,8 @@ declare -a FAIL_DETAILS=()
 #     each new query.
 
 execute_query() {
-    # Args: file_label query_no sql expects env requires_file expected_fail
-    local label="$1" sql="$2" expects="$3" envspec="$4" reqfile="$5" xfail="$6"
+    # Args: file_label sql expects env requires_file expected_fail setup
+    local label="$1" sql="$2" expects="$3" envspec="$4" reqfile="$5" xfail="$6" setup="${7:-}"
 
     if [ -n "$reqfile" ] && [ ! -e "$reqfile" ]; then
         printf "  %-32s  %sSKIP%s  (missing %s)\n" "$label" "$C_YEL" "$C_OFF" "$reqfile"
@@ -157,15 +161,21 @@ execute_query() {
     elif command -v gtimeout >/dev/null 2>&1; then
         TIMEOUT_CMD="gtimeout --signal=TERM --kill-after=2s $TLIMIT"
     fi
+    # With `-- setup:` statements, run them first on the same connection and
+    # print only the query's result (gpudb-sql --multi-last).
+    local -a MODE=(--sql "$sql")
+    if [ -n "$setup" ]; then
+        MODE=(--multi-last --sql "$setup"$'\n'"$sql")
+    fi
     if [ -n "$envspec" ]; then
         # shellcheck disable=SC2086
         { env $envspec $TIMEOUT_CMD \
-            "$GPUDB_SQL" --sql "$sql" >"$out_f" 2>"$err_f" ; } 2>/dev/null
+            "$GPUDB_SQL" "${MODE[@]}" >"$out_f" 2>"$err_f" ; } 2>/dev/null
         rc=$?
     else
         # shellcheck disable=SC2086
         { $TIMEOUT_CMD \
-            "$GPUDB_SQL" --sql "$sql" >"$out_f" 2>"$err_f" ; } 2>/dev/null
+            "$GPUDB_SQL" "${MODE[@]}" >"$out_f" 2>"$err_f" ; } 2>/dev/null
         rc=$?
     fi
     # `timeout` returns 124 (timed out, child exited cleanly after TERM)
@@ -238,11 +248,11 @@ run_file() {
     pass=0; fail=0; skip=0; efail=0; unexpected_pass=0
 
     # Parsed query arrays
-    local -a Q_SQL=() Q_EXP=() Q_ENV=() Q_REQ=() Q_XF=()
+    local -a Q_SQL=() Q_EXP=() Q_ENV=() Q_REQ=() Q_XF=() Q_SETUP=()
 
     # Per-query in-flight scratch
     local cur_sql=""
-    local cur_pre_env="" cur_pre_req="" cur_pre_xf=""
+    local cur_pre_env="" cur_pre_req="" cur_pre_xf="" cur_pre_setup=""
 
     # State: have we emitted any query yet that subsequent `-- expect:`
     # lines should attach to?
@@ -259,12 +269,14 @@ run_file() {
             Q_ENV+=("$cur_pre_env")
             Q_REQ+=("$cur_pre_req")
             Q_XF+=("$cur_pre_xf")
+            Q_SETUP+=("$cur_pre_setup")
             last_idx=$((${#Q_SQL[@]} - 1))
         fi
         cur_sql=""
         cur_pre_env=""
         cur_pre_req=""
         cur_pre_xf=""
+        cur_pre_setup=""
     }
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -313,6 +325,13 @@ run_file() {
                 cur_pre_xf="$val"
                 continue
                 ;;
+            "-- setup:"*|"--setup:"*)
+                local val="${trimmed#*setup:}"
+                val="${val# }"
+                val="${val%;}"
+                cur_pre_setup+="$val;"$'\n'
+                continue
+                ;;
             "--"*)
                 # Plain SQL comment — drop.
                 continue
@@ -340,7 +359,7 @@ run_file() {
         local label
         label="$(basename "$file"):q$((i+1))"
         execute_query "$label" "${Q_SQL[$i]}" "${Q_EXP[$i]}" \
-                      "${Q_ENV[$i]}" "${Q_REQ[$i]}" "${Q_XF[$i]}"
+                      "${Q_ENV[$i]}" "${Q_REQ[$i]}" "${Q_XF[$i]}" "${Q_SETUP[$i]}"
         i=$((i + 1))
     done
 
