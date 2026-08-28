@@ -76,6 +76,14 @@ for (B). That compared unlike quantities. The rows above were re-measured
 on the final build with both sides on the same clock; the operator column
 itself did not change.
 
+The v0.5 join rows were re-run on this same build to check they are not
+affected by the same construction: their aggregates return one scalar, so
+operator and statement time coincide — (a) inner i64 SF10 6.1 ms statement
+(`wall_ms` 6.03–6.08) vs native 84–87 ms, SF50 36.7–38.3 ms vs 420–436 ms
+(13.6–14.2× / 11.0–11.9×, as published); the row-returning (f) at SF10 is
+62–71 ms statement (`wall_ms` 26–36) vs native 73–74 ms, 1.03–1.19× — the
+published 1.16× was already a statement time.
+
 One-time costs, stated plainly: the first GROUP BY on a pair pays the sort —
 33 ms at SF1, 0.28 s at SF10, 2.9 s at SF50 (statement time; sort + building
 the cache buffers) — after which that pair, and any join that uses it as a
@@ -263,7 +271,7 @@ FROM (SELECT gpu_upload_pair('l', l_orderkey, (l_extendedprice*100)::BIGINT) AS 
 # (e) semi: gpu_semi_join_sum_resident_f64('o.k','o.v','late') with
 #   build 'late' = l_orderkey WHERE l_receiptdate > l_commitdate.
 # (f) rows: gpudb-sql --multi, uploads as earlier statements, then
-#   SELECT count(*) FROM gpu_join_rows_resident('l','o','inner');
+#   SELECT count(*) FROM gpu_join_rows_resident('l.k','o','inner');
 # SF50: export GPUDB_UPLOAD_POOL_MAX_MB=12288
 ```
 
