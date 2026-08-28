@@ -18,9 +18,17 @@
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
 
+#include "cub_ops.cuh"
+
+#include "thrust_errors.cuh"
+
 namespace {
 
 constexpr int BLOCK = 256;
+
+// i64 <-> order-preserving u64 (sign bit flipped), for the radix sort.
+struct FlipSign     { __host__ __device__ unsigned long long operator()(std::int64_t v) const { return static_cast<unsigned long long>(v) ^ (1ULL << 63); } };
+struct FlipSignBack { __host__ __device__ unsigned long long operator()(unsigned long long k) const { return k ^ (1ULL << 63); } };
 
 using u64 = unsigned long long;
 
@@ -192,12 +200,16 @@ cudaError_t gpudb_cuda_join_build_sort(const std::int64_t* d_keys,
     cudaError_t e = cudaMemcpyAsync(d_sorted, d_keys, n * sizeof(std::int64_t),
                                     cudaMemcpyDeviceToDevice, s);
     if (e != cudaSuccess) return e;
-    try {
-        thrust::sequence(thrust::cuda::par.on(s), d_perm, d_perm + n);
-        thrust::sort_by_key(thrust::cuda::par.on(s), d_sorted, d_sorted + n, d_perm);
-    } catch (...) {
-        return cudaErrorMemoryAllocation;
-    }
+    // Sort as order-preserving u64 keys (sign bit flipped) so the radix pass
+    // handles negatives; flip back afterwards. Explicit temp storage: a
+    // device fault returns its cudaError_t here instead of aborting.
+    e = gpudb_cuda_ops::transform(d_sorted, reinterpret_cast<u64*>(d_sorted), n, FlipSign{}, s);
+    if (e != cudaSuccess) return e;
+    if ((e = gpudb_cuda_ops::sequence(d_perm, n, s)) != cudaSuccess) return e;
+    if ((e = gpudb_cuda_ops::sort_pairs_u64(reinterpret_cast<u64*>(d_sorted), d_perm, n, s)) != cudaSuccess) return e;
+    e = gpudb_cuda_ops::transform(reinterpret_cast<const u64*>(d_sorted),
+                                  reinterpret_cast<u64*>(d_sorted), n, FlipSignBack{}, s);
+    if (e != cudaSuccess) return e;
     return cudaStreamSynchronize(s);
 }
 
@@ -243,12 +255,15 @@ cudaError_t gpudb_cuda_join_rows_count(const std::int64_t* d_probe,
 // total <- sum(cnt); cnt <- exclusive_scan(cnt) in place. Synchronizes.
 cudaError_t gpudb_cuda_join_rows_scan(u64* d_cnt, std::size_t n,
                                       u64* h_total, cudaStream_t s) {
-    try {
-        *h_total = thrust::reduce(thrust::cuda::par.on(s), d_cnt, d_cnt + n, u64{0});
-        thrust::exclusive_scan(thrust::cuda::par.on(s), d_cnt, d_cnt + n, d_cnt);
-    } catch (...) {
-        return cudaErrorMemoryAllocation;
-    }
+    gpudb_cuda_ops::DevBuf tot;
+    cudaError_t e = tot.alloc(sizeof(u64));
+    if (e != cudaSuccess) return e;
+    if ((e = gpudb_cuda_ops::sum_u64(d_cnt, n, static_cast<u64*>(tot.p), s)) != cudaSuccess) return e;
+    e = gpudb_cuda_ops::with_temp([&](void* tmp, std::size_t& b) {
+        return cub::DeviceScan::ExclusiveSum(tmp, b, d_cnt, d_cnt, n, s);
+    });
+    if (e != cudaSuccess) return e;
+    if ((e = cudaMemcpyAsync(h_total, tot.p, sizeof(u64), cudaMemcpyDeviceToHost, s)) != cudaSuccess) return e;
     return cudaStreamSynchronize(s);
 }
 

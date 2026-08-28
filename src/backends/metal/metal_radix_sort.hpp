@@ -27,7 +27,7 @@ public:
     DeviceView sort_device(const std::int64_t* keys, const std::int64_t* payloads, std::uint32_t n);
 
 private:
-    double run_sort_on_staged(std::uint32_t n, id<MTLBuffer>& in_keys, id<MTLBuffer>& in_vals);
+    double run_sort_on_staged(std::uint32_t n, __strong id<MTLBuffer>& in_keys, __strong id<MTLBuffer>& in_vals);
 
     void ensure_sort_buffers(std::uint32_t n, std::uint32_t num_blocks);
 

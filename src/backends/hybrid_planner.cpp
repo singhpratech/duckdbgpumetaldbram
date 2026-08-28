@@ -301,6 +301,82 @@ public:
         return cpu_->join_rows_resident(hp.inner(), hb.inner(), kind, max_rows);
     }
 
+    // ---- Resident GROUP BY / top-k (v0.6): same placement rule as joins ----
+    GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
+        return dispatch_resident_pair<GroupByResidentResult>(keys, vals,
+            [&](Aggregator& a, const ResidentColumn& k, const ResidentColumn& v) {
+                return a.groupby_sum_resident_i64(k, v, max_groups, filter);
+            });
+    }
+
+    GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
+        return dispatch_resident_pair<GroupByResidentResult>(keys, vals,
+            [&](Aggregator& a, const ResidentColumn& k, const ResidentColumn& v) {
+                return a.groupby_sum_resident_f64(k, v, max_groups, filter);
+            });
+    }
+
+    GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
+        return dispatch_resident_single<GroupByResidentResult>(keys,
+            [&](Aggregator& a, const ResidentColumn& k) {
+                return a.groupby_count_resident(k, max_groups, filter);
+            });
+    }
+
+    TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
+                             bool descending) override {
+        return dispatch_resident_single<TopKResult>(col,
+            [&](Aggregator& a, const ResidentColumn& c) {
+                return a.topk_resident(c, k, descending);
+            });
+    }
+
+    template <class R, class Op>
+    R dispatch_resident_pair(const ResidentColumn& c1, const ResidentColumn& c2,
+                             Op&& run) {
+        const auto& h1 = check_hybrid(c1);
+        const auto& h2 = check_hybrid(c2);
+        const std::size_t n = h1.rows();
+        if (h1.on_gpu() != h2.on_gpu())
+            throw std::runtime_error(
+                "resident group by: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        if (gpu_ && h1.on_gpu()) {
+            last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
+                                  n, 0, /*resident*/true, /*borderline*/false);
+            return run(*gpu_, h1.inner(), h2.inner());
+        }
+        last_ = make_decision(Backend::CPU,
+                              gpu_ ? DispatchReason::Resident_OnCpu
+                                   : DispatchReason::GpuUnavailable,
+                              n, 0, /*resident*/true, /*borderline*/false);
+        return run(*cpu_, h1.inner(), h2.inner());
+    }
+
+    template <class R, class Op>
+    R dispatch_resident_single(const ResidentColumn& c, Op&& run) {
+        const auto& h = check_hybrid(c);
+        const std::size_t n = h.rows();
+        if (gpu_ && h.on_gpu()) {
+            last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
+                                  n, 0, /*resident*/true, /*borderline*/false);
+            return run(*gpu_, h.inner());
+        }
+        last_ = make_decision(Backend::CPU,
+                              gpu_ ? DispatchReason::Resident_OnCpu
+                                   : DispatchReason::GpuUnavailable,
+                              n, 0, /*resident*/true, /*borderline*/false);
+        return run(*cpu_, h.inner());
+    }
+
     template <class Op>
     JoinAggResult dispatch_join(const ResidentColumn& probe_keys,
                                 const ResidentColumn& payload,

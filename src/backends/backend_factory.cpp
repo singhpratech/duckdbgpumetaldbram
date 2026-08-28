@@ -36,6 +36,28 @@ JoinRowsResult Aggregator::join_rows_resident(const ResidentColumn&,
     throw std::runtime_error("join_rows_resident: not implemented on this backend");
 }
 
+// Same opt-in rule for the v0.6 resident GROUP BY / top-k ops.
+GroupByResidentResult Aggregator::groupby_sum_resident_i64(const ResidentColumn&,
+                                                           const ResidentColumn&,
+                                                           std::size_t, const GroupByFilter&) {
+    throw std::runtime_error("groupby_sum_resident_i64: not implemented on this backend");
+}
+
+GroupByResidentResult Aggregator::groupby_sum_resident_f64(const ResidentColumn&,
+                                                           const ResidentColumn&,
+                                                           std::size_t, const GroupByFilter&) {
+    throw std::runtime_error("groupby_sum_resident_f64: not implemented on this backend");
+}
+
+GroupByResidentResult Aggregator::groupby_count_resident(const ResidentColumn&,
+                                                         std::size_t, const GroupByFilter&) {
+    throw std::runtime_error("groupby_count_resident: not implemented on this backend");
+}
+
+TopKResult Aggregator::topk_resident(const ResidentColumn&, std::size_t, bool) {
+    throw std::runtime_error("topk_resident: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

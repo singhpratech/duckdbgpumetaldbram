@@ -75,3 +75,31 @@ jobs:
           FROM (SELECT gpu_upload('smoke', range::BIGINT) AS n FROM range(100000)) u;
           SELECT gpu_last_stats();
           " || echo "resident surface not in served version yet (registry < v0.4.0)"
+
+      - name: Resident join parity (soft — needs registry v0.5.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          SELECT CASE WHEN gpu_join_sum_resident('p.k','p.v','b') = (SELECT sum(p.v) FROM (SELECT (range % 1000)::BIGINT AS k, range::BIGINT AS v FROM range(100000)) p JOIN (SELECT (range * 3 % 1000)::BIGINT AS k FROM range(500)) b ON p.k = b.k)
+                 THEN 'join parity ok' ELSE error('gpu/native join mismatch') END, u1.n1, u2.n2
+          FROM (SELECT gpu_upload_pair('p', (range % 1000)::BIGINT, range::BIGINT) AS n1 FROM range(100000)) u1,
+               (SELECT gpu_upload('b', (range * 3 % 1000)::BIGINT) AS n2 FROM range(500)) u2;
+          SELECT gpu_last_stats();
+          " || echo "resident joins not in served version yet (registry < v0.5.0)"
+
+      - name: Resident GROUP BY parity (soft — needs registry v0.6.0+)
+        continue-on-error: true
+        run: |
+          duckdb -c "
+          LOAD gpudb;
+          CREATE TABLE src AS SELECT (range % 997)::BIGINT AS k, (range % 1000 - 500)::BIGINT AS v FROM range(200000);
+          SELECT gpu_upload_pair('g', k, v) FROM src;
+          SELECT CASE WHEN (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident('g')) EXCEPT (SELECT k, sum(v) FROM src GROUP BY k))) = 0
+                       AND (SELECT count(*) FROM gpu_groupby_sum_resident('g')) = 997
+                       AND (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident_having('g', '>', 0)) EXCEPT (SELECT k, sum(v) s FROM src GROUP BY k HAVING s > 0))) = 0
+                       AND (SELECT count(*) FROM gpu_groupby_sum_resident_having('g', '>', 0)) = (SELECT count(*) FROM (SELECT k, sum(v) s FROM src GROUP BY k HAVING s > 0))
+                       AND (SELECT list(sum) FROM gpu_groupby_sum_resident_topk('g', 5, 'desc')) = (SELECT list(s) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s DESC LIMIT 5))
+                 THEN 'group by parity ok' ELSE error('gpu/native group by mismatch') END;
+          SELECT gpu_last_stats();
+          " || echo "resident group by not in served version yet (registry < v0.6.0)"

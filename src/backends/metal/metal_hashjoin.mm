@@ -70,7 +70,7 @@ std::uint32_t pick_table_capacity(std::size_t n_build) {
     return cap;
 }
 
-void ensure_buffer(id<MTLDevice> device, id<MTLBuffer>& buf, std::size_t& cap_bytes,
+void ensure_buffer(id<MTLDevice> device, __strong id<MTLBuffer>& buf, std::size_t& cap_bytes,
                    std::size_t need_bytes) {
     if (need_bytes <= cap_bytes) return;
     buf = [device newBufferWithLength:need_bytes options:MTLResourceStorageModeShared];
@@ -209,7 +209,7 @@ private:
         return ps;
     }
 
-    static void host_exclusive_scan(const id<MTLBuffer>& counts_buf, id<MTLBuffer>& offsets_buf,
+    static void host_exclusive_scan(const id<MTLBuffer>& counts_buf, __strong id<MTLBuffer>& offsets_buf,
                                     std::size_t& cap_offsets_bytes, id<MTLDevice> device,
                                     std::uint32_t n_partitions, std::uint32_t expected_total) {
         const std::size_t bytes_partition = n_partitions * sizeof(std::uint32_t);

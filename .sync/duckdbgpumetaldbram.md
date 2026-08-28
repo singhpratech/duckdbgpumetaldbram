@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: docs/readme-cuda-requirements
-- working on: docs: README CUDA toolkit/driver/GPU requirements + registry now serves v0.5.0
+- branch: feat/core-groupby-abi
+- working on: v0.6: PR #75 (core+Metal) complete incl. BENCHMARK Metal rows SF1/10/50, README, KNOWN_ISSUES, radix-sort fix; #76 (CUDA) stacked, green; awaiting user review
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-08-24T20:33:20Z
+- last update: 2026-08-28T15:37:49Z

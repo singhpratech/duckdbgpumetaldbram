@@ -19,7 +19,7 @@ SELECT u FROM (SELECT gpu_upload(nm, v) AS u
                FROM (VALUES ('a', 1::BIGINT), ('b', 2::BIGINT)) t(nm, v)) up;
 
 -- 2. NULL name at upload: hard error (was silently registered under '')
--- expected_fail: gpu_upload name may not be NULL
+-- expected_fail: gpu_upload: name may not be NULL
 SELECT u FROM (SELECT gpu_upload(NULL::VARCHAR, v) AS u
                FROM (VALUES (5::BIGINT)) t(v)) up;
 

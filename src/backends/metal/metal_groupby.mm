@@ -294,16 +294,21 @@ public:
                 // active byte mask using XOR-with-sign-bit form.
                 const std::uint64_t mn_u = static_cast<std::uint64_t>(mn) ^ 0x8000000000000000ULL;
                 const std::uint64_t mx_u = static_cast<std::uint64_t>(mx) ^ 0x8000000000000000ULL;
-                active_bytes = 0;
+                // Only bytes ABOVE the highest byte where min and max differ
+                // are constant across all keys; every pass at or below it
+                // must run (same rule as metal_radix_sort.mm — a per-byte
+                // min/max comparison skipped passes other keys needed).
+                std::uint32_t top = 0;
+                bool any = false;
                 for (std::uint32_t p = 0; p < 8; ++p) {
                     const std::uint64_t shift = p * 8;
                     const std::uint8_t mn_b = static_cast<std::uint8_t>((mn_u >> shift) & 0xFFu);
                     const std::uint8_t mx_b = static_cast<std::uint8_t>((mx_u >> shift) & 0xFFu);
-                    if (mn_b != mx_b) active_bytes |= (1u << p);
+                    if (mn_b != mx_b) { top = p; any = true; }
                 }
                 // If all keys are equal (no byte varies), still need pass 0
                 // so the data lands in the right ping-pong slot.
-                if (active_bytes == 0) active_bytes = 0x01;
+                active_bytes = any ? static_cast<std::uint8_t>((2u << top) - 1u) : 0x01;
             }
 
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];

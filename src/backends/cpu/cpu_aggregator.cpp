@@ -1,7 +1,9 @@
 #include "gpu_backend.hpp"
+#include "../groupby_filter.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -323,8 +325,168 @@ public:
         return r;
     }
 
+    // ---- Resident GROUP BY / top-k (v0.6) — the executable reference ----
+    // Sort (key, value) pairs, then run-length reduce. Output sorted by key
+    // ascending; i64 sums in uint64 wrap arithmetic (bit-exact contract).
+    GroupByResidentResult groupby_sum_resident_i64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        const auto& v = check_i64(vals);
+        if (k.rows() != v.rows())
+            throw std::runtime_error(
+                "groupby_sum_resident_i64: keys and vals row counts differ");
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        std::vector<std::pair<std::int64_t, std::int64_t>> p(k.rows());
+        for (std::size_t i = 0; i < k.rows(); ++i) p[i] = { k.as_i64()[i], v.as_i64()[i] };
+        std::sort(p.begin(), p.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (!filter.active()) check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_i64");
+
+        std::size_t i = 0;
+        while (i < p.size()) {
+            const std::int64_t key = p[i].first;
+            std::uint64_t sum = 0; std::int64_t cnt = 0;
+            for (; i < p.size() && p[i].first == key; ++i) {
+                sum += static_cast<std::uint64_t>(p[i].second); ++cnt;
+            }
+            r.keys.push_back(key);
+            r.sums.push_back(static_cast<std::int64_t>(sum));
+            r.counts.push_back(cnt);
+        }
+        apply_group_filter_host(r, filter, FilterAgg::SumI64, max_groups, "groupby_sum_resident_i64");
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    GroupByResidentResult groupby_sum_resident_f64(const ResidentColumn& keys,
+                                                   const ResidentColumn& vals,
+                                                   std::size_t max_groups,
+                                                   const GroupByFilter& filter) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        const auto& v = check_f64(vals);
+        if (k.rows() != v.rows())
+            throw std::runtime_error(
+                "groupby_sum_resident_f64: keys and vals row counts differ");
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        std::vector<std::pair<std::int64_t, double>> p(k.rows());
+        for (std::size_t i = 0; i < k.rows(); ++i) p[i] = { k.as_i64()[i], v.as_f64()[i] };
+        std::stable_sort(p.begin(), p.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        if (!filter.active()) check_group_cap(count_runs(p), max_groups, "groupby_sum_resident_f64");
+
+        std::size_t i = 0;
+        while (i < p.size()) {
+            const std::int64_t key = p[i].first;
+            double sum = 0.0; std::int64_t cnt = 0;
+            for (; i < p.size() && p[i].first == key; ++i) { sum += p[i].second; ++cnt; }
+            r.keys.push_back(key);
+            r.sums_f64.push_back(sum);
+            r.counts.push_back(cnt);
+        }
+        apply_group_filter_host(r, filter, FilterAgg::SumF64, max_groups, "groupby_sum_resident_f64");
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64(keys);
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        std::vector<std::int64_t> s(k.as_i64(), k.as_i64() + k.rows());
+        std::sort(s.begin(), s.end());
+        std::size_t groups = 1;
+        for (std::size_t i = 1; i < s.size(); ++i) groups += (s[i] != s[i - 1]);
+        if (!filter.active()) check_group_cap(groups, max_groups, "groupby_count_resident");
+
+        std::size_t i = 0;
+        while (i < s.size()) {
+            const std::int64_t key = s[i];
+            std::int64_t cnt = 0;
+            for (; i < s.size() && s[i] == key; ++i) ++cnt;
+            r.keys.push_back(key);
+            r.counts.push_back(cnt);
+        }
+        apply_group_filter_host(r, filter, FilterAgg::Count, max_groups, "groupby_count_resident");
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
+    TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
+                             bool descending) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (col.backend_tag() != Backend::CPU)
+            throw std::runtime_error("ResidentColumn from wrong backend");
+        const auto& c = static_cast<const CpuResidentColumn&>(col);
+        TopKResult r{};
+        r.rows_in = c.rows();
+        const std::size_t n = c.rows();
+        const std::size_t kk = std::min(k, n);
+        std::vector<std::int64_t> idx(n);
+        for (std::size_t i = 0; i < n; ++i) idx[i] = static_cast<std::int64_t>(i);
+
+        if (c.dtype() == Dtype::I64) {
+            const std::int64_t* d = c.as_i64();
+            auto less = [&](std::int64_t a, std::int64_t b) {
+                return descending ? d[a] > d[b] : d[a] < d[b];
+            };
+            std::partial_sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(kk),
+                              idx.end(), less);
+            r.idx.assign(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(kk));
+            r.values_i64.reserve(kk);
+            for (auto i : r.idx) r.values_i64.push_back(d[i]);
+        } else {
+            // Total order with NaN greatest (native DuckDB ORDER BY).
+            const double* d = c.as_f64();
+            auto lt = [](double a, double b) {
+                const bool na = std::isnan(a), nb = std::isnan(b);
+                if (na || nb) return !na && nb;
+                return a < b;
+            };
+            auto less = [&](std::int64_t a, std::int64_t b) {
+                return descending ? lt(d[b], d[a]) : lt(d[a], d[b]);
+            };
+            std::partial_sort(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(kk),
+                              idx.end(), less);
+            r.idx.assign(idx.begin(), idx.begin() + static_cast<std::ptrdiff_t>(kk));
+            r.values_f64.reserve(kk);
+            for (auto i : r.idx) r.values_f64.push_back(d[i]);
+        }
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
 private:
     enum class ReduceKind { Sum, Min, Max };
+
+    template <class Pairs>
+    static std::size_t count_runs(const Pairs& p) {
+        std::size_t g = p.empty() ? 0 : 1;
+        for (std::size_t i = 1; i < p.size(); ++i) g += (p[i].first != p[i - 1].first);
+        return g;
+    }
+
+    static void check_group_cap(std::size_t groups, std::size_t max_groups, const char* op) {
+        if (groups > max_groups)
+            throw std::runtime_error(
+                std::string(op) + ": result has " + std::to_string(groups) +
+                " groups, above the cap of " + std::to_string(max_groups) +
+                " (raise GPUDB_GROUPBY_ROWS_MAX_M if intentional)");
+    }
 
     static double elapsed_ms(std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
