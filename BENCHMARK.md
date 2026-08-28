@@ -2,7 +2,7 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
-## 2026-08-28 (v0.6.0) — resident GROUP BY / top-k from SQL, measured against native on both backends
+## 2026-08-28 (v0.6.0) — resident GROUP BY / top-k from SQL: the GPU beats native on high-cardinality aggregation, on both backends
 
 First benchmark of the resident GROUP BY / ORDER BY surface
 (`gpu_groupby_{sum,sum_f64,count}_resident` and `gpu_topk_resident[_f64]`,
