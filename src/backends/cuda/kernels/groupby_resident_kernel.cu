@@ -414,4 +414,17 @@ cudaError_t gpudb_cuda_groupby_filter_f64(const i64* keys, const double* agg, co
     return apply_filter<double>(keys, agg, cnt, n, cmp, t, topk, desc != 0, n_out, out_keys, out_agg, out_cnt, s);
 }
 
+
+// Test hook: poison the context with an out-of-bounds device read so the
+// next resident op sees a sticky cudaErrorIllegalAddress. Only for the
+// fault-injection unit test (run in a forked child — the context is dead
+// afterwards). Returns the error the poisoning itself produced.
+cudaError_t gpudb_cuda_debug_fault_inject(cudaStream_t s) {
+    DevBuf b; cudaError_t e = b.alloc(64);
+    if (e != cudaSuccess) return e;
+    if ((e = cudaMemsetAsync(b.p, 0, 64, s)) != cudaSuccess) return e;
+    std::size_t runs = 0;
+    return gpudb_cuda_sorted_run_count(static_cast<const i64*>(b.p), std::size_t(1) << 28, &runs, s);
+}
+
 } // extern "C"
