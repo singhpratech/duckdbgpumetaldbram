@@ -51,6 +51,7 @@ gpudb is for workloads that **ask the same aggregate questions of the same big d
 - **⚡ Serving APIs** — endpoints answering "total X for Y" thousands of times a day. The resident column is a cache that never goes stale-wrong: exact answers, 5–25× lower latency, re-upload in seconds when data refreshes.
 - **💰 DECIMAL/financial data** — money columns are stored DECIMAL, and native DuckDB re-casts every value on every scan. `gpu_upload` stores the cast once — it's why our biggest measured wins (9.9× Metal, 25× CUDA) came from the most accounting-shaped column in TPC-H.
 - **🎯 Membership at scale (semi / anti join)** — "how much did *these* customers spend?", "which transactions hit the blocklist?", "how many events came from outside the cohort?" Keep the big fact side resident (`gpu_upload_pair`), re-upload only the small, changing set, and ask with `gpu_semi_join_*` / `gpu_anti_join_*`: **22× (Metal) / ~376× (CUDA)** over native on TPC-H SF10 (measured, v0.5.0).
+- **📈 High-cardinality GROUP BY / top-k** — "quantity per order", "spend per customer", "top 10 by amount" over tens of millions of keys, re-asked as the data is explored. `gpu_groupby_sum_resident` / `gpu_groupby_count_resident` return `(key, sum, count)` rows from a cached device sort — `WHERE` / `ORDER BY` / `LIMIT` compose on top natively: **3.4–5.6× (Metal)** on TPC-H Q18's inner query at SF10–SF50, **≈2.5× end-to-end / ≈30× on-device (CUDA)**; `gpu_topk_resident` is ~0 ms after the first call. Low-cardinality GROUP BY stays a native win on Metal (measured, kept in the table).
 - **🔗 Fact ⋈ dimension rollups** — revenue joined to a filtered orders/customers/dates set, re-asked per filter. `gpu_join_sum_resident` / `gpu_left_join_count_resident` run the fused join-aggregate on the device with the sorted build side cached: **11.7× / 27–37×** at SF50. DOUBLE payloads via the `_f64` variants (within the 1e-9 relative tolerance contract; measured ≤4e-11).
 
 **Not for:** one-shot queries on cold data (transfer loses — the streaming `gpu_sum/min/max` deliberately match native there), or `min`/`max` where DuckDB's statistics answer without scanning, or joins that must return the matched *rows* at scale (`gpu_join_rows_resident` works, but native DuckDB wins on discrete GPUs — use the aggregate variants). [KNOWN_ISSUES.md](KNOWN_ISSUES.md) lists every trade-off honestly.
@@ -67,6 +68,10 @@ factors, six columns, both platforms) + reproduction: **[BENCHMARK.md](BENCHMARK
 | **SF10** (60M ⋈ 15M) | `EXISTS` semi-join + `SUM` DOUBLE | RTX 4090 Laptop · CUDA | 640 ms | **1.7 ms** | **~376× 🚀** |
 | **SF50** (300M ⋈ 75M) | `JOIN` + `SUM` BIGINT | MacBook M4 Max · Metal | 429 ms | **37 ms** | **11.7× 🚀** |
 | **SF10** (60M ⋈ 15M) | `EXISTS` semi-join + `SUM` DOUBLE | MacBook M4 Max · Metal | 182 ms | **8.2 ms** | **22.2× 🚀** |
+| **SF50** (300M rows → 75M groups) | Q18 inner: `GROUP BY l_orderkey HAVING sum > 300` | MacBook M4 Max · Metal | 460–521 ms | **88–97 ms** | **5.0–5.6× 🚀** |
+| **SF50** (300M rows → 75M groups) | `GROUP BY l_orderkey` + `SUM` BIGINT | MacBook M4 Max · Metal | 349–411 ms | **87–98 ms** | **3.6–4.7× 🚀** |
+| **SF50** (300M rows → 75M groups) | Q18 inner: `GROUP BY l_orderkey HAVING sum > 300` | RTX 4090 Laptop · CUDA | 959–988 ms | **365 ms** (kernel 21 ms) | **2.7× end-to-end, ~45× on-device** |
+| **SF50** (300M rows → 75M groups) | `GROUP BY l_orderkey` + `SUM` BIGINT | RTX 4090 Laptop · CUDA | 631–646 ms | **363–368 ms** (kernel 21 ms) | **1.8× end-to-end, ~30× on-device** |
 | **SF50** (300M rows) | `SUM` BIGINT | RTX 4090 Laptop · CUDA | 99 ms | **4 ms** | **25× 🚀** |
 | **SF100** (600M rows) | `SUM` DOUBLE | RTX 4090 Laptop · CUDA | 196 ms | **9 ms** | **22× 🚀** |
 | **SF100** (600M rows) | `SUM` BIGINT | MacBook M4 Max · Metal | 99 ms | **10 ms** | **9.9× 🚀** |
@@ -84,7 +89,11 @@ make native pay a cast per scan while the resident column stores it once —
 already-BIGINT columns win 3.3–3.7× (Metal) / 5.6–10× (CUDA). Whole-column
 `min`/`max` on stored tables stays a **native win** (zonemap statistics answer
 without scanning). One-time upload breaks even after ~100–150 repeated
-queries. All in [BENCHMARK.md](BENCHMARK.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+queries. The GROUP BY rows on CUDA are bounded by copying 24 bytes per
+group back over PCIe (the kernel is ~5% of wall); on unified memory that
+copy does not exist. Low-cardinality GROUP BY (a handful of groups) is a
+**native win on Metal** (0.55–0.7×) and stays in the table. All in
+[BENCHMARK.md](BENCHMARK.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
 ## The resident model in 20 seconds
 
@@ -292,7 +301,14 @@ resident-surface coverage in the community-CI sqllogic suite.
 
 ## Roadmap
 
-### Latest — shipped in v0.5.0
+### Latest — v0.6.0
+- [x] **Resident GROUP BY / top-k from SQL, both backends** — `gpu_groupby_sum_resident` / `gpu_groupby_sum_resident_f64` / `gpu_groupby_count_resident` return `(key, sum, count)` rows sorted by key; `gpu_topk_resident[_f64]` returns `(idx, value)` for `ORDER BY … LIMIT k`. Rides the upload-once model and the same cached device sort the joins use as a build side (one sort serves both). Segmented reduce with no hash table and no atomics on Metal; CUB `reduce_by_key` on CUDA. Verified against native `GROUP BY` both ways on TPC-H SF1/10/50: **3.4–5.6× (Metal)** on Q18's inner query, **≈2.5× end-to-end / ≈30× on-device (CUDA, PCIe copy-back bound)**. Honest losing rows kept: low-cardinality GROUP BY on Metal, the first top-k call vs native's zonemap top-k.
+- [x] **Composable results** — the GPU produces the rows, DuckDB does the rest: `SELECT key, sum FROM gpu_groupby_sum_resident('l') WHERE sum > 300 ORDER BY sum DESC LIMIT 10` is plain SQL over a small result.
+- [x] **Adversarial parity harness for GROUP BY** — `scripts/groupby_parity_check.sh`: 11 scenarios × 5 checks, incl. runs placed exactly on the kernels' 64-chunk / 256-block boundaries; SQL suite gained a `-- setup:` directive so table functions are tested in the documented sequential form.
+- [x] **Metal radix-sort fix** — the sort behind the v0.5 join build cache skipped a byte pass whenever min and max agreed on that byte; wrong for keys between them that differ there (TPC-H returnflag/linestatus packed keys). Fixed, regression scenarios in both parity harnesses; exposure of the v0.5.0 Metal binary stated in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
+- [x] Design: [docs/GROUPBY_RESIDENT_DESIGN.md](docs/GROUPBY_RESIDENT_DESIGN.md).
+
+### Shipped in v0.5.0
 - [x] **GPU joins from SQL, both backends** — `gpu_upload_pair` + fused `gpu_[left_|semi_|anti_]join_{sum,count}_resident[_f64]` (inner / left / semi / anti; right / full as documented compositions) and the row-returning `gpu_join_rows_resident`. Sorted-build + binary-search probe with the sorted side cached on the device. Verified against native DuckDB's hash join end-to-end on TPC-H SF10/SF50: **11.7× (Metal) / 27–37× (CUDA)** inner join-sum at SF50, **22× / ~376×** on the EXISTS semi-join; i64 bit-exact, f64 within the 1e-9 relative tolerance contract (measured ≤4e-11). Honest losing row kept: row materialisation across PCIe loses to native on discrete GPUs.
 - [x] **Adversarial parity harness** — `scripts/join_parity_check.sh`: 11 scenarios × 12 checks (dup-heavy, Knuth-hash, Zipf skew, int64 boundaries, negative keys, no-match, all-match, inverted sizes), native and gpudb computed in the same statement; passes on both machines.
 - [x] **Metal hash join + hybrid join planner + on-device segment reduce** — contributed by [@lmangani](https://github.com/lmangani) ([PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43)); this release lands that commit as the base of the join stack.
@@ -307,16 +323,14 @@ resident-surface coverage in the community-CI sqllogic suite.
 ### In flight
 - [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` shows what any given binary carries).
 
-### Next (v0.6.0 — directional, we'll see what the data says)
-- [ ] Resident GROUP BY from SQL returning (key, aggregate) rows, riding the same upload-once model and the cached radix sort
-- [ ] `ORDER BY` / top-k on resident columns
-- [ ] GROUP BY over join results; composite join keys
-- [ ] Resident f64 min/max (needs a v2 backend ABI entry)
+### Next (v0.7.0 — directional)
+- [ ] **Transparent operator substitution** — plain `SELECT k, sum(v) FROM t GROUP BY k` and `… JOIN …` routed to the resident operators without calling `gpu_*` functions, behind a `SET` switch, with everything unsupported falling through to native. The DuckDB **C API** exposes no optimizer hooks, but the C++ extension API does (`OptimizerExtension`); this means moving the loadable off the stable C ABI onto per-version builds, which is what most community extensions do anyway. The v0.6 table functions are the rewrite targets.
+- [ ] GROUP BY over join results as a fused op (join multiplicity × payload → segmented reduce); composite join keys
+- [ ] Resident f64 min/max (a small ABI entry)
 
-### Beyond (v0.6.0+ — exploratory)
+### Beyond (exploratory)
 - [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
 - [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
-- [ ] Transparent GPU operator substitution — **blocked upstream**: the DuckDB C API exposes no optimizer/planner/physical-operator hooks, so a loadable extension cannot silently replace plan operators today. A table-function-based `gpu_group_by(...)` is possible but doesn't compose with normal SQL; parked until the C API grows the needed hooks.
 
 <details>
 <summary><b>Earlier releases</b> (v0.1.0 → v0.3.0 + community-extension milestones)</summary>

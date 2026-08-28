@@ -2,6 +2,119 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-08-28 (v0.6.0) — resident GROUP BY / top-k from SQL: the GPU beats native on high-cardinality aggregation, on both backends
+
+First benchmark of the resident GROUP BY / ORDER BY surface
+(`gpu_groupby_{sum,sum_f64,count}_resident` and `gpu_topk_resident[_f64]`,
+table functions returning `(key, sum, count)` / `(idx, value)` rows). The
+model is the v0.5 one: keys and payload uploaded once with
+`gpu_upload_pair`; the key column is radix-sorted on the device on first use
+and cached with its permutation (the same cache the joins use as a build
+side); every later GROUP BY is a segmented reduce over that sorted order —
+output already sorted by key, no hash table, no atomics.
+
+**Correctness gates before any timing counted** (identical on both backends):
+`(key, sum)` sets equal to native `GROUP BY` both ways (`EXCEPT`), counts
+exact, `DOUBLE` sums within the 1e-9 relative contract (measured ≤ 5e-16 on
+Metal, ≤ 1e-13 on CUDA), top-k value multiset equal to native `ORDER BY …
+LIMIT`. `scripts/groupby_parity_check.sh` (11 adversarial scenarios × 5
+checks, native and gpudb in the same process) passes on both machines. Data:
+TPC-H dbgen `lineitem`; SF1 = 6,001,215 rows / 1,500,000 orderkeys; SF10 =
+59,986,052 / 15,000,000; SF50 = 300,005,811 / 75,000,000.
+
+The six measurements:
+
+- **(A) sum by orderkey** — `SELECT l_orderkey, sum(l_quantity) … GROUP BY 1` (15M groups at SF10, 75M at SF50 — TPC-H Q18's inner query shape).
+- **(B) Q18 inner with HAVING** — (A) `HAVING sum > 300` (624 groups survive at SF10, 3,182 at SF50); on gpudb the `WHERE sum > 300` runs natively over the GPU result.
+- **(C) sum DOUBLE by orderkey** — `sum(l_extendedprice)`, `DOUBLE` payload.
+- **(D) count by orderkey** — `count(*)` per key (keys-only op).
+- **(E) top-10** — `SELECT l_extendedprice FROM lineitem ORDER BY 1 DESC LIMIT 10` vs `gpu_topk_resident` over `(l_extendedprice*100)::BIGINT`.
+- **(F) low-cardinality** — `sum(l_quantity)` grouped by `l_returnflag`/`l_linestatus` packed into one `BIGINT` (4 groups) — the shape the sort-based design is NOT built for, measured anyway.
+
+Native `count(*)` wrappers are used on both sides so 15M–75M result rows are
+never printed; what is timed is the aggregation.
+
+### Apple M4 Max (Metal, 64 GB) — native and embedded engine both DuckDB v1.5.2
+
+Branch `feat/core-groupby-abi`, clean rebuild; native = the same embedded
+engine (`gpudb-sql`) running the plain SQL, warm, 16 threads, best of 2–3
+after a warm-up; gpudb = `gpu_last_stats()` `wall_ms` of the warm call
+(uploads and the one-time sort paid earlier);
+`backend=Metal reason=Hot_GpuAlwaysWins transfer_ms=0.000` on every row.
+SF50 ran with `GPUDB_UPLOAD_POOL_MAX_MB=12288`.
+
+| measurement | SF | native (ms) | gpudb warm (ms) | of which kernel | speedup | result check |
+|---|---|---:|---:|---:|---:|---|
+| (A) sum by orderkey | 1 | 6.9–9.5 | 2.3–2.7 | 1.5–1.9 | **~3×** | `EXCEPT` both ways = 0, 1,500,000 groups |
+| (A) sum by orderkey | 10 | 60–65 | 18.1 | 13.8 | **3.4×** | `EXCEPT` both ways = 0, 15,000,000 groups |
+| (A) sum by orderkey | 50 | 349–411 | 87–98 | 69–79 | **3.6–4.7×** | `EXCEPT` both ways = 0, 75,000,000 groups |
+| (B) Q18 inner, HAVING | 10 | 89–94 | 18.1 | 13.8 | **5.0×** | 624 groups == native |
+| (B) Q18 inner, HAVING | 50 | 460–521 | 88–97 | 69–78 | **5.0–5.6×** | 3,182 == native |
+| (C) sum DOUBLE by orderkey | 1 | 6.7–6.8 | 3.9–4.4 | 1.6–1.8 | 1.6× | rel-diff 4.4e-16 |
+| (C) sum DOUBLE by orderkey | 10 | 58 | 22.6–24.3 | 11.1 | **2.5×** | rel-diff 4.4e-16 |
+| (C) sum DOUBLE by orderkey | 50 | 347–350 | 117–126 | 67–71 | **2.8–3.0×** | rel-diff 4.5e-16 |
+| (D) count by orderkey | 10 | (as A) | 11.2 | 8.1 | — | 15,000,000 == native |
+| (D) count by orderkey | 50 | (as A) | 54 | 41 | — | 75,000,000 == native |
+| (E) top-10, first call (= the sort) | 10 | 0.5–2.0 | 129 | 29 | native wins | values == native |
+| (E) top-10, every call after | 10 / 50 | 0.5–9 | 0.001 | 0 | — | values == native |
+| (F) 4-group low-cardinality | 10 | 31–35 | 47 | 47 | **0.7× — native wins** | `EXCEPT` both ways = 0 |
+| (F) 4-group low-cardinality | 50 | 149–167 | 274 | 273 | **0.55× — native wins** | `EXCEPT` both ways = 0 |
+
+One-time costs, stated plainly: the first GROUP BY on a pair pays the sort —
+38 ms at SF1, 0.27 s at SF10, 2.9 s at SF50 (sort + building the cache
+buffers) — after which that pair, and any join that uses it as a build
+side, never sorts again. Break-even after ~6 repeated queries at SF10, ~10
+at SF50. The uploads themselves are 1.1 s (SF10) / 6 s (SF50) per pair.
+
+Where the time goes: kernel is 75–85% of wall on the high-cardinality rows
+(the rest is the host scan of ~n/256 block counts and the in-place output
+write into page-aligned vectors — no copy-back on unified memory). (F) is
+slow for a structural reason, not a tuning one: with four groups the
+segmented reduce gathers all 60M–300M payload values through the sort
+permutation (random access), and native's streaming hash aggregate is
+scan-bound. Pick by cardinality; the row stays. (E) after the first call is
+a slice of the cached sort — 10 rows, ~0 ms — but the first call loses to
+native's zonemap + heap top-k, which never sorts at all.
+
+`DOUBLE` on Metal: no doubles in MSL, so the GPU sorts and gathers the
+payload into key order (`gb_gather_i64`, raw 64-bit words) and the host
+streams one sequential sum per segment in parallel — the same
+"GPU sorts, host streams" split as the f64 join. It costs (C) ≈ 5 ms over
+(A) at SF10 and ≈ 30 ms at SF50.
+
+Found while benchmarking (F): the Metal radix sort skipped a byte pass
+whenever min and max agreed on that byte, which is wrong for keys between
+them that do not (`0x4146`, `0x4E46`, `0x4E4F`, `0x5246`): 4 groups came
+back as 66,085. Fixed in this release (also affected the v0.5 Metal join
+build cache for such key sets — see KNOWN_ISSUES); every row above is from
+the fixed build, and the shape is now a regression scenario in both parity
+harnesses.
+
+### Reproduce
+
+```bash
+./scripts/get_duckdb_libs.sh && ./scripts/build.sh        # gpudb-sql
+SF=10 ./scripts/gen_tpch.sh                                # data/tpch_sf10/
+./scripts/groupby_parity_check.sh build-macos              # or build-linux: 11 scenarios, 0 failed
+
+# uploads as earlier statements, reads after (gpudb-sql --multi):
+./build-macos/bin/gpudb-sql --db data/tpch_sf10/tpch.duckdb --multi --sql "
+SELECT gpu_upload_pair('l', l_orderkey, l_quantity::BIGINT) FROM lineitem;
+SELECT count(*) FROM gpu_groupby_sum_resident('l');                       -- (A); first call pays the sort
+SELECT count(*) FROM gpu_groupby_sum_resident('l');  SELECT gpu_last_stats();   -- warm
+SELECT count(*) FROM gpu_groupby_sum_resident('l') WHERE sum > 300;       -- (B)
+SELECT gpu_upload_pair('lf', l_orderkey, l_extendedprice::DOUBLE) FROM lineitem;
+SELECT count(*) FROM gpu_groupby_sum_resident_f64('lf');                  -- (C)
+SELECT count(*) FROM gpu_groupby_count_resident('l');                     -- (D)
+SELECT gpu_upload('ep', (l_extendedprice*100)::BIGINT) FROM lineitem;
+SELECT * FROM gpu_topk_resident('ep', 10, 'desc');                        -- (E)
+SELECT gpu_upload_pair('lc', (ascii(l_returnflag)*256 + ascii(l_linestatus))::BIGINT, l_quantity::BIGINT) FROM lineitem;
+SELECT * FROM gpu_groupby_sum_resident('lc');                             -- (F)
+"
+# native bars, same engine: SELECT count(*) FROM (SELECT l_orderkey, sum(l_quantity::BIGINT) FROM lineitem GROUP BY 1);  etc.
+# SF50: export GPUDB_UPLOAD_POOL_MAX_MB=12288
+```
+
 ## 2026-08-22 (v0.5.0) — fused resident joins: the GPU beats DuckDB's native hash join end-to-end, on both backends
 
 First benchmark of the fused resident join surface
