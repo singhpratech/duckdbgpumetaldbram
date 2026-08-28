@@ -92,6 +92,11 @@ public:
             ps_gb_chunk_sum_          = make_pso(lib, @"gb_chunk_sum_i64");
             ps_gb_finalize_           = make_pso(lib, @"gb_finalize_i64");
             ps_gb_gather_             = make_pso(lib, @"gb_gather_i64");
+            ps_gb_having_counts_      = make_pso(lib, @"gb_having_counts_i64");
+            ps_gb_having_compact_     = make_pso(lib, @"gb_having_compact_i64");
+            ps_gb_topk_hist_          = make_pso(lib, @"gb_topk_hist_i64");
+            ps_gb_topk_counts_        = make_pso(lib, @"gb_topk_counts_i64");
+            ps_gb_topk_compact_       = make_pso(lib, @"gb_topk_compact_i64");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
@@ -719,6 +724,251 @@ private:
         return b;
     }
 
+    // ---- Stage C: GroupByFilter on the device (i64 sums or counts) ----
+    // HAVING: block counts → host scan → compaction into the result vectors.
+    // top-k: 8-pass radix select on the aggregate, then compaction of the
+    // "strictly better than the k-th" class plus the first need_equal ties.
+    static std::uint32_t cmp_code(GroupByFilter::Cmp c) {
+        switch (c) {
+            case GroupByFilter::Cmp::GT: return 1u;
+            case GroupByFilter::Cmp::GE: return 2u;
+            case GroupByFilter::Cmp::LT: return 3u;
+            case GroupByFilter::Cmp::LE: return 4u;
+            default: return 0u;
+        }
+    }
+    static std::size_t host_scan_u32(std::uint32_t* v, std::size_t n) {
+        std::size_t tot = 0;
+        for (std::size_t b = 0; b < n; ++b) { const std::uint32_t c = v[b]; v[b] = static_cast<std::uint32_t>(tot); tot += c; }
+        return tot;
+    }
+    static void cap_rows(std::size_t rows, std::size_t max_groups, const char* op) {
+        if (rows > max_groups)
+            throw std::runtime_error(
+                std::string(op) + ": result has " + std::to_string(rows) +
+                " rows after the filter, above the cap of " + std::to_string(max_groups) +
+                " (raise GPUDB_GROUPBY_ROWS_MAX_M if intentional)");
+    }
+
+    void device_filter_i64(GroupByResidentResult& r,
+                           id<MTLBuffer> bk, id<MTLBuffer> bs, id<MTLBuffer> bc,
+                           bool gpu_sums, std::size_t num_segs,
+                           const GroupByFilter& f, std::size_t max_groups,
+                           const char* op, double& kernel_ms) {
+        r.groups_total = num_segs;
+        id<MTLBuffer> agg = gpu_sums ? bs : bc;
+        const std::uint32_t ns32  = static_cast<std::uint32_t>(num_segs);
+        const std::uint32_t cmp   = cmp_code(f.cmp);
+        const std::int64_t  thr   = f.threshold_i64;
+        const std::uint32_t with_sums = gpu_sums ? 1u : 0u;
+        const std::size_t   nb    = (num_segs + kBlock - 1) / kBlock;
+        grow(gb_block_buf_,  nb * sizeof(std::uint32_t), "filter block counts");
+        grow(gb_block2_buf_, nb * sizeof(std::uint32_t), "filter block counts (ties)");
+
+        auto run = [&](void (^enc)(id<MTLComputeCommandEncoder>)) {
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            enc(ce);
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            kernel_ms += cb_kernel_ms(cb);
+        };
+        const MTLSize grid = MTLSizeMake(nb, 1, 1), tg = MTLSizeMake(kBlock, 1, 1);
+
+        // ---- HAVING only ----
+        if (f.topk == 0) {
+            run(^(id<MTLComputeCommandEncoder> ce) {
+                [ce setComputePipelineState:ps_gb_having_counts_];
+                [ce setBuffer:agg offset:0 atIndex:0];
+                [ce setBytes:&ns32 length:sizeof(ns32) atIndex:1];
+                [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:2];
+                [ce setBytes:&thr  length:sizeof(thr)  atIndex:3];
+                [ce setBuffer:gb_block_buf_ offset:0 atIndex:4];
+                [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            });
+            const std::size_t surv = host_scan_u32(
+                static_cast<std::uint32_t*>([gb_block_buf_ contents]), nb);
+            cap_rows(surv, max_groups, op);
+            OutBuf ok = out_for(r.keys, surv), oc = out_for(r.counts, surv), os;
+            if (gpu_sums) os = out_for(r.sums, surv);
+            if (surv > 0) {
+                run(^(id<MTLComputeCommandEncoder> ce) {
+                    [ce setComputePipelineState:ps_gb_having_compact_];
+                    [ce setBuffer:agg offset:0 atIndex:0];
+                    [ce setBuffer:bk  offset:0 atIndex:1];
+                    [ce setBuffer:(gpu_sums ? bs : bc) offset:0 atIndex:2];
+                    [ce setBuffer:bc  offset:0 atIndex:3];
+                    [ce setBytes:&ns32 length:sizeof(ns32) atIndex:4];
+                    [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:5];
+                    [ce setBytes:&thr  length:sizeof(thr)  atIndex:6];
+                    [ce setBuffer:gb_block_buf_ offset:0 atIndex:7];
+                    [ce setBuffer:ok.buf offset:0 atIndex:8];
+                    [ce setBuffer:(gpu_sums ? os.buf : oc.buf) offset:0 atIndex:9];
+                    [ce setBuffer:oc.buf offset:0 atIndex:10];
+                    [ce setBytes:&with_sums length:sizeof(with_sums) atIndex:11];
+                    [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                });
+            }
+            copy_back(ok, r.keys); copy_back(oc, r.counts);
+            if (gpu_sums) copy_back(os, r.sums);
+            return;
+        }
+
+        // ---- top-k: radix select ----
+        grow(gb_hist_buf_, 256 * sizeof(std::uint32_t), "radix-select histogram");
+        auto* hist = static_cast<std::uint32_t*>([gb_hist_buf_ contents]);
+        const std::uint32_t desc = f.topk_desc ? 1u : 0u;
+        std::uint64_t prefix = 0, mask = 0;
+        std::size_t remaining = f.topk;     // rank still to satisfy within the prefix
+        std::size_t candidates = 0;
+        bool take_all = false;
+        for (int pass = 0; pass < 8; ++pass) {
+            const std::uint32_t shift = static_cast<std::uint32_t>(56 - 8 * pass);
+            std::memset(hist, 0, 256 * sizeof(std::uint32_t));
+            run(^(id<MTLComputeCommandEncoder> ce) {
+                [ce setComputePipelineState:ps_gb_topk_hist_];
+                [ce setBuffer:agg offset:0 atIndex:0];
+                [ce setBytes:&ns32   length:sizeof(ns32)   atIndex:1];
+                [ce setBytes:&cmp    length:sizeof(cmp)    atIndex:2];
+                [ce setBytes:&thr    length:sizeof(thr)    atIndex:3];
+                [ce setBytes:&prefix length:sizeof(prefix) atIndex:4];
+                [ce setBytes:&mask   length:sizeof(mask)   atIndex:5];
+                [ce setBytes:&shift  length:sizeof(shift)  atIndex:6];
+                [ce setBuffer:gb_hist_buf_ offset:0 atIndex:7];
+                [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            });
+            if (pass == 0) {
+                for (int b = 0; b < 256; ++b) candidates += hist[b];
+                if (candidates <= f.topk) { take_all = true; break; }
+            }
+            int chosen = -1;
+            if (desc) {
+                for (int b = 255; b >= 0; --b) {
+                    if (remaining <= hist[b]) { chosen = b; break; }
+                    remaining -= hist[b];
+                }
+            } else {
+                for (int b = 0; b < 256; ++b) {
+                    if (remaining <= hist[b]) { chosen = b; break; }
+                    remaining -= hist[b];
+                }
+            }
+            if (chosen < 0) throw std::runtime_error(std::string(op) + ": radix select lost the k-th rank (internal)");
+            prefix |= static_cast<std::uint64_t>(chosen) << shift;
+            mask   |= static_cast<std::uint64_t>(0xFF) << shift;
+        }
+
+        std::size_t out_rows = 0, n_better = 0, need_equal = 0;
+        std::uint64_t T = prefix;
+        if (take_all) {
+            // every cmp survivor is in the answer: "equal" class empty, all "better"
+            T = desc ? 0ull : ~0ull;   // nothing equals it in practice; better-than-T = everything (u > 0 fails for u==0!)
+        }
+        // Count the two classes with a T such that class membership is exact.
+        // For take_all we instead reuse the HAVING counts (cmp only) to be safe.
+        if (take_all) {
+            run(^(id<MTLComputeCommandEncoder> ce) {
+                [ce setComputePipelineState:ps_gb_having_counts_];
+                [ce setBuffer:agg offset:0 atIndex:0];
+                [ce setBytes:&ns32 length:sizeof(ns32) atIndex:1];
+                [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:2];
+                [ce setBytes:&thr  length:sizeof(thr)  atIndex:3];
+                [ce setBuffer:gb_block_buf_ offset:0 atIndex:4];
+                [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            });
+            out_rows = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]), nb);
+            cap_rows(out_rows, max_groups, op);
+            OutBuf ok = out_for(r.keys, out_rows), oc = out_for(r.counts, out_rows), os;
+            if (gpu_sums) os = out_for(r.sums, out_rows);
+            if (out_rows > 0) {
+                run(^(id<MTLComputeCommandEncoder> ce) {
+                    [ce setComputePipelineState:ps_gb_having_compact_];
+                    [ce setBuffer:agg offset:0 atIndex:0];
+                    [ce setBuffer:bk  offset:0 atIndex:1];
+                    [ce setBuffer:(gpu_sums ? bs : bc) offset:0 atIndex:2];
+                    [ce setBuffer:bc  offset:0 atIndex:3];
+                    [ce setBytes:&ns32 length:sizeof(ns32) atIndex:4];
+                    [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:5];
+                    [ce setBytes:&thr  length:sizeof(thr)  atIndex:6];
+                    [ce setBuffer:gb_block_buf_ offset:0 atIndex:7];
+                    [ce setBuffer:ok.buf offset:0 atIndex:8];
+                    [ce setBuffer:(gpu_sums ? os.buf : oc.buf) offset:0 atIndex:9];
+                    [ce setBuffer:oc.buf offset:0 atIndex:10];
+                    [ce setBytes:&with_sums length:sizeof(with_sums) atIndex:11];
+                    [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+                });
+            }
+            copy_back(ok, r.keys); copy_back(oc, r.counts);
+            if (gpu_sums) copy_back(os, r.sums);
+        } else {
+            run(^(id<MTLComputeCommandEncoder> ce) {
+                [ce setComputePipelineState:ps_gb_topk_counts_];
+                [ce setBuffer:agg offset:0 atIndex:0];
+                [ce setBytes:&ns32 length:sizeof(ns32) atIndex:1];
+                [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:2];
+                [ce setBytes:&thr  length:sizeof(thr)  atIndex:3];
+                [ce setBytes:&T    length:sizeof(T)    atIndex:4];
+                [ce setBytes:&desc length:sizeof(desc) atIndex:5];
+                [ce setBuffer:gb_block_buf_  offset:0 atIndex:6];
+                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:7];
+                [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            });
+            n_better = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]), nb);
+            const std::size_t n_equal = host_scan_u32(static_cast<std::uint32_t*>([gb_block2_buf_ contents]), nb);
+            if (n_better >= f.topk || n_better + n_equal < f.topk)
+                throw std::runtime_error(std::string(op) + ": radix select classes inconsistent (internal)");
+            need_equal = f.topk - n_better;
+            out_rows = f.topk;
+            cap_rows(out_rows, max_groups, op);
+            const std::uint32_t eb32 = static_cast<std::uint32_t>(n_better);
+            const std::uint32_t ne32 = static_cast<std::uint32_t>(need_equal);
+            OutBuf ok = out_for(r.keys, out_rows), oc = out_for(r.counts, out_rows), os;
+            if (gpu_sums) os = out_for(r.sums, out_rows);
+            run(^(id<MTLComputeCommandEncoder> ce) {
+                [ce setComputePipelineState:ps_gb_topk_compact_];
+                [ce setBuffer:agg offset:0 atIndex:0];
+                [ce setBuffer:bk  offset:0 atIndex:1];
+                [ce setBuffer:(gpu_sums ? bs : bc) offset:0 atIndex:2];
+                [ce setBuffer:bc  offset:0 atIndex:3];
+                [ce setBytes:&ns32 length:sizeof(ns32) atIndex:4];
+                [ce setBytes:&cmp  length:sizeof(cmp)  atIndex:5];
+                [ce setBytes:&thr  length:sizeof(thr)  atIndex:6];
+                [ce setBytes:&T    length:sizeof(T)    atIndex:7];
+                [ce setBytes:&desc length:sizeof(desc) atIndex:8];
+                [ce setBuffer:gb_block_buf_  offset:0 atIndex:9];
+                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:10];
+                [ce setBytes:&eb32 length:sizeof(eb32) atIndex:11];
+                [ce setBytes:&ne32 length:sizeof(ne32) atIndex:12];
+                [ce setBuffer:ok.buf offset:0 atIndex:13];
+                [ce setBuffer:(gpu_sums ? os.buf : oc.buf) offset:0 atIndex:14];
+                [ce setBuffer:oc.buf offset:0 atIndex:15];
+                [ce setBytes:&with_sums length:sizeof(with_sums) atIndex:16];
+                [ce dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+            });
+            copy_back(ok, r.keys); copy_back(oc, r.counts);
+            if (gpu_sums) copy_back(os, r.sums);
+        }
+
+        // Order the k rows by aggregate (desc/asc), ties by key ascending.
+        std::vector<std::size_t> idx(r.keys.size());
+        for (std::size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+        const std::vector<std::int64_t>& a = gpu_sums ? r.sums : r.counts;
+        std::sort(idx.begin(), idx.end(), [&](std::size_t x, std::size_t y) {
+            if (a[x] != a[y]) return f.topk_desc ? (a[x] > a[y]) : (a[x] < a[y]);
+            return r.keys[x] < r.keys[y];
+        });
+        GroupByResidentResult o{};
+        o.keys.reserve(idx.size()); o.counts.reserve(idx.size());
+        if (gpu_sums) o.sums.reserve(idx.size());
+        for (std::size_t i : idx) {
+            o.keys.push_back(r.keys[i]); o.counts.push_back(r.counts[i]);
+            if (gpu_sums) o.sums.push_back(r.sums[i]);
+        }
+        r.keys = std::move(o.keys); r.counts = std::move(o.counts);
+        if (gpu_sums) r.sums = std::move(o.sums);
+    }
+
     GroupByResidentResult groupby_impl(const MetalResidentColumn& k,
                                        const MetalResidentColumn* v,
                                        GbMode mode, std::size_t max_groups,
@@ -776,12 +1026,23 @@ private:
         const std::uint32_t ns32 = static_cast<std::uint32_t>(num_segs);
 
         // ---- Stage B: starts, chunk sums, finalize (one command buffer) ----
-        const bool gpu_sums = (mode == GbMode::SumI64);
-        OutBuf ok = out_for(r.keys, num_segs);
-        OutBuf oc = out_for(r.counts, num_segs);
-        OutBuf os;
+        // With a device filter the finalized arrays stay in scratch and only
+        // the survivors are written to the result vectors (Stage C).
+        const bool gpu_sums   = (mode == GbMode::SumI64);
+        const bool dev_filter = filter.active() && mode != GbMode::SumF64;
+        OutBuf ok, oc, os;
+        id<MTLBuffer> bk = nil, bc = nil, bs = nil;
+        if (dev_filter) {
+            bk = grow(gb_fkeys_,   num_segs * sizeof(std::int64_t), "filter keys");
+            bc = grow(gb_fcounts_, num_segs * sizeof(std::int64_t), "filter counts");
+            if (gpu_sums) bs = grow(gb_fsums_, num_segs * sizeof(std::int64_t), "filter sums");
+        } else {
+            ok = out_for(r.keys, num_segs);
+            oc = out_for(r.counts, num_segs);
+            if (gpu_sums) os = out_for(r.sums, num_segs);
+            bk = ok.buf; bc = oc.buf; bs = os.buf;
+        }
         if (gpu_sums) {
-            os = out_for(r.sums, num_segs);
             grow(gb_head_buf_, nchunks * sizeof(std::int64_t), "head partials");
             grow(gb_tail_buf_, nchunks * sizeof(std::int64_t), "tail partials");
         }
@@ -807,7 +1068,7 @@ private:
                 [ce setBuffer:mult_buf_     offset:0 atIndex:3];
                 [ce setBytes:&n32  length:sizeof(n32)  atIndex:4];
                 [ce setBytes:&ns32 length:sizeof(ns32) atIndex:5];
-                [ce setBuffer:os.buf        offset:0 atIndex:6];
+                [ce setBuffer:bs            offset:0 atIndex:6];
                 [ce setBuffer:gb_head_buf_  offset:0 atIndex:7];
                 [ce setBuffer:gb_tail_buf_  offset:0 atIndex:8];
                 [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
@@ -829,11 +1090,11 @@ private:
             [ce setBuffer:mult_buf_ offset:0 atIndex:1];
             [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
             [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
-            [ce setBuffer:(gpu_sums ? gb_head_buf_ : oc.buf) offset:0 atIndex:4];
-            [ce setBuffer:(gpu_sums ? gb_tail_buf_ : oc.buf) offset:0 atIndex:5];
-            [ce setBuffer:ok.buf    offset:0 atIndex:6];
-            [ce setBuffer:(gpu_sums ? os.buf : oc.buf) offset:0 atIndex:7];
-            [ce setBuffer:oc.buf    offset:0 atIndex:8];
+            [ce setBuffer:(gpu_sums ? gb_head_buf_ : bc) offset:0 atIndex:4];
+            [ce setBuffer:(gpu_sums ? gb_tail_buf_ : bc) offset:0 atIndex:5];
+            [ce setBuffer:bk        offset:0 atIndex:6];
+            [ce setBuffer:(gpu_sums ? bs : bc) offset:0 atIndex:7];
+            [ce setBuffer:bc        offset:0 atIndex:8];
             [ce setBytes:&with_sums length:sizeof(with_sums) atIndex:9];
             [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
@@ -842,9 +1103,14 @@ private:
             [cb waitUntilCompleted];
             kernel_ms += cb_kernel_ms(cb);
         }
-        copy_back(ok, r.keys);
-        copy_back(oc, r.counts);
-        if (gpu_sums) copy_back(os, r.sums);
+        if (dev_filter) {
+            device_filter_i64(r, bk, bs, bc, gpu_sums, num_segs, filter, max_groups, op, kernel_ms);
+        } else {
+            copy_back(ok, r.keys);
+            copy_back(oc, r.counts);
+            if (gpu_sums) copy_back(os, r.sums);
+            r.groups_total = num_segs;
+        }
 
         // ---- f64: host streams the gathered payload per segment ----
         if (mode == GbMode::SumF64) {
@@ -873,11 +1139,10 @@ private:
             for (auto& t : ts) t.join();
         }
 
-        // Filter (interim: host reference; device kernels follow).
-        apply_group_filter_host(r, filter,
-                                mode == GbMode::SumI64 ? FilterAgg::SumI64 :
-                                mode == GbMode::SumF64 ? FilterAgg::SumF64 : FilterAgg::Count,
-                                max_groups, op);
+        // f64: the sums were finished on the host, so the filter runs there too
+        // (the reference implementation; cap checked on the survivors).
+        if (mode == GbMode::SumF64)
+            apply_group_filter_host(r, filter, FilterAgg::SumF64, max_groups, op);
 
         r.kernel_ms   = kernel_ms;
         r.transfer_ms = 0.0;
@@ -1136,6 +1401,11 @@ private:
     id<MTLComputePipelineState> ps_gb_chunk_sum_          = nil;
     id<MTLComputePipelineState> ps_gb_finalize_           = nil;
     id<MTLComputePipelineState> ps_gb_gather_             = nil;
+    id<MTLComputePipelineState> ps_gb_having_counts_      = nil;
+    id<MTLComputePipelineState> ps_gb_having_compact_     = nil;
+    id<MTLComputePipelineState> ps_gb_topk_hist_          = nil;
+    id<MTLComputePipelineState> ps_gb_topk_counts_        = nil;
+    id<MTLComputePipelineState> ps_gb_topk_compact_       = nil;
 
     // Resident GROUP BY scratch (grown on demand): per-256-block run-start
     // counts / offsets (u32), per-64-chunk head and tail partials (i64), and
@@ -1144,6 +1414,14 @@ private:
     id<MTLBuffer> gb_head_buf_   = nil;
     id<MTLBuffer> gb_tail_buf_   = nil;
     id<MTLBuffer> gb_gather_buf_ = nil;
+    // GroupByFilter scratch: the finalized (key, sum, count) arrays stay on
+    // the device when a filter is active; per-block counts for the second
+    // class ("equal to the k-th") and the 256-bin radix-select histogram.
+    id<MTLBuffer> gb_fkeys_      = nil;
+    id<MTLBuffer> gb_fsums_      = nil;
+    id<MTLBuffer> gb_fcounts_    = nil;
+    id<MTLBuffer> gb_block2_buf_ = nil;
+    id<MTLBuffer> gb_hist_buf_   = nil;
 
     // Lazily constructed: only joins pay for the radix-sort pipelines.
     std::unique_ptr<metal_detail::MetalRadixSort> sorter_;

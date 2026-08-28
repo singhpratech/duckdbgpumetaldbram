@@ -12,6 +12,10 @@
 #   sum_f64   every group within relative 1e-9 of native sum(v/3.0)
 #   ordered   gpu rows arrive sorted by key ascending
 #   topk      multiset of the 50 largest / smallest payloads equals native
+#   having    (key, sum) sets equal both ways for HAVING sum > 0 / <= 0,
+#             count >= 2, f64 sum > 0 within 1e-9 — filter evaluated on the device
+#   group_topk multiset of the 50 largest / smallest group sums (and counts,
+#             f64 sums) equals native ORDER BY … LIMIT 50; output ordered by sum
 #
 # Usage: ./scripts/groupby_parity_check.sh [build_dir]
 set -u
@@ -45,7 +49,22 @@ SELECT
        THEN 'PASS' ELSE 'FAIL' END AS ordered,
   CASE WHEN (SELECT list_sort(list(value)) FROM gpu_topk_resident('p', 50, 'desc')) = (SELECT list_sort(list(v)) FROM (SELECT v FROM src ORDER BY v DESC LIMIT 50))
         AND (SELECT list_sort(list(value)) FROM gpu_topk_resident('p', 50, 'asc'))  = (SELECT list_sort(list(v)) FROM (SELECT v FROM src ORDER BY v ASC  LIMIT 50))
-       THEN 'PASS' ELSE 'FAIL' END AS topk;
+       THEN 'PASS' ELSE 'FAIL' END AS topk,
+  CASE WHEN (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '>', 0)) EXCEPT (SELECT k, sum(v) s FROM src GROUP BY k HAVING s > 0))) = 0
+        AND (SELECT count(*) FROM ((SELECT k, sum(v) s FROM src GROUP BY k HAVING s > 0) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '>', 0)))) = 0
+        AND (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '<=', 0)) EXCEPT (SELECT k, sum(v) s FROM src GROUP BY k HAVING s <= 0))) = 0
+        AND (SELECT count(*) FROM ((SELECT k, sum(v) s FROM src GROUP BY k HAVING s <= 0) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '<=', 0)))) = 0
+        AND (SELECT count(*) FROM ((SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)) EXCEPT (SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2))) = 0
+        AND (SELECT count(*) FROM ((SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2) EXCEPT (SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)))) = 0
+        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0) g JOIN (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0) n ON g.key = n.k
+             WHERE abs(g.sum - n.s) > 1e-9 * greatest(abs(n.s), 1)) = 0
+       THEN 'PASS' ELSE 'FAIL' END AS having,
+  CASE WHEN (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'desc')) = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
+        AND (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'asc'))  = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s ASC  LIMIT 50))
+        AND (SELECT list_sort(list(count)) FROM gpu_groupby_count_resident_topk('p', 50, 'desc')) = (SELECT list_sort(list(c)) FROM (SELECT count(*) c FROM src GROUP BY k ORDER BY c DESC LIMIT 50))
+        AND (SELECT count(*) FROM (SELECT sum, lag(sum) OVER () AS prev FROM gpu_groupby_sum_resident_topk('p', 50, 'desc')) WHERE prev IS NOT NULL AND prev < sum) = 0
+        AND (SELECT list_sort(list(round(sum, 6))) FROM gpu_groupby_sum_resident_f64_topk('pf', 50, 'desc')) = (SELECT list_sort(list(round(s, 6))) FROM (SELECT sum(v/3.0) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
+       THEN 'PASS' ELSE 'FAIL' END AS group_topk;
 " 2>&1 | tail -1)
   runs=$((runs+1))
   if echo "$out" | grep -q "FAIL\|failed\|Error"; then

@@ -579,3 +579,195 @@ kernel void gb_gather_i64(
 {
     if (gid < n) dst[gid] = src[perm[gid]];
 }
+
+// ---------------------------------------------------------------------------
+//  GroupByFilter on the finalized groups (device side, v0.6)
+//    HAVING:  per-block survivor counts → host scan → compaction
+//    top-k:   8-pass radix select on the aggregate (order-preserving ulong
+//             transform of the i64), then compaction of "strictly better than
+//             the k-th" plus the first `need_equal` ties
+//  cmp: 0 none, 1 >, 2 >=, 3 <, 4 <=. The aggregate is an i64 buffer (sums
+//  or counts); f64 sums are filtered on the host (no doubles in MSL).
+// ---------------------------------------------------------------------------
+
+inline bool gb_keep(long a, uint cmp, long t) {
+    switch (cmp) {
+        case 1u: return a >  t;
+        case 2u: return a >= t;
+        case 3u: return a <  t;
+        case 4u: return a <= t;
+        default: return true;
+    }
+}
+inline ulong gb_ord(long a) { return (ulong)a ^ 0x8000000000000000ul; }   // order-preserving
+
+kernel void gb_having_counts_i64(
+    device const long* agg          [[buffer(0)]],
+    constant uint&     num_segs     [[buffer(1)]],
+    constant uint&     cmp          [[buffer(2)]],
+    constant long&     thr          [[buffer(3)]],
+    device uint*       block_counts [[buffer(4)]],
+    uint               tid          [[thread_position_in_threadgroup]],
+    uint               gid          [[thread_position_in_grid]],
+    uint               block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    shm[tid] = (gid < num_segs && gb_keep(agg[gid], cmp, thr)) ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
+}
+
+kernel void gb_having_compact_i64(
+    device const long* agg           [[buffer(0)]],
+    device const long* keys          [[buffer(1)]],
+    device const long* sums          [[buffer(2)]],
+    device const long* counts        [[buffer(3)]],
+    constant uint&     num_segs      [[buffer(4)]],
+    constant uint&     cmp           [[buffer(5)]],
+    constant long&     thr           [[buffer(6)]],
+    device const uint* block_offsets [[buffer(7)]],
+    device long*       out_keys      [[buffer(8)]],
+    device long*       out_sums      [[buffer(9)]],
+    device long*       out_counts    [[buffer(10)]],
+    constant uint&     with_sums     [[buffer(11)]],
+    uint               gid           [[thread_position_in_grid]],
+    uint               block_id      [[threadgroup_position_in_grid]],
+    uint               lane          [[thread_index_in_simdgroup]],
+    uint               sg            [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint sg_tot[BLOCK];
+    const uint f = (gid < num_segs && gb_keep(agg[gid], cmp, thr)) ? 1u : 0u;
+    const uint lane_ex = simd_prefix_exclusive_sum(f);
+    const uint sg_sum  = simd_sum(f);
+    if (lane == 0) sg_tot[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint sg_off = 0u;
+    for (uint s = 0; s < sg; ++s) sg_off += sg_tot[s];
+    if (f) {
+        const uint pos = block_offsets[block_id] + sg_off + lane_ex;
+        out_keys[pos]   = keys[gid];
+        out_counts[pos] = counts[gid];
+        if (with_sums != 0u) out_sums[pos] = sums[gid];
+    }
+}
+
+// Histogram of byte (ord >> shift) & 255 over candidates that pass cmp and
+// whose higher bytes equal `prefix` under `mask`.
+kernel void gb_topk_hist_i64(
+    device const long*   agg      [[buffer(0)]],
+    constant uint&       num_segs [[buffer(1)]],
+    constant uint&       cmp      [[buffer(2)]],
+    constant long&       thr      [[buffer(3)]],
+    constant ulong&      prefix   [[buffer(4)]],
+    constant ulong&      mask     [[buffer(5)]],
+    constant uint&       shift    [[buffer(6)]],
+    device atomic_uint*  hist     [[buffer(7)]],
+    uint                 tid      [[thread_position_in_threadgroup]],
+    uint                 gid      [[thread_position_in_grid]])
+{
+    threadgroup atomic_uint h[256];
+    atomic_store_explicit(&h[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gid < num_segs) {
+        const long a = agg[gid];
+        if (gb_keep(a, cmp, thr)) {
+            const ulong u = gb_ord(a);
+            if ((u & mask) == prefix)
+                atomic_fetch_add_explicit(&h[(u >> shift) & 255ul], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint v = atomic_load_explicit(&h[tid], memory_order_relaxed);
+    if (v != 0u) atomic_fetch_add_explicit(&hist[tid], v, memory_order_relaxed);
+}
+
+// Per-block counts of two classes: "better than T" and "equal to T".
+kernel void gb_topk_counts_i64(
+    device const long* agg           [[buffer(0)]],
+    constant uint&     num_segs      [[buffer(1)]],
+    constant uint&     cmp           [[buffer(2)]],
+    constant long&     thr           [[buffer(3)]],
+    constant ulong&    T             [[buffer(4)]],
+    constant uint&     desc          [[buffer(5)]],
+    device uint*       better_counts [[buffer(6)]],
+    device uint*       equal_counts  [[buffer(7)]],
+    uint               tid           [[thread_position_in_threadgroup]],
+    uint               gid           [[thread_position_in_grid]],
+    uint               block_id      [[threadgroup_position_in_grid]])
+{
+    threadgroup uint sb[BLOCK];
+    threadgroup uint se[BLOCK];
+    uint b = 0u, e = 0u;
+    if (gid < num_segs) {
+        const long a = agg[gid];
+        if (gb_keep(a, cmp, thr)) {
+            const ulong u = gb_ord(a);
+            b = (desc != 0u) ? (u > T ? 1u : 0u) : (u < T ? 1u : 0u);
+            e = (u == T) ? 1u : 0u;
+        }
+    }
+    sb[tid] = b; se[tid] = e;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) { sb[tid] += sb[tid + s]; se[tid] += se[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { better_counts[block_id] = sb[0]; equal_counts[block_id] = se[0]; }
+}
+
+kernel void gb_topk_compact_i64(
+    device const long* agg            [[buffer(0)]],
+    device const long* keys           [[buffer(1)]],
+    device const long* sums           [[buffer(2)]],
+    device const long* counts         [[buffer(3)]],
+    constant uint&     num_segs       [[buffer(4)]],
+    constant uint&     cmp            [[buffer(5)]],
+    constant long&     thr            [[buffer(6)]],
+    constant ulong&    T              [[buffer(7)]],
+    constant uint&     desc           [[buffer(8)]],
+    device const uint* better_offsets [[buffer(9)]],
+    device const uint* equal_offsets  [[buffer(10)]],
+    constant uint&     equal_base     [[buffer(11)]],   // = total "better"
+    constant uint&     need_equal     [[buffer(12)]],   // ties to take
+    device long*       out_keys       [[buffer(13)]],
+    device long*       out_sums       [[buffer(14)]],
+    device long*       out_counts     [[buffer(15)]],
+    constant uint&     with_sums      [[buffer(16)]],
+    uint               gid            [[thread_position_in_grid]],
+    uint               block_id       [[threadgroup_position_in_grid]],
+    uint               lane           [[thread_index_in_simdgroup]],
+    uint               sg             [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint tb[BLOCK];
+    threadgroup uint te[BLOCK];
+    uint b = 0u, e = 0u;
+    if (gid < num_segs) {
+        const long a = agg[gid];
+        if (gb_keep(a, cmp, thr)) {
+            const ulong u = gb_ord(a);
+            b = (desc != 0u) ? (u > T ? 1u : 0u) : (u < T ? 1u : 0u);
+            e = (u == T) ? 1u : 0u;
+        }
+    }
+    const uint b_ex = simd_prefix_exclusive_sum(b), b_sum = simd_sum(b);
+    const uint e_ex = simd_prefix_exclusive_sum(e), e_sum = simd_sum(e);
+    if (lane == 0) { tb[sg] = b_sum; te[sg] = e_sum; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint b_off = 0u, e_off = 0u;
+    for (uint s = 0; s < sg; ++s) { b_off += tb[s]; e_off += te[s]; }
+    uint pos = 0xFFFFFFFFu;
+    if (b) pos = better_offsets[block_id] + b_off + b_ex;
+    else if (e) {
+        const uint r = equal_offsets[block_id] + e_off + e_ex;
+        if (r < need_equal) pos = equal_base + r;
+    }
+    if (pos != 0xFFFFFFFFu) {
+        out_keys[pos]   = keys[gid];
+        out_counts[pos] = counts[gid];
+        if (with_sums != 0u) out_sums[pos] = sums[gid];
+    }
+}

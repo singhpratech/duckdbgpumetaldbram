@@ -5,6 +5,15 @@
 //   SELECT key, count      FROM gpu_groupby_count_resident('p');   -- or a bare column
 //   SELECT idx, value      FROM gpu_topk_resident('c', 10, 'desc');     -- BIGINT column
 //   SELECT idx, value      FROM gpu_topk_resident_f64('cf', 10, 'desc'); -- DOUBLE column
+//   -- HAVING / top-k of groups evaluated ON THE DEVICE: only survivors come back
+//   SELECT * FROM gpu_groupby_sum_resident_having('p', '>', 300);        -- HAVING sum > 300
+//   SELECT * FROM gpu_groupby_sum_resident_f64_having('pf', '>=', 1e6);
+//   SELECT * FROM gpu_groupby_count_resident_having('p', '<', 5);        -- HAVING count(*) < 5
+//   SELECT * FROM gpu_groupby_sum_resident_topk('p', 10, 'desc');        -- ORDER BY sum DESC LIMIT 10
+//   SELECT * FROM gpu_groupby_sum_resident_f64_topk('pf', 10, 'asc');
+//   SELECT * FROM gpu_groupby_count_resident_topk('p', 10, 'desc');      -- ORDER BY count DESC LIMIT 10
+//   (cmp is one of '>', '>=', '<', '<='; the cap applies to the rows returned;
+//    topk output is ordered by the aggregate, ties in an unspecified order)
 //
 // The GPU produces the (key, aggregate) rows; everything downstream — WHERE,
 // ORDER BY, LIMIT, further joins — is ordinary DuckDB SQL over a small
@@ -92,10 +101,12 @@ Resolved resolve_pair(const std::string& name, bool need_vals, const char* fn) {
 // ---------------------------------------------------------------------------
 
 enum class GbOp : std::uint8_t { SumI64, SumF64, Count };
+enum class GbForm : std::uint8_t { Plain, Having, TopK };
 
 struct GbBindData {
     std::string name;
     GbOp op = GbOp::SumI64;
+    gpudb::GroupByFilter filter;
 };
 
 struct GbInitData {
@@ -104,27 +115,75 @@ struct GbInitData {
     std::size_t offset = 0;
 };
 
-const char* gb_fn_name(GbOp op) {
+const char* gb_fn_name(GbOp op, GbForm form = GbForm::Plain) {
     switch (op) {
-        case GbOp::SumI64: return "gpu_groupby_sum_resident";
-        case GbOp::SumF64: return "gpu_groupby_sum_resident_f64";
-        case GbOp::Count:  return "gpu_groupby_count_resident";
+        case GbOp::SumI64: return form == GbForm::Having ? "gpu_groupby_sum_resident_having"
+                                : form == GbForm::TopK  ? "gpu_groupby_sum_resident_topk"
+                                                        : "gpu_groupby_sum_resident";
+        case GbOp::SumF64: return form == GbForm::Having ? "gpu_groupby_sum_resident_f64_having"
+                                : form == GbForm::TopK  ? "gpu_groupby_sum_resident_f64_topk"
+                                                        : "gpu_groupby_sum_resident_f64";
+        case GbOp::Count:  return form == GbForm::Having ? "gpu_groupby_count_resident_having"
+                                : form == GbForm::TopK  ? "gpu_groupby_count_resident_topk"
+                                                        : "gpu_groupby_count_resident";
     }
     return "gpu_groupby_resident";
 }
 
-template <GbOp OP>
+// Parse the extra arguments of the _having / _topk forms into a GroupByFilter.
+// Returns false after setting a bind error.
+template <GbOp OP, GbForm FORM>
+bool gb_parse_filter(duckdb_bind_info info, gpudb::GroupByFilter& f) {
+    const char* fn = gb_fn_name(OP, FORM);
+    if (FORM == GbForm::Plain) return true;
+    duckdb_value a1 = duckdb_bind_get_parameter(info, 1);
+    duckdb_value a2 = duckdb_bind_get_parameter(info, 2);
+    if (!a1 || !a2 || duckdb_is_null_value(a1) || duckdb_is_null_value(a2)) {
+        if (a1) duckdb_destroy_value(&a1);
+        if (a2) duckdb_destroy_value(&a2);
+        duckdb_bind_set_error(info, (std::string(fn) + ": arguments may not be NULL").c_str());
+        return false;
+    }
+    bool ok = true;
+    std::string err;
+    if (FORM == GbForm::Having) {
+        std::string cmp = value_to_string(a1);
+        if      (cmp == ">")  f.cmp = gpudb::GroupByFilter::Cmp::GT;
+        else if (cmp == ">=") f.cmp = gpudb::GroupByFilter::Cmp::GE;
+        else if (cmp == "<")  f.cmp = gpudb::GroupByFilter::Cmp::LT;
+        else if (cmp == "<=") f.cmp = gpudb::GroupByFilter::Cmp::LE;
+        else { ok = false; err = std::string(fn) + ": comparison must be one of '>', '>=', '<', '<='"; }
+        if (OP == GbOp::SumF64) f.threshold_f64 = duckdb_get_double(a2);
+        else                    f.threshold_i64 = duckdb_get_int64(a2);
+    } else {
+        const std::int64_t k = duckdb_get_int64(a1);
+        std::string order = value_to_string(a2);
+        for (auto& ch : order) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (k < 1) { ok = false; err = std::string(fn) + ": k must be >= 1"; }
+        else if (order == "desc") f.topk_desc = true;
+        else if (order == "asc")  f.topk_desc = false;
+        else { ok = false; err = std::string(fn) + ": order must be 'asc' or 'desc'"; }
+        if (ok) f.topk = static_cast<std::size_t>(k);
+    }
+    duckdb_destroy_value(&a1);
+    duckdb_destroy_value(&a2);
+    if (!ok) duckdb_bind_set_error(info, err.c_str());
+    return ok;
+}
+
+template <GbOp OP, GbForm FORM>
 void gb_bind(duckdb_bind_info info) {
     duckdb_value nv = duckdb_bind_get_parameter(info, 0);
     if (!nv || duckdb_is_null_value(nv)) {
         if (nv) duckdb_destroy_value(&nv);
-        duckdb_bind_set_error(info, (std::string(gb_fn_name(OP)) + ": name may not be NULL").c_str());
+        duckdb_bind_set_error(info, (std::string(gb_fn_name(OP, FORM)) + ": name may not be NULL").c_str());
         return;
     }
     auto* bind = new GbBindData();
     bind->name = value_to_string(nv);
     bind->op = OP;
     duckdb_destroy_value(&nv);
+    if (!gb_parse_filter<OP, FORM>(info, bind->filter)) { delete bind; return; }
 
     duckdb_logical_type bigint = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
     duckdb_logical_type dbl    = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
@@ -141,7 +200,10 @@ void gb_init(duckdb_init_info info) {
     auto* bind = static_cast<GbBindData*>(duckdb_init_get_bind_data(info));
     auto* init = new GbInitData();
     init->op = bind->op;
-    const char* fn = gb_fn_name(bind->op);
+    const GbForm form = bind->filter.topk != 0 ? GbForm::TopK
+                      : bind->filter.cmp != gpudb::GroupByFilter::Cmp::None ? GbForm::Having
+                      : GbForm::Plain;
+    const char* fn = gb_fn_name(bind->op, form);
     try {
         std::lock_guard<std::mutex> lock(resident_mutex());
         const bool need_vals = bind->op != GbOp::Count;
@@ -153,28 +215,29 @@ void gb_init(duckdb_init_info info) {
                 if (cols.vals->dtype() != gpudb::Dtype::I64)
                     throw std::runtime_error(std::string(fn) +
                         ": '" + bind->name + ".v' is DOUBLE — use gpu_groupby_sum_resident_f64");
-                init->res = agg.groupby_sum_resident_i64(*cols.keys, *cols.vals, cap);
+                init->res = agg.groupby_sum_resident_i64(*cols.keys, *cols.vals, cap, bind->filter);
                 break;
             case GbOp::SumF64:
                 if (cols.vals->dtype() != gpudb::Dtype::F64)
                     throw std::runtime_error(std::string(fn) +
                         ": '" + bind->name + ".v' is BIGINT — use gpu_groupby_sum_resident");
-                init->res = agg.groupby_sum_resident_f64(*cols.keys, *cols.vals, cap);
+                init->res = agg.groupby_sum_resident_f64(*cols.keys, *cols.vals, cap, bind->filter);
                 break;
             case GbOp::Count:
                 if (cols.keys->dtype() != gpudb::Dtype::I64)
                     throw std::runtime_error(std::string(fn) +
                         ": keys must be a BIGINT resident column");
-                init->res = agg.groupby_count_resident(*cols.keys, cap);
+                init->res = agg.groupby_count_resident(*cols.keys, cap, bind->filter);
                 break;
         }
         const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
-            "op=%s backend=%s reason=%s rows_in=%zu groups=%zu "
+            "op=%s backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu "
             "wall_ms=%.3f kernel_ms=%.3f transfer_ms=%.3f",
             fn + 4 /* strip "gpu_" */, gpudb::to_string(d.chosen),
-            gpudb::to_string(d.reason), init->res.rows_in, init->res.keys.size(),
+            gpudb::to_string(d.reason), init->res.rows_in, init->res.groups_total,
+            init->res.keys.size(),
             init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms);
         resident_set_last_stats(buf);
     } catch (const std::exception& e) {
@@ -375,11 +438,31 @@ void register_table_fn(duckdb_connection con, const char* name,
 
 void register_gpu_groupby(duckdb_connection con) {
     register_table_fn(con, "gpu_groupby_sum_resident", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumI64>, gb_init, gb_function);
+                      gb_bind<GbOp::SumI64, GbForm::Plain>, gb_init, gb_function);
     register_table_fn(con, "gpu_groupby_sum_resident_f64", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumF64>, gb_init, gb_function);
+                      gb_bind<GbOp::SumF64, GbForm::Plain>, gb_init, gb_function);
     register_table_fn(con, "gpu_groupby_count_resident", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::Count>, gb_init, gb_function);
+                      gb_bind<GbOp::Count, GbForm::Plain>, gb_init, gb_function);
+    // HAVING on the aggregate (cmp VARCHAR, threshold) — evaluated on the device
+    register_table_fn(con, "gpu_groupby_sum_resident_having",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
+                      gb_bind<GbOp::SumI64, GbForm::Having>, gb_init, gb_function);
+    register_table_fn(con, "gpu_groupby_sum_resident_f64_having",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_DOUBLE},
+                      gb_bind<GbOp::SumF64, GbForm::Having>, gb_init, gb_function);
+    register_table_fn(con, "gpu_groupby_count_resident_having",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
+                      gb_bind<GbOp::Count, GbForm::Having>, gb_init, gb_function);
+    // top-k of groups by the aggregate (k BIGINT, order VARCHAR)
+    register_table_fn(con, "gpu_groupby_sum_resident_topk",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
+                      gb_bind<GbOp::SumI64, GbForm::TopK>, gb_init, gb_function);
+    register_table_fn(con, "gpu_groupby_sum_resident_f64_topk",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
+                      gb_bind<GbOp::SumF64, GbForm::TopK>, gb_init, gb_function);
+    register_table_fn(con, "gpu_groupby_count_resident_topk",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
+                      gb_bind<GbOp::Count, GbForm::TopK>, gb_init, gb_function);
     register_table_fn(con, "gpu_topk_resident",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       tk_bind<gpudb::Dtype::I64>, tk_init, tk_function);
@@ -387,7 +470,7 @@ void register_gpu_groupby(duckdb_connection con) {
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       tk_bind<gpudb::Dtype::F64>, tk_init, tk_function);
     std::fprintf(stderr,
-        "[gpudb] registered gpu_groupby_{sum,sum_f64,count}_resident + gpu_topk_resident[_f64]\n");
+        "[gpudb] registered gpu_groupby_{sum,sum_f64,count}_resident[_having|_topk] + gpu_topk_resident[_f64]\n");
 }
 
 } // namespace gpudb_ext
