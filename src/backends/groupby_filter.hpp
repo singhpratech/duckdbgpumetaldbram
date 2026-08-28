@@ -1,6 +1,8 @@
 // groupby_filter.hpp — host reference implementation of GroupByFilter
-// (HAVING on the aggregate, then top-k of groups). f64: every NaN sum is the
-// greatest value for top-k (DESC first, ASC last) and fails every cmp; -0.0 == 0.0.
+// (HAVING on the aggregate, then top-k of groups). f64 uses DuckDB's total
+// order for both cmp and top-k: every NaN sum is the greatest value (so
+// `> t` / `>= t` keep NaN groups, `< t` / `<= t` drop them, DESC lists them
+// first, ASC last); NaN == NaN; -0.0 == 0.0.
 // Executable contract for
 // every backend; also used where a backend finishes an aggregate on the
 // host (Metal f64 sums) and by unit/parity checks.
@@ -33,12 +35,16 @@ inline void apply_group_filter_host(GroupByResidentResult& r, const GroupByFilte
     auto keep = [&](std::size_t i) -> bool {
         if (f.cmp == GroupByFilter::Cmp::None) return true;
         if (is_f64) {
+            // DuckDB comparison order, not IEEE: NaN (any sign) is greater
+            // than everything and equal to NaN; -0.0 == 0.0. So `sum > t`
+            // keeps NaN groups exactly as native HAVING does.
             const double a = r.sums_f64[i], t = f.threshold_f64;
+            auto lt = [](double x, double y) { return !std::isnan(x) && (std::isnan(y) || x < y); };
             switch (f.cmp) {
-                case GroupByFilter::Cmp::GT: return a >  t;
-                case GroupByFilter::Cmp::GE: return a >= t;
-                case GroupByFilter::Cmp::LT: return a <  t;
-                case GroupByFilter::Cmp::LE: return a <= t;
+                case GroupByFilter::Cmp::GT: return lt(t, a);
+                case GroupByFilter::Cmp::GE: return !lt(a, t);
+                case GroupByFilter::Cmp::LT: return lt(a, t);
+                case GroupByFilter::Cmp::LE: return !lt(t, a);
                 default: return true;
             }
         }

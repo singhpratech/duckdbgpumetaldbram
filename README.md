@@ -73,7 +73,8 @@ gpudb is for workloads that **ask the same aggregate questions of the same big d
 TPC-H `lineitem`, warm cache, every result verified equal to native before
 timing counted. GROUP BY rows: statement against statement inside the same
 embedded DuckDB v1.5.2 process, after the one-time upload and sort; aggregate
-and join rows: DuckDB CLI v1.5.5, 5-run medians. Full grid + reproduction:
+and join rows: DuckDB CLI (v1.5.5 for CUDA, v1.5.2 for the Metal joins),
+5-run medians. Full grid + reproduction:
 **[BENCHMARK.md](BENCHMARK.md)**.
 
 | TPC-H | Workload | Hardware | Native | gpudb | |
@@ -107,9 +108,11 @@ make native pay a cast per scan while the resident column stores it once —
 already-BIGINT columns win 3.3–3.7× (Metal) / 5.6–10× (CUDA). Whole-column
 `min`/`max` on stored tables stays a **native win** (zonemap statistics answer
 without scanning). One-time upload breaks even after ~100–150 repeated
-aggregate queries; the GROUP BY rows assume the pair is resident (upload
-~6 s at SF50, first sort 0.2–3 s) and pay off after ~10–20 repeated
-queries. Returning every group is 1.5–3× — the larger ratios come from
+aggregate queries; the GROUP BY rows assume the pair is resident — on Metal the
+upload is ~1 s at SF10 / ~6 s at SF50 and the first call pays the sort
+(0.3–3 s), on CUDA the upload is 4–5 s / 19–25 s — which the device-side
+HAVING / top-k rows recoup after ~20–25 repeated queries and the all-groups
+rows after ~40 (Metal) to ~90 (CUDA). Returning every group is 1.5–3× — the larger ratios come from
 running the `HAVING` / `LIMIT` on the device; the CUDA all-groups row is
 bounded by copying 24 bytes per group over PCIe, which unified memory
 does not pay. `DOUBLE` sums filter on the host on Metal (1.4–2.6×). Low-cardinality GROUP BY (a handful of groups) is a
@@ -325,7 +328,7 @@ resident-surface coverage in the community-CI sqllogic suite.
 ### Latest — v0.6.0
 - [x] **Resident GROUP BY / top-k from SQL, both backends** — `gpu_groupby_sum_resident` / `gpu_groupby_sum_resident_f64` / `gpu_groupby_count_resident` return `(key, sum, count)` rows sorted by key; `gpu_topk_resident[_f64]` returns `(idx, value)` for `ORDER BY … LIMIT k`. Rides the upload-once model and the same cached device sort the joins use as a build side (one sort serves both). Segmented reduce with no hash table and no atomics on Metal; CUB `reduce_by_key` on CUDA. `_having(name, cmp, threshold)` and `_topk(name, k, order)` forms evaluate `HAVING` / `ORDER BY aggregate LIMIT k` on the device (Metal: block compaction + 8-pass radix select; CUDA: `copy_if` + radix sort) so only survivors cross to DuckDB. Verified against native both ways on TPC-H SF1/10/50 — statement time against statement time in the same process: **5.4–6.1× (Metal)** on Q18's inner query with the HAVING on the device, 6–8× on `HAVING count(*) >= 7`, 3.6–4.1× on the top-10 groups by sum; on CUDA the device-side HAVING is **13–24× (SF50) / 17× (SF10)** and the top-10 groups 8–12×; returning all 15M–75M groups is 2.3–2.9× (Metal) and 1.5–2.0× end-to-end on CUDA (~32–47× on-device, bounded by copying 24 bytes per group over PCIe). Honest losing rows kept: low-cardinality GROUP BY on Metal, the first top-k call vs native's zonemap top-k.
 - [x] **Composable results** — the GPU produces the rows, DuckDB does the rest: `SELECT key, sum FROM gpu_groupby_sum_resident('l') WHERE sum > 300 ORDER BY sum DESC LIMIT 10` is plain SQL over a small result.
-- [x] **Adversarial parity harness for GROUP BY** — `scripts/groupby_parity_check.sh`: 11 scenarios × 5 checks, incl. runs placed exactly on the kernels' 64-chunk / 256-block boundaries; SQL suite gained a `-- setup:` directive so table functions are tested in the documented sequential form.
+- [x] **Adversarial parity harness for GROUP BY** — `scripts/groupby_parity_check.sh`: 11 scenarios × 7 checks, incl. runs placed exactly on the kernels' 64-chunk / 256-block boundaries; SQL suite gained a `-- setup:` directive so table functions are tested in the documented sequential form.
 - [x] **Metal radix-sort fix** — the sort behind the v0.5 join build cache skipped a byte pass whenever min and max agreed on that byte; wrong for keys between them that differ there (TPC-H returnflag/linestatus packed keys). Fixed, regression scenarios in both parity harnesses; exposure of the v0.5.0 Metal binary stated in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 - [x] **Metal device memory is now released** — the Metal host code was built without ARC since v0.1, so every `MTLBuffer` (resident columns, sort caches, scratch) leaked until process exit; `gpu_drop_resident` now actually frees GPU memory.
 - [x] **Pre-release adversarial audit** — 65-agent find/verify pass over the sort, kernels, C-API layer, hybrid planner, SQL semantics vs native (NULLs, overflow, NaN/-0.0), the v0.5 join surface after the sort fix, the CUDA branch (static) and every documentation claim; all confirmed findings fixed or documented in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before the tag.

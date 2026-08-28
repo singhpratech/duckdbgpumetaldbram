@@ -197,7 +197,7 @@ DuckDB's pipeline ordering — the SQL suite uses `-- setup:` statements
   top-k both directions, k clamping.
 - `test/sql/gpu_groupby_resident.test` — SQL surface, composition with
   WHERE/ORDER BY/LIMIT, same-statement parity with native, guardrails.
-- `scripts/groupby_parity_check.sh` — 11 adversarial scenarios × 5 checks
+- `scripts/groupby_parity_check.sh` — 11 adversarial scenarios × 7 checks (+ a DOUBLE NaN/inf scenario)
   against native in the same process (dup-heavy, all-unique, single group,
   Knuth-hash, Zipf skew, negatives, int64 boundary keys, the min/max-share-a-
   byte radix regression, tiny, and runs placed exactly on the 64-chunk /

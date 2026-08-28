@@ -17,7 +17,7 @@ output already sorted by key, no hash table, no atomics.
 `(key, sum)` sets equal to native `GROUP BY` both ways (`EXCEPT`), counts
 exact, `DOUBLE` sums within the 1e-9 relative contract (measured ≤ 5e-16 on
 Metal, ≤ 2e-13 on CUDA), top-k value multiset equal to native `ORDER BY …
-LIMIT`. `scripts/groupby_parity_check.sh` (11 adversarial scenarios × 5
+LIMIT`. `scripts/groupby_parity_check.sh` (11 adversarial scenarios × 7
 checks, native and gpudb in the same process) passes on both machines. Data:
 TPC-H dbgen `lineitem`; SF1 = 6,001,215 rows / 1,500,000 orderkeys; SF10 =
 59,986,052 / 15,000,000; SF50 = 300,005,811 / 75,000,000.
@@ -104,9 +104,10 @@ bounded by the 8 histogram passes over 75M aggregates (each pass reads
 in MSL), so the filter runs on the host too and the win is only the row
 streaming — 1.4–2.6×, with the run-to-run variance of a host loop.
 
-One-time cost, stated plainly: the first filtered call on a pair allocates
-the device-side scratch for the finalized groups (24 B per group: 0.36 GB at
-SF10, 1.8 GB at SF50) — the first (B′) statement at SF50 took 907 ms, every
+One-time cost, stated plainly: the first filtered call in a process (on any
+pair) allocates the device-side scratch for the finalized groups, grown when
+a later call has more groups (24 B per group for the sum ops, 16 B for count:
+0.36 GB at SF10, 1.8 GB at SF50) — the first (B′) statement at SF50 took 907 ms, every
 later one 78 ms. The scratch is reused by every later filtered call on any
 pair.
 

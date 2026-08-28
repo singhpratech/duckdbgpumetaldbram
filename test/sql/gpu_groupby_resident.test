@@ -210,7 +210,12 @@ SELECT key, sum FROM gpu_groupby_sum_resident_f64_topk('nan', 3, 'asc');
 -- expect: 5  -10.0
 -- expect: 4  10.0
 
--- 34. DOUBLE HAVING drops NaN groups: sum >= -inf keeps everything except the two NaN groups
+-- 34. DOUBLE HAVING follows native: NaN sums are greater than everything, so sum >= -inf keeps every group
 -- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
 SELECT count(*), min(key), max(key) FROM gpu_groupby_sum_resident_f64_having('nan', '>=', '-inf'::DOUBLE);
--- expect: 4  1  5
+-- expect: 6  1  6
+
+-- 34b. DOUBLE HAVING sum > 0 keeps the NaN groups, exactly like native GROUP BY … HAVING
+-- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
+SELECT string_agg(key, ',' ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('nan', '>', 0.0);
+-- expect: 1,3,4,6

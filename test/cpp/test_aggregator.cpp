@@ -439,9 +439,17 @@ void test_backend(gpudb::Backend b) {
                      std::isnan(all.sums_f64[2]) && all.sums_f64[3] == inf && all.sums_f64[4] == 10.0 &&
                      all.sums_f64[5] == 0.0 && all.sums_f64[6] == -10.0 && all.sums_f64[7] == -inf;
                 EXPECT(ok);
-                gpudb::GroupByFilter ge; ge.cmp = Cmp::GE; ge.threshold_f64 = -inf;   // everything but NaN
+                gpudb::GroupByFilter ge; ge.cmp = Cmp::GE; ge.threshold_f64 = -inf;   // everything, NaN included
                 auto kept = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, ge);
-                EXPECT_EQ(kept.keys.size(), std::size_t(5));
+                EXPECT_EQ(kept.keys.size(), std::size_t(8));
+                gpudb::GroupByFilter gt0; gt0.cmp = Cmp::GT; gt0.threshold_f64 = 0.0;   // inf, NaN x3, 10 (native HAVING keeps NaN)
+                EXPECT_EQ(agg->groupby_sum_resident_f64(*nkc, *nfc, cap, gt0).keys.size(), std::size_t(5));
+                gpudb::GroupByFilter len; len.cmp = Cmp::LE; len.threshold_f64 = qnan;  // x <= NaN: everything
+                EXPECT_EQ(agg->groupby_sum_resident_f64(*nkc, *nfc, cap, len).keys.size(), std::size_t(8));
+                gpudb::GroupByFilter gen; gen.cmp = Cmp::GE; gen.threshold_f64 = qnan;  // x >= NaN: only NaN groups
+                EXPECT_EQ(agg->groupby_sum_resident_f64(*nkc, *nfc, cap, gen).keys.size(), std::size_t(3));
+                gpudb::GroupByFilter gtn; gtn.cmp = Cmp::GT; gtn.threshold_f64 = qnan;  // x > NaN: nothing
+                EXPECT_EQ(agg->groupby_sum_resident_f64(*nkc, *nfc, cap, gtn).keys.size(), std::size_t(0));
                 gpudb::GroupByFilter le; le.cmp = Cmp::LE; le.threshold_f64 = 0.0;
                 auto low = agg->groupby_sum_resident_f64(*nkc, *nfc, cap, le);
                 EXPECT_EQ(low.keys.size(), std::size_t(3));   // -inf, -10, 0

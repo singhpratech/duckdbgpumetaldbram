@@ -13,7 +13,9 @@
 #   ordered   gpu rows arrive sorted by key ascending
 #   topk      multiset of the 50 largest / smallest payloads equals native
 #   having    (key, sum) sets equal both ways for HAVING sum > 0 / <= 0,
-#             count >= 2, f64 sum > 0 within 1e-9 — filter evaluated on the device
+#             count >= 2; f64 sum > 0: same row count and every row within 1e-9
+#   f64_nan_inf (extra scenario) DOUBLE NaN/inf/-0.0 sums vs native HAVING for
+#             all four comparisons and NaN thresholds, and vs ORDER BY for top-k
 #   group_topk multiset of the 50 largest / smallest group sums (and counts,
 #             f64 sums) equals native ORDER BY … LIMIT 50; output ordered by sum
 #
@@ -56,8 +58,9 @@ SELECT
         AND (SELECT count(*) FROM ((SELECT k, sum(v) s FROM src GROUP BY k HAVING s <= 0) EXCEPT (SELECT key, sum FROM gpu_groupby_sum_resident_having('p', '<=', 0)))) = 0
         AND (SELECT count(*) FROM ((SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)) EXCEPT (SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2))) = 0
         AND (SELECT count(*) FROM ((SELECT k, count(*) c FROM src GROUP BY k HAVING c >= 2) EXCEPT (SELECT key, count FROM gpu_groupby_count_resident_having('p', '>=', 2)))) = 0
+        AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0)) = (SELECT count(*) FROM (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0))
         AND (SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('pf', '>', 0.0) g JOIN (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0) n ON g.key = n.k
-             WHERE abs(g.sum - n.s) > 1e-9 * greatest(abs(n.s), 1)) = 0
+             WHERE abs(g.sum - n.s) <= 1e-9 * greatest(abs(n.s), 1)) = (SELECT count(*) FROM (SELECT k, sum(v/3.0) AS s FROM src GROUP BY k HAVING s > 0.0))
        THEN 'PASS' ELSE 'FAIL' END AS having,
   CASE WHEN (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'desc')) = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s DESC LIMIT 50))
         AND (SELECT list_sort(list(sum)) FROM gpu_groupby_sum_resident_topk('p', 50, 'asc'))  = (SELECT list_sort(list(s)) FROM (SELECT sum(v) s FROM src GROUP BY k ORDER BY s ASC  LIMIT 50))
@@ -118,5 +121,25 @@ run_case "runs of length 63/65/255/257" \
   "SELECT (CASE WHEN range < 63 THEN 0 WHEN range < 128 THEN 1 WHEN range < 383 THEN 2 ELSE 3 + (range - 383) / 257 END)::BIGINT AS k, (range % 97)::BIGINT AS v FROM range(100000)"
 
 echo
+# DOUBLE NaN / inf: native HAVING and ORDER BY treat NaN as greater than everything
+# (and equal to NaN); the f64 filter must agree for all four comparisons and both orders.
+nan_out=$("$SQL" --multi --sql "
+CREATE TABLE nsrc AS SELECT * FROM (VALUES (1,'inf'::DOUBLE),(2,'-inf'::DOUBLE),(3,'nan'::DOUBLE),(4,10.0),(5,-10.0),(6,'inf'::DOUBLE),(6,'-inf'::DOUBLE),(7,0.0),(8,-0.0)) t(k,v);
+SELECT gpu_upload_pair('pn', k, v) FROM nsrc;
+SELECT CASE WHEN
+      (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','>',0.0))  = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s > 0.0))
+  AND (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','>=',0.0)) = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s >= 0.0))
+  AND (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','<',0.0))  = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s < 0.0))
+  AND (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','<=',0.0)) = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s <= 0.0))
+  AND (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','<=','nan'::DOUBLE)) = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s <= 'nan'::DOUBLE))
+  AND (SELECT list(key ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('pn','>=','nan'::DOUBLE)) = (SELECT list(k ORDER BY k) FROM (SELECT k, sum(v) s FROM nsrc GROUP BY k HAVING s >= 'nan'::DOUBLE))
+  AND (SELECT list(isnan(sum)) FROM gpu_groupby_sum_resident_f64_topk('pn', 3, 'desc')) = (SELECT list(isnan(s)) FROM (SELECT sum(v) s FROM nsrc GROUP BY k ORDER BY s DESC LIMIT 3))
+  AND (SELECT list(isnan(sum)) FROM gpu_groupby_sum_resident_f64_topk('pn', 3, 'desc')) = [true, true, false]
+  AND (SELECT list(sum) FROM gpu_groupby_sum_resident_f64_topk('pn', 3, 'asc')) = (SELECT list(s) FROM (SELECT sum(v) s FROM nsrc GROUP BY k ORDER BY s ASC LIMIT 3))
+  THEN 'PASS' ELSE 'FAIL' END AS f64_nan_inf;
+" 2>&1 | tail -1)
+runs=$((runs+1))
+if echo "$nan_out" | grep -q "FAIL\|failed\|Error"; then fails=$((fails+1)); echo "[FAIL] DOUBLE NaN / inf vs native HAVING and ORDER BY"; echo "       $nan_out"; else echo "[pass] DOUBLE NaN / inf vs native HAVING and ORDER BY"; fi
+
 echo "$((runs - fails)) / $runs scenarios passed"
 [ "$fails" -eq 0 ]

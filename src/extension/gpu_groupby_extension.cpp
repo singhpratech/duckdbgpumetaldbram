@@ -214,13 +214,13 @@ void gb_init(duckdb_init_info info) {
             case GbOp::SumI64:
                 if (cols.vals->dtype() != gpudb::Dtype::I64)
                     throw std::runtime_error(std::string(fn) +
-                        ": '" + bind->name + ".v' is DOUBLE — use gpu_groupby_sum_resident_f64");
+                        ": '" + bind->name + ".v' is DOUBLE — use " + gb_fn_name(GbOp::SumF64, form));
                 init->res = agg.groupby_sum_resident_i64(*cols.keys, *cols.vals, cap, bind->filter);
                 break;
             case GbOp::SumF64:
                 if (cols.vals->dtype() != gpudb::Dtype::F64)
                     throw std::runtime_error(std::string(fn) +
-                        ": '" + bind->name + ".v' is BIGINT — use gpu_groupby_sum_resident");
+                        ": '" + bind->name + ".v' is BIGINT — use " + gb_fn_name(GbOp::SumI64, form));
                 init->res = agg.groupby_sum_resident_f64(*cols.keys, *cols.vals, cap, bind->filter);
                 break;
             case GbOp::Count:
