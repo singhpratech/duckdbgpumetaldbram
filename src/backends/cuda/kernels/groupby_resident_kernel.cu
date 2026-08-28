@@ -19,6 +19,7 @@
 // so the radix path is used, then the sorted values are gathered back.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -110,6 +111,7 @@ cudaError_t reduce_runs(const i64* d_sorted, std::size_t n, Val vals_first, Add 
                         std::size_t* h_runs, cudaStream_t s) {
     DevBuf nr; cudaError_t e = nr.alloc(sizeof(u64));
     if (e != cudaSuccess) return e;
+    if ((e = cudaMemsetAsync(nr.p, 0, sizeof(u64), s)) != cudaSuccess) return e;   // CUB 2.x writes 32 bits
     auto out_vals = thrust::make_zip_iterator(thrust::make_tuple(out_agg, reinterpret_cast<u64*>(out_counts)));
     e = with_temp([&](void* tmp, std::size_t& b) {
         return cub::DeviceReduce::ReduceByKey(tmp, b, d_sorted, out_keys, vals_first, out_vals,
@@ -142,6 +144,7 @@ template <typename In, typename Flags, typename Out>
 cudaError_t select_flagged(In in, Flags flags, Out out, std::size_t n, cudaStream_t s) {
     DevBuf ns; cudaError_t e = ns.alloc(sizeof(u64));
     if (e != cudaSuccess) return e;
+    if ((e = cudaMemsetAsync(ns.p, 0, sizeof(u64), s)) != cudaSuccess) return e;   // CUB 2.x writes 32 bits
     return with_temp([&](void* tmp, std::size_t& b) {
         return cub::DeviceSelect::Flagged(tmp, b, in, flags, out, static_cast<u64*>(ns.p), n, s);
     });
@@ -159,6 +162,26 @@ struct Keep {
             case 2:  return a >= t;
             case 3:  return a <  t;
             case 4:  return a <= t;
+            default: return true;
+        }
+    }
+};
+// f64: DuckDB's total order for HAVING — NaN is greater than everything (so
+// NaN groups pass '>' and '>=', fail '<' and '<='), -0.0 == 0.0. Mirrors
+// apply_group_filter_host exactly; NOT the order-key mapping (which would
+// separate -0.0 from 0.0).
+template <>
+struct Keep<double> {
+    int cmp; double t;
+    __host__ __device__ static bool lt(double x, double y) {
+        return !isnan(x) && (isnan(y) || x < y);
+    }
+    __host__ __device__ bool operator()(double a) const {
+        switch (cmp) {
+            case 1:  return lt(t, a);     // a >  t
+            case 2:  return !lt(a, t);    // a >= t
+            case 3:  return lt(a, t);     // a <  t
+            case 4:  return !lt(t, a);    // a <= t
             default: return true;
         }
     }
@@ -365,6 +388,7 @@ cudaError_t gpudb_cuda_groupby_count(const i64* d_sorted, std::size_t n,
                                      std::size_t* h_runs, cudaStream_t s) {
     DevBuf nr; cudaError_t e = nr.alloc(sizeof(u64));
     if (e != cudaSuccess) return e;
+    if ((e = cudaMemsetAsync(nr.p, 0, sizeof(u64), s)) != cudaSuccess) return e;   // CUB 2.x writes 32 bits
     e = with_temp([&](void* tmp, std::size_t& b) {
         return cub::DeviceReduce::ReduceByKey(tmp, b, d_sorted, out_keys,
                                               thrust::constant_iterator<u64>(1ULL),
