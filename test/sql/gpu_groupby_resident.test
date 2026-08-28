@@ -219,3 +219,15 @@ SELECT count(*), min(key), max(key) FROM gpu_groupby_sum_resident_f64_having('na
 -- setup: SELECT gpu_upload_pair('nan', k, v) FROM (VALUES (1, 'inf'::DOUBLE), (2, '-inf'::DOUBLE), (3, 'nan'::DOUBLE), (4, 10.0), (5, -10.0), (6, 'inf'::DOUBLE), (6, '-inf'::DOUBLE)) t(k, v)
 SELECT string_agg(key, ',' ORDER BY key) FROM gpu_groupby_sum_resident_f64_having('nan', '>', 0.0);
 -- expect: 1,3,4,6
+
+-- 35. DOUBLE: negative-signed NaN is still greatest; -0.0 and 0.0 tie; k > groups returns all in aggregate order
+-- setup: SELECT gpu_upload_pair('nan2', k, v) FROM (VALUES (1, -('nan'::DOUBLE)), (2, -0.0), (3, 0.0), (4, 'inf'::DOUBLE), (5, -1.5)) t(k, v)
+SELECT count(*), sum(CASE WHEN isnan(sum) THEN 1 ELSE 0 END) AS nans FROM gpu_groupby_sum_resident_f64_topk('nan2', 99, 'desc');
+-- expect: 5  1
+-- setup: SELECT gpu_upload_pair('nan2', k, v) FROM (VALUES (1, -('nan'::DOUBLE)), (2, -0.0), (3, 0.0), (4, 'inf'::DOUBLE), (5, -1.5)) t(k, v)
+SELECT key FROM gpu_groupby_sum_resident_f64_topk('nan2', 2, 'desc') ORDER BY key;
+-- expect: 1
+-- expect: 4
+-- setup: SELECT gpu_upload_pair('nan2', k, v) FROM (VALUES (1, -('nan'::DOUBLE)), (2, -0.0), (3, 0.0), (4, 'inf'::DOUBLE), (5, -1.5)) t(k, v)
+SELECT count(*), min(key), max(key) FROM gpu_groupby_sum_resident_f64_having('nan2', '<=', 0.0);
+-- expect: 3  2  5

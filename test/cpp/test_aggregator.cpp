@@ -329,6 +329,42 @@ void test_backend(gpudb::Backend b) {
                 auto small = agg->groupby_sum_resident_i64(*kc, *vc, 9, gpudb::GroupByFilter{Cmp::None, 0, 0.0, 9, true});
                 EXPECT_EQ(small.keys.size(), std::size_t(9));
                 EXPECT_EQ(small.groups_total, ref.size());
+
+                // f64 NaN / inf rule on THIS backend vs the host reference:
+                // keys 1..8 -> +inf, -inf, NaN, -NaN, 10, -10, 0 (5 + -5),
+                // NaN from inf + -inf. cmp drops every NaN group; top-k treats
+                // every NaN as greatest (DESC first, ASC last).
+                {
+                    const double qn = std::numeric_limits<double>::quiet_NaN();
+                    const double in = std::numeric_limits<double>::infinity();
+                    std::vector<std::int64_t> nk = {1, 2, 3, 4, 5, 6, 7, 7, 8, 8};
+                    std::vector<double>       nv = {in, -in, qn, -qn, 10.0, -10.0, 5.0, -5.0, in, -in};
+                    auto nkc = agg->upload_i64(nk.data(), nk.size());
+                    auto nvc = agg->upload_f64(nv.data(), nv.size());
+                    const gpudb::GroupByFilter nf[] = {
+                        {Cmp::GT, 0, 0.0, 0, true}, {Cmp::LE, 0, 0.0, 0, true}, {Cmp::GE, 0, -in, 0, true},
+                        {Cmp::None, 0, 0.0, 3, true}, {Cmp::None, 0, 0.0, 3, false},
+                        {Cmp::None, 0, 0.0, 8, true}, {Cmp::GT, 0, -in, 2, true},
+                    };
+                    auto nbase = agg->groupby_sum_resident_f64(*nkc, *nvc, cap);
+                    for (const auto& fl : nf) {
+                        gpudb::GroupByResidentResult rr = nbase;
+                        gpudb::apply_group_filter_host(rr, fl, gpudb::FilterAgg::SumF64, cap, "ref");
+                        auto g = agg->groupby_sum_resident_f64(*nkc, *nvc, cap, fl);
+                        // exact row-by-row: NaN==NaN treated as equal, order must match
+                        bool ok = g.keys.size() == rr.keys.size();
+                        for (std::size_t i = 0; ok && i < g.keys.size(); ++i) {
+                            const double x = g.sums_f64[i], y = rr.sums_f64[i];
+                            const bool same_val = (std::isnan(x) && std::isnan(y)) || x == y;
+                            ok = same_val && (fl.topk == 0 ? g.keys[i] == rr.keys[i] : true);
+                        }
+                        EXPECT(ok);
+                    }
+                    auto t3 = agg->groupby_sum_resident_f64(*nkc, *nvc, cap, gpudb::GroupByFilter{Cmp::None, 0, 0.0, 3, true});
+                    EXPECT(t3.sums_f64.size() == 3 && std::isnan(t3.sums_f64[0]) && std::isnan(t3.sums_f64[1]) && std::isnan(t3.sums_f64[2]));
+                    auto a3 = agg->groupby_sum_resident_f64(*nkc, *nvc, cap, gpudb::GroupByFilter{Cmp::None, 0, 0.0, 3, false});
+                    EXPECT(a3.sums_f64.size() == 3 && a3.sums_f64[0] == -in && a3.sums_f64[1] == -10.0 && a3.sums_f64[2] == 0.0);
+                }
             }
 
             // Regression: keys whose min and max share a low byte while a

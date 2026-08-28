@@ -12,6 +12,7 @@
 // order-preserving uint64 keys (NaN greatest, matching DuckDB's total order)
 // so the radix path is used, then the sorted values are gathered back.
 
+#include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -191,6 +192,26 @@ struct Keep {
             case 2:  return a >= t;
             case 3:  return a <  t;
             case 4:  return a <= t;
+            default: return true;
+        }
+    }
+};
+// f64: DuckDB's total order for HAVING — NaN is greater than everything (so
+// NaN groups pass '>' and '>=', fail '<' and '<='), -0.0 == 0.0. Mirrors
+// apply_group_filter_host exactly; NOT the order-key mapping (which would
+// separate -0.0 from 0.0).
+template <>
+struct Keep<double> {
+    int cmp; double t;
+    __host__ __device__ static bool lt(double x, double y) {
+        return !isnan(x) && (isnan(y) || x < y);
+    }
+    __host__ __device__ bool operator()(double a) const {
+        switch (cmp) {
+            case 1:  return lt(t, a);     // a >  t
+            case 2:  return !lt(a, t);    // a >= t
+            case 3:  return lt(a, t);     // a <  t
+            case 4:  return !lt(t, a);    // a <= t
             default: return true;
         }
     }
