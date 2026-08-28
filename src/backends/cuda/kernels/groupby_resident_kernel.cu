@@ -12,7 +12,7 @@
 // order-preserving uint64 keys (NaN greatest, matching DuckDB's total order)
 // so the radix path is used, then the sorted values are gathered back.
 
-#include <cmath>
+#include <algorithm>
 #include <cstdint>
 #include <cuda_runtime.h>
 
@@ -196,26 +196,6 @@ struct Keep {
         }
     }
 };
-// f64: DuckDB's total order for HAVING — NaN is greater than everything (so
-// NaN groups pass '>' and '>=', fail '<' and '<='), -0.0 == 0.0. Mirrors
-// apply_group_filter_host exactly; NOT the order-key mapping (which would
-// separate -0.0 from 0.0).
-template <>
-struct Keep<double> {
-    int cmp; double t;
-    __host__ __device__ static bool lt(double x, double y) {
-        return !isnan(x) && (isnan(y) || x < y);
-    }
-    __host__ __device__ bool operator()(double a) const {
-        switch (cmp) {
-            case 1:  return lt(t, a);     // a >  t
-            case 2:  return !lt(a, t);    // a >= t
-            case 3:  return lt(a, t);     // a <  t
-            case 4:  return !lt(t, a);    // a <= t
-            default: return true;
-        }
-    }
-};
 
 struct DevBuf {
     void* p = nullptr;
@@ -227,6 +207,16 @@ struct DevBuf {
 // folds sign-magnitude with EVERY NaN greatest (DuckDB ORDER BY order) and
 // -0.0 == 0.0 handled by the tie rule. Inverted keys turn "largest k" into
 // "smallest k" so one ascending radix sort serves both directions.
+// ---- radix-select for top-k of groups ----
+//
+// Aggregates are mapped to order-preserving u64 keys (i64: flip the sign
+// bit; f64: sign-magnitude fold with NaN greatest, as in F64OrderKey). For
+// "largest k" the keys are inverted so the problem is always "smallest k".
+// Eight MSB->LSB passes of a 256-bin histogram over the elements matching
+// the prefix so far locate the k-th key T; the output is every element
+// with key < T plus enough key == T elements to reach k (tie choice
+// unspecified, per the contract), finally sorted by key.
+
 template <typename A> struct OrderKey;
 template <> struct OrderKey<i64> {
     __host__ __device__ u64 operator()(i64 v) const { return static_cast<u64>(v) ^ (1ULL << 63); }
@@ -237,6 +227,76 @@ template <> struct OrderKey<double> {
 template <typename A> struct InvOrderKey {
     __host__ __device__ u64 operator()(A v) const { return ~OrderKey<A>{}(v); }
 };
+
+__global__ void radix_hist_kernel(const u64* __restrict__ keys, std::size_t n,
+                                  u64 prefix, int shift, u64* __restrict__ hist) {
+    __shared__ unsigned int sh[256];
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) sh[i] = 0u;
+    __syncthreads();
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += stride) {
+        const u64 k = keys[i];
+        if (shift == 56 || (k >> (shift + 8)) == prefix)
+            atomicAdd(&sh[(k >> shift) & 0xFFu], 1u);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 256; i += blockDim.x)
+        if (sh[i]) atomicAdd(&hist[i], static_cast<u64>(sh[i]));
+}
+
+struct KeyLess  { u64 t; __host__ __device__ bool operator()(u64 k) const { return k <  t; } };
+struct KeyEqual { u64 t; __host__ __device__ bool operator()(u64 k) const { return k == t; } };
+
+// Selects the k smallest of `keys` (u64 order keys, n of them) into idx[0..k)
+// sorted ascending by key. Requires 0 < k <= n. Uses only its own scratch.
+inline cudaError_t radix_select_k(const u64* keys, std::size_t n, std::size_t k,
+                                  i64* out_idx, cudaStream_t s) {
+    auto pol = thrust::cuda::par.on(s);
+    DevBuf hb; cudaError_t e = hb.alloc(256 * sizeof(u64));
+    if (e != cudaSuccess) return e;
+    auto* d_hist = static_cast<u64*>(hb.p);
+    u64 h[256];
+    u64 prefix = 0; std::size_t want = k;              // want-th smallest among prefix matches
+    const int grid = static_cast<int>(std::min<std::size_t>((n + 255) / 256, 4096));
+    for (int pass = 0; pass < 8; ++pass) {
+        const int shift = 56 - 8 * pass;
+        if ((e = cudaMemsetAsync(d_hist, 0, 256 * sizeof(u64), s)) != cudaSuccess) return e;
+        radix_hist_kernel<<<grid, 256, 0, s>>>(keys, n, prefix, shift, d_hist);
+        if ((e = cudaMemcpyAsync(h, d_hist, sizeof(h), cudaMemcpyDeviceToHost, s)) != cudaSuccess) return e;
+        if ((e = cudaStreamSynchronize(s)) != cudaSuccess) return e;
+        std::size_t acc = 0; int bin = 255;
+        for (int b = 0; b < 256; ++b) { if (acc + h[b] >= want) { bin = b; break; } acc += h[b]; }
+        want -= acc;
+        prefix = (prefix << 8) | static_cast<u64>(bin);
+    }
+    const u64 T = prefix;
+    try {
+        auto cnt = thrust::make_counting_iterator<i64>(0);
+        // strictly smaller than T: all of them
+        auto end_lt = thrust::copy_if(pol, cnt, cnt + static_cast<i64>(n), keys, out_idx, KeyLess{T});
+        const std::size_t n_lt = static_cast<std::size_t>(end_lt - out_idx);
+        if (n_lt < k) {
+            // ties at T: take the first (k - n_lt) in index order
+            const std::size_t need = k - n_lt;
+            const std::size_t n_eq = static_cast<std::size_t>(
+                thrust::count_if(pol, keys, keys + n, KeyEqual{T}));
+            DevBuf eb; if ((e = eb.alloc(n_eq * sizeof(i64))) != cudaSuccess) return e;
+            auto* d_eq = static_cast<i64*>(eb.p);
+            thrust::copy_if(pol, cnt, cnt + static_cast<i64>(n), keys, d_eq, KeyEqual{T});
+            if ((e = cudaMemcpyAsync(out_idx + n_lt, d_eq, need * sizeof(i64),
+                                     cudaMemcpyDeviceToDevice, s)) != cudaSuccess) return e;
+        }
+        // order the k winners by key (ties by index, unspecified anyway)
+        DevBuf kb; if ((e = kb.alloc(k * sizeof(u64))) != cudaSuccess) return e;
+        auto* d_k = static_cast<u64*>(kb.p);
+        thrust::gather(pol, out_idx, out_idx + k, keys, d_k);
+        thrust::sort_by_key(pol, d_k, d_k + k, out_idx);
+    } catch (...) {
+        return gpudb_cuda_detail::map_exception();
+    }
+    return cudaGetLastError();
+}
 
 template <typename A>
 std::size_t count_survivors(const A* agg, std::size_t n, int cmp, A t, cudaStream_t s) {
@@ -291,11 +351,26 @@ cudaError_t apply_filter(const i64* keys, const A* agg, const i64* cnt, std::siz
             if (has_cnt) cudaMemcpyAsync(out_cnt, cnt, n * sizeof(i64), cudaMemcpyDeviceToDevice, s);
             return cudaGetLastError();
         }
-        // top-k over n_surv survivors: radix sort of (order key, index) — the
-        // order keys give one total order (NaN greatest) for both directions.
-        DevBuf kb, ix;
+        // top-k over n_surv survivors. Small k: radix-select on order keys
+        // (8 histogram passes + one compaction). Large k: full radix sort of
+        // (aggregate copy, index) pairs.
         cudaError_t e;
-        if ((e = kb.alloc(n_surv * sizeof(u64))) != cudaSuccess) return e;
+        if (n_out * 8 <= n_surv) {
+            DevBuf kb, ix;
+            if ((e = kb.alloc(n_surv * sizeof(u64))) != cudaSuccess) return e;
+            if ((e = ix.alloc(n_out * sizeof(i64)))  != cudaSuccess) return e;
+            auto* okeys = static_cast<u64*>(kb.p);
+            i64*  idx   = static_cast<i64*>(ix.p);
+            if (desc) thrust::transform(pol, a_in, a_in + n_surv, okeys, InvOrderKey<A>{});
+            else      thrust::transform(pol, a_in, a_in + n_surv, okeys, OrderKey<A>{});
+            if ((e = radix_select_k(okeys, n_surv, n_out, idx, s)) != cudaSuccess) return e;
+            thrust::gather(pol, idx, idx + n_out, k_in, out_keys);
+            thrust::gather(pol, idx, idx + n_out, a_in, out_agg);
+            if (has_cnt) thrust::gather(pol, idx, idx + n_out, c_in, out_cnt);
+            return cudaGetLastError();
+        }
+        DevBuf ak, ix;
+        if ((e = ak.alloc(n_surv * sizeof(A)))   != cudaSuccess) return e;
         if ((e = ix.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
         auto* okeys = static_cast<u64*>(kb.p);
         i64*  idx   = static_cast<i64*>(ix.p);
