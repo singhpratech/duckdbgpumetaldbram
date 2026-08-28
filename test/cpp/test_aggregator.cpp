@@ -261,6 +261,74 @@ void test_backend(gpudb::Backend b) {
             auto tk = agg->topk_resident(*vc, N + 10, false);   // k clamps to rows
             EXPECT_EQ(tk.idx.size(), N);
 
+            // gpudb::GroupByFilter (device-side HAVING + top-k of groups) vs the host
+            // reference on adversarial filters: threshold equal to a sum (all
+            // four comparisons), everything filtered, k > survivors, k == 1,
+            // negative thresholds, heavy ties, cmp + top-k, count and f64 ops.
+            {
+                using Cmp = gpudb::GroupByFilter::Cmp;
+                const std::size_t cap = std::size_t(100) * 1000000;
+                auto base_i = agg->groupby_sum_resident_i64(*kc, *vc, cap);
+                auto base_f = agg->groupby_sum_resident_f64(*kc, *fc, cap);
+                auto base_c = agg->groupby_count_resident(*kc, cap);
+                EXPECT_EQ(base_i.groups_total, ref.size());
+                const std::int64_t eq_sum = base_i.sums[base_i.sums.size() / 3];
+                const double       eq_f   = base_f.sums_f64[base_f.sums_f64.size() / 3];
+                const std::int64_t max_sum = *std::max_element(base_i.sums.begin(), base_i.sums.end());
+                const gpudb::GroupByFilter filters[] = {
+                    {Cmp::GT, eq_sum, eq_f, 0, true}, {Cmp::GE, eq_sum, eq_f, 0, true},
+                    {Cmp::LT, eq_sum, eq_f, 0, true}, {Cmp::LE, eq_sum, eq_f, 0, true},
+                    {Cmp::GT, max_sum + 1, 1e300, 0, true},              // everything filtered
+                    {Cmp::None, 0, 0.0, 10, true}, {Cmp::None, 0, 0.0, 10, false},
+                    {Cmp::None, 0, 0.0, 1, true},
+                    {Cmp::GT, max_sum - 2, eq_f, 1000000, true},         // k > survivors
+                    {Cmp::LT, 0, 0.0, 25, false}, {Cmp::LE, -900000, -2.0e5, 7, true},
+                    {Cmp::None, 0, 0.0, 3000, true},                     // ties among small counts
+                };
+                auto same = [](const gpudb::GroupByResidentResult& a, const gpudb::GroupByResidentResult& b, bool f64) {
+                    if (a.keys.size() != b.keys.size() || a.groups_total != b.groups_total) return false;
+                    std::vector<std::size_t> ia(a.keys.size()), ib(b.keys.size());
+                    for (std::size_t i = 0; i < ia.size(); ++i) { ia[i] = i; ib[i] = i; }
+                    std::sort(ia.begin(), ia.end(), [&](std::size_t x, std::size_t y) { return a.keys[x] < a.keys[y]; });
+                    std::sort(ib.begin(), ib.end(), [&](std::size_t x, std::size_t y) { return b.keys[x] < b.keys[y]; });
+                    for (std::size_t i = 0; i < ia.size(); ++i) {
+                        const std::size_t x = ia[i], y = ib[i];
+                        if (a.keys[x] != b.keys[y] || a.counts[x] != b.counts[y]) return false;
+                        if (f64) {
+                            const double tol = 1e-9 * std::max(1.0, std::abs(b.sums_f64[y]));
+                            if (std::abs(a.sums_f64[x] - b.sums_f64[y]) > tol) return false;
+                        } else if (!a.sums.empty() && a.sums[x] != b.sums[y]) return false;
+                    }
+                    return true;
+                };
+                for (const auto& fl : filters) {
+                    gpudb::GroupByResidentResult ri = base_i, rf = base_f, rc = base_c;
+                    gpudb::apply_group_filter_host(ri, fl, gpudb::FilterAgg::SumI64, cap, "ref");
+                    gpudb::apply_group_filter_host(rf, fl, gpudb::FilterAgg::SumF64, cap, "ref");
+                    gpudb::apply_group_filter_host(rc, fl, gpudb::FilterAgg::Count,  cap, "ref");
+                    auto gi = agg->groupby_sum_resident_i64(*kc, *vc, cap, fl);
+                    auto gf = agg->groupby_sum_resident_f64(*kc, *fc, cap, fl);
+                    auto gc = agg->groupby_count_resident(*kc, cap, fl);
+                    EXPECT(same(gi, ri, false));
+                    EXPECT(same(gf, rf, true));
+                    EXPECT(same(gc, rc, false));
+                    // order contract: key ascending without top-k, by aggregate with it
+                    bool ord = true;
+                    if (fl.topk == 0) ord = std::is_sorted(gi.keys.begin(), gi.keys.end());
+                    else for (std::size_t i = 1; i < gi.sums.size(); ++i)
+                        ord = ord && (fl.topk_desc ? gi.sums[i - 1] >= gi.sums[i] : gi.sums[i - 1] <= gi.sums[i]);
+                    EXPECT(ord);
+                }
+                // cap bounds the rows returned, with the filtered wording
+                bool threw_f = false;
+                try { (void)agg->groupby_sum_resident_i64(*kc, *vc, 3, gpudb::GroupByFilter{Cmp::GE, std::numeric_limits<std::int64_t>::min(), 0.0, 0, true}); }
+                catch (const std::runtime_error& e) { threw_f = std::string(e.what()).find("rows after the filter, above the cap of 3") != std::string::npos; }
+                EXPECT(threw_f);
+                auto small = agg->groupby_sum_resident_i64(*kc, *vc, 9, gpudb::GroupByFilter{Cmp::None, 0, 0.0, 9, true});
+                EXPECT_EQ(small.keys.size(), std::size_t(9));
+                EXPECT_EQ(small.groups_total, ref.size());
+            }
+
             // Regression: keys whose min and max share a low byte while a
             // key between them does not (0x4146, 0x4E46, 0x4E4F, 0x5246 —
             // TPC-H returnflag/linestatus packed). A radix sort that skips
