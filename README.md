@@ -50,7 +50,7 @@ SELECT gpu_join_sum_resident('l.k', 'l.v', 'o');   -- = sum(...) FROM lineitem J
 -- or within 1e-9 of native, verified by scripts/join_parity_check.sh
 ```
 
-Apache-2.0 · v0.5.0 · Linux + macOS · DuckDB ≥ 1.2
+Apache-2.0 · v0.6.0 · Linux + macOS · DuckDB ≥ 1.2
 
 ---
 
@@ -315,8 +315,8 @@ Two SQL paths, by design (v0.4.0):
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / GUARDRAIL / SKIP. As of v0.5.0: 91 queries, 0 failures — 87
-result checks plus 4 GUARDRAIL cases (deliberate misuse such as a `DOUBLE` join
+PASS / FAIL / GUARDRAIL / SKIP. As of v0.6.0: 126 queries, 0 failures — 113
+result checks plus 13 GUARDRAIL cases (deliberate misuse such as a `DOUBLE` join
 key or a `NULL` upload name, which the extension must reject with a clear
 error; the suite fails if one of them unexpectedly succeeds) — plus full
 resident-surface coverage in the community-CI sqllogic suite.
