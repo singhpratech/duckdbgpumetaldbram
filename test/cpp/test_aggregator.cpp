@@ -5,6 +5,10 @@
 #include "../../src/backends/groupby_filter.hpp"
 
 #include <algorithm>
+#if defined(__linux__)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -743,7 +747,58 @@ void test_hybrid_groupby() {
     }
 }
 
-int main() {
+#if GPUDB_HAVE_CUDA && defined(__linux__)
+extern "C" int gpudb_cuda_debug_fault_inject(void* stream);   // cudaError_t; 0 == success
+
+// A device fault (illegal address) is sticky: the context is dead for the
+// rest of the process. The contract is that it reaches SQL as an error, not
+// as an abort — Thrust temporaries used to throw from a destructor on the
+// failing cudaFree and terminate the process. The scenario runs in a fresh
+// child process (re-exec of this binary; a fork could not reuse the
+// parent's CUDA context): it poisons the context, calls a resident op, and
+// must see a std::runtime_error naming the fault and exit normally.
+int cuda_fault_child() {
+    try {
+        auto agg = gpudb::make_aggregator(gpudb::Backend::CUDA);
+        std::vector<std::int64_t> k = {1, 1, 2, 3};
+        auto kc = agg->upload_i64(k.data(), k.size());
+        (void)gpudb_cuda_debug_fault_inject(nullptr);
+        try {
+            (void)agg->groupby_count_resident(*kc, 100);
+            return 2;                                                 // no error at all
+        } catch (const std::runtime_error& e) {
+            return std::string(e.what()).find("illegal memory access") != std::string::npos ? 0 : 1;
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "fault child: unexpected: %s\n", e.what());
+        return 4;
+    }
+}
+
+void test_cuda_device_fault_is_an_error() {
+    std::printf("--- CUDA device fault surfaces as std::runtime_error (child process) ---\n");
+    std::fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+        execl("/proc/self/exe", "test_gpudb", "--cuda-fault-child", static_cast<char*>(nullptr));
+        std::_Exit(5);                                                // exec failed
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    const bool clean_exit = WIFEXITED(status);
+    const int  rc         = clean_exit ? WEXITSTATUS(status) : -1;
+    EXPECT(clean_exit);           // not SIGABRT / SIGSEGV
+    EXPECT_EQ(rc, 0);             // runtime_error naming the illegal access
+    std::printf("  child: %s, rc=%d\n", clean_exit ? "exited" : "killed by signal", rc);
+}
+#endif
+
+int main(int argc, char** argv) {
+#if GPUDB_HAVE_CUDA && defined(__linux__)
+    if (argc > 1 && std::string(argv[1]) == "--cuda-fault-child") return cuda_fault_child();
+#else
+    (void)argc; (void)argv;
+#endif
     std::printf("gpudb test suite\n");
     std::printf("available backends:");
     for (auto b : gpudb::available_backends()) std::printf(" %s", gpudb::to_string(b));
@@ -761,6 +816,10 @@ int main() {
     test_hybrid_aggregator();
     test_hybrid_groupby();
     test_hashjoin();
+
+#if GPUDB_HAVE_CUDA && defined(__linux__)
+    test_cuda_device_fault_is_an_error();
+#endif
 
 #if GPUDB_HAVE_METAL
     // Regression: the non-resident Metal GROUP BY's radix path (expected

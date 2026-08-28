@@ -243,6 +243,28 @@ single); the first call on a key column pays its sort (≈35 ms at SF10,
 it. Break-even for (A) is ≈95 repeated statements at SF10 (≈40 ms saved
 each), ≈80 at SF50 (≈230 ms each).
 
+**Follow-up on this branch — radix-select for (G), CUB on explicit temp
+storage.** Top-k of groups now finds the k-th aggregate with eight 256-bin
+histogram passes over order keys and compacts the winners (the full sort is
+kept for k ≥ groups/8); every resident step also moved from Thrust's
+self-allocating algorithms to CUB primitives on buffers we own, so a device
+fault returns its `cudaError_t` (→ SQL error) instead of aborting the
+process (unit-tested in a child process). Same harness as above, same day:
+
+| measurement | SF | native stmt (ms) | gpudb stmt (ms) | `kernel_ms` | before (sort-based) | end-to-end / on-device |
+|---|---|---:|---:|---:|---:|---:|
+| (G) top-10 groups by sum | 10 | 211–215 | 16.1–16.3 | 11.6–11.8 | 26.6–26.8 (kernel 21) | **13× / 18×** |
+| (G) top-10 groups by sum | 50 | 1009–1023 | 60–64 | 52–56 | 86–123 (kernel 78–115) | **16–17× / 18–19×** |
+| (B′) HAVING sum > 300 (unchanged path, CUB build) | 10 | 204–206 | 12.0–12.3 | 9.6–9.8 | 11.7–12.9 | 17× / 21× |
+| (B′) HAVING sum > 300 (unchanged path, CUB build) | 50 | 1019–1023 | 50–57 | 45–52 | 42–78 | 18–20× / 20–23× |
+
+(G) is now the reduce-by-key itself (the (B′) floor, 45–52 ms at SF50) plus
+≈8 ms of select — the 75M-key aggregate sort it replaced was 40–70 ms. Raw
+(G) lines: SF10 native 215.0 / 211.3 / 215.3, gpudb 16.06 / 16.33 / 16.17
+(`kernel_ms` 11.57 / 11.84 / 11.71); SF50 native 1009.2 / 1013.5 / 1009.6,
+gpudb 64.2 / 60.2 / 61.2 (`kernel_ms` 56.3 / 52.5 / 53.2); sums == native
+in every run.
+
 **Where the statement time goes (A–D).** The kernel is 3–5 % of the
 statement; ≈75 % is the result crossing device→host (15M × 24 B = 360 MB at
 SF10, 1.8 GB at SF50) and ≈20–25 % is DuckDB streaming those rows out of
