@@ -210,7 +210,9 @@ struct DevBuf {
 // ---- radix-select for top-k of groups ----
 //
 // Aggregates are mapped to order-preserving u64 keys (i64: flip the sign
-// bit; f64: sign-magnitude fold with NaN greatest, as in F64OrderKey). For
+// bit; f64: sign-magnitude fold with every NaN greatest — DuckDB's ORDER BY
+// places NaN above +inf — and -0.0 < 0.0, as in F64OrderKey). Both top-k
+// paths (select and full sort) use these keys, so the order is one. For
 // "largest k" the keys are inverted so the problem is always "smallest k".
 // Eight MSB->LSB passes of a 256-bin histogram over the elements matching
 // the prefix so far locate the k-th key T; the output is every element
@@ -369,8 +371,10 @@ cudaError_t apply_filter(const i64* keys, const A* agg, const i64* cnt, std::siz
             if (has_cnt) thrust::gather(pol, idx, idx + n_out, c_in, out_cnt);
             return cudaGetLastError();
         }
-        DevBuf ak, ix;
-        if ((e = ak.alloc(n_surv * sizeof(A)))   != cudaSuccess) return e;
+        // Full sort on the same order keys as the select path, so NaN placement
+        // (greatest) and -0.0/0.0 handling are identical whichever path runs.
+        DevBuf kb, ix;
+        if ((e = kb.alloc(n_surv * sizeof(u64))) != cudaSuccess) return e;
         if ((e = ix.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
         auto* okeys = static_cast<u64*>(kb.p);
         i64*  idx   = static_cast<i64*>(ix.p);
