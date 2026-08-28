@@ -83,6 +83,12 @@ run_case "int64 boundary keys" \
   "SELECT (CASE range % 4 WHEN 0 THEN 9223372036854775807 WHEN 1 THEN -9223372036854775808 WHEN 2 THEN 0 ELSE -1 END)::BIGINT AS k,
           (range % 5 - 2)::BIGINT AS v FROM range(1000)"
 
+# min and max share a low byte (0x4146 / 0x5246) while a key between them
+# does not (0x4E4F) — the shape that exposed the Metal radix pass-skip bug.
+run_case "min/max share a byte, middle key differs (TPC-H returnflag/linestatus)" \
+  "SELECT (CASE WHEN h < 50 THEN 20047 WHEN h < 51 THEN 20038 WHEN h < 75 THEN 16710 ELSE 21062 END)::BIGINT AS k, (range % 977)::BIGINT AS v
+   FROM (SELECT range, (range * 2654435761) % 100 AS h FROM range($N))"
+
 run_case "tiny (7 rows)" \
   "SELECT (range % 3)::BIGINT AS k, (range * 11)::BIGINT AS v FROM range(7)"
 

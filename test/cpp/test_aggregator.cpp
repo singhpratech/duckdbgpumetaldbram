@@ -258,6 +258,48 @@ void test_backend(gpudb::Backend b) {
             EXPECT(ok);
             auto tk = agg->topk_resident(*vc, N + 10, false);   // k clamps to rows
             EXPECT_EQ(tk.idx.size(), N);
+
+            // Regression: keys whose min and max share a low byte while a
+            // key between them does not (0x4146, 0x4E46, 0x4E4F, 0x5246 —
+            // TPC-H returnflag/linestatus packed). A radix sort that skips
+            // "constant" byte passes based on min/max alone breaks here.
+            {
+                const std::int64_t kset[4] = {16710, 20038, 20047, 21062};
+                const std::size_t M = 50'000;
+                std::vector<std::int64_t> mk(M), mv(M);
+                std::map<std::int64_t, std::pair<std::uint64_t, std::int64_t>> mref;
+                for (std::size_t i = 0; i < M; ++i) {
+                    const std::uint64_t h = (static_cast<std::uint64_t>(i) * 2654435761ull) % 100;
+                    mk[i] = h < 50 ? kset[2] : h < 51 ? kset[1] : h < 75 ? kset[0] : kset[3];
+                    mv[i] = static_cast<std::int64_t>(i);
+                    auto& e = mref[mk[i]];
+                    e.first += static_cast<std::uint64_t>(mv[i]); e.second += 1;
+                }
+                auto mkc = agg->upload_i64(mk.data(), M);
+                auto mvc = agg->upload_i64(mv.data(), M);
+                auto mr = agg->groupby_sum_resident_i64(*mkc, *mvc, std::size_t(100) * 1000000);
+                bool mok = mr.keys.size() == mref.size();
+                std::size_t mj = 0;
+                for (auto it = mref.begin(); mok && it != mref.end(); ++it, ++mj)
+                    mok = mr.keys[mj] == it->first &&
+                          mr.sums[mj] == static_cast<std::int64_t>(it->second.first) &&
+                          mr.counts[mj] == it->second.second;
+                EXPECT(mok);
+                // and the join over the same build keys (shares the sort cache)
+                std::vector<std::int64_t> pk{16710, 20038, 20047, 21062, 1, 20047};
+                std::vector<std::int64_t> pv{1, 10, 100, 1000, 7, 100};
+                auto pkc = agg->upload_i64(pk.data(), pk.size());
+                auto pvc = agg->upload_i64(pv.data(), pv.size());
+                std::int64_t jref = 0;
+                for (std::size_t i = 0; i < pk.size(); ++i)
+                    if (mref.count(pk[i])) jref += pv[i] * mref[pk[i]].second;
+                try {
+                    auto jr = agg->join_sum_resident_i64(*pkc, *pvc, *mkc, gpudb::JoinKind::INNER);
+                    EXPECT_EQ(jr.sum, jref);
+                } catch (const std::runtime_error& e) {
+                    if (std::string(e.what()).find("not implemented") == std::string::npos) throw;
+                }
+            }
         } catch (const std::runtime_error& e) {
             if (std::string(e.what()).find("not implemented") != std::string::npos) {
                 implemented = false;

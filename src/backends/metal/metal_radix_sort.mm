@@ -149,14 +149,21 @@ double MetalRadixSort::run_sort_on_staged(std::uint32_t n, id<MTLBuffer>& in_key
         }
         const std::uint64_t mn_u = static_cast<std::uint64_t>(mn) ^ 0x8000000000000000ULL;
         const std::uint64_t mx_u = static_cast<std::uint64_t>(mx) ^ 0x8000000000000000ULL;
-        active_bytes = 0;
+        // A pass can only be skipped for bytes ABOVE the highest byte in
+        // which min and max differ: every key in [min, max] shares that
+        // high-order prefix. Bytes at or below it are NOT constant just
+        // because min and max happen to agree there (min=0x4146,
+        // max=0x5246 does not mean no key has low byte 0x4F) — skipping
+        // such a pass silently breaks the sort.
+        std::uint32_t top = 0;
+        bool any = false;
         for (std::uint32_t p = 0; p < 8; ++p) {
             const std::uint64_t shift = p * 8;
             const std::uint8_t mn_b = static_cast<std::uint8_t>((mn_u >> shift) & 0xFFu);
             const std::uint8_t mx_b = static_cast<std::uint8_t>((mx_u >> shift) & 0xFFu);
-            if (mn_b != mx_b) active_bytes |= (1u << p);
+            if (mn_b != mx_b) { top = p; any = true; }
         }
-        if (active_bytes == 0) active_bytes = 0x01;
+        active_bytes = any ? static_cast<std::uint8_t>((2u << top) - 1u) : 0x01;
     }
 
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];

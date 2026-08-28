@@ -72,6 +72,13 @@ run_case "int64 boundary keys" \
   "SELECT (CASE range % 5 WHEN 0 THEN 9223372036854775807 WHEN 1 THEN -9223372036854775808 WHEN 2 THEN 0 WHEN 3 THEN -1 ELSE range END)::BIGINT AS k, (range % 101 - 50)::BIGINT AS v FROM range(100000)" \
   "SELECT k FROM (VALUES (9223372036854775807::BIGINT), (-9223372036854775808::BIGINT), (0::BIGINT), (42::BIGINT)) t(k)"
 
+# Build keys whose min and max share a low byte (0x4146 / 0x5246) while a
+# key between them does not (0x4E4F): exposed the Metal radix pass-skip bug.
+run_case "build min/max share a byte, middle key differs" \
+  "SELECT (CASE WHEN h < 50 THEN 20047 WHEN h < 51 THEN 20038 WHEN h < 75 THEN 16710 ELSE 21062 END)::BIGINT AS k, (range % 977)::BIGINT AS v
+   FROM (SELECT range, (range * 2654435761) % 100 AS h FROM range($I))" \
+  "SELECT (CASE WHEN range % 3 = 0 THEN 20047 WHEN range % 3 = 1 THEN 16710 ELSE 21062 END)::BIGINT AS k FROM range(3000)"
+
 run_case "negative keys both sides" \
   "SELECT (range % 1000 - 500)::BIGINT AS k, (range % 33 - 16)::BIGINT AS v FROM range(200000)" \
   "SELECT (range % 800 - 400)::BIGINT AS k FROM range(5000)"
