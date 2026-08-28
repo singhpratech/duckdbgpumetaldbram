@@ -21,6 +21,9 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
+#include <thrust/copy.h>
+#include <thrust/count.h>
+#include <thrust/functional.h>
 #include <thrust/reduce.h>
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
@@ -166,6 +169,137 @@ cudaError_t gpudb_cuda_sort_f64_perm(const double* d_vals, double* d_sorted,
         return gpudb_cuda_detail::map_exception();
     }
     return cudaStreamSynchronize(s);
+}
+
+} // extern "C"
+
+// ---- GroupByFilter on the device (v0.6): cmp on the aggregate, then top-k ----
+//
+// Survivors are selected with copy_if (order preserved, so the key-sorted
+// order survives); top-k radix-sorts (aggregate, index) pairs — primitive
+// keys and values, so Thrust takes the radix path — and gathers the first k.
+// cmp codes mirror GroupByFilter::Cmp: 0 None, 1 GT, 2 GE, 3 LT, 4 LE.
+
+namespace {
+
+template <typename A>
+struct Keep {
+    int cmp; A t;
+    __host__ __device__ bool operator()(A a) const {
+        switch (cmp) {
+            case 1:  return a >  t;
+            case 2:  return a >= t;
+            case 3:  return a <  t;
+            case 4:  return a <= t;
+            default: return true;
+        }
+    }
+};
+
+struct DevBuf {
+    void* p = nullptr;
+    cudaError_t alloc(std::size_t bytes) { return bytes ? cudaMalloc(&p, bytes) : cudaSuccess; }
+    ~DevBuf() { if (p) cudaFree(p); }
+};
+
+template <typename A>
+std::size_t count_survivors(const A* agg, std::size_t n, int cmp, A t, cudaStream_t s) {
+    if (cmp == 0) return n;
+    return static_cast<std::size_t>(
+        thrust::count_if(thrust::cuda::par.on(s), agg, agg + n, Keep<A>{cmp, t}));
+}
+
+// Writes exactly n_out rows: the survivors of cmp (key order) when topk == 0,
+// else the first n_out of the survivors sorted by aggregate. cnt may be
+// null (count op: the aggregate IS the count). Caller sized the outputs.
+template <typename A>
+cudaError_t apply_filter(const i64* keys, const A* agg, const i64* cnt, std::size_t n,
+                         int cmp, A t, std::size_t topk, bool desc, std::size_t n_out,
+                         i64* out_keys, A* out_agg, i64* out_cnt, cudaStream_t s) {
+    auto pol = thrust::cuda::par.on(s);
+    const bool has_cnt = (cnt != nullptr);
+    DevBuf sk, sa, sc;                       // survivors (only when cmp active)
+    const i64* k_in = keys; const A* a_in = agg; const i64* c_in = cnt;
+    std::size_t n_surv = n;
+    try {
+        if (cmp != 0) {
+            n_surv = count_survivors(agg, n, cmp, t, s);
+            // When there is no top-k the survivors ARE the output: select
+            // straight into the caller's buffers.
+            i64* dk = (topk == 0) ? out_keys : nullptr;
+            A*   da = (topk == 0) ? out_agg  : nullptr;
+            i64* dc = (topk == 0) ? out_cnt  : nullptr;
+            if (topk != 0) {
+                cudaError_t e;
+                if ((e = sk.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
+                if ((e = sa.alloc(n_surv * sizeof(A)))   != cudaSuccess) return e;
+                if (has_cnt && (e = sc.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
+                dk = static_cast<i64*>(sk.p); da = static_cast<A*>(sa.p);
+                dc = has_cnt ? static_cast<i64*>(sc.p) : nullptr;
+            }
+            if (has_cnt) {
+                auto first = thrust::make_zip_iterator(thrust::make_tuple(keys, agg, cnt));
+                auto out   = thrust::make_zip_iterator(thrust::make_tuple(dk, da, dc));
+                thrust::copy_if(pol, first, first + n, agg, out, Keep<A>{cmp, t});
+            } else {
+                auto first = thrust::make_zip_iterator(thrust::make_tuple(keys, agg));
+                auto out   = thrust::make_zip_iterator(thrust::make_tuple(dk, da));
+                thrust::copy_if(pol, first, first + n, agg, out, Keep<A>{cmp, t});
+            }
+            if (topk == 0) return cudaGetLastError();
+            k_in = dk; a_in = da; c_in = dc;
+        } else if (topk == 0) {
+            // No filter at all: plain copies (caller normally avoids this path).
+            cudaMemcpyAsync(out_keys, keys, n * sizeof(i64), cudaMemcpyDeviceToDevice, s);
+            cudaMemcpyAsync(out_agg,  agg,  n * sizeof(A),   cudaMemcpyDeviceToDevice, s);
+            if (has_cnt) cudaMemcpyAsync(out_cnt, cnt, n * sizeof(i64), cudaMemcpyDeviceToDevice, s);
+            return cudaGetLastError();
+        }
+        // top-k over n_surv survivors: radix sort (aggregate copy, index).
+        DevBuf ak, ix;
+        cudaError_t e;
+        if ((e = ak.alloc(n_surv * sizeof(A)))   != cudaSuccess) return e;
+        if ((e = ix.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
+        A*   a_sorted = static_cast<A*>(ak.p);
+        i64* idx      = static_cast<i64*>(ix.p);
+        cudaMemcpyAsync(a_sorted, a_in, n_surv * sizeof(A), cudaMemcpyDeviceToDevice, s);
+        thrust::sequence(pol, idx, idx + n_surv);
+        if (desc) thrust::sort_by_key(pol, a_sorted, a_sorted + n_surv, idx, thrust::greater<A>());
+        else      thrust::sort_by_key(pol, a_sorted, a_sorted + n_surv, idx, thrust::less<A>());
+        thrust::gather(pol, idx, idx + n_out, k_in, out_keys);
+        if (has_cnt) thrust::gather(pol, idx, idx + n_out, c_in, out_cnt);
+        cudaMemcpyAsync(out_agg, a_sorted, n_out * sizeof(A), cudaMemcpyDeviceToDevice, s);
+    } catch (...) {
+        return gpudb_cuda_detail::map_exception();
+    }
+    return cudaGetLastError();
+}
+
+} // namespace
+
+extern "C" {
+
+cudaError_t gpudb_cuda_groupby_survivors_i64(const i64* agg, std::size_t n, int cmp, i64 t,
+                                             std::size_t* h_out, cudaStream_t s) {
+    try { *h_out = count_survivors<i64>(agg, n, cmp, t, s); }
+    catch (...) { return gpudb_cuda_detail::map_exception(); }
+    return cudaGetLastError();
+}
+cudaError_t gpudb_cuda_groupby_survivors_f64(const double* agg, std::size_t n, int cmp, double t,
+                                             std::size_t* h_out, cudaStream_t s) {
+    try { *h_out = count_survivors<double>(agg, n, cmp, t, s); }
+    catch (...) { return gpudb_cuda_detail::map_exception(); }
+    return cudaGetLastError();
+}
+cudaError_t gpudb_cuda_groupby_filter_i64(const i64* keys, const i64* agg, const i64* cnt, std::size_t n,
+                                          int cmp, i64 t, std::size_t topk, int desc, std::size_t n_out,
+                                          i64* out_keys, i64* out_agg, i64* out_cnt, cudaStream_t s) {
+    return apply_filter<i64>(keys, agg, cnt, n, cmp, t, topk, desc != 0, n_out, out_keys, out_agg, out_cnt, s);
+}
+cudaError_t gpudb_cuda_groupby_filter_f64(const i64* keys, const double* agg, const i64* cnt, std::size_t n,
+                                          int cmp, double t, std::size_t topk, int desc, std::size_t n_out,
+                                          i64* out_keys, double* out_agg, i64* out_cnt, cudaStream_t s) {
+    return apply_filter<double>(keys, agg, cnt, n, cmp, t, topk, desc != 0, n_out, out_keys, out_agg, out_cnt, s);
 }
 
 } // extern "C"
