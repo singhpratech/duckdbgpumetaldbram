@@ -202,6 +202,21 @@ struct DevBuf {
     ~DevBuf() { if (p) cudaFree(p); }
 };
 
+// Order-preserving u64 keys for the aggregate: i64 flips the sign bit; f64
+// folds sign-magnitude with EVERY NaN greatest (DuckDB ORDER BY order) and
+// -0.0 == 0.0 handled by the tie rule. Inverted keys turn "largest k" into
+// "smallest k" so one ascending radix sort serves both directions.
+template <typename A> struct OrderKey;
+template <> struct OrderKey<i64> {
+    __host__ __device__ u64 operator()(i64 v) const { return static_cast<u64>(v) ^ (1ULL << 63); }
+};
+template <> struct OrderKey<double> {
+    __host__ __device__ u64 operator()(double d) const { return F64OrderKey{}(d); }
+};
+template <typename A> struct InvOrderKey {
+    __host__ __device__ u64 operator()(A v) const { return ~OrderKey<A>{}(v); }
+};
+
 template <typename A>
 std::size_t count_survivors(const A* agg, std::size_t n, int cmp, A t, cudaStream_t s) {
     if (cmp == 0) return n;
@@ -255,20 +270,21 @@ cudaError_t apply_filter(const i64* keys, const A* agg, const i64* cnt, std::siz
             if (has_cnt) cudaMemcpyAsync(out_cnt, cnt, n * sizeof(i64), cudaMemcpyDeviceToDevice, s);
             return cudaGetLastError();
         }
-        // top-k over n_surv survivors: radix sort (aggregate copy, index).
-        DevBuf ak, ix;
+        // top-k over n_surv survivors: radix sort of (order key, index) — the
+        // order keys give one total order (NaN greatest) for both directions.
+        DevBuf kb, ix;
         cudaError_t e;
-        if ((e = ak.alloc(n_surv * sizeof(A)))   != cudaSuccess) return e;
+        if ((e = kb.alloc(n_surv * sizeof(u64))) != cudaSuccess) return e;
         if ((e = ix.alloc(n_surv * sizeof(i64))) != cudaSuccess) return e;
-        A*   a_sorted = static_cast<A*>(ak.p);
-        i64* idx      = static_cast<i64*>(ix.p);
-        cudaMemcpyAsync(a_sorted, a_in, n_surv * sizeof(A), cudaMemcpyDeviceToDevice, s);
+        auto* okeys = static_cast<u64*>(kb.p);
+        i64*  idx   = static_cast<i64*>(ix.p);
+        if (desc) thrust::transform(pol, a_in, a_in + n_surv, okeys, InvOrderKey<A>{});
+        else      thrust::transform(pol, a_in, a_in + n_surv, okeys, OrderKey<A>{});
         thrust::sequence(pol, idx, idx + n_surv);
-        if (desc) thrust::sort_by_key(pol, a_sorted, a_sorted + n_surv, idx, thrust::greater<A>());
-        else      thrust::sort_by_key(pol, a_sorted, a_sorted + n_surv, idx, thrust::less<A>());
+        thrust::sort_by_key(pol, okeys, okeys + n_surv, idx);
         thrust::gather(pol, idx, idx + n_out, k_in, out_keys);
+        thrust::gather(pol, idx, idx + n_out, a_in, out_agg);
         if (has_cnt) thrust::gather(pol, idx, idx + n_out, c_in, out_cnt);
-        cudaMemcpyAsync(out_agg, a_sorted, n_out * sizeof(A), cudaMemcpyDeviceToDevice, s);
     } catch (...) {
         return gpudb_cuda_detail::map_exception();
     }
