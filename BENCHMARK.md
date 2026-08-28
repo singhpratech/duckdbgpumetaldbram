@@ -69,6 +69,47 @@ the `count(*)` (≈ 7 ms at SF10, ≈ 33 ms at SF50 for 15M / 75M rows).
 | (F) 4-group low-cardinality | 10 | 31.5–32.3 | 48.4 | 48.2 | 47.8 | **0.65× — native wins** | `EXCEPT` both ways = 0 |
 | (F) 4-group low-cardinality | 50 | 153–154 | 274 | 274 | 273 | **0.56× — native wins** | `EXCEPT` both ways = 0 |
 
+#### Filtering on the device (same build + `426a8ff`): only the survivors come back
+
+The rows above return every group and pay for it — DuckDB has to consume
+15M–75M rows whatever the GPU did. The `_having` / `_topk` forms evaluate
+`HAVING <aggregate> <cmp> <threshold>` and "the k groups with the largest /
+smallest aggregate" on the device (per-block compaction for HAVING; an
+8-pass radix select on the aggregate for top-k) and return only those rows.
+Same method as the table above: statement vs statement, same process, warm,
+min–max of 2–3 calls; result checks are `EXCEPT` both ways against native
+`HAVING`, and the top-k sums compared as a list against native
+`ORDER BY sum DESC LIMIT 10`.
+
+| measurement | SF | native stmt (ms) | gpudb stmt (ms) | `kernel_ms` | rows out | speedup (stmt / stmt) | result check |
+|---|---|---:|---:|---:|---:|---:|---|
+| (B′) Q18 inner, `HAVING sum > 300` on the device | 10 | 89 | 16.3–16.4 | 15.3 | 624 | **5.4×** | `EXCEPT` both ways = 0 |
+| (B′) Q18 inner, `HAVING sum > 300` on the device | 50 | 462–476 | 77.9–78.1 | 76.7 | 3,182 | **5.9–6.1×** | `EXCEPT` both ways = 0 |
+| (G) top-10 groups by `sum` (desc) | 10 | 90 | 25.0–25.1 | 22.4 | 10 | **3.6×** | sums == native |
+| (G) top-10 groups by `sum` (desc) | 50 | 463–471 | 114.4–114.9 | 111.5 | 10 | **4.0–4.1×** | sums == native |
+| (H) `HAVING count(*) >= 7` (count op) | 10 | 72–73 | 11.8 | 9.8 | 2,140,173 | **6.1–6.2×** | `EXCEPT` = 0, rows == native |
+| (H) `HAVING count(*) >= 7` (count op) | 50 | 413–438 | 56.4–56.8 | 49.5 | 10,712,841 | **7.3–7.8×** | `EXCEPT` = 0, rows == native |
+| (C′) DOUBLE `HAVING sum > 400000` (host-side f64) | 10 | 84–87 | 33.7–44.3 | 11.3 | 42,764 | 1.9–2.6× | rows == native |
+| (C′) DOUBLE `HAVING sum > 400000` (host-side f64) | 50 | 431–441 | 188–308 | 58–68 | 213,677 | 1.4–2.3× | rows == native |
+
+What changed and what did not: the kernel time is the same ~70 ms at SF50 as
+in (A) — the segmented reduce is the work — plus 7 ms of compaction for
+HAVING or ~40 ms of radix select for top-k; what disappeared is the ~30 ms
+of DuckDB consuming 75M rows and the ~20 ms of writing them, so the kernel
+is now 98% of the statement. (H) keeps 10.7M of 75M groups and still wins
+7×: the compaction writes only survivors and DuckDB only sees those. (G) is
+bounded by the 8 histogram passes over 75M aggregates (each pass reads
+600 MB); a wider digit would cut passes at the cost of a bigger histogram.
+(C′) is the honest row: `DOUBLE` sums are finished on the host (no doubles
+in MSL), so the filter runs on the host too and the win is only the row
+streaming — 1.4–2.6×, with the run-to-run variance of a host loop.
+
+One-time cost, stated plainly: the first filtered call on a pair allocates
+the device-side scratch for the finalized groups (24 B per group: 0.36 GB at
+SF10, 1.8 GB at SF50) — the first (B′) statement at SF50 took 907 ms, every
+later one 78 ms. The scratch is reused by every later filtered call on any
+pair.
+
 Correction, stated plainly: the first version of this section (commit
 `2f75309`, same day) computed the speedups from the operator's `wall_ms`
 against native's statement time and reported 3.4–4.7× for (A) and 5.0–5.6×
@@ -140,6 +181,10 @@ SELECT gpu_upload('ep', (l_extendedprice*100)::BIGINT) FROM lineitem;
 SELECT * FROM gpu_topk_resident('ep', 10, 'desc');                        -- (E)
 SELECT gpu_upload_pair('lc', (ascii(l_returnflag)*256 + ascii(l_linestatus))::BIGINT, l_quantity::BIGINT) FROM lineitem;
 SELECT * FROM gpu_groupby_sum_resident('lc');                             -- (F)
+SELECT count(*) FROM gpu_groupby_sum_resident_having('l', '>', 300);      -- (B′) HAVING on the device
+SELECT * FROM gpu_groupby_sum_resident_topk('l', 10, 'desc');             -- (G) top-10 groups by sum
+SELECT count(*) FROM gpu_groupby_count_resident_having('l', '>=', 7);     -- (H)
+SELECT count(*) FROM gpu_groupby_sum_resident_f64_having('lf', '>', 400000); -- (C′)
 "
 # native bars, same engine: SELECT count(*) FROM (SELECT l_orderkey, sum(l_quantity::BIGINT) FROM lineitem GROUP BY 1);  etc.
 # SF50: export GPUDB_UPLOAD_POOL_MAX_MB=12288

@@ -114,6 +114,57 @@ at Q18 sizes (75M groups at SF50 ≈ 1.8 GB over PCIe); `kernel_ms` vs
 `std::sort` on `(key, value)` pairs, run-length reduce; `partial_sort` for
 top-k. Not a performance path.
 
+## Device-side HAVING / top-k of groups (`GroupByFilter`)
+
+Returning every group is the expensive part of a high-cardinality GROUP BY:
+whatever the device does, DuckDB then consumes 15M–75M rows. The `_having`
+and `_topk` forms push the two common consumers of that result onto the
+device and return only the survivors.
+
+SQL:
+
+```sql
+SELECT * FROM gpu_groupby_sum_resident_having('p', '>', 300);      -- HAVING sum > 300
+SELECT * FROM gpu_groupby_sum_resident_f64_having('pf', '>=', 1e6);
+SELECT * FROM gpu_groupby_count_resident_having('p', '<', 5);      -- HAVING count(*) < 5
+SELECT * FROM gpu_groupby_sum_resident_topk('p', 10, 'desc');      -- ORDER BY sum DESC LIMIT 10
+SELECT * FROM gpu_groupby_count_resident_topk('p', 10, 'desc');
+```
+
+`cmp` is one of `'>'`, `'>='`, `'<'`, `'<='`; the threshold is BIGINT for the
+i64 sum and count forms, DOUBLE for `_f64`. `_having` output stays sorted by
+key; `_topk` output is ordered by the aggregate (ties in an unspecified,
+backend-defined order — compare multisets across backends). The row cap
+(`GPUDB_GROUPBY_ROWS_MAX_M`) applies to the rows returned, and
+`gpu_last_stats()` reports both `groups=` (before the filter) and `rows_out=`.
+
+Contract (`gpu_backend.hpp`): a trailing `const GroupByFilter&` on the three
+GROUP BY ops — `cmp` + `threshold_i64` / `threshold_f64`, `topk` + `topk_desc`;
+`GroupByResidentResult::groups_total`. `src/backends/groupby_filter.hpp` is
+the host reference (`apply_group_filter_host`) every backend is tested
+against.
+
+Metal: the finalized `(key, sum, count)` arrays stay in device scratch
+(24 B per group, allocated on the first filtered call and reused). HAVING is
+a per-256-block survivor count → host exclusive scan → cap check →
+compaction kernel writing survivors in key order straight into the result
+vectors (`gb_having_counts_i64`, `gb_having_compact_i64`). Top-k is an
+8-pass radix select on the aggregate (order-preserving `ulong` transform of
+the i64; one 256-bin histogram per pass, the host picks the digit holding
+the k-th rank), then a compaction of the "strictly better than the k-th"
+class plus exactly `k − better` of the ties (`gb_topk_hist_i64`,
+`gb_topk_counts_i64`, `gb_topk_compact_i64`); the k rows are ordered on the
+host. `DOUBLE` sums are finished on the host (no doubles in MSL), so their
+filter runs on the host through the reference implementation — the win
+there is only the row streaming.
+
+CUDA: `count_if` on the survivors → cap check → `copy_if` into the output
+(key order preserved); top-k sorts `(aggregate, index)` pairs with a radix
+sort and gathers the first k. The device→host copy is the survivors only,
+which on PCIe is the whole point.
+
+CPU: sort + run-length reduce as before, then the reference filter.
+
 ## Where it wins and where it doesn't
 
 - **High-cardinality GROUP BY** (Q18's `GROUP BY l_orderkey`: 15M groups at
