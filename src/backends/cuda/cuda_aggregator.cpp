@@ -10,6 +10,7 @@
 
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 #include <algorithm>
@@ -674,12 +675,17 @@ private:
         v.reserve(n);
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
         if (n * sizeof(T) >= (8u << 20)) {
-            constexpr std::uintptr_t kPage = 4096;
-            auto lo = reinterpret_cast<std::uintptr_t>(v.data());
-            auto hi = lo + n * sizeof(T);
-            lo = (lo + kPage - 1) & ~(kPage - 1);
-            hi &= ~(kPage - 1);
-            if (hi > lo) (void)madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_HUGEPAGE);
+            // Best-effort: align to the system page size (4 KiB on x86-64,
+            // 64 KiB on some aarch64 kernels), advise the interior pages.
+            const long ps = sysconf(_SC_PAGESIZE);
+            if (ps > 0 && (ps & (ps - 1)) == 0) {
+                const auto page = static_cast<std::uintptr_t>(ps);
+                auto lo = reinterpret_cast<std::uintptr_t>(v.data());
+                auto hi = lo + n * sizeof(T);
+                lo = (lo + page - 1) & ~(page - 1);
+                hi &= ~(page - 1);
+                if (hi > lo) (void)madvise(reinterpret_cast<void*>(lo), hi - lo, MADV_HUGEPAGE);
+            }
         }
 #endif
         v.resize(n);
