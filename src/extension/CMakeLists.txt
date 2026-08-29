@@ -58,6 +58,13 @@ set_target_properties(gpudb_duckdb PROPERTIES
 # symbol table wholesale.
 if(UNIX AND NOT APPLE)
     target_link_options(gpudb_duckdb PRIVATE "LINKER:--exclude-libs,ALL")
+    # Link libstdc++ and libgcc statically so the loadable extension carries no
+    # GLIBCXX_/CXXABI_ symbol-version floor from the build machine (a v0.6.0
+    # asset built on a 24.04 box needed GLIBCXX_3.4.32 and failed to LOAD on
+    # 22.04 userlands). glibc itself stays dynamic — its floor is set by the
+    # build environment's headers, so release assets are built on the oldest
+    # supported userland (Ubuntu 22.04, glibc 2.35).
+    target_link_options(gpudb_duckdb PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 # Output naming / location.
