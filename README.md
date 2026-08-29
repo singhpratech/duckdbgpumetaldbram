@@ -162,11 +162,13 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 ```
 
 Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
-Community binaries ship the full Metal backend on Apple Silicon and a clean CPU
-fallback on Linux. The Linux build is **CUDA-ready**: gpudb's build auto-enables
-the CUDA backend the moment the registry's build tooling ships its CUDA
-toolchain (already merged upstream in extension-ci-tools `main`); until then,
-build from source for CUDA. Check any binary with `SELECT gpu_build_info();`.
+The registry binary carries the **full Metal backend on Apple Silicon**. On
+Linux the registry binary is **CPU-only** — the community build machines have
+no CUDA toolchain, so every `gpu_*` function works and returns the same
+results, but `gpu_last_stats()` will say `backend=CPU`. For the CUDA backend
+on Linux use the release binary (Option B; statically linked CUDA runtime,
+needs only a driver) or build from source with `nvcc`. Check any binary with
+`SELECT gpu_build_info();`.
 The registry serves the **v0.5.0** build (merged 2026-08-24), including the
 full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
 …) and the GPU join functions (`gpu_upload_pair`, `gpu_join_*_resident`,
