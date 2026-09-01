@@ -109,6 +109,28 @@ Consequences, accepted:
 - **Removed in the same PR:** `third_party/duckdb_capi/`,
   `src/extension/duckdb_loadable.cpp`, the C-API template `Makefile`
   includes (replaced with the C++ template's).
+- **`-static-libstdc++` is reverted in this PR.** It is safe for the C-API
+  loadable (nothing C++ crosses the boundary) and is what v0.6.1 ships
+  (§11). It is *not* safe for a C++-API loadable: `unique_ptr<LogicalOperator>`,
+  `std::string`, exceptions and RTTI cross into the host's libstdc++, and two
+  copies in one process is a known source of typeinfo/exception mismatches.
+  The portable glibc floor for the C++ build comes from building in an
+  old-glibc container with dynamic libstdc++ — exactly what the community CI
+  does.
+- **Link options are re-applied to the template's target.** The C++
+  template's `build_loadable_extension` creates its own target; our
+  `--exclude-libs,ALL`, static CUDA runtime and the CUDA architecture list
+  must be attached to it, and the Linux instance runs
+  `make configure && make release && make test` in the community container
+  shape before PR 1 is opened.
+- **Which DuckDB versions get a CUDA release asset.** One container build and
+  one asset per version; DuckDB refuses a C++ extension whose footer version
+  does not match. v0.7 ships CUDA assets for the version the registry serves
+  and for the current `pip install duckdb` version when it differs (Colab's
+  pip lags releases); the release checklist lists both, and the quickstart
+  notebook selects the asset by `duckdb.__version__`.
+- **`get_duckdb_libs.sh` pins the submodule's tag.** `gpudb-sql` can only
+  `LOAD` a loadable built against the same DuckDB version it embeds.
 
 This lands **alone** as PR 1 with the entire v0.6 verification surface green
 on both machines (unit, SQL suite, both parity scripts, registry-smoke
@@ -133,14 +155,27 @@ to `count(v)` while still counting for `count(*)`. Cost: one extra mask read
 per element in the reduce; measured, and the bitmap is skipped entirely for
 NULL-free columns so v0.6 numbers are unchanged on the benchmark tables.
 
+There is no spare int64 value to make NULL "sort last", so the NULL-key rows
+are partitioned out at upload (valid-key prefix, NULL-key suffix; one
+`DevicePartition` on CUDA, one compaction pass on Metal) and only the prefix
+is sorted. The suffix is one group at the end — `count(*)` and the sums of
+its payloads — and is naturally excluded from join build/probe, which is what
+SQL join semantics need (NULL never matches). One extra pass at upload, zero
+cost at query time. NULL payloads are handled by identity injection in the
+reduce (0 for sum, ±inf / INT64 limits for min/max) and the per-group tuple
+becomes `(sum, count_v, count_star)`.
+
 ### 4.2 128-bit sums
 `sum(BIGINT)` in DuckDB is HUGEINT and never overflows. The device
-accumulates in two 64-bit limbs (segmented reduce with carry; CUDA has native
-128-bit arithmetic via CUB's reduce on a two-limb struct, Metal does the
-carry by hand — both are already the shape of the existing reduce). Output
-column is HUGEINT. The extra limb is skipped when the pin's static bound
-`rows × max|v| < 2^63` proves it unnecessary, which is the case on every
-benchmark table, so v0.6 numbers are unchanged.
+accumulates in two 64-bit limbs. On CUDA `nvcc` supports `__int128` in device code (11.5+, 64-bit
+targets), so it is `reduce_by_key` with an `__int128` accumulator through a
+transform iterator, no hand carry; Metal does the carry by hand in the
+segmented reduce. Output column is HUGEINT. The extra limb costs 16 B per
+element in the tree and per group out — expected to be a small measurable hit
+at SF50 — so it is skipped when the pin's static bound `rows × max|v| < 2^63`
+proves it unnecessary, which holds on every benchmark table. The bound needs
+the payload's min/max at upload: one `DeviceReduce`, cheap, and the same
+statistics pass §4.4 uses.
 
 ### 4.3 DECIMAL
 DuckDB stores `DECIMAL(p,s)` with `p ≤ 18` as an int64 scaled by `10^s`
@@ -155,10 +190,15 @@ machinery as 4.2).
 ### 4.4 Packed multi-column keys
 `GROUP BY a, b [, c]` over integer/date/timestamp columns: at upload, each
 column's `[min, max]` is read from DuckDB's statistics; if
-`Π (range_i + 1) < 2^63` the tuple is packed as a mixed-radix integer
+`Π (range_i + 2) < 2^63` (one extra slot per column for NULL, since DuckDB
+groups NULL per column and there are up to 2^n NULL combinations) the tuple
+is packed as a mixed-radix integer
 `((a−min_a)·R_b + (b−min_b))·R_c + (c−min_c)`, sorted and reduced as one
-64-bit key, and unpacked on the way out. Exact, no new kernels. When the
-product does not fit, the shape is not resident (native).
+64-bit key, and unpacked on the way out. Mixed radix preserves lexicographic
+order, so the sorted-by-key property holds for `ORDER BY a, b, c`. DuckDB's
+base-table min/max are conservative after updates (widened, never wrong),
+which is the safe direction. Exact, no new kernels. When the product does not
+fit, the shape is not resident (native).
 
 ### 4.5 VARCHAR keys via dictionary
 A VARCHAR key is uploaded as a dense int32 id against a host-side dictionary
@@ -173,18 +213,30 @@ Most real `GROUP BY` queries filter first. The resident set for a table
 includes the columns that appear in `WHERE` clauses of matched shapes (§5
 decides which); at query time the conjunction of comparisons is compiled to a
 small predicate program (column, op, constant) evaluated on the device into a
-selection mask that the segmented reduce consumes. New kernel on each backend
-(mask build + masked reduce); the masked reduce is the existing reduce with a
-predicate read, so its cost is measured against the unmasked one and both
-sides are in the gate.
+selection mask. Two execution variants, both built and both in the gate:
+(a) a masked reduce that reads one flag per element (cost ∝ rows in), and
+(b) compaction of the sorted permutation (`DeviceSelect::Flagged` on CUDA,
+the v0.6 block compaction on Metal) followed by the ordinary reduce over
+survivors (cost ∝ rows out plus one select pass). At 1% selectivity (b) wins
+by a wide margin, at 90% (a) wins; the §9.1 selectivity sweep fixes the
+crossover per backend and it becomes a threshold. A predicate on the **key**
+column (`WHERE k BETWEEN …`) is a binary search on the sorted key cache — a
+contiguous range at zero per-row cost — and is handled before either variant.
 
 ### 4.7 DOUBLE summation
 Native DuckDB's `sum(DOUBLE)` is itself order-dependent across thread counts.
 The device result is "equal up to reassociation"; parity uses the tolerance
 `groupby_parity_check.sh` already applies. This is the one place where
 "exact" means "as exact as native is with itself", and it is stated in the
-docs. Kahan-compensated device accumulation is implemented behind a setting
-so users who need the tighter bound can turn it on and see the cost.
+docs. Kahan summation is sequential by construction and cannot be a
+`reduce_by_key` operator; the compensated option that fits a tree reduction
+is double-double (TwoSum error-free transformation, 16 B state, ~106-bit
+effective), implemented behind a setting so users who need the tighter bound
+can turn it on and see the cost. Worth stating plainly: the device paths are
+deterministic run to run (fixed reduction tree, no atomics on either
+backend), unlike native DuckDB across thread counts — parity keeps its
+tolerance against native, but bit-reproducibility is a property gpudb can
+claim.
 
 ## 5. Automatic residency (piece C)
 
@@ -215,8 +267,9 @@ plans it served.
    transaction rolls back, the set is simply re-uploaded next time — the
    safe direction.
 2. **Row-count check at rewrite time** (catches the Appender API and anything
-   else that bypasses the planner and adds or removes rows): the table's
-   current row count must equal the count at upload.
+   else that bypasses the planner and adds or removes rows): the row count
+   visible to the *querying transaction* must equal the count at upload —
+   which makes this and (3) one check in practice.
 3. **Transaction visibility.** An upload runs in its own transaction and
    records the snapshot it read. A rewrite is applied only when the querying
    transaction started after that upload committed, so a connection with an
@@ -228,6 +281,17 @@ plans it served.
 What is not caught: in-place updates through a non-SQL path that keeps the
 row count constant. DuckDB has no such public path today; KNOWN_ISSUES says
 so and says what to do if one appears (`CALL gpu_invalidate('t')`).
+
+**Streams and cost of an upload.** Upload and query work run on separate
+device streams (CUDA streams; Metal command queues) with a completion event
+recorded at the end of the upload; a rewrite may consume a resident set only
+after that event reports complete. Today everything is on one stream. The
+expensive part of an upload is not the host-to-device copy but the key sort
+(`ensure_join_cache`; SF100 keys are seconds), and it competes with the
+concurrent native query for host memory bandwidth and PCIe — so the
+first-query row in the gate (§9.3) is measured with that sort running, not
+after it. The `GPUDB_UPLOAD_POOL_MAX_MB` knob becomes `gpudb_memory_budget`
+rather than a second setting.
 
 **Shared with joins.** A resident set is `{table, columns, sorted key
 permutation, validity}`. The v0.5 join build side is the same object, which
@@ -263,12 +327,12 @@ residency hit/miss, predicate rows in/out).
 
 | Kernel / path | Metal (macOS instance) | CUDA (Linux instance) |
 |---|---|---|
-| validity-aware sort + segmented reduce (4.1) | extend `sum.metal` reduce; NULL group sorts last | CUB `reduce_by_key` over `(key, valid)` |
-| two-limb sum (4.2) | manual carry in the segmented reduce | CUB reduce on a 128-bit struct |
-| predicate mask + masked reduce (4.6) | new kernels | new kernels (CUB `DeviceSelect::Flagged` for the mask) |
-| min/max group-by | segmented reduce with min/max ops (exists for scalar; extend) | CUB `reduce_by_key` with min/max |
+| NULL-key partition at upload + identity-injected reduce (4.1) | compaction pass; extend `sum.metal` reduce tuple to `(sum, count_v, count_star)` | `DevicePartition` on validity; transform iterator injects identities |
+| two-limb sum (4.2) | manual carry in the segmented reduce | `reduce_by_key` with an `__int128` accumulator |
+| predicate mask, variants (a) masked reduce and (b) compact-then-reduce (4.6) | new kernels; (b) reuses the v0.6 block compaction | new kernels; (b) uses `DeviceSelect::Flagged` |
+| min/max group-by | fused into the per-group tuple `(sum, count, min, max)`: one pass for all aggregates of a query | same, `reduce_by_key` on the tuple |
 | DOUBLE device-side HAVING/top-k (closes the v0.6 host path) | total-order radix select on the `gb_ord`-style key mapping for f64 | exists post-#77 |
-| Kahan option (4.7) | compensated segmented reduce | same |
+| double-double option (4.7) | compensated segmented reduce | same |
 
 The CPU reference backend implements every one of these first, in plain C++,
 and is the oracle the two GPU backends are checked against in unit tests
@@ -296,7 +360,13 @@ BENCHMARK.md gains, per backend, at SF1/SF10/SF50:
   top-k forms), with and without a `WHERE` mask at 1%/10%/50%/90%
   selectivity;
 - VARCHAR dictionary cost vs distinct count (4.5);
-- validity-bitmap and two-limb overheads on NULL-free vs 10%-NULL columns.
+- validity-bitmap and two-limb overheads on NULL-free vs 10%-NULL columns,
+  and the two-limb path forced on;
+- mask variant (a) vs (b) across the selectivity sweep;
+- optimizer-pass overhead: a plain `SELECT` (no `GROUP BY`) native vs
+  `LOAD gpudb` with `gpudb_transparent=false` vs transparent — rule 1 has
+  to hold for queries the pass never rewrites, and the §6.1 bound includes
+  the residency lookup and the DML scan.
 
 Thresholds in `hybrid_planner.cpp` for the transparent path are set from
 these tables, per backend, and the losing side of every sweep stays printed.
@@ -317,7 +387,9 @@ appender between two identical queries.
 
 ### 9.3 `scripts/transparent_gate.sh` (rule 1)
 Every rewritable shape and every §9.1 sweep point, transparent vs native,
-same process, warm, min-of-N, both backends. **Any row below 1.0× fails.**
+same process, warm, min-of-N with N ≥ 5 and the GPU clock printed beside
+each row (the 4090's boost clock is bimodal, 1665–2400 MHz, and a 1.0× row
+can flip between runs otherwise), both backends. **Any row below 1.0× fails.**
 Runs at SF1 in `local_check.sh`, at SF10/SF50 before every tag on both
 machines, output pasted into BENCHMARK.md unedited. The first-query case
 (residency miss) is a row in this table too: it must be ≥ 1.0× because it
@@ -347,25 +419,32 @@ Packaging only. No operator changes.
 
 **Problem.** The v0.6.0 `gpudb.linux_amd64.duckdb_extension` release asset
 was built on Ubuntu 24.04 and needs `GLIBCXX_3.4.32` / `GLIBC_2.38`, so it
-does not load on Ubuntu 22.04 hosts (glibc 2.35), Google Colab included. It
-is also built against CUDA 13, which needs a 580-series driver; Colab's T4
-runtime has a CUDA 12.x-era driver, so it would fall back to CPU there even
-if it loaded. The registry's Linux binary is unaffected (CPU-only, built by
+does not load on Ubuntu 22.04 hosts (glibc 2.35), Google Colab included. It is also built against CUDA 13, which needs an R580+ driver; CUDA 12.x
+minor-version compatibility means a 12.8-built asset gets the GPU on any
+R525+ driver, which is what Colab's T4 runtime has — that is the reason for
+building with 12.8, and it is the line the README "Requirements" row should
+carry. The registry's Linux binary is unaffected (CPU-only, built by
 community CI); this concerns the CUDA release asset only.
 
 **Fix (built and verified, not released).**
 - PR #82: `-static-libstdc++ -static-libgcc` for the loadable on Linux.
 - Build in `nvidia/cuda:12.8.1-devel-ubuntu22.04` (glibc 2.35, CUB 2.7.0),
-  static CUDA runtime → 12,645,358 B, glibc floor 2.34, NEEDED only
-  `libgomp`, `libc`, `ld-linux`; unit 366/366, SQL suite, parity, CLI SF1
-  smoke green; SHA-256
-  `ae64f1e3f2dad2a1db73d1781e0eb80c204da44504d07f37653403b5a652f9c7`. The
-  asset, `REPORT.md`, `container_build.sh`, `loadtest.sh` are parked outside
-  the repo on the Linux machine.
+  static CUDA runtime → 12,645,358 B, glibc floor 2.34 (plus `OMP_1.0` from
+  libgomp; no CXXABI dependency), NEEDED only `libgomp.so.1`, `libc.so.6`,
+  `ld-linux-x86-64.so.2`. Verified: unit 366/366, SQL 29/0, GROUP BY parity
+  12/12, `LOAD` on ubuntu:22.04 (CPU) and on the 24.04 host, v1.5.5 CLI SF1
+  smoke equal to native with `backend=CUDA` on the 4090. This is a
+  **v0.6.0-based verification build** (footer `C_STRUCT, v0.6.0, v1.2.0,
+  linux_amd64`; SHA-256
+  `ae64f1e3f2dad2a1db73d1781e0eb80c204da44504d07f37653403b5a652f9c7`); the
+  release asset is rebuilt at the v0.6.1 tag and will have a different
+  SHA. The asset, `REPORT.md`, `container_build.sh`, `loadtest.sh` are
+  parked outside the repo on the Linux machine.
 - `scripts/build.sh` honours `GPUDB_CUDA_STATIC_RUNTIME` from the environment
-  (today it must be set on the CMake cache by hand); add
-  `scripts/container_build_linux.sh` so the portable build is reproducible
-  from the repo.
+  (today it must be set on the CMake cache by hand; the container script
+  already does) and `scripts/container_build_linux.sh` is added so the
+  portable build is reproducible from the repo — one PR from the Linux
+  instance.
 - `examples/gpudb_quickstart.ipynb` (PR #81): loads the release asset, falls
   back to a direct `cmake --target gpudb_duckdb` build with Colab's `nvcc`.
   Needs one end-to-end T4 run that reaches the benchmark cells before it
@@ -384,8 +463,9 @@ community CI); this concerns the CUDA release asset only.
    the CUDA-13 note moves to "building from source".
 
 **Why before PR 1.** PR 1 changes how the loadable is built. The container
-build and the static-runtime flags must be in the tree first so the C++
-migration inherits them instead of re-deriving them.
+build and the static CUDA runtime must be in the tree first so the C++
+migration inherits them. `-static-libstdc++` (#82) is C-API-era only and is
+reverted in PR 1 (§3); v0.6.1 is the last release that carries it.
 
 ## 12. Milestones (no calendar — each gated on being right)
 
