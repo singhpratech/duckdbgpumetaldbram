@@ -272,9 +272,12 @@ No `gpu_pin`. The extension keeps a **residency manager** per database:
 When it sees a rewritable shape (§2) over a table whose size and estimated
 group count pass the §9.1 thresholds, and the needed columns are not
 resident, it records the shape and **returns the statement unchanged** (rule
-1: the first query pays nothing) while scheduling an upload of those columns
-on a background thread through a second connection on the same database
-instance. The second matching query
+1: the first query pays nothing). The **wrapper** then runs the upload
+(`SELECT gpu_upload_pair(...)`) on its own second cursor/thread — the
+extension stays free of threads and hidden connections, and
+`residency = 'manual' | 'eager' | 'background'` is a wrapper setting. The
+upload moves into the extension only if a CLI-side hook is ever upstreamed
+(§3.5). The second matching query
 finds them resident and is rewritten. `SET gpudb_residency = 'eager'` uploads
 on first sight instead (for scripts that know their workload);
 `'manual'` restores v0.6 behaviour (`gpu_upload_pair` only).
@@ -295,29 +298,49 @@ plans it served.
    (`CALL gpu_invalidate('t')`). The Appender API goes through the same
    connection object and is intercepted the same way. If the transaction
    rolls back, the set is simply re-uploaded next time — the safe direction.
-2. **Row-count check at rewrite time** (catches the Appender API and anything
-   else that bypasses the planner and adds or removes rows): the row count
-   visible to the *querying transaction* must equal the count at upload —
-   which makes this and (3) one check in practice.
+2. **Row-count check inside the rewritten statement — mandatory.** The
+   wrapper only sees its own connection; writers through other connections,
+   processes or clients are invisible to it. So every rewritten statement
+   carries the check itself: the resident table function takes the expected
+   row count and the wrapper passes `(SELECT count(*) FROM t)` as that
+   argument (stats-only on a base table in DuckDB, so it costs nothing). A
+   mismatch raises a typed error the wrapper catches, marks the set stale,
+   and re-runs the original text natively. Because the subquery evaluates
+   inside the querying transaction, this *is* the snapshot rule below,
+   with the C API and no transaction introspection. It is never optional:
+   without it rule 2 has a hole for any non-wrapper writer.
 3. **Transaction visibility.** An upload runs in its own transaction and
-   records the snapshot it read. A rewrite is applied only when the querying
-   transaction started after that upload committed, so a connection with an
-   older snapshot never sees newer resident data. The wrapper knows the
-   connection's transaction state (it sees `BEGIN`/`COMMIT`/`ROLLBACK`); if
-   that turns out insufficient in the spike, uploads are done synchronously
-   inside the first query under `'eager'` and the background path is
-   dropped — rule 2 beats rule 1.
+   records the row count it read. A rewrite is applied only when the
+   querying transaction's own `count(*)` (layer 2) equals it, so a
+   connection with an older or newer snapshot that differs in size never
+   sees mismatched resident data. Same-size, different-content snapshots
+   are the documented gap below; the wrapper additionally sees
+   `BEGIN`/`COMMIT`/`ROLLBACK` on its own connection and does not rewrite
+   inside a transaction that has written to the table.
 
-What is not caught: writes made through a *different* connection object
-that the wrapper does not own (a second process on the same database file,
-or a raw `duckdb.connect` next to the wrapped one) that keep the row count
-constant. KNOWN_ISSUES states it and the remedy (`CALL gpu_invalidate('t')`,
-or route all writes through the wrapper).
+What is not caught: writes made outside the wrapper (another connection,
+process or client) that change values **without changing the row count**.
+KNOWN_ISSUES states it and the remedy (`CALL gpu_invalidate('t')`, or route
+writes through the wrapper). Every other outside write is caught by layer 2.
 
-**Streams and cost of an upload.** Upload and query work run on separate
-device streams (CUDA streams; Metal command queues) with a completion event
-recorded at the end of the upload; a rewrite may consume a resident set only
-after that event reports complete. Today everything is on one stream. The
+**Concurrency — prerequisite of the background path.** Today
+`gpu_resident.cpp` holds one global mutex across an entire resident operator
+call (`gpu_groupby_extension.cpp`, `gpu_join_extension.cpp`), and the shared
+`HybridAggregator`'s backends keep non-thread-safe caches
+(`ensure_join_cache` / `ensure_sort_cache`). Fine with one connection and
+serialized calls; with a background upload on a second connection an SF50
+upload (its key sort is seconds) would hold the lock while the hit query
+blocks on it — the miss query never touches the lock, so rule 1 survives
+for the miss, but the hit would lose. Before any background upload lands:
+a short lock for registry lookup only; per-resident-set state
+`{uploading, ready, completion event}`; upload work on its own stream
+outside the global lock; a per-column (not global) mutex around the
+sort-cache build. This is shared-extension plus CUDA-backend work carried as
+one `feat/core-*` PR from the Linux instance; the Metal backend honours the
+same per-set lock. Upload and query work run on separate device streams
+(CUDA streams; Metal command queues) with a completion event recorded at
+the end of the upload; a rewrite may consume a resident set only after that
+event reports complete. Today everything is on one stream. The
 expensive part of an upload is not the host-to-device copy but the key sort
 (`ensure_join_cache`; SF100 keys are seconds), and it competes with the
 concurrent native query for host memory bandwidth and PCIe — so the
@@ -401,9 +424,12 @@ BENCHMARK.md gains, per backend, at SF1/SF10/SF50:
 - wrapper overhead: a plain `SELECT` (no `GROUP BY`) through `duckdb.connect`
   vs through `gpudb.connect` with `gpudb_transparent=false` vs transparent —
   rule 1 has to hold for statements that are never rewritten; and the
-  first-sighting cost of a `GROUP BY` statement (regex + parse round trip +
-  `gpu_rewrite_ast`, 0.15 ms measured) as its own row, with the statement
-  cache making every repeat free.
+    first-sighting cost of a `GROUP BY` statement (regex + parse round trip +
+  `gpu_rewrite_ast`, 0.15 ms measured) as its own row, measured on both
+  machines against the SF10 hit case and against a fall-through shape at
+  small size — the statement cache must make a fall-through statement cost
+  zero extra on its second execution, and the embedded `count(*)` check must
+  measure as zero on a base table.
 
 Thresholds in `hybrid_planner.cpp` for the transparent path are set from
 these tables, per backend, and the losing side of every sweep stays printed.
