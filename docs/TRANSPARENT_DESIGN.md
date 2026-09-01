@@ -1,8 +1,8 @@
 # v0.7 — transparent GPU execution (design)
 
 Status: proposal, 2026-09-01. Companion to `GROUPBY_RESIDENT_DESIGN.md` (v0.6).
-Carries the v0.6.1 maintenance release plan in §11 because v0.7's build
-migration inherits from it.
+Carries the v0.6.1 maintenance release plan in §11; its portable Linux
+build is the build every later release uses.
 
 ## 0. Two rules
 
@@ -21,10 +21,14 @@ handling a shape correctly.
 
 The end state a user sees:
 
-```sql
-LOAD gpudb;
--- that's it. Their existing SQL, unchanged, gets faster where it can.
+```python
+import gpudb                      # pip package: DuckDB + the gpudb extension + the rewrite
+con = gpudb.connect()             # same surface as duckdb.connect
+con.sql("SELECT l_orderkey, sum(l_quantity) FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300")
+# their existing SQL, unchanged, gets faster where it can; native otherwise.
 ```
+
+In the DuckDB CLI the explicit `gpu_*` functions remain the interface (§3.5).
 
 No `gpu_*` names, no `gpu_pin`, no cast to BIGINT. The v0.6 functions stay
 available as the explicit form and as the rewrite targets.
@@ -35,7 +39,7 @@ Five pieces, in dependency order:
 
 | # | Piece | Why it exists |
 |---|---|---|
-| A | **C++ extension API migration** (§3) | the optimizer hook does not exist in the C API |
+| A | **Parser-level rewrite through the C API** (§3): DuckDB's own `json_serialize_sql` / `json_deserialize_sql` plus a pure `gpu_rewrite_ast` function in the extension, driven by a thin client wrapper | no C++ API, no DuckDB-version coupling, nothing that can break the base extension |
 | B | **Exactness on the device** (§4): NULL-aware resident columns, 128-bit sums, DECIMAL as scaled integers, packed multi-column keys | rule 2 without fall-through |
 | C | **Automatic residency** (§5): the extension decides what to keep on the device, uploads in the background, and invalidates on writes | no `gpu_pin`; rule 1 even on the first query |
 | D | **The rewrite** (§6): `GROUP BY` with `WHERE`, `HAVING`, `ORDER BY … LIMIT`, over resident columns, with a device-side predicate mask | the user-visible feature |
@@ -78,65 +82,87 @@ GROUP BY k1 [, k2, k3]
   native above the rewritten node.
 
 Everything above the matched subtree (projection, aliases, joins to the
-result, further `ORDER BY`) is untouched; the replacement node reproduces the
-aggregate's column bindings (`ColumnBindingReplacer`).
+result, further `ORDER BY`, enclosing CTEs) is untouched; the replacement
+table-function reference exposes the same column names and aliases as the
+aggregate it replaces.
 
-## 3. C++ extension API migration (piece A)
+## 3. Where the rewrite happens: DuckDB's parser, through the C API (piece A)
 
-The DuckDB C API exposes no optimizer hook. `OptimizerExtension`
-(`duckdb/optimizer/optimizer_extension.hpp`; a struct holding an
-`optimize_function(OptimizerExtensionInput&, unique_ptr<LogicalOperator>&)`
-and an `optimizer_info`, appended to `DBConfig::optimizer_extensions` at load)
-is C++ only. It is not in the `duckdb.hpp` amalgamation either — the spike
-needs the DuckDB source tree, i.e. the `duckdb` submodule that
-`extension-ci-tools`' C++ template flow expects anyway.
+### 3.1 Constraint
+The loadable extension stays on the **stable C API**. No C++ extension API,
+no DuckDB source submodule, no per-DuckDB-version binaries, no internal
+classes. This was checked against the C API headers of v1.2 (vendored),
+v1.5.5 and DuckDB's `main` branch on 2026-09-01: the C API exposes no
+optimizer, planner or parser hook, and `main` adds none. The only
+interception mechanism it has — the replacement scan — fires only for table
+names that do not resolve, so it cannot touch a query over a real table.
 
-Consequences, accepted:
+### 3.2 The mechanism
+DuckDB exposes its own parser as SQL: `json_serialize_sql(sql)` returns the
+statement as a structured JSON tree (select list, table reference, group
+expressions, `HAVING` comparison, `ORDER BY`, `LIMIT`, `WHERE`, CTEs), and
+`json_deserialize_sql(json)` turns such a tree back into SQL. Both are plain
+SQL functions callable from any client and from the C API. The rewrite is
+therefore done on the **statement before DuckDB plans it**:
 
-- **Per-DuckDB-version binaries.** The community registry already builds and
-  serves per version (it serves v1.5.5 only today), so the C ABI's
-  forward-compatibility was not reaching users through that channel. Release
-  assets become per-version; the release checklist gains a DuckDB tag field.
-- **Community CI time** rises from ~1 min to the usual 15–25 min per platform
-  (DuckDB is compiled from the submodule). Every other C++ community
-  extension pays this.
-- **Local build.** `scripts/build.sh` gains `-DGPUDB_DUCKDB_SOURCE_DIR`
-  (default: the submodule). The loadable links no libduckdb — symbols
-  resolve from the host process (`-undefined dynamic_lookup` on macOS).
-- **`gpudb-sql`** (the embedded CLI the SQL test runner drives) stops
-  registering functions through the C API and `LOAD`s the freshly built
-  loadable instead. One registration path, not two.
-- **Removed in the same PR:** `third_party/duckdb_capi/`,
-  `src/extension/duckdb_loadable.cpp`, the C-API template `Makefile`
-  includes (replaced with the C++ template's).
-- **`-static-libstdc++` is reverted in this PR.** It is safe for the C-API
-  loadable (nothing C++ crosses the boundary) and is what v0.6.1 ships
-  (§11). It is *not* safe for a C++-API loadable: `unique_ptr<LogicalOperator>`,
-  `std::string`, exceptions and RTTI cross into the host's libstdc++, and two
-  copies in one process is a known source of typeinfo/exception mismatches.
-  The portable glibc floor for the C++ build comes from building in an
-  old-glibc container with dynamic libstdc++ — exactly what the community CI
-  does.
-- **Link options are re-applied to the template's target.** The C++
-  template's `build_loadable_extension` creates its own target; our
-  `--exclude-libs,ALL`, static CUDA runtime and the CUDA architecture list
-  must be attached to it, and the Linux instance runs
-  `make configure && make release && make test` in the community container
-  shape before PR 1 is opened.
-- **Which DuckDB versions get a CUDA release asset.** One container build and
-  one asset per version; DuckDB refuses a C++ extension whose footer version
-  does not match. v0.7 ships CUDA assets for the version the registry serves
-  and for the current `pip install duckdb` version when it differs (Colab's
-  pip lags releases); the release checklist lists both, and the quickstart
-  notebook selects the asset by `duckdb.__version__`.
-- **`get_duckdb_libs.sh` pins the submodule's tag.** `gpudb-sql` can only
-  `LOAD` a loadable built against the same DuckDB version it embeds.
+```
+statement text
+  → regex pre-check (GROUP BY present, table of interest)      ~0.001 ms
+  → json_serialize_sql                                          DuckDB's real parser
+  → gpu_rewrite_ast(json) → json    (pure function in the gpudb extension, C API scalar)
+  → json_deserialize_sql                                        DuckDB's real unparser
+  → the rewritten statement runs; the result is cached by statement text
+```
 
-This lands **alone** as PR 1 with the entire v0.6 verification surface green
-on both machines (unit, SQL suite, both parity scripts, registry-smoke
-probes, community `make configure && make release && make test`) and an
-audit pass of the shape used before the v0.6 tag. Nothing stacks on it until
-it is merged. It is the highest-risk step and it is isolated on purpose.
+Proven end to end on 2026-09-01 against the v0.6.0 build (Metal): a
+40-line rewriter over the serialized tree turned
+`SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300 ORDER BY q DESC LIMIT 10`
+into
+`SELECT "key" AS l_orderkey, sum AS q FROM gpu_groupby_sum_resident_having('lineitem', '>', 300) ORDER BY q DESC LIMIT 10`;
+native and rewritten returned identical rows (6M rows, 1.5M groups,
+`EXCEPT` both ways = 0), statement time 9–10 ms native vs 3–4 ms rewritten.
+The parse-and-serialize round trip costs 0.15 ms and is paid once per
+distinct statement text on a table of interest; every other statement pays
+the regex only.
+
+### 3.3 Where each part lives
+
+| Part | Lives in | Interface |
+|---|---|---|
+| `gpu_rewrite_ast(json VARCHAR) → VARCHAR`: matches the §2 shape on the serialized tree, consults residency (§5) and thresholds (§9.1), returns the rewritten tree or the input unchanged with a reason in `gpu_last_rewrite()` | the `gpudb` extension | C API scalar function; string in, string out; no DuckDB internals |
+| Kernels, resident columns, exactness (§4), residency manager (§5) | the `gpudb` extension | as today |
+| Interception: the statement has to pass through something before DuckDB executes it | a thin client wrapper: Python first (`import gpudb; con = gpudb.connect(...)`, same call surface as `duckdb.connect`), then Node, R, JDBC — each is ~100 lines that call the three SQL functions above | no DuckDB ABI at all |
+| DuckDB CLI | explicit `gpu_*` functions as in v0.6 (§3.5) | — |
+
+The rewriter never parses SQL text itself; every decision is made on the
+tree DuckDB produced, and the SQL that runs is the SQL DuckDB unparsed. A
+rewriter bug can only make one statement return an error (the wrapper then
+runs the original text natively and records the failure) — it cannot touch
+any other statement or the process.
+
+### 3.4 What this removes from the plan
+No C++ extension API migration; `third_party/duckdb_capi/` and
+`duckdb_loadable.cpp` stay; the community `Makefile` stays on the C-API
+template (1-minute builds, forward-compatible binaries, one release asset per
+platform regardless of DuckDB version); `-static-libstdc++` (#82) stays
+correct, since nothing C++ ever crosses the boundary; `gpudb-sql` and
+`get_duckdb_libs.sh` are unchanged. The C++ optimizer-hook design is kept in
+git history only.
+
+### 3.5 The CLI, and the upstream route
+The DuckDB CLI offers no place to intercept a statement, so CLI users keep
+the explicit v0.6 functions. Two routes close that gap later, neither
+blocking v0.7:
+
+1. **Upstream a C API hook.** Propose to DuckDB a statement-rewrite callback
+   on the *serialized* statement (`duckdb_add_statement_rewriter(db,
+   callback, data)`: JSON in, JSON or NULL out). It exposes no internal
+   class, matches machinery they already ship, and would serve any extension
+   that substitutes operators. If accepted, `gpu_rewrite_ast` plugs in
+   unchanged and the CLI is covered with the same C-API binary.
+2. **An optional, separate C++ shim extension** that only calls
+   `gpu_rewrite_ast` from an optimizer hook. Isolated so its per-version
+   breakage can never affect `gpudb`. Only if (1) is refused.
 
 ## 4. Exactness on the device (piece B)
 
@@ -242,12 +268,13 @@ claim.
 
 No `gpu_pin`. The extension keeps a **residency manager** per database:
 
-**What becomes resident.** The optimizer pass sees every plan. When it sees a
-rewritable shape (§2) over a table whose size and estimated group count pass
-the §9.1 thresholds, and the needed columns are not resident, it records the
-shape and **runs the query native** (rule 1: the first query pays nothing)
-while scheduling an upload of those columns on a background thread through a
-second connection on the same database instance. The second matching query
+**What becomes resident.** `gpu_rewrite_ast` sees every candidate statement.
+When it sees a rewritable shape (§2) over a table whose size and estimated
+group count pass the §9.1 thresholds, and the needed columns are not
+resident, it records the shape and **returns the statement unchanged** (rule
+1: the first query pays nothing) while scheduling an upload of those columns
+on a background thread through a second connection on the same database
+instance. The second matching query
 finds them resident and is rewritten. `SET gpudb_residency = 'eager'` uploads
 on first sight instead (for scripts that know their workload);
 `'manual'` restores v0.6 behaviour (`gpu_upload_pair` only).
@@ -260,12 +287,14 @@ plans it served.
 
 **Invalidation — the part that has to be right.** Three mechanisms, layered:
 
-1. **DML seen in the optimizer.** `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
-   `COPY … FROM`, `CREATE OR REPLACE`, `ALTER`, `DROP` all pass through the
-   optimizer as logical plans naming their target table. The pass marks every
-   resident set on that table invalid *before* the statement executes. If the
-   transaction rolls back, the set is simply re-uploaded next time — the
-   safe direction.
+1. **DML seen by the wrapper.** Every statement passes through the wrapper
+   before DuckDB executes it; `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`,
+   `COPY … FROM`, `CREATE OR REPLACE`, `ALTER`, `DROP` naming a table with a
+   resident set are recognised on the serialized tree (never by text
+   matching) and the set is marked invalid *before* the statement executes
+   (`CALL gpu_invalidate('t')`). The Appender API goes through the same
+   connection object and is intercepted the same way. If the transaction
+   rolls back, the set is simply re-uploaded next time — the safe direction.
 2. **Row-count check at rewrite time** (catches the Appender API and anything
    else that bypasses the planner and adds or removes rows): the row count
    visible to the *querying transaction* must equal the count at upload —
@@ -273,14 +302,17 @@ plans it served.
 3. **Transaction visibility.** An upload runs in its own transaction and
    records the snapshot it read. A rewrite is applied only when the querying
    transaction started after that upload committed, so a connection with an
-   older snapshot never sees newer resident data. (Verified in the spike;
-   if the C++ API does not expose what is needed, uploads are done
-   synchronously inside the first query's transaction under `'eager'` and
-   the background path is dropped — rule 2 beats rule 1.)
+   older snapshot never sees newer resident data. The wrapper knows the
+   connection's transaction state (it sees `BEGIN`/`COMMIT`/`ROLLBACK`); if
+   that turns out insufficient in the spike, uploads are done synchronously
+   inside the first query under `'eager'` and the background path is
+   dropped — rule 2 beats rule 1.
 
-What is not caught: in-place updates through a non-SQL path that keeps the
-row count constant. DuckDB has no such public path today; KNOWN_ISSUES says
-so and says what to do if one appears (`CALL gpu_invalidate('t')`).
+What is not caught: writes made through a *different* connection object
+that the wrapper does not own (a second process on the same database file,
+or a raw `duckdb.connect` next to the wrapped one) that keep the row count
+constant. KNOWN_ISSUES states it and the remedy (`CALL gpu_invalidate('t')`,
+or route all writes through the wrapper).
 
 **Streams and cost of an upload.** Upload and query work run on separate
 device streams (CUDA streams; Metal command queues) with a completion event
@@ -299,26 +331,27 @@ is what lets v0.8 route joins through the same manager (§10).
 
 ## 6. The rewrite (piece D)
 
-`OptimizerExtension` pass, before DuckDB's own optimizers so that our node is
-in place for the rest of the pipeline (filter pushdown, top-N, projection
-pruning see a `LogicalGet` with known cardinality and sorted-by-key
-property). Steps:
+`gpu_rewrite_ast` over the serialized statement:
 
-1. Match the §2 subtree bottom-up; on the first non-matching node, stop.
-   Measured cost for an unmatched plan is under 0.05 ms (unit test over
-   10,000 plans).
-2. Check residency (§5) and the thresholds (§9.1); on a miss, record and
-   return the plan untouched.
-3. Build the replacement: a `LogicalGet` over the C++ `TableFunction` for the
-   resident operator with bind data `{resident set, predicate program,
-   aggregates, filter, top-k}`; the function reports cardinality
-   (`groups_total` after first run, DuckDB's distinct estimate before) and
-   the sorted-by-key property. Rewire bindings with `ColumnBindingReplacer`.
-4. `EXPLAIN` shows `GPU_GROUPBY (resident: t.k,t.v; predicate: …; having: …;
-   topk: …)`. `SET gpudb_explain_rewrites = true` logs, for every candidate,
-   whether it was rewritten and if not why (shape / not resident / threshold
-   / stale / budget), which is also what the gate parses.
-5. `SET gpudb_transparent = false` disables the pass entirely.
+1. Walk the tree for the §2 shape; on the first non-matching node, return
+   the input unchanged. Unmatched trees cost under 0.05 ms in the function
+   (unit test over 10,000 statements); statements that never reach it cost
+   the wrapper's regex only.
+2. Check residency (§5) and thresholds (§9.1); on a miss, record the shape
+   and return unchanged.
+3. Build the replacement tree: the base-table reference becomes a
+   `TABLE_FUNCTION` reference to the resident operator with constant
+   arguments `{resident set, predicate program, aggregates, filter, top-k}`;
+   select-list expressions are remapped to the function's output columns
+   with the user's aliases preserved; `GROUP BY`/`HAVING`/pushed `ORDER BY
+   … LIMIT` are removed; everything else in the tree (CTEs, projections,
+   further `ORDER BY`, joins to the result) is left as is.
+4. `gpu_last_rewrite()` reports, for the last statement seen, whether it
+   was rewritten and if not why (shape / not resident / threshold / stale /
+   budget), which is also what the gate parses. `EXPLAIN` of the rewritten
+   statement shows the `gpu_*` table function in the plan.
+5. `SET gpudb_transparent = false` makes the wrapper pass every statement
+   through untouched (a config option registered through the C API).
 
 `gpu_last_stats()` gains the plan-level fields (rewritten yes/no, reason,
 residency hit/miss, predicate rows in/out).
@@ -338,19 +371,21 @@ The CPU reference backend implements every one of these first, in plain C++,
 and is the oracle the two GPU backends are checked against in unit tests
 before parity against native.
 
-## 8. Spike before the rest
+## 8. Spike
 
-Two things are unknown until tried and both are answered by one spike on the
-C++ API with the source submodule:
+The plan-surgery spike in the previous revision is no longer needed: the
+parser-level rewrite was run end to end on 2026-09-01 (§3.2). What remains
+to confirm before piece C/D is written, on the same throwaway branch:
 
-1. Plan surgery: rewrite the plain `GROUP BY k, sum(v)` shape, get `EXPLAIN`
-   and parity green, confirm `ColumnBindingReplacer` handles parents.
-2. Invalidation hooks: confirm DML plans reach the optimizer with their
-   target table, and what transaction/snapshot information the C++ API
-   exposes to the pass (§5.3).
+1. The serialized tree for every §2 construct (`WHERE` conjunctions,
+   multi-column keys, `count(*)`, `min`/`max`/`avg`, DECIMAL literals,
+   CTEs wrapping the shape) and that `json_deserialize_sql` reproduces each
+   rewritten form.
+2. The wrapper's statement cache and the invalidation path (§5.1) with
+   multi-statement strings, prepared statements with parameters, and
+   transactions.
 
-The spike is throwaway code on a branch; its findings update this document
-before piece C/D are written.
+Findings update this document before implementation.
 
 ## 9. The gate (piece E)
 
@@ -363,10 +398,12 @@ BENCHMARK.md gains, per backend, at SF1/SF10/SF50:
 - validity-bitmap and two-limb overheads on NULL-free vs 10%-NULL columns,
   and the two-limb path forced on;
 - mask variant (a) vs (b) across the selectivity sweep;
-- optimizer-pass overhead: a plain `SELECT` (no `GROUP BY`) native vs
-  `LOAD gpudb` with `gpudb_transparent=false` vs transparent — rule 1 has
-  to hold for queries the pass never rewrites, and the §6.1 bound includes
-  the residency lookup and the DML scan.
+- wrapper overhead: a plain `SELECT` (no `GROUP BY`) through `duckdb.connect`
+  vs through `gpudb.connect` with `gpudb_transparent=false` vs transparent —
+  rule 1 has to hold for statements that are never rewritten; and the
+  first-sighting cost of a `GROUP BY` statement (regex + parse round trip +
+  `gpu_rewrite_ast`, 0.15 ms measured) as its own row, with the statement
+  cache making every repeat free.
 
 Thresholds in `hybrid_planner.cpp` for the transparent path are set from
 these tables, per backend, and the losing side of every sweep stays printed.
@@ -396,11 +433,12 @@ machines, output pasted into BENCHMARK.md unedited. The first-query case
 runs native — the gate confirms the background upload does not steal from it.
 
 ### 9.4 Community path
-`make configure && make release && make test` via the C++ template on Linux
-(CPU-only, as the registry builds) plus the registry-smoke workflow with a
-transparent probe (`EXPLAIN` contains the GPU node after `LOAD gpudb` on the
-registry binary — the CPU backend rewrites too, at CPU-appropriate
-thresholds, so the community binary demonstrates the mechanism).
+Unchanged C-API template path (`make configure && make release && make
+test`) on Linux plus the registry-smoke workflow with a rewrite probe:
+`SELECT gpu_rewrite_ast(json_serialize_sql(...))` on the registry binary
+returns the table-function form, and `json_deserialize_sql` of it executes
+— the CPU backend rewrites too, at CPU-appropriate thresholds, so the
+community binary demonstrates the mechanism without a wrapper.
 
 ## 10. v0.8, designed for now
 
@@ -413,7 +451,7 @@ thresholds, so the community binary demonstrates the mechanism).
   rows). New kernel, both backends.
 - **Window functions** over resident sorted columns (`WINDOW_FUNCTIONS_DESIGN.md`).
 
-## 11. v0.6.1 — maintenance release (before PR 1)
+## 11. v0.6.1 — maintenance release (first)
 
 Packaging only. No operator changes.
 
@@ -462,23 +500,25 @@ community CI); this concerns the CUDA release asset only.
 5. README "Requirements": Linux asset glibc floor + CUDA 12.8/driver line;
    the CUDA-13 note moves to "building from source".
 
-**Why before PR 1.** PR 1 changes how the loadable is built. The container
-build and the static CUDA runtime must be in the tree first so the C++
-migration inherits them. `-static-libstdc++` (#82) is C-API-era only and is
-reverted in PR 1 (§3); v0.6.1 is the last release that carries it.
+**Why first.** The container build, the static CUDA runtime and
+`-static-libstdc++` (#82) are the portable Linux build for every release
+from here on — the loadable stays on the C API (§3.4), so nothing C++ ever
+crosses into DuckDB and the static runtime remains correct.
 
 ## 12. Milestones (no calendar — each gated on being right)
 
 | # | Deliverable | Gate |
 |---|---|---|
 | 0 | v0.6.1 (§11) | user go per step |
-| 1 | C++ API migration, C API removed, full v0.6 verification + audit | PR, user review |
-| 2 | Spike (§8): plain `GROUP BY` rewrite + invalidation hooks confirmed; this doc updated | findings written down |
+| 1 | Spike remainder (§8): tree shapes for every §2 construct, wrapper cache + invalidation with transactions/prepared statements; this doc updated | findings written down |
+| 2 | `gpu_rewrite_ast` for the plain `GROUP BY` shape + the Python wrapper, three-way parity on the v0.6 operators as they are | PR |
 | 3 | Exactness (§4): CPU reference first, then Metal + CUDA in parallel; unit + parity | per-kernel PRs |
 | 4 | Residency manager (§5): budget, eviction, three-layer invalidation, write-scenario parity | PR |
-| 5 | Rewrite (§6): full §2 shape, `EXPLAIN`, settings, `gpu_last_stats` fields | PR |
-| 6 | Gate (§9): sweeps, thresholds, `transparent_gate.sh` all ≥ 1.0× on both machines, BENCHMARK/KNOWN_ISSUES rows | PR |
-| 7 | Audit (v0.6 shape), tag v0.7.0, registry bump | user go per step |
+| 5 | Full §2 shape in the rewriter, `gpu_last_rewrite`, settings, `gpu_last_stats` fields; Node/R/JDBC wrappers | PR |
+| 6 | Gate (§9): sweeps, thresholds, `transparent_gate.sh` all ≥ 1.0× on both machines, BENCHMARK/KNOWN_ISSUES rows | PR; gate must be all ≥ 1.0× |
+| 7 | Audit (v0.6 shape), tag v0.7.0, registry bump, `pip` package release | user go per step |
+| — | Upstream proposal for a C API statement-rewrite hook (§3.5) | drafted after milestone 2 proves the interface; user sign-off before anything is posted |
 
 Milestones 3 and 4 run in parallel across the two machines; 1, 2, 5, 6 are
-shared-file work and go one at a time.
+shared-file work and go one at a time. The loadable extension's build,
+ABI and release shape do not change at any milestone.
