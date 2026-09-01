@@ -214,3 +214,4 @@ Composite keys (pack into one BIGINT for now), `GROUP BY` over join results
 as a fused op, resident f64 min/max, and transparent operator substitution
 via a DuckDB optimizer extension so plain `GROUP BY` SQL routes here without
 calling `gpu_*` functions.
+The v0.7 design is in `TRANSPARENT_DESIGN.md`.
