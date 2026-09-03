@@ -89,12 +89,30 @@ def run():
         gdesc = con.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else []
         check([(r[0], r[1]) for r in gdesc] == [(r[0], r[1]) for r in ndesc],
               f"{name}: names/types {[(r[0], r[1]) for r in gdesc]}")
+    print("== scalar renderer vs reference renderer (same rows, names, types)")
+    if con._has_rewrite_scalar:
+        py = fresh()
+        py._has_rewrite_scalar = False
+        for name, sql in cases.items():
+            if name == "explain":
+                continue
+            a = con.execute(sql).fetchall(); la = con.last_rewrite()
+            b = py.execute(sql).fetchall(); lb = py.last_rewrite()
+            da = con.execute("DESCRIBE " + la["sql"]).fetchall() if la["rewritten"] else None
+            db = py.execute("DESCRIBE " + lb["sql"]).fetchall() if lb["rewritten"] else None
+            check(la["engine"] == "scalar" and lb["engine"] == "python" and a == b and da == db
+                  and la["form"] == lb["form"],
+                  f"{name}: scalar={la['engine']}/{la['form']} python={lb['engine']}/{lb['form']} agree")
+        py.close()
+    else:
+        print("  (gpu_rewrite_ast not in this build; reference renderer only)")
     # cache hit pays no round trip
     con.execute(cases["plain"]).fetchall()
     check(con.last_rewrite()["round_trip_ms"] < 0.2, "template cache hit: no catalog work")
     con.execute("SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > 14100 ORDER BY k").fetchall()
-    check(con.last_rewrite()["rewritten"] and "14100" in con.last_rewrite()["sql"],
-          "literal change re-renders from the cached template")
+    check(con.last_rewrite()["rewritten"] and "14100" in con.last_rewrite()["sql"]
+          and con.last_rewrite()["engine"] == "python" and con.last_rewrite()["round_trip_ms"] < 0.5,
+          "literal change re-renders from the cached template without the scalar")
     for name in ("topk_desc", "topk_asc", "topk_default"):
         con.execute(cases[name]).fetchall()
         check(con.last_rewrite()["form"] == "topk", f"{name}: pushed as top-k")

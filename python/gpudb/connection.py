@@ -3,6 +3,7 @@ every statement passing through classification, name resolution, the
 template cache and the rewrite before DuckDB sees it."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
@@ -38,6 +39,8 @@ class Decision:
     tag: str = ""
     upload_sql: str = ""
     form: str = ""
+    literals: Tuple[str, ...] = ()     # literal values of the template this was decided on
+    scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
 
 
 @dataclass
@@ -50,9 +53,22 @@ class LastRewrite:
     sql: str = ""
     fallback: bool = False       # rewritten statement raised GPUDB_STALE, native re-run
     round_trip_ms: float = 0.0
+    engine: str = ""             # 'scalar' (gpu_rewrite_ast) | 'python' (reference renderer)
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
+
+
+def _num(x: Optional[str]):
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except ValueError:
+        try:
+            return float(x)
+        except ValueError:
+            return None
 
 
 def _find_extension(explicit: Optional[str]) -> Optional[str]:
@@ -366,10 +382,12 @@ class Connection:
             self._last.reason = "shape"
             return None
         t0 = time.perf_counter()
-        key = (self._normalise(sql), self._settings_key)
+        template, literals = self._normalise(sql)
+        key = (template, self._settings_key)
         d = self._cache.get(key)
         if d is None:
             d = self._decide(sql)
+            d.literals = literals
             self._cache[key] = d
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if not d.rewritten:
@@ -389,15 +407,21 @@ class Connection:
             if not self._manager.is_ready(d.tag):
                 self._last.reason = "not_resident"
                 return None
-        # literals may differ from the cached template: re-render from the
-        # current statement's tree (cheap: one serialize, no catalog work)
-        plan = d.plan
-        if plan.having is not None or plan.limit is not None:
-            plan = self._replan_literals(sql, plan)
-            if plan is None:
-                self._last.reason = "shape"
-                return None
-        out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+        if d.scalar_sql and literals == d.literals:
+            out = d.scalar_sql
+            self._last.engine = "scalar"
+        else:
+            # literals differ from the cached template (or no scalar): re-render
+            # from the current statement's tree with the reference renderer
+            # (one serialize, no catalog work, no scalar call)
+            plan = d.plan
+            if literals != d.literals and (plan.having is not None or plan.limit is not None):
+                plan = self._replan_literals(sql, plan)
+                if plan is None:
+                    self._last.reason = "shape"
+                    return None
+            out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+            self._last.engine = "python"
         self._last.rewritten = True
         self._last.sql = out
         return out
@@ -416,8 +440,13 @@ class Connection:
         return False
 
     @staticmethod
-    def _normalise(sql: str) -> str:
-        return _WS_RE.sub(" ", _LITERAL_RE.sub(lambda m: "'?'" if m.group(1) else "?", sql)).strip()
+    def _normalise(sql: str) -> Tuple[str, Tuple[str, ...]]:
+        lits: List[str] = []
+
+        def sub(m):
+            lits.append(m.group(0))
+            return "'?'" if m.group(1) else "?"
+        return _WS_RE.sub(" ", _LITERAL_RE.sub(sub, sql)).strip(), tuple(lits)
 
     def _serialize(self, sql: str) -> str:
         return self._raw.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0]
@@ -456,10 +485,13 @@ class Connection:
         if nrows < self._floor_rows:
             return Decision(False, "threshold")
         # NULLs and the overflow bound from zonemap statistics
+        stats: Dict[str, Dict[str, Any]] = {}
         for col in plan.upload_columns:
             st = _resolve.column_stats(self._raw, ident, col)
             if st is None or st.has_null:
                 return Decision(False, "nulls")
+            stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+                          "approx_unique": st.approx_unique}
             if col == plan.val and plan.needs_sum:
                 try:
                     bound = max(abs(float(st.min)), abs(float(st.max))) * (10 ** plan.scale)
@@ -478,8 +510,47 @@ class Connection:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
         plan.tag = ident.tag(plan.upload_columns)
-        return Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
-                        upload_sql=_rewrite.upload_sql(plan, ident.fqn), form=plan.form)
+        d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
+                     upload_sql=_rewrite.upload_sql(plan, ident.fqn), form=plan.form)
+        if self._has_rewrite_scalar:
+            # The extension's pure scalar is the authority on the decision and
+            # renders the statement for these literals; `ready` is passed as
+            # true because residency is enforced here, not in the scalar, and
+            # the decision must not depend on it.
+            ctx = {
+                "tag": plan.tag,
+                "table": {"catalog": ident.catalog, "schema": ident.schema, "name": ident.table,
+                          "oid": ident.oid},
+                "columns": {c: {"type": t, "scale": (_rewrite.decimal_scale(t) or (0, 0))[1]}
+                            for c, t in ident.columns.items()},
+                "backend": self._backend, "rows": nrows, "ready": True,
+                "default_order": "DESC" if self._settings["default_order"].upper().startswith("DESC") else "ASC",
+                "default_null_order": self._settings["default_null_order"],
+                "default_collation": self._settings["default_collation"],
+                "outputs": [{"name": o.name, "type": o.native_type} for o in plan.outputs],
+                "thresholds": {"min_rows": self._floor_rows},
+                "stats": stats,
+            }
+            try:
+                tree = self._serialize(sql)
+                row = self._raw.execute(
+                    "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
+                    [tree, json.dumps(ctx)]).fetchone()
+                info = (json.loads(row[0]).get("gpudb") or {})
+            except Exception as e:
+                self._log(f"gpu_rewrite_ast failed: {e}")
+                return Decision(False, "error")
+            if not info.get("rewritten"):
+                if info.get("reason") in ("not_resident", "threshold"):
+                    pass                       # static checks passed; residency is ours
+                else:
+                    self._log(f"scalar declined ({info.get('reason')}: {info.get('detail', '')}); "
+                              f"reference matcher accepted — following the scalar")
+                    return Decision(False, info.get("reason") or "shape")
+            else:
+                d.scalar_sql = row[1]
+                d.form = info.get("form") or d.form
+        return d
 
 
 def connect(database: str = ":memory:", read_only: bool = False, config: Optional[dict] = None,
