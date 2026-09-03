@@ -687,6 +687,14 @@ v0.8 route joins through the same manager (§10).
    `transaction` / `too_long` / `double`), which is also what the gate
    parses. `EXPLAIN` of the rewritten statement shows the `gpu_*` table
    function in the plan.
+   Two forms the reference renderer and the scalar both produce, settled
+   while building them (2026-09-03): a `HAVING count(*) <cmp> n` beside
+   `sum(v)` uses the SUM function and carries the count predicate in the
+   outer `WHERE (gd.ok AND r.count <cmp> n)`; an `ORDER BY <ordinal>` is
+   resolved to the select-list item and pushed as top-k when it names the
+   aggregate with a known direction and a `LIMIT`. Reason order in the
+   scalar: shape, backend, nulls, overflow, threshold, not_resident — a
+   shape miss is reported as `shape` even when the set is not ready.
 5. Settings are wrapper-side: `gpudb.connect(transparent=True,
    residency='background', memory_budget=None, floor_rows=None)` and
    `con.gpudb.transparent = False` at runtime. For scripts, the wrapper also
