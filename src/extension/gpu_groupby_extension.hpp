@@ -6,7 +6,11 @@
 #include "duckdb.h"
 #endif
 
+#include <memory>
+
 namespace gpudb_ext {
+
+class ResidentContext;
 
 // Register the v0.6 resident GROUP BY / top-k table functions:
 //   gpu_groupby_sum_resident(name)      -> (key BIGINT, sum BIGINT, count BIGINT)
@@ -18,6 +22,6 @@ namespace gpudb_ext {
 // count / top-k functions, a plain gpu_upload column name. Rows come out
 // sorted by key ascending (group by) or in the requested order (top-k).
 // Called by register_gpu_sum. Implementation: gpu_groupby_extension.cpp.
-void register_gpu_groupby(duckdb_connection con);
+void register_gpu_groupby(duckdb_connection con, const std::shared_ptr<ResidentContext>& ctx);
 
 } // namespace gpudb_ext

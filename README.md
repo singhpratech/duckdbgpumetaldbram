@@ -132,7 +132,27 @@ SELECT gpu_resident_info('sales');                       -- dtype / rows / devic
 SELECT gpu_last_stats();                                 -- which backend ran + kernel time
 SELECT gpu_build_info();                                 -- which backends this binary carries
 SELECT gpu_drop_resident('sales');                       -- free device memory
+
+-- v0.7 registry (milestone 0b): every resident set, with identity, state, size, hits
+SELECT * FROM gpu_residents();
+SELECT gpu_prepare_resident('l');          -- build the sort cache now instead of on the first GROUP BY
+SELECT gpu_invalidate('l');                -- mark a set stale (exact name, or an identity-tag prefix)
+-- staleness guard for a rewritten statement: raises "GPUDB_STALE: ..." unless the
+-- table still has the row count the upload saw; the one-row derived table runs once
+SELECT r.key, r.sum
+FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:lineitem:1:l_orderkey,l_quantity') r,
+     (SELECT gpu_assert_rows('gpudb:v1:memory:main:lineitem:1:l_orderkey,l_quantity', count(*)) AS ok
+      FROM lineitem) gd
+WHERE gd.ok;
 ```
+
+A set name of the form `gpudb:v1:<catalog>:<schema>:<table>:<table_oid>:<col1>[,<col2>…][:<extra>]`
+is an **identity tag**: the set is `managed` (what the v0.7 transparent path
+consumes), its fields show in `gpu_residents()`, and it is prepared at upload
+so the first query pays no sort. Any other name is an `explicit` set with the
+v0.6 behaviour. A pair is one registry entry (`'l.k'` / `'l.v'` address its
+columns), an operator call keeps its set alive until it finishes, and uploads
+never block queries on another connection.
 
 ⚠️ **One footgun:** in a single-statement upload-and-query, the outer query
 must reference the upload's result column (e.g. `SELECT u.n, gpu_sum_resident('x') FROM (SELECT gpu_upload('x', col) AS n FROM t) u`) —
@@ -349,6 +369,7 @@ resident-surface coverage in the community-CI sqllogic suite.
 - [x] [Community Extensions PR #2503](https://github.com/duckdb/community-extensions/pull/2503) **merged** (2026-08-17) — the registry now serves **v0.4.0**, resident-column surface included.
 
 ### In flight
+- [x] **v0.7 milestone 0b — residency prerequisite** (PR): the resident registry keyed per database with identity tags and origin, per-set state (`ready` = uploaded *and* prepared, `stale`, epoch, hits, references), `gpu_residents()`, `gpu_assert_rows()` as the in-statement staleness guard, `gpu_invalidate()`, `gpu_prepare_resident()`; a lock-free `gpu_upload` update path (the one contended atomic it had cost a 60M-row upload 1.8 s → 0.36 s and starved concurrent native queries 3–7×), segmented host buffers with no combine copy, and on CUDA the pair split on the device and uploads on the column's own stream. `scripts/residency_gate.sh` measures a native statement during a concurrent upload against DuckDB's own `list()` as the control. Design: [docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md) §5.3–§5.6.
 - [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` shows what any given binary carries).
 
 ### Next (v0.7.0 — directional)

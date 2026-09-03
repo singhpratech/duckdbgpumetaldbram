@@ -19,6 +19,9 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
 #include <vector>
 
 void test_hashjoin();
@@ -793,6 +796,121 @@ void test_cuda_device_fault_is_an_error() {
 }
 #endif
 
+
+// ---------------------------------------------------------------------------
+// ResidentColumn::prepare() (v0.7 milestone 0b, docs/TRANSPARENT_DESIGN.md
+// §5.5/§5.6): ready = uploaded AND prepared; prepare is idempotent, safe to
+// call concurrently with itself and with uploads on other threads, and
+// changes no answer. Runs through the hybrid aggregator so the CPU-only
+// build exercises the defaults (nothing to prepare) and the CUDA build
+// exercises the real sort cache.
+// ---------------------------------------------------------------------------
+void test_resident_prepare() {
+    std::printf("\n--- ResidentColumn::prepare / concurrent upload ---\n");
+    auto h = gpudb::make_hybrid_aggregator();
+    const bool on_gpu = h->gpu_backend() != gpudb::Backend::CPU;
+    std::printf("  gpu_backend: %s\n", gpudb::to_string(h->gpu_backend()));
+
+    std::mt19937_64 rng(0x9E7ULL);
+    const std::size_t N = 2'000'003;
+    std::vector<std::int64_t> keys(N), vals(N);
+    std::uniform_int_distribution<std::int64_t> kd(-50'000, 50'000), vd(-1'000, 1'000);
+    for (std::size_t i = 0; i < N; ++i) { keys[i] = kd(rng); vals[i] = vd(rng); }
+    const std::size_t cap = std::size_t(100) * 1000000;
+
+    // Lazy path (v0.6 behaviour) is the reference.
+    auto k_lazy = h->upload_i64(keys.data(), N);
+    auto v_lazy = h->upload_i64(vals.data(), N);
+    auto ref = h->groupby_sum_resident_i64(*k_lazy, *v_lazy, cap);
+
+    // Eager path: prepared before any operator ran.
+    auto k = h->upload_i64(keys.data(), N);
+    auto v = h->upload_i64(vals.data(), N);
+    if (on_gpu) {
+        EXPECT(!k->prepared());                       // CUDA: nothing derived yet
+        EXPECT_EQ(k->resident_bytes(), N * 8);
+    } else {
+        EXPECT(k->prepared());                        // CPU: nothing to derive
+    }
+    k->prepare();
+    EXPECT(k->prepared());
+    if (on_gpu) EXPECT_EQ(k->resident_bytes(), N * 8 * 3);   // + sorted copy + perm
+    const std::size_t bytes_after = k->resident_bytes();
+    k->prepare();                                      // idempotent
+    EXPECT_EQ(k->resident_bytes(), bytes_after);
+
+    auto got = h->groupby_sum_resident_i64(*k, *v, cap);
+    EXPECT_EQ(got.keys.size(), ref.keys.size());
+    bool same = got.keys == ref.keys && got.sums == ref.sums && got.counts == ref.counts;
+    EXPECT(same);
+
+    // Two threads preparing the SAME column race on the per-column lock:
+    // exactly one build, both observe prepared, no throw.
+    {
+        auto c = h->upload_i64(keys.data(), N);
+        std::atomic<int> failures{0};
+        auto worker = [&] {
+            try { c->prepare(); if (!c->prepared()) failures++; }
+            catch (const std::exception&) { failures++; }
+        };
+        std::thread t1(worker), t2(worker), t3(worker);
+        t1.join(); t2.join(); t3.join();
+        EXPECT_EQ(failures.load(), 0);
+        EXPECT_EQ(c->resident_bytes(), bytes_after);
+    }
+
+    // Uploads + prepares on four threads while this thread runs operators
+    // (serialized, as the extension's device lock does): the operator
+    // answers never change and nothing throws. This is the shape of the
+    // background upload the wrapper drives on a second connection.
+    {
+        std::atomic<int> failures{0};
+        std::atomic<bool> stop{false};
+        const std::size_t M = 400'009;
+        std::vector<std::thread> uploaders;
+        for (int t = 0; t < 4; ++t) {
+            uploaders.emplace_back([&, t] {
+                std::mt19937_64 r(0xABC + t);
+                std::vector<std::int64_t> kk(M), vv(M);
+                std::uniform_int_distribution<std::int64_t> d(-999, 999);
+                for (std::size_t i = 0; i < M; ++i) { kk[i] = d(r); vv[i] = d(r); }
+                for (int it = 0; it < 6 && !stop.load(); ++it) {
+                    try {
+                        auto ck = h->upload_i64(kk.data(), M);
+                        auto cv = h->upload_i64(vv.data(), M);
+                        ck->prepare();
+                        if (!ck->prepared()) failures++;
+                    } catch (const std::exception& e) {
+                        std::printf("    uploader %d: %s\n", t, e.what());
+                        failures++;
+                    }
+                }
+            });
+        }
+        int ops = 0;
+        bool ok = true;
+        for (int i = 0; i < 40 && ok; ++i) {
+            try {
+                auto g = h->groupby_sum_resident_i64(*k, *v, cap);
+                ok = g.keys == ref.keys && g.sums == ref.sums && g.counts == ref.counts;
+                auto tk = h->topk_resident(*v, 10, true);
+                ok = ok && tk.idx.size() == 10;
+                ++ops;
+            } catch (const std::exception& e) {
+                std::printf("    operator: %s\n", e.what());
+                ok = false;
+            }
+        }
+        stop.store(true);
+        for (auto& th : uploaders) th.join();
+        EXPECT(ok);
+        EXPECT_EQ(failures.load(), 0);
+        std::printf("  %d operator calls during 4 concurrent upload+prepare threads: %s\n",
+                    ops, ok ? "stable" : "MISMATCH");
+    }
+    std::printf("  ok\n");
+}
+
 int main(int argc, char** argv) {
 #if GPUDB_HAVE_CUDA && defined(__linux__)
     if (argc > 1 && std::string(argv[1]) == "--cuda-fault-child") return cuda_fault_child();
@@ -815,6 +933,7 @@ int main(int argc, char** argv) {
 
     test_hybrid_aggregator();
     test_hybrid_groupby();
+    test_resident_prepare();
     test_hashjoin();
 
 #if GPUDB_HAVE_CUDA && defined(__linux__)
