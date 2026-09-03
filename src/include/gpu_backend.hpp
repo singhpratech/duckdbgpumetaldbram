@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -188,6 +189,30 @@ public:
     [[nodiscard]] virtual Backend     backend_tag() const noexcept = 0;
     [[nodiscard]] virtual Dtype       dtype()       const noexcept = 0;
     [[nodiscard]] virtual std::size_t rows()        const noexcept = 0;
+
+    // ---- v0.7 milestone 0b: readiness (docs/TRANSPARENT_DESIGN.md §5.5) ----
+    // Backends may keep derived structures on a column (CUDA: the sorted-key
+    // + permutation cache every GROUP BY / join / top-k call needs). Those
+    // are built lazily on first use today, which makes the FIRST query after
+    // an upload pay seconds of sorting. prepare() builds them ahead of time,
+    // on the backend's own stream/queue, and returns only when they are
+    // complete and visible to every other stream (no event handshake is
+    // needed by the caller). Contract:
+    //   * idempotent and thread-safe: concurrent prepare() calls on one
+    //     column serialize on a per-column lock, the second is a no-op;
+    //   * throws std::runtime_error on failure (device OOM, fault) and
+    //     leaves the column usable — operators then build lazily as before;
+    //   * prepared() reports whether the derived structures exist. A column
+    //     with nothing to derive (CPU) is prepared from birth.
+    // resident_bytes() is the backend memory the column holds INCLUDING any
+    // derived structures — the number a device memory budget accounts for.
+    // Defaults keep every existing backend building unchanged (CPU has
+    // nothing to prepare; Metal overrides when its perm cache moves here).
+    virtual void prepare() {}
+    [[nodiscard]] virtual bool prepared() const noexcept { return true; }
+    [[nodiscard]] virtual std::size_t resident_bytes() const noexcept {
+        return rows() * 8;   // i64 and f64 are both 8 bytes wide
+    }
 };
 
 // Minimal aggregator surface for week 1.
@@ -217,6 +242,53 @@ public:
     virtual AggResult min_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult max_resident_i64(const ResidentColumn&) = 0;
     virtual AggResult sum_resident_f64(const ResidentColumn&) = 0;
+
+    // ---- v0.7 milestone 0b: pair upload without a host de-interleave ----
+    // gpu_upload_pair buffers (key, payload) INTERLEAVED in fixed-size
+    // segments — kv[2i] is the key, kv[2i+1] the payload's raw 8 bytes
+    // (int64, or the IEEE-754 bits of a double when vdt == F64) — and never
+    // concatenates them on the host. Splitting the pair into two columns on
+    // the host would materialise two more copies of the data (page-faulted,
+    // then read back by the H2D copy): ~1 GB of transient host memory and
+    // ~0.5 s of one core on a 60M-row upload. Backends that can split on the
+    // device override this (CUDA: one H2D per segment into a staging buffer,
+    // one kernel); the default keeps every existing backend correct by
+    // concatenating and de-interleaving on the host.
+    struct KvSpan {
+        const std::int64_t* kv = nullptr;   // 2 * rows lanes
+        std::size_t         rows = 0;
+    };
+    struct ResidentPair {
+        std::unique_ptr<ResidentColumn> keys;
+        std::unique_ptr<ResidentColumn> vals;
+    };
+    virtual ResidentPair upload_pair_interleaved(const KvSpan* spans, std::size_t n_spans,
+                                                 Dtype vdt) {
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        std::vector<std::int64_t> k(rows);
+        ResidentPair out;
+        std::size_t r = 0;
+        if (vdt == Dtype::I64) {
+            std::vector<std::int64_t> v(rows);
+            for (std::size_t i = 0; i < n_spans; ++i)
+                for (std::size_t j = 0; j < spans[i].rows; ++j, ++r) {
+                    k[r] = spans[i].kv[2 * j];
+                    v[r] = spans[i].kv[2 * j + 1];
+                }
+            out.vals = upload_i64(v.data(), rows);
+        } else {
+            std::vector<double> v(rows);
+            for (std::size_t i = 0; i < n_spans; ++i)
+                for (std::size_t j = 0; j < spans[i].rows; ++j, ++r) {
+                    k[r] = spans[i].kv[2 * j];
+                    std::memcpy(&v[r], &spans[i].kv[2 * j + 1], sizeof(double));
+                }
+            out.vals = upload_f64(v.data(), rows);
+        }
+        out.keys = upload_i64(k.data(), rows);
+        return out;
+    }
 
     // ---- Multi-aggregate fusion (SUM + MIN + MAX + COUNT in one pass) ----
     // Each int64 is read from memory ONCE; backends compute all four

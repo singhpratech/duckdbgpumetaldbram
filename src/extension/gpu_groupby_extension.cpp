@@ -24,7 +24,7 @@
 // groups (default 100) with a clean error naming the actual count.
 
 #include "gpu_groupby_extension.hpp"
-#include "gpu_join_extension.hpp"   // resident registry bridge
+#include "gpu_resident.hpp"          // resident registry
 #include "gpu_backend.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
@@ -38,7 +38,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <mutex>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,25 +75,30 @@ std::string value_to_string(duckdb_value v) {
 }
 
 // Resolve 'p' -> (p.k, p.v) for pair ops; for keys-only ops accept either a
-// pair name (use p.k) or a bare resident column name. Caller holds the mutex.
+// pair name (use p.k) or a bare resident column name. The returned set
+// reference keeps the columns alive for the duration of the call.
 struct Resolved {
+    std::shared_ptr<ResidentSet> set;
     gpudb::ResidentColumn* keys = nullptr;
     gpudb::ResidentColumn* vals = nullptr;
 };
 
-Resolved resolve_pair(const std::string& name, bool need_vals, const char* fn) {
+Resolved resolve_pair(ResidentContext& ctx, const std::string& name, bool need_vals,
+                      const char* fn) {
     Resolved r;
-    r.keys = find_resident_column(name + ".k");
-    r.vals = find_resident_column(name + ".v");
-    if (r.keys && (r.vals || !need_vals)) return r;
+    r.set = resident_acquire_set(ctx, name, fn);
+    if (r.set->pair) {
+        r.keys = r.set->keys.get();
+        r.vals = r.set->vals.get();
+        return r;
+    }
     if (!need_vals) {
-        r.keys = find_resident_column(name);
-        if (r.keys) return r;
+        r.keys = r.set->keys.get();
+        return r;
     }
     throw std::runtime_error(
-        std::string(fn) + ": no resident " + (need_vals ? "pair" : "column") +
-        " named '" + name + "' — create it with gpu_upload_pair" +
-        (need_vals ? "" : " or gpu_upload"));
+        std::string(fn) + ": '" + name + "' is a bare resident column, not a pair — "
+        "create the pair with gpu_upload_pair");
 }
 
 // ---------------------------------------------------------------------------
@@ -205,11 +210,12 @@ void gb_init(duckdb_init_info info) {
                       : GbForm::Plain;
     const char* fn = gb_fn_name(bind->op, form);
     try {
-        std::lock_guard<std::mutex> lock(resident_mutex());
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
         const bool need_vals = bind->op != GbOp::Count;
-        Resolved cols = resolve_pair(bind->name, need_vals, fn);
-        auto& agg = resident_aggregator();
+        Resolved cols = resolve_pair(ctx, bind->name, need_vals, fn);
+        auto& agg = resident_aggregator(ctx);
         const std::size_t cap = groupby_rows_cap();
+        auto dev = resident_device_lock(ctx);
         switch (bind->op) {
             case GbOp::SumI64:
                 if (cols.vals->dtype() != gpudb::Dtype::I64)
@@ -239,7 +245,7 @@ void gb_init(duckdb_init_info info) {
             gpudb::to_string(d.reason), init->res.rows_in, init->res.groups_total,
             init->res.keys.size(),
             init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms);
-        resident_set_last_stats(buf);
+        resident_record_stats(ctx, cols.set.get(), buf);
     } catch (const std::exception& e) {
         delete init;
         duckdb_init_set_error(info, e.what());
@@ -350,22 +356,19 @@ void tk_init(duckdb_init_info info) {
     auto* init = new TkInitData();
     init->dtype = bind->dtype;
     try {
-        std::lock_guard<std::mutex> lock(resident_mutex());
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
         // A pair name ranks its payload ('p' -> p.v); otherwise a bare column.
         // Never silently fall back to a pair's key column.
-        gpudb::ResidentColumn* target = find_resident_column(bind->name + ".v");
-        if (!target) target = find_resident_column(bind->name);
-        if (!target)
-            throw std::runtime_error(
-                "gpu_topk_resident: no resident pair or column named '" + bind->name +
-                "' — create it with gpu_upload_pair or gpu_upload");
+        std::shared_ptr<ResidentSet> set = resident_acquire_set(ctx, bind->name, "gpu_topk_resident");
+        gpudb::ResidentColumn* target = set->pair ? set->vals.get() : set->keys.get();
         if (target->dtype() != bind->dtype)
             throw std::runtime_error(
                 std::string(bind->dtype == gpudb::Dtype::F64 ? "gpu_topk_resident_f64" : "gpu_topk_resident") +
                 ": '" + bind->name + "' is " +
                 (target->dtype() == gpudb::Dtype::F64 ? "DOUBLE — use gpu_topk_resident_f64"
                                                        : "BIGINT — use gpu_topk_resident"));
-        auto& agg = resident_aggregator();
+        auto& agg = resident_aggregator(ctx);
+        auto dev = resident_device_lock(ctx);
         init->res = agg.topk_resident(*target, static_cast<std::size_t>(bind->k),
                                       bind->descending);
         const auto& d = agg.last_decision();
@@ -376,7 +379,7 @@ void tk_init(duckdb_init_info info) {
             gpudb::to_string(d.chosen), gpudb::to_string(d.reason),
             init->res.rows_in, init->res.idx.size(),
             init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms);
-        resident_set_last_stats(buf);
+        resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
         delete init;
         duckdb_init_set_error(info, e.what());
@@ -416,7 +419,8 @@ void register_table_fn(duckdb_connection con, const char* name,
                        const std::vector<duckdb_type>& params,
                        duckdb_table_function_bind_t bind,
                        duckdb_table_function_init_t init,
-                       duckdb_table_function_t fn) {
+                       duckdb_table_function_t fn,
+                       const std::shared_ptr<ResidentContext>& ctx) {
     duckdb_table_function tf = duckdb_create_table_function();
     duckdb_table_function_set_name(tf, name);
     for (duckdb_type t : params) {
@@ -427,6 +431,7 @@ void register_table_fn(duckdb_connection con, const char* name,
     duckdb_table_function_set_bind(tf, bind);
     duckdb_table_function_set_init(tf, init);
     duckdb_table_function_set_function(tf, fn);
+    duckdb_table_function_set_extra_info(tf, resident_extra_info(ctx), resident_extra_info_destroy);
     if (duckdb_register_table_function(con, tf) == DuckDBError) {
         duckdb_destroy_table_function(&tf);
         throw std::runtime_error(std::string(name) + " registration failed");
@@ -436,39 +441,39 @@ void register_table_fn(duckdb_connection con, const char* name,
 
 } // namespace
 
-void register_gpu_groupby(duckdb_connection con) {
+void register_gpu_groupby(duckdb_connection con, const std::shared_ptr<ResidentContext>& ctx) {
     register_table_fn(con, "gpu_groupby_sum_resident", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumI64, GbForm::Plain>, gb_init, gb_function);
+                      gb_bind<GbOp::SumI64, GbForm::Plain>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_sum_resident_f64", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumF64, GbForm::Plain>, gb_init, gb_function);
+                      gb_bind<GbOp::SumF64, GbForm::Plain>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_count_resident", {DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::Count, GbForm::Plain>, gb_init, gb_function);
+                      gb_bind<GbOp::Count, GbForm::Plain>, gb_init, gb_function, ctx);
     // HAVING on the aggregate (cmp VARCHAR, threshold) — evaluated on the device
     register_table_fn(con, "gpu_groupby_sum_resident_having",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
-                      gb_bind<GbOp::SumI64, GbForm::Having>, gb_init, gb_function);
+                      gb_bind<GbOp::SumI64, GbForm::Having>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_sum_resident_f64_having",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_DOUBLE},
-                      gb_bind<GbOp::SumF64, GbForm::Having>, gb_init, gb_function);
+                      gb_bind<GbOp::SumF64, GbForm::Having>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_count_resident_having",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
-                      gb_bind<GbOp::Count, GbForm::Having>, gb_init, gb_function);
+                      gb_bind<GbOp::Count, GbForm::Having>, gb_init, gb_function, ctx);
     // top-k of groups by the aggregate (k BIGINT, order VARCHAR)
     register_table_fn(con, "gpu_groupby_sum_resident_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumI64, GbForm::TopK>, gb_init, gb_function);
+                      gb_bind<GbOp::SumI64, GbForm::TopK>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_sum_resident_f64_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::SumF64, GbForm::TopK>, gb_init, gb_function);
+                      gb_bind<GbOp::SumF64, GbForm::TopK>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_groupby_count_resident_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      gb_bind<GbOp::Count, GbForm::TopK>, gb_init, gb_function);
+                      gb_bind<GbOp::Count, GbForm::TopK>, gb_init, gb_function, ctx);
     register_table_fn(con, "gpu_topk_resident",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      tk_bind<gpudb::Dtype::I64>, tk_init, tk_function);
+                      tk_bind<gpudb::Dtype::I64>, tk_init, tk_function, ctx);
     register_table_fn(con, "gpu_topk_resident_f64",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      tk_bind<gpudb::Dtype::F64>, tk_init, tk_function);
+                      tk_bind<gpudb::Dtype::F64>, tk_init, tk_function, ctx);
     std::fprintf(stderr,
         "[gpudb] registered gpu_groupby_{sum,sum_f64,count}_resident[_having|_topk] + gpu_topk_resident[_f64]\n");
 }

@@ -2,6 +2,88 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-09-03 (v0.7 milestone 0b) — residency prerequisite: the upload no longer starves a concurrent native query
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16 GB), CUDA 13.0.88, 20 host threads, 31 GB RAM
+(**of which ~20 GB were held by unrelated database containers during every run here — 4.5–6 GB
+available, load average 7–8; treat absolute numbers as an upper bound on cost, the comparisons are
+same-process, same-clock**), embedded DuckDB v1.5.2 (`gpudb-concurrent-bench`, `benchmark/concurrent_upload_bench.cpp`),
+TPC-H SF10 (`lineitem` 59,986,052 rows). Every number is statement time measured around `duckdb_query`;
+min / median / p99 / max over N runs; **min-of-N is never the decision** (it reported 80 ms inside a
+window where p99 was 1.4 s).
+
+### What was measured
+
+Two connections to one database in one process. Connection A runs a native statement back-to-back;
+connection B runs `SELECT gpu_upload_pair('gpudb:v1:memory:main:lineitem:1:l_orderkey,l_quantity', l_orderkey, l_quantity::BIGINT) FROM lineitem`
+(a managed set: upload + `prepare()` = the CUDA key sort) back-to-back on its own thread. The control
+competitor is DuckDB's own buffering aggregate over the same two columns,
+`SELECT len(list(l_orderkey)), len(list(l_quantity)) FROM lineitem`, alternated with the upload in the
+same process against the same baseline (`scripts/residency_gate.sh`).
+
+### (A) The upload statement itself, alone (60M pairs)
+
+| build | upload alone | finalize: split + H2D | prepare (sort) | host peak during upload |
+|---|---|---|---|---|
+| v0.6.0 registry (global lock in `update`, `std::vector` per thread, combine copy, host de-interleave) | 2.5–2.8 s | 478–1018 ms (de-interleave + 2 H2D) | lazy, on the first query | ≈2.8 GB (thread buffers + combined copy + two de-interleaved columns) |
+| + lock-free update, per-row atomic pool accounting | 1.8–2.5 s | same | 41–48 ms at upload | same |
+| + device-side pair split (one H2D per segment + kernel) | 1.79 s | 131–232 ms | 46–51 ms | ≈1.8 GB |
+| + segmented host buffers (8 MiB blocks shared on combine, no copy, no reallocation) | 1.79 s | 172–232 ms | 46–51 ms | ≈0.9 GB |
+| **+ pool accounting per 2048-row chunk instead of per row** | **363–455 ms** | 172–232 ms | 46–51 ms | ≈0.9 GB |
+
+The last row is the finding of the day: one process-wide `std::atomic` incremented **per row from 20
+scan threads** (the pool-cap accounting) was 80 % of the upload's time and — because every scan
+thread of the upload spins on that cache line — it was also what starved the native query on the
+other connection. The global mutex the design doc named (§5.6) was real but secondary.
+
+### (B) Native statement on connection A while connection B uploads — timeline, SF10, Q18 inner
+
+`SELECT l_orderkey, sum(l_quantity) AS q FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300`,
+baseline alone: min 195 / med 199–210 / p99 203–226 ms.
+
+| build (connection B) | native during B's scan phase | native during B's finalize | worst native |
+|---|---|---|---|
+| v0.6.0 registry | 762–1049 ms for the first ~1.6 s of every upload, then 203–231 ms | 210–357 ms | 1,402–1,448 ms |
+| device split + segments (per-row atomic still in) | 575–1029 ms for the first ~1.5 s | 228–232 ms | 1,448 ms |
+| **per-chunk accounting (this PR)** | **311–327 ms** | 214–236 ms | **327 ms** |
+
+### (C) The gate: upload vs DuckDB's own `list()` as the concurrent competitor (same process, same baseline)
+
+`scripts/residency_gate.sh build-linux data/tpch_bench/tpch_sf10.duckdb`, 2 rounds × 6 competitor statements each.
+
+| native statement (conn A) | baseline med / p99 | competitor on conn B | competitor alone | native during it: n, med / p99 / max | native p99 upload vs control |
+|---|---|---|---|---|---|
+| Q18 inner (15M groups) | 210 / 229 ms | `list()` control | 782–1091 ms | 42, 237 / 323 / 323 ms | |
+| | | **gpu_upload_pair** | **366–480 ms** | 18, 304 / **330** / 330 ms | **0.98×** (pass) |
+| `count(*), sum(l_extendedprice) … WHERE l_shipdate < '1992-03-01'` | 14.1 / 16.7 ms | `list()` control | 654–725 ms | 460, 15.8 / 96.8 / 101 ms | |
+| | | **gpu_upload_pair** | **343–385 ms** | 186, 16.3 / **118.5** / 123 ms | **0.82×** (within the 0.8 noise band; a rerun of the same row in a separate process gave 90.5 vs 181 ms, i.e. the p99 of a 14 ms statement moves ±40 % between invocations on this box) |
+| point lookup `orders WHERE o_orderkey = 4` | 0.3 / 1.2 ms | `list()` control | 444–494 ms | 9,530, 0.4 / 3.3 / 7.2 ms | |
+| | | **gpu_upload_pair** | **267–298 ms** | 4,985, 0.5 / **3.5** / 9.8 ms | **0.94×** (pass) |
+
+Reading it: with the data resident on the device the upload is now *cheaper* than DuckDB's own
+buffering aggregate over the same columns (0.37–0.48 s vs 0.8–1.1 s) and costs a concurrent native
+statement the same at p99 (0.94–0.98× on two shapes, 0.82× on the 14 ms scan). What remains is one
+process, one worker pool: **any** concurrent statement — a native GROUP BY, `list()`, `count(DISTINCT)` —
+slows a native query by 1.3–2.4× at p99 for as long as it runs (controls measured here: 0.42–0.75×).
+The design's "≥ 1.0× at p99 during a background upload" (§5.6/§9.3) is therefore not a property any
+in-process implementation can have; the gate as shipped holds the upload to "no worse a neighbour than
+`list()`", and *when* to upload (quiet period, rate cap, idle connection) is the wrapper's lever (§5.5).
+
+Ruled out on the way, with the probes in the transcript of this PR: swap/page-cache (vmstat: no
+swap-in, disk reads only at the very first scan), memory allocation as such (a side thread allocating
+and touching 1 GB in 8 MiB blocks, 4 KiB or THP pages, costs the native query ≤ 5 %), the CUDA
+sort (`prepare()` is 41–51 ms on a stream no query uses), and the finalize phase (the native query
+runs at baseline speed during it).
+
+### (D) Correctness surface for this PR
+
+`test_gpudb` 377/377 (new: prepare idempotence, concurrent prepare on one column, 4 upload+prepare
+threads against a stream of operator calls); SQL suite incl. the new `test/sql/gpu_resident_registry.test`
+(28 cases: identity tags, `gpu_residents()`, guard pass / typed fail / empty-result fail, invalidate,
+epoch, prepare, bytes); `groupby_parity_check.sh` 12/12; `join_parity_check.sh` 12/12; the loadable
+extension through the DuckDB v1.5.5 CLI (`gpu_residents`, guard form, `gpu_invalidate`,
+`gpu_prepare_resident` over the C-struct ABI).
+
 ## 2026-08-28 (v0.6.0) — resident GROUP BY / top-k from SQL: the GPU beats native on high-cardinality aggregation, on both backends
 
 First benchmark of the resident GROUP BY / ORDER BY surface

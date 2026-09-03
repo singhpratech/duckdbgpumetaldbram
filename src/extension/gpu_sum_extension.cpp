@@ -75,6 +75,7 @@
 
 #include "gpu_sum_extension.hpp"
 #include "gpu_join_extension.hpp"
+#include "gpu_resident.hpp"
 #include "gpu_groupby_extension.hpp"
 #include "gpu_backend.hpp"
 
@@ -426,9 +427,12 @@ void register_gpu_sum(duckdb_connection con) {
     register_set<OpSumI64, OpSumF64>(con, "gpu_sum");
     register_set<OpMinI64, OpMinF64>(con, "gpu_min");
     register_set<OpMaxI64, OpMaxF64>(con, "gpu_max");
-    register_gpu_resident(con);
-    register_gpu_join(con);
-    register_gpu_groupby(con);
+    // One resident context per registration (= per database): every gpu_*
+    // family reads the same registry through its function extra_info.
+    auto ctx = make_resident_context();
+    register_gpu_resident(con, ctx);
+    register_gpu_join(con, ctx);
+    register_gpu_groupby(con, ctx);
     std::fprintf(stderr,
         "[gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates "
         "+ resident-column functions (gpu_upload, gpu_*_resident) (backend=%s)\n",

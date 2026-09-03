@@ -74,7 +74,7 @@ SELECT count(*), min(value), max(value) FROM gpu_topk_resident_f64('cf', 10, 'de
 -- expect: 3  -2.25  9.0
 
 -- 10. GUARDRAIL: unknown name is a clean error
--- expected_fail: no resident pair named 'nope'
+-- expected_fail: no resident set named 'nope'
 SELECT * FROM gpu_groupby_sum_resident('nope');
 
 -- 11. GUARDRAIL: DOUBLE payload through the BIGINT function is rejected
@@ -109,10 +109,11 @@ SELECT * FROM gpu_groupby_sum_resident(NULL);
 -- expected_fail: may not be NULL
 SELECT * FROM gpu_topk_resident('c', NULL, 'desc');
 
--- 17. GUARDRAIL: top-k over a pair whose payload was dropped does not silently rank the key
+-- 17. GUARDRAIL: dropping either column of a pair drops the SET (v0.7: a pair
+--     is one registry entry), so top-k cannot silently rank the surviving key
 -- setup: SELECT gpu_upload_pair('p', k, v) FROM (VALUES (3,10),(1,20)) t(k,v)
 -- setup: SELECT gpu_drop_resident('p.v')
--- expected_fail: no resident pair or column named 'p'
+-- expected_fail: no resident set named 'p'
 SELECT * FROM gpu_topk_resident('p', 1, 'desc');
 
 -- 18. setup statements may contain ';' inside a string literal

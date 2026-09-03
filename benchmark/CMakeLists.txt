@@ -43,4 +43,14 @@ if(GPUDB_BUILD_EXT AND TARGET gpudb_ext)
         BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
         INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
     )
+    # Residency gate: a native statement on one connection while an upload
+    # runs on another (scripts/residency_gate.sh).
+    find_package(Threads REQUIRED)
+    add_executable(gpudb-concurrent-bench concurrent_upload_bench.cpp)
+    target_link_libraries(gpudb-concurrent-bench PRIVATE gpudb_ext Threads::Threads)
+    set_target_properties(gpudb-concurrent-bench PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+        BUILD_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
+        INSTALL_RPATH "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs"
+    )
 endif()
