@@ -211,7 +211,8 @@ DuckDB's pipeline ordering — the SQL suite uses `-- setup:` statements
 ## Deferred (v0.7)
 
 Composite keys (pack into one BIGINT for now), `GROUP BY` over join results
-as a fused op, resident f64 min/max, and transparent operator substitution
-via a DuckDB optimizer extension so plain `GROUP BY` SQL routes here without
-calling `gpu_*` functions.
+as a fused op, resident f64 min/max, and transparent execution: plain
+`GROUP BY` SQL rewritten before DuckDB plans it, through DuckDB's own
+`json_serialize_sql` / `json_deserialize_sql` and a pure C-API scalar in the
+extension, driven by a client wrapper — no C++ extension API.
 The v0.7 design is in `TRANSPARENT_DESIGN.md`.
