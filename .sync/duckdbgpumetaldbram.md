@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/core-groupby-abi
-- working on: v0.6: PR #75 (core+Metal) complete incl. BENCHMARK Metal rows SF1/10/50, README, KNOWN_ISSUES, radix-sort fix; #76 (CUDA) stacked, green; awaiting user review
+- branch: feat/metal-residency-prepare
+- working on: v0.7 milestone 0b Metal side: prepare()/prepared()/resident_bytes() + interleaved pair upload on Metal; stacked PR on #84
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-08-28T15:37:49Z
+- last update: 2026-09-03T22:21:28Z
