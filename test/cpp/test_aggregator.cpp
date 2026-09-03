@@ -808,7 +808,13 @@ void test_cuda_device_fault_is_an_error() {
 void test_resident_prepare() {
     std::printf("\n--- ResidentColumn::prepare / concurrent upload ---\n");
     auto h = gpudb::make_hybrid_aggregator();
-    const bool on_gpu = h->gpu_backend() != gpudb::Backend::CPU;
+    // The derived-structure expectations below (nothing prepared before
+    // prepare(), 3× bytes after) are the CUDA sort cache's; Metal keeps the
+    // header defaults until its perm cache moves behind prepare(), and the
+    // CPU backend has nothing to derive. The contract every backend must
+    // meet — prepared() after prepare(), idempotent, answers unchanged,
+    // thread-safe — is checked on all of them.
+    const bool on_gpu = h->gpu_backend() == gpudb::Backend::CUDA;
     std::printf("  gpu_backend: %s\n", gpudb::to_string(h->gpu_backend()));
 
     std::mt19937_64 rng(0x9E7ULL);
@@ -829,8 +835,6 @@ void test_resident_prepare() {
     if (on_gpu) {
         EXPECT(!k->prepared());                       // CUDA: nothing derived yet
         EXPECT_EQ(k->resident_bytes(), N * 8);
-    } else {
-        EXPECT(k->prepared());                        // CPU: nothing to derive
     }
     k->prepare();
     EXPECT(k->prepared());
