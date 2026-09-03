@@ -32,13 +32,15 @@ through is allowed for shapes we do not handle yet; it is not allowed as a
 way to avoid handling a shape correctly. Where exactness against native is
 not definable (DOUBLE sums, §4.7) the shape is not rewritten.
 
-The one documented gap, decided 2026-09-03: a writer in **another process**
-that changes values without changing the row count is invisible to the
-wrapper and to the in-statement row-count check (§5.4). DuckDB's
-single-writer rule already excludes this when the wrapper's process holds the
-write lock, so the requirement is: the wrapper opens the database read-write
-(the default); a read-only wrapper beside an external writer is unsupported
-and stated in KNOWN_ISSUES.
+The one documented gap, decided 2026-09-03: a writer on a **connection the
+wrapper did not open** — another process, or a raw `duckdb.connect()` in
+the same process — that changes values without changing the row count is
+invisible to the wrapper and to the in-statement row-count check (§5.4).
+DuckDB's single-writer rule already excludes the other-process case when the
+wrapper's process holds the write lock, so the requirement is: the wrapper
+opens the database read-write (the default) and every connection to that
+database in the process is opened through the wrapper; anything else is
+unsupported and stated in KNOWN_ISSUES.
 
 The end state a user sees:
 
@@ -526,24 +528,45 @@ Four mechanisms, layered; every one is independent of the others.
    that overlapped the transaction is discarded. Autocommit statements —
    the common case in Python — are rewritten as usual.
 
-What is not caught: the out-of-process same-count write in §0. Everything
-else — any write through the wrapper, any same-process write through
-another connection that changes the count, any catalog change — is caught
-by one of the four layers, and the write scenarios in §9.2 exercise each
-one.
+What is not caught: the same-count write from a connection the wrapper did
+not open (§0). Everything else — any write through the wrapper, any write
+through any connection that changes the count, any catalog change — is
+caught by one of the four layers, and the write scenarios in §9.2 exercise
+each one.
 
 ### 5.5 What becomes resident, and when it is ready
 When the wrapper sees a rewritable shape over a resolved table above the
 §9.1 floor whose columns are not resident, it records the template and runs
 the statement **unchanged** (rule 1: the first query pays only the round
-trip). The upload is scheduled on the wrapper's own second connection to
-the same database — the extension stays free of threads and hidden
-connections — under these rules:
+trip). The upload runs on the wrapper's own second connection to the
+same database — the extension stays free of threads and hidden connections
+— under these rules:
 
-- **Quiet period and rate cap.** No upload starts within 2 s of the last
-  invalidation of that table, and no more than one upload per table per 30 s
-  (wrapper settings). A write-heavy session therefore runs native rather
-  than re-uploading after every write and stealing from itself.
+- **Idle segments, never beside a user statement.** One DuckDB process has
+  one worker pool, so any scan on the second connection slows a statement
+  running at the same time on the first — DuckDB's own `list()` over the
+  same columns costs a concurrent native query 25–33% at p99 (§5.6). A
+  single long upload scan therefore violates rule 1 for every statement the
+  user runs during it, however cheap the callbacks are. The upload is
+  instead a sequence of short statements, each over one segment of the
+  table (`WHERE rowid >= a AND rowid < b`, the 8 MiB host segment the
+  extension already buffers, a few ms of scan), appended to an open upload
+  session in the extension (`gpu_upload_begin(tag)`, the aggregate with the
+  same tag, `gpu_upload_finish(tag)` → device copy + `prepare()`). The
+  wrapper issues a segment only when none of its connections has a
+  statement in flight and the connection has been idle for at least the
+  idle threshold (default 20 ms, a wrapper setting); a user statement that
+  arrives mid-segment overlaps it for at most one segment, and the wrapper
+  calls `interrupt()` on the upload connection when it sees the statement
+  arrive, so the overlap is bounded by DuckDB's interrupt latency (checked
+  between vectors) rather than the segment length. An interrupted segment
+  is re-run; progress before it is kept. A session that never goes idle
+  never uploads and runs native throughout — rule 1 holds, the win is
+  simply not there yet.
+- **Quiet period and rate cap.** No upload session starts within 2 s of the
+  last invalidation of that table, and no more than one session per table
+  per 30 s (wrapper settings). A write-heavy session therefore runs native
+  rather than re-uploading after every write.
 - **Epoch capture.** The upload records the set's epoch at start; when the
   device work finishes, the set becomes ready only if the epoch is
   unchanged; otherwise the buffers are freed.
@@ -569,18 +592,22 @@ connections — under these rules:
   sets, no rewrite).
 
 ### 5.6 Concurrency — prerequisite of the background path
-`gpu_resident.cpp` takes the global mutex inside `upload_update` (line 248)
-and `upload_combine` (line 302), which are DuckDB's per-thread aggregate
-callbacks. DuckDB's worker pool is shared across connections in one
-database instance, so every scan thread of the upload statement blocks on
-that mutex and a native query on the other connection starves for workers.
-Measured on SF10: Q18-inner 798–811 ms against an 80 ms baseline (0.10×)
-while an upload ran, and small statements 1.5× slower for the whole window.
-The fix is structural, not throttling:
+Before milestone 0b, `gpu_resident.cpp` took the global mutex inside
+`upload_update` and `upload_combine` (DuckDB's per-thread aggregate
+callbacks) and incremented one process-wide atomic (the host pool-cap
+accounting) **per row** from every scan thread. Measured on SF10: Q18-inner
+798–811 ms against an 80 ms baseline (0.10×) while an upload ran, and small
+statements 1.5× slower for the whole window. Milestone 0b (PR #84, Linux
+gate on the 4090, 2026-09-03) found that the per-row atomic, not the mutex,
+was the starvation: removing it alone took a 60M-row upload from 1.8 s to
+0.36 s and the concurrent native Q18 from 575–1450 ms spikes to
+311–327 ms. The mutex removal, the 8 MiB segments and the device-side split
+each mattered for footprint (host peak 2.8 GB → 0.9 GB, finalize
+478–1018 ms → 172–232 ms), not for starvation. The structural changes:
 
 - per-thread upload state with **no lock in `update`**; the lock is taken in
   `combine`/`finalize` only (already the contract for source states); pool
-  accounting through an atomic;
+  accounting batched per chunk, never per row;
 - a short registry lock for lookup only; per-set state
   `{uploading, prepared, ready, stale, epoch, completion event, refcount}`;
 - upload and prepare work on their own device stream (CUDA stream; Metal
@@ -591,11 +618,28 @@ The fix is structural, not throttling:
   zero, so LRU can never free a column mid-query.
 
 This is shared-extension plus CUDA-backend work carried as one
-`feat/core-*` PR from the Linux instance (milestone 0b, §12); the Metal
-backend honours the same per-set state. The first-query row in the gate
-(§9.3) is measured with the upload and prepare actually in flight, using
-max and p99 rather than min-of-N, because min-of-N hides the contention
-entirely (it reported 80 ms during the 800 ms window).
+`feat/core-*` PR from the Linux instance (milestone 0b, #84); the Metal
+backend implements `prepare()` and the interleaved pair upload on its side
+(#85).
+
+**What the fixed upload still costs a neighbour, and why segments.** With
+the callbacks fixed, a native statement on the other connection during a
+whole-table upload measured 0.98× (Q18 inner), 0.94× (point lookup) and
+0.82× (a 14 ms scan) of its p99 during a *control* — DuckDB's own `list()`
+over the same two columns, no gpudb code — and that control itself costs
+the native query 0.67–0.75× at p99 (a native `GROUP BY` 0.62×,
+`count(DISTINCT)` 0.42×). One worker pool: any concurrent scan is a loss
+for whoever shares it, and "≥ 1.0× at p99 during a background upload" is
+not achievable in-process by any implementation. Swap, allocation, prepare
+(41–51 ms on its own stream) and finalize were each ruled out as the cause.
+So the upload is not allowed to be concurrent with the user's statements at
+all: §5.5's idle segments with `interrupt()` bound the overlap to the
+interrupt latency, and the gate row (§9.3) measures the user's statements
+with the residency manager active, not a statement beside a running scan.
+`scripts/residency_gate.sh` (from #84) remains the regression gate for the
+callbacks themselves: the upload must stay no worse a neighbour than the
+`list()` control, and its own duration is printed so the per-row atomic can
+never come back unnoticed.
 
 ### 5.7 Shared with joins
 A resident set is `{identity, columns, sorted key permutation, validity,
@@ -768,10 +812,16 @@ can flip between runs otherwise), both backends. **Any row below 1.0×
 fails**, except the first-sighting row, whose bound is the §0 2% and is
 printed as such. Runs at SF1 in `local_check.sh` through the Python
 wrapper, at SF10/SF50 before every tag on both machines, output pasted into
-BENCHMARK.md unedited. The first-query case (residency miss) is a row in
-this table too, measured **while the upload and prepare are in flight** and
-reported as max and p99, not min: it must be ≥ 1.0× because it runs native,
-and this is the row that proves the background work does not steal from it.
+BENCHMARK.md unedited. The **residency-active** rows are in this table
+too: each native shape run through the wrapper with the residency manager
+uploading in idle segments (§5.5) versus the same shape with
+`residency='manual'`, reported as p99 and max over N ≥ 200 statements
+issued at the cadence of an interactive session (gaps of 0–50 ms, so
+segments do get scheduled between them), and must be ≥ 1.0× within the
+noise band the control rows establish. This is the row that proves the
+background work never steals from the user's statements; min-of-N is
+printed but never used, because it hides contention entirely (it reported
+80 ms inside the 800 ms window in §5.6).
 
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
@@ -862,6 +912,7 @@ crosses into DuckDB and the static runtime remains correct.
 |---|---|---|
 | 0a | v0.6.1 (§11) | user go per step |
 | 0b | Residency prerequisite PR (§5.3, §5.5, §5.6): identity-keyed registry with origin, per-set state + epoch + refcount, lock-free `update`, `ResidentColumn::prepare()` on the upload stream, `gpu_assert_rows`, `gpu_residents()` columns; Linux instance, Metal implements `prepare()` | unit + parity unchanged; SF10 concurrent-upload row ≥ 1.0× at p99 |
+| 0c | Upload session in the extension (§5.5): `gpu_upload_begin` / segment append to an open session / `gpu_upload_finish` → device copy + `prepare()`, rows_seen accumulated across segments, discarded on epoch change; Linux instance, Metal follows | registry test rows for begin/append/finish/interrupt; unit + parity unchanged |
 | 1 | Spike remainder (§8): tree shapes and rejections, `gpu_assert_rows` evaluation-order proof, classification/cache/invalidation, output names and types; this doc updated | findings written down |
 | 2 | `gpu_rewrite_ast` (pure, context-driven) for the plain `GROUP BY` shape + the Python wrapper (classification, resolution, template cache, transaction rule, typed fallback, settings), three-way parity on the v0.6 operators as they are | PR |
 | 3 | Exactness (§4): CPU reference first, then Metal + CUDA in parallel; native output types and names; unit + parity | per-kernel PRs |
@@ -871,7 +922,7 @@ crosses into DuckDB and the static runtime remains correct.
 | 7 | Audit (v0.6 shape), tag v0.7.0, registry bump, `pip` package release (per-platform assets; `allow_unsigned_extensions` requirement stated) | user go per step |
 | — | Upstream proposal for a C API statement-rewrite hook (§3.5) | drafted after milestone 2 proves the interface; user sign-off before anything is posted |
 
-Milestone 0b precedes everything that uploads in the background. Milestones
+Milestones 0b and 0c precede everything that uploads in the background. Milestones
 3 and 4 run in parallel across the two machines; 1, 2, 5, 6 are shared-file
 work and go one at a time. The loadable extension's build, ABI (plus the one
 `prepare()` entry) and release shape do not change at any milestone.
@@ -919,6 +970,15 @@ than the SQL keywords (§5.2). `register()` creates a non-temporary view;
 temp tables live in the `temp` catalog (§5.1). One `DESCRIBE` per template
 gives native names and types at 0.08 ms (§4.2). Every §2 construct and
 rejection has a distinguishing serialized field (§2).
+
+**Milestone 0b gate, Linux, 2026-09-03:** the starvation was a per-row
+atomic, not the mutex; with it fixed, a neighbouring native statement still
+loses 2–18% at p99 to a whole-table upload because one process has one
+worker pool — the same loss DuckDB's own `list()` inflicts. The user ruled
+that loss unacceptable, so the upload became idle segments with
+`interrupt()` (§5.5) and the gate row became "native shapes with the
+residency manager active ≥ 1.0×" (§9.3); the extension gains an upload
+session (milestone 0c).
 
 **Decided by the user, 2026-09-03:** the bounded first-sighting cost (§0)
 and the out-of-process same-count write as the one documented gap (§0),
