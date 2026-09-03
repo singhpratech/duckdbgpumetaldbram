@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
 - branch: feat/ext-python-wrapper
-- working on: v0.7 milestone 2: wrapper PR #87 now calls gpu_rewrite_ast (#86) when present; cross-renderer test; one shape pending in the scalar (count-only over a bare key)
+- working on: v0.7: #85 (Metal 0b), #86 (scalar, verified on Metal), #87 (wrapper) all green together on the Mac; awaiting user merge decisions; next: segments in the residency manager once 0c lands
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-03T22:44:09Z
+- last update: 2026-09-03T22:45:31Z
