@@ -74,6 +74,15 @@ SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k AS kk, 
        (SELECT string_agg(kk || ':' || n, ' ' ORDER BY kk) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k AS kk, count(*) AS n FROM t GROUP BY k HAVING count(*) >= 143 ORDER BY k'), getvariable('ctx')))) AS rows_;
 -- expect: SELECT "key" AS kk, count AS n FROM gpu_groupby_count_resident_having('gpudb:v1:memory:main:t:9:k,v', '>=', 143) AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY kk  0:143 1:143 2:143 3:143 4:143 5:143
 
+-- 6b. Count-only over a one-column tag (bare key set): count form, HAVING on count, top-k on count
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:9:k', k) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"count_star()","type":"BIGINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*) DESC LIMIT 3'), getvariable('ctx'))) AS sql,
+       (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142'), getvariable('ctx')))) EXCEPT (SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142))) AS extra,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k'), getvariable('ctx')), '$.gpudb.reason') AS sum_declined;
+-- expect: SELECT "key" AS k, count AS "count_star()" FROM gpu_groupby_count_resident_topk('gpudb:v1:memory:main:t:9:k', 3, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "count_star()" DESC LIMIT 3  0  shape
+
 -- 7. DECIMAL(15,2) payload: the wrapper uploaded (v*100)::BIGINT; the sum comes
 --    back typed DECIMAL(38,2) and equal to native; thresholds rescale exactly
 --    (300.5 → 30050; >= 300.555 → ceil → 30056; < 300.555 → 30056)

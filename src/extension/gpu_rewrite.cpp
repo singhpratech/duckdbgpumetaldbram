@@ -244,9 +244,10 @@ Agg aggregate_of(const json& e, const Context& cx, const std::string& t, const s
     if (fn == "sum" || fn == "count") {
         if (ch.size() != 1) reject("shape", fn + " with " + std::to_string(ch.size()) + " arguments");
         const std::string col = column_ref(ch[0], t, ta);
-        if (col.empty() || !ieq(col, cx.val_col)) {
+        if (col.empty() || cx.val_col.empty() || !ieq(col, cx.val_col)) {
             if (fn == "count" && !col.empty() && ieq(col, cx.key_col)) return Agg::Count;  // count(k) == count(*) with no NULL keys
-            reject("shape", fn + " over a column that is not the resident payload");
+            reject("shape", cx.val_col.empty() ? fn + " over a set that holds only the key column"
+                                              : fn + " over a column that is not the resident payload");
         }
         return fn == "sum" ? Agg::Sum : Agg::Count;
     }
@@ -456,11 +457,16 @@ Result do_rewrite(json tree, const json& ctxj) {
     if (gcol.empty() || !ieq(gcol, cx.key_col)) reject("shape", "GROUP BY key is not the resident key");
 
     // ---- column types (rule 2 gates) ----
+    // A one-column tag (columns == [key]) is a bare key set: count-only
+    // shapes over gpu_groupby_count_resident(tag) — no payload, no sum.
+    const bool bare = cx.val_col.empty();
     if (!cx.key.integer) reject(cx.key.floating ? "double" : "shape", "key type " + cx.key.type);
-    if (cx.val.floating) reject("double", "payload type " + cx.val.type);
-    if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
-    if (!cx.val.integer && !cx.val.decimal) reject("shape", "payload type '" + cx.val.type + "'");
-    const int scale = cx.val.decimal ? cx.val.scale : 0;
+    if (!bare) {
+        if (cx.val.floating) reject("double", "payload type " + cx.val.type);
+        if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
+        if (!cx.val.integer && !cx.val.decimal) reject("shape", "payload type '" + cx.val.type + "'");
+    }
+    const int scale = (!bare && cx.val.decimal) ? cx.val.scale : 0;
 
     // ---- select list ----
     struct Item { enum Kind { Key, Sum, Count } kind; std::string alias; };
@@ -482,6 +488,7 @@ Result do_rewrite(json tree, const json& ctxj) {
         }
         const Agg a = aggregate_of(e, cx, tname, talias);
         if (a == Agg::None) reject("shape", "select-list expression of class " + cls);
+        if (a == Agg::Sum && bare) reject("shape", "sum over a set that holds only the key column");
         if (a == Agg::Sum) { want_sum = true; items.push_back({Item::Sum, alias}); }
         else               { want_count = true; items.push_back({Item::Count, alias}); }
     }
@@ -507,6 +514,7 @@ Result do_rewrite(json tree, const json& ctxj) {
         having_agg = aggregate_of(*aggside, cx, tname, talias);
         if (having_agg == Agg::None) reject("shape", "HAVING is not on an aggregate");
         threshold = threshold_of(*cside, having_agg == Agg::Sum ? scale : 0, cmp).value;
+        if (having_agg == Agg::Sum && bare) reject("shape", "HAVING sum over a set that holds only the key column");
         if (having_agg == Agg::Sum) want_sum = true;
     }
     // One device function produces the rows: the SUM form yields
@@ -606,7 +614,7 @@ Result do_rewrite(json tree, const json& ctxj) {
     //      reason names the first thing the user can act on) ----
     if (ieq(cx.backend, "CPU") || cx.backend.empty()) reject("backend", "backend " + cx.backend);
     if (!cx.have_stats) reject("nulls", "no column statistics in context");
-    if (cx.key_has_null || cx.val_has_null) reject("nulls", "key or payload may hold NULLs");
+    if (cx.key_has_null || (!bare && cx.val_has_null)) reject("nulls", "key or payload may hold NULLs");
     if (use_sum) {
         // rows * max|v| (already in the payload's scale when DECIMAL) < 2^63
         const double bound = static_cast<double>(cx.rows) * cx.val_abs_max * std::pow(10.0, scale);
