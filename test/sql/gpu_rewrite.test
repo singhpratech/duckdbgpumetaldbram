@@ -52,8 +52,9 @@ SELECT (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_se
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
 -- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"default_order":"ASC","outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
 SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY sum(v) DESC LIMIT 2'), getvariable('ctx'))) AS by_expr,
-       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 2 LIMIT 2'), getvariable('ctx'))) LIKE '%_topk(%' AS ordinal_pushed;
--- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)" FROM gpu_groupby_sum_resident_topk('gpudb:v1:memory:main:t:9:k,v', 2, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "sum(v)" DESC LIMIT 2  false
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 2 DESC LIMIT 2'), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', 2, ''desc'')%ORDER BY "sum(v)" DESC LIMIT 2' AS ordinal_pushed,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 1 LIMIT 2'), getvariable('ctx'))) LIKE '%_resident(''gpudb:v1:memory:main:t:9:k,v'')%ORDER BY k LIMIT 2' AS ordinal_key_kept;
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)" FROM gpu_groupby_sum_resident_topk('gpudb:v1:memory:main:t:9:k,v', 2, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "sum(v)" DESC LIMIT 2  true  true
 
 -- 5b. ORDER BY with no explicit direction uses the connection's default_order;
 --     without one the ORDER BY is kept but nothing is pushed
@@ -116,10 +117,19 @@ FROM (VALUES
   (12, 'SELECT k, sum(v) OVER () AS s FROM t GROUP BY k'),
   (13, 'SELECT k, sum(v) AS s FROM t TABLESAMPLE 10% GROUP BY k'),
   (14, 'SELECT DISTINCT k, sum(v) AS s FROM t GROUP BY k'),
-  (15, 'SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) > 3'),
-  (16, 'INSERT INTO t VALUES (1, 2)')
+  (15, 'INSERT INTO t VALUES (1, 2)')
 ) v(i, q);
--- expect: shape shape shape shape shape shape shape shape shape shape shape shape shape shape shape error
+-- expect: shape shape shape shape shape shape shape shape shape shape shape shape shape shape error
+
+-- 10b. HAVING count(*) beside sum(v): the SUM function's rows, the count predicate in the outer WHERE
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":0,"max":999}}}'
+-- setup: SET VARIABLE q = 'SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) > 142 ORDER BY k'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) AS sql,
+       (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) EXCEPT (SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) > 142))) AS extra,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) AS n;
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS s FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:t:9:k,v') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE (gd.ok AND (r.count > 142)) ORDER BY k  0  6
 
 -- 11. Rule-2 and residency gates: nulls, overflow, double, decimal width, backend, not ready, threshold
 -- setup: SET VARIABLE base = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'

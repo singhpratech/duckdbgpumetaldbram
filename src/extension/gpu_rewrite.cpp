@@ -511,9 +511,11 @@ Result do_rewrite(json tree, const json& ctxj) {
     }
     // One device function produces the rows: the SUM form yields
     // (key, sum, count); the COUNT form only (key, count). A HAVING on count
-    // while the select needs sum has no v0.6 form.
+    // while the select needs sum has no device form, so the count predicate
+    // goes to the outer WHERE over the (key, sum, count) rows — same rows,
+    // names and types as native, the filter just runs on the small result.
     const bool use_sum = want_sum;
-    if (having_agg == Agg::Count && use_sum) reject("shape", "HAVING on count with sum in the select list");
+    const bool having_on_host = having_agg == Agg::Count && use_sum;
     (void)want_count;
 
     // ---- modifiers: ORDER BY / LIMIT kept; top-k pushed when possible ----
@@ -558,7 +560,14 @@ Result do_rewrite(json tree, const json& ctxj) {
             if (on.empty()) reject("shape", "ORDER BY an aggregate that is not selected");
             return j_colref(on);
         }
-        if (cls == "CONSTANT") reject("shape", "ordinal ORDER BY");
+        if (cls == "CONSTANT") {
+            // ORDER BY <ordinal>: the i-th select-list item, 1-based.
+            const json& v = field(e, "value");
+            if (!v.contains("value") || !v["value"].is_number_integer()) reject("shape", "non-integer ordinal ORDER BY");
+            const std::int64_t i = v["value"].get<std::int64_t>();
+            if (i < 1 || static_cast<std::size_t>(i) > items.size()) reject("shape", "ordinal ORDER BY out of range");
+            return j_colref(cx.outputs[static_cast<std::size_t>(i - 1)].name);
+        }
         reject("shape", "ORDER BY expression of class " + cls);
     };
 
@@ -609,11 +618,13 @@ Result do_rewrite(json tree, const json& ctxj) {
     // ---- build the replacement ----
     std::string fn = use_sum ? "gpu_groupby_sum_resident" : "gpu_groupby_count_resident";
     json args = json::array({j_const_varchar(cx.tag)});
-    if (having_agg != Agg::None) {
+    if (having_agg != Agg::None && !having_on_host) {
         fn += "_having";
         static const char* ops[] = {"", ">", ">=", "<", "<="};
         args.push_back(j_const_varchar(ops[cmp]));
         args.push_back(j_const_bigint(threshold));
+        r.form = "having";
+    } else if (having_on_host) {
         r.form = "having";
     } else if (topk > 0) {
         fn += "_topk";
@@ -661,7 +672,18 @@ Result do_rewrite(json tree, const json& ctxj) {
 
     node["select_list"] = new_select;
     node["from_table"] = new_from;
-    node["where_clause"] = j_colref2("gd", "ok");
+    if (having_on_host) {
+        static const char* types[] = {"", "COMPARE_GREATERTHAN", "COMPARE_GREATERTHANOREQUALTO",
+                                      "COMPARE_LESSTHAN", "COMPARE_LESSTHANOREQUALTO"};
+        json pred = json{{"class", "COMPARISON"}, {"type", types[cmp]}, {"alias", ""},
+                         {"query_location", kNoLocation}, {"left", j_colref2("r", "count")},
+                         {"right", j_const_bigint(threshold)}};
+        node["where_clause"] = json{{"class", "CONJUNCTION"}, {"type", "CONJUNCTION_AND"}, {"alias", ""},
+                                    {"query_location", kNoLocation},
+                                    {"children", json::array({j_colref2("gd", "ok"), pred})}};
+    } else {
+        node["where_clause"] = j_colref2("gd", "ok");
+    }
     node["group_expressions"] = json::array();
     node["group_sets"] = json::array();
     node["having"] = nullptr;
