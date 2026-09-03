@@ -76,6 +76,7 @@
 #include "gpu_sum_extension.hpp"
 #include "gpu_join_extension.hpp"
 #include "gpu_resident.hpp"
+#include "gpu_rewrite.hpp"
 #include "gpu_groupby_extension.hpp"
 #include "gpu_backend.hpp"
 
@@ -433,6 +434,7 @@ void register_gpu_sum(duckdb_connection con) {
     register_gpu_resident(con, ctx);
     register_gpu_join(con, ctx);
     register_gpu_groupby(con, ctx);
+    register_gpu_rewrite(con);   // pure: no context
     std::fprintf(stderr,
         "[gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates "
         "+ resident-column functions (gpu_upload, gpu_*_resident) (backend=%s)\n",

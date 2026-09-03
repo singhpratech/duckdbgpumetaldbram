@@ -31,11 +31,17 @@ add_library(gpudb_duckdb SHARED
     gpu_sum_extension.cpp
     gpu_resident.cpp
     gpu_join_extension.cpp
-    gpu_groupby_extension.cpp)
+    gpu_groupby_extension.cpp
+    gpu_rewrite.cpp)
+
+# nlohmann/json (MIT, third_party/nlohmann/) — the statement rewriter works
+# on json_serialize_sql trees; header-only, no link dependency.
+set(GPUDB_JSON_DIR "${CMAKE_SOURCE_DIR}/third_party")
 
 target_include_directories(gpudb_duckdb PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${DUCKDB_CAPI_DIR})
+    ${DUCKDB_CAPI_DIR}
+    ${GPUDB_JSON_DIR})
 
 # The core compute library (CPU / Metal / CUDA backends). It has NO DuckDB
 # dependency, so linking it introduces no undefined duckdb_* symbols.
@@ -133,10 +139,11 @@ set(DUCKDB_LIBS_DIR "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs")
 
 if(EXISTS "${DUCKDB_LIBS_DIR}/duckdb.h")
     # Compiled WITHOUT GPUDB_C_STRUCT_ABI: uses real duckdb.h + real libduckdb.
-    add_library(gpudb_ext STATIC gpu_sum_extension.cpp gpu_resident.cpp gpu_join_extension.cpp gpu_groupby_extension.cpp)
+    add_library(gpudb_ext STATIC gpu_sum_extension.cpp gpu_resident.cpp gpu_join_extension.cpp gpu_groupby_extension.cpp gpu_rewrite.cpp)
     target_include_directories(gpudb_ext PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
-        ${DUCKDB_LIBS_DIR})
+        ${DUCKDB_LIBS_DIR}
+        ${GPUDB_JSON_DIR})
     target_link_libraries(gpudb_ext PUBLIC
         gpudb
         "${DUCKDB_LIBS_DIR}/libduckdb${CMAKE_SHARED_LIBRARY_SUFFIX}")
