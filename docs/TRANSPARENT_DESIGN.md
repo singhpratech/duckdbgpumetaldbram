@@ -1,7 +1,7 @@
 # v0.7 — transparent GPU execution (design)
 
 Status: proposal, 2026-09-01; revised 2026-09-03 after an adversarial review
-(§13). Companion to `GROUPBY_RESIDENT_DESIGN.md` (v0.6). Carries the v0.6.1
+and the milestone-1 spike (§13). Companion to `GROUPBY_RESIDENT_DESIGN.md` (v0.6). Carries the v0.6.1
 maintenance release plan in §11; its portable Linux build is the build every
 later release uses.
 
@@ -109,14 +109,20 @@ GROUP BY k1 [, k2, k3]
   and session defaults native's problem, not ours.
 
 **Rejected by field, not by node.** The matcher reads every field of every
-node on the path and declines the statement when any of these is present:
-`GROUP BY ALL`, ordinal group references, `ROLLUP`/`CUBE`/`GROUPING SETS`,
-`FILTER (WHERE …)` on an aggregate, `DISTINCT` inside an aggregate, `ORDER BY`
-inside an aggregate, `SAMPLE`/`USING SAMPLE`, `AT` clauses, window
-functions, `QUALIFY`, set operations, `PARAMETER` nodes, and any `cte_map`
-at any scope that defines the table's name (§5.1). The unit test for the
-matcher enumerates each of these as a serialized tree that must come back
-unchanged.
+node on the path and declines the statement when any of these is present
+(field names as `json_serialize_sql` emits them, checked 2026-09-03 on
+DuckDB 1.4.5): `GROUP BY ALL` (`aggregate_handling = FORCE_AGGREGATES`),
+ordinal group references (a `CONSTANT` in `group_expressions`),
+`ROLLUP`/`CUBE`/`GROUPING SETS` (more than one entry in `group_sets`),
+`FILTER (WHERE …)` on an aggregate (`filter` on the function node),
+`DISTINCT` inside an aggregate (`distinct: true`), `ORDER BY` inside an
+aggregate (`order_bys` on the function node), `TABLESAMPLE` (`sample` on the
+`BASE_TABLE`), `USING SAMPLE` (`sample` on the select node), `AT` clauses
+(`at_clause` on the `BASE_TABLE`), window functions (class `WINDOW`),
+`QUALIFY` (`qualify` non-null), set operations (`SET_OPERATION_NODE`),
+`PARAMETER` nodes, and a non-empty `cte_map.map` at any scope that defines
+the table's name (§5.1). The unit test for the matcher enumerates each of
+these as a serialized tree that must come back unchanged.
 
 Everything above the matched subtree (projection, aliases, joins to the
 result, further `ORDER BY`, enclosing CTEs) is untouched; the replacement
@@ -272,17 +278,26 @@ proves it unnecessary (the output column is still HUGEINT). The bound needs
 the payload's min/max at upload: one `DeviceReduce`, cheap, and the same
 statistics pass §4.4 uses.
 
-Output types follow native exactly: `sum` of any integer type is HUGEINT,
-`sum` of `DECIMAL(p,s)` is `DECIMAL(38,s)`, `count`/`count(*)` are BIGINT,
-`min`/`max` keep the input type, `avg` is DOUBLE for integers and DECIMAL
-for DECIMAL inputs. The parity harness compares `typeof()` of every output
-column (§9.2).
+Output types follow native exactly (`DESCRIBE` over every aggregate ×
+input type, 2026-09-03): `sum` of any integer type, HUGEINT and UBIGINT
+included, is HUGEINT; `sum` of `DECIMAL(p,s)` is `DECIMAL(38,s)`;
+`count`/`count(*)` are BIGINT; `min`/`max` keep the input type; `avg` is
+DOUBLE for **every** input, DECIMAL included. Native `avg` over integer and
+DECIMAL inputs is the exact sum divided by the count (verified identical
+across 1/2/8 threads and three insert orders, and equal to
+`sum::DOUBLE / count`), so the device computes it the same way from the
+two-limb sum and stays exact. Unaliased output names are DuckDB's
+(`sum(v)`, `count_star()`, `avg(v)`); the wrapper obtains names and types
+together from one `DESCRIBE <statement>` per template — bind only, no
+execution, 0.08 ms measured. The parity harness compares `typeof()` and
+the name of every output column (§9.2).
 
 ### 4.3 DECIMAL
 DuckDB stores `DECIMAL(p,s)` with `p ≤ 18` as an int64 scaled by `10^s`
 (int16/int32 for smaller `p`). A DECIMAL payload is uploaded as its integer
 representation; `sum` is the 4.2 path with the result typed `DECIMAL(38,s)`;
-`min`/`max` are exact; `avg` is `DECIMAL` division on the host. This is what
+`min`/`max` are exact; `avg` is DOUBLE, the exact sum over the count on the
+host, as native does it (§4.2). This is what
 makes TPC-H's `l_quantity` / `l_extendedprice` match with no cast — the
 README examples currently write `l_quantity::BIGINT` and v0.7 stops needing
 to. `DECIMAL(p>18)` is int128-backed and is uploaded as two limbs (same
@@ -367,20 +382,27 @@ connection:
 
 1. If any `cte_map` at any scope in the tree defines the name, the
    statement runs native.
-2. An unqualified name is resolved against `current_schemas(true)` (temp
-   schema first) through `duckdb_tables()` and `duckdb_views()`; the first
-   hit wins. A view, a registered DataFrame/Arrow object (a view in DuckDB),
-   or no hit at all: native.
+2. An unqualified name is looked up in `duckdb_tables()` and
+   `duckdb_views()` across the temp catalog and every catalog and schema on
+   the search path (`current_setting('search_path')`, `current_database()`,
+   `current_schemas(true)`). Temp objects live in the `temp` catalog with
+   `temporary = true`; a `register()`ed DataFrame/Arrow object is a
+   non-temporary **view** in the current catalog (checked 2026-09-03). The
+   rule is conservative: the statement is rewritten only when exactly
+   **one** object of that name exists across all of those, and it is a base
+   table. Two candidates (a temp table shadowing a base table, a view beside
+   a table in another catalog), a view, or no hit at all: native. This
+   avoids reproducing the binder's precedence rules.
 3. A qualified name is checked the same way against its catalog and schema.
 4. The result is `(catalog, schema, table, table oid, column names)` — the
    **identity** — cached with the template together with the search path
    and catalog list that produced it.
 
-Any statement the classifier (§5.2) marks as catalog-changing — `CREATE`
-(including `TEMP`, `OR REPLACE`, `VIEW`), `DROP`, `ALTER`, `ATTACH`,
-`DETACH`, `USE`, `SET search_path`, `SET default_*`, `register()` /
-`unregister()` in the client — clears every cached resolution on that
-connection. The rewritten statement always names the table fully qualified.
+Any statement that is not a `SELECT` or `EXPLAIN` (§5.2) clears every
+cached resolution on that connection, as do `register()` / `unregister()`
+in the client; the splitter's types are too coarse to single out the
+catalog-changing ones (`USE` is typed `SET`), and clearing is cheap. The
+rewritten statement always names the table fully qualified.
 
 ### 5.2 Statement classification — DuckDB's own splitter
 `json_serialize_sql` serializes only `SELECT` statements; every other kind
@@ -391,18 +413,24 @@ instead uses the classifier DuckDB ships in every client: in Python
 `duckdb_prepared_statement_type`. Every incoming string is split; each
 member is handled by type:
 
-- `SELECT`: the rewrite path (§3.2).
+- `SELECT`: the rewrite path (§3.2). `SHOW`, `DESCRIBE`, `SUMMARIZE`,
+  `VALUES` and `FROM t` are typed `SELECT` too; `json_serialize_sql` may
+  refuse some of them, and a refusal simply means native.
 - `EXPLAIN [ANALYZE] <select>`: the inner statement is rewritten and
   re-prefixed, so users can see the resident operator in the plan.
-- `BEGIN`/`COMMIT`/`ROLLBACK`: transaction tracking (§5.4).
-- **Anything else** — `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`,
-  `TRUNCATE`, `CREATE`, `ALTER`, `DROP`, `ATTACH`, `DETACH`, `USE`, `SET`,
-  `CALL`, `PREPARE`/`EXECUTE`, `PRAGMA`, `LOAD`, `INSTALL`, `VACUUM`,
-  `CHECKPOINT`, and any type added by a later DuckDB — invalidates **every**
-  resident set on that database before the statement runs, and clears the
-  resolution cache if it is catalog-changing. Conservative on purpose: a
-  miss runs native, so over-invalidation costs at most a re-upload, never an
-  answer.
+- `TRANSACTION` (one type for `BEGIN`/`COMMIT`/`ROLLBACK`): invalidates
+  every set, then the first keyword decides open (`BEGIN`, `START`) or
+  closed (`COMMIT`, `END`, `ROLLBACK`, `ABORT`); anything else is treated
+  as open, the direction that never rewrites (§5.4).
+- **Anything else** — `INSERT`, `UPDATE`, `DELETE` (also `TRUNCATE`),
+  `MERGE_INTO`, `COPY`, `CREATE`, `ALTER`, `DROP`, `ATTACH`, `DETACH`,
+  `SET` (also `USE`, `PRAGMA`, `RESET`), `CALL` (also `CHECKPOINT`),
+  `PREPARE`/`EXECUTE`, `LOAD` (also `INSTALL`), `VACUUM`, `EXPORT`, and
+  any type added by a later DuckDB — invalidates **every** resident set on
+  that database before the statement runs and clears the resolution cache.
+  The parenthesised aliases are how DuckDB 1.4.5 actually types those
+  statements (checked 2026-09-03). Conservative on purpose: a miss runs
+  native, so over-invalidation costs at most a re-upload, never an answer.
 
 The client's non-SQL write paths — `Appender`, `con.append`, `register` —
 are wrapped by the same invalidation as an optimisation, but correctness does
@@ -454,22 +482,38 @@ Four mechanisms, layered; every one is independent of the others.
    ```sql
    SELECT "key" AS l_orderkey, sum AS q
    FROM gpu_groupby_sum_resident_having('<identity tag>', '>', 300) r,
-        (SELECT gpu_assert_rows('<identity tag>', count(*)) FROM main.lineitem) g
+        (SELECT gpu_assert_rows('<identity tag>', count(*)) AS ok FROM main.lineitem) gd
+   WHERE gd.ok
    ORDER BY q DESC LIMIT 10
    ```
 
    `gpu_assert_rows` is a volatile C-API scalar
    (`duckdb_scalar_function_set_volatile` exists in the vendored v1.2.0
-   header) that raises a typed error when the count differs from the set's
-   upload count. The derived table has exactly one row whatever the resident
-   side returns, so the check runs exactly once even when the resident
-   result is **empty** (a `WHERE`-form guard would never be evaluated on an
-   empty result and would pass a stale empty answer). `count(*)` runs inside
-   the querying transaction, so it is the snapshot rule with no transaction
-   introspection. It is a row-group scan, not stats-only, and is not free on
-   tables with deletes; §9.1 measures it and the threshold floor absorbs it.
-   On the typed error the wrapper marks the set stale and re-runs the
-   original text natively; on any other error it surfaces (§3.3).
+   header) returning BOOLEAN `true`, or raising a typed error when the count
+   differs from the set's upload count. Two properties make this form
+   correct, both established on 2026-09-03 with an `error()`-based
+   stand-in on the real Metal resident function (2M rows, 100K groups):
+
+   - The raising expression sits **inside** the one-row derived table, so it
+     is evaluated in that subquery's own pipeline, once, before the cross
+     product emits anything — with rows, with an **empty** resident result,
+     under `fetchmany(1)` streaming, with `threads=1`, and with the optimizer
+     disabled, the stale case raised every time and nothing reached the
+     client. (A guard whose call is in the `WHERE` of the outer query is
+     evaluated per output row and never fires on an empty result.)
+   - `gd.ok` is **referenced** by the outer `WHERE`. Unreferenced, the
+     optimizer's unused-column removal deletes the projection that carries
+     the call, the plan contains no guard at all, and a stale set passes
+     silently — the form in the first revision of this document had exactly
+     that hole. The parity harness asserts on `EXPLAIN` that the `FILTER` on
+     `ok` is present in every rewritten plan.
+
+   `count(*)` runs inside the querying transaction, so it is the snapshot
+   rule with no transaction introspection. Measured cost at SF1 (6M rows):
+   0.18 ms clean, 0.47 ms after deleting 10% of rows; the whole guard adds
+   0.3–0.5 ms to the rewritten statement. The §9.1 floor absorbs it. On the
+   typed error the wrapper marks the set stale and re-runs the original text
+   natively; on any other error it surfaces (§3.3).
 3. **Epoch** (§5.5): every invalidation increments the set's epoch; an
    upload that started under an older epoch can never become ready.
 4. **Transactions.** The wrapper tracks `BEGIN`/`COMMIT`/`ROLLBACK` on its
@@ -579,11 +623,12 @@ v0.8 route joins through the same manager (§10).
 3. Build the replacement tree: the base-table reference becomes a
    `TABLE_FUNCTION` reference to the resident operator with constant
    arguments `{identity tag, predicate program, aggregates, filter, top-k}`
-   cross-joined to the `gpu_assert_rows` derived table (§5.4). Every
-   remapped output is wrapped in a `CAST` to the native type (§4.2) and
-   carries the user's alias, or, when unaliased, DuckDB's auto-generated
-   name (`sum(l_quantity)`, `count_star()` — obtained once per template by
-   `json_serialize_sql` of the projection and cached). `HAVING` thresholds
+   cross-joined to the `gpu_assert_rows` derived table with `WHERE gd.ok`
+   (§5.4). Every remapped output is wrapped in a `CAST` to the native type
+   (§4.2) and carries the user's alias, or, when unaliased, DuckDB's
+   auto-generated name (`sum(l_quantity)`, `count_star()`); names and types
+   come from one `DESCRIBE` of the original statement per template, run by
+   the wrapper and passed in `context`. `HAVING` thresholds
    are rescaled exactly to the payload's scale: `>` floors, `>=` ceils, `<`
    ceils, `<=` floors; `=`/`<>` only when exactly representable, otherwise
    constant false/true; 128-bit thresholds on the two-limb path.
@@ -647,7 +692,14 @@ to confirm before piece C/D is written, on the same throwaway branch:
 4. The auto-generated column names and `typeof()` of every output for every
    aggregate/input-type pair in §4.2, against native.
 
-Findings update this document before implementation.
+Findings update this document before implementation. Status 2026-09-03:
+item 1 done (every construct and rejection serialized and round-tripped;
+fields recorded in §2; the `HAVING` literal `300.5` arrives as
+`DECIMAL(4,1)` value `3005`, confirming the rescale in §6); item 2 done for
+the evaluation-order and cost questions (§5.4) — the C-API scalar itself is
+milestone 0b; item 3 done for classification (§5.2) and resolution sources
+(§5.1), open for the wrapper's cache and transaction handling until the
+wrapper exists; item 4 done (§4.2).
 
 ## 9. The gate (piece E)
 
@@ -661,7 +713,8 @@ BENCHMARK.md gains, per backend, at SF1/SF10/SF50:
   and the two-limb path forced on;
 - mask variant (a) vs (b) across the selectivity sweep;
 - the `gpu_assert_rows` cross-join cost on a base table, clean and with 10%
-  deleted rows, at each SF;
+  deleted rows, at each SF (SF1 on the M-series: 0.18 / 0.47 ms for the
+  count, 0.3–0.5 ms for the whole guard);
 - wrapper overhead, measured on both machines: a plain `SELECT` (no
   `GROUP BY`) through `duckdb.connect` vs through `gpudb.connect` with
   `transparent=False` vs transparent — rule 1 has to hold for statements
@@ -855,6 +908,17 @@ crash surface (the deep-nesting crash is DuckDB's own
 `json_deserialize_sql`, reachable without gpudb); incomplete catch blocks
 (every backend throw is `std::runtime_error`); the documented gap being
 too narrow.
+
+**Milestone-1 spike, 2026-09-03 (Python `duckdb` 1.4.5 + the v0.6.0 Metal
+build):** the cross-join guard as first written was pruned by the optimizer
+and passed a stale set silently; the referenced form (`WHERE gd.ok`) raises
+in every case including the empty result and streaming fetch (§5.4).
+`avg` is DOUBLE for every input and native computes it exactly, so it stays
+on the transparent path (§4.2). The splitter's statement types are coarser
+than the SQL keywords (§5.2). `register()` creates a non-temporary view;
+temp tables live in the `temp` catalog (§5.1). One `DESCRIBE` per template
+gives native names and types at 0.08 ms (§4.2). Every §2 construct and
+rejection has a distinguishing serialized field (§2).
 
 **Decided by the user, 2026-09-03:** the bounded first-sighting cost (§0)
 and the out-of-process same-count write as the one documented gap (§0),
