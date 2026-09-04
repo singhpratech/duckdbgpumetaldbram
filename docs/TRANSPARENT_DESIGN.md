@@ -851,6 +851,16 @@ interrupt count, time-to-ready and the statements that started inside the
 11.6 (1.18×), point lookup 1.9/2.0 vs 2.0 (1.00×, max 3.4 vs 2.8); the set
 was ready 2.5–7 s into each run after 115 segments of 2–14 ms scan; the
 313 ms finish call had 12 point lookups start inside it at 0.4–0.5 ms.
+CUDA (RTX 4090, SM 1815 MHz), SF10, 2026-09-04, same script and branch:
+Q18-shape 213.7/212.5 vs 214.9 ms (0.99×, inside the band), small scan
+14.1/14.5 vs 14.4 (1.01×), point lookup 1.9/1.8 vs 1.4 (1.31×); 115
+segments of 3.8–9.7 ms scan, 48–56 interrupts; the finish call (211–484 ms:
+one `cudaMemcpyAsync` of the held segments plus the sort, on the column's
+own stream, no device lock a query needs) had 2–10 statements start inside
+it at their baseline latency, and the slowest statement of every run fell
+outside it. The Q18 run took 19 s to go ready because 0–50 ms gaps rarely
+clear the 20 ms idle bar beside a 200 ms statement — expected: a session
+that cannot find idle time waits, it does not intrude.
 
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
@@ -1012,7 +1022,8 @@ session (milestone 0c).
 **Milestone 0c, both machines, 2026-09-04:** upload sessions landed in the
 extension (Linux: SF10 `lineitem` as 115 segment statements of 4.7/6.2/12.9
 ms min/mean/max scan each, finish 285 ms) and the wrapper's residency
-manager moved to them (Metal: the gate rows above, all ≥ 1.0× at p99; a
+manager moved to them (Metal and CUDA: the gate rows above, all within
+the band at p99, finish invisible to neighbours on both; a
 20-segment session completes while statements flow with 0–10 ms gaps with
 `rows_seen` equal to `count(*)` exactly; a write mid-session drops the
 open session and the set comes back after the quiet period). Milestones
