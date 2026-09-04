@@ -560,9 +560,21 @@ same database — the extension stays free of threads and hidden connections
   calls `interrupt()` on the upload connection when it sees the statement
   arrive, so the overlap is bounded by DuckDB's interrupt latency (checked
   between vectors) rather than the segment length. An interrupted segment
-  is re-run; progress before it is kept. A session that never goes idle
-  never uploads and runs native throughout — rule 1 holds, the win is
-  simply not there yet.
+  is re-run; progress before it is kept: an append is one atomic step at
+  the aggregate's finalize, so an interrupted scan never appends, and the
+  wrapper reads `gpu_upload_status(tag).segments` after every interrupt to
+  learn whether the segment landed just before the interrupt was seen (it
+  does happen) rather than appending it twice. Consecutive interrupts pause
+  the session — 50 ms, doubling per interrupt, capped at 5 s, reset by a
+  landed segment — so a cadence whose statements keep landing on segments
+  pays the interrupt latency at most once per pause, not once per
+  statement. (Raising the idle threshold instead was tried first and
+  stalled a session under 0–10 ms gaps: a threshold above the gaps is never
+  met, a pause always expires.) `gpu_upload_finish` is one scalar call an
+  interrupt cannot stop; an interrupt seen after it returns is recognised by
+  the set being `ready` in `gpu_residents()`, not treated as a lost session.
+  A session that never goes idle never uploads and runs native throughout
+  — rule 1 holds, the win is simply not there yet.
 - **Quiet period and rate cap.** No upload session starts within 2 s of the
   last invalidation of that table, and no more than one session per table
   per 30 s (wrapper settings). A write-heavy session therefore runs native
@@ -829,7 +841,16 @@ segments do get scheduled between them), and must be ≥ 1.0× within the
 noise band the control rows establish. This is the row that proves the
 background work never steals from the user's statements; min-of-N is
 printed but never used, because it hides contention entirely (it reported
-80 ms inside the 800 ms window in §5.6).
+80 ms inside the 800 ms window in §5.6). These rows are produced by
+`scripts/wrapper_residency_gate.py` (manual pass, background pass with the
+upload of `lineitem` scheduled by a first sighting, manual pass again for
+the noise band; per pass the segment count, per-segment scan time,
+interrupt count, time-to-ready and the statements that started inside the
+`gpu_upload_finish` call). Metal, SF10, 2026-09-04: Q18-shape native p99
+84.2/88.7 ms manual vs 85.3 ms background (1.04×), small scan 12.4/13.7 vs
+11.6 (1.18×), point lookup 1.9/2.0 vs 2.0 (1.00×, max 3.4 vs 2.8); the set
+was ready 2.5–7 s into each run after 115 segments of 2–14 ms scan; the
+313 ms finish call had 12 point lookups start inside it at 0.4–0.5 ms.
 
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
@@ -987,6 +1008,16 @@ that loss unacceptable, so the upload became idle segments with
 `interrupt()` (§5.5) and the gate row became "native shapes with the
 residency manager active ≥ 1.0×" (§9.3); the extension gains an upload
 session (milestone 0c).
+
+**Milestone 0c, both machines, 2026-09-04:** upload sessions landed in the
+extension (Linux: SF10 `lineitem` as 115 segment statements of 4.7/6.2/12.9
+ms min/mean/max scan each, finish 285 ms) and the wrapper's residency
+manager moved to them (Metal: the gate rows above, all ≥ 1.0× at p99; a
+20-segment session completes while statements flow with 0–10 ms gaps with
+`rows_seen` equal to `count(*)` exactly; a write mid-session drops the
+open session and the set comes back after the quiet period). Milestones
+0b, 0c and 2 are therefore in: #85, #86 merged, #87 rebased and green, #88
+and the segment-mode manager on their branches.
 
 **Decided by the user, 2026-09-03:** the bounded first-sighting cost (§0)
 and the out-of-process same-count write as the one documented gap (§0),
