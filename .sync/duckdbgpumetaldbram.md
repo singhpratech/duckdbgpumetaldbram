@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/metal-residency-prepare
-- working on: v0.7 milestone 0b Metal side: prepare()/prepared()/resident_bytes() + interleaved pair upload on Metal; stacked PR on #84
+- branch: feat/ext-python-wrapper
+- working on: v0.7: #85 (Metal 0b) and #86 (scalar) merged to main, CI green; #87 (wrapper) rebased onto main, wrapper suite green, awaiting ready+merge; next: segments in the residency manager once 0c lands
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-03T22:21:28Z
+- last update: 2026-09-04T00:37:02Z
