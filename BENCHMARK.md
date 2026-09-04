@@ -2,6 +2,35 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-09-03 (v0.7 milestone 0c) — upload sessions: the whole-table upload becomes short idle-time segments
+
+**Hardware / build:** RTX 4090 Laptop GPU, embedded DuckDB v1.5.2 (`gpudb-sql`), TPC-H SF10
+`lineitem` (59,986,052 rows), `GPUDB_UPLOAD_POOL_MAX_MB=8192`. Statement time around `duckdb_query`.
+
+The wrapper cannot run one multi-second upload scan beside a user's queries (§5.6: one worker
+pool). An upload session lets it split the scan into short statements — `gpu_upload_begin(tag)`,
+one `gpu_upload_pair(tag, …) WHERE rowid >= a AND rowid < b` per 8 MiB segment, `gpu_upload_finish(tag)`
+— so a user statement that arrives mid-upload overlaps at most one segment and the wrapper's
+`interrupt()` bounds even that.
+
+| | statements | scan per segment | H2D + split | prepare (sort) | total device work |
+|---|---|---|---|---|---|
+| single-statement upload (0b) | 1 | — | 254 ms | on first query (lazy) | — |
+| **session, 512 K-row segments** | 115 begin/seg + finish | min 4.7 / mean 6.2 / max 12.9 ms | 109 ms (at finish) | 48 ms (at finish, managed) | 285 ms at finish |
+
+- Each segment statement is **4.7–12.9 ms** of scan and touches no device memory (it appends its
+  host segments to the open session); DuckDB checks for an interrupt between vectors, so the
+  wrapper's `interrupt()` returns in ~0.5 ms (measured on the Mac) — the overlap a user statement
+  can suffer is one partial segment, not the whole upload.
+- The 115 segment statements sum to 712 ms of scan against the single statement's ~250 ms: the
+  extra ~460 ms is the per-statement bind/scan-setup paid 115 times. It is spread across idle
+  gaps and never runs beside a user statement, so it does not enter the rule-1 gate; the wrapper
+  trades total upload wall-time for never blocking a query.
+- `finish` does the one device copy of all held segments (109 ms) plus `prepare()` for a managed
+  set (48 ms); the set flips to `ready` there. An interrupted or failed segment never reaches
+  finalize, so the session is unchanged and the wrapper re-runs just that segment (registry test
+  cases 24–32).
+
 ## 2026-09-03 (v0.7 milestone 2, extension side) — the statement rewriter's own cost
 
 **Hardware:** same box as the section below; DuckDB v1.5.5 CLI loading the Linux loadable
