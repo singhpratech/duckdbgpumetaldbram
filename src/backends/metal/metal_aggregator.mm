@@ -24,9 +24,11 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -60,6 +62,20 @@ double cb_kernel_ms(id<MTLCommandBuffer> cb) {
     return (e - s) * 1000.0;
 }
 
+// Shared by the aggregator and every column it uploads: the radix sorter's
+// staging buffers are single-use, so one sort runs at a time process-wide
+// (mu), and a column that outlives the aggregator can still build its cache.
+struct SortCtx {
+    id<MTLDevice>       device = nil;
+    id<MTLCommandQueue> queue  = nil;
+    std::mutex          mu;
+    std::unique_ptr<metal_detail::MetalRadixSort> sorter;   // created under mu
+    metal_detail::MetalRadixSort& get() {
+        if (!sorter) sorter = std::make_unique<metal_detail::MetalRadixSort>(device, queue);
+        return *sorter;
+    }
+};
+
 class MetalAggregator final : public Aggregator {
 public:
     MetalAggregator() {
@@ -68,6 +84,9 @@ public:
             if (!device_) throw std::runtime_error("MTLCreateSystemDefaultDevice returned nil");
             queue_ = [device_ newCommandQueue];
             if (!queue_) throw std::runtime_error("Failed to create Metal command queue");
+            sort_ctx_ = std::make_shared<SortCtx>();
+            sort_ctx_->device = device_;
+            sort_ctx_->queue  = queue_;
 
             NSError* err = nil;
             NSString* src = [NSString stringWithUTF8String:metal::kSumKernelSource];
@@ -147,6 +166,38 @@ public:
     std::unique_ptr<ResidentColumn> upload_f64(const double* d, std::size_t n) override {
         return make_resident(d, n, Dtype::F64, sizeof(double));
     }
+    // v0.7 milestone 0b: de-interleave the (key, payload) segments straight
+    // into the two shared buffers in one pass — no intermediate host vectors.
+    // The payload lane is copied bit-for-bit: for F64 it already holds the
+    // IEEE-754 image, and a shared MTLBuffer is plain host memory.
+    ResidentPair upload_pair_interleaved(const KvSpan* spans, std::size_t n_spans,
+                                         Dtype vdt) override {
+        @autoreleasepool {
+            std::size_t rows = 0;
+            for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+            const std::size_t bytes = (rows == 0) ? 1 : rows * sizeof(std::int64_t);
+            id<MTLBuffer> kb = [device_ newBufferWithLength:bytes
+                                                    options:MTLResourceStorageModeShared];
+            id<MTLBuffer> vb = [device_ newBufferWithLength:bytes
+                                                    options:MTLResourceStorageModeShared];
+            if (!kb || !vb)
+                throw std::runtime_error("upload_pair_interleaved: device allocation failed (Metal)");
+            auto* k = static_cast<std::int64_t*>([kb contents]);
+            auto* v = static_cast<std::int64_t*>([vb contents]);
+            std::size_t r = 0;
+            for (std::size_t i = 0; i < n_spans; ++i) {
+                const std::int64_t* kv = spans[i].kv;
+                for (std::size_t j = 0; j < spans[i].rows; ++j, ++r) {
+                    k[r] = kv[2 * j];
+                    v[r] = kv[2 * j + 1];
+                }
+            }
+            ResidentPair out;
+            out.keys = std::make_unique<MetalResidentColumn>(kb, rows, Dtype::I64, sort_ctx_);
+            out.vals = std::make_unique<MetalResidentColumn>(vb, rows, vdt, sort_ctx_);
+            return out;
+        }
+    }
     AggResult sum_resident_i64(const ResidentColumn& c) override {
         const auto& r = check_i64(c);
         return run_i64_resident(r.buffer(), r.rows(),
@@ -186,38 +237,16 @@ public:
         }
     }
 
-    // Get (or lazily build + cache) the radix-sorted copy of a build-key
-    // column. Sort cost is reported through *sort_kernel_ms on the call that
-    // pays it; later calls reuse the cache for free.
+    // Get (or build + cache) the radix-sorted copy of a build-key column.
+    // The build lives on the column (prepare(), TRANSPARENT_DESIGN.md §5.5);
+    // this is the lazy path an operator takes when the column was not
+    // prepared. Sort cost is reported through *sort_kernel_ms on the call
+    // that pays it; later calls reuse the cache for free.
     id<MTLBuffer> ensure_sorted_cache(const ResidentColumn& build_col,
                                       double* sort_kernel_ms) {
         const auto& bk = check_i64(build_col);
-        id<MTLBuffer> sorted = bk.sorted_cache();
-        if (sorted) return sorted;
-        if (bk.rows() > 0xFFFFFFFFull)
-            throw std::runtime_error("resident join: > 2^32 build rows unsupported");
-        if (!sorter_)
-            sorter_ = std::make_unique<metal_detail::MetalRadixSort>(device_, queue_);
-        const std::size_t n = bk.rows();
-        const auto* keys = static_cast<const std::int64_t*>([bk.buffer() contents]);
-        // Sort (key, original-index) pairs: the payload comes back as the
-        // permutation the row join needs.
-        std::vector<std::int64_t> idx(n);
-        for (std::size_t j = 0; j < n; ++j) idx[j] = static_cast<std::int64_t>(j);
-        auto view = sorter_->sort_device(keys, idx.data(),
-                                         static_cast<std::uint32_t>(n));
-        sorted             = [device_ newBufferWithLength:n * sizeof(std::int64_t)
-                                                  options:MTLResourceStorageModeShared];
-        id<MTLBuffer> perm = [device_ newBufferWithLength:n * sizeof(std::int64_t)
-                                                  options:MTLResourceStorageModeShared];
-        if (!sorted || !perm)
-            throw std::runtime_error(
-                "resident join: device allocation for sorted build cache failed");
-        std::memcpy([sorted contents], [view.keys contents],     n * sizeof(std::int64_t));
-        std::memcpy([perm contents],   [view.payloads contents], n * sizeof(std::int64_t));
-        bk.set_sorted_cache(sorted, perm);
-        *sort_kernel_ms += view.kernel_ms;
-        return sorted;
+        bk.build_sort_cache(sort_kernel_ms);
+        return bk.sorted_cache();
     }
 
     JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
@@ -622,68 +651,111 @@ public:
 private:
     class MetalResidentColumn final : public ResidentColumn {
     public:
-        MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt)
-            : buf_(buf), rows_(n), dtype_(dt) {}
+        MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt,
+                            std::shared_ptr<SortCtx> ctx)
+            : buf_(buf), rows_(n), dtype_(dt), ctx_(std::move(ctx)) {}
         Backend     backend_tag() const noexcept override { return Backend::METAL; }
         Dtype       dtype()       const noexcept override { return dtype_; }
         std::size_t rows()        const noexcept override { return rows_; }
         id<MTLBuffer> buffer()    const noexcept { return buf_; }
 
-        // Build-side sorted-key cache for the fused/row joins (see
-        // gpu_backend.hpp: backend-private, dies with the column, exempt from
-        // the host pool cap). perm holds the sort permutation as ORIGINAL
-        // upload indices (i64), aligned with the sorted keys — the row join
-        // uses it to emit original build indices. Mutable: built lazily on
-        // first join use of a const handle.
-        id<MTLBuffer> sorted_cache() const noexcept { return sorted_; }
-        id<MTLBuffer> perm_cache()   const noexcept { return perm_; }
-        void set_sorted_cache(id<MTLBuffer> keys, id<MTLBuffer> perm) const noexcept {
-            sorted_ = keys; perm_ = perm;
+        // ---- v0.7 milestone 0b: readiness (gpu_backend.hpp contract) ----
+        // The derived structure is the radix-sorted copy of the column plus
+        // the sort permutation as ORIGINAL upload indices (i64), which every
+        // GROUP BY, join build side and top-k call needs. prepare() builds it
+        // now; an operator builds it lazily on first use otherwise.
+        // Idempotent; concurrent calls serialize on cache_mu_ and the loser
+        // is a no-op; a failure throws std::runtime_error and leaves the
+        // column usable (the next caller retries the build).
+        void prepare() override { double ms = 0.0; build_sort_cache(&ms); }
+        bool prepared() const noexcept override {
+            return rows_ == 0 || ready_.load(std::memory_order_acquire);
+        }
+        std::size_t resident_bytes() const noexcept override {
+            const std::size_t base = rows_ * sizeof(std::int64_t);   // i64 and f64: 8 B
+            return base + (ready_.load(std::memory_order_acquire) ? 2 * base : 0);
+        }
+
+        // Sorted copy (i64 keys, or the order-preserving i64 image of f64
+        // values with NaN canonicalised greatest, as native DuckDB orders
+        // doubles) and the permutation; nil until built. Backend-private,
+        // dies with the column, exempt from the host pool cap.
+        id<MTLBuffer> sorted_cache() const noexcept {
+            return ready_.load(std::memory_order_acquire) ? sorted_ : nil;
+        }
+        id<MTLBuffer> perm_cache() const noexcept {
+            return ready_.load(std::memory_order_acquire) ? perm_ : nil;
+        }
+
+        void build_sort_cache(double* sort_kernel_ms) const {
+            if (rows_ == 0 || ready_.load(std::memory_order_acquire)) return;
+            std::lock_guard<std::mutex> lock(cache_mu_);
+            if (ready_.load(std::memory_order_relaxed)) return;   // lost the race: built
+            if (rows_ > 0xFFFFFFFFull)
+                throw std::runtime_error("resident sort cache: > 2^32 rows unsupported (Metal)");
+            @autoreleasepool {
+                const std::size_t n = rows_;
+                std::vector<std::int64_t> tk, idx(n);
+                for (std::size_t i = 0; i < n; ++i) idx[i] = static_cast<std::int64_t>(i);
+                const std::int64_t* keys = nullptr;
+                if (dtype_ == Dtype::I64) {
+                    keys = static_cast<const std::int64_t*>([buf_ contents]);
+                } else {
+                    // Order-preserving i64 image of each double: NaN
+                    // canonicalised and sorted greatest, negatives reflected.
+                    const auto* d = static_cast<const double*>([buf_ contents]);
+                    tk.resize(n);
+                    for (std::size_t i = 0; i < n; ++i) {
+                        double x = d[i];
+                        std::uint64_t u;
+                        if (std::isnan(x)) u = 0x7FF8000000000000ull;
+                        else std::memcpy(&u, &x, sizeof(u));
+                        if (static_cast<std::int64_t>(u) < 0)
+                            tk[i] = -static_cast<std::int64_t>(u & 0x7FFFFFFFFFFFFFFFull) - 1;
+                        else
+                            tk[i] = static_cast<std::int64_t>(u);
+                    }
+                    keys = tk.data();
+                }
+                id<MTLBuffer> sorted = [ctx_->device newBufferWithLength:n * sizeof(std::int64_t)
+                                                                 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> perm   = [ctx_->device newBufferWithLength:n * sizeof(std::int64_t)
+                                                                 options:MTLResourceStorageModeShared];
+                if (!sorted || !perm)
+                    throw std::runtime_error("resident sort cache: device allocation failed (Metal)");
+                double ms = 0.0;
+                {
+                    // One sort at a time: the sorter's staging buffers are single-use.
+                    std::lock_guard<std::mutex> slock(ctx_->mu);
+                    auto view = ctx_->get().sort_device(keys, idx.data(),
+                                                        static_cast<std::uint32_t>(n));
+                    std::memcpy([sorted contents], [view.keys contents],     n * sizeof(std::int64_t));
+                    std::memcpy([perm contents],   [view.payloads contents], n * sizeof(std::int64_t));
+                    ms = view.kernel_ms;
+                }
+                sorted_ = sorted;
+                perm_   = perm;
+                ready_.store(true, std::memory_order_release);
+                *sort_kernel_ms += ms;
+            }
         }
     private:
         id<MTLBuffer> buf_;
         std::size_t   rows_;
         Dtype         dtype_;
+        std::shared_ptr<SortCtx> ctx_;
+        mutable std::mutex        cache_mu_;      // guards the cache build
+        mutable std::atomic<bool> ready_{false};  // release after sorted_/perm_ are set
         mutable id<MTLBuffer> sorted_ = nil;
         mutable id<MTLBuffer> perm_   = nil;
     };
 
     enum class GbMode { SumI64, SumF64, Count };
 
-    // Radix-sort an F64 column by value through an order-preserving i64
-    // key transform (NaN canonicalised and sorted greatest, as native
-    // DuckDB orders doubles). Cached on the column like the i64 sort.
+    // F64 sort cache (top-k by value): built on the column, see
+    // MetalResidentColumn::build_sort_cache.
     void ensure_sorted_cache_f64(const MetalResidentColumn& c, double* sort_kernel_ms) {
-        if (c.sorted_cache()) return;
-        if (!sorter_)
-            sorter_ = std::make_unique<metal_detail::MetalRadixSort>(device_, queue_);
-        const std::size_t n = c.rows();
-        const auto* d = static_cast<const double*>([c.buffer() contents]);
-        std::vector<std::int64_t> tk(n), idx(n);
-        for (std::size_t i = 0; i < n; ++i) {
-            double x = d[i];
-            std::uint64_t u;
-            if (std::isnan(x)) u = 0x7FF8000000000000ull;
-            else std::memcpy(&u, &x, sizeof(u));
-            std::int64_t key;
-            if (static_cast<std::int64_t>(u) < 0)
-                key = -static_cast<std::int64_t>(u & 0x7FFFFFFFFFFFFFFFull) - 1;
-            else
-                key = static_cast<std::int64_t>(u);
-            tk[i]  = key;
-            idx[i] = static_cast<std::int64_t>(i);
-        }
-        auto view = sorter_->sort_device(tk.data(), idx.data(), static_cast<std::uint32_t>(n));
-        id<MTLBuffer> sorted = [device_ newBufferWithLength:n * sizeof(std::int64_t)
-                                                    options:MTLResourceStorageModeShared];
-        id<MTLBuffer> perm   = [device_ newBufferWithLength:n * sizeof(std::int64_t)
-                                                    options:MTLResourceStorageModeShared];
-        if (!sorted || !perm)
-            throw std::runtime_error("topk_resident: device allocation for sort cache failed");
-        std::memcpy([sorted contents], [view.keys contents],     n * sizeof(std::int64_t));
-        std::memcpy([perm contents],   [view.payloads contents], n * sizeof(std::int64_t));
-        c.set_sorted_cache(sorted, perm);
-        *sort_kernel_ms += view.kernel_ms;
+        c.build_sort_cache(sort_kernel_ms);
     }
 
     // Output buffer aliasing a std::vector's storage when it is page-aligned
@@ -1159,7 +1231,7 @@ private:
             id<MTLBuffer> buf = [device_ newBufferWithLength:bytes
                                                      options:MTLResourceStorageModeShared];
             if (n > 0) std::memcpy([buf contents], src, n * elem);
-            return std::make_unique<MetalResidentColumn>(buf, n, dt);
+            return std::make_unique<MetalResidentColumn>(buf, n, dt, sort_ctx_);
         }
     }
 
@@ -1424,7 +1496,7 @@ private:
     id<MTLBuffer> gb_hist_buf_   = nil;
 
     // Lazily constructed: only joins pay for the radix-sort pipelines.
-    std::unique_ptr<metal_detail::MetalRadixSort> sorter_;
+    std::shared_ptr<SortCtx> sort_ctx_;
 
     // Per-probe-element multiplicity scratch for the f64 join path (u32 per
     // row); grown on demand, reused across calls.

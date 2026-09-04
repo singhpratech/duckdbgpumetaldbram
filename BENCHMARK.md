@@ -2,6 +2,29 @@
 
 Append-only. Reproducible runs only — include hardware, CUDA toolkit, build flags.
 
+## 2026-09-03 (v0.7 milestone 2, extension side) — the statement rewriter's own cost
+
+**Hardware:** same box as the section below; DuckDB v1.5.5 CLI loading the Linux loadable
+extension, `SET threads = 1`, 4000 distinct statements (the HAVING threshold / WHERE constant
+varies), one `SELECT count(*)` per column so the per-call cost is `Run Time / 4000`.
+
+| call | 4000 calls | per call |
+|---|---|---|
+| `json_serialize_sql(stmt)` alone | 48 ms | 0.012 ms |
+| `gpu_rewrite_ast(tree, ctx)` — statement **rejected** (`WHERE`, reason `shape`) | 182 ms | 0.045 ms |
+| `gpu_rewrite_ast(tree, ctx)` — statement **rewritten** (HAVING + ORDER BY + LIMIT → `_having` form) | 577 ms | 0.144 ms |
+
+The §6 target for an unmatched statement was 0.05 ms. Both numbers are per template, not per
+statement: the wrapper caches the decision on the literal-normalised text (§3.3), and a pure
+scalar with identical arguments is constant-folded by DuckDB inside one statement (2000
+identical rows: 1 ms total).
+
+Parity (`scripts/rewrite_parity_check.sh`, native vs rewritten vs explicit `gpu_*`, EXCEPT both
+ways = 0): plain / HAVING sum / HAVING count / top-10 / sum-only / DECIMAL(15,2) sum typed
+DECIMAL(38,2) / DECIMAL HAVING with a finer threshold / TPC-H SF1 Q18-inner
+(`sum(l_quantity) > 300`, 6,001,215 rows) — 8/8, plus the EXPLAIN check (resident scan and the
+guard FILTER in the plan).
+
 ## 2026-09-03 (v0.7 milestone 0b) — residency prerequisite: the upload no longer starves a concurrent native query
 
 **Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16 GB), CUDA 13.0.88, 20 host threads, 31 GB RAM
