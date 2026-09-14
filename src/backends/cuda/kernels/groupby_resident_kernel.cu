@@ -452,3 +452,32 @@ cudaError_t gpudb_cuda_debug_fault_inject(cudaStream_t s) {
 }
 
 } // extern "C"
+
+// ---------------------------------------------------------------------------
+// v0.7 milestone 0b: split an interleaved (key, payload) buffer into two
+// columns on the device — the pair upload never de-interleaves on the host.
+// ---------------------------------------------------------------------------
+namespace {
+__global__ void deinterleave_kernel(const std::int64_t* __restrict__ kv,
+                                    std::int64_t* __restrict__ k,
+                                    std::int64_t* __restrict__ v, std::size_t n) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += stride) {
+        const longlong2 p = reinterpret_cast<const longlong2*>(kv)[i];   // one 16 B load
+        k[i] = p.x;
+        v[i] = p.y;
+    }
+}
+} // namespace
+
+extern "C" cudaError_t gpudb_cuda_deinterleave_i64(const std::int64_t* d_kv,
+                                                   std::int64_t* d_k, std::int64_t* d_v,
+                                                   std::size_t n, cudaStream_t s) {
+    if (n == 0) return cudaSuccess;
+    const int block = 256;
+    const std::size_t want = (n + block - 1) / block;
+    const int grid = static_cast<int>(want < 4096 ? want : 4096);
+    deinterleave_kernel<<<grid, block, 0, s>>>(d_kv, d_k, d_v, n);
+    return cudaGetLastError();
+}

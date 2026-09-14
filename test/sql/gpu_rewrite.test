@@ -1,0 +1,167 @@
+# gpu_rewrite SQL test — gpu_rewrite_ast(tree, context): the pure statement
+# rewriter behind the v0.7 transparent path (docs/TRANSPARENT_DESIGN.md §3, §6).
+#
+# Every case builds the context the wrapper would build (identity tag, resolved
+# table, column types, stats, DESCRIBE outputs), runs the rewrite on
+# json_serialize_sql(<statement>) and either executes the rewritten tree with
+# json_execute_serialized_sql and compares against native (EXCEPT both ways),
+# or reads the "gpudb" key for the rewrite decision and reason.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_rewrite
+
+-- 1. Plain GROUP BY: rewritten; rows identical to native (EXCEPT both ways = 0)
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(100000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"default_order":"ASC","default_null_order":"NULLS_LAST","outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"},{"name":"count_star()","type":"BIGINT"}],"thresholds":{"min_rows":1000},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'
+-- setup: SET VARIABLE q = 'SELECT k, sum(v), count(*) FROM t GROUP BY k'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.reason') AS reason,
+       (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) EXCEPT SELECT k, sum(v), count(*) FROM t GROUP BY k)) AS extra,
+       (SELECT count(*) FROM (SELECT k, sum(v), count(*) FROM t GROUP BY k EXCEPT SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))))) AS missing;
+-- expect: rewritten  0  0
+
+-- 2. Output names and types are native's: auto-generated names, HUGEINT sum
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"},{"name":"count_star()","type":"BIGINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v), count(*) FROM t GROUP BY k'), getvariable('ctx')));
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)", count AS "count_star()" FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:t:9:k,v') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok
+
+-- 3. HAVING sum(v) > c becomes the _having form; identical rows; ORDER BY / LIMIT kept
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(100000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"q","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'
+-- setup: SET VARIABLE q = 'SELECT k, sum(v) AS q FROM t GROUP BY k HAVING sum(v) > 2141449971 ORDER BY q DESC LIMIT 3'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.form') AS form,
+       (SELECT string_agg(k || ':' || q, ' ' ORDER BY q DESC) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) AS rewritten,
+       (SELECT string_agg(k || ':' || q, ' ' ORDER BY q DESC) FROM (SELECT k, sum(v) AS q FROM t GROUP BY k HAVING sum(v) > 2141449971 ORDER BY q DESC LIMIT 3)) AS native;
+-- expect: having  4:2141535687 3:2141492829  4:2141535687 3:2141492829
+
+-- 4. The four comparisons and a constant on the left all map to the device filter
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
+SELECT (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) >= 200000'), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT k FROM t GROUP BY k HAVING sum(v) >= 200000)) AS ge,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) < 200000'), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT k FROM t GROUP BY k HAVING sum(v) < 200000)) AS lt,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) <= 199866'), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT k FROM t GROUP BY k HAVING sum(v) <= 199866)) AS le,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING 200000 < sum(v)'), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT k FROM t GROUP BY k HAVING 200000 < sum(v))) AS flipped,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING 200000 < sum(v)'), getvariable('ctx'))) LIKE '%_having(''gpudb:v1:memory:main:t:9:k,v'', ''>'', 200000)%' AS flipped_op;
+-- expect: true  true  true  true  true
+
+-- 5. ORDER BY <aggregate> LIMIT k pushes the _topk form; ORDER BY / LIMIT stay in the statement
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"default_order":"ASC","outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY sum(v) DESC LIMIT 2'), getvariable('ctx'))) AS by_expr,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 2 DESC LIMIT 2'), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', 2, ''desc'')%ORDER BY "sum(v)" DESC LIMIT 2' AS ordinal_pushed,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 1 LIMIT 2'), getvariable('ctx'))) LIKE '%_resident(''gpudb:v1:memory:main:t:9:k,v'')%ORDER BY k LIMIT 2' AS ordinal_key_kept;
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)" FROM gpu_groupby_sum_resident_topk('gpudb:v1:memory:main:t:9:k,v', 2, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "sum(v)" DESC LIMIT 2  true  true
+
+-- 5b. ORDER BY with no explicit direction uses the connection's default_order;
+--     without one the ORDER BY is kept but nothing is pushed
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"q","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS q FROM t GROUP BY k ORDER BY q LIMIT 2'), getvariable('ctx')), '$.gpudb.form') AS form,
+       (SELECT string_agg(k, ',' ORDER BY q) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS q FROM t GROUP BY k ORDER BY q LIMIT 2'), getvariable('ctx')))) =
+       (SELECT string_agg(k, ',' ORDER BY q) FROM (SELECT k, sum(v) AS q FROM t GROUP BY k ORDER BY q LIMIT 2)) AS same_rows;
+-- expect: plain  true
+
+-- 6. count(*) only: the COUNT form; HAVING on count; ORDER BY the key maps to its output name
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"kk","type":"BIGINT"},{"name":"n","type":"BIGINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k AS kk, count(*) AS n FROM t GROUP BY k HAVING count(*) >= 143 ORDER BY k'), getvariable('ctx'))) AS sql,
+       (SELECT string_agg(kk || ':' || n, ' ' ORDER BY kk) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k AS kk, count(*) AS n FROM t GROUP BY k HAVING count(*) >= 143 ORDER BY k'), getvariable('ctx')))) AS rows_;
+-- expect: SELECT "key" AS kk, count AS n FROM gpu_groupby_count_resident_having('gpudb:v1:memory:main:t:9:k,v', '>=', 143) AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY kk  0:143 1:143 2:143 3:143 4:143 5:143
+
+-- 6b. Count-only over a one-column tag (bare key set): count form, HAVING on count, top-k on count
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:9:k', k) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"count_star()","type":"BIGINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*) DESC LIMIT 3'), getvariable('ctx'))) AS sql,
+       (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142'), getvariable('ctx')))) EXCEPT (SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142))) AS extra,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k'), getvariable('ctx')), '$.gpudb.reason') AS sum_declined;
+-- expect: SELECT "key" AS k, count AS "count_star()" FROM gpu_groupby_count_resident_topk('gpudb:v1:memory:main:t:9:k', 3, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "count_star()" DESC LIMIT 3  0  shape
+
+-- 7. DECIMAL(15,2) payload: the wrapper uploaded (v*100)::BIGINT; the sum comes
+--    back typed DECIMAL(38,2) and equal to native; thresholds rescale exactly
+--    (300.5 → 30050; >= 300.555 → ceil → 30056; < 300.555 → 30056)
+-- setup: CREATE TABLE d AS SELECT (i % 5)::BIGINT AS k, ((i % 97) / 4.0)::DECIMAL(15,2) AS v FROM range(2000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:d:3:k,v', k, (v * 100)::BIGINT) FROM d
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:d:3:k,v","table":{"catalog":"memory","schema":"main","name":"d","oid":3},"columns":{"k":"BIGINT","v":{"type":"DECIMAL(15,2)","scale":2}},"backend":"CUDA","rows":2000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"DECIMAL(38,2)"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":4},"v":{"has_null":false,"min":0,"max":24}}}'
+SELECT (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k'), getvariable('ctx'))) EXCEPT SELECT k, sum(v) FROM d GROUP BY k)) AS extra,
+       (SELECT typeof("sum(v)") FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k'), getvariable('ctx'))) LIMIT 1) AS type_,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k HAVING sum(v) > 300.5'), getvariable('ctx'))) LIKE '%''>'', 30050)%' AS gt,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k HAVING sum(v) >= 300.555'), getvariable('ctx'))) LIKE '%''>='', 30056)%' AS ge,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k HAVING sum(v) < 300.555'), getvariable('ctx'))) LIKE '%''<'', 30056)%' AS lt,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k HAVING sum(v) <= 300.555'), getvariable('ctx'))) LIKE '%''<='', 30055)%' AS le,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM d GROUP BY k HAVING sum(v) > 4801.5'), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT k FROM d GROUP BY k HAVING sum(v) > 4801.5)) AS having_rows;
+-- expect: 0  DECIMAL(38,2)  true  true  true  true  true
+
+-- 8. INTEGER key: the output is CAST back to the native type
+-- setup: CREATE TABLE ti AS SELECT (i % 3)::INTEGER AS k, i::BIGINT AS v FROM range(300) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:ti:4:k,v', k, v) FROM ti
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:ti:4:k,v","table":{"catalog":"memory","schema":"main","name":"ti","oid":4},"columns":{"k":"INTEGER","v":"BIGINT"},"backend":"CUDA","rows":300,"ready":true,"outputs":[{"name":"k","type":"INTEGER"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":2},"v":{"has_null":false,"min":0,"max":299}}}'
+SELECT typeof(k), typeof("sum(v)") FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM ti GROUP BY k'), getvariable('ctx'))) LIMIT 1;
+-- expect: INTEGER  HUGEINT
+
+-- 9. (the EXPLAIN check — the resident scan and the guard FILTER in the plan —
+--     lives in scripts/rewrite_parity_check.sh: EXPLAIN is a top-level statement)
+
+-- 10. Rejections come back as the input tree with a reason (rejected by field)
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'
+SELECT string_agg(json_extract_string(gpu_rewrite_ast(json_serialize_sql(q), getvariable('ctx')), '$.gpudb.reason'), ' ' ORDER BY i) AS reasons
+FROM (VALUES
+  (1, 'SELECT k, sum(v) AS s FROM t WHERE v > 1 GROUP BY k'),
+  (2, 'SELECT k, min(v) AS s FROM t GROUP BY k'),
+  (3, 'SELECT k, sum(DISTINCT v) AS s FROM t GROUP BY k'),
+  (4, 'SELECT k, sum(v) FILTER (WHERE v > 1) AS s FROM t GROUP BY k'),
+  (5, 'SELECT k, sum(v) AS s FROM t GROUP BY ALL'),
+  (6, 'SELECT k, sum(v) AS s FROM t GROUP BY 1'),
+  (7, 'SELECT k, sum(v) AS s FROM t GROUP BY ROLLUP (k)'),
+  (8, 'WITH t AS (SELECT 1 AS k, 2 AS v) SELECT k, sum(v) AS s FROM t GROUP BY k'),
+  (9, 'SELECT k, sum(v) AS s FROM other GROUP BY k'),
+  (10, 'SELECT k, sum(v) AS s FROM t GROUP BY k HAVING sum(v) = 5'),
+  (11, 'SELECT k, sum(v) AS s FROM t GROUP BY k UNION ALL SELECT 1, 2'),
+  (12, 'SELECT k, sum(v) OVER () AS s FROM t GROUP BY k'),
+  (13, 'SELECT k, sum(v) AS s FROM t TABLESAMPLE 10% GROUP BY k'),
+  (14, 'SELECT DISTINCT k, sum(v) AS s FROM t GROUP BY k'),
+  (15, 'INSERT INTO t VALUES (1, 2)')
+) v(i, q);
+-- expect: shape shape shape shape shape shape shape shape shape shape shape shape shape shape error
+
+-- 10b. HAVING count(*) beside sum(v): the SUM function's rows, the count predicate in the outer WHERE
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":0,"max":999}}}'
+-- setup: SET VARIABLE q = 'SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) > 142 ORDER BY k'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) AS sql,
+       (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) EXCEPT (SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) > 142))) AS extra,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) AS n;
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS s FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:t:9:k,v') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE (gd.ok AND (r.count > 142)) ORDER BY k  0  6
+
+-- 11. Rule-2 and residency gates: nulls, overflow, double, decimal width, backend, not ready, threshold
+-- setup: SET VARIABLE base = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'
+-- setup: SET VARIABLE q = 'SELECT k, sum(v) AS s FROM t GROUP BY k'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"stats":{"v":{"has_null":true}}}')), '$.gpudb.reason') AS nulls,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"stats":{"v":{"has_null":false,"min":0,"max":9.3e13}}}')), '$.gpudb.reason') AS overflow,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"columns":{"v":"DOUBLE"}}')), '$.gpudb.reason') AS double_,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"columns":{"v":"DECIMAL(38,4)"}}')), '$.gpudb.reason') AS decimal_,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"backend":"CPU"}')), '$.gpudb.reason') AS backend,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"ready":false}')), '$.gpudb.reason') AS not_ready,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), json_merge_patch(getvariable('base'), '{"thresholds":{"min_rows":1000000}}')), '$.gpudb.reason') AS threshold,
+       json_extract_string(gpu_rewrite_ast('not json', getvariable('base')), '$.gpudb.reason') AS bad_tree;
+-- expect: nulls  overflow  double  decimal  backend  not_resident  threshold  error
+
+-- 12. A rejected statement's tree comes back unchanged: it deserializes to the original text
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":299897}}}'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, min(v) AS s FROM t GROUP BY k'), getvariable('ctx')));
+-- expect: SELECT k, min(v) AS s FROM t GROUP BY k
+
+-- 13. GUARDRAIL: the rewritten statement raises the typed error when the table changed after the upload
+-- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":0,"max":999}}}'
+-- setup: INSERT INTO t VALUES (1, 1)
+-- expected_fail: GPUDB_STALE
+SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k'), getvariable('ctx')));

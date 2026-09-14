@@ -7,6 +7,7 @@
 // v1 contract matches HashJoinProbe: unique build keys, first match wins.
 
 #include "gpu_join_extension.hpp"
+#include "gpu_resident.hpp"
 #include "gpu_backend.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
@@ -226,16 +227,12 @@ void rows_init(duckdb_init_info info) {
     auto* bind = static_cast<RowsBindData*>(duckdb_init_get_bind_data(info));
     auto* init = new RowsInitData();
     try {
-        std::lock_guard<std::mutex> lock(resident_mutex());
-        gpudb::ResidentColumn* probe = find_resident_column(bind->probe);
-        gpudb::ResidentColumn* build = find_resident_column(bind->build);
-        if (!probe || !build)
-            throw std::runtime_error(
-                "gpu_join_rows_resident: no resident column named '" +
-                (probe ? bind->build : bind->probe) +
-                "' — create it with gpu_upload/gpu_upload_pair");
-        init->rows = resident_aggregator().join_rows_resident(
-            *probe, *build, bind->kind, join_rows_cap());
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
+        ResidentRef probe = resident_acquire_column(ctx, bind->probe, "gpu_join_rows_resident");
+        ResidentRef build = resident_acquire_column(ctx, bind->build, "gpu_join_rows_resident");
+        auto& agg = resident_aggregator(ctx);
+        auto dev = resident_device_lock(ctx);
+        init->rows = agg.join_rows_resident(*probe.col, *build.col, bind->kind, join_rows_cap());
         char buf[256];
         std::snprintf(buf, sizeof(buf),
             "op=join_rows_resident rows_probe=%zu rows_build=%zu out_rows=%zu "
@@ -243,7 +240,7 @@ void rows_init(duckdb_init_info info) {
             init->rows.rows_probe, init->rows.rows_build,
             init->rows.probe_idx.size(),
             init->rows.wall_ms, init->rows.kernel_ms, init->rows.transfer_ms);
-        resident_set_last_stats(buf);
+        resident_record_stats(ctx, probe.set.get(), buf);
     } catch (const std::exception& e) {
         delete init;
         duckdb_init_set_error(info, e.what());
@@ -283,7 +280,7 @@ void rows_function(duckdb_function_info info, duckdb_data_chunk output) {
 
 } // namespace
 
-void register_gpu_join(duckdb_connection con) {
+void register_gpu_join(duckdb_connection con, const std::shared_ptr<ResidentContext>& ctx) {
     duckdb_logical_type bigint = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
     duckdb_logical_type list_bigint = duckdb_create_list_type(bigint);
 
@@ -313,6 +310,7 @@ void register_gpu_join(duckdb_connection con) {
     duckdb_table_function_set_bind(rfn, rows_bind);
     duckdb_table_function_set_init(rfn, rows_init);
     duckdb_table_function_set_function(rfn, rows_function);
+    duckdb_table_function_set_extra_info(rfn, resident_extra_info(ctx), resident_extra_info_destroy);
     duckdb_destroy_logical_type(&varchar);
     if (duckdb_register_table_function(con, rfn) == DuckDBError) {
         duckdb_destroy_table_function(&rfn);

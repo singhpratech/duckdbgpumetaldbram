@@ -216,6 +216,32 @@ public:
             Backend::CPU, std::move(handle), n, Dtype::F64, /*on_gpu=*/false);
     }
 
+    ResidentPair upload_pair_interleaved(const KvSpan* spans, std::size_t n_spans,
+                                         Dtype vdt) override {
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        if (gpu_) {
+            try {
+                ResidentPair inner = gpu_->upload_pair_interleaved(spans, n_spans, vdt);
+                ResidentPair out;
+                out.keys = std::make_unique<HybridResidentColumn>(
+                    Backend::CPU, std::move(inner.keys), rows, Dtype::I64, /*on_gpu=*/true);
+                out.vals = std::make_unique<HybridResidentColumn>(
+                    Backend::CPU, std::move(inner.vals), rows, vdt, /*on_gpu=*/true);
+                return out;
+            } catch (const std::exception&) {
+                // fall through to the CPU upload
+            }
+        }
+        ResidentPair inner = cpu_->upload_pair_interleaved(spans, n_spans, vdt);
+        ResidentPair out;
+        out.keys = std::make_unique<HybridResidentColumn>(
+            Backend::CPU, std::move(inner.keys), rows, Dtype::I64, /*on_gpu=*/false);
+        out.vals = std::make_unique<HybridResidentColumn>(
+            Backend::CPU, std::move(inner.vals), rows, vdt, /*on_gpu=*/false);
+        return out;
+    }
+
     AggResult sum_resident_i64(const ResidentColumn& c) override {
         return dispatch_resident_i64(c, [&](Aggregator& a, const ResidentColumn& cc){
             return a.sum_resident_i64(cc);
@@ -413,6 +439,9 @@ private:
         Backend     backend_tag() const noexcept override { return inner_->backend_tag(); }
         Dtype       dtype()       const noexcept override { return dtype_; }
         std::size_t rows()        const noexcept override { return rows_; }
+        void prepare() override { inner_->prepare(); }
+        bool prepared() const noexcept override { return inner_->prepared(); }
+        std::size_t resident_bytes() const noexcept override { return inner_->resident_bytes(); }
         const ResidentColumn& inner() const noexcept { return *inner_; }
         bool on_gpu() const noexcept { return on_gpu_; }
     private:

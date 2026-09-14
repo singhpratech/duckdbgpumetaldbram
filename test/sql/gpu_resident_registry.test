@@ -1,0 +1,195 @@
+# gpu_resident_registry SQL test — the v0.7 resident registry
+# (docs/TRANSPARENT_DESIGN.md §5.3–§5.6): identity tags and origin,
+# gpu_residents(), gpu_assert_rows() as the in-statement staleness guard,
+# gpu_invalidate(), gpu_prepare_resident(), and the set-level registry
+# semantics (a pair is one entry; ready = uploaded AND prepared).
+#
+# Every query runs in a fresh gpudb-sql process; `-- setup:` statements run
+# first on the same connection.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_resident_registry
+
+-- 1. An identity tag makes a MANAGED set; its fields are parsed
+-- setup: CREATE TABLE t AS SELECT (i % 3)::BIGINT AS k, i::BIGINT AS v FROM range(10) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:17:k,v:rows=10', k, v) FROM t
+SELECT origin, catalog, schema, "table", table_oid, columns, kind, dtype, rows, rows_seen
+FROM gpu_residents();
+-- expect: managed  memory  main  t  17  k,v  pair  I64/I64  10  10
+
+-- 2. A plain name is an EXPLICIT set; identity fields are NULL; a bare
+--    column and a pair are 'column' / 'pair' kinds
+-- setup: SELECT gpu_upload('c', (range * 2)::BIGINT) FROM range(5)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, (range / 2.0)::DOUBLE) FROM range(6)
+SELECT name, origin, catalog IS NULL AS no_identity, kind, dtype, rows FROM gpu_residents() ORDER BY name;
+-- expect: c  explicit  true  column  I64  5
+-- expect: p  explicit  true  pair  I64/F64  6
+
+-- 3. Managed sets are READY (prepared) at upload; explicit sets are
+--    'uploaded' until an operator or gpu_prepare_resident builds the cache
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', range::BIGINT, range::BIGINT) FROM range(100)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(100)
+SELECT name, state, prepared FROM gpu_residents() ORDER BY name;
+-- expect: gpudb:v1:memory:main:t:1:k,v  ready  true
+-- expect: p  uploaded  false
+
+-- 4. gpu_prepare_resident builds the derived structures for an explicit set
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(100)
+SELECT gpu_prepare_resident('p') AS prepared_now;
+-- expect: true
+
+-- 4b. ... after which the set is ready (a separate statement: a scalar's side
+--     effect is not ordered against subqueries of the same SELECT)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(100)
+-- setup: SELECT gpu_prepare_resident('p')
+SELECT state, prepared FROM gpu_residents() WHERE name = 'p';
+-- expect: ready  true
+
+-- 5. Preparing does not change any answer: group by over a prepared set
+-- setup: CREATE TABLE t AS SELECT (i % 4)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t
+-- setup: SELECT gpu_prepare_resident('p')
+SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_sum_resident('p'))
+                      EXCEPT (SELECT k, sum(v) FROM t GROUP BY k));
+-- expect: 0
+
+-- 6. gpu_assert_rows passes when the count matches the rows the upload saw
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(50) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t
+SELECT gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', (SELECT count(*) FROM t)) AS ok;
+-- expect: true
+
+-- 7. rows_seen counts NULL-skipped rows too, so the guard compares against
+--    count(*) of the source table, not the resident row count
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, CASE WHEN i % 5 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range(50) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t
+SELECT rows, rows_seen, gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', 50) AS ok FROM gpu_residents();
+-- expect: 40  50  true
+
+-- 8. GUARDRAIL: a count that differs raises the TYPED error (prefix GPUDB_STALE:)
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(50) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t
+-- setup: INSERT INTO t VALUES (99, 99)
+-- expected_fail: GPUDB_STALE: gpu_assert_rows: resident set 'gpudb:v1:memory:main:t:1:k,v' is stale: table has 51 rows, the set was uploaded from 50
+SELECT gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', (SELECT count(*) FROM t));
+
+-- 9. GUARDRAIL: an unknown set is also GPUDB_STALE (the wrapper re-runs natively)
+-- expected_fail: GPUDB_STALE: gpu_assert_rows: no resident set named 'gpudb:v1:memory:main:t:1:k,v'
+SELECT gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', 0);
+
+-- 10. The rewritten-statement guard form (§5.4): the one-row derived table
+--     is cross-joined and referenced in WHERE, so it runs exactly once
+-- setup: CREATE TABLE t AS SELECT (i % 3)::BIGINT AS k, i::BIGINT AS v FROM range(30) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t
+SELECT r.key, r.sum
+FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:t:1:k,v') r,
+     (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', count(*)) AS ok FROM t) gd
+WHERE gd.ok ORDER BY r.key;
+-- expect: 0  135
+-- expect: 1  145
+-- expect: 2  155
+
+-- 11. GUARDRAIL: the guard fires even when the resident side returns NO rows
+--     (HAVING that nothing satisfies) — a stale empty answer never passes
+-- setup: CREATE TABLE t AS SELECT (i % 3)::BIGINT AS k, i::BIGINT AS v FROM range(30) r(i)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t
+-- setup: DELETE FROM t WHERE k = 2
+-- expected_fail: GPUDB_STALE
+SELECT r.key, r.sum
+FROM gpu_groupby_sum_resident_having('gpudb:v1:memory:main:t:1:k,v', '>', 1000000) r,
+     (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:1:k,v', count(*)) AS ok FROM t) gd
+WHERE gd.ok;
+
+-- 12. gpu_invalidate marks matching sets stale: exact name, or a ':'-delimited
+--     prefix of the identity tag; unrelated sets are untouched
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,x', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t2:2:k,v', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
+SELECT gpu_invalidate('gpudb:v1:memory:main:t:1') AS marked;
+-- expect: 2
+
+-- 12b. ... and the states afterwards
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,x', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t2:2:k,v', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_invalidate('gpudb:v1:memory:main:t:1')
+SELECT string_agg(name || '=' || state, ' ' ORDER BY name) FROM gpu_residents();
+-- expect: gpudb:v1:memory:main:t2:2:k,v=ready gpudb:v1:memory:main:t:1:k,v=stale gpudb:v1:memory:main:t:1:k,x=stale p=uploaded
+
+-- 13. GUARDRAIL: operators refuse a stale set with the typed prefix
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_invalidate('p')
+-- expected_fail: GPUDB_STALE: gpu_groupby_sum_resident: resident set 'p' is stale
+SELECT * FROM gpu_groupby_sum_resident('p');
+
+-- 14. Re-uploading under the same name replaces the stale set (epoch moves on)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
+-- setup: SELECT gpu_invalidate('p')
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, (range * 3)::BIGINT) FROM range(4)
+SELECT state, epoch, rows, (SELECT sum(sum) FROM gpu_groupby_sum_resident('p')) AS total FROM gpu_residents();
+-- expect: uploaded  1  4  18
+
+-- 15. Invalidating a prefix that matches nothing returns 0 and changes nothing
+-- setup: SELECT gpu_upload('c', range::BIGINT) FROM range(3)
+SELECT gpu_invalidate('nothing') AS marked, (SELECT state FROM gpu_residents()) AS state;
+-- expect: 0  uploaded
+
+-- 16. GUARDRAIL: the "gpudb:" prefix is reserved — a malformed tag is an error
+-- expected_fail: gpu_upload_pair: malformed identity tag 'gpudb:oops'
+SELECT gpu_upload_pair('gpudb:oops', range::BIGINT, range::BIGINT) FROM range(3);
+
+-- 17. GUARDRAIL: a tag with a non-integer table_oid is rejected
+-- expected_fail: non-integer table_oid 'x'
+SELECT gpu_upload('gpudb:v1:memory:main:t:x:v', range::BIGINT) FROM range(3);
+
+-- 18. The <extra> field is opaque and may itself contain ':'
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:5:v:rows=3:e=7', range::BIGINT) FROM range(3)
+SELECT "table", table_oid, columns, origin FROM gpu_residents();
+-- expect: t  5  v  managed
+
+-- 19. Dropping either column name of a pair drops the whole set; the name
+--     resolution 'p.k' / 'p.v' still works for column operators
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, (range * 10)::BIGINT) FROM range(5)
+SELECT gpu_sum_resident('p.k') AS keys, gpu_sum_resident('p.v') AS vals, gpu_drop_resident('p.k') AS dropped;
+-- expect: 10  100  true
+
+-- 19b. ... nothing is left after dropping through a column name
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, (range * 10)::BIGINT) FROM range(5)
+-- setup: SELECT gpu_drop_resident('p.v')
+SELECT count(*) FROM gpu_residents();
+-- expect: 0
+
+-- 20. Hits and per-set stats are recorded on the set an operator used
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(100)
+-- setup: SELECT gpu_upload('c', range::BIGINT) FROM range(100)
+-- setup: SELECT count(*) FROM gpu_groupby_sum_resident('p')
+-- setup: SELECT count(*) FROM gpu_groupby_count_resident('p')
+SELECT name, hits, coalesce(last_stats LIKE 'op=groupby_count_resident backend=%', false) AS stats_ok,
+       last_used_at IS NOT NULL AS used
+FROM gpu_residents() ORDER BY name;
+-- expect: c  0  false  false
+-- expect: p  2  true  true
+
+-- 21. gpu_resident_info keeps its v0.6 prefix and now reports set/origin/state
+-- setup: SELECT gpu_upload('c', range::BIGINT) FROM range(7)
+SELECT gpu_resident_info('c') LIKE 'dtype=I64 rows=7 device=% set=c origin=explicit state=uploaded prepared=%' AS ok;
+-- expect: true
+
+-- 22. bytes grows by the derived structures once a set is prepared
+--     (8 B/row per column, + sorted copy + 8 B/row permutation on the key)
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(1000)
+SELECT bytes FROM gpu_residents();
+-- expect: 16000
+
+-- 22b. ... prepared: + sorted copy of the key column + its permutation
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(1000)
+-- setup: SELECT gpu_prepare_resident('p')
+SELECT bytes FROM gpu_residents();
+-- expect: 32000
+
+-- 23. gpu_assert_rows on a BARE managed column: rows_seen is the upload's input count
+-- setup: CREATE TABLE t AS SELECT CASE WHEN i % 2 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range(20) r(i)
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:1:v', v) FROM t
+SELECT rows, rows_seen, gpu_assert_rows('gpudb:v1:memory:main:t:1:v', (SELECT count(*) FROM t)) AS ok FROM gpu_residents();
+-- expect: 10  20  true

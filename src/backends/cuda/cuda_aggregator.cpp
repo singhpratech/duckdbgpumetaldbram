@@ -14,12 +14,14 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <type_traits>
 #include <vector>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -40,6 +42,9 @@ cudaError_t gpudb_cuda_max_i64(const std::int64_t* d_in, std::size_t n,
 cudaError_t gpudb_cuda_sum_f64(const double* d_in, std::size_t n,
                                double* d_partials, double* d_out,
                                int grid, cudaStream_t s);
+cudaError_t gpudb_cuda_deinterleave_i64(const std::int64_t* d_kv,
+                                        std::int64_t* d_k, std::int64_t* d_v,
+                                        std::size_t n, cudaStream_t s);
 cudaError_t gpudb_cuda_join_build_sort(const std::int64_t* d_keys,
                                        std::int64_t* d_sorted, std::int64_t* d_perm,
                                        std::size_t n, cudaStream_t s);
@@ -110,6 +115,16 @@ namespace {
     do { auto _e = (call); if (_e != cudaSuccess) cuda_throw(_e, what); } while (0)
 
 // Owns a device buffer; freed in destructor.
+//
+// Threading (v0.7 milestone 0b, docs/TRANSPARENT_DESIGN.md §5.6): a column
+// is uploaded and prepared on its OWN non-blocking stream, never on the
+// aggregator's query stream, so an upload on one DuckDB connection never
+// serializes behind (or in front of) a query on another. The derived
+// sorted-key/permutation cache is built under a per-column mutex: either
+// prepare() builds it eagerly (managed sets) or the first operator builds it
+// lazily (explicit sets) — the two paths share one function and one lock.
+// Every build synchronizes its stream before publishing the pointers, so
+// consumers on any other stream see complete data without an event.
 class CudaResidentColumn final : public ResidentColumn {
 public:
     CudaResidentColumn(std::size_t n, Dtype dt) : rows_(n), dtype_(dt) {
@@ -121,6 +136,7 @@ public:
         if (d_sorted_) cudaFree(d_sorted_);
         if (d_perm_)   cudaFree(d_perm_);
         if (dptr_)     cudaFree(dptr_);
+        if (own_stream_) cudaStreamDestroy(own_stream_);
     }
 
     Backend     backend_tag() const noexcept override { return Backend::CUDA; }
@@ -131,63 +147,96 @@ public:
     const void* device_ptr() const noexcept { return dptr_; }
     std::size_t bytes()      const noexcept { return bytes_; }
 
-    // Build-side join cache: keys sorted + original-index permutation, built
-    // lazily on first use as a join build side, reused across kinds AND by
-    // the row-returning join. Lives and dies with the column; device memory
-    // only, exempt from the host-side GPUDB_UPLOAD_POOL_MAX_MB cap. A
-    // device-OOM here surfaces as std::runtime_error via cuda_throw.
-    void ensure_join_cache(cudaStream_t s) const {
-        if (d_sorted_ || rows_ == 0) return;
-        void* sorted = nullptr;
-        void* perm   = nullptr;
-        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, bytes_), "cudaMalloc join cache (sorted keys)");
-        cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
-        if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc join cache (perm)"); }
-        e = gpudb_cuda_join_build_sort(static_cast<const std::int64_t*>(dptr_),
-                                       static_cast<std::int64_t*>(sorted),
-                                       static_cast<std::int64_t*>(perm), rows_, s);
-        if (e != cudaSuccess) {
-            cudaFree(sorted); cudaFree(perm);
-            cuda_throw(e, "join cache build (sort_by_key)");
-        }
-        d_sorted_ = sorted;
-        d_perm_   = perm;
+    // H2D copy on the column's own stream; returns after the copy landed.
+    void upload_from_host(const void* src) {
+        if (bytes_ == 0) return;
+        cudaStream_t s = own_stream();
+        GPUDB_CUDA_CHECK(cudaMemcpyAsync(dptr_, src, bytes_, cudaMemcpyHostToDevice, s),
+                         "upload H2D");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "upload sync");
     }
-    // Sort cache for any dtype (v0.6 top-k): I64 shares the join cache above;
+
+    // ResidentColumn::prepare — build the sort cache now, on our own stream.
+    void prepare() override { ensure_sort_cache(own_stream()); }
+    bool prepared() const noexcept override {
+        return rows_ == 0 || d_sorted_.load(std::memory_order_acquire) != nullptr;
+    }
+    std::size_t resident_bytes() const noexcept override {
+        return bytes_ + (d_sorted_.load(std::memory_order_acquire)
+                             ? bytes_ + rows_ * sizeof(std::int64_t) : 0);
+    }
+
+    // Build-side join cache: keys sorted + original-index permutation, built
+    // on first use as a join build side (or by prepare()), reused across
+    // kinds AND by the row-returning join and every GROUP BY. Lives and dies
+    // with the column; device memory only, exempt from the host-side
+    // GPUDB_UPLOAD_POOL_MAX_MB cap. A device-OOM here surfaces as
+    // std::runtime_error via cuda_throw and leaves the column usable.
+    void ensure_join_cache(cudaStream_t s) const {
+        if (dtype_ != Dtype::I64)
+            throw std::runtime_error("CUDA join/group cache: keys must be an i64 column");
+        ensure_sort_cache(s);
+    }
+    // Sort cache for any dtype (v0.6 top-k): I64 is the join cache above;
     // F64 sorts through order-preserving u64 keys (NaN greatest) and stores
     // the sorted doubles in the same slot.
     void ensure_sort_cache(cudaStream_t s) const {
-        if (dtype_ == Dtype::I64) { ensure_join_cache(s); return; }
-        if (d_sorted_ || rows_ == 0) return;
+        if (rows_ == 0 || d_sorted_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(cache_mu_);
+        if (d_sorted_.load(std::memory_order_relaxed)) return;   // lost the race: built
         void* sorted = nullptr;
         void* perm   = nullptr;
-        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, bytes_), "cudaMalloc sort cache (sorted f64)");
+        const char* what_sorted = dtype_ == Dtype::I64 ? "cudaMalloc join cache (sorted keys)"
+                                                       : "cudaMalloc sort cache (sorted f64)";
+        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, bytes_), what_sorted);
         cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
         if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc sort cache (perm)"); }
-        e = gpudb_cuda_sort_f64_perm(static_cast<const double*>(dptr_),
-                                     static_cast<double*>(sorted),
-                                     static_cast<std::int64_t*>(perm), rows_, s);
+        if (dtype_ == Dtype::I64) {
+            e = gpudb_cuda_join_build_sort(static_cast<const std::int64_t*>(dptr_),
+                                           static_cast<std::int64_t*>(sorted),
+                                           static_cast<std::int64_t*>(perm), rows_, s);
+        } else {
+            e = gpudb_cuda_sort_f64_perm(static_cast<const double*>(dptr_),
+                                         static_cast<double*>(sorted),
+                                         static_cast<std::int64_t*>(perm), rows_, s);
+        }
+        // The build ran asynchronously on `s`; make it complete and visible
+        // to every stream before anyone can observe the pointers.
+        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
         if (e != cudaSuccess) {
             cudaFree(sorted); cudaFree(perm);
-            cuda_throw(e, "sort cache build (f64 sort_by_key)");
+            cuda_throw(e, dtype_ == Dtype::I64 ? "join cache build (sort_by_key)"
+                                               : "sort cache build (f64 sort_by_key)");
         }
-        d_sorted_ = sorted;
-        d_perm_   = perm;
+        d_perm_.store(perm, std::memory_order_relaxed);
+        d_sorted_.store(sorted, std::memory_order_release);
     }
     const std::int64_t* sorted_keys() const noexcept {
-        return static_cast<const std::int64_t*>(d_sorted_);
+        return static_cast<const std::int64_t*>(d_sorted_.load(std::memory_order_acquire));
     }
     const double* sorted_f64() const noexcept {
-        return static_cast<const double*>(d_sorted_);
+        return static_cast<const double*>(d_sorted_.load(std::memory_order_acquire));
     }
     const std::int64_t* perm() const noexcept {
-        return static_cast<const std::int64_t*>(d_perm_);
+        return static_cast<const std::int64_t*>(d_perm_.load(std::memory_order_acquire));
+    }
+
+    // The column's private stream (created on first use; non-blocking).
+    cudaStream_t own_stream() const {
+        std::lock_guard<std::mutex> lock(cache_mu_);
+        if (!own_stream_) {
+            GPUDB_CUDA_CHECK(cudaStreamCreateWithFlags(&own_stream_, cudaStreamNonBlocking),
+                             "cudaStreamCreate (resident column)");
+        }
+        return own_stream_;
     }
 
 private:
-    void*         dptr_     = nullptr;
-    mutable void* d_sorted_ = nullptr;
-    mutable void* d_perm_   = nullptr;
+    void*                       dptr_     = nullptr;
+    mutable std::atomic<void*>  d_sorted_ { nullptr };
+    mutable std::atomic<void*>  d_perm_   { nullptr };
+    mutable cudaStream_t        own_stream_ = nullptr;
+    mutable std::mutex          cache_mu_;   // guards cache build + own_stream_ creation
     std::size_t rows_  = 0;
     std::size_t bytes_ = 0;
     Dtype       dtype_;
@@ -239,25 +288,56 @@ public:
     }
 
     // ----- resident column upload -----
+    // Uploads run on the COLUMN's own stream (see CudaResidentColumn): an
+    // upload never touches stream_ or the aggregator scratch, so it needs no
+    // lock against operator calls and two uploads can overlap.
     std::unique_ptr<ResidentColumn> upload_i64(const std::int64_t* d, std::size_t n) override {
         auto col = std::make_unique<CudaResidentColumn>(n, Dtype::I64);
-        if (n > 0) {
-            GPUDB_CUDA_CHECK(cudaMemcpyAsync(col->device_ptr(), d, n * sizeof(std::int64_t),
-                                             cudaMemcpyHostToDevice, stream_),
-                             "upload i64 H2D");
-            GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "upload sync");
-        }
+        col->upload_from_host(d);
         return col;
     }
     std::unique_ptr<ResidentColumn> upload_f64(const double* d, std::size_t n) override {
         auto col = std::make_unique<CudaResidentColumn>(n, Dtype::F64);
-        if (n > 0) {
-            GPUDB_CUDA_CHECK(cudaMemcpyAsync(col->device_ptr(), d, n * sizeof(double),
-                                             cudaMemcpyHostToDevice, stream_),
-                             "upload f64 H2D");
-            GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "upload sync");
-        }
+        col->upload_from_host(d);
         return col;
+    }
+    // Interleaved pair: one H2D per host segment into a device staging
+    // buffer (16 B/row, transient, released before this returns), then a
+    // kernel splits it into the two columns. The host never materialises
+    // the de-interleaved columns and never concatenates the segments.
+    ResidentPair upload_pair_interleaved(const KvSpan* spans, std::size_t n_spans,
+                                         Dtype vdt) override {
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        ResidentPair out;
+        auto k = std::make_unique<CudaResidentColumn>(rows, Dtype::I64);
+        auto v = std::make_unique<CudaResidentColumn>(rows, vdt);
+        if (rows > 0) {
+            void* staging = nullptr;
+            const std::size_t bytes = rows * 2 * sizeof(std::int64_t);
+            GPUDB_CUDA_CHECK(cudaMalloc(&staging, bytes), "cudaMalloc pair staging");
+            cudaStream_t s = k->own_stream();
+            cudaError_t e = cudaSuccess;
+            std::size_t off = 0;
+            for (std::size_t i = 0; i < n_spans && e == cudaSuccess; ++i) {
+                const std::size_t nb = spans[i].rows * 2 * sizeof(std::int64_t);
+                if (nb == 0) continue;
+                e = cudaMemcpyAsync(static_cast<char*>(staging) + off, spans[i].kv, nb,
+                                    cudaMemcpyHostToDevice, s);
+                off += nb;
+            }
+            if (e == cudaSuccess)
+                e = gpudb_cuda_deinterleave_i64(static_cast<const std::int64_t*>(staging),
+                                                static_cast<std::int64_t*>(k->device_ptr()),
+                                                static_cast<std::int64_t*>(v->device_ptr()),
+                                                rows, s);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+            cudaFree(staging);
+            if (e != cudaSuccess) cuda_throw(e, "pair upload (H2D + device de-interleave)");
+        }
+        out.keys = std::move(k);
+        out.vals = std::move(v);
+        return out;
     }
 
     // ----- resident operators (kernel only, no transfer) -----
