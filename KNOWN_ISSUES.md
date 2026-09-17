@@ -109,6 +109,17 @@ matching native DuckDB, and `IS NULL` on such a result is now `true`.
 | `HAVING count(*) …` next to a `sum` in the select list uses the SUM function's `(key, sum, count)` rows and puts the count predicate in the outer `WHERE` (`gd.ok AND r.count > n`) | No device form filters on count while returning sums; the filter runs on the small result, so rows, names and types stay native's. |
 | The rewrite costs ~0.14 ms per matched statement and ~0.045 ms per rejected one (4000 distinct trees, one thread, RTX 4090 Laptop host); `json_serialize_sql` itself is ~0.012 ms | Paid once per template by the wrapper's cache; the parse/dump of a ~5 KB tree dominates. |
 
+### Design notes — upload sessions (v0.7 milestone 0c)
+
+| Behavior | Reason |
+|---|---|
+| Between `gpu_upload_begin(name)` and `gpu_upload_finish(name)`, every `gpu_upload`/`gpu_upload_pair` statement for that name **appends a segment** to the session and returns its own row count; no device memory is touched until finish | The wrapper uploads a table as short row-id-range statements so an upload never runs a long scan beside a user query (docs/TRANSPARENT_DESIGN.md §5.5/§5.6). `gpu_upload_status(name)` returns the open session's segment/row/byte counts as JSON. |
+| A segment statement that fails or is interrupted before finalize leaves the session exactly as it was; the wrapper re-runs that segment and keeps the earlier ones | The append is one step under the registry lock at finalize; a scan interrupted between vectors never reaches finalize. Registry test cases 24–32 pin begin/append/finish/abort/kind-mismatch/re-begin/invalidate. |
+| All segments of one session must use the same upload function and column types (all `gpu_upload_pair`, or all bare `gpu_upload`); a mismatch is an error and does not corrupt the session | One session builds one set; mixing a pair segment with a bare-column segment has no meaning. |
+| `gpu_invalidate` (and any epoch bump) drops an open session and frees its buffers; `gpu_upload_finish` then raises `GPUDB_UPLOAD_DISCARDED:` | A write that lands mid-upload must not produce a set built from a stale snapshot; the wrapper re-begins after the quiet period. Same epoch rule as a single-statement upload. |
+| The host buffer cap (`GPUDB_UPLOAD_POOL_MAX_MB`) counts a session's held segments; `gpu_upload_abort(name)` or a re-`gpu_upload_begin(name)` releases them | A session holds the whole table in host memory until finish, so it is charged like any buffered upload. |
+| A session's segments come from one connection's statements; the upload connection cannot see another connection's temp tables | DuckDB temp objects are connection-local; the wrapper's resolver already declines temp tables, so they are never uploaded. |
+
 ### Type support (v0.3.0)
 
 | Aggregate | Supported input types | Notes |
