@@ -69,6 +69,20 @@ GroupByResidentResult Aggregator::groupby_exact_resident(const ResidentColumn&,
     throw std::runtime_error("groupby_exact_resident: not implemented on this backend");
 }
 
+std::vector<std::unique_ptr<ResidentColumn>>
+Aggregator::upload_rows_exact(const RowSpan*, std::size_t, const Dtype*, std::size_t) {
+    throw std::runtime_error("upload_rows_exact: not implemented on this backend");
+}
+
+GroupByResidentResult Aggregator::groupby_exact_masked_resident(const ResidentColumn& keys,
+                                                                const ResidentColumn* vals,
+                                                                const Predicate*, std::size_t n_preds,
+                                                                std::size_t max_groups,
+                                                                const GroupByFilter& filter) {
+    if (n_preds == 0) return groupby_exact_resident(keys, vals, max_groups, filter);
+    throw std::runtime_error("groupby_exact_masked_resident: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

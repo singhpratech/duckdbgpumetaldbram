@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace gpudb_ext {
 
@@ -62,6 +63,11 @@ struct ResidentSet {
                                      // only gpu_groupby_exact_resident reads such a set
     std::unique_ptr<gpudb::ResidentColumn> keys;   // bare column, or pair.k
     std::unique_ptr<gpudb::ResidentColumn> vals;   // pair.v (null for a bare column)
+    // gpu_upload_rows_exact (v0.7 §4.6): row-aligned predicate columns — the
+    // BIGINT list's elements first (pred_int of them), then the DOUBLE
+    // list's (pred_dbl). Addressed as i<n> / f<n> by the WHERE program.
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
+    std::size_t   pred_int = 0, pred_dbl = 0;
     std::size_t   rows = 0;          // rows in the column(s): NULL rows are skipped
                                      // (exact sets: every row, NULLs included)
     std::size_t   rows_seen = 0;     // rows the upload scan delivered (count(*) of its input)
@@ -75,7 +81,9 @@ struct ResidentSet {
     std::string                last_stats;   // per-set copy of gpu_last_stats()
 
     std::size_t resident_bytes() const noexcept {
-        return (keys ? keys->resident_bytes() : 0) + (vals ? vals->resident_bytes() : 0);
+        std::size_t b = (keys ? keys->resident_bytes() : 0) + (vals ? vals->resident_bytes() : 0);
+        for (const auto& p : preds) if (p) b += p->resident_bytes();
+        return b;
     }
 };
 

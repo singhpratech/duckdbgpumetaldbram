@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/metal-exact-groupby
-- working on: v0.7 milestone 3: Metal exact GROUP BY done (upload_pair_exact + groupby_exact_resident, parity 0 mismatches at 20M rows); next: §4.3 DECIMAL + §4.4 packed keys on the shared side; CUDA side waits for the Linux instance
+- branch: feat/core-predicate-mask
+- working on: v0.7 milestone 3 §4.6: WHERE mask interface (Predicate, upload_rows_exact, groupby_exact_masked_resident) + CPU reference + gpu_upload_rows_exact / _where table functions; next: Metal mask kernels (variants a and b)
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-17T02:41:51Z
+- last update: 2026-09-17T02:53:27Z

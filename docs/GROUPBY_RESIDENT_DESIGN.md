@@ -28,6 +28,7 @@ query many times, no output materialised beyond the groups themselves.
 | `gpu_groupby_exact_resident(name)` | `(key BIGINT, sum HUGEINT, count BIGINT, count_star BIGINT, min BIGINT, max BIGINT, avg DOUBLE)` | v0.7 exact path over a `gpu_upload_pair_exact` set: native NULL semantics, 128-bit sum, `count` = `count(v)`, `avg` = exact sum / count |
 | `gpu_groupby_exact_resident_having(name, agg, cmp, threshold)` | same | `agg` ∈ `'sum'`, `'count'`, `'count_star'`, `'min'`, `'max'`; NULL aggregates never pass |
 | `gpu_groupby_exact_resident_topk(name, agg, k, 'asc'\|'desc')` | same | k groups by `agg`; NULL aggregates rank last in both directions |
+| `gpu_groupby_exact_resident_where(name, program)` / `_where_having(name, program, agg, cmp, threshold)` / `_where_topk(name, program, agg, k, order)` | same | v0.7 §4.6: the same over the rows a WHERE program selects. The set comes from `gpu_upload_rows_exact(name, k, v, BIGINT[] preds, DOUBLE[] preds)`; the program is `;`-separated terms `<col> <op> <const>`, `<col> in (…)`, `<col> is [not] null` over `k`, `v`, `i<n>`, `f<n>`; a row failing the mask is absent from every aggregate including `count(*)`, and a group with no surviving rows is not emitted. DOUBLE constants compare under DuckDB's total order (NaN greatest and equal to NaN, -0.0 = 0.0) |
 
 Rows come out **sorted by key ascending** on every backend; top-k rows come
 out in the requested order. **NULLs:** resident columns carry none —

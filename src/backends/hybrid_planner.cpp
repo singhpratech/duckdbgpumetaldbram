@@ -385,6 +385,69 @@ public:
             });
     }
 
+    // v0.7 §4.6: multi-lane exact upload, same placement rule.
+    std::vector<std::unique_ptr<ResidentColumn>>
+    upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
+                      const Dtype* dtypes, std::size_t n_lanes) override {
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        auto wrap = [&](std::vector<std::unique_ptr<ResidentColumn>>&& inner, bool on_gpu) {
+            std::vector<std::unique_ptr<ResidentColumn>> out;
+            out.reserve(inner.size());
+            for (std::size_t l = 0; l < inner.size(); ++l)
+                out.push_back(std::make_unique<HybridResidentColumn>(
+                    Backend::CPU, std::move(inner[l]), rows, dtypes[l], on_gpu));
+            return out;
+        };
+        if (gpu_) {
+            try {
+                return wrap(gpu_->upload_rows_exact(spans, n_spans, dtypes, n_lanes), /*on_gpu=*/true);
+            } catch (const std::exception&) {
+                // fall through to the CPU upload
+            }
+        }
+        return wrap(cpu_->upload_rows_exact(spans, n_spans, dtypes, n_lanes), /*on_gpu=*/false);
+    }
+
+    GroupByResidentResult groupby_exact_masked_resident(const ResidentColumn& keys,
+                                                        const ResidentColumn* vals,
+                                                        const Predicate* preds,
+                                                        std::size_t n_preds,
+                                                        std::size_t max_groups,
+                                                        const GroupByFilter& filter) override {
+        if (n_preds == 0) return groupby_exact_resident(keys, vals, max_groups, filter);
+        const auto& hk = check_hybrid(keys);
+        const HybridResidentColumn* hv = vals ? &check_hybrid(*vals) : nullptr;
+        // Unwrap every predicate column; all columns must live on one side.
+        std::vector<Predicate> inner(preds, preds + n_preds);
+        for (std::size_t p = 0; p < n_preds; ++p) {
+            if (!preds[p].col) throw std::runtime_error("resident group by: predicate without a column");
+            const auto& hp = check_hybrid(*preds[p].col);
+            if (hp.on_gpu() != hk.on_gpu())
+                throw std::runtime_error(
+                    "resident group by: columns are resident on different backends "
+                    "(one upload fell back to CPU) — re-upload and retry");
+            inner[p].col = &hp.inner();
+        }
+        if (hv && hv->on_gpu() != hk.on_gpu())
+            throw std::runtime_error(
+                "resident group by: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        const std::size_t n = hk.rows();
+        if (gpu_ && hk.on_gpu()) {
+            last_ = make_decision(gpu_backend_, DispatchReason::Hot_GpuAlwaysWins,
+                                  n, 0, /*resident*/true, /*borderline*/false);
+            return gpu_->groupby_exact_masked_resident(hk.inner(), hv ? &hv->inner() : nullptr,
+                                                       inner.data(), n_preds, max_groups, filter);
+        }
+        last_ = make_decision(Backend::CPU,
+                              gpu_ ? DispatchReason::Resident_OnCpu
+                                   : DispatchReason::GpuUnavailable,
+                              n, 0, /*resident*/true, /*borderline*/false);
+        return cpu_->groupby_exact_masked_resident(hk.inner(), hv ? &hv->inner() : nullptr,
+                                                   inner.data(), n_preds, max_groups, filter);
+    }
+
     GroupByResidentResult groupby_exact_resident(const ResidentColumn& keys,
                                                  const ResidentColumn* vals,
                                                  std::size_t max_groups,

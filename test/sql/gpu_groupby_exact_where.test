@@ -1,0 +1,78 @@
+# gpu_groupby_exact_where SQL test — the device-side WHERE mask of the exact
+# GROUP BY (v0.7 milestone 3, docs/TRANSPARENT_DESIGN.md §4.6):
+# gpu_upload_rows_exact(name, k, v, BIGINT[] preds, DOUBLE[] preds) and
+# gpu_groupby_exact_resident_where[_having|_topk](name, program, ...).
+#
+# Program grammar: terms separated by ';'  —  <col> <op> <const> |
+# <col> in (a, b) | <col> is [not] null ; cols k, v, i<n>, f<n>.
+# Parity is checked IN-PROCESS against native WHERE ... GROUP BY, both EXCEPT
+# directions. DOUBLE predicates use DuckDB's total order (NaN greatest and
+# equal to NaN, -0.0 = 0.0), which the fixture exercises.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_groupby_exact_where
+
+-- 1. Hand fixture: i64 predicate with NULLs, key predicate, payload IS NOT NULL
+-- setup: CREATE TABLE w1 AS SELECT * FROM (VALUES (1,10,5),(1,NULL,7),(NULL,5,7),(2,20,NULL),(NULL,NULL,9),(3,30,9),(3,1,1)) t(k,v,a)
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM w1
+SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident_where('w1', 'i0 >= 7') ORDER BY key NULLS LAST;
+-- expect: 1  NULL  0  1
+-- expect: 3  30  1  1
+-- expect: NULL  5  1  2
+
+-- 2. IN list and a key predicate together
+-- setup: CREATE TABLE w1 AS SELECT * FROM (VALUES (1,10,5),(1,NULL,7),(NULL,5,7),(2,20,NULL),(NULL,NULL,9),(3,30,9),(3,1,1)) t(k,v,a)
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM w1
+SELECT key, count_star FROM gpu_groupby_exact_resident_where('w1', 'i0 in (1, 9); k is not null') ORDER BY key;
+-- expect: 3  2
+
+-- 3. Empty program == no WHERE
+-- setup: CREATE TABLE w1 AS SELECT * FROM (VALUES (1,10,5),(1,NULL,7),(NULL,5,7),(2,20,NULL)) t(k,v,a)
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM w1
+SELECT count(*) FROM ((SELECT * FROM gpu_groupby_exact_resident_where('w1', '')) EXCEPT (SELECT * FROM gpu_groupby_exact_resident('w1')));
+-- expect: 0
+
+-- 4. PARITY vs native, 200k rows: BIGINT and DOUBLE predicates with NULLs, NaN and -0.0 cells
+-- setup: CREATE TABLE w4 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 301)::BIGINT - 150 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v, CASE WHEN (hash(i * 3) % 100) < 7 THEN NULL ELSE (hash(i * 5) % 50)::BIGINT END AS a, CASE WHEN (hash(i * 11) % 100) < 4 THEN NULL WHEN (hash(i * 29) % 100) < 2 THEN 'nan'::DOUBLE WHEN (hash(i * 31) % 100) < 1 THEN -0.0 ELSE ((hash(i * 37) % 10001)::BIGINT - 5000) / 100.0 END AS d FROM range(200000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('w4', k, v, [a], [d]) FROM w4
+SELECT (SELECT count(*) FROM ((SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident_where('w4', 'i0 > 20; f0 <= 12.5')) EXCEPT (SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM w4 WHERE a > 20 AND d <= 12.5 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM w4 WHERE a > 20 AND d <= 12.5 GROUP BY k) EXCEPT (SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident_where('w4', 'i0 > 20; f0 <= 12.5')))) AS mismatches, (SELECT count(*) FROM gpu_groupby_exact_resident_where('w4', 'i0 > 20; f0 <= 12.5')) = (SELECT count(*) FROM (SELECT k FROM w4 WHERE a > 20 AND d <= 12.5 GROUP BY k)) AS same_rows;
+-- expect: 0  true
+
+-- 5. DOUBLE total order: > keeps NaN, = 0 matches -0.0, = nan matches NaN, != nan drops NaN
+-- setup: CREATE TABLE w4 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 301)::BIGINT - 150 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v, CASE WHEN (hash(i * 3) % 100) < 7 THEN NULL ELSE (hash(i * 5) % 50)::BIGINT END AS a, CASE WHEN (hash(i * 11) % 100) < 4 THEN NULL WHEN (hash(i * 29) % 100) < 2 THEN 'nan'::DOUBLE WHEN (hash(i * 31) % 100) < 1 THEN -0.0 ELSE ((hash(i * 37) % 10001)::BIGINT - 5000) / 100.0 END AS d FROM range(200000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('w4', k, v, [a], [d]) FROM w4
+SELECT (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 > 5')) EXCEPT (SELECT k, count(*) FROM w4 WHERE d > 5 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE d > 5 GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 > 5')))) AS gt_nan, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 = 0')) EXCEPT (SELECT k, count(*) FROM w4 WHERE d = 0 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE d = 0 GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 = 0')))) AS eq_negzero, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 = nan')) EXCEPT (SELECT k, count(*) FROM w4 WHERE d = 'nan'::DOUBLE GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE d = 'nan'::DOUBLE GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 = nan')))) AS eq_nan, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 != nan')) EXCEPT (SELECT k, count(*) FROM w4 WHERE d <> 'nan'::DOUBLE GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE d <> 'nan'::DOUBLE GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'f0 != nan')))) AS ne_nan;
+-- expect: 0  0  0  0
+
+-- 6. IS NULL / IS NOT NULL on a predicate column and on the payload, IN with three values
+-- setup: CREATE TABLE w4 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 301)::BIGINT - 150 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v, CASE WHEN (hash(i * 3) % 100) < 7 THEN NULL ELSE (hash(i * 5) % 50)::BIGINT END AS a, ((hash(i * 37) % 10001)::BIGINT - 5000) / 100.0 AS d FROM range(200000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('w4', k, v, [a], [d]) FROM w4
+SELECT (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'i0 is null')) EXCEPT (SELECT k, count(*) FROM w4 WHERE a IS NULL GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE a IS NULL GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'i0 is null')))) AS isnull, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'i0 in (1, 5, 9); v is not null; k >= -10')) EXCEPT (SELECT k, count(*) FROM w4 WHERE a IN (1,5,9) AND v IS NOT NULL AND k >= -10 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM w4 WHERE a IN (1,5,9) AND v IS NOT NULL AND k >= -10 GROUP BY k) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_where('w4', 'i0 in (1, 5, 9); v is not null; k >= -10')))) AS in_notnull_key;
+-- expect: 0  0
+
+-- 7. WHERE + HAVING and WHERE + top-k on the device match native
+-- setup: CREATE TABLE w4 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 301)::BIGINT - 150 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v, CASE WHEN (hash(i * 3) % 100) < 7 THEN NULL ELSE (hash(i * 5) % 50)::BIGINT END AS a, ((hash(i * 37) % 10001)::BIGINT - 5000) / 100.0 AS d FROM range(200000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('w4', k, v, [a], [d]) FROM w4
+SELECT (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_exact_resident_where_having('w4', 'i0 < 25', 'sum', '>', 100)) EXCEPT (SELECT k, sum(v) FROM w4 WHERE a < 25 GROUP BY k HAVING sum(v) > 100))) + (SELECT count(*) FROM ((SELECT k, sum(v) FROM w4 WHERE a < 25 GROUP BY k HAVING sum(v) > 100) EXCEPT (SELECT key, sum FROM gpu_groupby_exact_resident_where_having('w4', 'i0 < 25', 'sum', '>', 100)))) AS having_mismatch, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_where_topk('w4', 'f0 > 0', 'count_star', 5, 'desc')) EXCEPT (SELECT k, count(*) FROM w4 WHERE d > 0 GROUP BY k ORDER BY count(*) DESC, k LIMIT 5))) AS topk_extra;
+-- expect: 0  0
+
+-- 8. GUARDRAIL: unknown predicate column index is a clean error
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM (VALUES (1,10,5)) t(k,v,a)
+-- expected_fail: predicate column
+SELECT * FROM gpu_groupby_exact_resident_where('w1', 'i3 > 1');
+
+-- 9. GUARDRAIL: bad operator is a clean bind error
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM (VALUES (1,10,5)) t(k,v,a)
+-- expected_fail: unknown operator
+SELECT * FROM gpu_groupby_exact_resident_where('w1', 'i0 ~ 1');
+
+-- 10. GUARDRAIL: predicate list length must not change between rows
+-- expected_fail: predicate list length changed
+SELECT gpu_upload_rows_exact('w1', k, v, CASE WHEN k = 1 THEN [a] ELSE [a, a] END, []) FROM (VALUES (1,10,5),(2,20,6)) t(k,v,a);
+
+-- 11. A gpu_upload_rows_exact set works with the plain exact forms too
+-- setup: CREATE TABLE w1 AS SELECT * FROM (VALUES (1,10,5),(1,NULL,7),(NULL,5,7),(2,20,NULL)) t(k,v,a)
+-- setup: SELECT gpu_upload_rows_exact('w1', k, v, [a], []) FROM w1
+SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident('w1') ORDER BY key NULLS LAST;
+-- expect: 1  10  1  2
+-- expect: 2  20  1  1
+-- expect: NULL  5  1  1
