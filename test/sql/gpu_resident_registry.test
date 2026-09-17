@@ -193,3 +193,99 @@ SELECT bytes FROM gpu_residents();
 -- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:1:v', v) FROM t
 SELECT rows, rows_seen, gpu_assert_rows('gpudb:v1:memory:main:t:1:v', (SELECT count(*) FROM t)) AS ok FROM gpu_residents();
 -- expect: 10  20  true
+
+-- 24. Upload session (v0.7 milestone 0c): begin, two segment statements, finish → one
+--     ready set holding both segments; rows_seen accumulated across segments
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, (i * 2)::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('gpudb:v1:memory:main:t:1:k,v')
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid < 400
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid >= 400
+-- setup: SELECT gpu_upload_finish('gpudb:v1:memory:main:t:1:k,v')
+SELECT name, state, prepared, rows, rows_seen,
+       (SELECT sum(sum) FROM gpu_groupby_sum_resident('gpudb:v1:memory:main:t:1:k,v')) AS total,
+       (SELECT sum(v) FROM t) AS native,
+       gpu_upload_status('gpudb:v1:memory:main:t:1:k,v') AS status_after
+FROM gpu_residents();
+-- expect: gpudb:v1:memory:main:t:1:k,v  ready  true  1000  1000  999000  999000  {"open":false}
+
+-- 25. A segment statement returns its own row count and touches no device memory;
+--     gpu_upload_status reports the open session
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('gpudb:v1:memory:main:t:1:k,v')
+SELECT (SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid < 300) AS seg1,
+       (SELECT count(*) FROM gpu_residents()) AS sets;
+-- expect: 300  0
+
+-- 25b. ... status after two segments
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('gpudb:v1:memory:main:t:1:k,v')
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid < 300
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid >= 300 AND rowid < 500
+SELECT json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.open') AS open,
+       json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.segments') AS segments,
+       json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.rows') AS rows_,
+       json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.rows_seen') AS seen,
+       json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.kind') AS kind,
+       json_extract_string(gpu_upload_status('gpudb:v1:memory:main:t:1:k,v'), '$.invalidated') AS inval;
+-- expect: true  2  500  500  pair  false
+
+-- 26. A segment statement that fails before finalize (here: a kind mismatch,
+--     raised inside the append) leaves the session exactly as it was; the
+--     interrupted-segment case is exercised by the wrapper's own check
+--     (an interrupted scan never reaches finalize).
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('p')
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t WHERE rowid < 300
+-- expected_fail: segment kind differs from the open upload session 'p'
+SELECT gpu_upload('p', k) FROM t WHERE rowid >= 300;
+
+-- 27. GUARDRAIL: gpu_upload_finish without an open session is the typed discard error
+-- expected_fail: GPUDB_UPLOAD_DISCARDED: gpu_upload_finish: no open upload session for 'p'
+SELECT gpu_upload_finish('p');
+
+-- 28. GUARDRAIL: an invalidation while the session is open discards it (finish raises)
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('gpudb:v1:memory:main:t:1:k,v')
+-- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', k, v) FROM t WHERE rowid < 500
+-- setup: SELECT gpu_invalidate('gpudb:v1:memory:main:t:1')
+-- expected_fail: GPUDB_UPLOAD_DISCARDED
+SELECT gpu_upload_finish('gpudb:v1:memory:main:t:1:k,v');
+
+-- 29. gpu_upload_abort drops the session; a later plain upload behaves as v0.6
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('p')
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t WHERE rowid < 500
+SELECT gpu_upload_abort('p') AS aborted;
+-- expect: true
+
+-- 29b. ... aborted twice is false, and a later plain upload behaves as v0.6
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('p')
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t WHERE rowid < 500
+-- setup: SELECT gpu_upload_abort('p')
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t
+SELECT gpu_upload_abort('p') AS again, (SELECT count(*) FROM gpu_residents()) AS sets, (SELECT rows FROM gpu_residents()) AS rows_;
+-- expect: false  1  1000
+
+-- 30. GUARDRAIL: segments of a session must agree in kind (pair vs bare column)
+-- setup: SELECT gpu_upload_begin('p')
+-- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
+-- expected_fail: segment kind differs from the open upload session 'p'
+SELECT gpu_upload('p', range::BIGINT) FROM range(10);
+
+-- 31. A bare-column session (count-only sets) works the same way
+-- setup: CREATE TABLE t AS SELECT (i % 4)::BIGINT AS k FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('gpudb:v1:memory:main:t:1:k')
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:1:k', k) FROM t WHERE rowid < 600
+-- setup: SELECT gpu_upload('gpudb:v1:memory:main:t:1:k', k) FROM t WHERE rowid >= 600
+-- setup: SELECT gpu_upload_finish('gpudb:v1:memory:main:t:1:k')
+SELECT kind, rows, rows_seen, state, (SELECT string_agg(key || ':' || count, ' ' ORDER BY key) FROM gpu_groupby_count_resident('gpudb:v1:memory:main:t:1:k')) AS counts FROM gpu_residents();
+-- expect: column  1000  1000  ready  0:250 1:250 2:250 3:250
+
+-- 32. Re-begin replaces an open session (its buffers are released)
+-- setup: CREATE TABLE t AS SELECT i::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i)
+-- setup: SELECT gpu_upload_begin('p')
+-- setup: SELECT gpu_upload_pair('p', k, v) FROM t WHERE rowid < 500
+-- setup: SELECT gpu_upload_begin('p')
+SELECT json_extract_string(gpu_upload_status('p'), '$.segments') AS segments, json_extract_string(gpu_upload_status('p'), '$.rows') AS rows_;
+-- expect: 0  0

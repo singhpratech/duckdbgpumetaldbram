@@ -35,7 +35,15 @@
 //   gpu_assert_rows(name, n)   -> BOOLEAN    typed "GPUDB_STALE:" error unless
 //                                            n == rows the upload scan saw
 //   gpu_invalidate(pattern)    -> BIGINT     mark sets stale (name == pattern
-//                                            or name starts with pattern + ':')
+//                                            or name starts with pattern + ':');
+//                                            drops open upload sessions too
+//   gpu_upload_begin(name)     -> BOOLEAN    open an upload session: every
+//                                            gpu_upload[_pair](name, ...) statement
+//                                            until finish appends a segment
+//   gpu_upload_finish(name)    -> BIGINT     device copy + prepare + publish
+//   gpu_upload_abort(name)     -> BOOLEAN    drop the session and its buffers
+//   gpu_upload_status(name)    -> VARCHAR    JSON: open, segments, rows, rows_seen,
+//                                            bytes, kind, epoch, invalidated
 //   gpu_drop_resident(name)    -> BOOLEAN    free the device memory
 //
 // Usage shape (single statement — the FROM subquery aggregates first, so the
@@ -325,11 +333,35 @@ void pool_release(std::size_t n) {
 // ResidentContext — one per database.
 // ---------------------------------------------------------------------------
 
+// An open upload session (v0.7 milestone 0c, docs/TRANSPARENT_DESIGN.md
+// §5.5): the wrapper uploads a table as a sequence of short statements, one
+// per row-id segment, each appending its buffered segments here; nothing
+// touches the device until gpu_upload_finish. A statement that fails or is
+// interrupted mid-scan never reaches finalize and leaves the session exactly
+// as it was (append is one atomic step under the registry lock), so the
+// wrapper re-runs that segment and keeps the earlier ones.
+struct UploadSession {
+    std::string   name;
+    bool          managed = false;
+    TagFields     tag;
+    bool          kind_set = false;                 // fixed by the first segment
+    bool          pair = false;
+    gpudb::Dtype  vdt = gpudb::Dtype::I64;          // payload (pair) / column (bare) dtype
+    std::vector<SegView> views;
+    std::size_t   lanes = 0;
+    std::size_t   rows_seen = 0;
+    std::size_t   segments = 0;
+    std::size_t   charged = 0;                      // pool bytes held by the views
+    std::uint64_t seq_at_start = 0;
+    std::int64_t  started_at_us = 0;
+};
+
 class ResidentContext {
 public:
     // --- registry ---
     std::mutex registry_mu;
     std::unordered_map<std::string, std::shared_ptr<ResidentSet>> registry;
+    std::unordered_map<std::string, std::shared_ptr<UploadSession>> sessions;   // open sessions, by name
 
     // Invalidation log: (prefix, seq). An upload whose name matches a record
     // with seq > its seq_at_start is discarded at finalize (§5.5 epoch
@@ -374,6 +406,14 @@ public:
             if (!matches(kv.first, prefix)) continue;
             SetState expect = kv.second->state.load();
             if (expect != SetState::Stale) { kv.second->state.store(SetState::Stale); ++n; }
+        }
+        for (auto it = sessions.begin(); it != sessions.end();) {
+            if (matches(it->first, prefix)) {
+                pool_release(it->second->charged);
+                it = sessions.erase(it);          // the segments go with the last reference
+            } else {
+                ++it;
+            }
         }
         invals.erase(std::remove_if(invals.begin(), invals.end(),
                                     [&](const Inval& r) { return r.prefix == prefix; }),
@@ -773,6 +813,75 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
     }
 }
 
+// Extract the row's VARCHAR cell as a std::string.
+inline std::string read_name(duckdb_string_t* names, idx_t row) {
+    return std::string(duckdb_string_t_data(&names[row]),
+                       duckdb_string_t_length(names[row]));
+}
+
+// Move a finished buffer onto the device and publish it: bare columns go
+// through the contiguous v1 upload (one host concatenation of the segments),
+// pairs through upload_pair_interleaved (one H2D per segment, split on the
+// device). Returns the rows resident. Throws std::runtime_error.
+std::size_t finish_upload(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype vdt,
+                          const char* fn) {
+    auto& a = ctx.aggregator();
+    const std::size_t lanes = b.lanes();
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!pair) {
+        std::vector<std::int64_t> flat(lanes);
+        std::size_t off = 0;
+        for (const auto& v : b.all_views()) {
+            std::memcpy(flat.data() + off, v.seg->data, v.lanes * sizeof(std::int64_t));
+            off += v.lanes;
+        }
+        std::unique_ptr<gpudb::ResidentColumn> col;
+        if (vdt == gpudb::Dtype::I64) col = a.upload_i64(flat.data(), lanes);
+        else                          col = a.upload_f64(reinterpret_cast<const double*>(flat.data()), lanes);
+        const std::size_t rows = col->rows();
+        publish_set(ctx, b, std::move(col), nullptr, /*pair*/false, fn);
+        return rows;
+    }
+    const std::size_t rows = lanes / 2;
+    std::vector<gpudb::Aggregator::KvSpan> spans;
+    const auto views = b.all_views();
+    spans.reserve(views.size());
+    for (const auto& v : views) spans.push_back({v.seg->data, v.lanes / 2});
+    gpudb::Aggregator::ResidentPair cols = a.upload_pair_interleaved(spans.data(), spans.size(), vdt);
+    if (upload_trace())
+        std::fprintf(stderr, "[gpudb upload] %s '%s': rows=%zu segments=%zu buffered=%zu MB "
+                     "upload(pair)=%.1f ms\n", fn, b.name.c_str(), rows, spans.size(),
+                     (lanes * 8) >> 20, ms_since(t0));
+    publish_set(ctx, b, std::move(cols.keys), std::move(cols.vals), /*pair*/true, fn);
+    return rows;
+}
+
+// If an upload session is open under the buffer's name, append the buffer's
+// segments to it (one atomic step) and return true; the statement then
+// returns its own row count and the device is not touched. Throws on a
+// kind mismatch or when the pool cap would be exceeded.
+bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype vdt,
+                    const char* fn) {
+    std::lock_guard<std::mutex> lock(ctx.registry_mu);
+    auto it = ctx.sessions.find(b.name);
+    if (it == ctx.sessions.end()) return false;
+    UploadSession& ss = *it->second;
+    if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt))
+        throw std::runtime_error(std::string(fn) + ": segment kind differs from the open upload "
+            "session '" + b.name + "' (all segments must use the same upload function and types)");
+    const std::size_t bytes = b.lanes() * sizeof(std::int64_t);
+    if (bytes > 0 && !pool_reserve(bytes))
+        throw std::runtime_error(std::string(fn) + ": out of buffer memory for the upload "
+            "session '" + b.name + "'" + kPoolCapHint);
+    ss.kind_set = true; ss.pair = pair; ss.vdt = vdt;
+    ss.charged += bytes;
+    ss.lanes += b.lanes();
+    ss.rows_seen += b.rows_seen;
+    ss.segments += 1;
+    for (const auto& v : b.all_views()) ss.views.push_back(v);
+    return true;
+}
+
 void upload_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
                      duckdb_vector result, idx_t count, idx_t offset) {
     if (count == 0) return;
@@ -792,24 +901,12 @@ void upload_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
         }
         try {
             ResidentContext& ctx = ctx_of_aggregate(info);
-            auto& a = ctx.aggregator();
-            // Bare columns go through the contiguous v1 upload: one host
-            // concatenation of the segments (8 B/row), then H2D.
-            std::vector<std::int64_t> flat(lanes);
-            std::size_t off = 0;
-            for (const auto& v : b->all_views()) {
-                std::memcpy(flat.data() + off, v.seg->data, v.lanes * sizeof(std::int64_t));
-                off += v.lanes;
+            if (session_append(ctx, *b, /*pair*/false, b->dtype, "gpu_upload")) {
+                out[offset + i] = static_cast<std::int64_t>(lanes);
+                continue;
             }
-            std::unique_ptr<gpudb::ResidentColumn> col;
-            if (b->dtype == gpudb::Dtype::I64) {
-                col = a.upload_i64(flat.data(), lanes);
-            } else {
-                col = a.upload_f64(reinterpret_cast<const double*>(flat.data()), lanes);
-            }
-            const std::size_t rows = col->rows();
-            publish_set(ctx, *b, std::move(col), nullptr, /*pair*/false, "gpu_upload");
-            out[offset + i] = static_cast<std::int64_t>(rows);
+            out[offset + i] = static_cast<std::int64_t>(
+                finish_upload(ctx, *b, /*pair*/false, b->dtype, "gpu_upload"));
         } catch (const std::exception& e) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload failed: ") + e.what()).c_str());
@@ -957,28 +1054,14 @@ void upload_pair_finalize_t(duckdb_function_info info, duckdb_aggregate_state* s
             duckdb_validity_set_row_invalid(validity, offset + i);
             continue;
         }
-        const std::size_t rows = lanes / 2;
         try {
-            // One H2D per segment; the backend splits (k, v) on the device
-            // where it can. No host concatenation, no host de-interleave.
             ResidentContext& ctx = ctx_of_aggregate(info);
-            const auto t0 = std::chrono::steady_clock::now();
-            auto& a = ctx.aggregator();
-            std::vector<gpudb::Aggregator::KvSpan> spans;
-            const auto views = b->all_views();
-            spans.reserve(views.size());
-            for (const auto& v : views) spans.push_back({v.seg->data, v.lanes / 2});
-            gpudb::Aggregator::ResidentPair cols =
-                a.upload_pair_interleaved(spans.data(), spans.size(), VDT);
-            auto kcol = std::move(cols.keys);
-            auto vcol = std::move(cols.vals);
-            if (upload_trace())
-                std::fprintf(stderr, "[gpudb upload] gpu_upload_pair '%s': rows=%zu segments=%zu "
-                             "buffered=%zu MB upload(pair)=%.1f ms\n",
-                             b->name.c_str(), rows, spans.size(), (lanes * 8) >> 20, ms_since(t0));
-            publish_set(ctx, *b, std::move(kcol), std::move(vcol), /*pair*/true,
-                        "gpu_upload_pair");
-            out[offset + i] = static_cast<std::int64_t>(rows);
+            if (session_append(ctx, *b, /*pair*/true, VDT, "gpu_upload_pair")) {
+                out[offset + i] = static_cast<std::int64_t>(lanes / 2);
+                continue;
+            }
+            out[offset + i] = static_cast<std::int64_t>(
+                finish_upload(ctx, *b, /*pair*/true, VDT, "gpu_upload_pair"));
         } catch (const std::exception& e) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_pair failed: ") + e.what()).c_str());
@@ -988,14 +1071,167 @@ void upload_pair_finalize_t(duckdb_function_info info, duckdb_aggregate_state* s
 }
 
 // ---------------------------------------------------------------------------
-// Resident scalar functions.
+// Upload sessions: gpu_upload_begin / gpu_upload_finish / gpu_upload_abort /
+// gpu_upload_status.
 // ---------------------------------------------------------------------------
 
-// Extract the row's VARCHAR cell as a std::string.
-inline std::string read_name(duckdb_string_t* names, idx_t row) {
-    return std::string(duckdb_string_t_data(&names[row]),
-                       duckdb_string_t_length(names[row]));
+// gpu_upload_begin(name) -> BOOLEAN: open (or replace) a session; segment
+// statements under this name append to it instead of uploading.
+void upload_begin_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    uint64_t* validity = duckdb_vector_get_validity(name_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<bool*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        auto ss = std::make_shared<UploadSession>();
+        ss->name = read_name(names, i);
+        if (starts_with(ss->name, kTagPrefix)) {
+            const std::string err = parse_tag(ss->name, ss->tag);
+            if (!err.empty()) {
+                duckdb_scalar_function_set_error(info, ("gpu_upload_begin: " + err).c_str());
+                return;
+            }
+            ss->managed = true;
+        }
+        ss->started_at_us = now_us();
+        {
+            std::lock_guard<std::mutex> lock(ctx.registry_mu);
+            ss->seq_at_start = ctx.inval_seq.load(std::memory_order_acquire);
+            auto old = ctx.sessions.find(ss->name);
+            if (old != ctx.sessions.end()) pool_release(old->second->charged);
+            ctx.sessions[ss->name] = ss;
+        }
+        out[i] = true;
+    }
 }
+
+// gpu_upload_finish(name) -> BIGINT rows: take the session, move it to the
+// device (+ prepare for managed sets), publish it, release its buffers.
+void upload_finish_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    uint64_t* validity = duckdb_vector_get_validity(name_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        const std::string name = read_name(names, i);
+        std::shared_ptr<UploadSession> ss;
+        {
+            std::lock_guard<std::mutex> lock(ctx.registry_mu);
+            auto it = ctx.sessions.find(name);
+            if (it != ctx.sessions.end()) { ss = it->second; ctx.sessions.erase(it); }
+        }
+        if (!ss) {
+            duckdb_scalar_function_set_error(info,
+                ("GPUDB_UPLOAD_DISCARDED: gpu_upload_finish: no open upload session for '" + name +
+                 "' — it was never begun, already finished, or invalidated while open").c_str());
+            return;
+        }
+        try {
+            if (ss->lanes == 0)
+                throw std::runtime_error("GPUDB_UPLOAD_EMPTY: gpu_upload_finish: the upload session '" +
+                                         name + "' received no rows");
+            UploadBuf b;
+            b.name = ss->name; b.name_set = true; b.managed = ss->managed; b.tag = ss->tag;
+            b.dtype = ss->vdt; b.views = ss->views; b.rows_seen = ss->rows_seen;
+            b.seq_at_start = ss->seq_at_start;
+            const std::size_t rows = finish_upload(ctx, b, ss->pair, ss->vdt, "gpu_upload_finish");
+            pool_release(ss->charged);
+            ss->charged = 0;
+            out[i] = static_cast<std::int64_t>(rows);
+        } catch (const std::exception& e) {
+            pool_release(ss->charged);
+            ss->charged = 0;
+            duckdb_scalar_function_set_error(info, e.what());
+            return;
+        }
+    }
+}
+
+// gpu_upload_abort(name) -> BOOLEAN: drop an open session and its buffers.
+void upload_abort_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    uint64_t* validity = duckdb_vector_get_validity(name_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<bool*>(duckdb_vector_get_data(output));
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        std::shared_ptr<UploadSession> ss;
+        {
+            std::lock_guard<std::mutex> lock(ctx.registry_mu);
+            auto it = ctx.sessions.find(read_name(names, i));
+            if (it != ctx.sessions.end()) { ss = it->second; ctx.sessions.erase(it); }
+        }
+        if (ss) pool_release(ss->charged);
+        out[i] = ss != nullptr;
+    }
+}
+
+// gpu_upload_status(name) -> VARCHAR (JSON): what the wrapper needs after an
+// interrupted segment — whether the session is open, how many segments and
+// rows it holds, and whether an invalidation since begin will discard it.
+void upload_status_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    uint64_t* validity = duckdb_vector_get_validity(name_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* out_validity = duckdb_vector_get_validity(output);
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        if (validity && !duckdb_validity_row_is_valid(validity, i)) {
+            duckdb_validity_set_row_invalid(out_validity, i);
+            continue;
+        }
+        const std::string name = read_name(names, i);
+        char buf[512];
+        {
+            std::lock_guard<std::mutex> lock(ctx.registry_mu);
+            auto it = ctx.sessions.find(name);
+            if (it == ctx.sessions.end()) {
+                std::snprintf(buf, sizeof(buf), "{\"open\":false}");
+            } else {
+                const UploadSession& ss = *it->second;
+                std::snprintf(buf, sizeof(buf),
+                    "{\"open\":true,\"segments\":%zu,\"rows\":%zu,\"rows_seen\":%zu,"
+                    "\"bytes\":%zu,\"kind\":\"%s\",\"epoch\":%llu,\"invalidated\":%s,"
+                    "\"started_at_us\":%lld}",
+                    ss.segments, ss.pair ? ss.lanes / 2 : ss.lanes, ss.rows_seen, ss.charged,
+                    !ss.kind_set ? "unset" : ss.pair ? "pair" : "column",
+                    static_cast<unsigned long long>(ss.seq_at_start),
+                    ctx.invalidated_since_locked(ss.name, ss.seq_at_start) ? "true" : "false",
+                    static_cast<long long>(ss.started_at_us));
+            }
+        }
+        duckdb_vector_assign_string_element(output, i, buf);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resident scalar functions.
+// ---------------------------------------------------------------------------
 
 // One body for the three BIGINT reductions, parameterized by member call.
 using ResidentOpI64 = gpudb::AggResult (gpudb::Aggregator::*)(const gpudb::ResidentColumn&);
@@ -1733,6 +1969,14 @@ void register_gpu_resident(duckdb_connection con,
         prepare_resident_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
     register_scalar_names(con, "gpu_invalidate",
         invalidate_exec, DUCKDB_TYPE_BIGINT, 1, ctx);
+    register_scalar_names(con, "gpu_upload_begin",
+        upload_begin_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
+    register_scalar_names(con, "gpu_upload_finish",
+        upload_finish_exec, DUCKDB_TYPE_BIGINT, 1, ctx);
+    register_scalar_names(con, "gpu_upload_abort",
+        upload_abort_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
+    register_scalar_names(con, "gpu_upload_status",
+        upload_status_exec, DUCKDB_TYPE_VARCHAR, 1, ctx);
     register_scalar(con, "gpu_assert_rows", assert_rows_exec, DUCKDB_TYPE_BOOLEAN,
                     {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar_names(con, "gpu_last_stats",
