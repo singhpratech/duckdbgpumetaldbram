@@ -3,6 +3,7 @@
 
 #include "gpu_backend.hpp"
 #include "../../src/backends/groupby_filter.hpp"
+#include "../../src/backends/predicate_mask.hpp"
 
 #include <algorithm>
 #if defined(__linux__)
@@ -10,6 +11,8 @@
 #include <unistd.h>
 #endif
 #include <cmath>
+#include <cstring>
+#include <functional>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -734,6 +737,156 @@ void test_backend(gpudb::Backend b) {
             try { (void)agg->upload_pair_exact(spans, 2, gpudb::Dtype::F64); }
             catch (const std::runtime_error&) { dbl_refused = true; }
             EXPECT(dbl_refused);
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
+
+    // ---- Exact GROUP BY with a WHERE mask (v0.7 §4.6) vs a host reference ----
+    // upload_rows_exact (key, payload, i64 pred, f64 pred) then conjunctions
+    // of predicates incl. NULL cells, IN, IS [NOT] NULL, and the f64 total
+    // order (NaN greatest and equal to NaN, -0.0 == 0.0). Backends opt in.
+    {
+        std::printf("  exact group by with WHERE mask:\n");
+        std::mt19937_64 rng(0x3A5EULL);
+        const std::size_t N = 120'011;
+        std::vector<std::int64_t> lanes(N * 4);
+        std::vector<std::uint64_t> valid[4];
+        for (auto& m : valid) m.assign((N + 63) / 64, ~std::uint64_t{0});
+        auto clr = [](std::vector<std::uint64_t>& m, std::size_t i) { m[i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+        auto isv = [](const std::vector<std::uint64_t>& m, std::size_t i) { return ((m[i >> 6] >> (i & 63)) & 1u) != 0; };
+        std::uniform_int_distribution<std::int64_t> kd(-500, 500), vd(-100000, 100000), ad(0, 40);
+        std::uniform_int_distribution<int> pct(0, 99);
+        std::uniform_real_distribution<double> dd(-50.0, 50.0);
+        for (std::size_t i = 0; i < N; ++i) {
+            lanes[4 * i + 0] = kd(rng);
+            lanes[4 * i + 1] = vd(rng);
+            lanes[4 * i + 2] = ad(rng);
+            double d = dd(rng);
+            const int r = pct(rng);
+            if (r < 2) d = std::numeric_limits<double>::quiet_NaN();
+            else if (r < 3) d = -0.0;
+            else if (r < 4) d = 0.0;
+            else if (r < 5) d = -std::numeric_limits<double>::quiet_NaN();   // sign-bit NaN
+            std::memcpy(&lanes[4 * i + 3], &d, sizeof(d));
+            if (pct(rng) < 5) clr(valid[0], i);
+            if (pct(rng) < 9) clr(valid[1], i);
+            if (pct(rng) < 6) clr(valid[2], i);
+            if (pct(rng) < 4) clr(valid[3], i);
+        }
+        const std::uint64_t* vptr[4] = { valid[0].data(), valid[1].data(), valid[2].data(), valid[3].data() };
+        gpudb::Aggregator::RowSpan span;
+        span.lanes = lanes.data(); span.rows = N; span.n_lanes = 4; span.valid = vptr;
+        const gpudb::Dtype dts[4] = { gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::F64 };
+        bool implemented = true;
+        try {
+            auto cols = agg->upload_rows_exact(&span, 1, dts, 4);
+            EXPECT_EQ(cols.size(), std::size_t(4));
+            std::size_t nk = 0; for (std::size_t i = 0; i < N; ++i) nk += !isv(valid[0], i);
+            EXPECT_EQ(cols[0]->null_count(), nk);
+            EXPECT_EQ(cols[3]->rows(), N);
+
+            // Host reference: evaluate the mask on the ORIGINAL rows, then group.
+            struct Ref { gpudb::Sum128 s; std::int64_t cv = 0, cs = 0;
+                         std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+                         std::int64_t mx = std::numeric_limits<std::int64_t>::min(); };
+            auto dkey = [](double x) { return gpudb::f64_total_order_key(x); };
+            auto run_case = [&](const std::vector<gpudb::Predicate>& ps,
+                                const std::function<bool(std::size_t)>& host_mask, int idx) {
+                std::map<std::int64_t, Ref> ref; Ref ref_null; bool null_group = false;
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (!host_mask(i)) continue;
+                    Ref& e = isv(valid[0], i) ? ref[lanes[4 * i]] : (null_group = true, ref_null);
+                    ++e.cs;
+                    if (!isv(valid[1], i)) continue;
+                    const std::int64_t x = lanes[4 * i + 1];
+                    e.s.add(x); ++e.cv; e.mn = std::min(e.mn, x); e.mx = std::max(e.mx, x);
+                }
+                auto r = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), ps.data(), ps.size(),
+                                                            std::size_t(100) * 1000000);
+                const std::size_t want = ref.size() + (null_group ? 1 : 0);
+                bool ok = r.keys.size() == want && r.groups_total == want;
+                std::size_t j = 0;
+                auto same = [&](std::size_t jj, const Ref& e) {
+                    return r.counts[jj] == e.cv && r.counts_star[jj] == e.cs &&
+                           (e.cv == 0 || (static_cast<std::uint64_t>(r.sums[jj]) == e.s.lo && r.sums_hi[jj] == e.s.hi &&
+                                          r.mins[jj] == e.mn && r.maxs[jj] == e.mx));
+                };
+                for (auto it = ref.begin(); ok && it != ref.end(); ++it, ++j)
+                    ok = r.key_null[j] == 0 && r.keys[j] == it->first && same(j, it->second);
+                if (ok && null_group) ok = r.key_null[j] == 1 && same(j, ref_null);
+                if (!ok) std::printf("    FAIL mask case %d: got %zu groups, ref %zu\n", idx, r.keys.size(), want);
+                EXPECT(ok);
+            };
+            using Op = gpudb::Predicate::Op;
+            auto P = [&](std::size_t lane, Op op, std::int64_t v) { gpudb::Predicate p; p.col = cols[lane].get(); p.op = op; p.value = v; return p; };
+            auto PF = [&](Op op, double d) { std::int64_t b; std::memcpy(&b, &d, sizeof(b)); return P(3, op, b); };
+            auto A = [&](std::size_t i) { return lanes[4 * i + 2]; };
+            auto D = [&](std::size_t i) { double d; std::memcpy(&d, &lanes[4 * i + 3], sizeof(d)); return d; };
+            // 0: i64 pred > 20 AND f64 pred <= 12.5 (NULL cells fail)
+            run_case({P(2, Op::GT, 20), PF(Op::LE, 12.5)},
+                     [&](std::size_t i) { return isv(valid[2], i) && A(i) > 20 && isv(valid[3], i) && dkey(D(i)) <= dkey(12.5); }, 0);
+            // 1: f64 > 5 keeps NaN (greatest)
+            run_case({PF(Op::GT, 5.0)}, [&](std::size_t i) { return isv(valid[3], i) && dkey(D(i)) > dkey(5.0); }, 1);
+            // 2: f64 = 0 matches -0.0 and +0.0
+            run_case({PF(Op::EQ, 0.0)}, [&](std::size_t i) { return isv(valid[3], i) && D(i) == 0.0; }, 2);
+            // 3: f64 = NaN matches every NaN regardless of sign bit
+            run_case({PF(Op::EQ, std::numeric_limits<double>::quiet_NaN())},
+                     [&](std::size_t i) { return isv(valid[3], i) && std::isnan(D(i)); }, 3);
+            // 4: IN list on i64 pred AND payload IS NOT NULL AND key >= -10 (a key predicate)
+            {
+                const std::int64_t lst[3] = { 1, 5, 9 };
+                gpudb::Predicate in = P(2, Op::In, 0); in.list = lst; in.n_list = 3;
+                run_case({in, P(1, Op::IsNotNull, 0), P(0, Op::GE, -10)},
+                         [&](std::size_t i) { return isv(valid[2], i) && (A(i) == 1 || A(i) == 5 || A(i) == 9) &&
+                                                     isv(valid[1], i) && isv(valid[0], i) && lanes[4 * i] >= -10; }, 4);
+            }
+            // 5: i64 pred IS NULL (keeps NULL keys too)
+            run_case({P(2, Op::IsNull, 0)}, [&](std::size_t i) { return !isv(valid[2], i); }, 5);
+            // 6: key IS NULL -> only the NULL-key group
+            run_case({P(0, Op::IsNull, 0)}, [&](std::size_t i) { return !isv(valid[0], i); }, 6);
+            // 7: nothing passes -> no groups
+            run_case({P(2, Op::GT, 1000)}, [&](std::size_t) { return false; }, 7);
+            // 8: f64 != NaN (drops every NaN, keeps the rest incl. -0.0)
+            run_case({PF(Op::NE, std::numeric_limits<double>::quiet_NaN())},
+                     [&](std::size_t i) { return isv(valid[3], i) && !std::isnan(D(i)); }, 8);
+            // 9: no predicates == the plain exact op
+            {
+                auto a = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), nullptr, 0, std::size_t(100) * 1000000);
+                auto b = agg->groupby_exact_resident(*cols[0], cols[1].get(), std::size_t(100) * 1000000);
+                EXPECT(a.keys == b.keys && a.sums == b.sums && a.sums_hi == b.sums_hi && a.counts_star == b.counts_star);
+            }
+            // 10: WHERE + HAVING sum > 0 + top-k desc by count(*): compare to the host filter over the masked result
+            {
+                std::vector<gpudb::Predicate> ps = { P(2, Op::LT, 30) };
+                auto base = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), ps.data(), ps.size(), std::size_t(100) * 1000000);
+                gpudb::GroupByFilter fl; fl.cmp = gpudb::GroupByFilter::Cmp::GT; fl.threshold_i64 = 0; fl.topk = 7; fl.topk_desc = true; fl.agg = gpudb::GroupByFilter::Agg::CountStar;
+                gpudb::GroupByResidentResult want = base;
+                gpudb::apply_group_filter_host(want, fl, gpudb::FilterAgg::Exact, std::size_t(100) * 1000000, "ref");
+                auto got = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), ps.data(), ps.size(), std::size_t(100) * 1000000, fl);
+                std::vector<std::tuple<std::int64_t, int, std::int64_t>> a, b;
+                for (std::size_t q = 0; q < got.keys.size(); ++q) a.emplace_back(got.keys[q], got.key_null[q], got.counts_star[q]);
+                for (std::size_t q = 0; q < want.keys.size(); ++q) b.emplace_back(want.keys[q], want.key_null[q], want.counts_star[q]);
+                std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+                EXPECT(a == b && got.groups_total == want.groups_total);
+            }
+            // Row count mismatch between a predicate column and the keys is an error.
+            {
+                std::vector<std::int64_t> other(N + 1, 0);
+                auto oc = agg->upload_i64(other.data(), N + 1);
+                gpudb::Predicate bad; bad.col = oc.get(); bad.op = Op::GT; bad.value = 0;
+                bool threw = false;
+                try { (void)agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), &bad, 1, std::size_t(100) * 1000000); }
+                catch (const std::runtime_error&) { threw = true; }
+                EXPECT(threw);
+            }
         } catch (const std::runtime_error& e) {
             if (std::string(e.what()).find("not implemented") != std::string::npos) {
                 implemented = false;

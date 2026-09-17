@@ -241,6 +241,28 @@ struct GroupByFilter {
     bool active() const { return cmp != Cmp::None || topk != 0; }
 };
 
+// v0.7 §4.6: one comparison of a resident predicate column against a
+// constant, for the device-side WHERE mask of the exact GROUP BY. A
+// conjunction is an array of these. `col` is a column of the SAME exact set
+// as the keys/payload (row-aligned by upload_rows_exact), I64 or F64:
+//   - I64 column: `value` / `list` are int64 constants;
+//   - F64 column: `value` / `list` hold the IEEE-754 bits of the double
+//     constants, and the comparison uses DuckDB's total order — every NaN is
+//     the greatest value and equal to any NaN, -0.0 == 0.0;
+//   - a NULL cell fails every comparison and In (SQL three-valued WHERE);
+//     IsNull / IsNotNull test the validity bit only; list values are
+//     non-NULL (the SQL layer drops a NULL literal from an IN list, whose
+//     only effect in a WHERE is "not true").
+class ResidentColumn;
+struct Predicate {
+    enum class Op : std::uint8_t { EQ, NE, LT, LE, GT, GE, IsNull, IsNotNull, In };
+    const ResidentColumn* col = nullptr;
+    Op                    op = Op::EQ;
+    std::int64_t          value = 0;
+    const std::int64_t*   list = nullptr;   // In: n_list constants, same encoding as value
+    std::size_t           n_list = 0;
+};
+
 // Returned by Aggregator::topk_resident — k rows in the requested order.
 // idx is the ORIGINAL upload-order index of each row; values_i64 or
 // values_f64 is filled according to the column's dtype.
@@ -496,6 +518,40 @@ public:
                                                          const ResidentColumn* vals,
                                                          std::size_t max_groups,
                                                          const GroupByFilter& filter = GroupByFilter{});
+
+    // ---- v0.7 milestone 3: predicate columns and the WHERE mask (§4.6) ----
+    // Row-major upload of an exact set with n_lanes columns per row: lane 0
+    // is the key, lane 1 the payload, lanes 2.. the predicate columns. Every
+    // lane is 8 bytes (int64, or the IEEE-754 bits of a double when its
+    // dtype is F64). `valid` holds one bitmap pointer per lane (nullptr =
+    // every row valid; the array itself may be nullptr). Rows whose KEY is
+    // NULL are partitioned to a suffix of EVERY returned column, so the
+    // columns stay row-aligned and the predicate columns can be read by the
+    // key's sort permutation. Returned in lane order. Default throws.
+    struct RowSpan {
+        const std::int64_t*        lanes = nullptr;   // n_lanes * rows values
+        std::size_t                rows = 0;
+        std::size_t                n_lanes = 0;
+        const std::uint64_t* const* valid = nullptr;  // n_lanes entries, or nullptr
+    };
+    virtual std::vector<std::unique_ptr<ResidentColumn>>
+        upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
+                          const Dtype* dtypes, std::size_t n_lanes);
+
+    // groupby_exact_resident with a WHERE mask: the conjunction of `preds`
+    // (n_preds entries, each over a column of the same set) selects the rows
+    // that take part. Semantics are native's: a row failing the mask is
+    // absent from every aggregate INCLUDING count(*), and a group none of
+    // whose rows pass is not emitted (the NULL-key group included).
+    // n_preds == 0 is exactly groupby_exact_resident. The output contract,
+    // filter and cap rules are those of groupby_exact_resident. Default:
+    // delegates when n_preds == 0, throws otherwise (backends opt in).
+    virtual GroupByResidentResult groupby_exact_masked_resident(const ResidentColumn& keys,
+                                                                const ResidentColumn* vals,
+                                                                const Predicate* preds,
+                                                                std::size_t n_preds,
+                                                                std::size_t max_groups,
+                                                                const GroupByFilter& filter = GroupByFilter{});
 
     // ORDER BY col [DESC] LIMIT k over a resident column (I64 or F64).
     // Returns the k smallest (descending=false) or largest values with their
