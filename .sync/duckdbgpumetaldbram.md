@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/ext-wrapper-segments
-- working on: v0.7: segment-mode residency manager on feat/ext-wrapper-segments (on top of #87 + #88): wrapper suite 131 ok incl. 20-segment session + mid-session write; SF10 wrapper gate 1.04x/1.18x/1.00x at p99; next: doc §5.5/§9.3 on PR #83
+- branch: feat/core-exact-groupby
+- working on: v0.7 milestone 3: exact GROUP BY interface + CPU reference pushed (feat/core-exact-groupby, PR open); next: Metal kernels for upload_pair_exact / groupby_exact_resident
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-04T01:01:25Z
+- last update: 2026-09-17T01:57:36Z
