@@ -303,17 +303,24 @@ def _kind_of(typ: str) -> str:
     return "i"
 
 
-def plan_residency(low: Lowered, plan: Plan) -> JoinResidency:
+def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object]] = None) -> JoinResidency:
     """Lane bookkeeping. A lane id is ('key',) | ('val',) | ('null',) |
-    ('pred', virtual column) | ('fk', table index, real column)."""
+    ('pred', virtual column) | ('fk', table index, real column). `computed`
+    (§4.10): virtual columns that are expressions over one table's columns;
+    they are lanes of that table's set like any other column."""
     tables = low.tables
+    computed = computed or {}
+    for name, comp in computed.items():
+        low.colmap.setdefault(name, (comp.table, name))
 
     def q_for(ti: int) -> Callable[[str], str]:
-        # virtual column -> quoted real column of table ti
+        # virtual column -> quoted real column (or computed expression) of table ti
         def q(v: str) -> str:
             tj, real = low.colmap[v]
             if tj != ti:
                 raise Decline("shape", "GROUP BY key components from different tables")
+            if v in computed:
+                return computed[v].sql
             return f'"{real}"'
         return q
 

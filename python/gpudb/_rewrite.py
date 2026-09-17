@@ -948,12 +948,14 @@ def pred_lane_expr(plan: Plan, c: str, q=_q_default) -> str:
     return f"CAST({q(c)} * {10 ** d[1]} AS BIGINT)" if d and d[1] else _int_image(q(c), t)
 
 
-def upload_sql(plan: Plan, fqn: str) -> str:
-    """The upload statement for the plan's resident set (§5.5)."""
+def upload_sql(plan: Plan, fqn: str, q=_q_default) -> str:
+    """The upload statement for the plan's resident set (§5.5). `q` renders a
+    plan column as SQL over the table: a quoted name, or the expression of a
+    computed lane (§4.10)."""
     tag = plan.tag.replace("'", "''")
-    k = key_lane_expr(plan)
+    k = key_lane_expr(plan, q)
     if plan.exact:
-        v = val_lane_expr(plan)
+        v = val_lane_expr(plan, q)
         if not plan.pred_cols and not plan.dict_key:
             # no predicate lanes: the 2-lane exact upload (same set, no list
             # columns to plan per segment statement)
@@ -961,7 +963,7 @@ def upload_sql(plan: Plan, fqn: str) -> str:
         pi, pf, ps = [], [], []
         for c in plan.pred_cols:
             t = plan.pred_types.get(c, "")
-            e = pred_lane_expr(plan, c)
+            e = pred_lane_expr(plan, c, q)
             (pf if t in ("DOUBLE", "FLOAT", "REAL") else ps if t in _STRING_TYPES else pi).append(e)
         if ps or plan.dict_key:
             return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
@@ -970,4 +972,4 @@ def upload_sql(plan: Plan, fqn: str) -> str:
                 f"[{', '.join(pf)}]::DOUBLE[]) FROM {fqn}")
     if plan.val is None:
         return f"SELECT gpu_upload('{tag}', {k}) FROM {fqn}"
-    return f"SELECT gpu_upload_pair('{tag}', {k}, {val_lane_expr(plan)}) FROM {fqn}"
+    return f"SELECT gpu_upload_pair('{tag}', {k}, {val_lane_expr(plan, q)}) FROM {fqn}"

@@ -62,17 +62,21 @@ JOIN_WHERES = {          # predicate -> the table it needs in the join ('' = any
 EXTRA_PAYLOADS = ["sum(l_extendedprice)", "max(l_tax)", "sum(l_discount)", "min(l_partkey)"]
 
 
+PAYLOAD = "l_quantity"            # --exprs swaps it for REVENUE (a computed lane, §4.10)
+REVENUE = "l_extendedprice * (1 - l_discount)"
+
+
 def build(key: str, where: str, form: str, having_thr: str, source: str = "lineitem", payloads: int = 1) -> str:
     """`payloads` > 1 adds aggregates over further columns (§4.9: one device
     pass per payload column)."""
     w = f" WHERE {where}" if where else ""
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
-        return f"SELECT {key}, sum(l_quantity){more}, count(*) FROM {source}{w} GROUP BY {key}"
+        return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
     if form == "having":
-        return (f"SELECT {key}, sum(l_quantity) AS q{more} FROM {source}{w} GROUP BY {key} "
-                f"HAVING sum(l_quantity) > {having_thr}")
-    return (f"SELECT {key}, sum(l_quantity) AS q{more} FROM {source}{w} GROUP BY {key} "
+        return (f"SELECT {key}, sum({PAYLOAD}) AS q{more} FROM {source}{w} GROUP BY {key} "
+                f"HAVING sum({PAYLOAD}) > {having_thr}")
+    return (f"SELECT {key}, sum({PAYLOAD}) AS q{more} FROM {source}{w} GROUP BY {key} "
             f"ORDER BY q DESC LIMIT 10")
 
 
@@ -94,11 +98,19 @@ def main() -> int:
     ap.add_argument("--wheres", default="all", help="'all' or a ';'-separated list of predicates ('' = none)")
     ap.add_argument("--joins", default="all", help="'all', 'none' or a ';'-separated list of JOINS labels")
     ap.add_argument("--no-single", action="store_true", help="skip the single-table sweep")
+    ap.add_argument("--exprs", action="store_true",
+                    help="aggregate l_extendedprice * (1 - l_discount) and add an expression WHERE (computed lanes)")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")
     args = ap.parse_args()
+    if args.exprs:
+        global PAYLOAD
+        PAYLOAD = REVENUE
+        WHERES["l_commitdate < l_receiptdate AND (l_shipmode = 'AIR' OR l_quantity > 40)"] = "computed"
+        WHERES["extract(year FROM l_shipdate) = 1995"] = "computed"
+        JOIN_WHERES["o_orderpriority LIKE '1-%' OR o_orderpriority LIKE '2-%'"] = "orders"
     if not os.path.exists(args.db):
         print(f"missing {args.db} — SF=1 ./scripts/gen_tpch.sh", file=sys.stderr)
         return 2
@@ -138,7 +150,7 @@ def main() -> int:
         key_label = f"{label}: {key}" if label else key
         # a HAVING threshold that keeps roughly 1% of the groups
         thr = con._raw.execute(
-            f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum(l_quantity) q FROM {source}{w} GROUP BY {key})"
+            f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum({PAYLOAD}) q FROM {source}{w} GROUP BY {key})"
         ).fetchone()[0]
         thr_s = f"{thr:.2f}" if thr is not None else "0"
         if True:

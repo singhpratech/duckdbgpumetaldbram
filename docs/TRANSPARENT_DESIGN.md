@@ -104,9 +104,15 @@ GROUP BY k1 [, k2, k3]
   reduce each (§4.9).
 - `WHERE`: conjunctions of comparisons between a column of `t` and a
   constant, `IN (list)`, `BETWEEN`, `IS [NOT] NULL`. Evaluated on the device
-  as a mask over the resident predicate columns (§4.6). Anything else (a
-  function call, a subquery, a correlated reference) is not a resident shape
-  and runs native.
+  as a mask over the resident predicate columns (§4.6). Through the Python
+  wrapper every other deterministic row-local conjunct — `OR`, `LIKE`, a
+  function predicate, column-vs-column — is a computed BOOLEAN lane (§4.10);
+  subqueries, correlated references and volatile functions run native.
+- Expressions (§4.10, Python wrapper): a deterministic expression over the
+  columns of one table may stand as an aggregate's argument
+  (`sum(price * (1 - discount))`, `sum(CASE ...)`), as a GROUP BY key
+  (`year(d)`, `substr(s, 1, 2)`, `a % 10`) and on the column side of a
+  `WHERE` comparison.
 - `HAVING`: any conjunction of aggregate-vs-constant comparisons (v0.6
   supports one; the `=`/`<>` cases and conjunctions are host-side over the
   device survivors until a kernel exists, which is still a device filter for
@@ -506,6 +512,70 @@ under a three-term `WHERE`; 1.00–1.08× at 100K groups over a join) and
 `_thresholds.py` sends the multi-payload plain form native under a `WHERE`,
 above 50K groups on a single table and above 20K groups over a join. HAVING
 and top-k keep their wins (1.06–3.0× single table, up to 4.8× over joins).
+
+### 4.10 Computed lanes: expressions as columns
+A deterministic, row-local expression over the columns of one table is, for a
+GROUP BY, just another column of that table. The wrapper
+(`python/gpudb/_exprs.py`) lowers such an expression to a *virtual column*
+`x_<hash>` before the matcher sees the statement: DuckDB itself evaluates the
+expression while the table is uploaded (`gpu_upload_rows_exact(..., <expr>,
+...)`), so its semantics, NULL handling, casts and typing are native's by
+construction, and everything downstream — matcher, type checks, thresholds,
+the pure rewrite scalar, the renderer, the join planner — handles an ordinary
+column. The scalar needed no change: it receives the lowered tree and a
+context whose `columns` include the virtual ones.
+
+Where an expression may stand:
+- the argument of `sum` / `count` / `min` / `max` / `avg` → a payload lane;
+- a GROUP BY expression, with its repeats in SELECT and ORDER BY → a key
+  (BOOLEAN keys travel as 0 / 1 and come back typed BOOLEAN);
+- `expr <op> constant`, `expr IN (...)`, `expr BETWEEN ...`,
+  `expr IS [NOT] NULL` → a predicate lane compared on the device;
+- any other `WHERE` conjunct (`OR`, `LIKE`, column-vs-column, a function
+  predicate) → a BOOLEAN lane kept where it is TRUE, which is SQL's `WHERE`.
+
+Accepted inside an expression: column references, constants, casts, `CASE`,
+comparisons, `AND` / `OR` / `NOT`, `IS NULL`, `BETWEEN`, `IN` lists,
+`COALESCE`, and every function `duckdb_functions()` lists as a scalar with
+stability `CONSISTENT` in all its overloads (built-in macros such as `nullif`
+when their definition names nothing else). Not accepted: `VOLATILE` and
+`CONSISTENT_WITHIN_QUERY` functions (`random()`, `now()`, `nextval()` ...),
+functions that read session state (`current_setting`, `getvariable`, ...),
+user macros, subqueries, windows, lambdas, parameters, aggregates, and an
+expression over columns of two joined tables (a lane belongs to one table's
+set). The expression's type decides what it can be: integer family / DECIMAL
+as a payload (DOUBLE declines as `double`, as for a column), those plus DATE /
+TIMESTAMP / VARCHAR / BOOLEAN as a key, any of them plus DOUBLE as a
+predicate. A DECIMAL wider than 18 digits is allowed for an expression (`a *
+b` is typed wide but holds small values): a value that does not fit fails the
+upload's BIGINT cast, the set is never published and the statement stays
+native.
+
+Identity: the virtual column's name is a hash of the table and the
+expression's SQL, so the same expression in another statement reuses the
+lane, and the identity tag lists it like a column. A literal *inside* an
+expression (`substr(s, 1, 2)`, a LIKE pattern, the constants of an `OR`) is
+part of that identity, while the statement cache normalises literals away —
+so a decision that involves such a lane is marked literal-sensitive and each
+literal tuple gets its own decision (at most 16 per template; beyond that the
+statement runs native). Each distinct expression is its own resident lane:
+an application that repeats its statements pays one upload per expression, an
+ad-hoc stream of ever-new patterns never becomes resident and runs native
+throughout.
+
+Decision-time probes (selectivity, a computed key's bounds and distinct
+estimate) read the virtual columns from a derived table `(SELECT *, <expr> AS
+"x_..." FROM <table or join>)`; they run once per template.
+
+TPC-H SF1 through the wrapper (M4 Max, identical rows): revenue by order
+under a three-table join with date predicates (Q3 shape) 2.2×, revenue by
+nation over four tables (Q5 shape) 3.8×, the Q12 `CASE` sums with
+column-vs-column predicates 1.9×, `GROUP BY extract(year ...)` with `NOT
+LIKE` 4.8×, `substr` key (Q22 shape) 2.3×; the gate's `--exprs` sweep
+(`sum(l_extendedprice * (1 - l_discount))`, computed predicates) has 96
+rewritten rows at 1.06–7.6×, none below native. Shapes with a handful of
+groups over a single table (Q1) stay native under the existing `min_groups`
+threshold: the resident reduce walks a huge group serially and loses there.
 
 ## 5. Automatic residency (piece C)
 
