@@ -58,9 +58,12 @@ struct ResidentSet {
     std::int64_t  table_oid = -1;
 
     bool          pair = false;
+    bool          exact = false;     // gpu_upload_pair_exact: NULLs kept (v0.7 §4.1);
+                                     // only gpu_groupby_exact_resident reads such a set
     std::unique_ptr<gpudb::ResidentColumn> keys;   // bare column, or pair.k
     std::unique_ptr<gpudb::ResidentColumn> vals;   // pair.v (null for a bare column)
     std::size_t   rows = 0;          // rows in the column(s): NULL rows are skipped
+                                     // (exact sets: every row, NULLs included)
     std::size_t   rows_seen = 0;     // rows the upload scan delivered (count(*) of its input)
     std::uint64_t epoch = 0;         // invalidation sequence at registration
     std::int64_t  uploaded_at_us = 0;

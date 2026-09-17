@@ -242,6 +242,34 @@ public:
         return out;
     }
 
+    // v0.7 milestone 3: same placement rule; a backend without the exact
+    // upload (default throw) sends the pair to the CPU reference.
+    ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
+                                   Dtype vdt) override {
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        if (gpu_) {
+            try {
+                ResidentPair inner = gpu_->upload_pair_exact(spans, n_spans, vdt);
+                ResidentPair out;
+                out.keys = std::make_unique<HybridResidentColumn>(
+                    Backend::CPU, std::move(inner.keys), rows, Dtype::I64, /*on_gpu=*/true);
+                out.vals = std::make_unique<HybridResidentColumn>(
+                    Backend::CPU, std::move(inner.vals), rows, vdt, /*on_gpu=*/true);
+                return out;
+            } catch (const std::exception&) {
+                // fall through to the CPU upload
+            }
+        }
+        ResidentPair inner = cpu_->upload_pair_exact(spans, n_spans, vdt);
+        ResidentPair out;
+        out.keys = std::make_unique<HybridResidentColumn>(
+            Backend::CPU, std::move(inner.keys), rows, Dtype::I64, /*on_gpu=*/false);
+        out.vals = std::make_unique<HybridResidentColumn>(
+            Backend::CPU, std::move(inner.vals), rows, vdt, /*on_gpu=*/false);
+        return out;
+    }
+
     AggResult sum_resident_i64(const ResidentColumn& c) override {
         return dispatch_resident_i64(c, [&](Aggregator& a, const ResidentColumn& cc){
             return a.sum_resident_i64(cc);
@@ -357,6 +385,22 @@ public:
             });
     }
 
+    GroupByResidentResult groupby_exact_resident(const ResidentColumn& keys,
+                                                 const ResidentColumn* vals,
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
+        if (!vals) {
+            return dispatch_resident_single<GroupByResidentResult>(keys,
+                [&](Aggregator& a, const ResidentColumn& k) {
+                    return a.groupby_exact_resident(k, nullptr, max_groups, filter);
+                });
+        }
+        return dispatch_resident_pair<GroupByResidentResult>(keys, *vals,
+            [&](Aggregator& a, const ResidentColumn& k, const ResidentColumn& v) {
+                return a.groupby_exact_resident(k, &v, max_groups, filter);
+            });
+    }
+
     TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
                              bool descending) override {
         return dispatch_resident_single<TopKResult>(col,
@@ -442,6 +486,7 @@ private:
         void prepare() override { inner_->prepare(); }
         bool prepared() const noexcept override { return inner_->prepared(); }
         std::size_t resident_bytes() const noexcept override { return inner_->resident_bytes(); }
+        std::size_t null_count() const noexcept override { return inner_->null_count(); }
         const ResidentColumn& inner() const noexcept { return *inner_; }
         bool on_gpu() const noexcept { return on_gpu_; }
     private:
