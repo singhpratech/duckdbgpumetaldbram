@@ -3209,3 +3209,35 @@ unchanged; the note is the decline reason.
 | Q21 | native (shape) | 22.1 | — | — | — | split: the inner GROUP BY declined (shape) |
 | Q22 | native (shape) | 8.4 | — | — | — | split: the inner GROUP BY declined (shape) |
 6 of 22 queries answered on the device; 0 with rows that differ from native
+
+## v0.7 TPC-H coverage map, second pass — Metal, SF1 (2026-09-18)
+
+Same script and configuration (shipping thresholds AND the 1M-row floor, which
+the first table above had switched off). Nested rewriting, wide / DECIMAL keys
+and the fast-path fix bring it to 9 of 22.
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.1 | 5.9 | 2.04× | True | |
+| Q2 | native (threshold) | 4.6 | — | — | — |  |
+| Q3 | GPU (plain) | 6.5 | 3.5 | 1.86× | True | |
+| Q4 | native (shape) | 7.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.8 | 1.9 | 3.60× | True | |
+| Q6 | native (shape) | 1.7 | — | — | — |  |
+| Q7 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q8 | native (shape) | 7.5 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q9 | native (shape) | 19.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q10 | GPU (topk) | 17.5 | 4.1 | 4.31× | True | |
+| Q11 | native (threshold) | 2.9 | — | — | — |  |
+| Q12 | GPU (plain) | 6.4 | 3.6 | 1.79× | True | |
+| Q13 | GPU (nested) | 18.3 | 1.9 | 9.46× | True | |
+| Q14 | GPU (projected) | 5.2 | 2.6 | 2.00× | True | |
+| Q15 | native (shape) | 3.4 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 12.9 | — | — | — |  |
+| Q17 | native (shape) | 6.3 | — | — | — | split failed: Binder Error: Referenced column "p_partkey" not found in FROM clause!
+| Q18 | GPU (nested) | 13.8 | 8.1 | 1.71× | True | |
+| Q19 | GPU (projected) | 10.3 | 2.8 | 3.67× | True | |
+| Q20 | native (shape) | 7.9 | — | — | — |  |
+| Q21 | native (shape) | 22.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.5 | — | — | — | split: the inner GROUP BY declined (threshold) |
+9 of 22 queries answered on the device; 0 with rows that differ from native

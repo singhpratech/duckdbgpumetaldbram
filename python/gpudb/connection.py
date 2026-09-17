@@ -127,6 +127,8 @@ class Connection:
         self._last = LastRewrite()
         self._cache: Dict[Tuple[str, str], Decision] = {}
         self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
+        self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
+        self._last_tags: List[str] = []
         self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
         self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
         self._select_template: Optional[dict] = None
@@ -375,8 +377,8 @@ class Connection:
     # ---- the statement path ----
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
-        tag = self._last.tag
-        if tag:
+        tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        for tag in tags:
             st = self._manager.get(tag)
             # a joined set: the error does not say which table moved
             for dep in (st.deps if st is not None else []):
@@ -391,6 +393,7 @@ class Connection:
     def _invalidate_all(self, why: str) -> None:
         self._manager.invalidate(None)
         self._cache.clear()
+        self._nested_cache.clear()
         self._unique_cache.clear()
         self._expr_types.clear()
         self._big_tables = None
@@ -413,19 +416,24 @@ class Connection:
         return self._big_tables
 
     def _names_big_table(self, sql: str) -> bool:
+        """Does the statement name a table at or above the floor — anywhere
+        (FROM a, b / JOIN b / a subquery), not only right after the first
+        FROM? A word match: a false positive only costs one parse."""
         big = self._big_tables if self._big_tables is not None else self._refresh_big_tables()
         if not big:
             return False
-        for m in _TABLE_REF_RE.finditer(sql):
-            last = m.group(1).split(".")[-1].strip('"')
-            if last in big:
-                return True
-        return False
+        rx = getattr(self, "_big_tables_rx", None)
+        if rx is None or rx[0] is not big:
+            pat = "|".join(re.escape(t) for t in sorted(big, key=len, reverse=True))
+            rx = (big, re.compile(r'(?<![A-Za-z0-9_])(?:' + pat + r')(?![A-Za-z0-9_])', re.IGNORECASE))
+            self._big_tables_rx = rx
+        return rx[1].search(sql) is not None
 
     def _route(self, query: Any, parameters) -> Any:
         """Return the SQL to run in place of `query`."""
         self._last = LastRewrite(statement=query if isinstance(query, str) else "")
         self._timing_decision = None
+        self._last_tags = []
         if not isinstance(query, str):
             self._last.reason = "shape"
             return query
@@ -487,6 +495,147 @@ class Connection:
         if not _maybe_aggregate(sql):
             self._last.reason = "shape"
             return None
+        out = self._rewrite_text(sql)
+        # the statement as a whole is not a transparent shape (or reads a CTE / view /
+        # derived table, which has no identity of its own): a SELECT inside it may be
+        if out is None and getattr(self, "_exact", False) and \
+                self._last.reason in ("shape", "not_found", "view", "temp", "ambiguous", "double", "decimal"):
+            whole = self._last.reason
+            out = self._rewrite_nested(sql)
+            if out is None and self._last.reason == "shape":
+                self._last.reason = whole
+        return out
+
+    # ---- nested rewriting (§4.14): subqueries, derived tables and CTEs that are rewritable themselves ----
+    _AGG_NAMES = ("sum", "count", "count_star", "min", "max", "avg")
+
+    @classmethod
+    def _is_aggregate_select(cls, node) -> bool:
+        if not isinstance(node, dict) or node.get("type") != "SELECT_NODE":
+            return False
+        if node.get("group_expressions"):
+            return True
+        def has_agg(e):
+            if isinstance(e, dict):
+                if e.get("class") == "FUNCTION" and (e.get("function_name") or "").lower() in cls._AGG_NAMES:
+                    return True
+                return any(has_agg(v) for k, v in e.items() if k != "subquery")
+            if isinstance(e, list):
+                return any(has_agg(v) for v in e)
+            return False
+        return has_agg(node.get("select_list") or [])
+
+    def _rewrite_nested(self, sql: str) -> Optional[str]:
+        """The statement as a whole is not a transparent shape, but a SELECT
+        inside it may be: `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP
+        BY l_orderkey HAVING sum(l_quantity) > 300)`, a derived table, a CTE, a
+        scalar subquery. Each such SELECT is rewritten on its own (its own
+        decision, thresholds, residency and guards) and spliced back; the
+        outer statement stays DuckDB's. A correlated subquery does not bind on
+        its own and declines by itself."""
+        key = (sql, self._settings_key)
+        entry = self._nested_cache.get(key)
+        if entry is False:
+            self._last.reason = "shape"
+            return None
+        first = entry is None
+        if first:
+            try:
+                tree = json.loads(self._serialize(sql))
+            except Exception:
+                self._nested_cache[key] = False
+                return None
+            stmts = tree.get("statements") or []
+            if len(stmts) != 1:
+                self._nested_cache[key] = False
+                self._last.reason = "shape"
+                return None
+            subs: List[Tuple[list, str]] = []
+
+            def walk(e, path, top):
+                if isinstance(e, dict):
+                    if not top and self._is_aggregate_select(e):
+                        try:
+                            sub_sql = self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(
+                                {"error": False, "statements": [{"node": e, "named_param_map": []}]})]).fetchone()[0]
+                        except Exception:
+                            sub_sql = None
+                        if sub_sql:
+                            self._rewrite_text(sub_sql)
+                            if self._last.rewritten or self._last.reason == "not_resident":
+                                subs.append((list(path), sub_sql))
+                                return                      # rewritten as a whole: do not descend
+                    for k, v in e.items():
+                        walk(v, path + [k], False)
+                elif isinstance(e, list):
+                    for i, v in enumerate(e):
+                        walk(v, path + [i], False)
+
+            walk(stmts[0].get("node"), ["statements", 0, "node"], True)
+            if not subs or len(self._nested_cache) > 512:
+                self._nested_cache[key] = False
+                self._last = LastRewrite(statement=sql, reason="shape")
+                return None
+            entry = {"tree": tree, "subs": subs, "final": {}, "decision": Decision(True, form="nested")}
+            self._nested_cache[key] = entry
+        d = entry["decision"]
+        if not d.rewritten:
+            self._last = LastRewrite(statement=sql, reason=d.reason or "threshold")
+            return None
+        outs, tags, pending = [], [], False
+        for _path, sub_sql in entry["subs"]:
+            o = self._rewrite_text(sub_sql)
+            if o is None:
+                pending = pending or self._last.reason == "not_resident"
+                outs.append(None)
+            else:
+                outs.append(o)
+                tags.append(self._last.tag)
+        self._last = LastRewrite(statement=sql)
+        self._timing_decision = None
+        self._last_decision = None
+        if not any(outs):
+            self._last.reason = "not_resident" if pending else "threshold"
+            if pending:
+                self._timing_decision = d            # its native runs are this statement's native time
+            return None
+        fkey = tuple(outs)
+        final = entry["final"].get(fkey)
+        if final is None:
+            try:
+                tree = json.loads(json.dumps(entry["tree"]))
+                for (path, _sub_sql), o in zip(entry["subs"], outs):
+                    if o is None:
+                        continue
+                    node = json.loads(self._serialize(o))["statements"][0]["node"]
+                    holder = tree
+                    for k in path[:-1]:
+                        holder = holder[k]
+                    holder[path[-1]] = node
+                final = self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(tree)]).fetchone()[0]
+                want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+                have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + final).fetchall()]
+                if want != have:
+                    raise ValueError(f"names / types changed: {want} -> {have}")
+            except Exception as e:
+                self._log(f"nested rewrite failed: {str(e)[:160]}")
+                self._nested_cache[key] = False
+                self._last.reason = "shape"
+                return None
+            if len(entry["final"]) < 32:
+                entry["final"][fkey] = final
+        self._timing_decision = d
+        self._last.rewritten = True
+        self._last.form = "nested"
+        self._last.tag = tags[0] if tags else ""
+        self._last_tags = tags
+        self._last.engine = "nested"
+        self._last.sql = final
+        return final
+
+    def _rewrite_text(self, sql: str) -> Optional[str]:
+        """The rewritten SQL of ONE statement, or None with _last.reason set."""
+        self._last = LastRewrite(statement=sql)
         t0 = time.perf_counter()
         template, literals = self._normalise(sql)
         key = (template, self._settings_key)
@@ -753,7 +902,7 @@ class Connection:
         if not getattr(self, "_exact", False):
             raise first
         tree2, computed = self._lower_exprs(tree, low)
-        if not computed:
+        if not computed and tree2 == tree:
             raise first
         if low is not None:
             low.tree_json = tree2
@@ -901,7 +1050,7 @@ class Connection:
             return Decision(False, e.reason)
         # thresholds: the row count floor (§9.1); group estimate comes from
         # the resident set once it exists
-        nrows = (low.tables[low.root].rows if low is not None
+        nrows = (max(t.rows for t in low.tables) if low is not None     # the largest joined table decides
                  else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
         if nrows < self._floor_rows:
             return Decision(False, "threshold")
@@ -975,13 +1124,23 @@ class Connection:
         # count(*) scan at decision time, cached with the template)
         if plan.exact and getattr(self, "_thresholds", True):
             est = (stats.get(plan.key) or {}).get("approx_unique")
-            if plan.packed:
+            if len(plan.keys) > 1:
                 est = 1
                 for kc in plan.keys:
                     u = (stats.get(kc) or {}).get("approx_unique")
                     est = None if (u is None or est is None) else est * u
                 if est is not None:
                     est = min(est, nrows)
+            if est is None:
+                # no zone-map estimate (VARCHAR columns carry none): count the key's distinct
+                # values once — one scan per statement template
+                try:
+                    cols = ", ".join(f'"{kc}"' for kc in plan.keys)
+                    src = probe_from if probe_from else ident.fqn
+                    est = int(self._raw.execute(
+                        f"SELECT approx_count_distinct(hash({cols})) FROM {src}").fetchone()[0])
+                except Exception as e:
+                    self._log(f"distinct-count probe failed: {e}")
             sel = None
             if plan.where:
                 try:

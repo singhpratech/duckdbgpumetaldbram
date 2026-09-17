@@ -43,7 +43,8 @@ WHERES = {
     "l_discount <= 0.09": "~90%",
     "l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4": "mixed",
 }
-FORMS = ("plain", "having", "topk", "projected")   # projected: expressions over aggregates (§4.11)
+# projected: expressions over aggregates (§4.11); nested: a rewritable GROUP BY inside a statement DuckDB keeps (§4.14)
+FORMS = ("plain", "having", "topk", "projected", "nested")
 # key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
 # applies where its table is part of the join
 JOINS = {
@@ -80,6 +81,9 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
         return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
+    if form == "nested":
+        return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({PAYLOAD}) AS q{more} "
+                f"FROM {source}{w} GROUP BY {key} HAVING sum({PAYLOAD}) > {having_thr}) gpudb_x")
     if form == "global":          # no GROUP BY (§4.12); only swept over joins
         return f"SELECT sum({PAYLOAD}) AS q, count(*){more} FROM {source}{w}"
     if form == "projected":
@@ -198,7 +202,7 @@ def main() -> int:
                     print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"declined ({lr['reason']}) |")
                     continue
-                if form == "global":
+                if form in ("global", "nested"):
                     identical = got == nat
                 elif form == "topk":
                     # ORDER BY <agg> LIMIT k without a tiebreaker: which of the

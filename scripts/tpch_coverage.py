@@ -49,7 +49,10 @@ def main() -> int:
         c0.execute("LOAD tpch")
     queries = c0.execute("SELECT query_nr, query FROM tpch_queries() ORDER BY 1").fetchall()
     logs = []
-    con = gpudb.connect(args.db, read_only=True, residency="eager", floor_rows=0,
+    # the shipping configuration, floor included (tables under 1M rows are never parsed);
+    # --no-thresholds also drops the floor, to see every shape the engine accepts
+    con = gpudb.connect(args.db, read_only=True, residency="eager",
+                        floor_rows=0 if args.no_thresholds else 1_000_000,
                         thresholds=not args.no_thresholds, log=logs.append)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     print(f"# TPC-H coverage — {args.db}, {info}, thresholds {'off' if args.no_thresholds else 'on'}, N={args.n}")

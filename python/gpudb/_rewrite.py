@@ -271,8 +271,8 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         pass
     groups = node.get("group_expressions") or []
     sets = node.get("group_sets") or []
-    if not 1 <= len(groups) <= 3 or sets != [list(range(len(groups)))]:
-        raise Decline("shape", "group by is not one to three columns")
+    if not 1 <= len(groups) <= 8 or sets != [list(range(len(groups)))]:
+        raise Decline("shape", "group by is not one to eight columns")
     keys = [_colref(g) for g in groups]
     if any(k is None for k in keys):
         raise Decline("shape", "group by expression")
@@ -515,12 +515,16 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
         kt = columns.get(kc)
         if kt is None:
             raise Decline("shape", f"unknown column {kc}")
-        if kt not in _KEY_TYPES and not (exact and (kt in _TEMPORAL_TYPES or kt in _STRING_TYPES)):
+        if kt not in _KEY_TYPES and not (exact and (kt in _TEMPORAL_TYPES or kt in _STRING_TYPES or decimal_scale(kt))):
             raise Decline("shape", f"key type {kt}")
         plan.key_types.append(kt)
     plan.key_type = plan.key_types[0]
-    plan.dict_key = any(t in _STRING_TYPES for t in plan.key_types)
-    if plan.dict_key and len(plan.keys) > 1:
+    # up to three integer / temporal keys pack into one BIGINT (§4.4); a VARCHAR or DECIMAL
+    # component, or four to eight keys, make the key a hashed tuple with a dictionary (§4.5)
+    plan.dict_key = any(t in _STRING_TYPES or decimal_scale(t) for t in plan.key_types) or len(plan.keys) > 3
+    if plan.dict_key and not exact:
+        raise Decline("shape", "a dictionary key needs the exact path")
+    if plan.dict_key and (len(plan.keys) > 1 or plan.key_type not in _STRING_TYPES):
         # components of a hashed tuple key are read back from the dictionary; a
         # WHERE on one goes through its own lane, so they are predicate columns
         for kc in plan.keys:
@@ -607,7 +611,7 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
     """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col == plan.key and len(plan.keys) == 1:
+    if col == plan.key and len(plan.keys) == 1 and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
         return "k", ("s" if plan.dict_key else "i"), 0
     if col == plan.val:
         return "v", "i", plan.scale
@@ -810,10 +814,14 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
         fn = "gpu_groupby_exact_multi"
         args = [f"'{tag}'", "'" + prog.replace("'", "''") + "'", f"'{lanes}'", f"'{mfilter}'"]
+    # a filtered result (device HAVING / top-k) decodes its few keys one by one instead of
+    # joining the whole dictionary (tens of ms for 100K wide tuples, per statement)
+    dict_per_key = plan.dict_key and (fn.endswith(("_having", "_topk")) or bool(mfilter))
     cols = []
     for out in plan.outputs:
         if out.kind == "key" and plan.dict_key:
-            ref = 'd."c%d"' % out.key_index
+            ref = ("gpu_resident_dict_component('%s', r.\"key\", %d)" % (tag, out.key_index) if dict_per_key
+                   else 'd."c%d"' % out.key_index)
             t = out.native_type.upper()
             expr = ref if t in _STRING_TYPES or t.startswith("VARCHAR") else f"CAST({ref} AS {out.native_type})"
             cols.append(f'{expr} AS "{out.name}"')
@@ -826,7 +834,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         else:
             cols.append(f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS "{out.name}"')
     src = f"{fn}({', '.join(args)}) r"
-    if plan.dict_key:
+    if plan.dict_key and not dict_per_key:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
     if plan.guards:
         # a joined set: one assert per base table, each against that table's own set
