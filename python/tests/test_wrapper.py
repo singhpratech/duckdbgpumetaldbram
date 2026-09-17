@@ -31,7 +31,9 @@ def native(sql):
 
 SETUP = f"""
 CREATE TABLE t AS SELECT (i % 1000)::INTEGER AS k, (i % 97)::BIGINT AS v,
-                         ((i % 977) / 100.0)::DECIMAL(15,2) AS d, (i * 0.5)::DOUBLE AS x
+                         ((i % 977) / 100.0)::DECIMAL(15,2) AS d, (i * 0.5)::DOUBLE AS x,
+                         DATE '1995-01-01' + (i % 2000)::INTEGER AS dt,
+                         TIMESTAMP '2020-01-01' + INTERVAL (i % 86400) SECOND AS ts
                   FROM range({N}) r(i);
 CREATE TABLE tu AS SELECT (i % 1000)::INTEGER AS k, i::BIGINT AS v FROM range({N}) r(i);
 CREATE TABLE tn AS SELECT (i % 10)::BIGINT AS k, CASE WHEN i % 7 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range({N}) r(i);
@@ -85,11 +87,13 @@ def run():
         "having_eq":  "SELECT k, sum(v) FROM t GROUP BY k HAVING count(*) = 300 ORDER BY k",
         "having_avg": "SELECT k, sum(v) FROM t GROUP BY k HAVING avg(v) > 47.9 ORDER BY k",
         "decimal_minmax": "SELECT k, min(d), max(d), sum(d) FROM t WHERE d > 1.25 GROUP BY k ORDER BY k",
+        "date_key":   "SELECT dt, sum(v), count(*) FROM t WHERE ts >= TIMESTAMP '2020-01-01 12:00:00' GROUP BY dt ORDER BY dt",
+        "date_pred":  "SELECT k, sum(v) FROM t WHERE dt BETWEEN DATE '1996-01-01' AND DATE '1997-12-31' AND dt <> DATE '1996-05-05' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
     }
     if not con._exact:
         for name in ("nulls", "min_max_avg", "where_int", "where_mixed", "where_having", "where_topk",
-                     "having_eq", "having_avg", "decimal_minmax"):
+                     "having_eq", "having_avg", "decimal_minmax", "date_key", "date_pred"):
             cases.pop(name)
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
@@ -172,7 +176,7 @@ def run():
     check(con.last_rewrite()["reason"] in ("view", "threshold"), "registered relation: never rewritten")
     # a temp table that SHADOWS the resident base table: native, and the
     # answer is the temp table's, not the resident set's
-    con.execute("CREATE TEMP TABLE t AS SELECT k, v * 2 AS v, d, x FROM t")
+    con.execute("CREATE TEMP TABLE t AS SELECT k, v * 2 AS v, d, x, dt, ts FROM t")
     got = con.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
     lr = con.last_rewrite()
     check(not lr["rewritten"] and got == con._raw.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall(),
@@ -198,7 +202,7 @@ def run():
           "same-count UPDATE seen by the wrapper: set invalidated and re-uploaded, answer correct")
     # a writer the wrapper does not see, count changes -> guard fires, fallback
     raw = con._raw.cursor()
-    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5)")
+    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
     got = con.execute(q).fetchall()
     lr = con.last_rewrite()
     nat2 = [(k, s + (5 if k == 3 else 0)) for k, s in nat]
@@ -208,7 +212,7 @@ def run():
     con.execute(q).fetchall()
     con.execute(q).fetchall()
     check(con.last_rewrite()["rewritten"], "resident again after the delete")
-    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5)")
+    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
     got = con.execute("SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > 10000000").fetchall()
     check(con.last_rewrite()["fallback"] and got == [],
           "unseen INSERT + empty resident result: guard still fires")
@@ -216,7 +220,7 @@ def run():
     # transactions
     con.execute(q).fetchall(); con.execute(q).fetchall()
     con.execute("BEGIN")
-    con.execute("INSERT INTO t VALUES (3, 7, 1.00, 0.5)")
+    con.execute("INSERT INTO t VALUES (3, 7, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
     con.execute(q).fetchall()
     check(not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "transaction",
           "inside BEGIN: never rewritten")
@@ -225,7 +229,7 @@ def run():
     check(got == nat and con.last_rewrite()["rewritten"], "after ROLLBACK: resident again, answer correct")
     # multi-statement string with DML
     attempts = con._manager.get(tag).attempts
-    con.execute("SELECT 1; INSERT INTO t VALUES (3, 9, 1.00, 0.5); SELECT 2")
+    con.execute("SELECT 1; INSERT INTO t VALUES (3, 9, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01'); SELECT 2")
     got = con.execute(q).fetchall()
     check(con._manager.get(tag).attempts == attempts + 1 and got == con._raw.execute(q).fetchall(),
           "multi-statement DML invalidates; re-uploaded; answer correct")

@@ -18,6 +18,7 @@ operations, PARAMETER nodes, and any CTE that defines the table's name.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import math
 import re
@@ -27,6 +28,8 @@ from typing import Dict, List, Optional, Tuple
 
 _INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _KEY_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}
+_TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
+_EPOCH = _dt.date(1970, 1, 1)
 _DEC_RE = re.compile(r"^DECIMAL\((\d+),(\d+)\)$")
 _CMP = {
     "COMPARE_GREATERTHAN": ">", "COMPARE_GREATERTHANOREQUALTO": ">=",
@@ -134,7 +137,50 @@ def _agg(e) -> Optional[Tuple[str, Optional[str]]]:
     return None
 
 
+def _temporal_const(e):
+    """CAST('yyyy-mm-dd' AS DATE) / CAST('yyyy-mm-dd hh:mm:ss[.f]' AS TIMESTAMP)
+    (how DATE '...' / TIMESTAMP '...' literals serialise) -> date | datetime,
+    else None. A literal that is not a plain date/time text declines."""
+    if e.get("class") != "CAST":
+        return None
+    ch = e.get("child") or {}
+    if ch.get("class") != "CONSTANT":
+        return None
+    v = ch.get("value") or {}
+    if v.get("is_null"):
+        raise Decline("shape", "NULL temporal constant")
+    if (v.get("type") or {}).get("id") != "VARCHAR":
+        return None
+    target = (e.get("cast_type") or {}).get("id")
+    text = str(v.get("value"))
+    try:
+        if target == "DATE":
+            return _dt.date.fromisoformat(text.strip())
+        if target == "TIMESTAMP":
+            t = text.strip().replace("T", " ")
+            if len(t) == 10:
+                return _dt.datetime.fromisoformat(t)
+            if t[-1] in "Zz" or "+" in t[10:] or t.count("-") > 2:
+                raise Decline("shape", "TIMESTAMP literal with a time zone")
+            return _dt.datetime.fromisoformat(t)
+    except ValueError:
+        raise Decline("shape", f"temporal constant '{text}' is not a plain literal")
+    return None
+
+
+def _temporal_int(x) -> int:
+    """The integer the resident lane holds: days since 1970-01-01 for a date,
+    microseconds since the epoch for a naive timestamp."""
+    if isinstance(x, _dt.datetime):
+        d = (x.date() - _EPOCH).days
+        return d * 86_400_000_000 + ((x.hour * 60 + x.minute) * 60 + x.second) * 1_000_000 + x.microsecond
+    return (x - _EPOCH).days
+
+
 def _const(e):
+    t = _temporal_const(e)
+    if t is not None:
+        return t
     if e.get("class") != "CONSTANT":
         return None
     v = e.get("value") or {}
@@ -393,17 +439,30 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
     kt = columns.get(plan.key)
     if kt is None:
         raise Decline("shape", f"unknown column {plan.key}")
-    if kt not in _KEY_TYPES:
+    if kt not in _KEY_TYPES and not (exact and kt in _TEMPORAL_TYPES):
         raise Decline("shape", f"key type {kt}")
     plan.key_type = kt
     for c in plan.pred_cols:
         pt = columns.get(c)
         if pt is None:
             raise Decline("shape", f"unknown column {c}")
-        if pt in _INT_TYPES or pt in ("DOUBLE", "FLOAT", "REAL") or decimal_scale(pt):
+        if pt in _INT_TYPES or pt in ("DOUBLE", "FLOAT", "REAL") or pt in _TEMPORAL_TYPES or decimal_scale(pt):
             plan.pred_types[c] = pt
         else:
             raise Decline("shape", f"WHERE column type {pt}")
+    # a temporal column only compares against a plain literal of its own type
+    for w in plan.where:
+        ct = plan.key_type if w.col == plan.key else plan.pred_types.get(w.col, columns.get(w.col, ""))
+        lits = w.lit if isinstance(w.lit, list) else ([] if w.lit is None else [w.lit])
+        for x in lits:
+            is_dt = isinstance(x, _dt.datetime)
+            is_d = isinstance(x, _dt.date) and not is_dt
+            if ct == "DATE" and not is_d:
+                raise Decline("shape", "DATE column against a non-DATE constant")
+            if ct == "TIMESTAMP" and not is_dt:
+                raise Decline("shape", "TIMESTAMP column against a non-TIMESTAMP constant")
+            if ct not in _TEMPORAL_TYPES and (is_d or is_dt):
+                raise Decline("shape", "temporal constant against a non-temporal column")
     if exact and plan.val is not None and any(o.kind == "avg" for o in plan.outputs) \
             and decimal_scale(columns.get(plan.val, "")):
         raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
@@ -493,12 +552,18 @@ def _where_program(plan: Plan) -> str:
         if w.op == "in":
             vals = []
             for x in w.lit:
+                if isinstance(x, _dt.date):
+                    vals.append(str(_temporal_int(x)))
+                    continue
                 t = x * (Decimal(10) ** scale)
                 if t == t.to_integral_value():
                     vals.append(str(int(t)))
             if not vals:
                 raise Decline("shape", "IN list with no representable value")
             terms.append(f"{lane} in ({', '.join(vals)})")
+            continue
+        if isinstance(w.lit, _dt.date):
+            terms.append(f"{lane} {'!=' if w.op == '<>' else w.op} {_temporal_int(w.lit)}")
             continue
         op, thr = _rescale_threshold(w.op, w.lit, scale)
         terms.append(f"{lane} {'!=' if op == '<>' else op} {thr}")
@@ -515,10 +580,18 @@ def where_sql(plan: Plan) -> str:
         elif w.op == "isnotnull":
             parts.append(f"{c} IS NOT NULL")
         elif w.op == "in":
-            parts.append(f"{c} IN ({', '.join(str(x) for x in w.lit)})")
+            parts.append(f"{c} IN ({', '.join(_lit_sql(x) for x in w.lit)})")
         else:
-            parts.append(f"{c} {w.op} {w.lit}")
+            parts.append(f"{c} {w.op} {_lit_sql(w.lit)}")
     return " AND ".join(parts) if parts else "TRUE"
+
+
+def _lit_sql(x) -> str:
+    if isinstance(x, _dt.datetime):
+        return f"TIMESTAMP '{x.isoformat(sep=' ')}'"
+    if isinstance(x, _dt.date):
+        return f"DATE '{x.isoformat()}'"
+    return str(x)
 
 
 def _native_type_of(plan: Plan, kind: str) -> str:
@@ -533,7 +606,12 @@ def _native_type_of(plan: Plan, kind: str) -> str:
 
 def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     """r.<col> typed exactly as native: DECIMAL(p, s) through the exact scaled
-    multiply (then CAST to DECIMAL(p, s) when p != 38)."""
+    multiply (then CAST to DECIMAL(p, s) when p != 38); DATE / TIMESTAMP keys
+    back from their day / microsecond image."""
+    if native_type.upper() == "DATE":
+        return f'(DATE \'1970-01-01\' + CAST(r."{col}" AS INTEGER))'
+    if native_type.upper() == "TIMESTAMP":
+        return f'make_timestamp(r."{col}")'
     d = decimal_scale(native_type)
     if d and d[1] > 0:
         p, s = d
@@ -651,7 +729,14 @@ def upload_sql(plan: Plan, fqn: str) -> str:
     uploaded as (v * 10^s)::BIGINT, which is exact because v * 10^s is an
     integral DECIMAL."""
     tag = plan.tag.replace("'", "''")
-    k = f'CAST("{plan.key}" AS BIGINT)'
+
+    def lane(col: str, t: str) -> str:
+        if t == "DATE":
+            return f'CAST("{col}" - DATE \'1970-01-01\' AS BIGINT)'
+        if t == "TIMESTAMP":
+            return f'epoch_us("{col}")'
+        return f'CAST("{col}" AS BIGINT)'
+    k = lane(plan.key, plan.key_type)
     if plan.exact:
         if plan.val is None:
             v = "CAST(NULL AS BIGINT)"
@@ -670,7 +755,7 @@ def upload_sql(plan: Plan, fqn: str) -> str:
                 pf.append(f'CAST("{c}" AS DOUBLE)')
             else:
                 d = decimal_scale(t)
-                pi.append(f'CAST("{c}" * {10 ** d[1]} AS BIGINT)' if d and d[1] else f'CAST("{c}" AS BIGINT)')
+                pi.append(f'CAST("{c}" * {10 ** d[1]} AS BIGINT)' if d and d[1] else lane(c, t))
         return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
                 f"[{', '.join(pf)}]::DOUBLE[]) FROM {fqn}")
     if plan.val is None:
