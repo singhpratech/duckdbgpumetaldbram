@@ -1733,7 +1733,10 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   compiled=cpu           → built without a GPU toolchain
 //   compiled=cpu,cuda      → CUDA backend present (nvcc at build time)
 //   compiled=cpu,metal     → Metal backend present (macOS build)
-void build_info_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
+//   exact=true|false       → the runtime backend runs the v0.7 exact GROUP BY
+//                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
+//                            device; the wrapper only rewrites when true
+void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
                      duckdb_vector output) {
     std::string info = "compiled=cpu";
 #if defined(GPUDB_HAVE_CUDA)
@@ -1748,6 +1751,7 @@ void build_info_exec(duckdb_function_info /*info*/, duckdb_data_chunk input,
         case gpudb::Backend::METAL: info += "metal"; break;
         default:                    info += "cpu";   break;
     }
+    info += ctx_of(info_).aggregator().exact_supported() ? " exact=true" : " exact=false";
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());

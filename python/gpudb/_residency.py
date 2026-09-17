@@ -58,7 +58,8 @@ class SetState:
 
     @property
     def pair(self) -> bool:
-        return "gpu_upload_pair(" in self.upload_sql
+        return ("gpu_upload_pair(" in self.upload_sql or "gpu_upload_pair_exact(" in self.upload_sql
+                or "gpu_upload_rows_exact(" in self.upload_sql)
 
     @property
     def segment_rows_default(self) -> int:

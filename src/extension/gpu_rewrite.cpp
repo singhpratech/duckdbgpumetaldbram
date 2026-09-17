@@ -43,6 +43,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -83,11 +84,15 @@ struct ColInfo {
 
 struct Output { std::string name, type; };
 
+struct PredCol { std::string name; ColInfo info; std::string lane; };   // lane: "i<n>" / "f<n>"
+
 struct Context {
     std::string tag;
     std::string catalog, schema, table;
     std::string key_col, val_col;          // from the tag's column list
     ColInfo key, val;
+    bool exact = false;                    // the set was uploaded by gpu_upload_rows_exact (v0.7 §4)
+    std::vector<PredCol> preds;            // tag columns after key/payload, in order (exact sets)
     std::string backend;
     std::int64_t rows = 0;
     bool ready = false;
@@ -129,6 +134,7 @@ Context parse_context(const json& c) {
     x.backend = c.value("backend", "");
     x.rows    = c.value("rows", std::int64_t{0});
     x.ready   = c.value("ready", false);
+    x.exact   = c.value("exact", false);
     x.default_order = c.value("default_order", "");
     if (c.contains("outputs") && c["outputs"].is_array()) {
         for (const auto& o : c["outputs"])
@@ -148,12 +154,19 @@ Context parse_context(const json& c) {
             pos = k + 1;
         }
         if (f.size() >= 7) {
-            const std::string& cols = f[6];
-            const std::size_t comma = cols.find(',');
-            x.key_col = cols.substr(0, comma);
-            if (comma != std::string::npos) x.val_col = cols.substr(comma + 1);
-            const std::size_t comma2 = x.val_col.find(',');
-            if (comma2 != std::string::npos) x.val_col = x.val_col.substr(0, comma2);
+            // "k[,v[,p1,p2,...]]" — an exact set's payload slot may be "-" (count-only shapes)
+            std::vector<std::string> cols;
+            const std::string& cl = f[6];
+            std::size_t p0 = 0;
+            while (true) {
+                const std::size_t k = cl.find(',', p0);
+                cols.push_back(cl.substr(p0, k == std::string::npos ? std::string::npos : k - p0));
+                if (k == std::string::npos) break;
+                p0 = k + 1;
+            }
+            if (!cols.empty()) x.key_col = cols[0];
+            if (cols.size() >= 2 && cols[1] != "-") x.val_col = cols[1];
+            for (std::size_t i = 2; i < cols.size(); ++i) x.preds.push_back(PredCol{cols[i], ColInfo{}, ""});
         }
     }
     // Column types: {"col": "TYPE"} or {"col": {"type": "TYPE", "scale": s}}.
@@ -172,6 +185,14 @@ Context parse_context(const json& c) {
     };
     x.key = col_info(x.key_col);
     x.val = col_info(x.val_col);
+    {
+        int ni = 0, nf = 0;
+        for (auto& pc : x.preds) {
+            pc.info = col_info(pc.name);
+            if (pc.info.floating) pc.lane = "f" + std::to_string(nf++);
+            else                  pc.lane = "i" + std::to_string(ni++);   // integer family and DECIMAL
+        }
+    }
     // Stats: {"col": {"has_null": b, "min": n, "max": n}}
     if (c.contains("stats") && c["stats"].is_object()) {
         x.have_stats = true;
@@ -414,6 +435,506 @@ struct Result {
     std::string reason, detail, form;
 };
 
+// ---------------------------------------------------------------------------
+// The exact path (v0.7 §4): sets from gpu_upload_rows_exact, functions
+// gpu_groupby_exact_resident[_where][_having|_topk], native NULL semantics,
+// HUGEINT sums, the full aggregate set and a WHERE program.
+// ---------------------------------------------------------------------------
+
+enum class XAgg { None, Sum, CountV, CountStar, Min, Max, Avg };
+
+const char* xagg_col(XAgg a) {
+    switch (a) {
+        case XAgg::Sum: return "sum";        case XAgg::CountV: return "count";
+        case XAgg::CountStar: return "count_star"; case XAgg::Min: return "min";
+        case XAgg::Max: return "max";        case XAgg::Avg: return "avg";
+        default: return "";
+    }
+}
+
+// The aggregate a FUNCTION node computes over the exact set, or None.
+XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::string& ta) {
+    if (sfield(e, "class") != "FUNCTION") return XAgg::None;
+    if (!is_null(e, "filter")) reject("shape", "FILTER on an aggregate");
+    if (field(e, "distinct").get<bool>()) reject("shape", "DISTINCT inside an aggregate");
+    const json& ob = field(e, "order_bys");
+    if (ob.is_object() && ob.contains("orders") && !ob["orders"].empty())
+        reject("shape", "ORDER BY inside an aggregate");
+    if (!sfield(e, "schema").empty() && !ieq(sfield(e, "schema"), "main")) reject("shape", "schema-qualified function");
+    const std::string fn = lower(sfield(e, "function_name"));
+    const json& ch = field(e, "children");
+    if (fn == "count_star") {
+        if (!ch.empty()) reject("shape", "count_star with arguments");
+        return XAgg::CountStar;
+    }
+    if (fn == "count" || fn == "sum" || fn == "min" || fn == "max" || fn == "avg") {
+        if (ch.size() != 1) reject("shape", fn + " with " + std::to_string(ch.size()) + " arguments");
+        const std::string col = column_ref(ch[0], t, ta);
+        if (col.empty()) reject("shape", fn + " over an expression");
+        if (cx.val_col.empty() || !ieq(col, cx.val_col))
+            reject("shape", cx.val_col.empty() ? fn + " over a set that holds only the key column"
+                                              : fn + " over a column that is not the resident payload");
+        if (fn == "count") return XAgg::CountV;
+        if (fn == "sum")   return XAgg::Sum;
+        if (fn == "min")   return XAgg::Min;
+        if (fn == "max")   return XAgg::Max;
+        return XAgg::Avg;
+    }
+    reject("shape", "aggregate " + fn + " is not on the transparent path yet");
+}
+
+// Native output type of an aggregate over this set (what DESCRIBE reports).
+std::string xagg_native_type(XAgg a, const Context& cx) {
+    switch (a) {
+        case XAgg::Sum:       return cx.val.decimal ? "DECIMAL(38," + std::to_string(cx.val.scale) + ")" : "HUGEINT";
+        case XAgg::CountV: case XAgg::CountStar: return "BIGINT";
+        case XAgg::Min: case XAgg::Max: return cx.val.type;
+        case XAgg::Avg:       return "DOUBLE";
+        default: return "";
+    }
+}
+
+// Output expression for a column of the exact function, typed exactly as
+// native: integers and HUGEINT by cast; DECIMAL(p, s) through the exact
+// scaled multiply, then CAST to DECIMAL(p, s) when p != 38.
+json j_output_exact(const std::string& col, const std::string& type, const std::string& name) {
+    ColInfo t = parse_type(type);
+    if (t.decimal && t.width != 38 && t.scale > 0) {
+        json inner = j_output(col, "DECIMAL(38," + std::to_string(t.scale) + ")", "");
+        return j_cast(std::move(inner), j_decimal_type(t.width, t.scale), name);
+    }
+    return j_output(col, type, name);
+}
+
+// A constant as an exact int64 at `scale`; ok = false when not representable
+// (a fractional constant against an integer / coarser DECIMAL column).
+std::int64_t const_exact_scaled(const json& e, int scale, bool& ok) {
+    ok = true;
+    if (sfield(e, "class") != "CONSTANT") reject("shape", "not a constant");
+    const json& v = field(e, "value");
+    if (field(v, "is_null").get<bool>()) reject("shape", "NULL constant");
+    const std::string id = sfield(field(v, "type"), "id");
+    const json& val = field(v, "value");
+    const std::int64_t m = pow10_i64(scale);
+    auto scale_up = [&](std::int64_t x) {
+        if (m != 1 && (x > std::numeric_limits<std::int64_t>::max() / m ||
+                       x < std::numeric_limits<std::int64_t>::min() / m))
+            reject("overflow", "constant does not fit int64 at the column's scale");
+        return x * m;
+    };
+    if (id == "INTEGER" || id == "BIGINT" || id == "SMALLINT" || id == "TINYINT" ||
+        id == "UINTEGER" || id == "USMALLINT" || id == "UTINYINT") {
+        if (!val.is_number_integer()) reject("shape", "non-integer constant payload");
+        return scale_up(val.get<std::int64_t>());
+    }
+    if (id == "DECIMAL") {
+        const json& ti = field(field(v, "type"), "type_info");
+        const int sc = ti.is_object() ? ti.value("scale", 0) : 0;
+        if (!val.is_number_integer()) reject("decimal", "DECIMAL constant wider than int64");
+        const std::int64_t u = val.get<std::int64_t>();
+        if (sc <= scale) {
+            const std::int64_t mm = pow10_i64(scale - sc);
+            if (mm != 1 && (u > std::numeric_limits<std::int64_t>::max() / mm ||
+                            u < std::numeric_limits<std::int64_t>::min() / mm))
+                reject("overflow", "constant does not fit int64 at the column's scale");
+            return u * mm;
+        }
+        const std::int64_t d = pow10_i64(sc - scale);
+        if (u % d != 0) { ok = false; return 0; }
+        return u / d;
+    }
+    if (id == "DOUBLE" || id == "FLOAT") {
+        if (!val.is_number()) reject("shape", "non-numeric floating constant");
+        const double x = val.get<double>() * std::pow(10.0, scale);
+        if (!std::isfinite(x) || std::fabs(x) >= 9007199254740992.0)
+            reject("shape", "floating constant outside the exact integer range");
+        if (x != std::floor(x)) { ok = false; return 0; }
+        return static_cast<std::int64_t>(x);
+    }
+    reject("shape", "constant of type " + id);
+}
+
+// A constant as the double DuckDB compares a DOUBLE column against.
+double const_as_double(const json& e) {
+    if (sfield(e, "class") != "CONSTANT") reject("shape", "not a constant");
+    const json& v = field(e, "value");
+    if (field(v, "is_null").get<bool>()) reject("shape", "NULL constant");
+    const std::string id = sfield(field(v, "type"), "id");
+    const json& val = field(v, "value");
+    if (id == "DOUBLE" || id == "FLOAT") { if (!val.is_number()) reject("shape", "non-numeric constant"); return val.get<double>(); }
+    if (id == "DECIMAL") {
+        const json& ti = field(field(v, "type"), "type_info");
+        const int sc = ti.is_object() ? ti.value("scale", 0) : 0;
+        if (!val.is_number_integer()) reject("decimal", "DECIMAL constant wider than int64");
+        return static_cast<double>(val.get<std::int64_t>()) / std::pow(10.0, sc);
+    }
+    if (val.is_number_integer()) return static_cast<double>(val.get<std::int64_t>());
+    reject("shape", "constant of type " + id);
+}
+
+std::string fmt_double(double d) {
+    if (std::isnan(d)) return "nan";
+    if (std::isinf(d)) return d > 0 ? "inf" : "-inf";
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "%.17g", d);
+    return buf;
+}
+
+// WHERE → the program of gpu_groupby_exact_resident_where: a conjunction of
+// <lane> <op> <const>, <lane> in (...), <lane> is [not] null over k, v and
+// the set's predicate lanes. Anything else declines the statement (shape).
+struct WhereOut { std::string program; };
+
+WhereOut where_program(const json& w, const Context& cx, const std::string& t, const std::string& ta) {
+    WhereOut out;
+    std::vector<std::string> terms;
+    // lane + column info for a COLUMN_REF, or reject
+    auto lane_of = [&](const json& e, ColInfo& info) -> std::string {
+        const std::string c = column_ref(e, t, ta);
+        if (c.empty()) reject("shape", "WHERE on an expression");
+        if (ieq(c, cx.key_col)) { info = cx.key; return "k"; }
+        if (!cx.val_col.empty() && ieq(c, cx.val_col)) { info = cx.val; return "v"; }
+        for (const auto& pc : cx.preds) if (ieq(c, pc.name)) { info = pc.info; return pc.lane; }
+        reject("shape", "WHERE column '" + c + "' is not in the resident set");
+    };
+    auto const_text = [&](const json& c, const ColInfo& info, int cmp, bool& drop_term, bool& always_false) -> std::string {
+        // cmp: 1 > 2 >= 3 < 4 <= 5 = 6 <>
+        drop_term = false; always_false = false;
+        if (info.floating) return fmt_double(const_as_double(c));
+        if (!info.integer && !info.decimal) reject("shape", "WHERE on a column of type " + info.type);
+        const int scale = info.decimal ? info.scale : 0;
+        if (cmp >= 1 && cmp <= 4) return std::to_string(threshold_of(c, scale, cmp).value);
+        bool ok = true;
+        const std::int64_t x = const_exact_scaled(c, scale, ok);
+        if (!ok) { if (cmp == 5) always_false = true; else drop_term = true; return ""; }   // = never true; <> always true
+        return std::to_string(x);
+    };
+    std::function<void(const json&)> walk = [&](const json& e) {
+        const std::string cls = sfield(e, "class");
+        const std::string ty  = sfield(e, "type");
+        if (cls == "CONJUNCTION") {
+            if (ty != "CONJUNCTION_AND") reject("shape", "OR in WHERE");
+            for (const json& ch : field(e, "children")) walk(ch);
+            return;
+        }
+        if (cls == "COMPARISON") {
+            const json* col = &field(e, "left");
+            const json* cst = &field(e, "right");
+            bool flip = false;
+            if (sfield(*col, "class") == "CONSTANT") { std::swap(col, cst); flip = true; }
+            int cmp = 0;
+            if      (ty == "COMPARE_GREATERTHAN")          cmp = flip ? 3 : 1;
+            else if (ty == "COMPARE_GREATERTHANOREQUALTO") cmp = flip ? 4 : 2;
+            else if (ty == "COMPARE_LESSTHAN")             cmp = flip ? 1 : 3;
+            else if (ty == "COMPARE_LESSTHANOREQUALTO")    cmp = flip ? 2 : 4;
+            else if (ty == "COMPARE_EQUAL")                cmp = 5;
+            else if (ty == "COMPARE_NOTEQUAL")             cmp = 6;
+            else reject("shape", "WHERE comparison " + ty);
+            ColInfo info;
+            const std::string lane = lane_of(*col, info);
+            bool drop = false, never = false;
+            const std::string c = const_text(*cst, info, cmp, drop, never);
+            if (never) reject("shape", "WHERE equality against a constant the column cannot hold");
+            if (drop) return;
+            static const char* ops[] = {"", ">", ">=", "<", "<=", "=", "!="};
+            terms.push_back(lane + " " + ops[cmp] + " " + c);
+            return;
+        }
+        if (cls == "OPERATOR" && (ty == "OPERATOR_IS_NULL" || ty == "OPERATOR_IS_NOT_NULL")) {
+            const json& ch = field(e, "children");
+            if (ch.size() != 1) reject("shape", "IS NULL arity");
+            ColInfo info;
+            terms.push_back(lane_of(ch[0], info) + (ty == "OPERATOR_IS_NULL" ? " is null" : " is not null"));
+            return;
+        }
+        if (cls == "OPERATOR" && ty == "COMPARE_IN") {
+            const json& ch = field(e, "children");
+            if (ch.size() < 2) reject("shape", "IN without values");
+            ColInfo info;
+            const std::string lane = lane_of(ch[0], info);
+            std::vector<std::string> vals;
+            for (std::size_t i = 1; i < ch.size(); ++i) {
+                if (sfield(ch[i], "class") != "CONSTANT") reject("shape", "IN over a non-constant");
+                const json& v = field(ch[i], "value");
+                if (field(v, "is_null").get<bool>()) continue;    // x IN (.., NULL) is never TRUE for that element
+                bool drop = false, never = false;
+                const std::string c = const_text(ch[i], info, 5, drop, never);
+                if (never) continue;                                // not representable: matches nothing
+                vals.push_back(c);
+            }
+            if (vals.empty()) reject("shape", "IN list with no representable value");
+            std::string term = lane + " in (";
+            for (std::size_t i = 0; i < vals.size(); ++i) term += (i ? ", " : "") + vals[i];
+            terms.push_back(term + ")");
+            return;
+        }
+        if (cls == "BETWEEN") {
+            if (ty != "COMPARE_BETWEEN") reject("shape", "WHERE " + ty);
+            ColInfo info;
+            const std::string lane = lane_of(field(e, "input"), info);
+            bool d1 = false, n1 = false, d2 = false, n2 = false;
+            const std::string lo = const_text(field(e, "lower"), info, 2, d1, n1);
+            const std::string hi = const_text(field(e, "upper"), info, 4, d2, n2);
+            terms.push_back(lane + " >= " + lo);
+            terms.push_back(lane + " <= " + hi);
+            return;
+        }
+        reject("shape", "WHERE expression of class " + cls);
+    };
+    walk(w);
+    for (std::size_t i = 0; i < terms.size(); ++i) out.program += (i ? "; " : "") + terms[i];
+    return out;
+}
+
+Result do_rewrite_exact(json tree, json node, const Context& cx,
+                        const std::string& tname, const std::string& talias) {
+    Result r;
+    // ---- column types (rule 2 gates) ----
+    const bool bare = cx.val_col.empty();
+    if (!cx.key.integer) reject(cx.key.floating ? "double" : "shape", "key type " + cx.key.type);
+    if (!bare) {
+        if (cx.val.floating) reject("double", "payload type " + cx.val.type);
+        if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
+        if (!cx.val.integer && !cx.val.decimal) reject("shape", "payload type '" + cx.val.type + "'");
+    }
+    const int scale = (!bare && cx.val.decimal) ? cx.val.scale : 0;
+
+    // ---- WHERE → program ----
+    WhereOut where;
+    if (!is_null(node, "where_clause")) where = where_program(node["where_clause"], cx, tname, talias);
+
+    // ---- select list ----
+    struct Item { bool key; XAgg agg; std::string alias; };
+    std::vector<Item> items;
+    const json& sel = field(node, "select_list");
+    if (!sel.is_array() || sel.empty()) reject("shape", "empty select list");
+    for (const json& e : sel) {
+        const std::string cls = sfield(e, "class");
+        if (cls == "STAR") reject("shape", "SELECT *");
+        if (cls == "WINDOW") reject("shape", "window function");
+        if (cls == "PARAMETER") reject("shape", "parameter");
+        const std::string alias = sfield(e, "alias");
+        if (cls == "COLUMN_REF") {
+            const std::string c = column_ref(e, tname, talias);
+            if (c.empty() || !ieq(c, cx.key_col)) reject("shape", "column that is not the GROUP BY key");
+            items.push_back({true, XAgg::None, alias});
+            continue;
+        }
+        const XAgg a = xagg_of(e, cx, tname, talias);
+        if (a == XAgg::None) reject("shape", "select-list expression of class " + cls);
+        if (a == XAgg::Avg && cx.val.decimal) reject("decimal", "avg over a DECIMAL payload is not on the exact path");
+        items.push_back({false, a, alias});
+    }
+    if (cx.outputs.size() != items.size()) reject("error", "context.outputs does not match the select list");
+
+    // ---- HAVING: one comparison; device form for sum/count/count_star/min/max
+    //      with > >= < <=; anything else (=, <>, avg) is exact on the host
+    //      over the small result ----
+    int cmp = 0;
+    XAgg having_agg = XAgg::None;
+    std::int64_t threshold = 0;
+    bool having_dev = false;
+    json host_pred;
+    if (!is_null(node, "having")) {
+        const json& h = node["having"];
+        if (sfield(h, "class") != "COMPARISON") reject("shape", "HAVING is not one comparison");
+        const std::string ct = sfield(h, "type");
+        bool flip = false;
+        const json* aggside = &field(h, "left");
+        const json* cside   = &field(h, "right");
+        if (sfield(*aggside, "class") == "CONSTANT") { std::swap(aggside, cside); flip = true; }
+        if      (ct == "COMPARE_GREATERTHAN")          cmp = flip ? 3 : 1;
+        else if (ct == "COMPARE_GREATERTHANOREQUALTO") cmp = flip ? 4 : 2;
+        else if (ct == "COMPARE_LESSTHAN")             cmp = flip ? 1 : 3;
+        else if (ct == "COMPARE_LESSTHANOREQUALTO")    cmp = flip ? 2 : 4;
+        else if (ct == "COMPARE_EQUAL")                cmp = 5;
+        else if (ct == "COMPARE_NOTEQUAL")             cmp = 6;
+        else reject("shape", "HAVING comparison " + ct);
+        having_agg = xagg_of(*aggside, cx, tname, talias);
+        if (having_agg == XAgg::None) reject("shape", "HAVING is not on an aggregate");
+        if (having_agg == XAgg::Avg && cx.val.decimal) reject("decimal", "HAVING avg over a DECIMAL payload");
+        if (sfield(*cside, "class") != "CONSTANT") reject("shape", "HAVING threshold is not a constant");
+        if (cmp <= 4 && having_agg != XAgg::Avg) {
+            const int tscale = (having_agg == XAgg::Sum || having_agg == XAgg::Min || having_agg == XAgg::Max) ? scale : 0;
+            threshold = threshold_of(*cside, tscale, cmp).value;
+            having_dev = true;
+        } else {
+            // native-typed aggregate expression <op> the user's constant, in the outer WHERE
+            static const char* types[] = {"", "COMPARE_GREATERTHAN", "COMPARE_GREATERTHANOREQUALTO",
+                                          "COMPARE_LESSTHAN", "COMPARE_LESSTHANOREQUALTO",
+                                          "COMPARE_EQUAL", "COMPARE_NOTEQUAL"};
+            json lhs = j_output_exact(xagg_col(having_agg), xagg_native_type(having_agg, cx), "");
+            host_pred = json{{"class", "COMPARISON"}, {"type", types[cmp]}, {"alias", ""},
+                             {"query_location", kNoLocation}, {"left", lhs}, {"right", *cside}};
+        }
+    }
+
+    // ---- modifiers: ORDER BY / LIMIT kept; top-k pushed when possible ----
+    const json& mods = field(node, "modifiers");
+    const json* order_mod = nullptr;
+    const json* limit_mod = nullptr;
+    for (const json& m : mods) {
+        const std::string mt = sfield(m, "type");
+        if      (mt == "ORDER_MODIFIER" && !order_mod) order_mod = &m;
+        else if (mt == "LIMIT_MODIFIER" && !limit_mod) limit_mod = &m;
+        else reject("shape", "modifier " + mt);
+    }
+    auto output_name_for_key = [&]() -> std::string {
+        for (std::size_t i = 0; i < items.size(); ++i) if (items[i].key) return cx.outputs[i].name;
+        return "";
+    };
+    auto output_name_for_agg = [&](XAgg a) -> std::string {
+        for (std::size_t i = 0; i < items.size(); ++i) if (!items[i].key && items[i].agg == a) return cx.outputs[i].name;
+        return "";
+    };
+    XAgg order_agg = XAgg::None;   // the aggregate a single ORDER BY names (for the top-k push)
+    auto remap = [&](const json& e) -> json {
+        const std::string cls = sfield(e, "class");
+        if (cls == "COLUMN_REF") {
+            const json& names = field(e, "column_names");
+            if (names.size() == 1) {
+                const std::string n = names[0].get<std::string>();
+                for (std::size_t i = 0; i < items.size(); ++i)
+                    if (ieq(n, cx.outputs[i].name) || (!items[i].alias.empty() && ieq(n, items[i].alias))) {
+                        if (!items[i].key) order_agg = items[i].agg;
+                        return j_colref(cx.outputs[i].name);
+                    }
+            }
+            const std::string c = column_ref(e, tname, talias);
+            if (!c.empty() && ieq(c, cx.key_col)) {
+                const std::string on = output_name_for_key();
+                if (on.empty()) reject("shape", "ORDER BY the key when the key is not selected");
+                return j_colref(on);
+            }
+            reject("shape", "ORDER BY an expression the rewrite cannot map");
+        }
+        if (cls == "FUNCTION") {
+            const XAgg a = xagg_of(e, cx, tname, talias);
+            const std::string on = output_name_for_agg(a);
+            if (on.empty()) reject("shape", "ORDER BY an aggregate that is not selected");
+            order_agg = a;
+            return j_colref(on);
+        }
+        if (cls == "CONSTANT") {
+            const json& v = field(e, "value");
+            if (!v.contains("value") || !v["value"].is_number_integer()) reject("shape", "non-integer ordinal ORDER BY");
+            const std::int64_t i = v["value"].get<std::int64_t>();
+            if (i < 1 || static_cast<std::size_t>(i) > items.size()) reject("shape", "ordinal ORDER BY out of range");
+            if (!items[static_cast<std::size_t>(i - 1)].key) order_agg = items[static_cast<std::size_t>(i - 1)].agg;
+            return j_colref(cx.outputs[static_cast<std::size_t>(i - 1)].name);
+        }
+        reject("shape", "ORDER BY expression of class " + cls);
+    };
+
+    std::int64_t topk = 0;
+    bool topk_desc = false;
+    json new_mods = json::array();
+    if (order_mod) {
+        json om = *order_mod;
+        json& orders = om["orders"];
+        if (!orders.is_array() || orders.empty()) reject("shape", "empty ORDER BY");
+        for (json& o : orders) { order_agg = XAgg::None; o["expression"] = remap(o["expression"]); }
+        if (orders.size() == 1 && limit_mod && having_agg == XAgg::None &&
+            order_agg != XAgg::None && order_agg != XAgg::Avg) {
+            const json& o = orders[0];
+            const json& lim = field(*limit_mod, "limit");
+            const bool off_null = is_null(*limit_mod, "offset");
+            std::string dir = sfield(o, "type");
+            if (dir == "ORDER_DEFAULT") dir = ieq(cx.default_order, "DESC") ? "DESCENDING" :
+                                              ieq(cx.default_order, "ASC")  ? "ASCENDING" : "";
+            if (off_null && !dir.empty() && sfield(lim, "class") == "CONSTANT") {
+                const json& lv = field(lim, "value");
+                if (!field(lv, "is_null").get<bool>() && lv["value"].is_number_integer()) {
+                    const std::int64_t k = lv["value"].get<std::int64_t>();
+                    if (k > 0) { topk = k; topk_desc = dir == "DESCENDING"; }
+                }
+            }
+        }
+        new_mods.push_back(om);
+    }
+    if (limit_mod) new_mods.push_back(*limit_mod);
+
+    // ---- residency / thresholds (exactness needs no stats gate) ----
+    if (ieq(cx.backend, "CPU") || cx.backend.empty()) reject("backend", "backend " + cx.backend);
+    if (cx.rows < cx.min_rows) reject("threshold", std::to_string(cx.rows) + " rows below the floor");
+    if (!cx.ready) reject("not_resident", "set is not ready");
+
+    // ---- build the replacement ----
+    std::string fn = "gpu_groupby_exact_resident";
+    json args = json::array({j_const_varchar(cx.tag)});
+    if (!where.program.empty()) { fn += "_where"; args.push_back(j_const_varchar(where.program)); }
+    if (having_dev) {
+        fn += "_having";
+        static const char* ops[] = {"", ">", ">=", "<", "<="};
+        args.push_back(j_const_varchar(xagg_col(having_agg)));
+        args.push_back(j_const_varchar(ops[cmp]));
+        args.push_back(j_const_bigint(threshold));
+        r.form = "having";
+    } else if (having_agg != XAgg::None) {
+        r.form = "having";
+    } else if (topk > 0) {
+        fn += "_topk";
+        args.push_back(j_const_varchar(xagg_col(order_agg)));
+        args.push_back(j_const_bigint(topk));
+        args.push_back(j_const_varchar(topk_desc ? "desc" : "asc"));
+        r.form = "topk";
+    } else {
+        r.form = "plain";
+    }
+
+    json tf = json{{"type", "TABLE_FUNCTION"}, {"alias", "r"}, {"sample", nullptr},
+                   {"query_location", kNoLocation}, {"function", j_function(fn, args)},
+                   {"column_name_alias", json::array()}, {"with_ordinality", "WITHOUT_ORDINALITY"}};
+    json guard_select = json{{"type", "SELECT_NODE"}, {"modifiers", json::array()},
+                             {"cte_map", json{{"map", json::array()}}},
+                             {"select_list", json::array({j_function("gpu_assert_rows",
+                                 json::array({j_const_varchar(cx.tag), j_function("count_star", json::array())}),
+                                 false, "ok")})},
+                             {"from_table", json{{"type", "BASE_TABLE"}, {"alias", ""}, {"sample", nullptr},
+                                 {"query_location", kNoLocation}, {"schema_name", cx.schema},
+                                 {"table_name", cx.table}, {"column_name_alias", json::array()},
+                                 {"catalog_name", cx.catalog}, {"at_clause", nullptr}}},
+                             {"where_clause", nullptr}, {"group_expressions", json::array()},
+                             {"group_sets", json::array()}, {"aggregate_handling", "STANDARD_HANDLING"},
+                             {"having", nullptr}, {"sample", nullptr}, {"qualify", nullptr}};
+    json guard = json{{"type", "SUBQUERY"}, {"alias", "gd"}, {"sample", nullptr},
+                      {"query_location", kNoLocation},
+                      {"subquery", json{{"node", guard_select}, {"named_param_map", json::array()}}},
+                      {"column_name_alias", json::array()}};
+    json new_from = json{{"type", "JOIN"}, {"alias", ""}, {"sample", nullptr},
+                         {"query_location", kNoLocation}, {"left", tf}, {"right", guard},
+                         {"condition", nullptr}, {"join_type", "INNER"}, {"ref_type", "CROSS"},
+                         {"using_columns", json::array()}, {"delim_flipped", false},
+                         {"duplicate_eliminated_columns", json::array()}};
+
+    json new_select = json::array();
+    for (std::size_t i = 0; i < items.size(); ++i) {
+        const Output& o = cx.outputs[i];
+        if (items[i].key) new_select.push_back(j_output_exact("key", o.type, o.name));
+        else              new_select.push_back(j_output_exact(xagg_col(items[i].agg), o.type, o.name));
+    }
+
+    node["select_list"] = new_select;
+    node["from_table"] = new_from;
+    if (!host_pred.is_null()) {
+        node["where_clause"] = json{{"class", "CONJUNCTION"}, {"type", "CONJUNCTION_AND"}, {"alias", ""},
+                                    {"query_location", kNoLocation},
+                                    {"children", json::array({j_colref2("gd", "ok"), host_pred})}};
+    } else {
+        node["where_clause"] = j_colref2("gd", "ok");
+    }
+    node["group_expressions"] = json::array();
+    node["group_sets"] = json::array();
+    node["having"] = nullptr;
+    node["modifiers"] = new_mods;
+    tree["statements"][0]["node"] = node;
+    r.tree = std::move(tree);
+    r.rewritten = true;
+    r.reason = "rewritten";
+    return r;
+}
+
+
 Result do_rewrite(json tree, const json& ctxj) {
     Result r;
     if (!tree.is_object()) reject("error", "tree is not a JSON object");
@@ -433,7 +954,6 @@ Result do_rewrite(json tree, const json& ctxj) {
     if (sfield(node, "aggregate_handling") != "STANDARD_HANDLING") reject("shape", "GROUP BY ALL");
     const json& cte = field(node, "cte_map");
     if (cte.is_object() && cte.contains("map") && !cte["map"].empty()) reject("shape", "CTE in scope");
-    if (!is_null(node, "where_clause")) reject("shape", "WHERE (predicate mask is a later milestone)");
 
     const json& from = field(node, "from_table");
     if (sfield(from, "type") != "BASE_TABLE") reject("shape", "FROM is not one base table");
@@ -455,6 +975,9 @@ Result do_rewrite(json tree, const json& ctxj) {
     if (sfield(gexp[0], "class") == "CONSTANT") reject("shape", "ordinal GROUP BY");
     const std::string gcol = column_ref(gexp[0], tname, talias);
     if (gcol.empty() || !ieq(gcol, cx.key_col)) reject("shape", "GROUP BY key is not the resident key");
+
+    if (cx.exact) return do_rewrite_exact(std::move(tree), std::move(node), cx, tname, talias);
+    if (!is_null(node, "where_clause")) reject("shape", "WHERE needs an exact set (gpu_upload_rows_exact)");
 
     // ---- column types (rule 2 gates) ----
     // A one-column tag (columns == [key]) is a bare key set: count-only

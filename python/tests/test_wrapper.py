@@ -74,8 +74,22 @@ def run():
         "decimal_having_le": "SELECT k, sum(d) AS s FROM t GROUP BY k HAVING sum(d) <= 1466.505 ORDER BY k",
         "sum_no_key": "SELECT sum(v) FROM t GROUP BY k ORDER BY 1",
         "order_key_desc": "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k DESC LIMIT 3",
+        # v0.7 exact path: NULLs, the full aggregate set, WHERE
+        "nulls":      "SELECT k, sum(v), count(v), count(*) FROM tn GROUP BY k ORDER BY k",
+        "min_max_avg": "SELECT k, min(v), max(v), avg(v), count(*) FROM t GROUP BY k ORDER BY k",
+        "where_int":  "SELECT k, sum(v) FROM t WHERE v > 3 GROUP BY k ORDER BY k",
+        "where_mixed": "SELECT k, sum(v), count(*) FROM t WHERE x <= 1000.5 AND v IN (1, 2, 3, 40) AND k BETWEEN 10 AND 900 GROUP BY k ORDER BY k",
+        "where_having": "SELECT k, sum(v) AS s FROM t WHERE x > 250 GROUP BY k HAVING sum(v) > 1000 ORDER BY k",
+        "where_topk": "SELECT k, count(*) AS c FROM t WHERE v <> 7 GROUP BY k ORDER BY c DESC, k LIMIT 5",
+        "having_eq":  "SELECT k, sum(v) FROM t GROUP BY k HAVING count(*) = 300 ORDER BY k",
+        "having_avg": "SELECT k, sum(v) FROM t GROUP BY k HAVING avg(v) > 47.9 ORDER BY k",
+        "decimal_minmax": "SELECT k, min(d), max(d), sum(d) FROM t WHERE d > 1.25 GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
     }
+    if not con._exact:
+        for name in ("nulls", "min_max_avg", "where_int", "where_mixed", "where_having", "where_topk",
+                     "having_eq", "having_avg", "decimal_minmax"):
+            cases.pop(name)
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
         lr = con.last_rewrite()
@@ -124,14 +138,19 @@ def run():
         "rollup":       ("SELECT k, sum(v) FROM t GROUP BY ROLLUP(k)", "shape"),
         "filter":       ("SELECT k, sum(v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
         "distinct":     ("SELECT k, sum(DISTINCT v) FROM t GROUP BY k", "shape"),
-        "where":        ("SELECT k, sum(v) FROM t WHERE v > 3 GROUP BY k", "shape"),
+        "where_or":     ("SELECT k, sum(v) FROM t WHERE v > 3 OR v < 1 GROUP BY k", "shape"),
+        "where_fn":     ("SELECT k, sum(v) FROM t WHERE abs(v) > 3 GROUP BY k", "shape"),
         "double":       ("SELECT k, sum(x) FROM t GROUP BY k", "double"),
-        "nulls":        ("SELECT k, sum(v) FROM tn GROUP BY k", "nulls"),
-        "min":          ("SELECT k, min(v) FROM t GROUP BY k", "shape"),
+        "avg_decimal":  ("SELECT k, avg(d) FROM t GROUP BY k", "decimal"),
         "cte_shadow":   ("WITH t AS (SELECT 1 k, 1 v) SELECT k, sum(v) FROM t GROUP BY k", "shape"),
         "two_tables":   ("SELECT a.k, sum(a.v) FROM t a JOIN t b USING (k) GROUP BY a.k", "shape"),
         "no_group":     ("SELECT sum(v) FROM t", "shape"),
     }
+    if not con._exact:
+        rej.pop("where_or"); rej.pop("where_fn"); rej.pop("avg_decimal")
+        rej["where"] = ("SELECT k, sum(v) FROM t WHERE v > 3 GROUP BY k", "shape")
+        rej["nulls"] = ("SELECT k, sum(v) FROM tn GROUP BY k", "nulls")
+        rej["min"] = ("SELECT k, min(v) FROM t GROUP BY k", "shape")
     for name, (sql, reason) in rej.items():
         nat, _ = native(sql)
         got = con.execute(sql).fetchall()
