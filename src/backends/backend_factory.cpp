@@ -58,6 +58,17 @@ TopKResult Aggregator::topk_resident(const ResidentColumn&, std::size_t, bool) {
     throw std::runtime_error("topk_resident: not implemented on this backend");
 }
 
+// v0.7 milestone 3 exact path: same opt-in rule (CPU is the reference).
+Aggregator::ResidentPair Aggregator::upload_pair_exact(const KvSpan*, std::size_t, Dtype) {
+    throw std::runtime_error("upload_pair_exact: not implemented on this backend");
+}
+
+GroupByResidentResult Aggregator::groupby_exact_resident(const ResidentColumn&,
+                                                         const ResidentColumn*,
+                                                         std::size_t, const GroupByFilter&) {
+    throw std::runtime_error("groupby_exact_resident: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

@@ -25,6 +25,9 @@ query many times, no output materialised beyond the groups themselves.
 | `gpu_groupby_count_resident(name)` | `(key BIGINT, count BIGINT)` | `name` may be a pair (uses `name.k`) or a bare `gpu_upload` column |
 | `gpu_topk_resident(name, k, 'asc'\|'desc')` | `(idx BIGINT, value BIGINT)` | ranks the payload of a pair, or a bare BIGINT column; `idx` = upload-order index |
 | `gpu_topk_resident_f64(name, k, 'asc'\|'desc')` | `(idx BIGINT, value DOUBLE)` | same over a DOUBLE payload / column |
+| `gpu_groupby_exact_resident(name)` | `(key BIGINT, sum HUGEINT, count BIGINT, count_star BIGINT, min BIGINT, max BIGINT, avg DOUBLE)` | v0.7 exact path over a `gpu_upload_pair_exact` set: native NULL semantics, 128-bit sum, `count` = `count(v)`, `avg` = exact sum / count |
+| `gpu_groupby_exact_resident_having(name, agg, cmp, threshold)` | same | `agg` ∈ `'sum'`, `'count'`, `'count_star'`, `'min'`, `'max'`; NULL aggregates never pass |
+| `gpu_groupby_exact_resident_topk(name, agg, k, 'asc'\|'desc')` | same | k groups by `agg`; NULL aggregates rank last in both directions |
 
 Rows come out **sorted by key ascending** on every backend; top-k rows come
 out in the requested order. **NULLs:** resident columns carry none —
@@ -32,7 +35,15 @@ out in the requested order. **NULLs:** resident columns carry none —
 `gpu_groupby_sum_resident('p')` equals native
 `SELECT k, sum(v), count(v) FROM t WHERE k IS NOT NULL AND v IS NOT NULL GROUP BY k`:
 no NULL-key group, `count` is `COUNT(payload)` rather than `COUNT(*)`, and
-top-k never returns a NULL row (KNOWN_ISSUES.md states this). `gpu_last_stats()` reports the backend, dispatch
+top-k never returns a NULL row (KNOWN_ISSUES.md states this). The v0.7
+exact path lifts this: `gpu_upload_pair_exact` partitions NULL-key rows to a
+suffix of both columns and keeps NULL payloads under a validity bitmap
+(`ResidentColumn::null_count()`), and `gpu_groupby_exact_resident` returns the
+full native tuple — NULL-key group last, `count_star` counting NULL payloads,
+NULL `sum`/`min`/`max`/`avg` for an all-NULL group, and a two-limb 128-bit
+sum emitted as HUGEINT (docs/TRANSPARENT_DESIGN.md §4.1–4.2; the CPU backend
+is the executable reference, `Sum128` in gpu_backend.hpp fixes the limb
+arithmetic every backend must match). `gpu_last_stats()` reports the backend, dispatch
 reason, `rows_in`, `groups`, and the wall / kernel / transfer split for the
 last call, as for the other resident ops. Group count is capped at `GPUDB_GROUPBY_ROWS_MAX_M`
 million (default 100) with a clean error naming the actual count — checked

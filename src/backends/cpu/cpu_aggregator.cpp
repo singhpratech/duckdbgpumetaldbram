@@ -60,9 +60,22 @@ public:
         buf_.assign(static_cast<const std::byte*>(src),
                     static_cast<const std::byte*>(src) + n * elem);
     }
+    // §4.1 exact-path column: `valid` is a DuckDB-layout bitmap over the n
+    // rows (nullptr = all valid). For a key column the NULL rows are the
+    // suffix by construction; for a payload column they sit anywhere.
+    CpuResidentColumn(std::vector<std::int64_t>&& data, std::vector<std::uint64_t>&& valid,
+                      std::size_t null_count)
+        : rows_(data.size()), dtype_(Dtype::I64), valid_(std::move(valid)), nulls_(null_count) {
+        buf_.resize(rows_ * sizeof(std::int64_t));
+        if (rows_) std::memcpy(buf_.data(), data.data(), buf_.size());
+    }
     Backend     backend_tag() const noexcept override { return Backend::CPU; }
     Dtype       dtype()       const noexcept override { return dtype_; }
     std::size_t rows()        const noexcept override { return rows_; }
+    std::size_t null_count()  const noexcept override { return nulls_; }
+    std::size_t resident_bytes() const noexcept override {
+        return rows_ * 8 + valid_.size() * sizeof(std::uint64_t);
+    }
 
     [[nodiscard]] const std::int64_t* as_i64() const {
         return reinterpret_cast<const std::int64_t*>(buf_.data());
@@ -70,11 +83,17 @@ public:
     [[nodiscard]] const double* as_f64() const {
         return reinterpret_cast<const double*>(buf_.data());
     }
+    // Row i valid? (no bitmap = every row valid)
+    [[nodiscard]] bool valid(std::size_t i) const noexcept {
+        return valid_.empty() || ((valid_[i >> 6] >> (i & 63)) & 1u);
+    }
 
 private:
     std::vector<std::byte> buf_;
     std::size_t rows_;
     Dtype       dtype_;
+    std::vector<std::uint64_t> valid_;   // empty = no NULLs
+    std::size_t nulls_ = 0;
 };
 
 class CpuAggregator final : public Aggregator {
@@ -426,6 +445,117 @@ public:
         return r;
     }
 
+    // ---- v0.7 milestone 3: exact path (§4.1 / §4.2) — the executable reference ----
+    // Partition: valid-key rows first in input order, NULL-key rows as the
+    // suffix; NULL payloads stay in place under a validity bitmap.
+    ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
+                                   Dtype vdt) override {
+        if (vdt != Dtype::I64)
+            throw std::runtime_error(
+                "upload_pair_exact: DOUBLE payloads are not on the exact path (docs/TRANSPARENT_DESIGN.md §4.7)");
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        auto bit = [](const std::uint64_t* m, std::size_t i) {
+            return !m || ((m[i >> 6] >> (i & 63)) & 1u);
+        };
+        std::vector<std::int64_t> k(rows), v(rows);
+        std::vector<std::uint64_t> vvalid((rows + 63) / 64, 0);
+        std::size_t head = 0, null_keys = 0, null_vals = 0;
+        for (std::size_t s = 0; s < n_spans; ++s)
+            for (std::size_t j = 0; j < spans[s].rows; ++j)
+                null_keys += !bit(spans[s].key_valid, j);
+        std::size_t tail = rows - null_keys;          // suffix write cursor
+        bool any_null_val = false;
+        for (std::size_t s = 0; s < n_spans; ++s) {
+            const KvSpan& sp = spans[s];
+            for (std::size_t j = 0; j < sp.rows; ++j) {
+                const bool kv_ok = bit(sp.key_valid, j);
+                const bool vv_ok = bit(sp.val_valid, j);
+                const std::size_t dst = kv_ok ? head++ : tail++;
+                k[dst] = kv_ok ? sp.kv[2 * j] : 0;
+                v[dst] = vv_ok ? sp.kv[2 * j + 1] : 0;
+                if (vv_ok) vvalid[dst >> 6] |= std::uint64_t{1} << (dst & 63);
+                else { ++null_vals; any_null_val = true; }
+            }
+        }
+        if (!any_null_val) vvalid.clear();            // no bitmap when NULL-free
+        ResidentPair out;
+        out.keys = std::make_unique<CpuResidentColumn>(std::move(k), std::vector<std::uint64_t>{}, null_keys);
+        out.vals = std::make_unique<CpuResidentColumn>(std::move(v), std::move(vvalid), null_vals);
+        return out;
+    }
+
+    GroupByResidentResult groupby_exact_resident(const ResidentColumn& keys,
+                                                 const ResidentColumn* vals,
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64_nullable(keys);
+        const CpuResidentColumn* v = vals ? &check_i64_nullable(*vals) : nullptr;
+        if (v && v->rows() != k.rows())
+            throw std::runtime_error("groupby_exact_resident: keys and vals row counts differ");
+        GroupByResidentResult r{};
+        r.rows_in = k.rows();
+        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        const std::size_t n = k.rows();
+        const std::size_t n_valid = n - k.null_count();     // valid-key prefix
+        // Sort the prefix's row indices by key (stable: input order within a
+        // group is irrelevant to every aggregate here, but keep it anyway).
+        std::vector<std::size_t> idx;
+        idx.resize(n_valid);
+        for (std::size_t i = 0; i < n_valid; ++i) idx[i] = i;
+        const std::int64_t* kd = k.as_i64();
+        std::stable_sort(idx.begin(), idx.end(),
+                         [kd](std::size_t a, std::size_t b) { return kd[a] < kd[b]; });
+
+        std::size_t groups = 0;
+        for (std::size_t i = 0; i < n_valid; ++i)
+            groups += (i == 0 || kd[idx[i]] != kd[idx[i - 1]]);
+        if (k.null_count()) ++groups;
+        if (!filter.active()) check_group_cap(groups, max_groups, "groupby_exact_resident");
+
+        auto emit = [&](std::int64_t key, bool key_is_null, std::size_t b, std::size_t e,
+                        bool via_idx) {
+            Sum128 s; std::int64_t cnt_v = 0;
+            std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+            std::int64_t mx = std::numeric_limits<std::int64_t>::min();
+            if (v) {
+                const std::int64_t* vd = v->as_i64();
+                for (std::size_t i = b; i < e; ++i) {
+                    const std::size_t row = via_idx ? idx[i] : i;
+                    if (!v->valid(row)) continue;
+                    const std::int64_t x = vd[row];
+                    s.add(x); ++cnt_v;
+                    if (x < mn) mn = x;
+                    if (x > mx) mx = x;
+                }
+            } else {
+                cnt_v = static_cast<std::int64_t>(e - b);
+            }
+            r.keys.push_back(key);
+            r.key_null.push_back(key_is_null ? 1 : 0);
+            r.sums.push_back(static_cast<std::int64_t>(s.lo));
+            r.sums_hi.push_back(s.hi);
+            r.counts.push_back(cnt_v);
+            r.counts_star.push_back(static_cast<std::int64_t>(e - b));
+            r.mins.push_back(cnt_v ? mn : 0);
+            r.maxs.push_back(cnt_v ? mx : 0);
+        };
+        std::size_t i = 0;
+        while (i < n_valid) {
+            const std::int64_t key = kd[idx[i]];
+            std::size_t j = i + 1;
+            while (j < n_valid && kd[idx[j]] == key) ++j;
+            emit(key, false, i, j, /*via_idx*/true);
+            i = j;
+        }
+        if (k.null_count()) emit(0, true, n_valid, n, /*via_idx*/false);
+        apply_group_filter_host(r, filter, FilterAgg::Exact, max_groups, "groupby_exact_resident");
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
     TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
                              bool descending) override {
         const auto t0 = std::chrono::steady_clock::now();
@@ -623,7 +753,18 @@ private:
         return r;
     }
 
+    // Legacy ops have no NULL semantics: refuse a column that carries NULLs
+    // (only upload_pair_exact produces one) instead of reading NULL rows as
+    // data. groupby_exact_resident uses check_i64_nullable.
     static const CpuResidentColumn& check_i64(const ResidentColumn& c) {
+        const auto& r = check_i64_nullable(c);
+        if (r.null_count() != 0)
+            throw std::runtime_error(
+                "ResidentColumn carries NULL rows (uploaded by gpu_upload_pair_exact) — "
+                "only the exact GROUP BY (gpu_groupby_exact_resident) accepts it");
+        return r;
+    }
+    static const CpuResidentColumn& check_i64_nullable(const ResidentColumn& c) {
         if (c.backend_tag() != Backend::CPU)
             throw std::runtime_error("ResidentColumn from wrong backend");
         if (c.dtype() != Dtype::I64)
