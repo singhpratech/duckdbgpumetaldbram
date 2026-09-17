@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _exprs, _join, _resolve, _rewrite, _thresholds
+from . import _classify, _exprs, _join, _resolve, _rewrite, _split, _thresholds
 from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -46,6 +46,14 @@ class Decision:
     # computed lanes (§4.10) that embed a literal: the normalised template does
     # not identify the statement, so each literal tuple gets its own decision
     literal_sensitive: bool = False
+    # expressions over aggregates (§4.11): the rewritten INNER group by is
+    # spliced into this outer statement text at the placeholder
+    wrap: Optional[Tuple[str, str]] = None
+    # measured rule 1 (§9.1): this statement's own native time, seen while it
+    # was not resident yet, against its first rewritten runs
+    native_ms: Optional[float] = None
+    rewritten_ms: List[float] = field(default_factory=list)
+    timing_checked: bool = False
     variants: Dict[Tuple[str, ...], "Decision"] = field(default_factory=dict)
 
 
@@ -238,12 +246,38 @@ class Connection:
             self._manager.statement_end()
         return self
 
+    def _note_timing(self, ms: float) -> None:
+        """Rule 1, measured: the thresholds PREDICT the win. When this
+        session has also seen the statement run native (it did, every time
+        before its set became resident), compare: if the best of the first
+        three rewritten runs is not faster than the best native run, the
+        template runs native from now on (reason 'threshold')."""
+        d = getattr(self, "_timing_decision", None)
+        if d is None or d.timing_checked or not getattr(self, "_thresholds", True) or self._last.fallback:
+            return
+        if not self._last.rewritten:
+            if self._last.reason == "not_resident":
+                d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
+            return
+        d.rewritten_ms.append(ms)
+        if d.native_ms is None or len(d.rewritten_ms) < 3:
+            return
+        d.timing_checked = True
+        best = min(d.rewritten_ms)
+        if best >= d.native_ms:
+            self._log(f"threshold: measured {best:.2f} ms rewritten vs {d.native_ms:.2f} ms native — "
+                      f"template declined from now on")
+            d.rewritten = False
+            d.reason = "threshold"
+
     def execute(self, query, parameters=None):
         sql = self._route(query, parameters)
         self._manager.statement_begin()
         try:
             try:
+                t0 = time.perf_counter()
                 self._raw.execute(sql, parameters)
+                self._note_timing((time.perf_counter() - t0) * 1000.0)
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
@@ -382,6 +416,7 @@ class Connection:
     def _route(self, query: Any, parameters) -> Any:
         """Return the SQL to run in place of `query`."""
         self._last = LastRewrite(statement=query if isinstance(query, str) else "")
+        self._timing_decision = None
         if not isinstance(query, str):
             self._last.reason = "shape"
             return query
@@ -467,6 +502,7 @@ class Connection:
         if not d.rewritten:
             self._last.reason = d.reason
             return None
+        self._timing_decision = d
         self._last.form = d.form
         self._last.tag = d.tag
         self._last_decision = d
@@ -502,6 +538,8 @@ class Connection:
                     return None
             out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
             self._last.engine = "python"
+        if d.wrap is not None:
+            out = d.wrap[0] + out + d.wrap[1]
         self._last.rewritten = True
         self._last.sql = out
         return out
@@ -694,10 +732,41 @@ class Connection:
             plan.form = cached.form
         return plan
 
-    def _decide(self, sql: str) -> Decision:
+    def _decide_split(self, sql: str) -> Optional[Decision]:
+        """§4.11: answer the GROUP BY on the device and let DuckDB evaluate
+        the expressions over its aggregates (and a compound HAVING) on top."""
+        try:
+            names = [r[0] for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+            tmpl = json.loads(self._serialize(f"SELECT 1 FROM {_split.PLACEHOLDER}"))
+            parts = _split.split(self._serialize(sql), names, tmpl)
+            if parts is None:
+                return None
+            inner_sql, outer_sql = (self._raw.execute("SELECT json_deserialize_sql(?)", [x]).fetchone()[0]
+                                    for x in parts)
+        except Exception as e:
+            self._log(f"split failed: {e}")
+            return None
+        if outer_sql.count(_split.PLACEHOLDER) != 1:
+            return None
+        d = self._decide(inner_sql, allow_split=False)
+        if not d.rewritten:
+            self._log(f"split: the inner GROUP BY declined ({d.reason})")
+            return Decision(False, d.reason)
+        head, tail = outer_sql.split(_split.PLACEHOLDER)
+        d.wrap = (head + "(", ") AS gpudb_q" + tail)
+        d.literal_sensitive = True          # the outer text carries this statement's literals
+        if d.form == "plain":
+            d.form = "projected"
+        return d
+
+    def _decide(self, sql: str, allow_split: bool = True) -> Decision:
         try:
             plan, low, computed = self._match(sql)
         except _rewrite.Decline as e:
+            if allow_split and getattr(self, "_exact", False) and e.reason == "shape":
+                d = self._decide_split(sql)
+                if d is not None:
+                    return d
             if e.detail:
                 self._log(f"declined ({e.reason}): {e.detail}")
             return Decision(False, e.reason)

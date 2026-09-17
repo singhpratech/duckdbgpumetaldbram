@@ -41,7 +41,7 @@ WHERES = {
     "l_discount <= 0.09": "~90%",
     "l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4": "mixed",
 }
-FORMS = ("plain", "having", "topk")
+FORMS = ("plain", "having", "topk", "projected")   # projected: expressions over aggregates (§4.11)
 # key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
 # applies where its table is part of the join
 JOINS = {
@@ -73,6 +73,9 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
         return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
+    if form == "projected":
+        return (f"SELECT {key}, sum({PAYLOAD}) / count(*) AS mean{more} FROM {source}{w} GROUP BY {key} "
+                f"HAVING sum({PAYLOAD}) > {having_thr} AND count(*) > 1")
     if form == "having":
         return (f"SELECT {key}, sum({PAYLOAD}) AS q{more} FROM {source}{w} GROUP BY {key} "
                 f"HAVING sum({PAYLOAD}) > {having_thr}")
