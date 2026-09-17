@@ -940,7 +940,9 @@ inline long gbx_agg64(device const long* cnt, device const long* cstar,
 inline bool gbx_keep(device const long* lo, device const long* hi, device const long* cnt,
                      device const long* cstar, device const long* mn, device const long* mx,
                      uint agg, uint cmp, long thr, uint gid) {
+    if (cstar[gid] == 0l) return false;   // masked-out group (variant (a)): never emitted
     const bool is_null = gbx_is_null(cnt, agg, gid);
+    if (cmp == 7u) return true;        // keep every (non-empty) group
     if (cmp == 5u) return is_null;
     if (cmp == 0u) return !is_null;   // no HAVING: the non-NULL groups are the top-k candidates, NULL ones are appended last by the host
     if (is_null) return false;
@@ -1186,5 +1188,253 @@ kernel void gbx_topk_compact_i64(
         o_lo[pos] = lo[gid];       o_hi[pos] = hi[gid];
         o_cnt[pos] = cnt[gid];     o_cstar[pos] = cstar[gid];
         o_mn[pos] = mn[gid];       o_mx[pos] = mx[gid];
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Exact GROUP BY — WHERE mask (v0.7 §4.6)
+//
+//  gbx_mask_i64   one pass per predicate over the ORIGINAL rows: pass 0
+//                 writes mask[i], later passes AND into it. op: 0 = 1 != 2 <
+//                 3 <= 4 > 5 >= 6 is null 7 is not null 8 in. F64 columns
+//                 compare under DuckDB's total order via an order-preserving
+//                 ulong image (NaN greatest and one value, -0.0 == +0.0).
+//                 Rows at or past null_suffix_from are NULL (the key column's
+//                 partition; 0xFFFFFFFF for every other column).
+//  Variant (a)    gbxm_chunk_i64 / gbxm_finalize_i64: the exact reduce
+//                 skipping masked-out rows, count(*) counted (6-long
+//                 partials: lo hi cnt cstar mn mx); groups with cstar == 0
+//                 are dropped by the compaction that follows.
+//  Variant (b)    gbx_sel_counts_i64 / gbx_sel_compact_i64: compact the
+//                 sorted keys + permutation to the surviving positions, then
+//                 the ordinary gbx_chunk / gbx_finalize run over them.
+// ---------------------------------------------------------------------------
+
+inline ulong gbx_f64_key(long bits) {
+    ulong u = (ulong)bits;
+    const bool nan = (((u >> 52) & 0x7FFul) == 0x7FFul) && ((u & 0xFFFFFFFFFFFFFul) != 0ul);
+    if (nan) return ~0ul;
+    if ((u & 0x7FFFFFFFFFFFFFFFul) == 0ul) u = 0ul;                 // -0.0 -> +0.0
+    return (u & 0x8000000000000000ul) ? ~u : (u | 0x8000000000000000ul);
+}
+inline bool gbx_cmp_u(uint op, ulong a, ulong b) {
+    switch (op) {
+        case 0u: return a == b;  case 1u: return a != b;
+        case 2u: return a <  b;  case 3u: return a <= b;
+        case 4u: return a >  b;  case 5u: return a >= b;
+        default: return false;
+    }
+}
+inline bool gbx_cmp_s(uint op, long a, long b) {
+    switch (op) {
+        case 0u: return a == b;  case 1u: return a != b;
+        case 2u: return a <  b;  case 3u: return a <= b;
+        case 4u: return a >  b;  case 5u: return a >= b;
+        default: return false;
+    }
+}
+
+kernel void gbx_mask_i64(
+    device const long*  col              [[buffer(0)]],
+    device const ulong* valid            [[buffer(1)]],
+    constant uint&      has_valid        [[buffer(2)]],
+    constant uint&      null_suffix_from [[buffer(3)]],
+    constant uint&      n                [[buffer(4)]],
+    constant uint&      is_f64           [[buffer(5)]],
+    constant uint&      op               [[buffer(6)]],
+    constant long&      value            [[buffer(7)]],
+    device const long*  list             [[buffer(8)]],
+    constant uint&      n_list           [[buffer(9)]],
+    constant uint&      first            [[buffer(10)]],
+    device uchar*       mask             [[buffer(11)]],
+    uint                gid              [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    if (first == 0u && mask[gid] == 0u) return;
+    const bool v = (gid < null_suffix_from) && gbx_valid(valid, has_valid, (ulong)gid);
+    bool pass;
+    if (op == 6u)      pass = !v;
+    else if (op == 7u) pass = v;
+    else if (!v)       pass = false;
+    else {
+        const long raw = col[gid];
+        if (is_f64 != 0u) {
+            const ulong a = gbx_f64_key(raw);
+            if (op == 8u) {
+                pass = false;
+                for (uint i = 0; i < n_list && !pass; ++i) pass = (a == gbx_f64_key(list[i]));
+            } else {
+                pass = gbx_cmp_u(op, a, gbx_f64_key(value));
+            }
+        } else {
+            if (op == 8u) {
+                pass = false;
+                for (uint i = 0; i < n_list && !pass; ++i) pass = (raw == list[i]);
+            } else {
+                pass = gbx_cmp_s(op, raw, value);
+            }
+        }
+    }
+    mask[gid] = pass ? 1u : 0u;
+}
+
+// ---- variant (a): masked reduce with count(*) in the tuple ----
+struct GbxmAcc { ulong lo; long hi; long cnt; long cstar; long mn; long mx; };
+inline GbxmAcc gbxm_zero() {
+    GbxmAcc a; a.lo = 0ul; a.hi = 0l; a.cnt = 0l; a.cstar = 0l; a.mn = GBX_LMAX; a.mx = GBX_LMIN; return a;
+}
+inline void gbxm_add(thread GbxmAcc& a, long v) {
+    const ulong u = (ulong)v, old = a.lo;
+    a.lo += u;
+    a.hi += (v < 0l ? -1l : 0l) + (a.lo < old ? 1l : 0l);
+    a.cnt += 1l; a.mn = min(a.mn, v); a.mx = max(a.mx, v);
+}
+inline void gbxm_merge(thread GbxmAcc& a, GbxmAcc b) {
+    const ulong old = a.lo;
+    a.lo += b.lo; a.hi += b.hi + (a.lo < old ? 1l : 0l);
+    a.cnt += b.cnt; a.cstar += b.cstar; a.mn = min(a.mn, b.mn); a.mx = max(a.mx, b.mx);
+}
+inline void gbxm_store(device long* p, uint i, GbxmAcc a) {
+    p[6u * i + 0u] = (long)a.lo; p[6u * i + 1u] = a.hi; p[6u * i + 2u] = a.cnt;
+    p[6u * i + 3u] = a.cstar;    p[6u * i + 4u] = a.mn; p[6u * i + 5u] = a.mx;
+}
+inline GbxmAcc gbxm_load(device const long* p, uint i) {
+    GbxmAcc a;
+    a.lo = (ulong)p[6u * i + 0u]; a.hi = p[6u * i + 1u]; a.cnt = p[6u * i + 2u];
+    a.cstar = p[6u * i + 3u];     a.mn = p[6u * i + 4u]; a.mx = p[6u * i + 5u];
+    return a;
+}
+inline void gbxm_out(device long* lo, device long* hi, device long* cnt, device long* cstar,
+                     device long* mn, device long* mx, uint seg, GbxmAcc a) {
+    lo[seg] = (long)a.lo; hi[seg] = a.hi; cnt[seg] = a.cnt; cstar[seg] = a.cstar;
+    mn[seg] = a.cnt ? a.mn : 0l;
+    mx[seg] = a.cnt ? a.mx : 0l;
+}
+
+kernel void gbxm_chunk_i64(
+    device const long*  perm      [[buffer(0)]],
+    device const long*  vals      [[buffer(1)]],
+    device const ulong* valid     [[buffer(2)]],
+    constant uint&      has_valid [[buffer(3)]],
+    device const uint*  starts    [[buffer(4)]],
+    constant uint&      n         [[buffer(5)]],
+    constant uint&      num_segs  [[buffer(6)]],
+    device const uchar* mask      [[buffer(7)]],   // over ORIGINAL rows
+    constant uint&      with_vals [[buffer(8)]],
+    device long*        out_lo    [[buffer(9)]],
+    device long*        out_hi    [[buffer(10)]],
+    device long*        out_cnt   [[buffer(11)]],
+    device long*        out_cstar [[buffer(12)]],
+    device long*        out_mn    [[buffer(13)]],
+    device long*        out_mx    [[buffer(14)]],
+    device long*        head      [[buffer(15)]],  // 6 longs per chunk
+    device long*        tail      [[buffer(16)]],
+    uint                gid       [[thread_position_in_grid]])
+{
+    const uint a = gid * GB_CHUNK;
+    if (a >= n) return;
+    const uint b = (n - a < GB_CHUNK) ? n : a + GB_CHUNK;
+    uint lo = 0, hi = num_segs;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (starts[mid] <= a) lo = mid + 1; else hi = mid;
+    }
+    uint seg = lo - 1;
+    uint i = a;
+    GbxmAcc hs = gbxm_zero(), ts = gbxm_zero();
+    while (i < b) {
+        const uint rs = starts[seg];
+        const uint re = (seg + 1 < num_segs) ? starts[seg + 1] : n;
+        const uint e  = min(re, b);
+        GbxmAcc s = gbxm_zero();
+        for (uint j = i; j < e; ++j) {
+            const ulong row = (ulong)perm[j];
+            if (mask[row] == 0u) continue;
+            s.cstar += 1l;
+            if (with_vals != 0u && gbx_valid(valid, has_valid, row)) gbxm_add(s, vals[row]);
+        }
+        if (with_vals == 0u) s.cnt = s.cstar;
+        if (rs < a)      hs = s;
+        else if (re > b) ts = s;
+        else             gbxm_out(out_lo, out_hi, out_cnt, out_cstar, out_mn, out_mx, seg, s);
+        i = e; ++seg;
+    }
+    gbxm_store(head, gid, hs);
+    gbxm_store(tail, gid, ts);
+}
+
+kernel void gbxm_finalize_i64(
+    device const long* keys      [[buffer(0)]],
+    device const uint* starts    [[buffer(1)]],
+    constant uint&     n         [[buffer(2)]],
+    constant uint&     num_segs  [[buffer(3)]],
+    device const long* head      [[buffer(4)]],
+    device const long* tail      [[buffer(5)]],
+    device long*       out_keys  [[buffer(6)]],
+    device long*       out_cstar [[buffer(7)]],
+    device long*       out_lo    [[buffer(8)]],
+    device long*       out_hi    [[buffer(9)]],
+    device long*       out_cnt   [[buffer(10)]],
+    device long*       out_mn    [[buffer(11)]],
+    device long*       out_mx    [[buffer(12)]],
+    uint               gid       [[thread_position_in_grid]])
+{
+    if (gid >= num_segs) return;
+    const uint rs = starts[gid];
+    const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
+    out_keys[gid] = keys[rs];
+    const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
+    if (c0 < c1) {
+        GbxmAcc s = gbxm_load(tail, c0);
+        for (uint t = c0 + 1u; t <= c1; ++t) gbxm_merge(s, gbxm_load(head, t));
+        gbxm_out(out_lo, out_hi, out_cnt, out_cstar, out_mn, out_mx, gid, s);
+    }
+}
+
+// ---- variant (b): compact the sorted positions that survive the mask ----
+kernel void gbx_sel_counts_i64(
+    device const long*  perm         [[buffer(0)]],
+    device const uchar* mask         [[buffer(1)]],
+    constant uint&      n            [[buffer(2)]],
+    device uint*        block_counts [[buffer(3)]],
+    uint                tid          [[thread_position_in_threadgroup]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    shm[tid] = (gid < n && mask[(ulong)perm[gid]] != 0u) ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
+}
+
+kernel void gbx_sel_compact_i64(
+    device const long*  keys          [[buffer(0)]],
+    device const long*  perm          [[buffer(1)]],
+    device const uchar* mask          [[buffer(2)]],
+    constant uint&      n             [[buffer(3)]],
+    device const uint*  block_offsets [[buffer(4)]],
+    device long*        o_keys        [[buffer(5)]],
+    device long*        o_perm        [[buffer(6)]],
+    uint                gid           [[thread_position_in_grid]],
+    uint                block_id      [[threadgroup_position_in_grid]],
+    uint                lane          [[thread_index_in_simdgroup]],
+    uint                sg            [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint sg_tot[BLOCK];
+    const uint f = (gid < n && mask[(ulong)perm[gid]] != 0u) ? 1u : 0u;
+    const uint lane_ex = simd_prefix_exclusive_sum(f);
+    const uint sg_sum  = simd_sum(f);
+    if (lane == 0) sg_tot[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint sg_off = 0u;
+    for (uint s = 0; s < sg; ++s) sg_off += sg_tot[s];
+    if (f) {
+        const uint pos = block_offsets[block_id] + sg_off + lane_ex;
+        o_keys[pos] = keys[gid];
+        o_perm[pos] = perm[gid];
     }
 }

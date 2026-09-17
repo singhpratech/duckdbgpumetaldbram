@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -123,6 +124,11 @@ public:
             ps_gbx_topk_hist_         = make_pso(lib, @"gbx_topk_hist_i64");
             ps_gbx_topk_counts_       = make_pso(lib, @"gbx_topk_counts_i64");
             ps_gbx_topk_compact_      = make_pso(lib, @"gbx_topk_compact_i64");
+            ps_gbx_mask_              = make_pso(lib, @"gbx_mask_i64");
+            ps_gbxm_chunk_            = make_pso(lib, @"gbxm_chunk_i64");
+            ps_gbxm_finalize_         = make_pso(lib, @"gbxm_finalize_i64");
+            ps_gbx_sel_counts_        = make_pso(lib, @"gbx_sel_counts_i64");
+            ps_gbx_sel_compact_       = make_pso(lib, @"gbx_sel_compact_i64");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
@@ -1343,13 +1349,108 @@ private:
                                                  const ResidentColumn* vals,
                                                  std::size_t max_groups,
                                                  const GroupByFilter& filter) override {
+        return exact_impl(keys, vals, nullptr, 0, max_groups, filter, "groupby_exact_resident");
+    }
+
+    GroupByResidentResult groupby_exact_masked_resident(const ResidentColumn& keys,
+                                                        const ResidentColumn* vals,
+                                                        const Predicate* preds,
+                                                        std::size_t n_preds,
+                                                        std::size_t max_groups,
+                                                        const GroupByFilter& filter) override {
+        return exact_impl(keys, vals, preds, n_preds, max_groups, filter, "groupby_exact_masked_resident");
+    }
+
+    // §4.6: multi-lane exact upload — one host pass (UMA) partitions NULL-key
+    // rows to a suffix of every lane and de-interleaves into shared buffers;
+    // each non-key lane gets its own validity bitmap when it has NULLs.
+    std::vector<std::unique_ptr<ResidentColumn>>
+    upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
+                      const Dtype* dtypes, std::size_t n_lanes) override {
+        if (n_lanes == 0) throw std::runtime_error("upload_rows_exact: no lanes");
+        if (dtypes[0] != Dtype::I64) throw std::runtime_error("upload_rows_exact: the key lane must be I64");
+        if (n_lanes > 1 && dtypes[1] != Dtype::I64)
+            throw std::runtime_error(
+                "upload_rows_exact: DOUBLE payloads are not on the exact path (docs/TRANSPARENT_DESIGN.md §4.7)");
         @autoreleasepool {
-            const char* op = "groupby_exact_resident";
+            std::size_t rows = 0, null_keys = 0;
+            auto bit = [](const std::uint64_t* m, std::size_t i) {
+                return !m || ((m[i >> 6] >> (i & 63)) & 1u);
+            };
+            auto lane_valid = [](const RowSpan& sp, std::size_t lane) -> const std::uint64_t* {
+                return sp.valid ? sp.valid[lane] : nullptr;
+            };
+            for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+                if (spans[sidx].n_lanes != n_lanes) throw std::runtime_error("upload_rows_exact: span lane count differs");
+                rows += spans[sidx].rows;
+                const std::uint64_t* kv = lane_valid(spans[sidx], 0);
+                if (kv) for (std::size_t j = 0; j < spans[sidx].rows; ++j) null_keys += !bit(kv, j);
+            }
+            const std::size_t bytes = (rows == 0) ? 1 : rows * sizeof(std::int64_t);
+            const std::size_t words = (rows + 63) / 64;
+            std::vector<id<MTLBuffer>> bufs(n_lanes, nil);
+            std::vector<std::int64_t*> dst(n_lanes, nullptr);
+            for (std::size_t l = 0; l < n_lanes; ++l) {
+                bufs[l] = [device_ newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+                if (!bufs[l]) throw std::runtime_error("upload_rows_exact: device allocation failed (Metal)");
+                dst[l] = static_cast<std::int64_t*>([bufs[l] contents]);
+            }
+            std::vector<std::vector<std::uint64_t>> valid(n_lanes, std::vector<std::uint64_t>(words, ~std::uint64_t{0}));
+            std::vector<std::size_t> nulls(n_lanes, 0);
+            std::size_t head = 0, tail = rows - null_keys;
+            for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+                const RowSpan& sp = spans[sidx];
+                const std::uint64_t* kv = lane_valid(sp, 0);
+                for (std::size_t j = 0; j < sp.rows; ++j) {
+                    const bool k_ok = bit(kv, j);
+                    const std::size_t d = k_ok ? head++ : tail++;
+                    for (std::size_t l = 0; l < n_lanes; ++l) {
+                        const bool ok = (l == 0) ? k_ok : bit(lane_valid(sp, l), j);
+                        dst[l][d] = ok ? sp.lanes[j * n_lanes + l] : 0;
+                        if (!ok) { valid[l][d >> 6] &= ~(std::uint64_t{1} << (d & 63)); ++nulls[l]; }
+                    }
+                }
+            }
+            std::vector<std::unique_ptr<ResidentColumn>> out;
+            out.reserve(n_lanes);
+            for (std::size_t l = 0; l < n_lanes; ++l) {
+                id<MTLBuffer> vb = nil;
+                if (l != 0 && nulls[l]) {
+                    vb = [device_ newBufferWithBytes:valid[l].data()
+                                             length:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
+                                            options:MTLResourceStorageModeShared];
+                    if (!vb) throw std::runtime_error("upload_rows_exact: validity allocation failed (Metal)");
+                }
+                out.push_back(std::make_unique<MetalResidentColumn>(
+                    bufs[l], rows, dtypes[l], sort_ctx_,
+                    /*null_suffix*/ l == 0 ? null_keys : 0, vb, nulls[l]));
+            }
+            return out;
+        }
+    }
+
+    static std::uint32_t pred_op_code(Predicate::Op op) {
+        switch (op) {
+            case Predicate::Op::EQ: return 0u;  case Predicate::Op::NE: return 1u;
+            case Predicate::Op::LT: return 2u;  case Predicate::Op::LE: return 3u;
+            case Predicate::Op::GT: return 4u;  case Predicate::Op::GE: return 5u;
+            case Predicate::Op::IsNull: return 6u; case Predicate::Op::IsNotNull: return 7u;
+            case Predicate::Op::In: return 8u;
+        }
+        return 0u;
+    }
+
+    // The exact GROUP BY, plain or masked (§4.1, §4.2, §4.6).
+    GroupByResidentResult exact_impl(const ResidentColumn& keys, const ResidentColumn* vals,
+                                     const Predicate* preds, std::size_t n_preds,
+                                     std::size_t max_groups, const GroupByFilter& filter,
+                                     const char* op) {
+        @autoreleasepool {
             const auto t_wall0 = std::chrono::steady_clock::now();
             const auto& k = check_i64_nullable(keys);
             const MetalResidentColumn* v = vals ? &check_i64_nullable(*vals) : nullptr;
             if (v && v->rows() != k.rows())
-                throw std::runtime_error("groupby_exact_resident: keys and vals row counts differ");
+                throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
             GroupByResidentResult r{};
             r.rows_in = k.rows();
             const std::size_t n_total = k.rows();
@@ -1361,44 +1462,218 @@ private:
             if (n_total > 0xFFFFFFFFull - 64)
                 throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
             if (filter.active()) (void)agg_code(filter.agg);   // reject avg early
+            for (std::size_t p = 0; p < n_preds; ++p) {
+                if (!preds[p].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
+                if (preds[p].col->backend_tag() != Backend::METAL)
+                    throw std::runtime_error("ResidentColumn mismatch (Metal predicate column)");
+                if (preds[p].col->rows() != n_total)
+                    throw std::runtime_error(std::string(op) + ": predicate column row count differs from the keys");
+            }
 
             const std::size_t n = k.sort_rows();          // valid-key prefix
-            const bool null_group = k.null_suffix() > 0;
             double kernel_ms = 0.0;
             id<MTLBuffer> sorted = nil, perm = nil;
-            std::size_t num_segs = 0;
-            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
-            const std::size_t nblocks = (n + kBlock - 1) / kBlock;
-            const std::size_t nchunks = (n + 63) / 64;
-
-            // ---- Stage A: run starts over the prefix ----
             if (n > 0) {
                 k.build_sort_cache(&kernel_ms);
                 sorted = k.sorted_cache();
                 perm   = k.perm_cache();
-                grow(gb_block_buf_, nblocks * sizeof(std::uint32_t), "block counts");
-                grow(mult_buf_, n * sizeof(std::uint32_t), "run starts");
+            }
+
+            // ---- key predicates → a contiguous range of the sorted prefix ----
+            // (binary search on the UMA sorted cache, zero per-row cost); the
+            // NULL-key group survives only IS NULL or the absence of any key
+            // comparison. Everything else goes to the mask.
+            std::size_t lo = 0, hi = n;
+            bool null_ok = true;
+            std::vector<const Predicate*> maskp;
+            if (n_preds) {
+                const auto* sk = sorted ? static_cast<const std::int64_t*>([sorted contents]) : nullptr;
+                auto lower = [&](std::int64_t x) { return sk ? static_cast<std::size_t>(std::lower_bound(sk, sk + n, x) - sk) : 0; };
+                auto upper = [&](std::int64_t x) { return sk ? static_cast<std::size_t>(std::upper_bound(sk, sk + n, x) - sk) : 0; };
+                for (std::size_t p = 0; p < n_preds; ++p) {
+                    const Predicate& pr = preds[p];
+                    if (pr.col != &k) { maskp.push_back(&pr); continue; }
+                    switch (pr.op) {
+                        case Predicate::Op::IsNull:    hi = std::min(hi, lo); break;              // keys: none; NULL group stays
+                        case Predicate::Op::IsNotNull: null_ok = false; break;
+                        case Predicate::Op::EQ: lo = std::max(lo, lower(pr.value)); hi = std::min(hi, upper(pr.value)); null_ok = false; break;
+                        case Predicate::Op::LT: hi = std::min(hi, lower(pr.value)); null_ok = false; break;
+                        case Predicate::Op::LE: hi = std::min(hi, upper(pr.value)); null_ok = false; break;
+                        case Predicate::Op::GT: lo = std::max(lo, upper(pr.value)); null_ok = false; break;
+                        case Predicate::Op::GE: lo = std::max(lo, lower(pr.value)); null_ok = false; break;
+                        default: maskp.push_back(&pr); null_ok = false; break;   // NE, In: mask (NULL keys fail them)
+                    }
+                }
+                if (lo > hi) lo = hi;
+            }
+            const std::size_t range_n = hi - lo;
+            const bool masked = !maskp.empty();
+
+            // ---- mask over the ORIGINAL rows (one kernel pass per predicate) and
+            //      the survivor count over the key range, in ONE command buffer ----
+            const std::size_t sel_nb = (range_n + kBlock - 1) / kBlock;
+            if (masked) {
+                grow(gbx_mask_buf_, std::max<std::size_t>(1, n_total), "where mask");
+                if (!gbx_dummy_valid_)
+                    gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+                if (range_n > 0) grow(gb_block_buf_, sel_nb * sizeof(std::uint32_t), "select block counts");
+                const std::uint32_t nt32 = static_cast<std::uint32_t>(n_total);
+                const std::uint32_t rn32 = static_cast<std::uint32_t>(range_n);
+                std::vector<id<MTLBuffer>> lists(maskp.size(), nil);
+                for (std::size_t p = 0; p < maskp.size(); ++p) {
+                    const Predicate& pr = *maskp[p];
+                    if (pr.op == Predicate::Op::In && pr.n_list) {
+                        lists[p] = [device_ newBufferWithBytes:pr.list length:pr.n_list * sizeof(std::int64_t)
+                                                       options:MTLResourceStorageModeShared];
+                        if (!lists[p]) throw std::runtime_error("where mask: IN list allocation failed (Metal)");
+                    }
+                }
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                for (std::size_t p = 0; p < maskp.size(); ++p) {
+                    const Predicate& pr = *maskp[p];
+                    const auto& pc = static_cast<const MetalResidentColumn&>(*pr.col);
+                    const bool has_bitmap = pc.valid_buffer() != nil;
+                    const std::uint32_t has_valid = has_bitmap ? 1u : 0u;
+                    const std::uint32_t null_from = pc.null_suffix()
+                        ? static_cast<std::uint32_t>(pc.sort_rows()) : 0xFFFFFFFFu;
+                    const std::uint32_t is_f64 = pc.dtype() == Dtype::F64 ? 1u : 0u;
+                    const std::uint32_t opc = pred_op_code(pr.op);
+                    const std::int64_t  value = pr.value;
+                    const std::uint32_t n_list = static_cast<std::uint32_t>(pr.op == Predicate::Op::In ? pr.n_list : 0);
+                    const std::uint32_t first = p == 0 ? 1u : 0u;
+                    id<MTLBuffer> list = lists[p] ? lists[p] : gbx_dummy_valid_;
+                    [ce setComputePipelineState:ps_gbx_mask_];
+                    [ce setBuffer:pc.buffer() offset:0 atIndex:0];
+                    [ce setBuffer:(has_bitmap ? pc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+                    [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:2];
+                    [ce setBytes:&null_from length:sizeof(null_from) atIndex:3];
+                    [ce setBytes:&nt32      length:sizeof(nt32)      atIndex:4];
+                    [ce setBytes:&is_f64    length:sizeof(is_f64)    atIndex:5];
+                    [ce setBytes:&opc       length:sizeof(opc)       atIndex:6];
+                    [ce setBytes:&value     length:sizeof(value)     atIndex:7];
+                    [ce setBuffer:list offset:0 atIndex:8];
+                    [ce setBytes:&n_list    length:sizeof(n_list)    atIndex:9];
+                    [ce setBytes:&first     length:sizeof(first)     atIndex:10];
+                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:11];
+                    [ce dispatchThreadgroups:MTLSizeMake((n_total + kBlock - 1) / kBlock, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                    [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+                if (range_n > 0) {
+                    [ce setComputePipelineState:ps_gbx_sel_counts_];
+                    [ce setBuffer:perm offset:lo * sizeof(std::int64_t) atIndex:0];
+                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:1];
+                    [ce setBytes:&rn32 length:sizeof(rn32) atIndex:2];
+                    [ce setBuffer:gb_block_buf_ offset:0 atIndex:3];
+                    [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                }
+                [ce endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                kernel_ms += cb_kernel_ms(cb);
+            }
+
+            // ---- choose the reduce input: the range as is, its compaction (b), or masked (a) ----
+            id<MTLBuffer> run_sorted = sorted, run_perm = perm;
+            std::size_t run_off = lo, run_n = range_n;
+            bool mask_in_reduce = false;
+            bool compact_pending = false;     // variant (b): compaction runs in Stage A's command buffer
+            std::size_t n_sel_b = 0;
+            if (masked && range_n > 0) {
+                const std::size_t nb = sel_nb;
+                const std::size_t n_sel = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]), nb);
+                if (n_sel == 0) {
+                    run_n = 0;
+                } else if (static_cast<double>(n_sel) < compact_below_ * static_cast<double>(range_n)) {
+                    // variant (b): compact sorted keys + perm to the survivors
+                    // (encoded below, in Stage A's command buffer)
+                    run_sorted = grow(gbx_sel_keys_, n_sel * sizeof(std::int64_t), "compacted keys");
+                    run_perm   = grow(gbx_sel_perm_, n_sel * sizeof(std::int64_t), "compacted perm");
+                    run_off = 0; run_n = n_sel; compact_pending = true; n_sel_b = n_sel;
+                } else {
+                    mask_in_reduce = true;               // variant (a)
+                }
+            }
+            const std::size_t soff = run_off * sizeof(std::int64_t);
+            const std::uint32_t n32 = static_cast<std::uint32_t>(run_n);
+            const std::size_t nblocks = (run_n + kBlock - 1) / kBlock;
+            const std::size_t nchunks = (run_n + 63) / 64;
+
+            // ---- Stage A: (variant (b) compaction, then) run starts over the reduce input ----
+            std::size_t num_segs = 0;
+            if (run_n > 0) {
+                // Variant (b): the select offsets live in gb_block_buf_ and are
+                // read by the compaction below, so Stage A counts go to a
+                // second buffer. (grow() may allocate: take the handle after.)
+                id<MTLBuffer> block_a = compact_pending
+                    ? grow(gb_block2_buf_, nblocks * sizeof(std::uint32_t), "block counts")
+                    : grow(gb_block_buf_,  nblocks * sizeof(std::uint32_t), "block counts");
+                grow(mult_buf_, run_n * sizeof(std::uint32_t), "run starts");
+                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                if (compact_pending) {
+                    const std::uint32_t rn32 = static_cast<std::uint32_t>(range_n);
+                    [ce setComputePipelineState:ps_gbx_sel_compact_];
+                    [ce setBuffer:sorted offset:lo * sizeof(std::int64_t) atIndex:0];
+                    [ce setBuffer:perm   offset:lo * sizeof(std::int64_t) atIndex:1];
+                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:2];
+                    [ce setBytes:&rn32 length:sizeof(rn32) atIndex:3];
+                    [ce setBuffer:gb_block_buf_ offset:0 atIndex:4];
+                    [ce setBuffer:run_sorted offset:0 atIndex:5];
+                    [ce setBuffer:run_perm   offset:0 atIndex:6];
+                    [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                    [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
                 [ce setComputePipelineState:ps_gb_block_counts_];
-                [ce setBuffer:sorted        offset:0 atIndex:0];
+                [ce setBuffer:run_sorted    offset:soff atIndex:0];
                 [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
-                [ce setBuffer:gb_block_buf_ offset:0 atIndex:2];
+                [ce setBuffer:block_a offset:0 atIndex:2];
                 [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
                 kernel_ms += cb_kernel_ms(cb);
-                auto* bc = static_cast<std::uint32_t*>([gb_block_buf_ contents]);
+                auto* bc = static_cast<std::uint32_t*>([block_a contents]);
                 for (std::size_t b = 0; b < nblocks; ++b) {
                     const std::uint32_t c = bc[b];
                     bc[b] = static_cast<std::uint32_t>(num_segs);
                     num_segs += c;
                 }
+                if (compact_pending) {
+                    // Stage B reads the block offsets from gb_block_buf_
+                    std::memcpy([gb_block_buf_ contents], bc, nblocks * sizeof(std::uint32_t));
+                    (void)n_sel_b;
+                }
             }
+
+            // ---- the NULL-key group: fold the suffix on the host (UMA), under the mask ----
+            Sum128 ns; std::int64_t ncnt = 0, ncstar = 0;
+            std::int64_t nmn = std::numeric_limits<std::int64_t>::max();
+            std::int64_t nmx = std::numeric_limits<std::int64_t>::min();
+            if (null_ok && k.null_suffix() > 0) {
+                const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
+                const auto* vd = v ? static_cast<const std::int64_t*>([v->buffer() contents]) : nullptr;
+                const auto* vv = (v && v->valid_buffer())
+                    ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
+                for (std::size_t i = n; i < n_total; ++i) {
+                    if (mk && !mk[i]) continue;
+                    ++ncstar;
+                    if (!v) continue;
+                    if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
+                    const std::int64_t x = vd[i];
+                    ns.add(x); ++ncnt; nmn = std::min(nmn, x); nmx = std::max(nmx, x);
+                }
+                if (!v) ncnt = ncstar;
+            }
+            const bool null_group = ncstar > 0;
             const std::size_t total = num_segs + (null_group ? 1 : 0);
-            if (!filter.active() && total > max_groups)
+            // With the mask inside the reduce, groups whose every row was
+            // masked out are still counted in num_segs and dropped by the
+            // compaction below, so the cap is checked there instead.
+            const bool dev_path = filter.active() || mask_in_reduce;
+            if (!dev_path && total > max_groups)
                 throw std::runtime_error(
                     std::string(op) + ": result has " + std::to_string(total) +
                     " groups, above the cap of " + std::to_string(max_groups) +
@@ -1406,122 +1681,159 @@ private:
             const std::uint32_t ns32 = static_cast<std::uint32_t>(num_segs);
 
             // ---- finalized tuple arrays: lo hi cnt cstar mn mx keys (+ key_null) ----
-            const bool dev_filter = filter.active();
             std::vector<OutBuf> o(7);
             std::vector<id<MTLBuffer>> b(8, nil);
-            if (dev_filter) {
+            if (dev_path) {
                 const std::size_t bytes = std::max<std::size_t>(1, total) * sizeof(std::int64_t);
                 for (int i = 0; i < 7; ++i) b[i] = grow_slot(gbx_f_, i, bytes, "exact filter scratch");
                 b[7] = grow_slot(gbx_f_, 7, std::max<std::size_t>(1, total), "exact filter key_null");
             } else {
-                o[0] = out_for(r.sums, total);        o[1] = out_for(r.sums_hi, total);
-                o[2] = out_for(r.counts, total);      o[3] = out_for(r.counts_star, total);
-                o[4] = out_for(r.mins, total);        o[5] = out_for(r.maxs, total);
-                o[6] = out_for(r.keys, total);
-                for (int i = 0; i < 7; ++i) b[i] = o[i].buf;
+                // Result vectors alias the device output where the caller
+                // reads them; the rest land in scratch (GroupByFilter::columns).
+                const std::size_t bytes = std::max<std::size_t>(1, total) * sizeof(std::int64_t);
+                std::vector<std::int64_t>* vecs[7] = { &r.sums, &r.sums_hi, &r.counts, &r.counts_star,
+                                                       &r.mins, &r.maxs, &r.keys };
+                const unsigned bits[7] = { 1, 1, 2, 3, 4, 5, 0 };
+                for (int i = 0; i < 7; ++i) {
+                    if (filter.wants(bits[i])) { o[i] = out_for(*vecs[i], total); b[i] = o[i].buf; }
+                    else                       { b[i] = grow_slot(gbx_f_, i, bytes, "exact unread column"); }
+                }
             }
 
             // ---- Stage B: starts, chunk tuples, finalize ----
-            if (n > 0) {
+            if (run_n > 0) {
                 const std::uint32_t with_vals = v ? 1u : 0u;
-                if (v) {
-                    grow(gbx_head_buf_, nchunks * 5 * sizeof(std::int64_t), "exact head partials");
-                    grow(gbx_tail_buf_, nchunks * 5 * sizeof(std::int64_t), "exact tail partials");
-                }
                 if (!gbx_dummy_valid_)
                     gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
                 const bool has_bitmap = v && v->valid_buffer();
                 id<MTLBuffer> valid = has_bitmap ? v->valid_buffer() : gbx_dummy_valid_;
                 const std::uint32_t has_valid = has_bitmap ? 1u : 0u;
+                id<MTLBuffer> vbuf = v ? v->buffer() : gbx_dummy_valid_;
 
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
                 [ce setComputePipelineState:ps_gb_run_starts_];
-                [ce setBuffer:sorted        offset:0 atIndex:0];
+                [ce setBuffer:run_sorted    offset:soff atIndex:0];
                 [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
                 [ce setBuffer:gb_block_buf_ offset:0 atIndex:2];
                 [ce setBuffer:mult_buf_     offset:0 atIndex:3];
                 [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                if (v) {
-                    [ce setComputePipelineState:ps_gbx_chunk_];
-                    [ce setBuffer:perm          offset:0 atIndex:0];
-                    [ce setBuffer:v->buffer()   offset:0 atIndex:1];
+                if (mask_in_reduce) {
+                    // variant (a): masked reduce, count(*) in the tuple
+                    grow(gbxm_head_buf_, nchunks * 6 * sizeof(std::int64_t), "masked head partials");
+                    grow(gbxm_tail_buf_, nchunks * 6 * sizeof(std::int64_t), "masked tail partials");
+                    [ce setComputePipelineState:ps_gbxm_chunk_];
+                    [ce setBuffer:run_perm      offset:soff atIndex:0];
+                    [ce setBuffer:vbuf          offset:0 atIndex:1];
                     [ce setBuffer:valid         offset:0 atIndex:2];
                     [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:3];
                     [ce setBuffer:mult_buf_     offset:0 atIndex:4];
                     [ce setBytes:&n32  length:sizeof(n32)  atIndex:5];
                     [ce setBytes:&ns32 length:sizeof(ns32) atIndex:6];
-                    for (int i = 0; i < 6; ++i) if (i != 3) [ce setBuffer:b[i] offset:0 atIndex:(7 + (i < 3 ? i : i - 1))];
-                    [ce setBuffer:gbx_head_buf_ offset:0 atIndex:12];
-                    [ce setBuffer:gbx_tail_buf_ offset:0 atIndex:13];
+                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:7];
+                    [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:8];
+                    [ce setBuffer:b[0] offset:0 atIndex:9];    // lo
+                    [ce setBuffer:b[1] offset:0 atIndex:10];   // hi
+                    [ce setBuffer:b[2] offset:0 atIndex:11];   // cnt
+                    [ce setBuffer:b[3] offset:0 atIndex:12];   // cstar
+                    [ce setBuffer:b[4] offset:0 atIndex:13];   // mn
+                    [ce setBuffer:b[5] offset:0 atIndex:14];   // mx
+                    [ce setBuffer:gbxm_head_buf_ offset:0 atIndex:15];
+                    [ce setBuffer:gbxm_tail_buf_ offset:0 atIndex:16];
                     [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    [ce setComputePipelineState:ps_gbxm_finalize_];
+                    [ce setBuffer:run_sorted offset:soff atIndex:0];
+                    [ce setBuffer:mult_buf_  offset:0 atIndex:1];
+                    [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
+                    [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
+                    [ce setBuffer:gbxm_head_buf_ offset:0 atIndex:4];
+                    [ce setBuffer:gbxm_tail_buf_ offset:0 atIndex:5];
+                    [ce setBuffer:b[6] offset:0 atIndex:6];    // keys
+                    [ce setBuffer:b[3] offset:0 atIndex:7];    // cstar
+                    [ce setBuffer:b[0] offset:0 atIndex:8];
+                    [ce setBuffer:b[1] offset:0 atIndex:9];
+                    [ce setBuffer:b[2] offset:0 atIndex:10];
+                    [ce setBuffer:b[4] offset:0 atIndex:11];
+                    [ce setBuffer:b[5] offset:0 atIndex:12];
+                    [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                } else {
+                    if (v) {
+                        grow(gbx_head_buf_, nchunks * 5 * sizeof(std::int64_t), "exact head partials");
+                        grow(gbx_tail_buf_, nchunks * 5 * sizeof(std::int64_t), "exact tail partials");
+                        [ce setComputePipelineState:ps_gbx_chunk_];
+                        [ce setBuffer:run_perm      offset:soff atIndex:0];
+                        [ce setBuffer:v->buffer()   offset:0 atIndex:1];
+                        [ce setBuffer:valid         offset:0 atIndex:2];
+                        [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:3];
+                        [ce setBuffer:mult_buf_     offset:0 atIndex:4];
+                        [ce setBytes:&n32  length:sizeof(n32)  atIndex:5];
+                        [ce setBytes:&ns32 length:sizeof(ns32) atIndex:6];
+                        [ce setBuffer:b[0] offset:0 atIndex:7];
+                        [ce setBuffer:b[1] offset:0 atIndex:8];
+                        [ce setBuffer:b[2] offset:0 atIndex:9];
+                        [ce setBuffer:b[4] offset:0 atIndex:10];
+                        [ce setBuffer:b[5] offset:0 atIndex:11];
+                        [ce setBuffer:gbx_head_buf_ offset:0 atIndex:12];
+                        [ce setBuffer:gbx_tail_buf_ offset:0 atIndex:13];
+                        [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
+                    [ce setComputePipelineState:ps_gbx_finalize_];
+                    [ce setBuffer:run_sorted offset:soff atIndex:0];
+                    [ce setBuffer:mult_buf_  offset:0 atIndex:1];
+                    [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
+                    [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
+                    [ce setBuffer:(v ? gbx_head_buf_ : b[0]) offset:0 atIndex:4];
+                    [ce setBuffer:(v ? gbx_tail_buf_ : b[0]) offset:0 atIndex:5];
+                    [ce setBuffer:b[6] offset:0 atIndex:6];    // keys
+                    [ce setBuffer:b[3] offset:0 atIndex:7];    // cstar
+                    [ce setBuffer:b[0] offset:0 atIndex:8];    // lo
+                    [ce setBuffer:b[1] offset:0 atIndex:9];    // hi
+                    [ce setBuffer:b[2] offset:0 atIndex:10];   // cnt
+                    [ce setBuffer:b[4] offset:0 atIndex:11];   // mn
+                    [ce setBuffer:b[5] offset:0 atIndex:12];   // mx
+                    [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:13];
+                    [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
-                [ce setComputePipelineState:ps_gbx_finalize_];
-                [ce setBuffer:sorted    offset:0 atIndex:0];
-                [ce setBuffer:mult_buf_ offset:0 atIndex:1];
-                [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
-                [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
-                [ce setBuffer:(v ? gbx_head_buf_ : b[0]) offset:0 atIndex:4];
-                [ce setBuffer:(v ? gbx_tail_buf_ : b[0]) offset:0 atIndex:5];
-                [ce setBuffer:b[6] offset:0 atIndex:6];    // keys
-                [ce setBuffer:b[3] offset:0 atIndex:7];    // cstar
-                [ce setBuffer:b[0] offset:0 atIndex:8];    // lo
-                [ce setBuffer:b[1] offset:0 atIndex:9];    // hi
-                [ce setBuffer:b[2] offset:0 atIndex:10];   // cnt
-                [ce setBuffer:b[4] offset:0 atIndex:11];   // mn
-                [ce setBuffer:b[5] offset:0 atIndex:12];   // mx
-                [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:13];
-                [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
-                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
                 kernel_ms += cb_kernel_ms(cb);
             }
 
-            // ---- the NULL-key group: fold the suffix on the host (UMA) ----
             if (null_group) {
-                Sum128 s; std::int64_t cnt = 0;
-                std::int64_t mn = std::numeric_limits<std::int64_t>::max();
-                std::int64_t mx = std::numeric_limits<std::int64_t>::min();
-                const std::size_t rows = n_total - n;
-                if (v) {
-                    const auto* vd = static_cast<const std::int64_t*>([v->buffer() contents]);
-                    const auto* vv = v->valid_buffer()
-                        ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
-                    for (std::size_t i = n; i < n_total; ++i) {
-                        if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
-                        const std::int64_t x = vd[i];
-                        s.add(x); ++cnt; mn = std::min(mn, x); mx = std::max(mx, x);
-                    }
-                } else {
-                    cnt = static_cast<std::int64_t>(rows);
-                }
-                static_cast<std::int64_t*>([b[0] contents])[num_segs] = static_cast<std::int64_t>(s.lo);
-                static_cast<std::int64_t*>([b[1] contents])[num_segs] = s.hi;
-                static_cast<std::int64_t*>([b[2] contents])[num_segs] = cnt;
-                static_cast<std::int64_t*>([b[3] contents])[num_segs] = static_cast<std::int64_t>(rows);
-                static_cast<std::int64_t*>([b[4] contents])[num_segs] = cnt ? mn : 0;
-                static_cast<std::int64_t*>([b[5] contents])[num_segs] = cnt ? mx : 0;
+                static_cast<std::int64_t*>([b[0] contents])[num_segs] = static_cast<std::int64_t>(ns.lo);
+                static_cast<std::int64_t*>([b[1] contents])[num_segs] = ns.hi;
+                static_cast<std::int64_t*>([b[2] contents])[num_segs] = ncnt;
+                static_cast<std::int64_t*>([b[3] contents])[num_segs] = ncstar;
+                static_cast<std::int64_t*>([b[4] contents])[num_segs] = ncnt ? nmn : 0;
+                static_cast<std::int64_t*>([b[5] contents])[num_segs] = ncnt ? nmx : 0;
                 static_cast<std::int64_t*>([b[6] contents])[num_segs] = 0;
             }
 
-            if (dev_filter) {
+            if (dev_path) {
                 auto* kn = static_cast<std::uint8_t*>([b[7] contents]);
                 std::memset(kn, 0, std::max<std::size_t>(1, total));
                 if (null_group) kn[num_segs] = 1;
                 device_filter_exact(r, b, total, filter, max_groups, op, kernel_ms);
             } else {
-                copy_back(o[0], r.sums);   copy_back(o[1], r.sums_hi);
-                copy_back(o[2], r.counts); copy_back(o[3], r.counts_star);
-                copy_back(o[4], r.mins);   copy_back(o[5], r.maxs);
-                copy_back(o[6], r.keys);
-                r.key_null.assign(total, 0);
-                if (null_group) r.key_null[num_segs] = 1;
+                if (filter.wants(1)) { copy_back(o[0], r.sums);   copy_back(o[1], r.sums_hi); }
+                if (filter.wants(2))   copy_back(o[2], r.counts);
+                if (filter.wants(3))   copy_back(o[3], r.counts_star);
+                if (filter.wants(4))   copy_back(o[4], r.mins);
+                if (filter.wants(5))   copy_back(o[5], r.maxs);
+                if (filter.wants(0)) {
+                    copy_back(o[6], r.keys);
+                    r.key_null.assign(total, 0);
+                    if (null_group) r.key_null[num_segs] = 1;
+                }
                 r.groups_total = total;
             }
             r.kernel_ms   = kernel_ms;
@@ -1540,8 +1852,8 @@ private:
                              const char* op, double& kernel_ms) {
         r.groups_total = total;
         const std::uint32_t ns32 = static_cast<std::uint32_t>(total);
-        const std::uint32_t agg  = agg_code(f.agg);
-        const std::uint32_t cmp  = cmp_code(f.cmp);
+        const std::uint32_t agg  = f.active() ? agg_code(f.agg) : 0u;
+        const std::uint32_t cmp  = f.active() ? cmp_code(f.cmp) : 7u;   // 7 = every non-empty group
         const std::int64_t  thr  = f.threshold_i64;
         const std::uint32_t desc = f.topk_desc ? 1u : 0u;
         const std::size_t   nb   = (total + kBlock - 1) / kBlock;
@@ -1575,11 +1887,20 @@ private:
         };
         std::vector<OutBuf> o(7);
         id<MTLBuffer> kn_out = nil;
+        // Columns the caller reads; a top-k result is re-ordered on the host
+        // by its aggregate and key, so everything is kept in that case.
+        const std::uint32_t want = f.topk ? GroupByFilter::kAllColumns : f.columns;
+        auto wants = [&](unsigned bit) { return (want >> bit) & 1u; };
+        std::vector<std::int64_t>* vecs[7] = { &r.sums, &r.sums_hi, &r.counts, &r.counts_star,
+                                               &r.mins, &r.maxs, &r.keys };
+        const unsigned bits[7] = { 1, 1, 2, 3, 4, 5, 0 };
+        std::vector<id<MTLBuffer>> unread(7, nil);
         auto alloc_out = [&](std::size_t rows) {
-            o[0] = out_for(r.sums, rows);   o[1] = out_for(r.sums_hi, rows);
-            o[2] = out_for(r.counts, rows); o[3] = out_for(r.counts_star, rows);
-            o[4] = out_for(r.mins, rows);   o[5] = out_for(r.maxs, rows);
-            o[6] = out_for(r.keys, rows);
+            const std::size_t bytes = std::max<std::size_t>(1, rows) * sizeof(std::int64_t);
+            for (int i = 0; i < 7; ++i) {
+                if (wants(bits[i])) { o[i] = out_for(*vecs[i], rows); }
+                else { o[i] = OutBuf{}; o[i].buf = grow_slot(unread, i, bytes, "exact unread survivor column"); o[i].aliased = true; }
+            }
             kn_out = grow(gbx_knull_out_, std::max<std::size_t>(1, rows), "exact key_null out");
         };
         auto compact = [&](std::uint32_t cmpc, std::uint32_t base, std::uint32_t limit) {
@@ -1605,23 +1926,27 @@ private:
             });
         };
         auto finish = [&](std::size_t rows) {
-            copy_back(o[0], r.sums);   copy_back(o[1], r.sums_hi);
-            copy_back(o[2], r.counts); copy_back(o[3], r.counts_star);
-            copy_back(o[4], r.mins);   copy_back(o[5], r.maxs);
-            copy_back(o[6], r.keys);
-            r.key_null.assign(rows, 0);
-            if (rows) std::memcpy(r.key_null.data(), [kn_out contents], rows);
+            for (int i = 0; i < 7; ++i) if (wants(bits[i])) copy_back(o[i], *vecs[i]);
+            if (wants(0)) {
+                r.key_null.assign(rows, 0);
+                if (rows) std::memcpy(r.key_null.data(), [kn_out contents], rows);
+            }
         };
 
-        // ---- HAVING only: survivors keep key order (compaction is stable) ----
+        // ---- no filter (masked reduce dropped groups) or HAVING only:
+        //      survivors keep key order (compaction is stable) ----
         if (f.topk == 0) {
             const std::size_t surv = count_pass(cmp);
+            if (!f.active()) r.groups_total = surv;     // empty groups were never groups
             cap_rows(surv, max_groups, op);
             alloc_out(surv);
             if (surv > 0) compact(cmp, 0u, static_cast<std::uint32_t>(surv));
             finish(surv);
             return;
         }
+        // Under a filter over a masked reduce, groups_total must not count
+        // the empty (masked-out) groups either.
+        r.groups_total = count_pass(7u);
 
         // ---- top-k ----
         // Candidates pass cmp and have a non-NULL aggregate. Without a HAVING
@@ -2031,6 +2356,11 @@ private:
     id<MTLComputePipelineState> ps_gbx_topk_hist_         = nil;
     id<MTLComputePipelineState> ps_gbx_topk_counts_       = nil;
     id<MTLComputePipelineState> ps_gbx_topk_compact_      = nil;
+    id<MTLComputePipelineState> ps_gbx_mask_              = nil;
+    id<MTLComputePipelineState> ps_gbxm_chunk_            = nil;
+    id<MTLComputePipelineState> ps_gbxm_finalize_         = nil;
+    id<MTLComputePipelineState> ps_gbx_sel_counts_        = nil;
+    id<MTLComputePipelineState> ps_gbx_sel_compact_       = nil;
 
     // Exact GROUP BY scratch: 5-long chunk partials, the finalized tuple
     // arrays (lo, hi, cnt, cstar, mn, mx, keys, key_null) kept on the device
@@ -2040,6 +2370,24 @@ private:
     std::vector<id<MTLBuffer>> gbx_f_ = std::vector<id<MTLBuffer>>(8, nil);
     id<MTLBuffer> gbx_dummy_valid_ = nil;
     id<MTLBuffer> gbx_knull_out_ = nil;
+    // §4.6 WHERE mask scratch: the mask (one byte per original row), IN
+    // lists, 6-long masked partials, and the compacted sorted keys /
+    // permutation of variant (b).
+    id<MTLBuffer> gbx_mask_buf_ = nil, gbx_list_buf_ = nil;
+    id<MTLBuffer> gbxm_head_buf_ = nil, gbxm_tail_buf_ = nil;
+    id<MTLBuffer> gbx_sel_keys_ = nil, gbx_sel_perm_ = nil;
+    // Variant choice: compact-then-reduce when the surviving fraction of the
+    // key range is below this (GPUDB_METAL_MASK_COMPACT_BELOW, default 0.5;
+    // the §9.1 selectivity sweep fixes it per backend).
+    double compact_below_ = [] {
+        double v = 0.5;
+        if (const char* e = std::getenv("GPUDB_METAL_MASK_COMPACT_BELOW")) {
+            char* end = nullptr;
+            const double x = std::strtod(e, &end);
+            if (end && end != e && *end == '\0' && x >= 0.0 && x <= 1.0) v = x;
+        }
+        return v;
+    }();
 
     // Resident GROUP BY scratch (grown on demand): per-256-block run-start
     // counts / offsets (u32), per-64-chunk head and tail partials (i64), and

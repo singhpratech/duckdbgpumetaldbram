@@ -474,6 +474,8 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
 struct GxInitData {
     gpudb::GroupByResidentResult res;
     std::size_t offset = 0;
+    std::size_t rows = 0;      // result rows (some vectors may be left empty, see GroupByFilter::columns)
+    std::vector<idx_t> cols;   // projection pushdown: output vector j is source column cols[j]
 };
 
 const char* gx_fn_name(GbForm form, bool where = false) {
@@ -594,6 +596,30 @@ void gx_bind(duckdb_bind_info info) {
 void gx_init(duckdb_init_info info) {
     auto* bind = static_cast<GxBindData*>(duckdb_init_get_bind_data(info));
     auto* init = new GxInitData();
+    // Projection pushdown: only the columns the statement reads are filled
+    // (a count(*) over the function reads none). Emitting 2M groups x 7
+    // columns through DuckDB's chunk pipeline costs more than the reduce.
+    std::uint32_t want = 0;
+    {
+        const idx_t nc = duckdb_init_get_column_count(info);
+        init->cols.reserve(nc);
+        for (idx_t i = 0; i < nc; ++i) {
+            const idx_t c = duckdb_init_get_column_index(info, i);
+            init->cols.push_back(c);
+            switch (c) {
+                case 0: want |= 1u << 0; break;                 // key
+                case 1: want |= 1u << 1; break;                 // sum
+                case 2: want |= 1u << 2; break;                 // count
+                case 3: want |= 1u << 3; break;                 // count_star
+                case 4: want |= 1u << 4; break;                 // min
+                case 5: want |= 1u << 5; break;                 // max
+                case 6: want |= (1u << 1) | (1u << 2); break;   // avg = sum / count
+                default: break;
+            }
+        }
+        // sum / min / max / avg NULL-ness is read from count(v)
+        if (want & ((1u << 1) | (1u << 4) | (1u << 5))) want |= 1u << 2;
+    }
     const GbForm form = bind->filter.topk != 0 ? GbForm::TopK
                       : bind->filter.cmp != gpudb::GroupByFilter::Cmp::None ? GbForm::Having
                       : GbForm::Plain;
@@ -613,12 +639,19 @@ void gx_init(duckdb_init_info info) {
         if (where) rw = resolve_where(*set, bind->where, fn);
         auto& agg = resident_aggregator(ctx);
         const std::size_t cap = groupby_rows_cap();
+        gpudb::GroupByFilter filt = bind->filter;
+        filt.columns = want;   // only the projected result vectors are materialised
         auto dev = resident_device_lock(ctx);
         if (where)
             init->res = agg.groupby_exact_masked_resident(*set->keys, set->vals.get(),
-                                                          rw.preds.data(), rw.preds.size(), cap, bind->filter);
+                                                          rw.preds.data(), rw.preds.size(), cap, filt);
         else
-            init->res = agg.groupby_exact_resident(*set->keys, set->vals.get(), cap, bind->filter);
+            init->res = agg.groupby_exact_resident(*set->keys, set->vals.get(), cap, filt);
+        {
+            const auto& rr = init->res;
+            init->rows = std::max({ rr.keys.size(), rr.sums.size(), rr.counts.size(), rr.counts_star.size(),
+                                    rr.mins.size(), rr.maxs.size() });
+        }
         const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
@@ -626,7 +659,7 @@ void gx_init(duckdb_init_info info) {
             "wall_ms=%.3f kernel_ms=%.3f transfer_ms=%.3f",
             fn + 4 /* strip "gpu_" */, gpudb::to_string(d.chosen),
             gpudb::to_string(d.reason), init->res.rows_in, init->res.groups_total,
-            init->res.keys.size(),
+            init->rows,
             init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms);
         resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
@@ -641,58 +674,81 @@ void gx_function(duckdb_function_info info, duckdb_data_chunk output) {
     auto* init = static_cast<GxInitData*>(duckdb_function_get_init_data(info));
     if (!init) return;
     const auto& r = init->res;
-    const std::size_t remaining = r.keys.size() - init->offset;
+    const std::size_t remaining = init->rows - init->offset;
     if (remaining == 0) return;
 
     constexpr idx_t kChunk = 2048;
     const idx_t out_n = static_cast<idx_t>(std::min<std::size_t>(remaining, kChunk));
     const std::size_t off = init->offset;
 
-    duckdb_vector v_key = duckdb_data_chunk_get_vector(output, 0);
-    duckdb_vector v_sum = duckdb_data_chunk_get_vector(output, 1);
-    duckdb_vector v_cnt = duckdb_data_chunk_get_vector(output, 2);
-    duckdb_vector v_cst = duckdb_data_chunk_get_vector(output, 3);
-    duckdb_vector v_min = duckdb_data_chunk_get_vector(output, 4);
-    duckdb_vector v_max = duckdb_data_chunk_get_vector(output, 5);
-    duckdb_vector v_avg = duckdb_data_chunk_get_vector(output, 6);
-    duckdb_vector_ensure_validity_writable(v_key);
-    duckdb_vector_ensure_validity_writable(v_sum);
-    duckdb_vector_ensure_validity_writable(v_min);
-    duckdb_vector_ensure_validity_writable(v_max);
-    duckdb_vector_ensure_validity_writable(v_avg);
-    auto* key = static_cast<std::int64_t*>(duckdb_vector_get_data(v_key));
-    auto* sum = static_cast<duckdb_hugeint*>(duckdb_vector_get_data(v_sum));
-    auto* cnt = static_cast<std::int64_t*>(duckdb_vector_get_data(v_cnt));
-    auto* cst = static_cast<std::int64_t*>(duckdb_vector_get_data(v_cst));
-    auto* mn  = static_cast<std::int64_t*>(duckdb_vector_get_data(v_min));
-    auto* mx  = static_cast<std::int64_t*>(duckdb_vector_get_data(v_max));
-    auto* avg = static_cast<double*>(duckdb_vector_get_data(v_avg));
-    uint64_t* key_ok = duckdb_vector_get_validity(v_key);
-    uint64_t* sum_ok = duckdb_vector_get_validity(v_sum);
-    uint64_t* min_ok = duckdb_vector_get_validity(v_min);
-    uint64_t* max_ok = duckdb_vector_get_validity(v_max);
-    uint64_t* avg_ok = duckdb_vector_get_validity(v_avg);
-
-    for (idx_t i = 0; i < out_n; ++i) {
-        const std::size_t j = off + i;
-        key[i] = r.keys[j];
-        if (!r.key_null.empty() && r.key_null[j]) duckdb_validity_set_row_invalid(key_ok, i);
-        cnt[i] = r.counts[j];
-        cst[i] = r.counts_star[j];
-        const gpudb::Sum128 s{static_cast<std::uint64_t>(r.sums[j]), r.sums_hi[j]};
-        sum[i].lower = s.lo;
-        sum[i].upper = s.hi;
-        mn[i] = r.mins[j];
-        mx[i] = r.maxs[j];
-        if (r.counts[j] == 0) {
-            // All payloads NULL: sum/min/max/avg are NULL, as native.
-            duckdb_validity_set_row_invalid(sum_ok, i);
-            duckdb_validity_set_row_invalid(min_ok, i);
-            duckdb_validity_set_row_invalid(max_ok, i);
-            duckdb_validity_set_row_invalid(avg_ok, i);
-            avg[i] = 0.0;
-        } else {
-            avg[i] = s.to_double() / static_cast<double>(r.counts[j]);
+    for (idx_t j = 0; j < init->cols.size(); ++j) {
+        duckdb_vector vec = duckdb_data_chunk_get_vector(output, j);
+        switch (init->cols[j]) {
+            case 0: {   // key (NULL for the NULL-key group)
+                auto* key = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                uint64_t* ok = nullptr;
+                for (idx_t i = 0; i < out_n; ++i) {
+                    key[i] = r.keys[off + i];
+                    if (!r.key_null.empty() && r.key_null[off + i]) {
+                        if (!ok) { duckdb_vector_ensure_validity_writable(vec); ok = duckdb_vector_get_validity(vec); }
+                        duckdb_validity_set_row_invalid(ok, i);
+                    }
+                }
+                break;
+            }
+            case 1: {   // sum HUGEINT (NULL when count(v) == 0)
+                auto* sum = static_cast<duckdb_hugeint*>(duckdb_vector_get_data(vec));
+                uint64_t* ok = nullptr;
+                for (idx_t i = 0; i < out_n; ++i) {
+                    sum[i].lower = static_cast<std::uint64_t>(r.sums[off + i]);
+                    sum[i].upper = r.sums_hi[off + i];
+                    if (r.counts[off + i] == 0) {
+                        if (!ok) { duckdb_vector_ensure_validity_writable(vec); ok = duckdb_vector_get_validity(vec); }
+                        duckdb_validity_set_row_invalid(ok, i);
+                    }
+                }
+                break;
+            }
+            case 2: {   // count(v)
+                auto* c = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) c[i] = r.counts[off + i];
+                break;
+            }
+            case 3: {   // count(*)
+                auto* c = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) c[i] = r.counts_star[off + i];
+                break;
+            }
+            case 4: case 5: {   // min / max (NULL when count(v) == 0)
+                const auto& src = init->cols[j] == 4 ? r.mins : r.maxs;
+                auto* m = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                uint64_t* ok = nullptr;
+                for (idx_t i = 0; i < out_n; ++i) {
+                    m[i] = src[off + i];
+                    if (r.counts[off + i] == 0) {
+                        if (!ok) { duckdb_vector_ensure_validity_writable(vec); ok = duckdb_vector_get_validity(vec); }
+                        duckdb_validity_set_row_invalid(ok, i);
+                    }
+                }
+                break;
+            }
+            case 6: {   // avg DOUBLE = native's hugeint->double of the exact sum, over count(v)
+                auto* a = static_cast<double*>(duckdb_vector_get_data(vec));
+                uint64_t* ok = nullptr;
+                for (idx_t i = 0; i < out_n; ++i) {
+                    const std::int64_t cnt = r.counts[off + i];
+                    if (cnt == 0) {
+                        a[i] = 0.0;
+                        if (!ok) { duckdb_vector_ensure_validity_writable(vec); ok = duckdb_vector_get_validity(vec); }
+                        duckdb_validity_set_row_invalid(ok, i);
+                    } else {
+                        const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[off + i]), r.sums_hi[off + i]};
+                        a[i] = sm.to_double() / static_cast<double>(cnt);
+                    }
+                }
+                break;
+            }
+            default: break;
         }
     }
     duckdb_data_chunk_set_size(output, out_n);
@@ -833,9 +889,11 @@ void register_table_fn(duckdb_connection con, const char* name,
                        duckdb_table_function_bind_t bind,
                        duckdb_table_function_init_t init,
                        duckdb_table_function_t fn,
-                       const std::shared_ptr<ResidentContext>& ctx) {
+                       const std::shared_ptr<ResidentContext>& ctx,
+                       bool projection_pushdown = false) {
     duckdb_table_function tf = duckdb_create_table_function();
     duckdb_table_function_set_name(tf, name);
+    if (projection_pushdown) duckdb_table_function_supports_projection_pushdown(tf, true);
     for (duckdb_type t : params) {
         duckdb_logical_type lt = duckdb_create_logical_type(t);
         duckdb_table_function_add_parameter(tf, lt);
@@ -883,22 +941,22 @@ void register_gpu_groupby(duckdb_connection con, const std::shared_ptr<ResidentC
                       gb_bind<GbOp::Count, GbForm::TopK>, gb_init, gb_function, ctx);
     // exact GROUP BY (v0.7 §4): full native tuple, HUGEINT sum, NULL semantics
     register_table_fn(con, "gpu_groupby_exact_resident", {DUCKDB_TYPE_VARCHAR},
-                      gx_bind<GbForm::Plain, false>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::Plain, false>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_groupby_exact_resident_having",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
-                      gx_bind<GbForm::Having, false>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::Having, false>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_groupby_exact_resident_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      gx_bind<GbForm::TopK, false>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::TopK, false>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     // ... with a WHERE program over the set's predicate columns (§4.6)
     register_table_fn(con, "gpu_groupby_exact_resident_where", {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR},
-                      gx_bind<GbForm::Plain, true>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::Plain, true>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_groupby_exact_resident_where_having",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT},
-                      gx_bind<GbForm::Having, true>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::Having, true>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_groupby_exact_resident_where_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
-                      gx_bind<GbForm::TopK, true>, gx_init, gx_function, ctx);
+                      gx_bind<GbForm::TopK, true>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_topk_resident",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       tk_bind<gpudb::Dtype::I64>, tk_init, tk_function, ctx);

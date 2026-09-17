@@ -50,7 +50,18 @@ same run-start pipeline as the v0.6 GROUP BY, with the payload's validity
 bitmap read in the reduce and the two-limb sum carried by hand), the NULL-key
 suffix is folded into one trailing group on the host (UMA, cost ∝ NULL-key
 rows), and HAVING / top-k run on the device over the tuple — top-k on the sum
-is a 16-pass radix select over the 128-bit ordinal. `gpu_last_stats()` reports the backend, dispatch
+is a 16-pass radix select over the 128-bit ordinal. The WHERE mask (§4.6) on Metal: key comparisons are
+folded into a `[lo, hi)` range of the sorted prefix by binary search on the
+UMA sorted cache (zero per-row cost; a comparison drops the NULL-key group as
+native does); every other term is one `gbx_mask_i64` pass over the original
+rows into a byte mask; then either `gbxm_chunk_i64` reduces in place skipping
+masked rows with `count(*)` carried in the tuple and empty groups dropped by
+the compaction (variant a), or `gbx_sel_compact_i64` compacts the sorted keys
+and permutation to the survivors and the ordinary reduce runs over them
+(variant b) — chosen by the surviving fraction against
+`GPUDB_METAL_MASK_COMPACT_BELOW` (default 0.5; the §9.1 sweep fixes it per
+backend). The exact table functions declare projection pushdown, so a
+statement that reads two of the seven columns pays for two. `gpu_last_stats()` reports the backend, dispatch
 reason, `rows_in`, `groups`, and the wall / kernel / transfer split for the
 last call, as for the other resident ops. Group count is capped at `GPUDB_GROUPBY_ROWS_MAX_M`
 million (default 100) with a clean error naming the actual count — checked
