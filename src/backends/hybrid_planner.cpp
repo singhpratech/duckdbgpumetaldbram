@@ -385,6 +385,11 @@ public:
             });
     }
 
+    // Rule 1: the rewrite may only fire when the exact ops run on the GPU side.
+    bool exact_supported() const noexcept override {
+        return gpu_ ? gpu_->exact_supported() : cpu_->exact_supported();
+    }
+
     // v0.7 §4.6: multi-lane exact upload, same placement rule.
     std::vector<std::unique_ptr<ResidentColumn>>
     upload_rows_exact(const RowSpan* spans, std::size_t n_spans,

@@ -563,6 +563,13 @@ public:
                                                                 std::size_t max_groups,
                                                                 const GroupByFilter& filter = GroupByFilter{});
 
+    // Does this backend run the exact path (upload_rows_exact +
+    // groupby_exact_[masked_]resident) on its own device? False means the
+    // default-throwing stubs are in place and the hybrid would fall back to
+    // the CPU reference — correct, but not the GPU, so the transparent
+    // rewrite must not fire on it (rule 1). The hybrid reports its GPU side.
+    [[nodiscard]] virtual bool exact_supported() const noexcept { return false; }
+
     // ORDER BY col [DESC] LIMIT k over a resident column (I64 or F64).
     // Returns the k smallest (descending=false) or largest values with their
     // ORIGINAL upload-order indices; k is clamped to rows(). Values arrive

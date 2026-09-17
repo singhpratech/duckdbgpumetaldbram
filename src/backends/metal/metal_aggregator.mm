@@ -216,6 +216,8 @@ public:
     // the interleaved segments (UMA: the shared buffers are the device
     // memory) partitions NULL-key rows to a suffix of both columns, keeps
     // NULL payloads in place under a validity bitmap, and de-interleaves.
+    bool exact_supported() const noexcept override { return true; }
+
     ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
                                    Dtype vdt) override {
         if (vdt != Dtype::I64)

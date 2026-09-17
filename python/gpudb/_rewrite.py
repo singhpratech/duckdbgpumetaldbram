@@ -46,9 +46,18 @@ class Decline(Exception):
 
 @dataclass
 class OutItem:
-    kind: str                 # 'key' | 'sum' | 'count'
+    kind: str                 # 'key' | 'sum' | 'count' | 'count_star' | 'min' | 'max' | 'avg'
     name: str                 # output column name (alias or native auto-name)
     native_type: str          # from DESCRIBE of the original statement
+
+
+# A WHERE term (v0.7 §4.6): column, op in {> >= < <= = <> in isnull isnotnull},
+# literal(s) as Decimal (or None for the NULL tests).
+@dataclass
+class WhereTerm:
+    col: str
+    op: str
+    lit: object = None        # Decimal | list[Decimal] | None
 
 
 @dataclass
@@ -69,10 +78,24 @@ class Plan:
     limit: Optional[int] = None
     form: str = "plain"                # plain | having | topk
     tag: str = ""
+    # v0.7 exact path
+    exact: bool = False                # render for gpu_upload_rows_exact / gpu_groupby_exact_resident*
+    where: List[WhereTerm] = field(default_factory=list)
+    pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
+    pred_types: Dict[str, str] = field(default_factory=dict)
+    topk_agg: str = ""                 # aggregate kind the top-k push orders by
 
     @property
     def upload_columns(self) -> List[str]:
+        if self.exact:
+            return [self.key, self.val if self.val else "-"] + list(self.pred_cols)
         return [self.key] + ([self.val] if self.val else [])
+
+    def uses_exact_only(self) -> bool:
+        """Anything a v0.6 set cannot answer: WHERE, min/max/avg, count(v)
+        with NULLs — decided by the caller from the backend's capability."""
+        return bool(self.where) or any(o.kind in ("min", "max", "avg") for o in self.outputs) \
+            or (self.having is not None and self.having[0] in ("min", "max", "avg"))
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +124,12 @@ def _agg(e) -> Optional[Tuple[str, Optional[str]]]:
     children = e.get("children") or []
     if fname == "count_star" and not children:
         return ("count_star", None)
-    if fname in ("sum", "count") and len(children) == 1:
+    if fname in ("sum", "count", "min", "max", "avg") and len(children) == 1:
         c = _colref(children[0])
         if c is None:
             raise Decline("shape", f"{fname} over an expression")
         return (fname, c)
-    if fname in ("min", "max", "avg", "sum_no_overflow", "count_star"):
+    if fname in ("sum_no_overflow", "count_star"):
         raise Decline("shape", f"{fname} not on the transparent path yet")
     return None
 
@@ -125,6 +148,8 @@ def _const(e):
         info = (v.get("type") or {}).get("type_info") or {}
         scale = int(info.get("scale", 0))
         return Decimal(int(val)) / (Decimal(10) ** scale)
+    if t in ("DOUBLE", "FLOAT"):
+        return Decimal(repr(float(val)))
     raise Decline("shape", f"constant of type {t}")
 
 
@@ -154,8 +179,8 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         raise Decline("shape", "CTE present")
     if ft.get("sample") or ft.get("at_clause") or ft.get("column_name_alias"):
         raise Decline("shape", "table sample/at/alias")
-    if node.get("sample") or node.get("qualify") or node.get("where_clause"):
-        raise Decline("shape", "sample/qualify/where")
+    if node.get("sample") or node.get("qualify"):
+        raise Decline("shape", "sample/qualify")
     if node.get("aggregate_handling") != "STANDARD_HANDLING":
         raise Decline("shape", "GROUP BY ALL")
     if node.get("distinct") or node.get("modifiers") is None:
@@ -170,6 +195,62 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
     alias_tbl = ft.get("alias") or table
     plan = Plan(catalog=ft.get("catalog_name") or "", schema=ft.get("schema_name") or "",
                 table=table, key=key)
+
+    # where (v0.7 §4.6): a conjunction of column-vs-constant comparisons,
+    # IN, BETWEEN, IS [NOT] NULL over columns of t
+    def where_walk(e):
+        cls, ty = e.get("class"), e.get("type")
+        if cls == "CONJUNCTION":
+            if ty != "CONJUNCTION_AND":
+                raise Decline("shape", "OR in WHERE")
+            for ch in e.get("children") or []:
+                where_walk(ch)
+            return
+        if cls == "COMPARISON":
+            if ty not in _CMP:
+                raise Decline("shape", f"WHERE comparison {ty}")
+            op = _CMP[ty]
+            left, right = e.get("left") or {}, e.get("right") or {}
+            c = _colref(left)
+            if c is not None and _const(right) is not None:
+                plan.where.append(WhereTerm(c, op, _const(right)))
+            elif _colref(right) is not None and _const(left) is not None:
+                plan.where.append(WhereTerm(_colref(right), _FLIP[op], _const(left)))
+            else:
+                raise Decline("shape", "WHERE is not column vs constant")
+            return
+        if cls == "OPERATOR" and ty in ("OPERATOR_IS_NULL", "OPERATOR_IS_NOT_NULL"):
+            ch = e.get("children") or []
+            c = _colref(ch[0]) if len(ch) == 1 else None
+            if c is None:
+                raise Decline("shape", "IS NULL over an expression")
+            plan.where.append(WhereTerm(c, "isnull" if ty == "OPERATOR_IS_NULL" else "isnotnull"))
+            return
+        if cls == "OPERATOR" and ty == "COMPARE_IN":
+            ch = e.get("children") or []
+            c = _colref(ch[0]) if ch else None
+            if c is None or len(ch) < 2:
+                raise Decline("shape", "IN shape")
+            vals = []
+            for x in ch[1:]:
+                if x.get("class") != "CONSTANT":
+                    raise Decline("shape", "IN over a non-constant")
+                if (x.get("value") or {}).get("is_null"):
+                    continue
+                vals.append(_const(x))
+            plan.where.append(WhereTerm(c, "in", vals))
+            return
+        if cls == "BETWEEN" and ty == "COMPARE_BETWEEN":
+            c = _colref(e.get("input") or {})
+            lo, hi = _const(e.get("lower") or {}), _const(e.get("upper") or {})
+            if c is None or lo is None or hi is None:
+                raise Decline("shape", "BETWEEN shape")
+            plan.where.append(WhereTerm(c, ">=", lo))
+            plan.where.append(WhereTerm(c, "<=", hi))
+            return
+        raise Decline("shape", f"WHERE expression {cls}")
+    if node.get("where_clause"):
+        where_walk(node["where_clause"])
 
     # select list
     sel = node.get("select_list") or []
@@ -188,19 +269,15 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         if a is None:
             raise Decline("shape", "select expression")
         kind, col = a
+        if kind == "count_star":
+            plan.outputs.append(OutItem("count_star", alias or "count_star()", ""))
+            continue
+        if plan.val not in (None, col):
+            raise Decline("shape", "two payload columns")
+        plan.val = col
         if kind == "sum":
-            if plan.val not in (None, col):
-                raise Decline("shape", "two payload columns")
-            plan.val = col
             plan.needs_sum = True
-            plan.outputs.append(OutItem("sum", alias or f"sum({col})", ""))
-        elif kind == "count":
-            if plan.val not in (None, col):
-                raise Decline("shape", "two payload columns")
-            plan.val = col
-            plan.outputs.append(OutItem("count", alias or f"count({col})", ""))
-        else:
-            plan.outputs.append(OutItem("count", alias or "count_star()", ""))
+        plan.outputs.append(OutItem(kind, alias or f"{kind}({col})", ""))
     if any(m.get("type") == "DISTINCT_MODIFIER" for m in node.get("modifiers") or []):
         raise Decline("shape", "DISTINCT")
 
@@ -220,16 +297,15 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             op = _FLIP[op]
         else:
             raise Decline("shape", "having is not aggregate vs constant")
-        if akind == "sum":
+        if akind == "count_star":
+            plan.having = ("count_star", op, lit)
+        else:
             if plan.val not in (None, acol):
                 raise Decline("shape", "having over another payload")
             plan.val = acol
-            plan.needs_sum = True
-            plan.having = ("sum", op, lit)
-        elif akind == "count_star" or (akind == "count" and acol == plan.val):
-            plan.having = ("count", op, lit)
-        else:
-            raise Decline("shape", "having aggregate")
+            if akind == "sum":
+                plan.needs_sum = True
+            plan.having = (akind, op, lit)
         plan.form = "having"
 
     # modifiers: ORDER BY / LIMIT
@@ -263,10 +339,10 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                     if a is None:
                         raise Decline("shape", "order by expression")
                     kind, col = a
-                    if kind == "sum" and col == plan.val:
-                        target = ("sum", None)
-                    elif kind == "count_star" or (kind == "count" and col == plan.val):
-                        target = ("count", None)
+                    if kind == "count_star":
+                        target = ("count_star", None)
+                    elif col == plan.val:
+                        target = (kind, None)
                     else:
                         raise Decline("shape", "order by aggregate")
                 plan.order.append((target[0] + ("" if target[1] is None else ":" + target[1]),
@@ -288,10 +364,15 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
     if plan.limit is not None and len(plan.order) == 1 and plan.having is None:
         tgt, direction, nulls = plan.order[0]
         base = tgt.split(":")[0]
-        if base in ("sum", "count"):
+        if base in ("sum", "count", "count_star", "min", "max"):
             d = direction if direction != "ORDER_DEFAULT" else default_order
             if d in ("ASCENDING", "DESCENDING", "ASC", "DESC"):
                 plan.form = "topk"
+                plan.topk_agg = base
+    # predicate columns of the set: WHERE columns other than key / payload
+    for w in plan.where:
+        if w.col not in (plan.key, plan.val) and w.col not in plan.pred_cols:
+            plan.pred_cols.append(w.col)
     return plan
 
 
@@ -303,13 +384,32 @@ def decimal_scale(t: str) -> Optional[Tuple[int, int]]:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
-def check_types(plan: Plan, columns: Dict[str, str]) -> None:
+def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> None:
+    plan.exact = exact
+    if not exact and plan.uses_exact_only():
+        raise Decline("shape", "WHERE / min / max / avg need the exact path (backend without it)")
+    if not exact and any(o.kind == "count" for o in plan.outputs):
+        pass   # count(v) on a NULL-free v0.6 set is exact; NULLs are rejected by the stats gate
     kt = columns.get(plan.key)
     if kt is None:
         raise Decline("shape", f"unknown column {plan.key}")
     if kt not in _KEY_TYPES:
         raise Decline("shape", f"key type {kt}")
     plan.key_type = kt
+    for c in plan.pred_cols:
+        pt = columns.get(c)
+        if pt is None:
+            raise Decline("shape", f"unknown column {c}")
+        if pt in _INT_TYPES or pt in ("DOUBLE", "FLOAT", "REAL") or decimal_scale(pt):
+            plan.pred_types[c] = pt
+        else:
+            raise Decline("shape", f"WHERE column type {pt}")
+    if exact and plan.val is not None and any(o.kind == "avg" for o in plan.outputs) \
+            and decimal_scale(columns.get(plan.val, "")):
+        raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
+    if exact and plan.having is not None and plan.having[0] == "avg" \
+            and plan.val is not None and decimal_scale(columns.get(plan.val, "")):
+        raise Decline("decimal", "HAVING avg over a DECIMAL payload")
     if plan.val is not None:
         vt = columns.get(plan.val)
         if vt is None:
@@ -354,48 +454,116 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
     raise Decline("shape", "=/<> against a non-representable threshold")
 
 
-def render(plan: Plan, fqn: str, default_order: str) -> str:
+def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
+    """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
+    if col == plan.key:
+        return "k", "i", 0
+    if col == plan.val:
+        return "v", "i", plan.scale
+    ni = nf = 0
+    for c in plan.pred_cols:
+        t = plan.pred_types.get(c, "")
+        if t in ("DOUBLE", "FLOAT", "REAL"):
+            if c == col:
+                return f"f{nf}", "f", 0
+            nf += 1
+        else:
+            if c == col:
+                d = decimal_scale(t)
+                return f"i{ni}", "i", (d[1] if d else 0)
+            ni += 1
+    raise Decline("shape", f"WHERE column {col} is not in the set")
+
+
+def _where_program(plan: Plan) -> str:
+    terms = []
+    for w in plan.where:
+        lane, kind, scale = _lane_of(plan, w.col)
+        if w.op in ("isnull", "isnotnull"):
+            terms.append(f"{lane} is null" if w.op == "isnull" else f"{lane} is not null")
+            continue
+        if kind == "f":
+            def f(x):
+                return repr(float(x))
+            if w.op == "in":
+                terms.append(f"{lane} in ({', '.join(f(x) for x in w.lit)})")
+            else:
+                terms.append(f"{lane} {'!=' if w.op == '<>' else w.op} {f(w.lit)}")
+            continue
+        if w.op == "in":
+            vals = []
+            for x in w.lit:
+                t = x * (Decimal(10) ** scale)
+                if t == t.to_integral_value():
+                    vals.append(str(int(t)))
+            if not vals:
+                raise Decline("shape", "IN list with no representable value")
+            terms.append(f"{lane} in ({', '.join(vals)})")
+            continue
+        op, thr = _rescale_threshold(w.op, w.lit, scale)
+        terms.append(f"{lane} {'!=' if op == '<>' else op} {thr}")
+    return "; ".join(terms)
+
+
+def _native_type_of(plan: Plan, kind: str) -> str:
+    if kind == "sum":
+        return f"DECIMAL(38,{plan.scale})" if plan.scale else "HUGEINT"
+    if kind in ("count", "count_star"):
+        return "BIGINT"
+    if kind in ("min", "max"):
+        return plan.val_type
+    return "DOUBLE"
+
+
+def _out_expr(plan: Plan, col: str, native_type: str) -> str:
+    """r.<col> typed exactly as native: DECIMAL(p, s) through the exact scaled
+    multiply (then CAST to DECIMAL(p, s) when p != 38)."""
+    d = decimal_scale(native_type)
+    if d and d[1] > 0:
+        p, s = d
+        inner = f'(CAST(r."{col}" AS DECIMAL({38 - s},0)) * {Decimal(1).scaleb(-s)})'
+        return inner if p == 38 else f"CAST({inner} AS DECIMAL({p},{s}))"
+    if native_type.upper() in ("BIGINT",):
+        return f'r."{col}"'
+    return f'CAST(r."{col}" AS {native_type})'
+
+
+def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     tag = plan.tag.replace("'", "''")
-    sum_path = plan.val is not None            # pair set: key + payload
-    base = "gpu_groupby_sum_resident" if sum_path else "gpu_groupby_count_resident"
-    fn, args = base, [f"'{tag}'"]
-    extra_pred = ""                            # HAVING left to the outer statement
+    fn, args = "gpu_groupby_exact_resident", [f"'{tag}'"]
+    prog = _where_program(plan)
+    if prog:
+        fn += "_where"
+        args.append("'" + prog.replace("'", "''") + "'")
+    extra_pred = ""
     if plan.form == "having":
         akind, op, lit = plan.having
-        if akind == "sum":
-            op, thr = _rescale_threshold(op, lit, plan.scale)
-            fn = base + "_having"
-            args += [f"'{op}'", str(thr)]
-        else:                                  # count
-            op, thr = _rescale_threshold(op, lit, 0)
-            if sum_path:
-                extra_pred = f' AND r."count" {op} {thr}'
-            else:
-                fn = base + "_having"
-                args += [f"'{op}'", str(thr)]
+        col = {"count": "count", "count_star": "count_star"}.get(akind, akind)
+        if akind != "avg" and op in (">", ">=", "<", "<="):
+            scale = plan.scale if akind in ("sum", "min", "max") else 0
+            op2, thr = _rescale_threshold(op, lit, scale)
+            fn += "_having"
+            args += [f"'{col}'", f"'{op2}'", str(thr)]
+        else:
+            extra_pred = f" AND {_out_expr(plan, col, _native_type_of(plan, akind))} {op} {lit}"
     elif plan.form == "topk":
         tgt, direction, _ = plan.order[0]
         d = direction if direction != "ORDER_DEFAULT" else default_order
         dir_word = "desc" if d in ("DESCENDING", "DESC") else "asc"
-        if tgt.split(":")[0] == ("sum" if sum_path else "count"):
-            fn = base + "_topk"
-            args += [str(plan.limit), f"'{dir_word}'"]
-        # ORDER BY count on the sum path: plain function, native sort + limit
+        fn += "_topk"
+        args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
     cols = []
     for out in plan.outputs:
-        if out.kind == "key":
-            cols.append(f'CAST(r."key" AS {out.native_type}) AS "{out.name}"')
-        elif out.kind == "sum":
-            if plan.scale:
-                cols.append(f'(CAST(r."sum" AS DECIMAL({38 - plan.scale},0)) * '
-                            f'{Decimal(1).scaleb(-plan.scale)}) AS "{out.name}"')
-            else:
-                cols.append(f'CAST(r."sum" AS {out.native_type}) AS "{out.name}"')
-        else:
-            cols.append(f'CAST(r."count" AS {out.native_type}) AS "{out.name}"')
+        col = "key" if out.kind == "key" else out.kind
+        cols.append(f'{_out_expr(plan, col, out.native_type)} AS "{out.name}"')
     sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
            f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
            f"WHERE gd.ok{extra_pred}")
+    return sql + _order_limit_sql(plan)
+
+
+def _order_limit_sql(plan: Plan) -> str:
+    sql = ""
     if plan.order:
         parts = []
         for tgt, direction, nulls in plan.order:
@@ -414,6 +582,53 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
     return sql
 
 
+def render(plan: Plan, fqn: str, default_order: str) -> str:
+    if plan.exact:
+        return _render_exact(plan, fqn, default_order)
+    tag = plan.tag.replace("'", "''")
+    sum_path = plan.val is not None            # pair set: key + payload
+    base = "gpu_groupby_sum_resident" if sum_path else "gpu_groupby_count_resident"
+    fn, args = base, [f"'{tag}'"]
+    extra_pred = ""                            # HAVING left to the outer statement
+    if plan.form == "having":
+        akind, op, lit = plan.having
+        if akind == "sum":
+            op, thr = _rescale_threshold(op, lit, plan.scale)
+            fn = base + "_having"
+            args += [f"'{op}'", str(thr)]
+        else:                                  # count / count_star
+            op, thr = _rescale_threshold(op, lit, 0)
+            if sum_path:
+                extra_pred = f' AND r."count" {op} {thr}'
+            else:
+                fn = base + "_having"
+                args += [f"'{op}'", str(thr)]
+    elif plan.form == "topk":
+        tgt, direction, _ = plan.order[0]
+        d = direction if direction != "ORDER_DEFAULT" else default_order
+        dir_word = "desc" if d in ("DESCENDING", "DESC") else "asc"
+        if tgt.split(":")[0] in (("sum",) if sum_path else ("count", "count_star")):
+            fn = base + "_topk"
+            args += [str(plan.limit), f"'{dir_word}'"]
+        # ORDER BY count on the sum path: plain function, native sort + limit
+    cols = []
+    for out in plan.outputs:
+        if out.kind == "key":
+            cols.append(f'CAST(r."key" AS {out.native_type}) AS "{out.name}"')
+        elif out.kind == "sum":
+            if plan.scale:
+                cols.append(f'(CAST(r."sum" AS DECIMAL({38 - plan.scale},0)) * '
+                            f'{Decimal(1).scaleb(-plan.scale)}) AS "{out.name}"')
+            else:
+                cols.append(f'CAST(r."sum" AS {out.native_type}) AS "{out.name}"')
+        else:                                  # count / count_star on a v0.6 set
+            cols.append(f'CAST(r."count" AS {out.native_type}) AS "{out.name}"')
+    sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
+           f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
+           f"WHERE gd.ok{extra_pred}")
+    return sql + _order_limit_sql(plan)
+
+
 def upload_sql(plan: Plan, fqn: str) -> str:
     """The upload statement for the plan's resident set (§5.5). Integer
     payloads are cast to BIGINT (exact); DECIMAL(p<=18,s) payloads are
@@ -421,6 +636,27 @@ def upload_sql(plan: Plan, fqn: str) -> str:
     integral DECIMAL."""
     tag = plan.tag.replace("'", "''")
     k = f'CAST("{plan.key}" AS BIGINT)'
+    if plan.exact:
+        if plan.val is None:
+            v = "CAST(NULL AS BIGINT)"
+        elif plan.scale:
+            v = f'CAST("{plan.val}" * {10 ** plan.scale} AS BIGINT)'
+        else:
+            v = f'CAST("{plan.val}" AS BIGINT)'
+        if not plan.pred_cols:
+            # no predicate lanes: the 2-lane exact upload (same set, no list
+            # columns to plan per segment statement)
+            return f"SELECT gpu_upload_pair_exact('{tag}', {k}, {v}) FROM {fqn}"
+        pi, pf = [], []
+        for c in plan.pred_cols:
+            t = plan.pred_types.get(c, "")
+            if t in ("DOUBLE", "FLOAT", "REAL"):
+                pf.append(f'CAST("{c}" AS DOUBLE)')
+            else:
+                d = decimal_scale(t)
+                pi.append(f'CAST("{c}" * {10 ** d[1]} AS BIGINT)' if d and d[1] else f'CAST("{c}" AS BIGINT)')
+        return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
+                f"[{', '.join(pf)}]::DOUBLE[]) FROM {fqn}")
     if plan.val is None:
         return f"SELECT gpu_upload('{tag}', {k}) FROM {fqn}"
     if plan.scale:

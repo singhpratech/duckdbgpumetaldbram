@@ -160,6 +160,7 @@ class Connection:
             return
         m = re.search(r"runtime=(\w+)", info)
         self._backend = (m.group(1) if m else "").upper()   # CPU | METAL | CUDA
+        self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
         try:
             self._raw.execute("SELECT gpu_rewrite_ast('{}', '{}')").fetchall()
             self._has_rewrite_scalar = True
@@ -415,7 +416,7 @@ class Connection:
             # from the current statement's tree with the reference renderer
             # (one serialize, no catalog work, no scalar call)
             plan = d.plan
-            if literals != d.literals and (plan.having is not None or plan.limit is not None):
+            if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
                 plan = self._replan_literals(sql, plan)
                 if plan is None:
                     self._last.reason = "shape"
@@ -459,6 +460,9 @@ class Connection:
             return None
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
         plan.outputs, plan.tag = cached.outputs, cached.tag
+        plan.exact, plan.pred_types = cached.exact, cached.pred_types
+        if plan.pred_cols != cached.pred_cols:
+            return None
         if plan.form == "topk" and cached.form != "topk":
             plan.form = cached.form
         return plan
@@ -476,7 +480,7 @@ class Connection:
         if ident is None:
             return Decision(False, why)
         try:
-            _rewrite.check_types(plan, ident.columns)
+            _rewrite.check_types(plan, ident.columns, exact=getattr(self, "_exact", False))
         except _rewrite.Decline as e:
             return Decision(False, e.reason)
         # thresholds: the row count floor (§9.1); group estimate comes from
@@ -487,7 +491,16 @@ class Connection:
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
         for col in plan.upload_columns:
+            if col == "-":
+                continue
             st = _resolve.column_stats(self._raw, ident, col)
+            if plan.exact:
+                # the exact path keeps NULLs and never wraps: statistics are
+                # informative only (thresholds), never a gate
+                if st is not None:
+                    stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+                                  "approx_unique": st.approx_unique}
+                continue
             if st is None or st.has_null:
                 return Decision(False, "nulls")
             stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
@@ -519,6 +532,7 @@ class Connection:
             # the decision must not depend on it.
             ctx = {
                 "tag": plan.tag,
+                "exact": plan.exact,
                 "table": {"catalog": ident.catalog, "schema": ident.schema, "name": ident.table,
                           "oid": ident.oid},
                 "columns": {c: {"type": t, "scale": (_rewrite.decimal_scale(t) or (0, 0))[1]}

@@ -103,6 +103,7 @@ private:
 class CpuAggregator final : public Aggregator {
 public:
     Backend backend() const noexcept override { return Backend::CPU; }
+    bool exact_supported() const noexcept override { return true; }   // the reference
 
     std::string device_name() const override {
 #if GPUDB_HAVE_OPENMP
