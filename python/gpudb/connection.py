@@ -463,6 +463,7 @@ class Connection:
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
         plan.outputs, plan.tag = cached.outputs, cached.tag
         plan.exact, plan.pred_types = cached.exact, cached.pred_types
+        plan.keys, plan.key_types, plan.pack = cached.keys, cached.key_types, cached.pack
         if plan.pred_cols != cached.pred_cols:
             return None
         if plan.form == "topk" and cached.form != "topk":
@@ -492,16 +493,16 @@ class Connection:
             return Decision(False, "threshold")
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
-        for col in plan.upload_columns:
-            if col == "-":
-                continue
+        stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
+        for col in stat_cols:
             st = _resolve.column_stats(self._raw, ident, col)
             if plan.exact:
                 # the exact path keeps NULLs and never wraps: statistics are
                 # informative only (thresholds), never a gate
                 if st is not None:
                     stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
-                                  "approx_unique": st.approx_unique}
+                                  "approx_unique": st.approx_unique,
+                                  "min_raw": st.min, "max_raw": st.max}   # temporal bounds stay text
                 continue
             if st is None or st.has_null:
                 return Decision(False, "nulls")
@@ -516,11 +517,34 @@ class Connection:
                     return Decision(False, "overflow")
         if self._settings["default_collation"]:
             pass   # integer keys only in this cut; VARCHAR keys arrive with §4.5
+        # packed keys (§4.4): each component's integer image bounds from stats()
+        if plan.exact and plan.packed:
+            pack = []
+            for kc, kt in zip(plan.keys, plan.key_types):
+                st = stats.get(kc) or {}
+                lo, hi = _rewrite.stat_image(st.get("min_raw"), kt), _rewrite.stat_image(st.get("max_raw"), kt)
+                if lo is None or hi is None or hi < lo:
+                    return Decision(False, "shape")
+                pack.append((lo, hi - lo + 2))
+            stride, packs = 1, []
+            for mn, rng in reversed(pack):
+                if stride > (2 ** 63 - 1) // rng:
+                    return Decision(False, "shape")      # does not fit in 64 bits: native
+                packs.append((mn, rng, stride))
+                stride *= rng
+            plan.pack = list(reversed(packs))
         # per-backend thresholds (§9.1): distinct-count estimate of the key and,
         # under a WHERE, the selectivity of THIS statement's literals (one
         # count(*) scan at decision time, cached with the template)
         if plan.exact and getattr(self, "_thresholds", True):
             est = (stats.get(plan.key) or {}).get("approx_unique")
+            if plan.packed:
+                est = 1
+                for kc in plan.keys:
+                    u = (stats.get(kc) or {}).get("approx_unique")
+                    est = None if (u is None or est is None) else est * u
+                if est is not None:
+                    est = min(est, nrows)
             sel = None
             if plan.where:
                 try:
@@ -553,6 +577,9 @@ class Connection:
             ctx = {
                 "tag": plan.tag,
                 "exact": plan.exact,
+                "keys": [{"name": kc, "type": kt, **({"min": mn, "max": mn + rng - 2} if plan.packed else {})}
+                         for kc, kt, (mn, rng, _st) in zip(plan.keys, plan.key_types,
+                                                          plan.pack if plan.packed else [(0, 2, 1)] * len(plan.keys))],
                 "table": {"catalog": ident.catalog, "schema": ident.schema, "name": ident.table,
                           "oid": ident.oid},
                 "columns": {c: {"type": t, "scale": (_rewrite.decimal_scale(t) or (0, 0))[1]}
