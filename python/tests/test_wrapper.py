@@ -109,6 +109,10 @@ def run():
         "five_mixed_keys_topk": "SELECT k, s, d, dt, v, count(*) AS n FROM t GROUP BY k, s, d, dt, v ORDER BY n DESC, k, s NULLS LAST, d, dt, v LIMIT 5",
         "seven_keys":     "SELECT k, s, d, dt, v, x > 1000 AS big, k % 3 AS r, count(*) AS n FROM t WHERE k < 20 GROUP BY k, s, d, dt, v, x > 1000, k % 3 ORDER BY k, s NULLS LAST, d, dt, v, big, r",
         "str_key_topk_per_key": "SELECT s, sum(v) AS sv FROM t GROUP BY s ORDER BY sv DESC LIMIT 3",
+        # DATE / TIMESTAMP payloads: min, max, count (days / microseconds on the device, typed on the way out)
+        "date_payload":   "SELECT k, min(dt), max(dt), count(dt), count(*) FROM tn3 GROUP BY k ORDER BY k NULLS LAST",
+        "ts_payload_where": "SELECT k, max(ts) AS last_seen, min(dt) AS first_day, sum(v) FROM t WHERE v > 40 GROUP BY k ORDER BY k",
+        "date_payload_having_cnt": "SELECT z, min(dt) FROM tn3 GROUP BY z HAVING count(*) > 100 ORDER BY z",
         # several payload columns in one statement (§4.9)
         "multi_sums": "SELECT k, sum(a), sum(b), sum(c), count(*) FROM tm GROUP BY k ORDER BY k",
         "multi_mixed": "SELECT k, min(a), max(c), avg(b), count(c), count(*) FROM tm WHERE x > 250.5 AND z <> 3 GROUP BY k ORDER BY k",
@@ -528,10 +532,37 @@ def run():
         got = con.execute(sql).fetchall()
         check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
               f"global single table: runs native ({con.last_rewrite()['reason']}) — native's filter + sum wins there")
+        # count(DISTINCT x) (§4.17): the device groups by (keys, x), DuckDB counts the pairs per key
+        dcases = {
+            "distinct_basic":  "SELECT z, count(DISTINCT k) AS dk FROM tm GROUP BY z ORDER BY z",
+            "distinct_with_aggs": "SELECT z, count(DISTINCT k) AS dk, sum(a) AS sa, count(*) AS n, count(c) AS nc, min(b), max(c) FROM tm WHERE a % 3 <> 1 GROUP BY z ORDER BY z",
+            "distinct_nulls":  "SELECT k % 5 AS kk, count(DISTINCT s) AS ds, count(DISTINCT s) + 1 AS ds1 FROM t GROUP BY k % 5 ORDER BY kk",
+            "distinct_expr":   "SELECT z, count(DISTINCT a % 1000) AS d FROM tm GROUP BY z HAVING count(DISTINCT a % 1000) > 990 ORDER BY d DESC, z LIMIT 5",
+            "distinct_date":   "SELECT z, count(DISTINCT dt), min(dt) FROM tn3 GROUP BY z ORDER BY z",
+            "distinct_join":   "SELECT tier, count(DISTINCT g) AS dg, sum(v) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
+        }
+        for name, sql in dcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"distinct {name}: rewritten ({lr['reason']})")
+            check(got == want, f"distinct {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"distinct {name}: names and types identical")
+        for name, sql in {
+            "distinct_two_columns": "SELECT z, count(DISTINCT k), count(DISTINCT a) FROM tm GROUP BY z ORDER BY z",
+            "distinct_with_avg":    "SELECT z, count(DISTINCT k), avg(a) FROM tm GROUP BY z ORDER BY z",
+            "sum_distinct":         "SELECT z, sum(DISTINCT k) FROM tm GROUP BY z ORDER BY z",
+        }.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"] and got == want, f"distinct decline {name}: runs native, answer unchanged")
         pdeclines = {
             "double_inside":  "SELECT k, sum(x) / count(*) FROM t GROUP BY k",
             "window_over_agg": "SELECT k, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY k",
-            "distinct_agg":   "SELECT k, count(DISTINCT v) + 1 FROM t GROUP BY k",
+            "distinct_agg":   "SELECT k, sum(DISTINCT v) + 1 FROM t GROUP BY k",
             "subquery_in_select": "SELECT k, sum(v) / (SELECT count(*) FROM t) FROM t GROUP BY k",
         }
         for name, sql in pdeclines.items():
@@ -545,6 +576,44 @@ def run():
             got = con.execute(sql).fetchall()
             check(con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
                   f"post-agg literal variant x{m}: answer correct")
+    con.close()
+
+    # ---- folded derived tables (§4.16): a select-project-join subquery as the FROM of an aggregate ----
+    print("== folded derived tables")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute(JOIN_SETUP_EARLY)
+        fcases = {
+            "spj_exprs":      "SELECT bucket, sum(vol) AS s, count(*) FROM (SELECT k % 10 AS bucket, a * z AS vol FROM tm WHERE z <> 3) x GROUP BY bucket ORDER BY bucket",
+            "qualified_refs": "SELECT x.bucket, max(x.vol) FROM (SELECT k % 10 AS bucket, b - a AS vol FROM tm) AS x WHERE x.vol > 0 GROUP BY x.bucket ORDER BY x.bucket",
+            "column_alias_list": "SELECT kk, sum(vv) FROM (SELECT k, v FROM t WHERE v > 5) AS q(kk, vv) GROUP BY kk ORDER BY kk",
+            "select_star":    "SELECT k, sum(v), min(d) FROM (SELECT * FROM t WHERE x < 100000) q WHERE q.v <> 9 GROUP BY k ORDER BY k",
+            "join_inside":    "SELECT yr, reg, sum(vol) AS s FROM (SELECT year(opened) AS yr, region AS reg, amt * (1 - 0.1) AS vol, tier FROM jf, jd WHERE jf.did = jd.did AND mode <> 'SHIP') shipping WHERE tier < 5 GROUP BY yr, reg ORDER BY yr, reg NULLS LAST",
+            "share_q8_shape": "SELECT yr, sum(CASE WHEN reg = 'north' THEN vol ELSE 0 END) / sum(vol) AS share FROM (SELECT year(opened) AS yr, region AS reg, amt AS vol FROM jf JOIN jd ON jf.did = jd.did WHERE g < 250) a GROUP BY yr ORDER BY yr",
+            "two_levels":     "SELECT b2, count(*), sum(w) FROM (SELECT b1 % 5 AS b2, w FROM (SELECT k % 100 AS b1, a + 1 AS w FROM tm) i1) i2 GROUP BY b2 ORDER BY b2",
+            "single_cte":     "WITH base AS (SELECT k % 20 AS kk, v * 2 AS vv FROM t WHERE v > 1) SELECT kk, sum(vv), count(*) FROM base GROUP BY kk ORDER BY kk",
+            "order_by_outer_alias": "SELECT bucket AS bb, sum(vol) AS total FROM (SELECT k % 10 AS bucket, a AS vol FROM tm) x GROUP BY bucket ORDER BY total DESC, bb LIMIT 4",
+        }
+        for name, sql in fcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"] and lr["form"] != "nested", f"fold {name}: rewritten as one statement, form={lr['form']} ({lr['reason']})")
+            check(got == want, f"fold {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"fold {name}: names and types identical")
+        # not select-project-join: never folded (the nested path may still take the inner statement)
+        for name, sql in {
+            "distinct_inside": "SELECT kk, count(*) FROM (SELECT DISTINCT k % 10 AS kk, v FROM t) x GROUP BY kk ORDER BY kk",
+            "limit_inside":    "SELECT kk, count(*) FROM (SELECT k % 10 AS kk FROM t ORDER BY v, k LIMIT 5000) x GROUP BY kk ORDER BY kk",
+            "window_inside":   "SELECT kk, sum(rn) FROM (SELECT k % 10 AS kk, row_number() OVER (PARTITION BY k ORDER BY v, x) AS rn FROM t) x GROUP BY kk ORDER BY kk",
+        }.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"] and got == want,
+                  f"fold decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
     con.close()
 
     # ---- nested rewriting (§4.14): rewritable SELECTs inside a statement DuckDB keeps ----

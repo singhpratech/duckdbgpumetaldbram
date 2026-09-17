@@ -46,6 +46,12 @@ kept and 0.62–0.82× at 9%; with a plain column payload 0.78–1.19× at 55–
 kept — the mask costs the device what the expression costs native. TPC-H Q1
 (two VARCHAR keys, eight aggregates over expressions, 98% of the rows):
 12.2 → 5.9 ms.                                       → string_key_min_selectivity
+count(DISTINCT x) (§4.17; SF1, x = l_shipmode with 7 values, beside a sum):
+the device groups by (key, x) and DuckDB re-aggregates every pair, ~0.25 ms
+per 1K pairs. Up to 17K pairs 1.3–7.1×; 70K pairs 2.1–2.5× without a WHERE
+but 0.82–1.13× under a 9–10% one; 700K pairs 0.39–0.51×; 441 pairs under a
+1% WHERE 0.84× (native is 5 ms there)                → reagg_max_pairs,
+reagg_max_pairs_where, reagg_min_selectivity
 Several payload columns (§4.9; three of them, same machine, SF1): the fused
 operator shares the mask and the grouping, so HAVING / top-k keep their wins
 (1.06–3.0× single table, up to 4.8× over joins), but every extra aggregate is
@@ -95,6 +101,10 @@ class Thresholds:
     # a VARCHAR key is exempt from min_groups / topk_min_groups without a WHERE, and under a WHERE
     # when a payload is a computed expression and at least this much survives
     string_key_min_selectivity: float = 0.5
+    # count(DISTINCT x): (key, x) pairs the device returns for DuckDB to re-aggregate
+    reagg_max_pairs: int = 100_000
+    reagg_max_pairs_where: int = 20_000
+    reagg_min_selectivity: float = 0.05
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -107,7 +117,8 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
-           limited: bool = False, computed_payload: bool = False) -> Tuple[bool, str]:
+           limited: bool = False, computed_payload: bool = False,
+           reaggregated: bool = False) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
     the statement is over a key join (its own table above)."""
@@ -116,6 +127,14 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         return False, f"no thresholds for backend {backend!r}"
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
+    if reaggregated:
+        # est_groups counts (key, x) pairs: every one of them goes back through DuckDB
+        if est_groups > t.reagg_max_pairs:
+            return False, f"{est_groups} (key, value) pairs to re-aggregate > {t.reagg_max_pairs}"
+        if has_where and est_groups > t.reagg_max_pairs_where:
+            return False, f"{est_groups} (key, value) pairs under a WHERE > {t.reagg_max_pairs_where}"
+        if has_where and (selectivity is None or selectivity < t.reagg_min_selectivity):
+            return False, f"selectivity below {t.reagg_min_selectivity} for count(DISTINCT)"
     # (a result of a few hundred groups is never output-bound, however many columns it has)
     if payloads > 1 and form == "plain" and est_groups >= t.min_groups:
         if join and est_groups > t.multi_join_plain_max_groups:

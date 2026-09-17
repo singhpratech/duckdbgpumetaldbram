@@ -44,7 +44,8 @@ WHERES = {
     "l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4": "mixed",
 }
 # projected: expressions over aggregates (§4.11); nested: a rewritable GROUP BY inside a statement DuckDB keeps (§4.14)
-FORMS = ("plain", "having", "topk", "projected", "nested")
+# distinct: count(DISTINCT x) beside a sum (§4.17: the device groups by (key, x))
+FORMS = ("plain", "having", "topk", "projected", "nested", "distinct")
 # key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
 # applies where its table is part of the join
 JOINS = {
@@ -81,6 +82,9 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
         return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
+    if form == "distinct":
+        return (f"SELECT {key}, count(DISTINCT l_shipmode) AS modes, sum({PAYLOAD}) AS q{more} "
+                f"FROM {source}{w} GROUP BY {key}")
     if form == "nested":
         return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({PAYLOAD}) AS q{more} "
                 f"FROM {source}{w} GROUP BY {key} HAVING sum({PAYLOAD}) > {having_thr}) gpudb_x")

@@ -3241,3 +3241,34 @@ and the fast-path fix bring it to 9 of 22.
 | Q21 | native (shape) | 22.2 | — | — | — | split: the inner GROUP BY declined (shape) |
 | Q22 | native (shape) | 8.5 | — | — | — | split: the inner GROUP BY declined (threshold) |
 9 of 22 queries answered on the device; 0 with rows that differ from native
+
+## v0.7 TPC-H coverage map, third pass — Metal, SF1 (2026-09-18)
+
+Folded derived tables (Q7–Q9) and the UNION ALL staleness guard: 12 of 22, every
+rewritten query faster than native.
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.2 | 7.3 | 1.67× | True | |
+| Q2 | native (threshold) | 5.0 | — | — | — |  |
+| Q3 | GPU (plain) | 6.4 | 3.1 | 2.08× | True | |
+| Q4 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.9 | 1.4 | 4.79× | True | |
+| Q6 | native (shape) | 1.7 | — | — | — |  |
+| Q7 | GPU (plain) | 7.3 | 3.9 | 1.86× | True | |
+| Q8 | GPU (projected) | 7.5 | 3.3 | 2.28× | True | |
+| Q9 | GPU (plain) | 19.2 | 2.4 | 7.93× | True | |
+| Q10 | GPU (topk) | 17.6 | 3.9 | 4.50× | True | |
+| Q11 | native (threshold) | 2.8 | — | — | — |  |
+| Q12 | GPU (plain) | 6.1 | 3.5 | 1.78× | True | |
+| Q13 | GPU (nested) | 18.3 | 1.9 | 9.57× | True | |
+| Q14 | GPU (projected) | 5.4 | 2.5 | 2.13× | True | |
+| Q15 | native (shape) | 3.3 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 13.1 | — | — | — |  |
+| Q17 | native (shape) | 6.2 | — | — | — | split failed: Binder Error: Referenced column "p_partkey" not found in FROM clause!
+| Q18 | GPU (nested) | 13.4 | 8.9 | 1.50× | True | |
+| Q19 | GPU (projected) | 10.6 | 2.5 | 4.32× | True | |
+| Q20 | native (shape) | 8.1 | — | — | — |  |
+| Q21 | native (shape) | 22.6 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
+12 of 22 queries answered on the device; 0 with rows that differ from native

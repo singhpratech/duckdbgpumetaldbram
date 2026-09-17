@@ -31,7 +31,7 @@ from ._rewrite import Decline, Plan, _STRING_TYPES, decimal_scale
 from . import _rewrite
 from ._resolve import Identity
 
-MAX_TABLES = 6
+MAX_TABLES = 8
 _INT_JOIN_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _FLOAT_TYPES = {"DOUBLE", "FLOAT", "REAL"}
 

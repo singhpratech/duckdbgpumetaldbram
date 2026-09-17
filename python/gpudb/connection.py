@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _exprs, _join, _resolve, _rewrite, _split, _thresholds
+from . import _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds
 from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -128,6 +128,7 @@ class Connection:
         self._cache: Dict[Tuple[str, str], Decision] = {}
         self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
         self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
+        self._flat_cache: Dict[str, str] = {}                    # statement text -> the same with SPJ derived tables folded in
         self._last_tags: List[str] = []
         self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
         self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
@@ -394,6 +395,7 @@ class Connection:
         self._manager.invalidate(None)
         self._cache.clear()
         self._nested_cache.clear()
+        self._flat_cache.clear()
         self._unique_cache.clear()
         self._expr_types.clear()
         self._big_tables = None
@@ -633,9 +635,38 @@ class Connection:
         self._last.sql = final
         return final
 
+    def _folded(self, sql: str) -> str:
+        """§4.16: the statement with select-project-join derived tables folded
+        into it — what the rewrite decides on and builds from. The original
+        text is what runs when the rewrite declines."""
+        flat = self._flat_cache.get(sql)
+        if flat is None:
+            flat = sql
+            if "(" in sql or sql.lstrip()[:4].upper() == "WITH":
+                try:
+                    folded = None
+                    tree = self._serialize(sql)
+                    if _flatten.fold(tree) is not None:                 # cheap structural test first
+                        want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+                        folded = _flatten.fold(tree, [w[0] for w in want])
+                    if folded is not None:
+                        cand = self._raw.execute("SELECT json_deserialize_sql(?)", [folded]).fetchone()[0]
+                        have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
+                        if want == have:
+                            flat = cand
+                        else:
+                            self._log(f"fold: names / types changed ({want} -> {have}); not folded")
+                except Exception as e:
+                    self._log(f"fold failed: {str(e)[:120]}")
+            if len(self._flat_cache) > 1024:
+                self._flat_cache.clear()
+            self._flat_cache[sql] = flat
+        return flat
+
     def _rewrite_text(self, sql: str) -> Optional[str]:
         """The rewritten SQL of ONE statement, or None with _last.reason set."""
         self._last = LastRewrite(statement=sql)
+        sql = self._folded(sql)
         t0 = time.perf_counter()
         template, literals = self._normalise(sql)
         key = (template, self._settings_key)
@@ -937,7 +968,11 @@ class Connection:
         try:
             names = [r[0] for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
             tmpl = json.loads(self._serialize(f"SELECT 1 FROM {_split.PLACEHOLDER}"))
-            parts = _split.split(self._serialize(sql), names, tmpl)
+            tree = self._serialize(sql)
+            parts = _split.split(tree, names, tmpl)                       # §4.11 / §4.12
+            reagg = parts is None
+            if parts is None:
+                parts = _split.split_distinct(tree, names, tmpl)          # §4.17
             if parts is None:
                 return None
             inner_sql, outer_sql = (self._raw.execute("SELECT json_deserialize_sql(?)", [x]).fetchone()[0]
@@ -948,7 +983,7 @@ class Connection:
             return None
         if outer_sql.count(_split.PLACEHOLDER) != 1:
             return None
-        d = self._decide(inner_sql, allow_split=False)
+        d = self._decide(inner_sql, allow_split=False, reagg=reagg)
         if not d.rewritten:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
             return Decision(False, d.reason)
@@ -963,15 +998,15 @@ class Connection:
             d.form = "projected"
         return d
 
-    def _decide(self, sql: str, allow_split: bool = True) -> Decision:
+    def _decide(self, sql: str, allow_split: bool = True, reagg: bool = False) -> Decision:
         """Device path first; a join it cannot express falls back to uploading
         the join's result (§4.13); expressions over aggregates fall back to the
         split (§4.11), whose inner statement comes back through here."""
-        d = self._decide_once(sql, "device")
+        d = self._decide_once(sql, "device", reagg)
         if d.rewritten or d.reason != "shape" or not getattr(self, "_exact", False):
             return d
         if d.is_join and getattr(self, "_join", False):
-            du = self._decide_once(sql, "upload")
+            du = self._decide_once(sql, "upload", reagg)
             if du.rewritten or du.reason != "shape":
                 return du
         if allow_split:
@@ -980,15 +1015,15 @@ class Connection:
                 return ds
         return d
 
-    def _decide_once(self, sql: str, mode: str) -> Decision:
-        d = self._decide_body(sql, mode)
+    def _decide_once(self, sql: str, mode: str, reagg: bool = False) -> Decision:
+        d = self._decide_body(sql, mode, reagg)
         try:
             d.is_join = _join.is_join_statement(self._serialize(sql))
         except Exception:
             pass
         return d
 
-    def _decide_body(self, sql: str, mode: str) -> Decision:
+    def _decide_body(self, sql: str, mode: str, reagg: bool = False) -> Decision:
         try:
             plan, low, computed = self._match(sql, mode)
         except _rewrite.Decline as e:
@@ -1159,7 +1194,8 @@ class Connection:
                                          join=low is not None, payloads=max(1, len(plan.vals)),
                                          string_key=bool(plan.dict_key),
                                          limited=plan.limit is not None and plan.limit <= 10_000,
-                                         computed_payload=any(v in computed for v in plan.vals))
+                                         computed_payload=any(v in computed for v in plan.vals),
+                                         reaggregated=reagg)
             if not ok:
                 self._log(f"threshold: {why}")
                 return Decision(False, "threshold")
