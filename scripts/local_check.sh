@@ -107,6 +107,18 @@ if [ "$NO_EXT" = "0" ]; then
         exit 1
     fi
     green "SQL test suite OK"
+
+    # v0.7 rule 1: every rewritten shape >= 1.0x native through the Python
+    # wrapper (docs/TRANSPARENT_DESIGN.md §9.3). Runs when TPC-H SF1 and the
+    # duckdb Python module are present; the SF10 run is the pre-tag gate.
+    if [ -f data/tpch_sf1/tpch.duckdb ] && python3 -c "import duckdb" 2>/dev/null; then
+        hr "transparent gate (SF1, through the Python wrapper)"
+        if ! python3 scripts/transparent_gate.py --db data/tpch_sf1/tpch.duckdb --n 5; then
+            red "transparent gate: a rewritten shape came out below 1.0x or differed from native"
+            exit 1
+        fi
+        green "transparent gate OK"
+    fi
 fi
 
 hr "summary"

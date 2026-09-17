@@ -2509,3 +2509,96 @@ mid-cardinality regime fix (PR #21) routes per-state work to a serial
 path because the inter-thread coordination overhead dominates. The README
 "4.8× over CPU" line was from a pre-PR #21 baseline (81.7 ms CPU) and
 has been updated to **3.6× over CPU** (54.1 ms CPU vs 15.0 ms CUDA).
+
+
+## v0.7 transparent gate — Metal, TPC-H SF1 (2026-09-17)
+
+`python3 scripts/transparent_gate.py --db data/tpch_sf1/tpch.duckdb --n 5`, output unedited
+(docs/TRANSPARENT_DESIGN.md §9.3). Every cell is one statement run through
+`gpudb.connect()` natively (`transparent=False`) and transparently in the same
+process, warm, min of 5, rows compared (top-k on the multiset of the ordered
+aggregate: ties at the k-th value are unspecified in SQL). Rows marked
+`declined (threshold)` are the shapes the wrapper's per-backend thresholds
+(`python/gpudb/_thresholds.py`) keep on the native path; their native time is
+printed so the decision stays visible. Apple M4 Max, DuckDB 1.4.5 Python,
+`lineitem` 6,001,215 rows; `sum(l_quantity)` over a DECIMAL(15,2) column,
+HAVING thresholds at the 99th percentile of the group sums.
+
+# transparent_gate — data/tpch_sf1/tpch.duckdb (6,001,215 rows), compiled=cpu,metal runtime=metal exact=true, N=5, min ratio 1.0
+
+| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |
+|---|---|---|---|---|---|---|---|---|
+| l_linenumber | — | 100% | plain | 7 | 2.1 | — | — | declined (threshold) |
+| l_linenumber | — | 100% | having | 1 | 1.8 | — | — | declined (threshold) |
+| l_linenumber | — | 100% | topk | 7 | 1.8 | — | — | declined (threshold) |
+| l_suppkey | — | 100% | plain | 10000 | 10.4 | 9.2 | 1.13× | PASS |
+| l_suppkey | — | 100% | having | 100 | 5.0 | 2.8 | 1.77× | PASS |
+| l_suppkey | — | 100% | topk | 10 | 4.9 | — | — | declined (threshold) |
+| l_partkey | — | 100% | plain | 200000 | 116.2 | 103.4 | 1.12× | PASS |
+| l_partkey | — | 100% | having | 1981 | 19.2 | 3.1 | 6.20× | PASS |
+| l_partkey | — | 100% | topk | 10 | 18.2 | 4.9 | 3.71× | PASS |
+| l_orderkey | — | 100% | plain | 1500000 | 745.7 | — | — | declined (threshold) |
+| l_orderkey | — | 100% | having | 14816 | 16.8 | 9.8 | 1.71× | PASS |
+| l_orderkey | — | 100% | topk | 10 | 9.6 | 7.1 | 1.35× | PASS |
+| l_linenumber | l_discount < 0.01 | 9% | plain | 7 | 1.4 | — | — | declined (threshold) |
+| l_linenumber | l_discount < 0.01 | 9% | having | 1 | 1.4 | — | — | declined (threshold) |
+| l_linenumber | l_discount < 0.01 | 9% | topk | 7 | 1.4 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | plain | 10000 | 7.2 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | having | 99 | 2.3 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 2.3 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | plain | 186984 | 93.5 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | having | 1808 | 3.9 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | topk | 10 | 3.2 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | plain | 455920 | 220.4 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | having | 4547 | 5.5 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | topk | 10 | 3.5 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | plain | 1 | 1.5 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | having | 0 | 1.3 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | topk | 1 | 1.3 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | plain | 10000 | 7.8 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | having | 99 | 2.8 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | topk | 10 | 2.9 | — | — | declined (threshold) |
+| l_partkey | l_linenumber = 1 | 25% | plain | 199893 | 104.4 | — | — | declined (threshold) |
+| l_partkey | l_linenumber = 1 | 25% | having | 1952 | 7.2 | 6.6 | 1.10× | PASS |
+| l_partkey | l_linenumber = 1 | 25% | topk | 10 | 6.3 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber = 1 | 25% | plain | 1500000 | 730.6 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber = 1 | 25% | having | 0 | 7.1 | 3.5 | 2.05× | PASS |
+| l_orderkey | l_linenumber = 1 | 25% | topk | 10 | 7.1 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | plain | 3 | 2.1 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | having | 1 | 1.8 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | topk | 3 | 1.7 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber <= 3 | 64% | plain | 10000 | 9.6 | 8.6 | 1.11× | PASS |
+| l_suppkey | l_linenumber <= 3 | 64% | having | 100 | 4.7 | 2.9 | 1.61× | PASS |
+| l_suppkey | l_linenumber <= 3 | 64% | topk | 10 | 4.4 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | plain | 200000 | 115.5 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | having | 1994 | 11.6 | 3.8 | 3.04× | PASS |
+| l_partkey | l_linenumber <= 3 | 64% | topk | 10 | 10.6 | 5.5 | 1.94× | PASS |
+| l_orderkey | l_linenumber <= 3 | 64% | plain | 1500000 | 742.3 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | having | 13299 | 14.5 | 10.4 | 1.40× | PASS |
+| l_orderkey | l_linenumber <= 3 | 64% | topk | 10 | 8.7 | 8.3 | 1.05× | PASS |
+| l_linenumber | l_discount <= 0.09 | 91% | plain | 7 | 2.4 | — | — | declined (threshold) |
+| l_linenumber | l_discount <= 0.09 | 91% | having | 1 | 2.1 | — | — | declined (threshold) |
+| l_linenumber | l_discount <= 0.09 | 91% | topk | 7 | 2.2 | — | — | declined (threshold) |
+| l_suppkey | l_discount <= 0.09 | 91% | plain | 10000 | 10.7 | 9.0 | 1.19× | PASS |
+| l_suppkey | l_discount <= 0.09 | 91% | having | 100 | 5.2 | 3.1 | 1.65× | PASS |
+| l_suppkey | l_discount <= 0.09 | 91% | topk | 10 | 5.2 | — | — | declined (threshold) |
+| l_partkey | l_discount <= 0.09 | 91% | plain | 200000 | 118.7 | — | — | declined (threshold) |
+| l_partkey | l_discount <= 0.09 | 91% | having | 1985 | 18.0 | 4.6 | 3.89× | PASS |
+| l_partkey | l_discount <= 0.09 | 91% | topk | 10 | 17.2 | 6.0 | 2.84× | PASS |
+| l_orderkey | l_discount <= 0.09 | 91% | plain | 1478717 | 749.7 | — | — | declined (threshold) |
+| l_orderkey | l_discount <= 0.09 | 91% | having | 14405 | 16.0 | 11.2 | 1.43× | PASS |
+| l_orderkey | l_discount <= 0.09 | 91% | topk | 10 | 9.9 | 8.2 | 1.21× | PASS |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 6 | 2.4 | — | — | declined (threshold) |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 1 | 2.1 | — | — | declined (threshold) |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 6 | 2.2 | — | — | declined (threshold) |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 10000 | 9.5 | 9.1 | 1.05× | PASS |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 100 | 4.5 | 3.8 | 1.16× | PASS |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 4.9 | — | — | declined (threshold) |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 200000 | 111.3 | — | — | declined (threshold) |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 1986 | 11.1 | 5.3 | 2.11× | PASS |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 10.1 | 6.6 | 1.52× | PASS |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 1367799 | 686.2 | — | — | declined (threshold) |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 13644 | 15.1 | 11.4 | 1.32× | PASS |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 9.0 | 8.7 | 1.03× | PASS |
+
+all rewritten rows at or above the bound and identical to native

@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""transparent_gate.py — rule 1 for the transparent path (docs/TRANSPARENT_DESIGN.md
+§9.1 / §9.3): every rewritable shape, transparent vs native, same process,
+warm, min of N, through the Python wrapper (the path users take).
+
+For every (key column, WHERE predicate, form) cell over TPC-H lineitem the
+script runs the statement natively (transparent=False) and transparently,
+checks the rows are identical (sorted), records min-of-N statement times and
+the ratio native/transparent, and prints the table in BENCHMARK.md form.
+Rows the wrapper rewrote and that came out below RATIO_MIN (default 1.0)
+FAIL; rows the wrapper declined are printed with the reason and never fail.
+The losing side of every sweep stays printed.
+
+Usage:
+  python3 scripts/transparent_gate.py [--db data/tpch_sf1/tpch.duckdb] [--n 5]
+                                      [--min-ratio 1.0] [--keys l_orderkey,l_partkey,...]
+Needs a built extension (build-macos / build-linux) or GPUDB_EXTENSION_PATH.
+"""
+from __future__ import annotations
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
+import gpudb  # noqa: E402
+
+# key column -> (label, approximate groups at SF1)
+KEYS = {
+    "l_linenumber": "7 groups",
+    "l_suppkey":    "10K groups",
+    "l_partkey":    "200K groups",
+    "l_orderkey":   "1.5M groups",
+}
+# WHERE predicate -> label; selectivity is measured, not assumed
+WHERES = {
+    "": "no WHERE",
+    "l_discount < 0.01": "~9%",
+    "l_linenumber = 1": "~25%",
+    "l_linenumber <= 3": "~55%",
+    "l_discount <= 0.09": "~90%",
+    "l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4": "mixed",
+}
+FORMS = ("plain", "having", "topk")
+
+
+def build(key: str, where: str, form: str, having_thr: str) -> str:
+    w = f" WHERE {where}" if where else ""
+    if form == "plain":
+        return f"SELECT {key}, sum(l_quantity), count(*) FROM lineitem{w} GROUP BY {key}"
+    if form == "having":
+        return (f"SELECT {key}, sum(l_quantity) AS q FROM lineitem{w} GROUP BY {key} "
+                f"HAVING sum(l_quantity) > {having_thr}")
+    return (f"SELECT {key}, sum(l_quantity) AS q FROM lineitem{w} GROUP BY {key} "
+            f"ORDER BY q DESC LIMIT 10")
+
+
+def time_min(run, n: int) -> float:
+    best = float("inf")
+    for _ in range(n):
+        t0 = time.perf_counter()
+        run()
+        best = min(best, (time.perf_counter() - t0) * 1000.0)
+    return best
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default="data/tpch_sf1/tpch.duckdb")
+    ap.add_argument("--n", type=int, default=5)
+    ap.add_argument("--min-ratio", type=float, default=1.0)
+    ap.add_argument("--keys", default=",".join(KEYS))
+    ap.add_argument("--wheres", default="all", help="'all' or a ';'-separated list of predicates ('' = none)")
+    args = ap.parse_args()
+    if not os.path.exists(args.db):
+        print(f"missing {args.db} — SF=1 ./scripts/gen_tpch.sh", file=sys.stderr)
+        return 2
+
+    con = gpudb.connect(args.db, read_only=True, residency="eager", floor_rows=0)
+    info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
+    rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
+    print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}")
+    print()
+    print("| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |")
+    print("|---|---|---|---|---|---|---|---|---|")
+
+    keys = [k for k in args.keys.split(",") if k]
+    wheres = list(WHERES) if args.wheres == "all" else args.wheres.split(";")
+    fails = []
+    for where in wheres:
+        w = f" WHERE {where}" if where else ""
+        sel_rows = con._raw.execute(f"SELECT count(*) FROM lineitem{w}").fetchone()[0]
+        sel = f"{100.0 * sel_rows / rows_total:.0f}%"
+        for key in keys:
+            # a HAVING threshold that keeps roughly 1% of the groups
+            thr = con._raw.execute(
+                f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum(l_quantity) q FROM lineitem{w} GROUP BY {key})"
+            ).fetchone()[0]
+            thr_s = f"{thr:.2f}" if thr is not None else "0"
+            for form in FORMS:
+                sql = build(key, where, form, thr_s)
+                # native
+                con.transparent = False
+                nat = con.execute(sql).fetchall()
+                t_nat = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                # transparent (first call may upload; timed calls are warm)
+                con.transparent = True
+                got = con.execute(sql).fetchall()
+                lr = con.last_rewrite()
+                if not lr["rewritten"]:
+                    print(f"| {key} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                          f"declined ({lr['reason']}) |")
+                    continue
+                if form == "topk":
+                    # ORDER BY <agg> LIMIT k without a tiebreaker: which of the
+                    # groups tied at the k-th value are returned is unspecified
+                    # in SQL and differs between native runs too — compare the
+                    # multiset of aggregate values (the kept ORDER BY makes the
+                    # order native's problem, §2).
+                    identical = sorted(str(r[-1]) for r in got) == sorted(str(r[-1]) for r in nat)
+                else:
+                    identical = sorted(map(str, got)) == sorted(map(str, nat))
+                t_tr = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                ratio = t_nat / t_tr if t_tr > 0 else float("inf")
+                ok = identical and ratio >= args.min_ratio
+                result = "PASS" if ok else ("FAIL rows differ" if not identical else "FAIL")
+                if not ok:
+                    fails.append((key, where, form, ratio, identical))
+                print(f"| {key} | {where or '—'} | {sel} | {lr['form']} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
+                      f"{ratio:.2f}× | {result} |")
+                sys.stdout.flush()
+    print()
+    if fails:
+        print(f"{len(fails)} row(s) below {args.min_ratio}× or not identical:")
+        for key, where, form, ratio, identical in fails:
+            print(f"  - {key} / {where or 'no WHERE'} / {form}: {ratio:.2f}×" + ("" if identical else " (rows differ)"))
+        return 1
+    print("all rewritten rows at or above the bound and identical to native")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

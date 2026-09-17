@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _resolve, _rewrite
+from . import _classify, _resolve, _rewrite, _thresholds
 from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -169,9 +169,11 @@ class Connection:
 
     # ---- duckdb surface ----
     def cursor(self) -> "Connection":
-        return Connection(self._raw.cursor(), transparent=self._transparent,
-                          residency=self._residency_mode, floor_rows=self._floor_rows,
-                          log=self._log, _parent=self)
+        c = Connection(self._raw.cursor(), transparent=self._transparent,
+                       residency=self._residency_mode, floor_rows=self._floor_rows,
+                       log=self._log, _parent=self)
+        c._thresholds = getattr(self, "_thresholds", True)
+        return c
 
     def duplicate(self) -> "Connection":
         return self.cursor()
@@ -514,6 +516,24 @@ class Connection:
                     return Decision(False, "overflow")
         if self._settings["default_collation"]:
             pass   # integer keys only in this cut; VARCHAR keys arrive with §4.5
+        # per-backend thresholds (§9.1): distinct-count estimate of the key and,
+        # under a WHERE, the selectivity of THIS statement's literals (one
+        # count(*) scan at decision time, cached with the template)
+        if plan.exact and getattr(self, "_thresholds", True):
+            est = (stats.get(plan.key) or {}).get("approx_unique")
+            sel = None
+            if plan.where:
+                try:
+                    kept = self._raw.execute(
+                        f"SELECT count(*) FROM {ident.fqn} WHERE {_rewrite.where_sql(plan)}").fetchone()[0]
+                    sel = (kept / nrows) if nrows else 0.0
+                except Exception as e:
+                    self._log(f"selectivity probe failed: {e}")
+                    return Decision(False, "threshold")
+            ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where))
+            if not ok:
+                self._log(f"threshold: {why}")
+                return Decision(False, "threshold")
         try:
             described = self._raw.execute("DESCRIBE " + sql).fetchall()
             _rewrite.apply_describe(plan, [(r[0], r[1]) for r in described])
@@ -570,13 +590,15 @@ class Connection:
 def connect(database: str = ":memory:", read_only: bool = False, config: Optional[dict] = None,
             *, extension: Optional[str] = None, transparent: bool = True,
             residency: str = "background", floor_rows: int = 1_000_000,
-            idle_ms: float = 20.0, log=None) -> Connection:
+            idle_ms: float = 20.0, thresholds: bool = True, log=None) -> Connection:
     """duckdb.connect with the gpudb extension loaded and the transparent path
     on. `residency`: 'background' (upload in short row-id segments, each only
     while the connection is idle for `idle_ms`; §5.5), 'eager' (upload on first
     sighting, synchronously), 'manual' (v0.6 behaviour: only sets uploaded
     under an identity tag are used). `floor_rows`: tables smaller than this
-    are never parsed (§0)."""
+    are never parsed (§0). `thresholds`: apply the per-backend shape thresholds
+    (§9.1, gpudb/_thresholds.py); False rewrites every exact shape regardless
+    of the predicted win — for parity testing, never for production."""
     if residency not in ("background", "eager", "manual"):
         raise ValueError("residency must be 'background', 'eager' or 'manual'")
     cfg = dict(config or {})
@@ -586,5 +608,7 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     raw = duckdb.connect(database, read_only=read_only, config=cfg)
     if ext:
         raw.execute(f"LOAD '{ext}'")
-    return Connection(raw, transparent=transparent, residency=residency,
-                      floor_rows=floor_rows, idle_ms=idle_ms, log=log)
+    con = Connection(raw, transparent=transparent, residency=residency,
+                     floor_rows=floor_rows, idle_ms=idle_ms, log=log)
+    con._thresholds = thresholds
+    return con
