@@ -247,6 +247,60 @@ def run():
           "rewritten once resident; answer correct")
     con.close()
 
+    print("== segmented upload (0c): progress kept across interrupts; a write mid-session discards it")
+    import random
+    con = fresh(residency="background", idle_ms=5)
+    con._manager.quiet_s = 0.2
+    con.execute("CREATE TABLE big AS SELECT (range % 1000)::INTEGER AS k, range::BIGINT AS v FROM range(2000000)")
+    con._manager.segment_rows = 100_000          # 20 segments instead of one
+    qb = "SELECT k, sum(v) FROM big GROUP BY k"
+    con.execute(qb).fetchall()
+    tag = con.last_rewrite()["tag"]
+    check(tag and not con.last_rewrite()["rewritten"], "big: first sighting native, upload scheduled")
+    # interactive cadence while the session runs: short statements with 0-10 ms gaps
+    t0 = time.monotonic()
+    n_stmts = 0
+    while not con._manager.is_ready(tag) and time.monotonic() - t0 < 60:
+        con.execute("SELECT count(*) FROM big WHERE v = 3").fetchall()
+        n_stmts += 1
+        time.sleep(random.uniform(0, 0.01))
+    pr = con._manager.progress()[tag]
+    check(pr["state"] == "ready", f"big: session finished while statements flowed ({n_stmts} statements, {pr})")
+    check(pr["segments"] == pr["planned"] == 20, f"big: all planned segments landed: {pr['segments']}/{pr['planned']}")
+    seen = con._raw.execute("SELECT rows_seen, rows, state FROM gpu_residents() WHERE name = ?", [tag]).fetchone()
+    check(seen == (2000000, 2000000, "ready"), f"big: extension saw every row exactly once: {seen}")
+    got = con.execute(qb).fetchall()
+    check(con.last_rewrite()["rewritten"] and got == con._raw.execute(qb).fetchall(),
+          f"big: rewritten once resident; answer correct (interrupts={pr['interrupts']}, {pr['session_ms']} ms)")
+    # a write while a session is open: the session is dropped, the set re-uploads after the quiet period
+    con._manager.segment_rows = 50_000           # 40 segments, so the write lands mid-session
+    con.execute("UPDATE big SET v = v + 1 WHERE k = 7")
+    check(con.residents()[tag] == "stale", "big: UPDATE marks the set stale")
+    time.sleep(0.3)
+    con.execute(qb).fetchall()                      # re-sighting queues the session
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        pr = con._manager.progress()[tag]
+        if pr["state"] == "uploading" and 1 <= pr["segments"] < pr["planned"]:
+            break
+        time.sleep(0.001)
+    check(pr["state"] == "uploading" and pr["segments"] >= 1, f"big: caught the session mid-way: {pr}")
+    con.execute("UPDATE big SET v = v + 1 WHERE k = 8")
+    st = con._raw.execute("SELECT gpu_upload_status(?)", [tag]).fetchone()[0]
+    check('"open":false' in st, f"big: the write dropped the open session: {st}")
+    con._manager.wait_idle(5)
+    check(con.residents()[tag] == "stale", f"big: manager state after the mid-session write: {con.residents()[tag]}")
+    time.sleep(0.3)
+    con.execute(qb).fetchall()
+    ok = con._manager.wait_idle(60)
+    got = con.execute(qb).fetchall()
+    pr = con._manager.progress()[tag]
+    check(ok and con.last_rewrite()["rewritten"] and got == con._raw.execute(qb).fetchall(),
+          f"big: re-uploaded after the write, answer correct ({pr['segments']} segments)")
+    seen = con._raw.execute("SELECT rows_seen FROM gpu_residents() WHERE name = ?", [tag]).fetchone()
+    check(seen == (2000000,), f"big: rows_seen after re-upload: {seen}")
+    con.close()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0

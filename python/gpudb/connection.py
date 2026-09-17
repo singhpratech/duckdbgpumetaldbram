@@ -401,7 +401,7 @@ class Connection:
                 self._last.reason = "manual"
                 return None
         elif not self._manager.is_ready(d.tag):
-            st = self._manager.note_candidate(d.tag, d.upload_sql)
+            st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn)
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
             if not self._manager.is_ready(d.tag):
@@ -558,7 +558,8 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
             residency: str = "background", floor_rows: int = 1_000_000,
             idle_ms: float = 20.0, log=None) -> Connection:
     """duckdb.connect with the gpudb extension loaded and the transparent path
-    on. `residency`: 'background' (upload when idle), 'eager' (upload on first
+    on. `residency`: 'background' (upload in short row-id segments, each only
+    while the connection is idle for `idle_ms`; §5.5), 'eager' (upload on first
     sighting, synchronously), 'manual' (v0.6 behaviour: only sets uploaded
     under an identity tag are used). `floor_rows`: tables smaller than this
     are never parsed (§0)."""
