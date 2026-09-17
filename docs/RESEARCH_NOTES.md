@@ -80,7 +80,9 @@ rounded conversion would be *more* accurate and *different from native*.
 
 **Finding: `avg(DECIMAL)` has no such formula.** We could not find a
 decomposition into `sum` and `count` that matches native bit for bit, so
-`avg` over a DECIMAL column stays native. It still does.
+`avg` over a DECIMAL column stayed native — until the TPC-H survey of 09-17
+(below) made it the first item again, and a systematic search found the
+formula.
 
 **Finding: a class of bug the unit tests cannot see.** The first exact call
 from SQL crashed on Metal while every unit test passed. A scratch buffer
@@ -472,11 +474,106 @@ re-uploads it.
 
 ---
 
+## 2026-09-17/18 — A coverage map: the 22 TPC-H queries
+
+**Question.** We kept choosing the next feature by intuition. What does an
+actual workload say?
+
+**Method.** `scripts/tpch_coverage.py` runs the 22 official queries through
+the wrapper and natively, prints rewritten / native with the decline reason,
+checks rows against native and times both. First run: 4 of 22 (Q3, Q5, Q12,
+Q14). The declines clustered, and each cluster became a work item.
+
+**`avg` over DECIMAL (Q1) — the formula exists after all.** On 09-15 we gave
+up after `sum::DOUBLE / count` mismatched. A systematic test of five
+candidates over 5,003 groups at four scales (NULLs, negatives, values to
+1e12):
+
+| formula | groups differing from native |
+|---|---|
+| `(S / C) / 10^s` | 20–32% |
+| `(S / 10^s) / C` | 21–26% |
+| `sum(decimal)::DOUBLE / C` | 21–30% |
+| `S / C * (1 / 10^s)` | 27–33% |
+| **`S / (C * 10^s)`** | **0** |
+
+(`S` = the unscaled 128-bit sum as DOUBLE, `C` = `count(v)`.) Native divides
+ONCE, by the scaled count. The table functions already return the exact sum
+and count, so this was a rewriter change only. A note for the CUDA / x86
+port: DuckDB does this arithmetic in `long double`, which is 80-bit on x86 and
+plain double on ARM; the formula was verified on ARM only and must be
+re-verified on x86 before it is trusted there.
+
+**A join equality hidden in every OR branch (Q19).** Q19 writes `p_partkey =
+l_partkey` inside each of three OR branches, so no join edge was visible and
+the statement looked like a cross product. `(A AND x) OR (A AND y)` = `A AND
+(x OR y)` also in three-valued logic, so common conjuncts are hoisted before
+the join analysis.
+
+**Few groups depend on the key's TYPE.** Q1 has four groups and would have
+been declined by the few-groups bound — yet it measured 2×. A sweep by key
+type and payload count explained it: an INTEGER key with 7 groups loses or
+ties (0.62–1.28×: native aggregates a tiny integer domain through a perfect
+hash), a VARCHAR key with 3 groups wins 1.12–1.70× unless a WHERE removes most
+rows (0.62–0.82× at 9%) — native hashes the strings on every row, the device
+hashed them once at upload. We exempted string keys from the bound when at
+least half the rows survive — and then put the shape under the gate, which
+promptly failed it: with a plain column payload and a WHERE the same shape
+measures 0.78–0.95×. The earlier sweep had used an expression payload, which
+native evaluates per row and the resident lane gives for free; the mask costs
+the device about what the expression costs native. The exemption is now: no
+WHERE, or a WHERE with a computed payload and at least half the rows kept
+(Q1's shape), plain form only — with three groups a HAVING or top-k saves
+nothing and measured 0.98–1.07×. Lesson, again: a bound is only as good as the sweep behind it,
+and every new bound goes under the gate before it ships.
+
+**Two estimate fixes (Q3).** The group estimate for a multi-column key is the
+product of the columns' distinct counts — 6M for Q3, whose WHERE keeps 30K
+rows. It is now capped by the rows that survive the WHERE. And a LIMIT that
+is not pushed as a top-k (ORDER BY two terms) still means only LIMIT rows
+reach the client, so the fetch-bound reasoning behind the join plain-form
+bound does not apply.
+
+**Result, thresholds on, rows identical on every rewritten query:**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.3 | 6.0 | 2.03× | True | |
+| Q2 | native (shape) | 4.5 | — | — | — | declined (shape, upload): SUBQUERY inside an expression |
+| Q3 | GPU (plain) | 6.2 | 3.2 | 1.93× | True | |
+| Q4 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.6 | 1.9 | 3.56× | True | |
+| Q6 | native (shape) | 1.8 | — | — | — |  |
+| Q7 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q8 | native (shape) | 7.5 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q9 | native (shape) | 19.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q10 | native (shape) | 17.9 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q11 | native (shape) | 2.7 | — | — | — | declined (shape, upload): having is not aggregate vs constant |
+| Q12 | GPU (plain) | 6.2 | 3.5 | 1.75× | True | |
+| Q13 | native (shape) | 18.7 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q14 | GPU (projected) | 5.3 | 3.0 | 1.74× | True | |
+| Q15 | native (shape) | 3.1 | — | — | — | declined (shape, upload): not a plain SELECT |
+| Q16 | native (shape) | 12.4 | — | — | — | declined (shape, upload): SUBQUERY inside an expression |
+| Q17 | native (shape) | 6.1 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q18 | native (shape) | 13.9 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q19 | GPU (projected) | 10.8 | 2.9 | 3.78× | True | |
+| Q20 | native (shape) | 7.7 | — | — | — |  |
+| Q21 | native (shape) | 22.1 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.4 | — | — | — | split: the inner GROUP BY declined (shape) |
+
+**What the remaining 16 need**, in clusters: subqueries and derived tables
+that are themselves rewritable (Q13, Q15, Q18, the scalar subquery of Q11);
+select-project-join derived tables as the FROM (Q7, Q8, Q9); more than three
+GROUP BY keys and DECIMAL keys (Q10); `count(DISTINCT)` (Q16); correlated
+subqueries and EXISTS (Q2, Q4, Q17, Q20, Q21, Q22); Q6 is a single-table
+aggregate without GROUP BY, where native wins by measurement.
+
+---
+
 ## Open questions
 
 - **`count(DISTINCT x)`, `median`, `stddev`**: new kernels; `count(DISTINCT)`
   needs values sorted within a group.
-- **`avg(DECIMAL)`**: no bit-exact decomposition found yet.
 - **RIGHT / FULL / semi / anti joins**, `IN (SELECT …)` and `EXISTS`
   subqueries, CTEs and derived tables as inputs.
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal

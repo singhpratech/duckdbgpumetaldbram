@@ -1010,6 +1010,19 @@ json j_guard(const Context& cx) {
                 {"column_name_alias", json::array()}};
 }
 
+// avg over a DECIMAL(p, s) payload, exactly as native computes it (verified
+// against native on millions of rows at several scales, NULLs and negatives):
+//   double(unscaled sum) / (count * 10^s)
+// — ONE division by the scaled count. (sum / count) / 10^s and
+// (sum / 10^s) / count each differ from native on 20-30% of groups.
+json j_avg_decimal(const std::string& sum_col, const std::string& count_col, int scale, const std::string& name) {
+    std::int64_t p10 = 1;
+    for (int i = 0; i < scale; ++i) p10 *= 10;
+    json num = j_cast(j_colref2("r", sum_col), j_type("DOUBLE"));
+    json den = j_function("*", json::array({j_colref2("r", count_col), j_const_bigint(p10)}), true);
+    return j_function("/", json::array({std::move(num), std::move(den)}), true, name);
+}
+
 Result do_rewrite_exact(json tree, json node, const Context& cx,
                         const std::string& tname, const std::string& talias) {
     Result r;
@@ -1062,7 +1075,6 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         int pay = -1;
         const XAgg a = xagg_of(e, cx, tname, talias, pays, pay);
         if (a == XAgg::None) reject("shape", "select-list expression of class " + cls);
-        if (a == XAgg::Avg && pay_info(pay).decimal) reject("decimal", "avg over a DECIMAL payload is not on the exact path");
         items.push_back({false, a, alias, 0, pay});
     }
     if (cx.outputs.size() != items.size()) reject("error", "context.outputs does not match the select list");
@@ -1093,7 +1105,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         else reject("shape", "HAVING comparison " + ct);
         having_agg = xagg_of(*aggside, cx, tname, talias, pays, having_pay);
         if (having_agg == XAgg::None) reject("shape", "HAVING is not on an aggregate");
-        if (having_agg == XAgg::Avg && pay_info(having_pay).decimal) reject("decimal", "HAVING avg over a DECIMAL payload");
+
         if (sfield(*cside, "class") != "CONSTANT") reject("shape", "HAVING threshold is not a constant");
         if (cmp <= 4 && having_agg != XAgg::Avg) {
             const ColInfo& hv = pay_info(having_pay);
@@ -1106,7 +1118,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             static const char* types[] = {"", "COMPARE_GREATERTHAN", "COMPARE_GREATERTHANOREQUALTO",
                                           "COMPARE_LESSTHAN", "COMPARE_LESSTHANOREQUALTO",
                                           "COMPARE_EQUAL", "COMPARE_NOTEQUAL"};
-            json lhs = j_output_exact(agg_col(having_agg, having_pay), xagg_native_type(having_agg, pay_info(having_pay)), "");
+            const ColInfo& hp = pay_info(having_pay);
+            json lhs = (having_agg == XAgg::Avg && hp.decimal && hp.scale > 0)
+                ? j_avg_decimal(agg_col(XAgg::Sum, having_pay), agg_col(XAgg::CountV, having_pay), hp.scale, "")
+                : j_output_exact(agg_col(having_agg, having_pay), xagg_native_type(having_agg, hp), "");
             host_pred = json{{"class", "COMPARISON"}, {"type", types[cmp]}, {"alias", ""},
                              {"query_location", kNoLocation}, {"left", lhs}, {"right", *cside}};
         }
@@ -1291,7 +1306,12 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             else if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
             else                  new_select.push_back(j_output_exact("key", o.type, o.name));
         } else {
-            new_select.push_back(j_output_exact(agg_col(items[i].agg, items[i].pay), o.type, o.name));
+            const ColInfo& ip = pay_info(items[i].pay);
+            if (items[i].agg == XAgg::Avg && ip.decimal && ip.scale > 0)
+                new_select.push_back(j_avg_decimal(agg_col(XAgg::Sum, items[i].pay), agg_col(XAgg::CountV, items[i].pay),
+                                                   ip.scale, o.name));
+            else
+                new_select.push_back(j_output_exact(agg_col(items[i].agg, items[i].pay), o.type, o.name));
         }
     }
 

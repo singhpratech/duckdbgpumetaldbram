@@ -557,12 +557,6 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
         raise Decline("shape", "several payload columns need the exact path")
     if plan.val is not None and not plan.vals:
         plan.vals = [plan.val]
-    for o in plan.outputs:
-        if exact and o.kind == "avg" and decimal_scale(columns.get(plan.vals[o.pay], "")):
-            raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
-    if exact and plan.having is not None and plan.having[0] == "avg" \
-            and plan.vals and decimal_scale(columns.get(plan.vals[plan.having_pay], "")):
-        raise Decline("decimal", "HAVING avg over a DECIMAL payload")
     for i, vc in enumerate(plan.vals):
         vt = columns.get(vc)
         if vt is None:
@@ -718,6 +712,22 @@ def _native_type_of(plan: Plan, kind: str, pay: int = 0) -> str:
     return "DOUBLE"
 
 
+def _avg_decimal_expr(plan: Plan, pay: int, scale: int) -> str:
+    """avg over a DECIMAL(p, s) payload exactly as native computes it:
+    double(unscaled sum) / (count * 10^s) — ONE division by the scaled count
+    (verified against native; (sum / count) / 10^s and (sum / 10^s) / count
+    each differ from it on 20-30% of groups)."""
+    return (f'(CAST(r."{_agg_col(plan, "sum", pay)}" AS DOUBLE) / '
+            f'(r."{_agg_col(plan, "count", pay)}" * {10 ** scale}))')
+
+
+def _agg_expr(plan: Plan, kind: str, pay: int, native_type: str) -> str:
+    scale = plan.scales.get(plan.vals[pay], plan.scale) if plan.vals else plan.scale
+    if kind == "avg" and scale:
+        return _avg_decimal_expr(plan, pay, scale)
+    return _out_expr(plan, _agg_col(plan, kind, pay), native_type)
+
+
 def _agg_col(plan: Plan, kind: str, pay: int) -> str:
     """The table function's column for an aggregate: the single-payload
     functions name them sum / count / ..., gpu_groupby_exact_multi sum<p> ..."""
@@ -786,7 +796,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
                 fn += "_having"
                 args += [f"'{col}'", f"'{op2}'", str(thr)]
         else:
-            extra_pred = f" AND {_out_expr(plan, _agg_col(plan, col, hp), _native_type_of(plan, akind, hp))} {op} {lit}"
+            extra_pred = f" AND {_agg_expr(plan, col, hp, _native_type_of(plan, akind, hp))} {op} {lit}"
     elif plan.form == "topk":
         tgt, direction, _ = plan.order[0]
         d = direction if direction != "ORDER_DEFAULT" else default_order
@@ -811,8 +821,10 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         if out.kind == "key" and plan.packed:
             cols.append(f'{_key_component_expr(plan, out.key_index, out.native_type)} AS "{out.name}"')
             continue
-        col = "key" if out.kind == "key" else _agg_col(plan, out.kind, out.pay)
-        cols.append(f'{_out_expr(plan, col, out.native_type)} AS "{out.name}"')
+        if out.kind == "key":
+            cols.append(f'{_out_expr(plan, "key", out.native_type)} AS "{out.name}"')
+        else:
+            cols.append(f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS "{out.name}"')
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))

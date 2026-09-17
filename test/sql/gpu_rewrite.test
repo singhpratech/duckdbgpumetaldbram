@@ -221,7 +221,7 @@ SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')),
        json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%_where_having(''gpudb:v1:memory:main:t:9:k,d,p'', ''i0 > 25%i0 <= 300'', ''sum'', ''>'', 200000)%' AS rescaled;
 -- expect: rewritten  0  0  DECIMAL(38,2) DECIMAL(15,2)  true
 
--- 22. EXACT: declines by field — WHERE on a column outside the set, OR, avg over DECIMAL
+-- 22. EXACT: declines by field — WHERE on a column outside the set, OR (the scalar alone; the Python wrapper lowers OR to a computed lane)
 -- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v,a","exact":true,"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT","a":"INTEGER","z":"INTEGER"},"backend":"METAL","rows":100000,"ready":true,"outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":1000}}'
 SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t WHERE z > 1 GROUP BY k'), getvariable('ctx')), '$.gpudb.reason') AS outside,
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t WHERE a > 1 OR a < -5 GROUP BY k'), getvariable('ctx')), '$.gpudb.reason') AS disjunction,
@@ -311,3 +311,17 @@ SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q'))
        json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%gpu_assert_rows(''gpudb:v1:memory:main:f:9:did,val=v:join'', (SELECT count_star() FROM memory.main.f)) AND gpu_assert_rows(''gpudb:v1:memory:main:d:11:did,key=tier,opened:join'', (SELECT count_star() FROM memory.main.d))%' AS two_guards,
        json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), replace(getvariable('ctx'), '"table":"d"', '"table":""')), '$.gpudb.reason') AS bad_guard;
 -- expect: true  true  error
+
+-- 31. EXACT: avg over a DECIMAL payload = double(unscaled sum) / (count * 10^scale), native's own formula — identical DOUBLEs on 5003 groups with NULLs, negatives and 1e9-scale values, in the select list and in HAVING
+-- setup: SELECT setseed(0.3)
+-- setup: CREATE TABLE t AS SELECT (i % 5003)::INTEGER AS k, CASE WHEN random() < 0.05 THEN NULL ELSE CAST(round((random() - 0.3) * 1e9, 2) AS DECIMAL(15,2)) END AS d FROM range(400000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:t:9:k,d', k, CAST(d * 100 AS BIGINT), [], []) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,d","exact":true,"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"INTEGER","d":{"type":"DECIMAL(15,2)","scale":2}},"backend":"METAL","rows":400000,"ready":true,"default_order":"ASC","outputs":[{"name":"k","type":"INTEGER"},{"name":"a","type":"DOUBLE"},{"name":"s","type":"DECIMAL(38,2)"}],"thresholds":{"min_rows":1000}}'
+-- setup: SET VARIABLE q = 'SELECT k, avg(d) AS a, sum(d) AS s FROM t GROUP BY k'
+-- setup: SET VARIABLE qh = 'SELECT k, avg(d) AS a, sum(d) AS s FROM t GROUP BY k HAVING avg(d) > 200000000.5'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.reason') AS reason,
+       (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) EXCEPT SELECT k, avg(d), sum(d) FROM t GROUP BY k)) + (SELECT count(*) FROM (SELECT k, avg(d), sum(d) FROM t GROUP BY k EXCEPT SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))))) AS mismatch,
+       (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('qh')), getvariable('ctx'))) EXCEPT SELECT k, avg(d), sum(d) FROM t GROUP BY k HAVING avg(d) > 200000000.5)) + (SELECT count(*) FROM (SELECT k, avg(d), sum(d) FROM t GROUP BY k HAVING avg(d) > 200000000.5 EXCEPT SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('qh')), getvariable('ctx'))))) AS having_mismatch,
+       (SELECT count(*) > 100 FROM t GROUP BY k HAVING avg(d) > 200000000.5 LIMIT 1) IS NOT NULL AS having_selects_some,
+       (SELECT typeof(a) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIMIT 1) AS avg_type;
+-- expect: rewritten  0  0  true  DOUBLE
