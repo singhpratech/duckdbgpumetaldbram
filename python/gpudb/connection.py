@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _join, _resolve, _rewrite, _thresholds
+from . import _classify, _exprs, _join, _resolve, _rewrite, _thresholds
 from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -43,6 +43,10 @@ class Decision:
     scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
     output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
     join: Optional[Any] = None         # _join.JoinResidency for a statement over a key join (§4.8)
+    # computed lanes (§4.10) that embed a literal: the normalised template does
+    # not identify the statement, so each literal tuple gets its own decision
+    literal_sensitive: bool = False
+    variants: Dict[Tuple[str, ...], "Decision"] = field(default_factory=dict)
 
 
 @dataclass
@@ -106,6 +110,9 @@ class Connection:
         self._last = LastRewrite()
         self._cache: Dict[Tuple[str, str], Decision] = {}
         self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
+        self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
+        self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
+        self._select_template: Optional[dict] = None
         self._settings: Dict[str, str] = {}
         self._settings_key = ""
         self._backend = ""
@@ -342,6 +349,7 @@ class Connection:
         self._manager.invalidate(None)
         self._cache.clear()
         self._unique_cache.clear()
+        self._expr_types.clear()
         self._big_tables = None
         try:
             self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
@@ -443,6 +451,18 @@ class Connection:
             d = self._decide(sql)
             d.literals = literals
             self._cache[key] = d
+        elif d.literal_sensitive and literals != d.literals:
+            # a computed lane embeds a literal (substr(s, 1, 2), a LIKE pattern,
+            # an OR of comparisons): another literal tuple is another statement
+            v = d.variants.get(literals)
+            if v is None:
+                if len(d.variants) >= 16:
+                    self._last.reason = "threshold"
+                    return None
+                v = self._decide(sql)
+                v.literals = literals
+                d.variants[literals] = v
+            d = v
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if not d.rewritten:
             self._last.reason = d.reason
@@ -542,23 +562,123 @@ class Connection:
             lambda ident: self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0],
             self._is_unique)
 
+    # ---- computed lanes (§4.10) ----
+    # Listed CONSISTENT, but they read session state a resident lane must not depend on.
+    _SESSION_FUNCTIONS = {"current_setting", "getvariable", "getenv", "version", "current_schema", "current_schemas",
+                          "current_database", "current_catalog", "current_user", "user", "session_user",
+                          "current_query", "in_search_path", "current_role"}
+
+    def _function_ok(self, name: str) -> bool:
+        """Is `name` safe inside a computed lane? Every overload must be a
+        scalar function DuckDB lists as CONSISTENT; a built-in macro (nullif,
+        ...) is accepted when its definition names no function that is not."""
+        if self._function_stability is None:
+            ok: Dict[str, bool] = {}
+            try:
+                rows = self._raw.execute(
+                    "SELECT lower(function_name), function_type, stability, internal, macro_definition "
+                    "FROM duckdb_functions()").fetchall()
+                bad = {r[0] for r in rows if r[1] == "scalar" and r[2] != "CONSISTENT"} | self._SESSION_FUNCTIONS
+                macros: Dict[str, List[str]] = {}
+                for fname, ftype, stab, internal, mdef in rows:
+                    if ftype == "scalar":
+                        ok[fname] = ok.get(fname, True) and stab == "CONSISTENT" and fname not in bad
+                    elif ftype == "macro" and internal:
+                        macros.setdefault(fname, []).append(mdef or "")
+                    else:
+                        ok[fname] = False
+                for fname, defs in macros.items():
+                    if fname in ok and not ok[fname]:
+                        continue
+                    tokens = set()
+                    for d in defs:
+                        tokens |= {t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", d)}
+                    ok[fname] = ok.get(fname, True) and not (tokens & bad) and "select" not in tokens
+            except Exception as e:
+                self._log(f"function catalog probe failed: {e}")
+            self._function_stability = ok
+        return self._function_stability.get(name.lower(), False)
+
+    def _expr_to_sql(self, expr_json: str) -> str:
+        if self._select_template is None:
+            self._select_template = json.loads(self._serialize("SELECT 1"))
+        stmt = json.loads(json.dumps(self._select_template))
+        stmt["statements"][0]["node"]["select_list"] = [json.loads(expr_json)]
+        return self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(stmt)]).fetchone()[0]
+
+    def _expr_type(self, fqn: str, sql: str) -> str:
+        key = (fqn, sql)
+        t = self._expr_types.get(key)
+        if t is None:
+            try:
+                t = self._raw.execute(f"DESCRIBE SELECT {sql} AS c FROM {fqn}").fetchall()[0][1]
+            except Exception as e:
+                raise _rewrite.Decline("shape", f"expression does not bind: {str(e)[:80]}")
+            self._expr_types[key] = t
+        return t
+
+    def _lower_exprs(self, tree: str, low: Optional["_join.Lowered"]):
+        """(tree with expressions lowered to virtual columns, {name: Computed},
+        single-table identity or None)."""
+        if low is not None:
+            columns = low.columns
+            idents = [t.ident for t in low.tables]
+            table_of = lambda c: low.colmap[c][0]            # noqa: E731
+            real_of = lambda c: low.colmap[c][1]             # noqa: E731
+        else:
+            j = json.loads(tree)
+            ft = ((j.get("statements") or [{}])[0].get("node") or {}).get("from_table") or {}
+            if ft.get("type") != "BASE_TABLE":
+                raise _rewrite.Decline("shape", "from is not a base table")
+            ident, why = _resolve.resolve(self._raw, ft.get("catalog_name") or "", ft.get("schema_name") or "",
+                                          ft.get("table_name") or "")
+            if ident is None:
+                raise _rewrite.Decline(why or "shape", "table")
+            columns, idents = ident.columns, [ident]
+            table_of = lambda c: 0                           # noqa: E731
+            real_of = lambda c: c                            # noqa: E731
+        lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=lambda c: c,
+                            deserialize=self._expr_to_sql,
+                            describe=lambda ti, sql: self._expr_type(idents[ti].fqn, sql),
+                            function_ok=self._function_ok,
+                            identity=lambda ti: idents[ti].fqn)
+        return lw.lower(tree), lw.computed
+
     def _match(self, sql: str):
-        """(plan, lowered join or None). Raises _rewrite.Decline."""
+        """(plan, lowered join or None, computed lanes). Raises _rewrite.Decline."""
         tree = self._serialize(sql)
+        order, nulls = self._settings["default_order"], self._settings["default_null_order"]
         try:
-            return _rewrite.match(tree, self._settings["default_order"],
-                                  self._settings["default_null_order"]), None
-        except _rewrite.Decline:
-            if not (getattr(self, "_join", False) and _join.is_join_statement(tree)):
-                raise
-        low = self._lower_join(tree)
-        return _rewrite.match(low.tree_json, self._settings["default_order"],
-                              self._settings["default_null_order"]), low
+            return _rewrite.match(tree, order, nulls), None, {}
+        except _rewrite.Decline as e:
+            first = e
+        low = None
+        if _join.is_join_statement(tree):
+            if not getattr(self, "_join", False):
+                raise first
+            low = self._lower_join(tree)
+            tree = low.tree_json
+            try:
+                return _rewrite.match(tree, order, nulls), low, {}
+            except _rewrite.Decline as e:
+                first = e
+        if not getattr(self, "_exact", False):
+            raise first
+        tree2, computed = self._lower_exprs(tree, low)
+        if not computed:
+            raise first
+        if low is not None:
+            low.tree_json = tree2
+        plan = _rewrite.match(tree2, order, nulls)
+        plan.lowered_tree = tree2
+        return plan, low, computed
 
     def _replan_literals(self, sql: str, cached: _rewrite.Plan) -> Optional[_rewrite.Plan]:
         try:
-            plan, _low = self._match(sql)
+            plan, _low, _computed = self._match(sql)
         except _rewrite.Decline:
+            return None
+        if plan.keys != cached.keys:
             return None
         plan.guards = cached.guards
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
@@ -576,7 +696,7 @@ class Connection:
 
     def _decide(self, sql: str) -> Decision:
         try:
-            plan, low = self._match(sql)
+            plan, low, computed = self._match(sql)
         except _rewrite.Decline as e:
             if e.detail:
                 self._log(f"declined ({e.reason}): {e.detail}")
@@ -591,6 +711,7 @@ class Connection:
             columns, probe_from = ident.columns, ident.fqn
             idents = [ident]
             col_home = lambda c: (ident, c)                     # noqa: E731
+            base_from = ident.fqn
         else:
             # a key join lowered to one virtual table: the root (fact) table
             # carries the identity, every column knows its own table
@@ -598,6 +719,17 @@ class Connection:
             columns, probe_from = low.columns, low.from_sql + " gpudb_j"
             idents = [t.ident for t in low.tables]
             col_home = lambda c: (low.tables[low.colmap[c][0]].ident, low.colmap[c][1])   # noqa: E731
+            base_from = low.from_sql + " gpudb_j0"
+        if computed:
+            # computed lanes (§4.10) are columns of the statement from here on;
+            # decision-time probes read them from a derived table
+            columns = dict(columns)
+            for cname, comp in computed.items():
+                columns[cname] = comp.lane_type
+            proj = ", ".join(
+                (f"CAST({c.probe_sql} AS TINYINT)" if c.native_type == "BOOLEAN" else c.probe_sql) + f' AS "{n}"'
+                for n, c in computed.items())
+            probe_from = f"(SELECT *, {proj} FROM {base_from}) gpudb_c"
         try:
             _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False))
         except _rewrite.Decline as e:
@@ -612,7 +744,20 @@ class Connection:
         stats: Dict[str, Dict[str, Any]] = {}
         stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
         for col in stat_cols:
-            st = _resolve.column_stats(self._raw, *col_home(col))
+            if col in computed:
+                st = None
+                if col in (plan.keys or [plan.key]):
+                    # a computed key: bounds and the distinct estimate from one scan
+                    try:
+                        mn, mx, uq, nn = self._raw.execute(
+                            f'SELECT min("{col}"), max("{col}"), approx_count_distinct("{col}"), '
+                            f'count(*) - count("{col}") FROM {probe_from}').fetchone()
+                        st = _resolve.ColumnStats(has_null=bool(nn), min=None if mn is None else str(mn),
+                                                  max=None if mx is None else str(mx), approx_unique=int(uq))
+                    except Exception as e:
+                        self._log(f"computed key statistics failed: {e}")
+            else:
+                st = _resolve.column_stats(self._raw, *col_home(col))
             if plan.exact:
                 # the exact path keeps NULLs and never wraps: statistics are
                 # informative only (thresholds), never a gate
@@ -695,13 +840,17 @@ class Connection:
         except Exception as e:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
+        q = (lambda c: computed[c].sql if c in computed else f'"{c}"')   # noqa: E731
         if low is None:
-            plan.tag = ident.tag(plan.upload_columns)
+            try:
+                plan.tag = ident.tag(plan.upload_columns)
+            except ValueError:
+                return Decision(False, "shape")
             d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
-                         upload_sql=_rewrite.upload_sql(plan, ident.fqn), form=plan.form)
+                         upload_sql=_rewrite.upload_sql(plan, ident.fqn, q), form=plan.form)
         else:
             try:
-                jr = _join.plan_residency(low, plan)
+                jr = _join.plan_residency(low, plan, computed)
             except _rewrite.Decline as e:
                 self._log(f"declined ({e.reason}): {e.detail}")
                 return Decision(False, e.reason)
@@ -711,6 +860,7 @@ class Connection:
             plan.guards = [(g, f) for g, f, _i in jr.guards]
             d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag, upload_sql="",
                          form=plan.form, join=jr)
+        d.literal_sensitive = any(c.has_constant for c in computed.values())
         if self._has_rewrite_scalar:
             # The extension's pure scalar is the authority on the decision and
             # renders the statement for these literals; `ready` is passed as
@@ -738,7 +888,8 @@ class Connection:
                 ctx["guards"] = [{"tag": g, "catalog": i.catalog, "schema": i.schema, "table": i.table}
                                  for g, _f, i in d.join.guards]
             try:
-                tree = low.tree_json if low is not None else self._serialize(sql)
+                tree = (getattr(plan, "lowered_tree", None)
+                        or (low.tree_json if low is not None else self._serialize(sql)))
                 row = self._raw.execute(
                     "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
                     [tree, json.dumps(ctx)]).fetchone()

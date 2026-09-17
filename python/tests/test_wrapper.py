@@ -186,8 +186,9 @@ def run():
         "rollup":       ("SELECT k, sum(v) FROM t GROUP BY ROLLUP(k)", "shape"),
         "filter":       ("SELECT k, sum(v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
         "distinct":     ("SELECT k, sum(DISTINCT v) FROM t GROUP BY k", "shape"),
-        "where_or":     ("SELECT k, sum(v) FROM t WHERE v > 3 OR v < 1 GROUP BY k", "shape"),
-        "where_fn":     ("SELECT k, sum(v) FROM t WHERE abs(v) > 3 GROUP BY k", "shape"),
+        # (OR and function predicates are computed lanes since §4.10 — see "computed lanes")
+        "where_volatile": ("SELECT k, sum(v) FROM t WHERE v > random() GROUP BY k", "shape"),
+        "where_subquery": ("SELECT k, sum(v) FROM t WHERE v > (SELECT 3) GROUP BY k", "shape"),
         "double":       ("SELECT k, sum(x) FROM t GROUP BY k", "double"),
         "avg_decimal":  ("SELECT k, avg(d) FROM t GROUP BY k", "decimal"),
         "cte_shadow":   ("WITH t AS (SELECT 1 k, 1 v) SELECT k, sum(v) FROM t GROUP BY k", "shape"),
@@ -195,7 +196,7 @@ def run():
         "no_group":     ("SELECT sum(v) FROM t", "shape"),
     }
     if not con._exact:
-        rej.pop("where_or"); rej.pop("where_fn"); rej.pop("avg_decimal")
+        rej.pop("where_volatile"); rej.pop("where_subquery"); rej.pop("avg_decimal")
         rej["where"] = ("SELECT k, sum(v) FROM t WHERE v > 3 GROUP BY k", "shape")
         rej["nulls"] = ("SELECT k, sum(v) FROM tn GROUP BY k", "nulls")
         rej["min"] = ("SELECT k, min(v) FROM t GROUP BY k", "shape")
@@ -205,7 +206,7 @@ def run():
         lr = con.last_rewrite()
         check(not lr["rewritten"] and lr["reason"] == reason,
               f"{name}: native, reason={lr['reason']} (expected {reason})")
-        check(sorted(map(str, got)) == sorted(map(str, nat)), f"{name}: answer unchanged")
+        check(name == "where_volatile" or sorted(map(str, got)) == sorted(map(str, nat)), f"{name}: answer unchanged")
 
     print("== catalog shadowing")
     con.execute("CREATE TEMP TABLE t2 AS SELECT * FROM t")
@@ -371,6 +372,83 @@ def run():
     check(seen == (2000000,), f"big: rows_seen after re-upload: {seen}")
     con.close()
 
+    # ---- computed lanes (§4.10): expressions as payloads, keys and predicates ----
+    print("== computed lanes")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        ecases = {
+            "sum_product":    "SELECT k, sum(a * z) AS s, count(*) FROM tm GROUP BY k ORDER BY k",
+            "sum_decimal_expr": "SELECT k, sum(c * (1 - 0.05)) AS net, min(c + 1.5), max(c * c) FROM tm GROUP BY k ORDER BY k",
+            "case_sum":       "SELECT k, sum(CASE WHEN z < 5 THEN a ELSE 0 END) AS lo, sum(CASE WHEN z >= 5 THEN b END) AS hi FROM tm GROUP BY k ORDER BY k",
+            "count_expr":     "SELECT k, count(CASE WHEN z = 3 THEN 1 END) AS threes, count(*) FROM tm GROUP BY k ORDER BY k",
+            "key_modulo":     "SELECT a % 1000 AS bucket, sum(b), count(*) FROM tm GROUP BY a % 1000 ORDER BY bucket",
+            "key_year":       "SELECT year(dt) AS y, month(dt) AS m, sum(v) FROM t GROUP BY year(dt), month(dt) ORDER BY y, m",
+            "key_extract_ts": "SELECT extract(hour FROM ts) AS h, count(*) FROM t GROUP BY extract(hour FROM ts) ORDER BY h",
+            "key_substr":     "SELECT substr(s, 1, 2) AS p, sum(v), count(*) FROM t GROUP BY substr(s, 1, 2) ORDER BY p NULLS LAST",
+            "key_upper_concat": "SELECT upper(s) || '-' || CAST(k % 3 AS VARCHAR) AS tag, count(*) FROM t GROUP BY upper(s) || '-' || CAST(k % 3 AS VARCHAR) ORDER BY tag NULLS LAST",
+            "key_boolean":    "SELECT v > 50 AS big, sum(v), count(*) FROM t GROUP BY v > 50 ORDER BY big",
+            "key_date_trunc": "SELECT date_trunc('month', dt) AS mth, sum(d) FROM t GROUP BY date_trunc('month', dt) ORDER BY mth",
+            "where_expr_cmp": "SELECT k, sum(v) FROM t WHERE v * 2 + 1 > 101 GROUP BY k ORDER BY k",
+            "where_or":       "SELECT k, sum(v), count(*) FROM t WHERE v < 10 OR x > 140000.5 OR s = 'beta' GROUP BY k ORDER BY k",
+            "where_like":     "SELECT k, count(*) FROM t WHERE s LIKE 'a%' OR s LIKE '%ta' GROUP BY k ORDER BY k",
+            "where_not_like_null": "SELECT k, count(*) FROM t WHERE s NOT LIKE 'al%' GROUP BY k ORDER BY k",
+            "where_col_vs_col": "SELECT k, sum(a) FROM tm WHERE a < b AND z <> 4 GROUP BY k ORDER BY k",
+            "where_fn_between": "SELECT k, count(*) FROM t WHERE year(dt) BETWEEN 1996 AND 1998 AND abs(v - 48) IN (1, 2, 3) GROUP BY k ORDER BY k",
+            "where_is_null_expr": "SELECT k, count(*) FROM t WHERE nullif(v, 7) IS NULL GROUP BY k ORDER BY k",
+            "having_expr":    "SELECT k, sum(a * z) AS s FROM tm GROUP BY k HAVING sum(a * z) > 270000000 ORDER BY k",
+            "topk_expr":      "SELECT k, sum(b - a) AS d FROM tm GROUP BY k ORDER BY d DESC LIMIT 5",
+            "order_by_key_expr": "SELECT a % 7 AS r, count(*) FROM tm GROUP BY a % 7 ORDER BY a % 7 DESC",
+            "all_together":   "SELECT k % 10 AS kk, sum(CASE WHEN s LIKE '%a' THEN v * 2 ELSE v END) AS w, max(d * 3) FROM t WHERE x / 2 < 60000 AND (k < 500 OR v = 96) GROUP BY k % 10 ORDER BY kk",
+        }
+        for name, sql in ecases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"expr {name}: rewritten ({lr['reason']})")
+            check(got == want, f"expr {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"expr {name}: names and types identical")
+        con.execute("CREATE MACRO twice(x) AS x * 2")
+        edeclines = {
+            "volatile":       "SELECT k, sum(v * random()) FROM t GROUP BY k",
+            "now":            "SELECT k, count(*) FROM t WHERE ts < now() GROUP BY k",
+            "double_payload": "SELECT k, sum(v / 2) FROM t GROUP BY k",
+            "double_key":     "SELECT x * 2 AS xx, count(*) FROM t GROUP BY x * 2",
+            "macro":          "SELECT k, sum(twice(v)) FROM t GROUP BY k",
+            "subquery":       "SELECT k, sum(v) FROM t WHERE v > (SELECT avg(v) FROM t) GROUP BY k",
+            "agg_of_agg_expr": "SELECT k, sum(v) / count(*) FROM t GROUP BY k",
+            "window":         "SELECT k, sum(v), row_number() OVER () FROM t GROUP BY k",
+        }
+        for name, sql in edeclines.items():
+            stable = name not in ("volatile", "now")
+            want = sorted(map(str, con._raw.execute(sql).fetchall())) if stable else None
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"], f"expr decline {name}: runs native ({con.last_rewrite()['reason']})")
+            check(want is None or sorted(map(str, got)) == want, f"expr decline {name}: answer unchanged")
+        # a literal INSIDE a computed lane: another literal is another statement, never the cached one
+        for a, b in ((1, 2), (1, 3), (2, 2)):
+            sql = f"SELECT substr(s, {a}, {b}) AS p, count(*) FROM t GROUP BY substr(s, {a}, {b}) ORDER BY p NULLS LAST"
+            got = con.execute(sql).fetchall()
+            check(con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
+                  f"expr literal-sensitive: substr(s, {a}, {b}) rewritten with its own lane, answer correct")
+        for pat in ("a%", "%a", "d_lta"):
+            sql = f"SELECT k, count(*) FROM t WHERE s LIKE '{pat}' GROUP BY k ORDER BY k"
+            got = con.execute(sql).fetchall()
+            check(got == con._raw.execute(sql).fetchall(), f"expr literal-sensitive: LIKE '{pat}' answer correct")
+        # a write makes the computed lanes stale like any other lane
+        q = ecases["sum_product"]
+        con.execute("UPDATE tm SET z = z + 1 WHERE k = 5")
+        got = con.execute(q).fetchall()
+        check(got == con._raw.execute(q).fetchall(), "expr: answer correct right after a write")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"] and got == con._raw.execute(q).fetchall(),
+              "expr: rewritten again over the re-uploaded lanes, answer correct")
+    else:
+        print("  backend without the exact path: expressions stay native")
+    con.close()
+
     # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----
     print("== key joins")
     JOIN_SETUP = f"""
@@ -405,6 +483,9 @@ def run():
             "multi_fact":     "SELECT tier, sum(v), sum(amt), min(g), count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE opened < DATE '2021-06-01' GROUP BY tier ORDER BY tier",
             "multi_both_sides": "SELECT g, sum(v) AS sv, sum(jd.nid) AS sn, max(tier) FROM jf JOIN jd ON jf.did = jd.did GROUP BY g HAVING sum(jd.nid) > 11000 ORDER BY g",
             "multi_topk_dim": "SELECT region, sum(amt) AS a, sum(v) AS b FROM jf JOIN jd ON jf.did = jd.did GROUP BY region ORDER BY b DESC LIMIT 3",
+            "expr_fact_payload": "SELECT tier, sum(amt * (1 - 0.1)) AS net, sum(v * g) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
+            "expr_dim_key":   "SELECT year(opened) AS y, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE upper(region) LIKE 'N%' OR tier = 6 GROUP BY year(opened) ORDER BY y",
+            "expr_case_both": "SELECT g % 10 AS gg, sum(CASE WHEN mode = 'AIR' THEN amt ELSE 0 END) AS air, count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE opened + 30 < DATE '2022-01-01' GROUP BY g % 10 ORDER BY gg",
         }
         for name, sql in jcases.items():
             want = con._raw.execute(sql).fetchall()
@@ -424,6 +505,7 @@ def run():
             "cross_keys":   "SELECT g, tier, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY g, tier",
             "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did GROUP BY tier",
             "subquery_leaf": "SELECT tier, count(*) FROM jf JOIN (SELECT * FROM jd) d ON jf.did = d.did GROUP BY tier",
+            "expr_two_tables": "SELECT tier, sum(v * jd.nid) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier",
         }
         for name, sql in declines.items():
             want = sorted(map(str, con._raw.execute(sql).fetchall())) if name != "non_equi" else None
