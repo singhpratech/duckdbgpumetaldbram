@@ -192,7 +192,7 @@ def run():
         "double":       ("SELECT k, sum(x) FROM t GROUP BY k", "double"),
         "avg_decimal":  ("SELECT k, avg(d) FROM t GROUP BY k", "decimal"),
         "cte_shadow":   ("WITH t AS (SELECT 1 k, 1 v) SELECT k, sum(v) FROM t GROUP BY k", "shape"),
-        "two_tables":   ("SELECT a.k, sum(a.v) FROM t a JOIN t b USING (k) GROUP BY a.k", "shape"),
+        "two_tables":   ("SELECT a.k, sum(a.v) FROM t a JOIN t b USING (k) GROUP BY a.k", "threshold"),   # a 90M-row self join: too big to upload
         "no_group":     ("SELECT sum(v) FROM t", "shape"),
     }
     if not con._exact:
@@ -448,6 +448,18 @@ def run():
         print("  backend without the exact path: expressions stay native")
     con.close()
 
+    JOIN_SETUP_EARLY = f"""
+    CREATE TABLE jf AS SELECT i::BIGINT AS id, (i % 5000)::INTEGER AS did, CASE WHEN i % 41 = 0 THEN NULL ELSE (i % 700)::INTEGER END AS eid,
+                              (i % 300)::INTEGER AS g, CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 1013)::BIGINT END AS v,
+                              ((i % 977) / 100.0)::DECIMAL(15,2) AS amt, ['AIR','RAIL','SHIP'][1 + i % 3] AS mode
+                       FROM range({N}) r(i);
+    CREATE TABLE jd (did INTEGER PRIMARY KEY, region VARCHAR, tier INTEGER, opened DATE, score DOUBLE, nid INTEGER);
+    INSERT INTO jd SELECT i, CASE WHEN i % 23 = 0 THEN NULL ELSE ['north','south','east','west'][1 + i % 4] END, (i % 7)::INTEGER,
+                          DATE '2020-01-01' + (i % 900)::INTEGER, i / 5000.0, (i % 25)::INTEGER FROM range(4800) r(i);
+    CREATE TABLE je AS SELECT i::INTEGER AS eid, (i % 9)::INTEGER AS bucket FROM range(650) r(i);
+    CREATE TABLE jn AS SELECT i::INTEGER AS nid, (i % 5)::INTEGER AS continent FROM range(25) r(i);
+    CREATE TABLE jm AS SELECT (i % 100)::INTEGER AS did, i AS w FROM range(1000) r(i);
+    """
     # ---- expressions over aggregates (§4.11): the GROUP BY on the device, the projection in DuckDB ----
     print("== expressions over aggregates")
     con = fresh()
@@ -480,6 +492,28 @@ def run():
             check(got == want, f"post-agg {name}: rows identical to native ({len(want)} rows)")
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"post-agg {name}: names and types identical")
+        gcases = {
+            "global_join":    "SELECT sum(v), count(*), count(v), min(amt), max(amt), avg(g) FROM jf JOIN jd ON jf.did = jd.did WHERE tier = 2",
+            "global_empty":   "SELECT sum(v), count(*), count(v), min(amt), avg(g) FROM jf JOIN jd ON jf.did = jd.did WHERE tier = 99",
+            "global_ratio":   "SELECT sum(amt) / count(*) AS m FROM jf JOIN jd ON jf.did = jd.did WHERE region = 'east'",
+            "global_having":  "SELECT sum(v) AS s FROM jf JOIN jd ON jf.did = jd.did HAVING sum(v) > 1",
+            "global_having_empty": "SELECT sum(v) AS s FROM jf JOIN jd ON jf.did = jd.did WHERE tier = 99 HAVING sum(v) > 1",
+        }
+        con.execute(JOIN_SETUP_EARLY)
+        for name, sql in gcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"global {name}: rewritten ({lr['reason']})")
+            check(got == want, f"global {name}: rows identical to native ({want})")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"global {name}: names and types identical")
+        sql = "SELECT sum(v), count(*) FROM t WHERE v > 3"
+        got = con.execute(sql).fetchall()
+        check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
+              f"global single table: runs native ({con.last_rewrite()['reason']}) — native's filter + sum wins there")
         pdeclines = {
             "avg_decimal_inside": "SELECT k, avg(d) * 2 FROM t GROUP BY k",
             "double_inside":  "SELECT k, sum(x) / count(*) FROM t GROUP BY k",
@@ -533,18 +567,7 @@ def run():
 
     # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----
     print("== key joins")
-    JOIN_SETUP = f"""
-    CREATE TABLE jf AS SELECT i::BIGINT AS id, (i % 5000)::INTEGER AS did, CASE WHEN i % 41 = 0 THEN NULL ELSE (i % 700)::INTEGER END AS eid,
-                              (i % 300)::INTEGER AS g, CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 1013)::BIGINT END AS v,
-                              ((i % 977) / 100.0)::DECIMAL(15,2) AS amt, ['AIR','RAIL','SHIP'][1 + i % 3] AS mode
-                       FROM range({N}) r(i);
-    CREATE TABLE jd (did INTEGER PRIMARY KEY, region VARCHAR, tier INTEGER, opened DATE, score DOUBLE, nid INTEGER);
-    INSERT INTO jd SELECT i, CASE WHEN i % 23 = 0 THEN NULL ELSE ['north','south','east','west'][1 + i % 4] END, (i % 7)::INTEGER,
-                          DATE '2020-01-01' + (i % 900)::INTEGER, i / 5000.0, (i % 25)::INTEGER FROM range(4800) r(i);
-    CREATE TABLE je AS SELECT i::INTEGER AS eid, (i % 9)::INTEGER AS bucket FROM range(650) r(i);
-    CREATE TABLE jn AS SELECT i::INTEGER AS nid, (i % 5)::INTEGER AS continent FROM range(25) r(i);
-    CREATE TABLE jm AS SELECT (i % 100)::INTEGER AS did, i AS w FROM range(1000) r(i);
-    """
+    JOIN_SETUP = JOIN_SETUP_EARLY
     con = fresh()
     con.execute(JOIN_SETUP)
     if getattr(con, "_join", False):
@@ -580,23 +603,55 @@ def run():
             check(got == want, f"join {name}: rows identical to native ({len(want)} rows)")
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"join {name}: names and types identical")
+        # §4.13: joins the device operator cannot express — DuckDB runs the join once, during the upload
+        ucases = {
+            "left_join":      "SELECT tier, count(*) AS n, count(jd.did) AS matched, sum(v) FROM jf LEFT JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier NULLS LAST",
+            "left_join_on_pred": "SELECT region, count(*), sum(amt) FROM jf LEFT JOIN jd ON jf.did = jd.did AND jd.tier < 3 WHERE g < 200 GROUP BY region ORDER BY region NULLS LAST",
+            "left_then_inner": "SELECT bucket, count(*), count(tier) FROM jf LEFT JOIN jd ON jf.did = jd.did JOIN je ON jf.eid = je.eid GROUP BY bucket ORDER BY bucket",
+            "many_to_many":   "SELECT jf.did, count(*) AS n, sum(w) FROM jf JOIN jm ON jf.did = jm.did GROUP BY jf.did ORDER BY jf.did",
+            "using":          "SELECT tier, did % 3 AS r, count(*) FROM jf JOIN jd USING (did) GROUP BY tier, did % 3 ORDER BY tier, r",
+            "composite_key":  "SELECT a.g, count(*), sum(b.v) FROM jf a JOIN jf b ON a.id = b.id AND a.did = b.did WHERE a.g < 50 GROUP BY a.g ORDER BY a.g",
+            "cross_keys":     "SELECT g, tier, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE g < 40 GROUP BY g, tier ORDER BY g, tier",
+            "expr_two_tables": "SELECT tier, sum(v * jd.nid) AS x, sum(CASE WHEN region = 'north' THEN amt ELSE 0 END) AS north_amt FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
+            "or_two_tables":  "SELECT g, count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE (tier = 1 AND mode = 'AIR') OR (tier = 2 AND v > 900) GROUP BY g ORDER BY g",
+            "global_cross":   "SELECT 100.0 * sum(CASE WHEN region = 'south' THEN amt ELSE 0 END) / sum(amt) AS south_pct, count(*) FROM jf, jd WHERE jf.did = jd.did AND opened < DATE '2021-01-01'",
+            "varchar_join_key": "SELECT jd.tier, count(*) FROM jf JOIN jd ON CAST(jf.did AS VARCHAR) = CAST(jd.did AS VARCHAR) AND jf.did = jd.did GROUP BY jd.tier ORDER BY jd.tier",
+            "having_topk":    "SELECT g, tier, sum(amt) AS a FROM jf LEFT JOIN jd ON jf.did = jd.did GROUP BY g, tier HAVING sum(amt) > 100 ORDER BY a DESC, g, tier LIMIT 12",
+        }
+        for name, sql in ucases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"] and ":joinu-" in (lr["tag"] or ""), f"join-upload {name}: rewritten over the uploaded join ({lr['reason']})")
+            check(got == want, f"join-upload {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"join-upload {name}: names and types identical")
         declines = {
-            "many_to_many": "SELECT jf.did, count(*) FROM jf JOIN jm ON jf.did = jm.did GROUP BY jf.did",
-            "left_join":    "SELECT tier, count(*) FROM jf LEFT JOIN jd ON jf.did = jd.did GROUP BY tier",
-            "using":        "SELECT tier, count(*) FROM jf JOIN jd USING (did) GROUP BY tier",
-            "self_join":    "SELECT a.g, count(*) FROM jf a JOIN jf b ON a.id = b.id GROUP BY a.g",
-            "cross_keys":   "SELECT g, tier, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY g, tier",
-            "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did GROUP BY tier",
+            "right_join":   "SELECT tier, count(*) FROM jf RIGHT JOIN jd ON jf.did = jd.did GROUP BY tier",
+            "full_join":    "SELECT tier, count(*) FROM jf FULL JOIN jd ON jf.did = jd.did GROUP BY tier",
+            "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did WHERE jf.id < 300 GROUP BY tier",
+            "cross_product": "SELECT tier, count(*) FROM jn, jd WHERE jd.tier = 1 GROUP BY tier",
+            "blow_up":      "SELECT a.did, count(*) FROM jm a JOIN jm b ON a.did = b.did JOIN jm c ON a.did = c.did GROUP BY a.did",
+            "volatile_on":  "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did AND random() < 2 GROUP BY tier",
             "subquery_leaf": "SELECT tier, count(*) FROM jf JOIN (SELECT * FROM jd) d ON jf.did = d.did GROUP BY tier",
-            "expr_two_tables": "SELECT tier, sum(v * jd.nid) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier",
         }
         for name, sql in declines.items():
-            want = sorted(map(str, con._raw.execute(sql).fetchall())) if name != "non_equi" else None
-            got = con.execute(sql).fetchall() if name != "non_equi" else None
-            if name == "non_equi":
-                con._route(sql, None)
+            want = sorted(map(str, con._raw.execute(sql).fetchall()))
+            got = con.execute(sql).fetchall()
             check(not con.last_rewrite()["rewritten"], f"join decline {name}: runs native ({con.last_rewrite()['reason']})")
-            check(want is None or sorted(map(str, got)) == want, f"join decline {name}: answer unchanged")
+            check(sorted(map(str, got)) == want, f"join decline {name}: answer unchanged")
+        # an uploaded join is guarded per base table too: a foreign write to the dimension falls back, then rebuilds
+        qu = ucases["left_join"]
+        other2 = con._raw.cursor()
+        other2.execute("INSERT INTO jd VALUES (4998, 'west', 2, DATE '2020-02-02', 0.25, 3)")
+        got = con.execute(qu).fetchall()
+        check(con.last_rewrite()["fallback"] and got == con._raw.execute(qu).fetchall(),
+              "join-upload: foreign write to a joined table -> GPUDB_STALE fallback, native answer")
+        got = con.execute(qu).fetchall()
+        check(con.last_rewrite()["rewritten"] and not con.last_rewrite()["fallback"] and got == con._raw.execute(qu).fetchall(),
+              "join-upload: resident again after the foreign write")
         # a write to a DIMENSION makes the joined set stale; the next sighting rebuilds it
         q = jcases["dim_key"]
         con.execute("UPDATE jd SET tier = tier + 10 WHERE did < 100")
@@ -618,8 +673,8 @@ def run():
         con.execute("CREATE TABLE je2 AS SELECT * FROM je UNION ALL SELECT 5, 99")
         sql = "SELECT bucket, count(*) FROM jf JOIN je2 ON jf.eid = je2.eid GROUP BY bucket ORDER BY bucket"
         got = con.execute(sql).fetchall()
-        check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
-              "join: a dimension key with a duplicate runs native")
+        check(con.last_rewrite()["rewritten"] and ":joinu-" in con.last_rewrite()["tag"] and got == con._raw.execute(sql).fetchall(),
+              "join: a dimension key with a duplicate cannot use the device join -> the join's result is uploaded, answer correct")
         # intermediates of a chain are dropped, the final set survives
         con.execute(jcases["snowflake"]).fetchall()
         names = [r[0] for r in con._raw.execute("SELECT name FROM gpu_residents()").fetchall()]
@@ -636,6 +691,15 @@ def run():
         got = con.execute(q).fetchall()
         check(ok and con.last_rewrite()["rewritten"] and got == con._raw.execute(q).fetchall(),
               f"join background: resident after the idle uploads, answer correct ({con.residents()})")
+        q = ucases["left_join_on_pred"]
+        con.execute(q).fetchall()
+        check(con.last_rewrite()["reason"] == "not_resident", "join-upload background: first sighting runs native")
+        ok = con._manager.wait_idle(60)
+        got = con.execute(q).fetchall()
+        tag = con.last_rewrite()["tag"]
+        pr = con._manager.progress().get(tag, {})
+        check(ok and con.last_rewrite()["rewritten"] and got == con._raw.execute(q).fetchall(),
+              f"join-upload background: the join was uploaded in idle segments ({pr.get('segments')} of {pr.get('planned')}), answer correct")
     else:
         print("  backend without join_materialize on the device: joins stay native")
         sql = "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier"

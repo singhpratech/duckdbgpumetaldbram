@@ -18,6 +18,7 @@ Needs a built extension (build-macos / build-linux) or GPUDB_EXTENSION_PATH.
 """
 from __future__ import annotations
 import argparse
+import re
 import os
 import sys
 import time
@@ -49,6 +50,11 @@ JOINS = {
     "li x orders x customer": ("lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey",
                                ["c_nationkey", "c_custkey"]),
     "li x part":              ("lineitem JOIN part ON l_partkey = p_partkey", ["p_brand", "p_size"]),
+    # §4.13: joins answered from an upload of the join's result (LEFT JOIN with an ON predicate; a composite key)
+    "li left orders":         ("lineitem LEFT JOIN orders ON l_orderkey = o_orderkey AND o_orderpriority = '1-URGENT'",
+                               ["o_orderdate", "l_suppkey"]),
+    "li x partsupp":          ("lineitem JOIN partsupp ON l_partkey = ps_partkey AND l_suppkey = ps_suppkey",
+                               ["ps_availqty", "l_suppkey"]),
 }
 JOIN_WHERES = {          # predicate -> the table it needs in the join ('' = any)
     "": "",
@@ -73,6 +79,8 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
         return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
+    if form == "global":          # no GROUP BY (§4.12); only swept over joins
+        return f"SELECT sum({PAYLOAD}) AS q, count(*){more} FROM {source}{w}"
     if form == "projected":
         return (f"SELECT {key}, sum({PAYLOAD}) / count(*) AS mean{more} FROM {source}{w} GROUP BY {key} "
                 f"HAVING sum({PAYLOAD}) > {having_thr} AND count(*) > 1")
@@ -157,7 +165,7 @@ def main() -> int:
         for label in labels:
             source, jkeys = JOINS[label]
             for where, table in JOIN_WHERES.items():
-                if table and table not in source:
+                if table and not re.search(rf"\b{table}\b", source):
                     continue
                 cells += [(label, source, key, where) for key in jkeys]
     sel_cache = {}
@@ -175,7 +183,7 @@ def main() -> int:
         ).fetchone()[0]
         thr_s = f"{thr:.2f}" if thr is not None else "0"
         if True:
-            for form in FORMS:
+            for form in FORMS + (("global",) if label else ()):
                 sql = build(key, where, form, thr_s, source, args.payloads)
                 # native
                 con.transparent = False
@@ -189,7 +197,9 @@ def main() -> int:
                     print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"declined ({lr['reason']}) |")
                     continue
-                if form == "topk":
+                if form == "global":
+                    identical = got == nat
+                elif form == "topk":
                     # ORDER BY <agg> LIMIT k without a tiebreaker: which of the
                     # groups tied at the k-th value are returned is unspecified
                     # in SQL and differs between native runs too — compare the
@@ -218,20 +228,28 @@ def main() -> int:
                 # (Apple silicon: the same ms-scale statement runs in one of two
                 # modes for seconds at a time, ~2.8 or ~4.2 ms here, depending on
                 # what the SoC did just before — hence the pause between rounds.)
+                # A hot loop is meant to be warm on BOTH sides, and the device needs
+                # ~10 back-to-back runs to clock up where the CPU needs a few: each
+                # re-measurement first warms the side it is about to time.
                 for _ in range(3):
                     if not identical or ratio >= args.min_ratio or PACE_S > 0:
                         break
-                    for _ in range(args.n):
-                        con.transparent = False
-                        t_nat = min(t_nat, time_min(lambda: con.execute(sql).fetchall(), 1))
-                        con.transparent = True
-                        t_tr = min(t_tr, time_min(lambda: con.execute(sql).fetchall(), 1))
+                    for transparent in (False, True):
+                        con.transparent = transparent
+                        for _w in range(20):
+                            con.execute(sql).fetchall()
+                        t = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                        if transparent:
+                            t_tr = min(t_tr, t)
+                        else:
+                            t_nat = min(t_nat, t)
+                    con.transparent = True
                     ratio = t_nat / t_tr if t_tr > 0 else float("inf")
                 ok = identical and ratio >= args.min_ratio
                 result = "PASS" if ok else ("FAIL rows differ" if not identical else "FAIL")
                 if not ok:
                     fails.append((key_label, where, form, ratio, identical))
-                print(f"| {key_label} | {where or '—'} | {sel} | {lr['form']} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
+                print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
                       f"{ratio:.2f}× | {result} |")
                 sys.stdout.flush()
     print()

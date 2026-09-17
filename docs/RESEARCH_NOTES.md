@@ -418,16 +418,67 @@ Two consequences:
 
 ---
 
+## 2026-09-17 (night) — No GROUP BY, and the joins the device cannot do
+
+**Aggregates without GROUP BY.** `SELECT sum(…) FROM … WHERE …` is one group.
+We measured before building: on a single table native wins (TPC-H Q6, five
+predicates: 2.0 ms native vs 2.9 ms at SF1, 17 vs 25 ms at SF10). A vectorised
+filter-and-sum is about as good as a CPU gets, and the device pays one kernel
+pass per predicate. So the shape is only rewritten over a join (1.3–3.4×),
+where native has to join first. Implementation is the §4.11 split with a
+constant computed key. The subtle part is the empty input: native returns one
+row (NULL sums, zero counts) where a GROUP BY returns none, so the outer
+statement LEFT JOINs the inner result to a one-row table and coalesces the
+counts — and a HAVING must filter in the outer statement (we had it on the
+device first; a test with an empty input and a HAVING caught it).
+
+**Question.** The device join only does "fact rows with dimension columns
+attached". LEFT JOIN, many-to-many, `USING`, composite keys, GROUP BY keys
+from two tables, and expressions mixing two tables (Q14's `CASE WHEN p_type
+LIKE … THEN l_extendedprice …`) all declined. Do we need a kernel for each?
+
+**Idea.** No — reuse the computed-lane trick one level up. A computed lane
+lets DuckDB evaluate an *expression* during upload; an uploaded join lets
+DuckDB evaluate the *FROM clause* during upload. The resident set then holds
+lanes of the join's result, any lane can be any expression over the joined
+row, and rule 2 holds by construction because DuckDB did the join.
+
+**What had to be solved.**
+- *Segmented upload.* Tables are uploaded in row-id segments during idle time.
+  For an INNER / LEFT join every result row has exactly one row of the
+  leftmost table, so the join is segmented by that table's rowid.
+- *Staleness.* A joined set has no table to count. A new column-less
+  "sentinel" set per base table (`gpu_note_rows`) remembers the row count; the
+  rewritten statement asserts each table against its sentinel.
+- *Never upload a cross product.* Every table must be tied to the others by
+  an equality, and the join's row count (one native join, once per statement
+  template) must not exceed four times the largest table.
+
+**Results (SF1, identical rows).** Q14 1.6×, a Q19-style OR across two tables
+2.2×, LEFT JOIN with an ON predicate 1.8×, composite-key join 2.2×, the full
+Q3 (GROUP BY over columns of two tables) 1.5×.
+
+**Finding: a LEFT JOIN exposed a serial loop.** The first gate run had a LEFT
+JOIN shape at 0.72–0.90×. Unmatched rows have a NULL dimension key, so 80% of
+that set was the NULL-key group — which the Metal operator folds on the host,
+serially. Folding it with up to eight threads fixed the shape (gate: 60
+rewritten rows, 1.03–7.9×). The device join had never shown it because inner
+joins rarely produce NULL keys.
+
+**Trade-off recorded.** The device join stays the first choice: its base sets
+are shared between statements and it rebuilds in milliseconds. An uploaded
+join is one set per distinct FROM clause, and any change to a joined table
+re-uploads it.
+
+---
+
 ## Open questions
 
-- **Cross-table expressions** after a join (Q14): needs either device-side
-  expression evaluation or a decomposition such as `sum(x) FILTER (WHERE
-  dimension predicate)`.
 - **`count(DISTINCT x)`, `median`, `stddev`**: new kernels; `count(DISTINCT)`
   needs values sorted within a group.
 - **`avg(DECIMAL)`**: no bit-exact decomposition found yet.
-- **LEFT / semi / anti joins** on the same materialised-join idea (a match
-  lane instead of dropping unmatched rows).
+- **RIGHT / FULL / semi / anti joins**, `IN (SELECT …)` and `EXISTS`
+  subqueries, CTEs and derived tables as inputs.
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
   and as the CPU reference; the CUDA side is to be written against the same
   interface and then swept with the same gate.

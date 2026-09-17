@@ -88,13 +88,19 @@ GROUP BY k1 [, k2, k3]
   and VARCHAR through a dictionary when the column is low-cardinality enough
   that a dictionary is cheap and the collation is binary (§4.5). UBIGINT and
   HUGEINT keys are not int64-orderable and run native.
-- `FROM`: one base table, or an inner equi-join tree of base tables in which
-  every join lands on a column that is unique in its table — the fact-to-
-  dimension joins of a star or snowflake schema (§4.8). Keys, the payload and
-  `WHERE` columns may come from any of the joined tables (all components of a
-  multi-column key from the same one). Outer / semi / anti joins, `USING`,
-  self joins, composite join keys, subqueries as join inputs and many-to-many
-  joins run native.
+- `FROM`: one base table, or a join of base tables. An inner equi-join tree
+  in which every join lands on a column that is unique in its table — the
+  fact-to-dimension joins of a star or snowflake schema — is materialised on
+  the device (§4.8). Any other INNER / LEFT join of base tables tied together
+  by equalities — many-to-many, `USING`, composite or non-integer keys, extra
+  `ON` predicates, self joins, keys or expressions that mix columns of several
+  tables — is answered from an upload of the join's result (§4.13, Python
+  wrapper). RIGHT / FULL / semi / anti joins, cross products, subqueries as
+  join inputs and joins whose result is more than four times the largest
+  table run native.
+- No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is accepted
+  over a join (§4.12); on a single table native's filter-and-sum wins and the
+  statement is left alone.
 - Payloads: integer family, DECIMAL (§4.3). DOUBLE/FLOAT payloads are not
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.
 - Aggregates: `sum`, `count`, `count(*)`, `min`, `max`, `avg` (= sum/count,
@@ -598,6 +604,68 @@ literal-sensitive (the outer text carries the literals). Declines: `avg` over
 DECIMAL and DOUBLE aggregates inside the expression (the inner declines),
 DISTINCT / FILTER aggregates, windows, subqueries, a bare column that is not
 a group key.
+
+### 4.12 Aggregates without GROUP BY
+`SELECT sum(x), count(*) FROM a JOIN b … WHERE …` has one group. The split of
+§4.11 handles it: the inner statement groups by a constant computed key (`(c
+IS NULL AND c IS NOT NULL)` over any column of the statement — FALSE on every
+row, never NULL), the outer statement selects the aggregates. One difference
+from a GROUP BY matters: over an empty input native returns ONE row (NULL
+sums, zero counts), a GROUP BY returns none. The outer statement is therefore
+`FROM (SELECT 1) LEFT JOIN (<inner>) ON true` with `coalesce(count, 0)`, and
+a HAVING always filters in the outer statement (no row in, no row out).
+Measured before building it: on a single table native wins this shape (TPC-H
+Q6: 2.0 ms native vs 2.9 ms at SF1, 17 vs 25 ms at SF10 — a vectorised filter
+and sum is memory-bandwidth-optimal on the CPU, while the device evaluates
+five predicate passes), so the wrapper's fast path only parses a GROUP-BY-less
+aggregate when the statement joins, and the single-table case stays native by
+the `min_groups` bound. Over a join: 1.3–3.4× at SF1.
+
+### 4.13 Joins the device operator cannot express: upload the join's result
+§4.8 covers joins that are "fact rows with dimension columns attached". A
+LEFT JOIN, a many-to-many join, `USING`, a composite or non-integer key, an
+`ON` clause with more than an equality, a GROUP BY whose keys come from two
+tables, an expression that mixes columns of two tables (`CASE WHEN p_type LIKE
+'PROMO%' THEN l_extendedprice * (1 - l_discount) …`, TPC-H Q14) are not that.
+For them the computed-lane idea (§4.10) is applied to the FROM clause: DuckDB
+executes the join — once, inside the background upload — and the resident set
+holds lanes of the join's RESULT. Any lane is then an expression over the
+joined row, evaluated by DuckDB, so semantics are native's by construction.
+
+`_join.lower_upload` accepts INNER / LEFT joins (explicit or comma syntax) of
+base tables in which every table is tied to the others by at least one
+equality — a cross product is never uploaded — and lowers the statement to
+the same single virtual table as §4.8. Equalities written in `WHERE` move
+into the upload's `WHERE`; `ON` clauses stay where they are (a LEFT JOIN's
+`ON` predicates decide matching, not filtering) and are validated like
+computed lanes. `USING` columns resolve to the left side, which is the merged
+column's value for the join types accepted. The upload statement is
+`gpu_upload_rows_exact(...) FROM (SELECT <lanes>, <leftmost table>.rowid AS
+rowid FROM <the FROM clause> WHERE <equalities>)`: every result row of an
+INNER / LEFT join has exactly one row of the leftmost table, so the existing
+row-id segmentation uploads the join in idle-time pieces like a table.
+
+Staleness: a set built from a join has no table of its own to count. The
+extension gains `gpu_note_rows(tag, n)`, a column-less SENTINEL set that
+remembers a base table's row count at upload time; the rewritten statement
+carries one `gpu_assert_rows(<sentinel>, (SELECT count(*) FROM <table>))` per
+base table (the `guards` context field of §4.8), and the residency manager
+makes the uploaded set depend on its sentinels.
+
+Order of attempts: the device join first (its base sets are shared between
+statements and re-materialise in milliseconds); when it declines for shape,
+the upload; when the select list holds expressions over aggregates, the split
+of §4.11 around whichever of the two answers the inner statement. A join
+whose result exceeds four times its largest table (or 2^32 rows) is declined
+before anything is uploaded (`threshold`).
+
+Metal: a LEFT JOIN can put most rows into the NULL-key group (every unmatched
+row has a NULL dimension key); that group is folded on the host, which cost
+several ms serially (gate: 0.72–0.90× on such a shape) and is now folded by
+up to eight threads. Gate, TPC-H SF1: LEFT JOIN with an `ON` predicate and a
+composite-key join, all forms, 60 rewritten rows at 1.03–7.9×. Through the
+wrapper: Q14 1.6×, a Q19-style `OR` across two tables 2.2×, the full Q3 with
+its three-column GROUP BY over two tables 1.5×.
 
 ## 5. Automatic residency (piece C)
 

@@ -51,8 +51,38 @@ def _contains(e, pred) -> bool:
     return False
 
 
-def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tuple[str, str]]:
-    """(inner statement JSON, outer statement JSON over PLACEHOLDER) or None."""
+def _first_colref(e) -> Optional[dict]:
+    if isinstance(e, dict):
+        if e.get("class") == "COLUMN_REF":
+            return e
+        for v in e.values():
+            r = _first_colref(v)
+            if r is not None:
+                return r
+    elif isinstance(e, list):
+        for v in e:
+            r = _first_colref(v)
+            if r is not None:
+                return r
+    return None
+
+
+def _always_false(col: dict) -> dict:
+    """(c IS NULL AND c IS NOT NULL): FALSE on every row, never NULL — the
+    single group of an aggregate without GROUP BY, as a computed key."""
+    c = dict(json.loads(json.dumps(col)), alias="")
+    op = lambda t: {"class": "OPERATOR", "type": t, "alias": "", "query_location": _NO_LOC,   # noqa: E731
+                    "children": [json.loads(json.dumps(c))]}
+    return {"class": "CONJUNCTION", "type": "CONJUNCTION_AND", "alias": "", "query_location": _NO_LOC,
+            "children": [op("OPERATOR_IS_NULL"), op("OPERATOR_IS_NOT_NULL")]}
+
+
+def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tuple[str, str, bool]]:
+    """(inner statement JSON, outer statement JSON over PLACEHOLDER, global)
+    or None. `global` = the statement has no GROUP BY: the inner statement
+    groups by a constant computed key, and the caller LEFT JOINs the inner
+    result to a one-row table so that an empty input still gives native's
+    single row (NULL sums, zero counts)."""
     j = json.loads(tree_json)
     stmts = j.get("statements") or []
     if len(stmts) != 1:
@@ -61,7 +91,13 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
     if node.get("type") != "SELECT_NODE" or (node.get("cte_map") or {}).get("map"):
         return None
     groups = node.get("group_expressions") or []
-    if not groups or node.get("group_sets") != [list(range(len(groups)))]:
+    is_global = not groups and node.get("group_sets") in ([], None)
+    if is_global:
+        col = _first_colref(node)
+        if col is None or not _contains(node.get("select_list") or [], _is_agg):
+            return None
+        global_key = _always_false(col)
+    elif node.get("group_sets") != [list(range(len(groups)))]:
         return None
     if node.get("aggregate_handling") != "STANDARD_HANDLING" or node.get("qualify") or node.get("sample"):
         return None
@@ -92,6 +128,17 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
 
     ok = [True]
 
+    def agg_ref(i: int, e: dict) -> dict:
+        r = dict(_ref(f"__g{i}"), alias=e.get("alias") or "")
+        if is_global and (e.get("function_name") or "").lower() in ("count", "count_star"):
+            # no input rows: the LEFT JOIN gives NULL where native's count gives 0
+            return {"class": "OPERATOR", "type": "OPERATOR_COALESCE", "alias": e.get("alias") or "",
+                    "query_location": _NO_LOC,
+                    "children": [dict(r, alias=""),
+                                 {"class": "CONSTANT", "type": "VALUE_CONSTANT", "alias": "", "query_location": _NO_LOC,
+                                  "value": {"type": {"id": "INTEGER", "type_info": None}, "is_null": False, "value": 0}}]}
+        return r
+
     def sub(e, top_level_order: bool = False):
         if isinstance(e, list):
             return [sub(x) for x in e]
@@ -108,9 +155,9 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
                     return e
                 for i, a in enumerate(aggs):
                     if _same(a, e):
-                        return dict(_ref(f"__g{i}"), alias=e.get("alias") or "")
+                        return agg_ref(i, e)
                 aggs.append(e)
-                return dict(_ref(f"__g{len(aggs) - 1}"), alias=e.get("alias") or "")
+                return agg_ref(len(aggs) - 1, e)
             if e.get("class") == "COLUMN_REF":
                 nm = e.get("column_names") or []
                 if not (top_level_order and len(nm) == 1 and nm[0].casefold() in select_aliases):
@@ -130,8 +177,9 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
         simple = (having.get("class") == "COMPARISON"
                   and ((_is_agg(having.get("left") or {}) and _is_const(having.get("right") or {}))
                        or (_is_agg(having.get("right") or {}) and _is_const(having.get("left") or {}))))
-        if simple:
-            inner_having = having                     # the device's HAVING
+        if simple and not is_global:
+            inner_having = having                     # the device's HAVING (a global aggregate filters its ONE
+                                                      # row in the outer statement: no row in, no row out)
         else:
             outer_where = sub(having)
     outer_mods = []
@@ -146,6 +194,10 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
 
     inner = json.loads(json.dumps(j))
     inode = inner["statements"][0]["node"]
+    if is_global:
+        groups = [global_key]
+        inode["group_expressions"] = [json.loads(json.dumps(global_key))]
+        inode["group_sets"] = [[0]]
     inode["select_list"] = [dict(json.loads(json.dumps(g)), alias=f"__k{i}") for i, g in enumerate(groups)] + \
                            [dict(json.loads(json.dumps(a)), alias=f"__g{i}") for i, a in enumerate(aggs)]
     inode["having"] = inner_having
@@ -156,4 +208,4 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
     onode["select_list"] = outer_sel
     onode["where_clause"] = outer_where
     onode["modifiers"] = outer_mods
-    return json.dumps(inner), json.dumps(outer)
+    return json.dumps(inner), json.dumps(outer), is_global

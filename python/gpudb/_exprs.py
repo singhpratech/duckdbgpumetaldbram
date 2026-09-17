@@ -197,7 +197,7 @@ class Lowerer:
         if len(tables) != 1:
             raise Decline("shape", "expression over columns of several tables")
         ti = tables.pop()
-        sql = self._sql(e, lambda c: [self.real_of(c)])
+        sql = self._sql(e, lambda c: self.real_of(c).split("\x00"))
         probe_sql = self._sql(e, lambda c: self.probe_of(c).split("\x00"))
         name = "x_" + hashlib.sha1((self.identity(ti) + "\x00" + sql).encode()).hexdigest()[:14]
         native = self.describe(ti, sql).upper()
