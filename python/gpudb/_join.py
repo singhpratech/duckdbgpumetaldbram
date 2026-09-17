@@ -99,6 +99,55 @@ def _and(conjuncts: list):
             "query_location": 18446744073709551615, "children": conjuncts}
 
 
+def _strip_loc(e):
+    if isinstance(e, dict):
+        return {k: _strip_loc(v) for k, v in e.items() if k != "query_location"}
+    if isinstance(e, list):
+        return [_strip_loc(v) for v in e]
+    return e
+
+
+def _eq_either_way(a, b) -> bool:
+    """Structurally equal, or the same equality with its sides swapped."""
+    sa, sb = _strip_loc(a), _strip_loc(b)
+    if sa == sb:
+        return True
+    if (isinstance(sa, dict) and isinstance(sb, dict) and sa.get("type") == "COMPARE_EQUAL"
+            and sb.get("type") == "COMPARE_EQUAL"):
+        return sa.get("left") == sb.get("right") and sa.get("right") == sb.get("left")
+    return False
+
+
+def hoist_common_or_terms(conjuncts: list) -> list:
+    """(A AND x) OR (A AND y) OR (A AND z)  ->  A AND (x OR y OR z).
+    TPC-H Q19 writes its join equality inside every branch of an OR; hoisted,
+    it is an ordinary join edge. Exact: a conjunct common to every branch
+    factors out of a disjunction in three-valued logic as well."""
+    out = []
+    for c in conjuncts:
+        if not (isinstance(c, dict) and c.get("class") == "CONJUNCTION" and c.get("type") == "CONJUNCTION_OR"):
+            out.append(c)
+            continue
+        branches = []
+        for b in c.get("children") or []:
+            terms: list = []
+            _split_and(b, terms)
+            branches.append(terms)
+        if len(branches) < 2:
+            out.append(c)
+            continue
+        common = [t for t in branches[0] if all(any(_eq_either_way(t, u) for u in br) for br in branches[1:])]
+        if not common:
+            out.append(c)
+            continue
+        out.extend(common)
+        rest = [[t for t in br if not any(_eq_either_way(t, k) for k in common)] for br in branches]
+        if all(rest):                                   # a branch left empty makes the OR true: nothing to keep
+            out.append({"class": "CONJUNCTION", "type": "CONJUNCTION_OR", "alias": "",
+                        "query_location": 18446744073709551615, "children": [_and(r) for r in rest]})
+    return out
+
+
 def is_join_statement(tree_json: str) -> bool:
     try:
         j = json.loads(tree_json)
@@ -191,6 +240,7 @@ def lower(tree_json: str,
     # ---- edges: a.x = b.y across two tables, from ON and from WHERE ----
     where_conjuncts: list = []
     _split_and(node.get("where_clause"), where_conjuncts)
+    where_conjuncts = hoist_common_or_terms(where_conjuncts)
     edges: List[Tuple[int, str, int, str]] = []
     residual: list = []
     for c in on_conjuncts + where_conjuncts:
@@ -643,6 +693,7 @@ def lower_upload(tree_json: str,
                 parent[find(ti)] = find(owners[0])
     where_conj: list = []
     _split_and(node.get("where_clause"), where_conj)
+    where_conj = hoist_common_or_terms(where_conj)
     edge_conj, residual = [], []
     for c in where_conj:
         e = is_edge(c)

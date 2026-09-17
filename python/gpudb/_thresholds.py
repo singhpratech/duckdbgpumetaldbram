@@ -35,6 +35,17 @@ sides). SF10 (60M x 15M rows): every one of 78 rows wins, the plain form
 1.08–1.28× at 1M groups returned, 1.12–1.14× at 320K under the 3% WHERE,
 HAVING / top-k 2.0–9.9×                               → join_plain_max_groups,
 join_plain_small_groups, join_plain_min_selectivity
+Few groups, by key type (2026-09-17, SF1, 1 to 5 payload columns with an
+expression payload, after the block-level reduce): an INTEGER key with 7
+groups loses or ties on every form (0.62–1.28×; native aggregates a tiny
+integer domain through a perfect hash in 1.5–5 ms), a VARCHAR key with 3
+groups WINS 1.02–1.71× with no WHERE (native hashes the strings on every
+row). Under a WHERE it depends on the payload: with an EXPRESSION payload
+(native evaluates it per row, the resident lane is free) 1.12–1.48× at 98%
+kept and 0.62–0.82× at 9%; with a plain column payload 0.78–1.19× at 55–91%
+kept — the mask costs the device what the expression costs native. TPC-H Q1
+(two VARCHAR keys, eight aggregates over expressions, 98% of the rows):
+12.2 → 5.9 ms.                                       → string_key_min_selectivity
 Several payload columns (§4.9; three of them, same machine, SF1): the fused
 operator shares the mask and the grouping, so HAVING / top-k keep their wins
 (1.06–3.0× single table, up to 4.8× over joins), but every extra aggregate is
@@ -81,6 +92,9 @@ class Thresholds:
     # statements aggregating several payload columns (§4.9)
     multi_plain_max_groups: int = 50_000        # plain form, single table, no WHERE (under a WHERE: native)
     multi_join_plain_max_groups: int = 20_000   # plain form over a key join
+    # a VARCHAR key is exempt from min_groups / topk_min_groups without a WHERE, and under a WHERE
+    # when a payload is a computed expression and at least this much survives
+    string_key_min_selectivity: float = 0.5
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -92,7 +106,8 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
-           has_where: bool, join: bool = False, payloads: int = 1) -> Tuple[bool, str]:
+           has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
+           limited: bool = False, computed_payload: bool = False) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
     the statement is over a key join (its own table above)."""
@@ -101,7 +116,8 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         return False, f"no thresholds for backend {backend!r}"
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
-    if payloads > 1 and form == "plain" and est_groups is not None:
+    # (a result of a few hundred groups is never output-bound, however many columns it has)
+    if payloads > 1 and form == "plain" and est_groups >= t.min_groups:
         if join and est_groups > t.multi_join_plain_max_groups:
             return False, (f"{est_groups} groups x {payloads} payload columns returned over a join "
                            f"> {t.multi_join_plain_max_groups} (output-bound)")
@@ -110,7 +126,11 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         if not join and est_groups > t.multi_plain_max_groups:
             return False, f"{est_groups} groups x {payloads} payload columns returned > {t.multi_plain_max_groups}"
     if join:
-        if form != "plain":
+        # `limited`: the statement ends in a LIMIT that was not pushed as a top-k (ORDER BY
+        # several terms): every group still leaves the operator, but only LIMIT rows reach
+        # the client, so the fetch-bound reasoning behind the plain-form bounds does not
+        # apply (TPC-H Q3: 11K groups under a 1% WHERE, LIMIT 10 — 1.5-1.7x)
+        if form != "plain" or limited:
             return True, ""
         if est_groups > t.join_plain_max_groups:
             return False, f"{est_groups} groups returned over a join > {t.join_plain_max_groups} (output-bound)"
@@ -121,7 +141,10 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
                 return False, (f"selectivity {selectivity:.2f} < {t.join_plain_min_selectivity} for the plain form "
                                f"over a join with {est_groups} groups")
         return True, ""
-    if est_groups < t.min_groups:
+    few_ok = string_key and (not has_where or (computed_payload and selectivity is not None
+                                               and selectivity >= t.string_key_min_selectivity))
+    # (plain form only: with three groups HAVING / top-k save nothing and measured 0.98–1.07x)
+    if est_groups < t.min_groups and not (few_ok and form == "plain"):
         return False, f"{est_groups} groups < {t.min_groups}"
     sel = selectivity if has_where else 1.0
     if sel is None:

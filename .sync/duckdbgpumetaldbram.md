@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/ext-global-aggregates
-- working on: v0.7: aggregates without GROUP BY over joins; joins by uploading the join result (LEFT, many-to-many, composite keys, cross-table expressions)
+- branch: feat/ext-coverage-survey
+- working on: v0.7: TPC-H coverage map; avg over DECIMAL; OR-hoisted join edges; few-group string keys; estimate fixes
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-17T17:54:11Z
+- last update: 2026-09-17T18:10:12Z

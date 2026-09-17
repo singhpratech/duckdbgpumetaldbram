@@ -29,6 +29,7 @@ import gpudb  # noqa: E402
 # key column -> (label, approximate groups at SF1)
 KEYS = {
     "l_linenumber": "7 groups",
+    "l_returnflag": "3 groups, VARCHAR key",      # few groups are only rewritten for string keys (_thresholds.py)
     "l_suppkey":    "10K groups",
     "l_partkey":    "200K groups",
     "l_orderkey":   "1.5M groups",

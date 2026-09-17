@@ -989,11 +989,18 @@ class Connection:
                         f"SELECT count(*) FILTER (WHERE {_rewrite.where_sql(plan)}), count(*) "
                         f"FROM {probe_from}").fetchone()
                     sel = (kept / total) if total else 0.0
+                    # there cannot be more groups than rows that survive the WHERE (the
+                    # product of several keys' distinct counts overshoots wildly under a filter)
+                    if est is not None:
+                        est = max(1, min(est, int(kept)))
                 except Exception as e:
                     self._log(f"selectivity probe failed: {e}")
                     return Decision(False, "threshold")
             ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
-                                         join=low is not None, payloads=max(1, len(plan.vals)))
+                                         join=low is not None, payloads=max(1, len(plan.vals)),
+                                         string_key=bool(plan.dict_key),
+                                         limited=plan.limit is not None and plan.limit <= 10_000,
+                                         computed_payload=any(v in computed for v in plan.vals))
             if not ok:
                 self._log(f"threshold: {why}")
                 return Decision(False, "threshold")

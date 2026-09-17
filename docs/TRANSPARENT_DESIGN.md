@@ -326,6 +326,17 @@ README examples currently write `l_quantity::BIGINT` and v0.7 stops needing
 to. `DECIMAL(p>18)` is int128-backed and is uploaded as two limbs (same
 machinery as 4.2).
 
+
+`avg` over a DECIMAL(p ≤ 18, s) payload is computed the way native computes
+it — ONE division by the scaled count, `double(unscaled sum) / (count ×
+10^s)` — in the rewritten select list (and in a host-side `HAVING avg(...)`),
+from the exact `sum` and `count` the table function returns. Verified against
+native over thousands of groups at four scales; `(sum / count) / 10^s`,
+`(sum / 10^s) / count` and `sum(decimal)::DOUBLE / count` each differ from
+native on 20–30% of groups. Native does this arithmetic in `long double`
+(80-bit on x86, double on ARM): the formula is verified on ARM and must be
+re-verified on x86 with the CUDA port.
+
 ### 4.4 Packed multi-column keys
 `GROUP BY a, b [, c]` over integer/date/timestamp columns: at upload, each
 column's `[min, max]` is read from DuckDB's statistics; if

@@ -3176,3 +3176,36 @@ both sides; the ratios hold. Thresholds on, rows identical to native.
 | li x orders: l_suppkey | l_discount < 0.01 | 9% | having | 99 | 26.9 | 9.7 | 2.78× | PASS |
 | li x orders: l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 26.0 | 10.3 | 2.51× | PASS |
 | li x orders: l_suppkey | l_discount < 0.01 | 9% | projected | 99 | 24.4 | 10.1 | 2.41× | PASS |
+
+## v0.7 TPC-H coverage map — Metal, SF1 (2026-09-17)
+
+`scripts/tpch_coverage.py`: the 22 official queries through `gpudb.connect()`
+with the shipping thresholds, against native in the same process (hot loop,
+minimum of 5, rewritten queries warmed first). A declined query runs native
+unchanged; the note is the decline reason.
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.3 | 6.0 | 2.03× | True | |
+| Q2 | native (shape) | 4.5 | — | — | — | declined (shape, upload): SUBQUERY inside an expression |
+| Q3 | GPU (plain) | 6.2 | 3.2 | 1.93× | True | |
+| Q4 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.6 | 1.9 | 3.56× | True | |
+| Q6 | native (shape) | 1.8 | — | — | — |  |
+| Q7 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q8 | native (shape) | 7.5 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q9 | native (shape) | 19.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q10 | native (shape) | 17.9 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q11 | native (shape) | 2.7 | — | — | — | declined (shape, upload): having is not aggregate vs constant |
+| Q12 | GPU (plain) | 6.2 | 3.5 | 1.75× | True | |
+| Q13 | native (shape) | 18.7 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q14 | GPU (projected) | 5.3 | 3.0 | 1.74× | True | |
+| Q15 | native (shape) | 3.1 | — | — | — | declined (shape, upload): not a plain SELECT |
+| Q16 | native (shape) | 12.4 | — | — | — | declined (shape, upload): SUBQUERY inside an expression |
+| Q17 | native (shape) | 6.1 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q18 | native (shape) | 13.9 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q19 | GPU (projected) | 10.8 | 2.9 | 3.78× | True | |
+| Q20 | native (shape) | 7.7 | — | — | — |  |
+| Q21 | native (shape) | 22.1 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.4 | — | — | — | split: the inner GROUP BY declined (shape) |
+6 of 22 queries answered on the device; 0 with rows that differ from native

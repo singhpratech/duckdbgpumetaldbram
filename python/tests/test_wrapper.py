@@ -112,6 +112,12 @@ def run():
         "multi_topk_fn": "SELECT k, sum(b), min(a) FROM tm WHERE z > 1 GROUP BY k ORDER BY sum(b) LIMIT 4",
         "multi_two_keys": "SELECT k, z, sum(a), sum(b) FROM tm GROUP BY k, z ORDER BY k, z",
         "multi_same_col": "SELECT k, sum(a), min(a), max(a), avg(a), sum(b) FROM tm GROUP BY k ORDER BY k",
+        # avg over DECIMAL: native's own formula, double(unscaled sum) / (count * 10^scale)
+        "avg_decimal": "SELECT k, avg(d), sum(d), count(d) FROM t GROUP BY k ORDER BY k",
+        "avg_decimal_nulls": "SELECT k, avg(c) AS m, avg(a) AS ma, min(c) FROM tm WHERE z <> 5 GROUP BY k ORDER BY k",
+        "avg_decimal_having": "SELECT k, avg(c) AS m FROM tm GROUP BY k HAVING avg(c) > 249.95 ORDER BY k",
+        "avg_decimal_order": "SELECT k, avg(d) AS m FROM t GROUP BY k ORDER BY m DESC, k LIMIT 8",
+        "avg_decimal_expr": "SELECT k, avg(c * 3 - 1.25) AS m FROM tm GROUP BY k ORDER BY k",
         "str_mixed":  "SELECT k, s, sum(v) FROM t WHERE s <> 'beta' AND k < 20 GROUP BY s, k ORDER BY k, s NULLS LAST",
         "str_pred":   "SELECT k, sum(v) FROM t WHERE s = 'delta' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
@@ -190,13 +196,12 @@ def run():
         "where_volatile": ("SELECT k, sum(v) FROM t WHERE v > random() GROUP BY k", "shape"),
         "where_subquery": ("SELECT k, sum(v) FROM t WHERE v > (SELECT 3) GROUP BY k", "shape"),
         "double":       ("SELECT k, sum(x) FROM t GROUP BY k", "double"),
-        "avg_decimal":  ("SELECT k, avg(d) FROM t GROUP BY k", "decimal"),
         "cte_shadow":   ("WITH t AS (SELECT 1 k, 1 v) SELECT k, sum(v) FROM t GROUP BY k", "shape"),
         "two_tables":   ("SELECT a.k, sum(a.v) FROM t a JOIN t b USING (k) GROUP BY a.k", "threshold"),   # a 90M-row self join: too big to upload
         "no_group":     ("SELECT sum(v) FROM t", "shape"),
     }
     if not con._exact:
-        rej.pop("where_volatile"); rej.pop("where_subquery"); rej.pop("avg_decimal")
+        rej.pop("where_volatile"); rej.pop("where_subquery")
         rej["where"] = ("SELECT k, sum(v) FROM t WHERE v > 3 GROUP BY k", "shape")
         rej["nulls"] = ("SELECT k, sum(v) FROM tn GROUP BY k", "nulls")
         rej["min"] = ("SELECT k, min(v) FROM t GROUP BY k", "shape")
@@ -467,6 +472,7 @@ def run():
         pcases = {
             "ratio":          "SELECT k, sum(a) / count(*) AS mean, sum(b) * 1.0 / sum(a + 1) AS r, count(*) FROM tm GROUP BY k ORDER BY k",
             "decimal_mean":   "SELECT k, sum(c) / count(c) AS mc, max(c) - min(c) AS spread FROM tm GROUP BY k ORDER BY k",
+            "avg_decimal_inside": "SELECT k, avg(d) * 2 AS twice, round(avg(d), 3) AS r FROM t GROUP BY k ORDER BY k",
             "pct_case":       "SELECT k, 100.0 * sum(CASE WHEN z < 4 THEN b ELSE 0 END) / sum(b) AS pct FROM tm GROUP BY k ORDER BY k",
             "unnamed":        "SELECT k, sum(a) + 1, round(sum(b) / 1000.0, 2), -min(a) FROM tm GROUP BY k ORDER BY k",
             "key_in_expr":    "SELECT k * 2 AS kk, sum(a) - k AS adj, CAST(k AS VARCHAR) || ':' || CAST(count(*) AS VARCHAR) AS label FROM tm GROUP BY k ORDER BY kk",
@@ -515,7 +521,6 @@ def run():
         check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
               f"global single table: runs native ({con.last_rewrite()['reason']}) — native's filter + sum wins there")
         pdeclines = {
-            "avg_decimal_inside": "SELECT k, avg(d) * 2 FROM t GROUP BY k",
             "double_inside":  "SELECT k, sum(x) / count(*) FROM t GROUP BY k",
             "window_over_agg": "SELECT k, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY k",
             "distinct_agg":   "SELECT k, count(DISTINCT v) + 1 FROM t GROUP BY k",
@@ -614,6 +619,7 @@ def run():
             "cross_keys":     "SELECT g, tier, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE g < 40 GROUP BY g, tier ORDER BY g, tier",
             "expr_two_tables": "SELECT tier, sum(v * jd.nid) AS x, sum(CASE WHEN region = 'north' THEN amt ELSE 0 END) AS north_amt FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
             "or_two_tables":  "SELECT g, count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE (tier = 1 AND mode = 'AIR') OR (tier = 2 AND v > 900) GROUP BY g ORDER BY g",
+            "edge_inside_or": "SELECT g, count(*), sum(amt) FROM jf, jd WHERE (jf.did = jd.did AND tier = 1 AND mode = 'AIR') OR (jf.did = jd.did AND tier = 2 AND v > 900) OR (jd.did = jf.did AND tier = 3) GROUP BY g ORDER BY g",
             "global_cross":   "SELECT 100.0 * sum(CASE WHEN region = 'south' THEN amt ELSE 0 END) / sum(amt) AS south_pct, count(*) FROM jf, jd WHERE jf.did = jd.did AND opened < DATE '2021-01-01'",
             "varchar_join_key": "SELECT jd.tier, count(*) FROM jf JOIN jd ON CAST(jf.did AS VARCHAR) = CAST(jd.did AS VARCHAR) AND jf.did = jd.did GROUP BY jd.tier ORDER BY jd.tier",
             "having_topk":    "SELECT g, tier, sum(amt) AS a FROM jf LEFT JOIN jd ON jf.did = jd.did GROUP BY g, tier HAVING sum(amt) > 100 ORDER BY a DESC, g, tier LIMIT 12",
