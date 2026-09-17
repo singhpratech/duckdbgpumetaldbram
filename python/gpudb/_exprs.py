@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ._rewrite import Decline, decimal_scale, _INT_TYPES, _STRING_TYPES, _TEMPORAL_TYPES
+from . import _scope
 
 _AGGS = {"sum", "count", "min", "max", "avg"}
 _NO_LOC = 18446744073709551615
@@ -51,12 +52,13 @@ class Computed:
     native_type: str   # DuckDB's type of the expression
     lane_type: str     # the type the rewrite engines see (BOOLEAN -> TINYINT, wide DECIMAL -> DECIMAL(18,s))
     has_constant: bool # the expression embeds a literal: the statement's template alone does not identify it
+    dep_tables: tuple = ()   # §4.18: base tables its subqueries read (each needs a staleness guard)
 
 
 def _strip(e):
     """The expression without source positions (and without a top-level alias)."""
     if isinstance(e, dict):
-        return {k: _strip(v) for k, v in e.items() if k != "query_location"}
+        return {k: _strip(v) for k, v in e.items() if k != "query_location" and not k.startswith("__")}
     if isinstance(e, list):
         return [_strip(v) for v in e]
     return e
@@ -119,7 +121,14 @@ class Lowerer:
     def __init__(self, columns: Dict[str, str], table_of: Callable[[str], int],
                  real_of: Callable[[str], str], probe_of: Callable[[str], str],
                  deserialize: Callable[[str], str], describe: Callable[[int, str], str],
-                 function_ok: Callable[[str], bool], identity: Callable[[int], str]):
+                 function_ok: Callable[[str], bool], identity: Callable[[int], str],
+                 resolve_table: Optional[Callable] = None,
+                 sql_qualifier: Optional[str] = None, probe_qualifier: Optional[str] = None):
+        # how a column of the enclosing statement is written INSIDE a subquery of the generated
+        # SQL (a bare name there would re-bind to the subquery's own tables): the alias the
+        # upload / the probe gives the outer row. None = names are already qualified.
+        self.sql_qualifier, self.probe_qualifier = sql_qualifier, probe_qualifier
+        self.resolve_table = resolve_table   # (catalog, schema, name) -> (Identity | None, why): subquery scoping
         self.columns = columns            # statement column -> type (case as in the catalog)
         self.table_of, self.real_of, self.probe_of = table_of, real_of, probe_of
         self.deserialize, self.describe = deserialize, describe
@@ -138,8 +147,82 @@ class Lowerer:
             raise Decline("shape", f"unknown column {names[-1]} inside an expression")
         return c
 
+    # aggregates a subquery may use: exact and independent of evaluation order
+    _SUBQUERY_AGGS = {"count", "count_star", "min", "max", "sum", "avg", "bool_and", "bool_or"}
+
+    def _validate_subquery(self, e, cols: set, flags: dict) -> None:
+        """§4.18: EXISTS / IN / a scalar subquery inside a lane. DuckDB evaluates it
+        per row during the upload, so it must be deterministic: a plain SELECT
+        over base tables (no LIMIT / ORDER BY / sample / window), CONSISTENT
+        scalar functions, and aggregates that do not depend on evaluation order
+        (sum / avg only over non-floating columns)."""
+        if self.resolve_table is None:
+            raise Decline("shape", "SUBQUERY inside an expression")
+        if e.get("child") is not None:
+            self._validate(e["child"], cols, flags)
+        node = (e.get("subquery") or {}).get("node") or {}
+        if node.get("sample") or node.get("qualify"):
+            raise Decline("shape", "sample / qualify inside a subquery")
+        if any(m.get("type") != "DISTINCT_MODIFIER" for m in node.get("modifiers") or []):
+            raise Decline("shape", "LIMIT / ORDER BY inside a subquery")
+        flags["const"] = True          # its text is part of the lane's identity
+
+        def floating(x) -> bool:
+            if isinstance(x, dict):
+                if x.get("class") == "COLUMN_REF":
+                    t = x.get("__type") if x.get("__inner") else self.columns.get(self._column(x), "")
+                    return (t or "").upper() in ("DOUBLE", "FLOAT", "REAL")
+                return any(floating(v) for k, v in x.items() if k not in _NOT_EXPR_KEYS)
+            if isinstance(x, list):
+                return any(floating(v) for v in x)
+            return False
+
+        def walk(x) -> None:
+            if isinstance(x, list):
+                for v in x:
+                    walk(v)
+                return
+            if not isinstance(x, dict):
+                return
+            cls = x.get("class")
+            if cls == "COLUMN_REF":
+                if not x.get("__inner"):
+                    cols.add(self._column(x))          # a correlation: a column of the enclosing statement
+                return
+            if cls == "SUBQUERY":
+                self._validate_subquery(x, cols, flags)
+                return
+            if cls in ("WINDOW", "PARAMETER", "LAMBDA", "POSITIONAL_REFERENCE"):
+                raise Decline("shape", f"{cls} inside a subquery")
+            if cls == "FUNCTION":
+                name = (x.get("function_name") or "").lower()
+                if x.get("filter") or ((x.get("order_bys") or {}).get("orders")) or x.get("export_state"):
+                    raise Decline("shape", "aggregate modifier inside a subquery")
+                if name in self._SUBQUERY_AGGS:
+                    if name in ("sum", "avg") and floating(x.get("children") or []):
+                        raise Decline("double", f"{name} over a floating column inside a subquery")
+                elif not self.function_ok(name):
+                    raise Decline("shape", f"function {name} inside a subquery is not a deterministic scalar function")
+            for k, v in x.items():
+                if k not in _NOT_EXPR_KEYS and k != "from_table":
+                    walk(v)
+
+        def conditions(ft) -> None:
+            if isinstance(ft, dict) and ft.get("type") == "JOIN":
+                walk(ft.get("condition"))
+                conditions(ft.get("left"))
+                conditions(ft.get("right"))
+
+        conditions(node.get("from_table"))
+        walk({k: v for k, v in node.items() if k not in ("from_table", "cte_map")})
+
     def _validate(self, e, cols: set, flags: dict) -> None:
         cls = e.get("class")
+        if cls == "SUBQUERY":
+            self._validate_subquery(e, cols, flags)
+            return
+        if cls == "COLUMN_REF" and e.get("__inner"):
+            return
         if cls is None:
             # a structural container (a CASE's when / then pair): its members are the expressions
             for ch in _children(e):
@@ -164,18 +247,23 @@ class Lowerer:
             self._validate(ch, cols, flags)
 
     # ---- registration ----
-    def _sql(self, e, name_of: Callable[[str], List[str]]) -> str:
-        def sub(x):
+    def _sql(self, e, name_of: Callable[[str], List[str]], qualifier: Optional[str] = None) -> str:
+        def sub(x, depth=0):
             if isinstance(x, dict):
                 if x.get("class") == "COLUMN_REF":
                     y = dict(x)
-                    y["column_names"] = name_of(self._column(x))
+                    if not x.get("__inner"):           # a column of a subquery's own tables stays as written
+                        names = name_of(self._column(x))
+                        if depth and qualifier and len(names) == 1:
+                            names = [qualifier] + names
+                        y["column_names"] = names
                     return y
-                return {k: sub(v) for k, v in x.items()}
+                return {k: sub(v, depth + 1 if (x.get("class") == "SUBQUERY" and k == "subquery") else depth)
+                        for k, v in x.items()}
             if isinstance(x, list):
-                return [sub(v) for v in x]
+                return [sub(v, depth) for v in x]
             return x
-        body = sub(_strip(e))
+        body = _strip(sub(e))
         if isinstance(body, dict):
             body["alias"] = ""
         text = self.deserialize(json.dumps(body))
@@ -190,6 +278,11 @@ class Lowerer:
                 return name
         cols: set = set()
         flags: dict = {}
+        deps = []
+        if _scope.has_subquery(e):
+            if self.resolve_table is None:
+                raise Decline("shape", "SUBQUERY inside an expression")
+            deps = _scope.mark(e, self.resolve_table)
         self._validate(e, cols, flags)
         if not cols:
             raise Decline("shape", "expression without a column")
@@ -197,8 +290,8 @@ class Lowerer:
         if len(tables) != 1:
             raise Decline("shape", "expression over columns of several tables")
         ti = tables.pop()
-        sql = self._sql(e, lambda c: self.real_of(c).split("\x00"))
-        probe_sql = self._sql(e, lambda c: self.probe_of(c).split("\x00"))
+        sql = self._sql(e, lambda c: self.real_of(c).split("\x00"), self.sql_qualifier)
+        probe_sql = self._sql(e, lambda c: self.probe_of(c).split("\x00"), self.probe_qualifier)
         name = "x_" + hashlib.sha1((self.identity(ti) + "\x00" + sql).encode()).hexdigest()[:14]
         native = self.describe(ti, sql).upper()
         lane = native
@@ -217,7 +310,8 @@ class Lowerer:
             raise Decline("shape", f"WHERE term of type {native}")
         self.computed[name] = Computed(name=name, table=ti, sql=sql, probe_sql=probe_sql, native_type=native,
                                        lane_type="VARCHAR" if native.startswith("VARCHAR") else lane,
-                                       has_constant=bool(flags.get("const")))
+                                       has_constant=bool(flags.get("const")), dep_tables=tuple(deps))
+        _scope.strip(e)
         self._by_tree.append((e, name))
         return name
 

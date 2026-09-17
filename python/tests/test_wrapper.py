@@ -578,6 +578,85 @@ def run():
                   f"post-agg literal variant x{m}: answer correct")
     con.close()
 
+    # ---- subquery predicates (§4.18): EXISTS / IN / correlated scalar as BOOLEAN lanes ----
+    print("== subquery predicates")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute(JOIN_SETUP_EARLY)
+        scases = {
+            # inner and outer tables share every column name: a correlation that lost its qualifier
+            # would silently re-bind to the inner table
+            "exists_self":     "SELECT k, count(*), sum(v) FROM t o WHERE EXISTS (SELECT 1 FROM t i WHERE i.k = o.k + 1 AND i.v > o.v + 90) GROUP BY k ORDER BY k",
+            "exists_unaliased": "SELECT k, count(*) FROM tu WHERE EXISTS (SELECT 1 FROM t WHERE t.k = tu.k AND t.v = tu.v % 97 AND t.v < 5) GROUP BY k ORDER BY k",
+            "not_exists":      "SELECT k, sum(v) FROM t o WHERE NOT EXISTS (SELECT 1 FROM tn3 WHERE tn3.k = o.k AND tn3.z = 2) AND v > 10 GROUP BY k ORDER BY k",
+            "in_subquery":     "SELECT k, count(*) FROM t WHERE k IN (SELECT k FROM tn3 WHERE z = 1) GROUP BY k ORDER BY k",
+            "not_in_with_nulls": "SELECT k, count(*) FROM t WHERE k NOT IN (SELECT k FROM tn3 WHERE z = 3) GROUP BY k ORDER BY k",
+            "not_in_no_nulls": "SELECT k, count(*) FROM t WHERE k NOT IN (SELECT k FROM tn3 WHERE z = 3 AND k IS NOT NULL) GROUP BY k ORDER BY k",
+            "scalar_correlated": "SELECT k, count(*), max(v) FROM t o WHERE v > (SELECT avg(v) FROM t i WHERE i.k = o.k) GROUP BY k ORDER BY k",
+            "scalar_uncorrelated": "SELECT k, sum(a) FROM tm WHERE b > (SELECT 2 * min(b) + 400000 FROM tm) GROUP BY k ORDER BY k",
+            "exists_and_plain": "SELECT s, count(*) AS n, sum(d) FROM t o WHERE dt >= DATE '1996-01-01' AND EXISTS (SELECT * FROM tm WHERE tm.k = o.k AND tm.z = 12 AND tm.a < 2000) GROUP BY s ORDER BY s NULLS LAST",
+            "join_exists_other_table": "SELECT tier, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE EXISTS (SELECT 1 FROM je WHERE je.eid = jf.eid AND je.bucket < 4) GROUP BY tier ORDER BY tier",
+            "join_exists_same_table": "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE EXISTS (SELECT 1 FROM jf f2 WHERE f2.did = jf.did AND f2.id <> jf.id AND f2.g = jf.g) AND NOT EXISTS (SELECT 1 FROM jd d2 WHERE d2.nid = jd.nid AND d2.tier > jd.tier + 5) GROUP BY tier ORDER BY tier",
+            "left_join_exists": "SELECT region, count(*) FROM jf LEFT JOIN jd ON jf.did = jd.did AND jd.tier < 5 WHERE jf.eid IN (SELECT eid FROM je WHERE bucket = 2) GROUP BY region ORDER BY region NULLS LAST",
+            "global_with_subquery": "SELECT sum(amt) / 7.0 AS avg_yearly, count(*) FROM jf, jd WHERE jf.did = jd.did AND tier = 3 AND v < (SELECT 0.2 * avg(v) FROM jf f2 WHERE f2.did = jd.did)",
+        }
+        for name, sql in scases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"subquery {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want, f"subquery {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"subquery {name}: names and types identical")
+        check(len(con._raw.execute(scases["exists_self"]).fetchall()) > 0 and
+              len(con._raw.execute(scases["not_in_with_nulls"]).fetchall()) == 0,
+              "subquery fixtures: the self-correlated EXISTS selects rows, NOT IN over a NULL selects none")
+        sdeclines = {
+            "limit_inside":    "SELECT k, count(*) FROM t o WHERE v > (SELECT v FROM tu i WHERE i.k = o.k ORDER BY i.v LIMIT 1) GROUP BY k",
+            "volatile_inside": "SELECT k, count(*) FROM t o WHERE EXISTS (SELECT 1 FROM tu i WHERE i.k = o.k AND i.v > random() * 1000000) GROUP BY k",
+            "double_sum_inside": "SELECT k, count(*) FROM t o WHERE x > (SELECT sum(x) / 300 FROM t i WHERE i.k = o.k) GROUP BY k",
+            "derived_inside":  "SELECT k, count(*) FROM t o WHERE EXISTS (SELECT 1 FROM (SELECT k AS kk FROM tu) q WHERE q.kk = o.k) GROUP BY k",
+        }
+        for name, sql in sdeclines.items():
+            want = sorted(map(str, con._raw.execute(sql).fetchall())) if name != "volatile_inside" else None
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"], f"subquery decline {name}: runs native ({con.last_rewrite()['reason']})")
+            check(want is None or sorted(map(str, got)) == want, f"subquery decline {name}: answer unchanged")
+        # a dictionary key under a WHERE: few rows surviving next to the distinct tuples decode per key,
+        # most of them surviving join the dictionary (needs the estimates: thresholds on)
+        con2 = fresh(thresholds=True)
+        for name, sql, per_key in [
+            ("selective", "SELECT s, k, v, dt, count(*), sum(d) FROM t WHERE k IN (SELECT k FROM tn3 WHERE z = 1) AND v < 3 GROUP BY s, k, v, dt", True),
+            ("unselective", "SELECT s, k, v, dt, count(*), sum(d) FROM t WHERE v >= 0 GROUP BY s, k, v, dt", False),
+        ]:
+            want = sorted(map(str, con2._raw.execute(sql).fetchall()))
+            got = sorted(map(str, con2.execute(sql).fetchall()))
+            lr = con2.last_rewrite()
+            if lr["rewritten"]:
+                check(("gpu_resident_dict_component" in lr["sql"]) == per_key and got == want,
+                      f"wide-key decode {name}: {'per key' if per_key else 'dictionary join'}, rows identical")
+            else:
+                check(got == want, f"wide-key decode {name}: native ({lr['reason']}), rows identical")
+        con2.close()
+        # a table read ONLY inside the subquery is guarded too: a foreign write to it falls back, then rebuilds
+        q = scases["join_exists_other_table"]
+        other4 = con._raw.cursor()
+        other4.execute("INSERT INTO je VALUES (649, 1)")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["fallback"] and got == con._raw.execute(q).fetchall(),
+              "subquery: foreign write to the table read only by EXISTS -> GPUDB_STALE fallback, native answer")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"] and not con.last_rewrite()["fallback"] and got == con._raw.execute(q).fetchall(),
+              "subquery: resident again after the foreign write, answer correct")
+        q = scases["in_subquery"]
+        other4.execute("INSERT INTO tn3 VALUES (777, DATE '1995-01-02', 1, 5)")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["fallback"] and got == con._raw.execute(q).fetchall(),
+              "subquery (single table): foreign write to the IN-subquery's table -> fallback, native answer")
+    con.close()
+
     # ---- folded derived tables (§4.16): a select-project-join subquery as the FROM of an aggregate ----
     print("== folded derived tables")
     con = fresh()
@@ -622,6 +701,7 @@ def run():
     if getattr(con, "_exact", False):
         ncases = {
             "in_subquery_having": "SELECT count(*), sum(a) FROM tm WHERE k IN (SELECT k FROM t GROUP BY k HAVING sum(v) > 14400)",
+            "in_subquery_rows": "SELECT k, a FROM tm WHERE k IN (SELECT k FROM t GROUP BY k HAVING sum(v) > 14400) ORDER BY k, a, b, z LIMIT 20",
             "derived_table":   "SELECT c, count(*) AS n FROM (SELECT k, count(v) AS c FROM tn3 GROUP BY k) x GROUP BY c ORDER BY c",
             "derived_aliases": "SELECT bucket, max(total) FROM (SELECT k % 10, sum(a) FROM tm GROUP BY k % 10) AS x(bucket, total) GROUP BY bucket ORDER BY bucket",
             "cte_twice":       "WITH r AS (SELECT k AS kk, sum(b) AS tot FROM tm WHERE z < 7 GROUP BY kk) SELECT kk, tot FROM r WHERE tot = (SELECT max(tot) FROM r) ORDER BY kk",
@@ -641,11 +721,15 @@ def run():
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"nested {name}: names and types identical")
         check(con.last_rewrite()["form"] != "nested", "nested: GROUP BY <select alias> is an ordinary shape, not a nested one")
-        sql = ncases["in_subquery_having"]
+        sql = ncases["in_subquery_rows"]
         con.execute(sql).fetchall()
         check(con.last_rewrite()["form"] == "nested" and "gpu_groupby_exact_resident" in con.last_rewrite()["sql"]
               and " tm " in con.last_rewrite()["sql"].replace("\n", " ") + " ",
               "nested: the subquery runs on the device, the outer statement stays DuckDB's")
+        # the same subquery under an aggregating outer SELECT is one statement now (§4.18): the IN is a lane
+        con.execute(ncases["in_subquery_having"]).fetchall()
+        check(con.last_rewrite()["form"] != "nested" and ":sentinel" in con.last_rewrite()["sql"],
+              "nested: an aggregate filtered by IN (subquery) is taken whole, the subquery's table guarded")
         ndeclines = {
             "correlated":     "SELECT k, v FROM tu o WHERE v > (SELECT sum(v) / 300 FROM t i WHERE i.k = o.k GROUP BY i.k) ORDER BY k, v LIMIT 5",
             "lateral_like":   "SELECT k, (SELECT count(*) FROM tn WHERE tn.k = tu.k % 10 GROUP BY tn.k) AS c FROM tu WHERE k < 3 ORDER BY k, v LIMIT 5",
@@ -700,6 +784,33 @@ def run():
             check(seen[-1] == "rewritten", f"measured: faster than its own native runs -> kept ({seen})")
     finally:
         _th.TABLE.clear(); _th.TABLE.update(saved)
+    con.close()
+
+    # an eager session never sees the statement run native: a rewritten statement slow enough to be
+    # suspect has native timed once, on a cursor of its own (the caller's result set is untouched)
+    from gpudb import connection as _cn
+    saved_bound = _cn._MEASURE_NATIVE_ABOVE_MS
+    con = fresh(thresholds=True)
+    try:
+        _cn._MEASURE_NATIVE_ABOVE_MS = 0.0          # every statement is "suspect"
+        q = "SELECT k, sum(v), count(*) FROM t GROUP BY k"
+        want = sorted(con._raw.execute(q).fetchall())
+        outs = [sorted(con.execute(q).fetchall()) for _ in range(5)]
+        d = con._timing_decision or next(iter(con._cache.values()))
+        check(all(o == want for o in outs), "measured (eager): every run's rows reach the caller, the probe run included")
+        check(d.native_ms is not None and d.timing_checked, "measured (eager): native timed once after three rewritten runs")
+        verdict = "threshold" if min(d.rewritten_ms[:3]) >= d.native_ms else "rewritten"
+        now = "rewritten" if con.last_rewrite()["rewritten"] else con.last_rewrite()["reason"]
+        check(now == verdict, f"measured (eager): the comparison decides ({now}; {min(d.rewritten_ms[:3]):.2f} vs {d.native_ms:.2f} ms)")
+        _cn._MEASURE_NATIVE_ABOVE_MS = 1e9          # nothing is suspect: no probe
+        q2 = "SELECT k, max(v) FROM t GROUP BY k"
+        for _ in range(5):
+            con.execute(q2).fetchall()
+        d2 = con._timing_decision
+        check(d2 is not d and d2.native_ms is None and con.last_rewrite()["rewritten"],
+              "measured (eager): a fast rewritten statement is never probed")
+    finally:
+        _cn._MEASURE_NATIVE_ABOVE_MS = saved_bound
     con.close()
 
     # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----

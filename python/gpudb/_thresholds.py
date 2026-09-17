@@ -45,7 +45,14 @@ row). Under a WHERE it depends on the payload: with an EXPRESSION payload
 kept and 0.62–0.82× at 9%; with a plain column payload 0.78–1.19× at 55–91%
 kept — the mask costs the device what the expression costs native. TPC-H Q1
 (two VARCHAR keys, eight aggregates over expressions, 98% of the rows):
-12.2 → 5.9 ms.                                       → string_key_min_selectivity
+12.2 → 5.9 ms. ONE expression payload under a WHERE is a coin flip: the same
+cell measured 1.07x median over 12 process starts with 3 to 5 of them below
+1.0x (the device time is bimodal per process start, 3.5 vs 4.2 ms, native sits at
+3.8), and 0.58–1.35x across 55–91% kept. From TWO expression payloads on,
+native pays per expression and the device does not: 1.08–1.59x on all 27
+cells (2–4 payloads x 55/64/91% kept x 3 process starts).
+                                → string_key_min_selectivity,
+                                  string_key_min_computed_payloads
 count(DISTINCT x) (§4.17; SF1, x = l_shipmode with 7 values, beside a sum):
 the device groups by (key, x) and DuckDB re-aggregates every pair, ~0.25 ms
 per 1K pairs. Up to 17K pairs 1.3–7.1×; 70K pairs 2.1–2.5× without a WHERE
@@ -99,8 +106,9 @@ class Thresholds:
     multi_plain_max_groups: int = 50_000        # plain form, single table, no WHERE (under a WHERE: native)
     multi_join_plain_max_groups: int = 20_000   # plain form over a key join
     # a VARCHAR key is exempt from min_groups / topk_min_groups without a WHERE, and under a WHERE
-    # when a payload is a computed expression and at least this much survives
+    # when at least this many payloads are computed expressions and at least this much survives
     string_key_min_selectivity: float = 0.5
+    string_key_min_computed_payloads: int = 2
     # count(DISTINCT x): (key, x) pairs the device returns for DuckDB to re-aggregate
     reagg_max_pairs: int = 100_000
     reagg_max_pairs_where: int = 20_000
@@ -117,7 +125,7 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
-           limited: bool = False, computed_payload: bool = False,
+           limited: bool = False, computed_payloads: int = 0,
            reaggregated: bool = False) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
@@ -160,7 +168,11 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
                 return False, (f"selectivity {selectivity:.2f} < {t.join_plain_min_selectivity} for the plain form "
                                f"over a join with {est_groups} groups")
         return True, ""
-    few_ok = string_key and (not has_where or (computed_payload and selectivity is not None
+    # (count(DISTINCT) beside one expression payload keeps its win there: 1.26–1.84x, 0 of 8 below 1.0x —
+    # native builds a second hash table for the DISTINCT)
+    few_ok = string_key and (not has_where or ((computed_payloads >= t.string_key_min_computed_payloads
+                                                or (reaggregated and computed_payloads >= 1))
+                                               and selectivity is not None
                                                and selectivity >= t.string_key_min_selectivity))
     # (plain form only: with three groups HAVING / top-k save nothing and measured 0.98–1.07x)
     if est_groups < t.min_groups and not (few_ok and form == "plain"):

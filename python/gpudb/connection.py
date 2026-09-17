@@ -32,6 +32,9 @@ _MAX_STATEMENT_BYTES = 16 * 1024
 _LITERAL_RE = re.compile(r"""('(?:[^']|'')*')|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)""")
 _WS_RE = re.compile(r"\s+")
 STALE_MARKER = "GPUDB_STALE"
+# a rewritten statement this slow is far outside a device answer (1-5 ms): when the session
+# never saw it run native (eager residency), native is timed once to compare
+_MEASURE_NATIVE_ABOVE_MS = 20.0
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
            "not_found", "manual", "error", "off", "params", "multi")
@@ -58,6 +61,7 @@ class Decision:
     # spliced into this outer statement text at the placeholder
     wrap: Optional[Tuple[str, str]] = None
     is_join: bool = False              # the statement's FROM is a join (decides the §4.13 fallback)
+    sentinels: List[Any] = field(default_factory=list)   # §4.18: row-count sentinels of tables read by subquery lanes
     # measured rule 1 (§9.1): this statement's own native time, seen while it
     # was not resident yet, against its first rewritten runs
     native_ms: Optional[float] = None
@@ -258,12 +262,14 @@ class Connection:
             self._manager.statement_end()
         return self
 
-    def _note_timing(self, ms: float) -> None:
+    def _note_timing(self, ms: float, query=None, parameters=None) -> None:
         """Rule 1, measured: the thresholds PREDICT the win. When this
         session has also seen the statement run native (it did, every time
         before its set became resident), compare: if the best of the first
         three rewritten runs is not faster than the best native run, the
-        template runs native from now on (reason 'threshold')."""
+        template runs native from now on (reason 'threshold'). A session
+        that never saw it native (eager residency) times native ONCE, on its
+        own cursor, when the rewritten runs are slow enough to be suspect."""
         d = getattr(self, "_timing_decision", None)
         if d is None or d.timing_checked or not getattr(self, "_thresholds", True) or self._last.fallback:
             return
@@ -272,8 +278,21 @@ class Connection:
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
             return
         d.rewritten_ms.append(ms)
-        if d.native_ms is None or len(d.rewritten_ms) < 3:
+        if len(d.rewritten_ms) < 3:
             return
+        if d.native_ms is None:
+            if min(d.rewritten_ms) < _MEASURE_NATIVE_ABOVE_MS or not isinstance(query, str):
+                return
+            try:
+                cur = self._raw.cursor()       # the caller still fetches from self._raw
+                t0 = time.perf_counter()
+                cur.execute(query, parameters)
+                d.native_ms = (time.perf_counter() - t0) * 1000.0
+                cur.close()
+            except duckdb.Error as e:
+                self._log(f"native timing probe failed: {e}")
+                d.timing_checked = True
+                return
         d.timing_checked = True
         best = min(d.rewritten_ms)
         if best >= d.native_ms:
@@ -289,7 +308,7 @@ class Connection:
             try:
                 t0 = time.perf_counter()
                 self._raw.execute(sql, parameters)
-                self._note_timing((time.perf_counter() - t0) * 1000.0)
+                self._note_timing((time.perf_counter() - t0) * 1000.0, query, parameters)
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
@@ -707,8 +726,11 @@ class Connection:
                         self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
                     else:
                         self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn)
+            for b in d.sentinels:
+                self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
             st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
-                                              deps=[b.tag for b in d.join.base] if d.join is not None else None,
+                                              deps=([b.tag for b in d.join.base] if d.join is not None
+                                                    else [b.tag for b in d.sentinels] or None),
                                               steps=d.join.steps_sql if d.join is not None else None)
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
@@ -878,13 +900,17 @@ class Connection:
             lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=real_of,
                                 deserialize=self._expr_to_sql,
                                 describe=lambda ti, sql: self._expr_type(src, sql),
-                                function_ok=self._function_ok, identity=lambda ti: src)
+                                function_ok=self._function_ok, identity=lambda ti: src,
+                                resolve_table=lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t))
         else:
+            oa = _join.OUTER_ALIAS
             lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=lambda c: c,
                                 deserialize=self._expr_to_sql,
-                                describe=lambda ti, sql: self._expr_type(idents[ti].fqn, sql),
+                                describe=lambda ti, sql: self._expr_type(f"{idents[ti].fqn} AS {oa}", sql),
                                 function_ok=self._function_ok,
-                                identity=lambda ti: idents[ti].fqn)
+                                identity=lambda ti: idents[ti].fqn,
+                                resolve_table=lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
+                                sql_qualifier=oa, probe_qualifier=oa if low is None else "gpudb_j0")
         return lw.lower(tree), lw.computed
 
     def _validate_join_condition(self, e) -> None:
@@ -1040,7 +1066,7 @@ class Connection:
             columns, probe_from = ident.columns, ident.fqn
             idents = [ident]
             col_home = lambda c: (ident, c)                     # noqa: E731
-            base_from = ident.fqn
+            base_from = f"{ident.fqn} AS {_join.OUTER_ALIAS}"
         else:
             # a key join lowered to one virtual table: the root (fact) table
             # carries the identity, every column knows its own table
@@ -1186,15 +1212,22 @@ class Connection:
                     # there cannot be more groups than rows that survive the WHERE (the
                     # product of several keys' distinct counts overshoots wildly under a filter)
                     if est is not None:
+                        # few rows survive next to the number of distinct key tuples: a dictionary
+                        # key decodes per returned row, not by joining the whole dictionary
+                        # (Q18: 57 groups out of 1.5M entries, 416 ms vs 4 ms; all 1.5M groups
+                        # out: 1410 ms joined vs 2200 ms per key — the crossover is near a third)
+                        plan.decode_per_key = bool(plan.dict_key) and int(kept) * 4 <= est
                         est = max(1, min(est, int(kept)))
                 except Exception as e:
                     self._log(f"selectivity probe failed: {e}")
                     return Decision(False, "threshold")
+            # a lane with a subquery (EXISTS / IN / correlated scalar, §4.18) makes native run a
+            # join too, whatever the FROM says: the join bounds apply
             ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
-                                         join=low is not None, payloads=max(1, len(plan.vals)),
+                                         join=low is not None or any(c.dep_tables for c in computed.values()), payloads=max(1, len(plan.vals)),
                                          string_key=bool(plan.dict_key),
                                          limited=plan.limit is not None and plan.limit <= 10_000,
-                                         computed_payload=any(v in computed for v in plan.vals),
+                                         computed_payloads=sum(1 for v in set(plan.vals) if v in computed),
                                          reaggregated=reagg)
             if not ok:
                 self._log(f"threshold: {why}")
@@ -1214,7 +1247,8 @@ class Connection:
             except ValueError:
                 return Decision(False, "shape")
             d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
-                         upload_sql=_rewrite.upload_sql(plan, ident.fqn, q), form=plan.form)
+                         upload_sql=_rewrite.upload_sql(plan, f"{ident.fqn} AS {_join.OUTER_ALIAS}", q),
+                         form=plan.form)
         else:
             try:
                 jr = (_join.plan_upload_residency(low, plan, computed) if isinstance(low, _join.LoweredUpload)
@@ -1229,6 +1263,29 @@ class Connection:
             d = Decision(True, "", plan=plan, fqn=jr.root_fqn or ident.fqn, tag=plan.tag,
                          upload_sql=jr.upload_sql, form=plan.form, join=jr)
         d.literal_sensitive = any(c.has_constant for c in computed.values())
+        # §4.18: tables read only inside subquery lanes get a row-count sentinel and a guard
+        covered = {(i.catalog, i.oid) for i in idents}
+        extra: List[_resolve.Identity] = []
+        for c in computed.values():
+            for t in c.dep_tables:
+                if (t.catalog, t.oid) not in covered:
+                    covered.add((t.catalog, t.oid))
+                    extra.append(t)
+        if extra:
+            try:
+                sent = [_join.BaseSet(table=0, tag=t.tag(["rows"]) + ":sentinel", fqn=t.fqn, sentinel=True,
+                                      upload_sql="SELECT gpu_note_rows('%s', (SELECT count(*) FROM %s))" % (
+                                          (t.tag(["rows"]) + ":sentinel").replace("'", "''"), t.fqn))
+                        for t in extra]
+            except ValueError:
+                return Decision(False, "shape")
+            if d.join is not None:
+                d.join.base = list(d.join.base) + sent
+                d.join.guards = list(d.join.guards) + [(b.tag, b.fqn, t) for b, t in zip(sent, extra)]
+                plan.guards = [(g, f) for g, f, _i in d.join.guards]
+            else:
+                d.sentinels = sent
+                plan.guards = [(plan.tag, ident.fqn)] + [(b.tag, b.fqn) for b in sent]
         if self._has_rewrite_scalar:
             # The extension's pure scalar is the authority on the decision and
             # renders the statement for these literals; `ready` is passed as
@@ -1245,6 +1302,7 @@ class Connection:
                 "columns": {c: {"type": t, "scale": (_rewrite.decimal_scale(t) or (0, 0))[1]}
                             for c, t in columns.items()},
                 "backend": self._backend, "rows": nrows, "ready": True,
+                "decode_per_key": bool(getattr(plan, "decode_per_key", False)),
                 "default_order": "DESC" if self._settings["default_order"].upper().startswith("DESC") else "ASC",
                 "default_null_order": self._settings["default_null_order"],
                 "default_collation": self._settings["default_collation"],
@@ -1255,6 +1313,11 @@ class Connection:
             if low is not None:
                 ctx["guards"] = [{"tag": g, "catalog": i.catalog, "schema": i.schema, "table": i.table}
                                  for g, _f, i in d.join.guards]
+            elif d.sentinels:
+                ctx["guards"] = [{"tag": plan.tag, "catalog": ident.catalog, "schema": ident.schema,
+                                  "table": ident.table}] + \
+                                [{"tag": b.tag, "catalog": t.catalog, "schema": t.schema, "table": t.table}
+                                 for b, t in zip(d.sentinels, extra)]
             try:
                 tree = (getattr(plan, "lowered_tree", None)
                         or (low.tree_json if low is not None else self._serialize(sql)))

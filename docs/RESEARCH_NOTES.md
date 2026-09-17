@@ -706,13 +706,130 @@ and `count` over a lane of days / microseconds, typed back on the way out.
 
 ---
 
+## 2026-09-17 (late) — Subqueries in WHERE, a silent wrong answer avoided, and a 0.03× caught by the coverage map
+
+**The idea.** Q4, Q17 and Q21 stayed native because their WHERE holds a
+subquery: `EXISTS (…)`, `NOT EXISTS (…)`, `l_quantity < (SELECT 0.2 *
+avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)`. Seen from one
+outer row, such a term is just a value — true, false or NULL — that depends on
+the row's own columns and on what the subquery's tables contain. That is what
+a computed lane is (§4.10), with one more dependency. So: let DuckDB evaluate
+the term for every row during the upload (it decorrelates the subquery into a
+join, the same plan native would run), keep the BOOLEAN as a predicate lane,
+and the device answers `lane = 1`. No kernel work at all. NULL needs no
+special care: `k NOT IN (a set holding a NULL)` is NULL for every row, the
+lane holds NULL, `= 1` rejects it as WHERE does. A fixture pins that case
+(native returns zero rows; so does the device).
+
+**The hazard.** This one would have produced wrong answers without an error.
+The lowerings rename columns: in a join, `o_orderkey` becomes a lane name of
+the virtual table; in an upload, an expression is re-emitted inside a new
+SELECT. Inside a subquery, a reference either binds to the subquery's own FROM
+or reaches out to the enclosing statement, and only the second kind may be
+renamed. Worse, once renamed to a bare name it can be captured by the inner
+FROM:
+
+    SELECT k, count(*) FROM t o
+    WHERE EXISTS (SELECT 1 FROM t i WHERE i.k = o.k + 1)
+
+emitted as `… WHERE i.k = k + 1` binds `k` to `i`, the predicate is false for
+every row, the statement returns nothing, and nothing complains. The fix has
+two halves. `_scope.mark` resolves every column reference the way SQL does —
+innermost scope first, against the actual columns of the tables in each FROM —
+and tags the ones bound inside a subquery so that no lowering touches them.
+And every OUTER reference inside a subquery is emitted qualified with an alias
+the outer relation always carries (`gpudb_o`; `gpudb_j0` for the join probe),
+so capture is impossible by construction rather than by luck of naming. The
+test fixtures for this are deliberately hostile: self-correlated subqueries
+over the same table, inner and outer sharing every column name, aliased and
+unaliased, single-table and under a join.
+
+**Staleness grows a dimension.** A lane computed from `orders` inside an
+upload of `lineitem` is wrong the moment `orders` changes. Every table a
+subquery reads gets a sentinel (`gpu_note_rows`) and an arm in the statement's
+guard. A foreign connection inserting into the table read ONLY by the EXISTS
+trips the guard: native answer, set rebuilt, resident again on the next run —
+tested for the single-table and the join case.
+
+**What is refused.** LIMIT / ORDER BY / sample / window / derived table / CTE
+inside the subquery, non-CONSISTENT functions, and `sum` / `avg` over floating
+columns inside it (evaluation order would leak into the lane). These run
+native and are in the tests as declines.
+
+**Measured.** Gate (`--subqueries`, Metal, SF1): 185 rewritten cells, minimum
+1.15×, none below 1.0×; 31 declined by the bounds. EXISTS on lineitem 3.1–8.3×,
+NOT IN 1.4–6.1×, the Q17 shape 3.3–13.3×, EXISTS over a join up to 36×.
+
+**The coverage map caught what the gate could not.** First run after the
+change: 15 of 22 — and Q18 at **0.03×**, 446 ms against 13 ms native, rows
+identical. Before this work Q18 ran through the nested path (its IN-subquery
+on the device, 1.5×); now the whole statement was taken, keyed by five columns
+including `c_name`, and 57 result rows were decoded by LEFT JOINing a
+dictionary of 1.5M tuples. Measured both decodes on the same resident set:
+
+| groups returned | dictionary join | per-key decode | no decode |
+|---|---|---|---|
+| 57 | 415.7 ms | 4.0 ms | 1.6 ms |
+| 1,500,000 | 1410 ms | 2200 ms | 473 ms |
+
+Neither dominates; the crossover sits near a third of the dictionary. The
+wrapper already measures how many rows survive the WHERE and estimates the
+distinct key tuples, so it now tells the rewriter which decode to emit
+(`decode_per_key`: survivors × 4 ≤ distinct tuples). Q18: 14.5 → 2.3 ms, 6.2×.
+
+The second lesson is about the safety net, not the decode. The measured rule-1
+check compares rewritten runs with native runs *this session happened to see
+while the data was uploading*. With eager residency it sees none, so a 30×
+loss sailed through. Now, when the best of the first three rewritten runs is
+20 ms or more — nothing the device answers takes that long — native is timed
+once on a separate cursor (the caller's result set is untouched) and the usual
+comparison decides. It costs one native execution, only for statements that
+already look wrong.
+
+Why the gate missed it: the gate sweeps shapes over a grid of keys and
+predicates, and no cell had "wide dictionary key, almost nothing survives".
+The 22 fixed queries are a different kind of test — real statements nobody
+designed around the implementation — and they keep paying for themselves.
+
+**A coin-flip cell, and how to tell noise from a regression.** The full gate
+after this work flagged two cells, both `GROUP BY l_returnflag` (a VARCHAR key,
+three groups) under a 55% WHERE with one expression payload: 0.86× and 0.80×.
+Nothing in the change touches that path, which is a claim, not evidence. The
+evidence: the same cell run 12 times per side, alternating the main branch's
+wrapper and this branch's against one extension binary, order swapped halfway.
+Median ratio identical on both sides (plain 1.07×, projected 1.02×); main below
+1.0× in 3 of 12 process starts, the branch in 5 of 12 (Fisher exact p = 0.67); the
+rewritten SQL byte-identical. So: not a regression — but also not a cell that
+should be rewritten at all. The device time is bimodal *per process start*
+(3.5 ms or 4.2 ms, nothing between; native sits at 3.8), so a cell whose median
+is 1.07× loses one process start in four, and rule 1 has no room for that.
+
+What separates this cell from TPC-H Q1 — same kind of key, also under a WHERE,
+2.0× — is the number of expression payloads: native evaluates every expression
+for every row, the resident lanes cost the device nothing extra.
+
+| expression payloads | 55% kept | 64% kept | 91% kept |
+|---|---|---|---|
+| 1 | 0.58–0.96× | 1.10–1.33× | 0.90–1.35× |
+| 2 | 1.12–1.14× | 1.32–1.35× | 1.35–1.55× |
+| 3 | 1.16–1.20× | 1.39–1.41× | 1.50–1.59× |
+| 4 | 1.08–1.13× | 1.26–1.29× | 1.21–1.53× |
+
+(three process starts each.) The few-groups exemption for VARCHAR keys under
+a WHERE now needs two expression payloads (`string_key_min_computed_payloads`);
+`count(DISTINCT)` beside one expression payload keeps its own exemption, since
+it measured 1.25–1.84× with no process start below 1.0×. Method worth keeping: when a
+gate cell fails on a path the change cannot reach, alternate old and new code
+on one binary across many process starts before believing either story.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
   need kernels or a different decomposition.
-- **RIGHT / FULL / semi / anti joins**, correlated subqueries and `EXISTS`
-  (Q2, Q4, Q17, Q20, Q21, Q22); Q16 combines `count(DISTINCT)` with a
-  `NOT IN` subquery over tables below the row floor.
+- **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
+  HAVING; subqueries over other subqueries (Q2, Q20, Q22 — Q22 also sits below
+  the row floor); Q16 combines `count(DISTINCT)` with a `NOT IN` subquery over
+  tables below the row floor. WHERE-term subqueries are done (§4.18).
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
   and as the CPU reference; the CUDA side is to be written against the same
   interface and then swept with the same gate.
