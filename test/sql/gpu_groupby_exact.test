@@ -88,3 +88,29 @@ SELECT * FROM gpu_groupby_sum_resident('e1');
 -- setup: SELECT gpu_upload_pair('l12', k, v) FROM t12
 SELECT count(*) FROM ((SELECT key, sum::BIGINT, count FROM gpu_groupby_exact_resident('e12')) EXCEPT (SELECT key, sum, count FROM gpu_groupby_sum_resident('l12')));
 -- expect: 0
+
+-- 13. Upload SESSIONS carry exact segments: two gpu_upload_pair_exact segments appended, finished, exact result equals native
+-- setup: CREATE TABLE s13 AS SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 500)::BIGINT END AS k, CASE WHEN i % 13 = 0 THEN NULL ELSE (i * 7 % 1000 - 500)::BIGINT END AS v FROM range(20000) r(i)
+-- setup: SELECT gpu_upload_begin('s13')
+-- setup: SELECT gpu_upload_pair_exact('s13', k, v) FROM s13 WHERE rowid < 12000
+-- setup: SELECT gpu_upload_pair_exact('s13', k, v) FROM s13 WHERE rowid >= 12000
+-- setup: SELECT gpu_upload_finish('s13')
+SELECT (SELECT count(*) FROM ((SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident('s13')) EXCEPT (SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM s13 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM s13 GROUP BY k) EXCEPT (SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident('s13')))) AS mismatches, (SELECT rows FROM gpu_residents() WHERE name = 's13') AS rows_resident;
+-- expect: 0  20000
+
+-- 14. Sessions with gpu_upload_rows_exact segments keep the predicate lanes and their NULLs
+-- setup: CREATE TABLE s14 AS SELECT (i % 300)::BIGINT AS k, (i % 97)::BIGINT AS v, CASE WHEN i % 11 = 0 THEN NULL ELSE (i % 40)::BIGINT END AS a, (i % 7) / 2.0 AS d FROM range(30000) r(i)
+-- setup: SELECT gpu_upload_begin('s14')
+-- setup: SELECT gpu_upload_rows_exact('s14', k, v, [a], [d]) FROM s14 WHERE rowid < 10000
+-- setup: SELECT gpu_upload_rows_exact('s14', k, v, [a], [d]) FROM s14 WHERE rowid >= 10000 AND rowid < 20000
+-- setup: SELECT gpu_upload_rows_exact('s14', k, v, [a], [d]) FROM s14 WHERE rowid >= 20000
+-- setup: SELECT gpu_upload_finish('s14')
+SELECT (SELECT count(*) FROM ((SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('s14', 'i0 >= 20; f0 < 2.5')) EXCEPT (SELECT k, sum(v), count(*) FROM s14 WHERE a >= 20 AND d < 2.5 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, sum(v), count(*) FROM s14 WHERE a >= 20 AND d < 2.5 GROUP BY k) EXCEPT (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('s14', 'i0 >= 20; f0 < 2.5')))) AS mismatches;
+-- expect: 0
+
+-- 15. GUARDRAIL: mixing an exact segment into a legacy session is a clean error
+-- setup: CREATE TABLE s15 AS SELECT (i % 5)::BIGINT AS k, i::BIGINT AS v FROM range(100) r(i)
+-- setup: SELECT gpu_upload_begin('s15')
+-- setup: SELECT gpu_upload_pair('s15', k, v) FROM s15 WHERE rowid < 50
+-- expected_fail: segment kind differs
+SELECT gpu_upload_pair_exact('s15', k, v) FROM s15 WHERE rowid >= 50;

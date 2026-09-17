@@ -231,24 +231,11 @@ struct Segment {
     Segment& operator=(const Segment&) = delete;
     std::size_t room() const noexcept { return kLanes - n; }
 
-    // §4.1 (gpu_upload_pair_exact only): per-PAIR validity bitmaps, DuckDB
-    // layout, indexed by pair row (= lane / 2). Empty = every row valid;
-    // allocated all-ones on the first NULL so NULL-free segments cost
-    // nothing. Never touched by the legacy uploads.
-    std::vector<std::uint64_t> key_valid, val_valid;
-    void mark_pair_null(std::size_t row, bool key_null, bool val_null) {
-        if (!key_null && !val_null) return;
-        if (key_valid.empty()) {
-            key_valid.assign(kLanes / 2 / 64, ~std::uint64_t{0});
-            val_valid.assign(kLanes / 2 / 64, ~std::uint64_t{0});
-        }
-        if (key_null) key_valid[row >> 6] &= ~(std::uint64_t{1} << (row & 63));
-        if (val_null) val_valid[row >> 6] &= ~(std::uint64_t{1} << (row & 63));
-    }
-    // §4.6 (gpu_upload_rows_exact only): one validity bitmap per lane,
-    // indexed by row (= lane offset / lanes_per_row); a lane's bitmap is
-    // allocated all-ones on its first NULL. rows_cap is the segment's row
-    // capacity for that lane count.
+    // Exact uploads (gpu_upload_pair_exact: 2 lanes; gpu_upload_rows_exact:
+    // 2 + n_pi + n_pf): one validity bitmap per lane, indexed by row (= lane
+    // offset / lanes_per_row); a lane's bitmap is allocated all-ones on its
+    // first NULL, so NULL-free segments cost nothing. Never touched by the
+    // legacy uploads.
     std::vector<std::vector<std::uint64_t>> lane_valid;
     void mark_lane_null(std::size_t row, std::size_t lane, std::size_t n_lanes) {
         if (lane_valid.empty()) lane_valid.resize(n_lanes);
@@ -381,6 +368,8 @@ struct UploadSession {
     bool          kind_set = false;                 // fixed by the first segment
     bool          pair = false;
     gpudb::Dtype  vdt = gpudb::Dtype::I64;          // payload (pair) / column (bare) dtype
+    bool          exact = false;                    // gpu_upload_pair_exact / gpu_upload_rows_exact segments
+    std::size_t   lanes_per_row = 0, n_pi = 0, n_pf = 0;   // exact: lane layout (fixed by the first segment)
     std::vector<SegView> views;
     std::size_t   lanes = 0;
     std::size_t   rows_seen = 0;
@@ -873,8 +862,11 @@ inline std::string read_name(duckdb_string_t* names, idx_t row) {
 // through the contiguous v1 upload (one host concatenation of the segments),
 // pairs through upload_pair_interleaved (one H2D per segment, split on the
 // device). Returns the rows resident. Throws std::runtime_error.
+std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* fn);
+
 std::size_t finish_upload(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype vdt,
                           const char* fn) {
+    if (b.lanes_per_row != 0) return finish_upload_exact(ctx, b, fn);   // exact (§4.1 / §4.6) buffer
     auto& a = ctx.aggregator();
     const std::size_t lanes = b.lanes();
     const auto t0 = std::chrono::steady_clock::now();
@@ -911,19 +903,22 @@ std::size_t finish_upload(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::
 // returns its own row count and the device is not touched. Throws on a
 // kind mismatch or when the pool cap would be exceeded.
 bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype vdt,
-                    const char* fn) {
+                    const char* fn, bool exact = false) {
     std::lock_guard<std::mutex> lock(ctx.registry_mu);
     auto it = ctx.sessions.find(b.name);
     if (it == ctx.sessions.end()) return false;
     UploadSession& ss = *it->second;
-    if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt))
+    if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt || ss.exact != exact ||
+                        (exact && (ss.lanes_per_row != b.lanes_per_row || ss.n_pi != b.n_pi || ss.n_pf != b.n_pf))))
         throw std::runtime_error(std::string(fn) + ": segment kind differs from the open upload "
-            "session '" + b.name + "' (all segments must use the same upload function and types)");
+            "session '" + b.name + "' (all segments must use the same upload function, types and "
+            "predicate lists)");
     const std::size_t bytes = b.lanes() * sizeof(std::int64_t);
     if (bytes > 0 && !pool_reserve(bytes))
         throw std::runtime_error(std::string(fn) + ": out of buffer memory for the upload "
             "session '" + b.name + "'" + kPoolCapHint);
-    ss.kind_set = true; ss.pair = pair; ss.vdt = vdt;
+    ss.kind_set = true; ss.pair = pair; ss.vdt = vdt; ss.exact = exact;
+    if (exact) { ss.lanes_per_row = b.lanes_per_row; ss.n_pi = b.n_pi; ss.n_pf = b.n_pf; }
     ss.charged += bytes;
     ss.lanes += b.lanes();
     ss.rows_seen += b.rows_seen;
@@ -1184,10 +1179,13 @@ void upload_pair_exact_update(duckdb_function_info info, duckdb_data_chunk input
         }
         const bool k_null = k_validity && !duckdb_validity_row_is_valid(k_validity, i);
         const bool v_null = v_validity && !duckdb_validity_row_is_valid(v_validity, i);
+        if (b.lanes_per_row == 0) { b.lanes_per_row = 2; b.n_pi = 0; b.n_pf = 0; }
         std::int64_t* dst = b.reserve_lanes(2);
+        const std::size_t row = static_cast<std::size_t>(dst - b.open->data) / 2;
         dst[0] = k_null ? 0 : kd[i];
         dst[1] = v_null ? 0 : vd[i];
-        b.open->mark_pair_null(static_cast<std::size_t>(dst - b.open->data) / 2, k_null, v_null);
+        if (k_null) b.open->mark_lane_null(row, 0, 2);
+        if (v_null) b.open->mark_lane_null(row, 1, 2);
         b.charged += kPair;
         used += kPair;
         return true;
@@ -1221,34 +1219,13 @@ void upload_pair_exact_finalize(duckdb_function_info info, duckdb_aggregate_stat
             duckdb_validity_set_row_invalid(validity, offset + i);
             continue;
         }
-        const std::size_t rows = lanes / 2;
         try {
             ResidentContext& ctx = ctx_of_aggregate(info);
-            const auto t0 = std::chrono::steady_clock::now();
-            auto& a = ctx.aggregator();
-            std::vector<gpudb::Aggregator::KvSpan> spans;
-            const auto views = b->all_views();
-            spans.reserve(views.size());
-            for (const auto& v : views) {
-                gpudb::Aggregator::KvSpan sp;
-                sp.kv = v.seg->data;
-                sp.rows = v.lanes / 2;
-                sp.key_valid = v.seg->key_valid.empty() ? nullptr : v.seg->key_valid.data();
-                sp.val_valid = v.seg->val_valid.empty() ? nullptr : v.seg->val_valid.data();
-                spans.push_back(sp);
+            if (session_append(ctx, *b, /*pair*/true, gpudb::Dtype::I64, "gpu_upload_pair_exact", /*exact*/true)) {
+                out[offset + i] = static_cast<std::int64_t>(lanes / 2);
+                continue;
             }
-            gpudb::Aggregator::ResidentPair cols =
-                a.upload_pair_exact(spans.data(), spans.size(), gpudb::Dtype::I64);
-            auto kcol = std::move(cols.keys);
-            auto vcol = std::move(cols.vals);
-            if (upload_trace())
-                std::fprintf(stderr, "[gpudb upload] gpu_upload_pair_exact '%s': rows=%zu "
-                             "null_keys=%zu null_vals=%zu segments=%zu upload=%.1f ms\n",
-                             b->name.c_str(), rows, kcol->null_count(), vcol->null_count(),
-                             spans.size(), ms_since(t0));
-            publish_set(ctx, *b, std::move(kcol), std::move(vcol), /*pair*/true,
-                        "gpu_upload_pair_exact", /*exact*/true);
-            out[offset + i] = static_cast<std::int64_t>(rows);
+            out[offset + i] = static_cast<std::int64_t>(finish_upload_exact(ctx, *b, "gpu_upload_pair_exact"));
         } catch (const std::exception& e) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_pair_exact failed: ") + e.what()).c_str());
@@ -1395,6 +1372,49 @@ void upload_rows_exact_update(duckdb_function_info info, duckdb_data_chunk input
     pool_release(reserved - std::min(reserved, used));
 }
 
+// Move an exact buffer (gpu_upload_pair_exact: 2 lanes; gpu_upload_rows_exact:
+// 2 + n_pi + n_pf lanes) onto the device through upload_rows_exact and publish
+// it as an exact set (key, payload, predicate columns). Returns the rows
+// resident (NULLs included). Throws std::runtime_error.
+std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* fn) {
+    const std::size_t L = b.lanes_per_row;
+    const std::size_t lanes = b.lanes();
+    const std::size_t rows = lanes / L;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto& a = ctx.aggregator();
+    std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);
+    for (std::size_t e = 0; e < b.n_pf; ++e) dtypes[2 + b.n_pi + e] = gpudb::Dtype::F64;
+    const auto views = b.all_views();
+    std::vector<gpudb::Aggregator::RowSpan> spans(views.size());
+    std::vector<std::vector<const std::uint64_t*>> valid_ptrs(views.size());
+    for (std::size_t s2 = 0; s2 < views.size(); ++s2) {
+        const auto& v = views[s2];
+        spans[s2].lanes = v.seg->data;
+        spans[s2].rows = v.lanes / L;
+        spans[s2].n_lanes = L;
+        valid_ptrs[s2].assign(L, nullptr);
+        if (!v.seg->lane_valid.empty())
+            for (std::size_t l = 0; l < L && l < v.seg->lane_valid.size(); ++l)
+                if (!v.seg->lane_valid[l].empty()) valid_ptrs[s2][l] = v.seg->lane_valid[l].data();
+        spans[s2].valid = valid_ptrs[s2].data();
+    }
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols =
+        a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    if (cols.size() != L) throw std::runtime_error("upload_rows_exact returned the wrong column count");
+    auto kcol = std::move(cols[0]);
+    auto vcol = std::move(cols[1]);
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
+    for (std::size_t l = 2; l < L; ++l) preds.push_back(std::move(cols[l]));
+    if (upload_trace())
+        std::fprintf(stderr, "[gpudb upload] %s '%s': rows=%zu lanes=%zu null_keys=%zu null_vals=%zu "
+                     "segments=%zu upload=%.1f ms\n",
+                     fn, b.name.c_str(), rows, L, kcol->null_count(), vcol->null_count(),
+                     spans.size(), ms_since(t0));
+    publish_set(ctx, b, std::move(kcol), std::move(vcol), /*pair*/true, fn,
+                /*exact*/true, std::move(preds), b.n_pi, b.n_pf);
+    return rows;
+}
+
 void upload_rows_exact_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
                                 duckdb_vector result, idx_t count, idx_t offset) {
     if (count == 0) return;
@@ -1411,43 +1431,13 @@ void upload_rows_exact_finalize(duckdb_function_info info, duckdb_aggregate_stat
             duckdb_validity_set_row_invalid(validity, offset + i);
             continue;
         }
-        const std::size_t L = b->lanes_per_row;
-        const std::size_t rows = lanes / L;
         try {
             ResidentContext& ctx = ctx_of_aggregate(info);
-            const auto t0 = std::chrono::steady_clock::now();
-            auto& a = ctx.aggregator();
-            std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);
-            for (std::size_t e = 0; e < b->n_pf; ++e) dtypes[2 + b->n_pi + e] = gpudb::Dtype::F64;
-            const auto views = b->all_views();
-            std::vector<gpudb::Aggregator::RowSpan> spans(views.size());
-            std::vector<std::vector<const std::uint64_t*>> valid_ptrs(views.size());
-            for (std::size_t s2 = 0; s2 < views.size(); ++s2) {
-                const auto& v = views[s2];
-                spans[s2].lanes = v.seg->data;
-                spans[s2].rows = v.lanes / L;
-                spans[s2].n_lanes = L;
-                valid_ptrs[s2].assign(L, nullptr);
-                if (!v.seg->lane_valid.empty())
-                    for (std::size_t l = 0; l < L; ++l)
-                        if (!v.seg->lane_valid[l].empty()) valid_ptrs[s2][l] = v.seg->lane_valid[l].data();
-                spans[s2].valid = valid_ptrs[s2].data();
+            if (session_append(ctx, *b, /*pair*/true, gpudb::Dtype::I64, "gpu_upload_rows_exact", /*exact*/true)) {
+                out[offset + i] = static_cast<std::int64_t>(lanes / b->lanes_per_row);
+                continue;
             }
-            std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols =
-                a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
-            if (cols.size() != L) throw std::runtime_error("upload_rows_exact returned the wrong column count");
-            auto kcol = std::move(cols[0]);
-            auto vcol = std::move(cols[1]);
-            std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
-            for (std::size_t l = 2; l < L; ++l) preds.push_back(std::move(cols[l]));
-            if (upload_trace())
-                std::fprintf(stderr, "[gpudb upload] gpu_upload_rows_exact '%s': rows=%zu lanes=%zu "
-                             "null_keys=%zu null_vals=%zu segments=%zu upload=%.1f ms\n",
-                             b->name.c_str(), rows, L, kcol->null_count(), vcol->null_count(),
-                             spans.size(), ms_since(t0));
-            publish_set(ctx, *b, std::move(kcol), std::move(vcol), /*pair*/true,
-                        "gpu_upload_rows_exact", /*exact*/true, std::move(preds), b->n_pi, b->n_pf);
-            out[offset + i] = static_cast<std::int64_t>(rows);
+            out[offset + i] = static_cast<std::int64_t>(finish_upload_exact(ctx, *b, "gpu_upload_rows_exact"));
         } catch (const std::exception& e) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_rows_exact failed: ") + e.what()).c_str());
@@ -1536,6 +1526,7 @@ void upload_finish_exec(duckdb_function_info info, duckdb_data_chunk input, duck
             b.name = ss->name; b.name_set = true; b.managed = ss->managed; b.tag = ss->tag;
             b.dtype = ss->vdt; b.views = ss->views; b.rows_seen = ss->rows_seen;
             b.seq_at_start = ss->seq_at_start;
+            if (ss->exact) { b.lanes_per_row = ss->lanes_per_row; b.n_pi = ss->n_pi; b.n_pf = ss->n_pf; }
             const std::size_t rows = finish_upload(ctx, b, ss->pair, ss->vdt, "gpu_upload_finish");
             pool_release(ss->charged);
             ss->charged = 0;
