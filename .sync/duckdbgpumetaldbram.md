@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/core-exact-groupby
-- working on: v0.7 milestone 3: exact GROUP BY interface + CPU reference pushed (feat/core-exact-groupby, PR open); next: Metal kernels for upload_pair_exact / groupby_exact_resident
+- branch: feat/metal-exact-groupby
+- working on: v0.7 milestone 3: Metal exact GROUP BY done (upload_pair_exact + groupby_exact_resident, parity 0 mismatches at 20M rows); next: §4.3 DECIMAL + §4.4 packed keys on the shared side; CUDA side waits for the Linux instance
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-17T01:57:36Z
+- last update: 2026-09-17T02:41:51Z
