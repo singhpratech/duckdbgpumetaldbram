@@ -149,6 +149,22 @@ def run():
         con.execute(cases[name]).fetchall()
         check(con.last_rewrite()["form"] == "topk", f"{name}: pushed as top-k")
 
+    print("== output-bound HAVING: first run rewritten, template declined afterwards")
+    cth = fresh(thresholds=True)
+    cth.execute("CREATE TABLE tb AS SELECT i::BIGINT AS k, (i % 7)::BIGINT AS v FROM range(400000) r(i)")
+    qh = "SELECT k, sum(v) FROM tb GROUP BY k HAVING count(*) >= 1"
+    nat_h = cth._raw.execute(qh).fetchall()
+    got1 = cth.execute(qh).fetchall(); lr1 = cth.last_rewrite()
+    got2 = cth.execute(qh).fetchall(); lr2 = cth.last_rewrite()
+    check(lr1["rewritten"] and sorted(got1) == sorted(nat_h), "output-bound HAVING: first run rewritten and correct")
+    check(not lr2["rewritten"] and lr2["reason"] == "threshold" and sorted(got2) == sorted(nat_h),
+          f"output-bound HAVING: 400K survivors > plain bound -> declined afterwards (reason={lr2['reason']})")
+    cth.execute("SELECT k, sum(v) FROM tb GROUP BY k HAVING count(*) >= 5").fetchall()
+    check(not cth.last_rewrite()["rewritten"], "same template, other literal: stays declined (decisions are per template)")
+    cth.execute("SELECT k, sum(v) FROM tb GROUP BY k HAVING sum(v) >= 5").fetchall()
+    check(cth.last_rewrite()["rewritten"], "a different template (HAVING sum) still rewrites")
+    cth.close()
+
     print("== rejections (must run native, answer unchanged)")
     rej = {
         "group_by_all": ("SELECT k, sum(v) FROM t GROUP BY ALL", "shape"),
@@ -295,9 +311,12 @@ def run():
     tag = con.last_rewrite()["tag"]
     check(tag and not con.last_rewrite()["rewritten"], "big: first sighting native, upload scheduled")
     # interactive cadence while the session runs: short statements with 0-10 ms gaps
+    # The manager only uses idle windows and backs off (doubling, capped) after
+    # each interrupted segment, so time-to-ready under this cadence is not the
+    # property under test — completion without intruding is. Generous budget.
     t0 = time.monotonic()
     n_stmts = 0
-    while not con._manager.is_ready(tag) and time.monotonic() - t0 < 60:
+    while not con._manager.is_ready(tag) and time.monotonic() - t0 < 180:
         con.execute("SELECT count(*) FROM big WHERE v = 3").fetchall()
         n_stmts += 1
         time.sleep(random.uniform(0, 0.01))

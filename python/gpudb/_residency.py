@@ -18,7 +18,7 @@ never appends). A session that never goes idle never uploads and runs
 native throughout — rule 1 holds, the win is simply not there yet.
 
 Consecutive interrupts pause the session (50 ms, doubling per interrupt,
-capped at 5 s) so a cadence whose statements keep landing on segments pays
+capped at 1 s) so a cadence whose statements keep landing on segments pays
 the interrupt latency at most once per pause, not once per statement; a
 completed segment resets the pause.
 """
@@ -32,7 +32,9 @@ from typing import Callable, Dict, List, Optional
 
 SEGMENT_BYTES = 8 << 20          # the extension's host segment (gpu_resident.cpp)
 RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling per consecutive interrupt
-RETRY_PAUSE_MAX_MS = 5000.0
+RETRY_PAUSE_MAX_MS = 1000.0      # the idle wait already yields to every statement; a longer cap only
+                                 # delayed readiness (measured: 15 of 20 segments landed in 3 s, the
+                                 # rest took 30+ s at a 5 s cap under a 0-10 ms statement cadence)
 
 
 @dataclass

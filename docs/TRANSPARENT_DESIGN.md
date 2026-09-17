@@ -565,7 +565,7 @@ same database — the extension stays free of threads and hidden connections
   wrapper reads `gpu_upload_status(tag).segments` after every interrupt to
   learn whether the segment landed just before the interrupt was seen (it
   does happen) rather than appending it twice. Consecutive interrupts pause
-  the session — 50 ms, doubling per interrupt, capped at 5 s, reset by a
+  the session — 50 ms, doubling per interrupt, capped at 1 s, reset by a
   landed segment — so a cadence whose statements keep landing on segments
   pays the interrupt latency at most once per pause, not once per
   statement. (Raising the idle threshold instead was tried first and
