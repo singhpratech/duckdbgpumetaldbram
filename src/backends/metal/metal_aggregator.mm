@@ -1657,6 +1657,55 @@ private:
     }
 
     // The exact GROUP BY, plain or masked (§4.1, §4.2, §4.6).
+    // The NULL-key group: rows [from, to) of the key-partitioned set, under the
+    // mask. Folded on the host (unified memory). A LEFT JOIN can put most of a
+    // set there (every unmatched row has a NULL dimension key), so a long
+    // suffix is folded by several threads; the 128-bit add / min / max merge is
+    // associative, the result does not depend on the split.
+    struct NullFold {
+        Sum128 s; std::int64_t cnt = 0, cstar = 0;
+        std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+        std::int64_t mx = std::numeric_limits<std::int64_t>::min();
+    };
+    static NullFold fold_null_suffix(const MetalResidentColumn* v, const std::uint8_t* mk,
+                                     std::size_t from, std::size_t to) {
+        const auto* vd = v ? static_cast<const std::int64_t*>([v->buffer() contents]) : nullptr;
+        const auto* vv = (v && v->valid_buffer())
+            ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
+        auto range = [=](std::size_t a, std::size_t b) {
+            NullFold f;
+            for (std::size_t i = a; i < b; ++i) {
+                if (mk && !mk[i]) continue;
+                ++f.cstar;
+                if (!vd) continue;
+                if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
+                const std::int64_t x = vd[i];
+                f.s.add(x); ++f.cnt; f.mn = std::min(f.mn, x); f.mx = std::max(f.mx, x);
+            }
+            return f;
+        };
+        const std::size_t rows = to - from;
+        unsigned nt = std::min<unsigned>(8, std::max<unsigned>(1, std::thread::hardware_concurrency()));
+        if (rows < (std::size_t(1) << 17) || nt < 2) return range(from, to);
+        std::vector<NullFold> parts(nt);
+        std::vector<std::thread> th;
+        const std::size_t step = (rows + nt - 1) / nt;
+        for (unsigned t = 0; t < nt; ++t) {
+            const std::size_t a = from + t * step, b = std::min(to, a + step);
+            th.emplace_back([&parts, t, a, b, &range] { parts[t] = a < b ? range(a, b) : NullFold{}; });
+        }
+        for (auto& x : th) x.join();
+        NullFold out;
+        for (const auto& f : parts) {
+            const std::uint64_t old = out.s.lo;
+            out.s.lo += f.s.lo;
+            out.s.hi += f.s.hi + (out.s.lo < old ? 1 : 0);
+            out.cnt += f.cnt; out.cstar += f.cstar;
+            out.mn = std::min(out.mn, f.mn); out.mx = std::max(out.mx, f.mx);
+        }
+        return out;
+    }
+
     // `extras` (§4.9): further payload columns reduced over the SAME mask,
     // selection and run starts as `vals` — only Stage B repeats per payload.
     // Their tuples come back in `extra_out`, row-aligned with the returned
@@ -1885,17 +1934,8 @@ private:
             std::int64_t nmx = std::numeric_limits<std::int64_t>::min();
             if (null_ok && k.null_suffix() > 0) {
                 const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
-                const auto* vd = v ? static_cast<const std::int64_t*>([v->buffer() contents]) : nullptr;
-                const auto* vv = (v && v->valid_buffer())
-                    ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
-                for (std::size_t i = n; i < n_total; ++i) {
-                    if (mk && !mk[i]) continue;
-                    ++ncstar;
-                    if (!v) continue;
-                    if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
-                    const std::int64_t x = vd[i];
-                    ns.add(x); ++ncnt; nmn = std::min(nmn, x); nmx = std::max(nmx, x);
-                }
+                const NullFold f = fold_null_suffix(v, mk, n, n_total);
+                ns = f.s; ncnt = f.cnt; ncstar = f.cstar; nmn = f.mn; nmx = f.mx;
                 if (!v) ncnt = ncstar;
             }
             const bool null_group = ncstar > 0;
@@ -2105,18 +2145,8 @@ private:
                 if (null_group) {
                     const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
                     for (std::size_t e = 0; e < n_extras; ++e) {
-                        Sum128 es; std::int64_t ecnt = 0;
-                        std::int64_t emn = std::numeric_limits<std::int64_t>::max();
-                        std::int64_t emx = std::numeric_limits<std::int64_t>::min();
-                        const auto* vd = static_cast<const std::int64_t*>([ex[e]->buffer() contents]);
-                        const auto* vv = ex[e]->valid_buffer()
-                            ? static_cast<const std::uint64_t*>([ex[e]->valid_buffer() contents]) : nullptr;
-                        for (std::size_t i = n; i < n_total; ++i) {
-                            if (mk && !mk[i]) continue;
-                            if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
-                            const std::int64_t x = vd[i];
-                            es.add(x); ++ecnt; emn = std::min(emn, x); emx = std::max(emx, x);
-                        }
+                        const NullFold f = fold_null_suffix(ex[e], mk, n, n_total);
+                        const Sum128 es = f.s; const std::int64_t ecnt = f.cnt, emn = f.mn, emx = f.mx;
                         static_cast<std::int64_t*>([eb[e][0] contents])[num_segs] = static_cast<std::int64_t>(es.lo);
                         static_cast<std::int64_t*>([eb[e][1] contents])[num_segs] = es.hi;
                         static_cast<std::int64_t*>([eb[e][2] contents])[num_segs] = ecnt;

@@ -18,6 +18,14 @@ from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
+# an aggregate without GROUP BY is only worth parsing over a join (§4.12): on a
+# single table native's filter + sum wins (measured), so the fast path keeps it
+_GLOBAL_AGG_JOIN_RE = re.compile(
+    r"\b(?:sum|count|min|max|avg)\s*\(.*\bFROM\b.*(?:\bJOIN\b|,)", re.IGNORECASE | re.DOTALL)
+
+
+def _maybe_aggregate(sql: str) -> bool:
+    return bool(_GROUP_BY_RE.search(sql) or _GLOBAL_AGG_JOIN_RE.search(sql))
 _SELECT_START_RE = re.compile(r"^\s*(SELECT|FROM|VALUES)\b", re.IGNORECASE)
 _TABLE_REF_RE = re.compile(r'\bFROM\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)){0,2})', re.IGNORECASE)
 _MAX_STATEMENT_BYTES = 16 * 1024
@@ -49,6 +57,7 @@ class Decision:
     # expressions over aggregates (§4.11): the rewritten INNER group by is
     # spliced into this outer statement text at the placeholder
     wrap: Optional[Tuple[str, str]] = None
+    is_join: bool = False              # the statement's FROM is a join (decides the §4.13 fallback)
     # measured rule 1 (§9.1): this statement's own native time, seen while it
     # was not resident yet, against its first rewritten runs
     native_ms: Optional[float] = None
@@ -427,8 +436,8 @@ class Connection:
         # VALUES and carries no ';' cannot be DML (a CTE prefix can, so WITH
         # takes the full path), so nothing is invalidated either.
         if ";" not in query and _SELECT_START_RE.match(query) and (
-                not _GROUP_BY_RE.search(query) or not self._names_big_table(query)):
-            self._last.reason = "threshold" if _GROUP_BY_RE.search(query) else "shape"
+                not _maybe_aggregate(query) or not self._names_big_table(query)):
+            self._last.reason = "threshold" if _maybe_aggregate(query) else "shape"
             return query
         stmts = _classify.split(self._raw, query)
         if stmts is None:
@@ -475,7 +484,7 @@ class Connection:
         if len(sql) > _MAX_STATEMENT_BYTES:
             self._last.reason = "too_long"
             return None
-        if not _GROUP_BY_RE.search(sql):
+        if not _maybe_aggregate(sql):
             self._last.reason = "shape"
             return None
         t0 = time.perf_counter()
@@ -514,7 +523,10 @@ class Connection:
         elif not self._manager.is_ready(d.tag):
             if d.join is not None:
                 for b in d.join.base:
-                    self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn)
+                    if b.sentinel:
+                        self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
+                    else:
+                        self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn)
             st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
                                               deps=[b.tag for b in d.join.base] if d.join is not None else None,
                                               steps=d.join.steps_sql if d.join is not None else None)
@@ -658,7 +670,13 @@ class Connection:
     def _lower_exprs(self, tree: str, low: Optional["_join.Lowered"]):
         """(tree with expressions lowered to virtual columns, {name: Computed},
         single-table identity or None)."""
-        if low is not None:
+        upload = isinstance(low, _join.LoweredUpload)
+        if upload:
+            # §4.13: lanes are expressions over the JOINED row — any tables, qualified names
+            columns = low.columns
+            table_of = lambda c: 0                           # noqa: E731
+            real_of = lambda c: low.tables[low.colmap[c][0]].alias + "\x00" + low.colmap[c][1]   # noqa: E731
+        elif low is not None:
             columns = low.columns
             idents = [t.ident for t in low.tables]
             table_of = lambda c: low.colmap[c][0]            # noqa: E731
@@ -675,15 +693,47 @@ class Connection:
             columns, idents = ident.columns, [ident]
             table_of = lambda c: 0                           # noqa: E731
             real_of = lambda c: c                            # noqa: E731
-        lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=lambda c: c,
-                            deserialize=self._expr_to_sql,
-                            describe=lambda ti, sql: self._expr_type(idents[ti].fqn, sql),
-                            function_ok=self._function_ok,
-                            identity=lambda ti: idents[ti].fqn)
+        if upload:
+            src = low.from_text + (f" WHERE {low.edge_where}" if low.edge_where else "")
+            lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=real_of,
+                                deserialize=self._expr_to_sql,
+                                describe=lambda ti, sql: self._expr_type(src, sql),
+                                function_ok=self._function_ok, identity=lambda ti: src)
+        else:
+            lw = _exprs.Lowerer(columns, table_of, real_of, probe_of=lambda c: c,
+                                deserialize=self._expr_to_sql,
+                                describe=lambda ti, sql: self._expr_type(idents[ti].fqn, sql),
+                                function_ok=self._function_ok,
+                                identity=lambda ti: idents[ti].fqn)
         return lw.lower(tree), lw.computed
 
-    def _match(self, sql: str):
-        """(plan, lowered join or None, computed lanes). Raises _rewrite.Decline."""
+    def _validate_join_condition(self, e) -> None:
+        """An ON conjunct of an uploaded join (§4.13) is evaluated by DuckDB
+        during the upload: it must be deterministic like a computed lane."""
+        if isinstance(e, dict):
+            cls = e.get("class")
+            if cls in ("SUBQUERY", "WINDOW", "PARAMETER", "LAMBDA", "STAR"):
+                raise _rewrite.Decline("shape", f"{cls} in a join condition")
+            if cls == "FUNCTION" and not self._function_ok(e.get("function_name") or ""):
+                raise _rewrite.Decline("shape", f"function {e.get('function_name')} in a join condition")
+            for v in e.values():
+                self._validate_join_condition(v)
+        elif isinstance(e, list):
+            for v in e:
+                self._validate_join_condition(v)
+
+    def _lower_join_upload(self, tree: str) -> "_join.LoweredUpload":
+        return _join.lower_upload(
+            tree,
+            lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
+            lambda ident: self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0],
+            lambda stmt: self._raw.execute("SELECT json_deserialize_sql(?)", [stmt]).fetchone()[0],
+            self._validate_join_condition)
+
+    def _match(self, sql: str, mode: str = "device"):
+        """(plan, lowered join or None, computed lanes). Raises _rewrite.Decline.
+        mode 'device': a join is materialised on the device (§4.8); 'upload':
+        the join's result is uploaded (§4.13)."""
         tree = self._serialize(sql)
         order, nulls = self._settings["default_order"], self._settings["default_null_order"]
         try:
@@ -694,7 +744,7 @@ class Connection:
         if _join.is_join_statement(tree):
             if not getattr(self, "_join", False):
                 raise first
-            low = self._lower_join(tree)
+            low = self._lower_join(tree) if mode == "device" else self._lower_join_upload(tree)
             tree = low.tree_json
             try:
                 return _rewrite.match(tree, order, nulls), low, {}
@@ -713,7 +763,7 @@ class Connection:
 
     def _replan_literals(self, sql: str, cached: _rewrite.Plan) -> Optional[_rewrite.Plan]:
         try:
-            plan, _low, _computed = self._match(sql)
+            plan, _low, _computed = self._match(sql, "upload" if cached.tag and ":joinu-" in cached.tag else "device")
         except _rewrite.Decline:
             return None
         if plan.keys != cached.keys:
@@ -742,7 +792,8 @@ class Connection:
             if parts is None:
                 return None
             inner_sql, outer_sql = (self._raw.execute("SELECT json_deserialize_sql(?)", [x]).fetchone()[0]
-                                    for x in parts)
+                                    for x in parts[:2])
+            is_global = parts[2]
         except Exception as e:
             self._log(f"split failed: {e}")
             return None
@@ -753,22 +804,47 @@ class Connection:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
             return Decision(False, d.reason)
         head, tail = outer_sql.split(_split.PLACEHOLDER)
-        d.wrap = (head + "(", ") AS gpudb_q" + tail)
+        if is_global:
+            # no GROUP BY: one row even when nothing qualifies, as native
+            d.wrap = (head + "(SELECT 1) AS gpudb_one LEFT JOIN (", ") AS gpudb_q ON (true)" + tail)
+        else:
+            d.wrap = (head + "(", ") AS gpudb_q" + tail)
         d.literal_sensitive = True          # the outer text carries this statement's literals
         if d.form == "plain":
             d.form = "projected"
         return d
 
     def _decide(self, sql: str, allow_split: bool = True) -> Decision:
+        """Device path first; a join it cannot express falls back to uploading
+        the join's result (§4.13); expressions over aggregates fall back to the
+        split (§4.11), whose inner statement comes back through here."""
+        d = self._decide_once(sql, "device")
+        if d.rewritten or d.reason != "shape" or not getattr(self, "_exact", False):
+            return d
+        if d.is_join and getattr(self, "_join", False):
+            du = self._decide_once(sql, "upload")
+            if du.rewritten or du.reason != "shape":
+                return du
+        if allow_split:
+            ds = self._decide_split(sql)
+            if ds is not None:
+                return ds
+        return d
+
+    def _decide_once(self, sql: str, mode: str) -> Decision:
+        d = self._decide_body(sql, mode)
         try:
-            plan, low, computed = self._match(sql)
+            d.is_join = _join.is_join_statement(self._serialize(sql))
+        except Exception:
+            pass
+        return d
+
+    def _decide_body(self, sql: str, mode: str) -> Decision:
+        try:
+            plan, low, computed = self._match(sql, mode)
         except _rewrite.Decline as e:
-            if allow_split and getattr(self, "_exact", False) and e.reason == "shape":
-                d = self._decide_split(sql)
-                if d is not None:
-                    return d
             if e.detail:
-                self._log(f"declined ({e.reason}): {e.detail}")
+                self._log(f"declined ({e.reason}, {mode}): {e.detail}")
             return Decision(False, e.reason)
         except Exception as e:
             self._log(f"rewrite error: {e}")
@@ -785,11 +861,31 @@ class Connection:
             # a key join lowered to one virtual table: the root (fact) table
             # carries the identity, every column knows its own table
             ident = low.tables[low.root].ident
-            columns, probe_from = low.columns, low.from_sql + " gpudb_j"
+            columns = low.columns
+            probe_from = (low.from_sql + " gpudb_j") if not isinstance(low, _join.LoweredUpload) else ""
             idents = [t.ident for t in low.tables]
             col_home = lambda c: (low.tables[low.colmap[c][0]].ident, low.colmap[c][1])   # noqa: E731
-            base_from = low.from_sql + " gpudb_j0"
-        if computed:
+            base_from = (low.from_sql + " gpudb_j0") if not isinstance(low, _join.LoweredUpload) else ""
+        upload_mode = isinstance(low, _join.LoweredUpload)
+        if upload_mode:
+            # §4.13: the set holds the join's result; how big is it? (one native join, once per template)
+            where = f" WHERE {low.edge_where}" if low.edge_where else ""
+            try:
+                join_rows = self._raw.execute(f"SELECT count(*) FROM {low.from_text}{where}").fetchone()[0]
+            except Exception as e:
+                self._log(f"join count failed: {e}")
+                return Decision(False, "error", is_join=True)
+            biggest = max(t.rows for t in low.tables)
+            if join_rows > min(4 * biggest, 0xFFFFFFFF - 64):
+                self._log(f"declined (threshold): the join returns {join_rows} rows from tables of at most {biggest}")
+                return Decision(False, "threshold", is_join=True)
+            columns = dict(columns)
+            for cname, comp in computed.items():
+                columns[cname] = comp.lane_type
+            names = list(dict.fromkeys(list(plan.keys or [plan.key]) + list(plan.vals or ([plan.val] if plan.val else []))
+                                       + list(plan.pred_cols)))
+            probe_from = low.derived(names, computed, with_rowid=False) + " gpudb_c"
+        elif computed:
             # computed lanes (§4.10) are columns of the statement from here on;
             # decision-time probes read them from a derived table
             columns = dict(columns)
@@ -919,7 +1015,8 @@ class Connection:
                          upload_sql=_rewrite.upload_sql(plan, ident.fqn, q), form=plan.form)
         else:
             try:
-                jr = _join.plan_residency(low, plan, computed)
+                jr = (_join.plan_upload_residency(low, plan, computed) if isinstance(low, _join.LoweredUpload)
+                      else _join.plan_residency(low, plan, computed))
             except _rewrite.Decline as e:
                 self._log(f"declined ({e.reason}): {e.detail}")
                 return Decision(False, e.reason)
@@ -927,8 +1024,8 @@ class Connection:
                 return Decision(False, "shape")          # an identifier the tag cannot carry
             plan.tag = jr.tag
             plan.guards = [(g, f) for g, f, _i in jr.guards]
-            d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag, upload_sql="",
-                         form=plan.form, join=jr)
+            d = Decision(True, "", plan=plan, fqn=jr.root_fqn or ident.fqn, tag=plan.tag,
+                         upload_sql=jr.upload_sql, form=plan.form, join=jr)
         d.literal_sensitive = any(c.has_constant for c in computed.values())
         if self._has_rewrite_scalar:
             # The extension's pure scalar is the authority on the decision and

@@ -239,7 +239,7 @@ class ResidencyManager:
         for s in self._sets.values():
             if s.state != "pending" or now < s.resume_at:
                 continue
-            if s.derived:
+            if s.deps:
                 deps = [self._sets.get(d) for d in s.deps]
                 if any(d is None or d.state == "failed" for d in deps):
                     s.state = "failed"

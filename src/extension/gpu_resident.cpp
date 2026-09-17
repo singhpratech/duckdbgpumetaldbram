@@ -2262,6 +2262,52 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
     }
 }
 
+// gpu_note_rows(name, n) -> BOOLEAN (v0.7 §4.13). Registers a column-less
+// SENTINEL set that only remembers n, the row count of a base table when a
+// set built from a JOIN over it was uploaded. gpu_assert_rows(name,
+// count(*)) over the table is then the staleness guard for that table, as it
+// is for a table's own set. Holds no device memory.
+void note_rows_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector n_vec    = duckdb_data_chunk_get_vector(input, 1);
+    auto* names  = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    auto* counts = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(n_vec));
+    uint64_t* name_validity = duckdb_vector_get_validity(name_vec);
+    uint64_t* n_validity    = duckdb_vector_get_validity(n_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<bool*>(duckdb_vector_get_data(output));
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        try {
+            if ((name_validity && !duckdb_validity_row_is_valid(name_validity, i)) ||
+                (n_validity && !duckdb_validity_row_is_valid(n_validity, i)) || counts[i] < 0)
+                throw std::runtime_error("gpu_note_rows: name and a non-negative row count are required");
+            auto set = std::make_shared<ResidentSet>();
+            set->name = read_name(names, i);
+            if (set->name.empty()) throw std::runtime_error("gpu_note_rows: empty name");
+            if (starts_with(set->name, kTagPrefix)) {
+                TagFields tag;
+                const std::string err = parse_tag(set->name, tag);
+                if (!err.empty()) throw std::runtime_error("gpu_note_rows: " + err);
+                set->managed = true;
+                set->catalog = tag.catalog; set->schema = tag.schema; set->table = tag.table;
+                set->table_oid = tag.table_oid; set->columns = tag.columns; set->extra = tag.extra;
+            }
+            set->rows_seen = static_cast<std::size_t>(counts[i]);
+            set->uploaded_at_us = now_us();
+            set->state.store(SetState::Ready);
+            const std::uint64_t seq = ctx.inval_seq.load(std::memory_order_acquire);
+            if (!ctx.publish(set, seq))
+                throw std::runtime_error("GPUDB_UPLOAD_DISCARDED: gpu_note_rows: '" + read_name(names, i) +
+                                         "' was invalidated meanwhile");
+            out[i] = true;
+        } catch (const std::exception& e) {
+            duckdb_scalar_function_set_error(info, e.what());
+            return;
+        }
+    }
+}
+
 // gpu_assert_rows(name, n) -> BOOLEAN. The in-statement staleness guard
 // (docs/TRANSPARENT_DESIGN.md §5.4): raises a TYPED error, prefix
 // "GPUDB_STALE:", unless the set exists, is not stale, and was uploaded from
@@ -2962,6 +3008,8 @@ void register_gpu_resident(duckdb_connection con,
         invalidate_exec, DUCKDB_TYPE_BIGINT, 1, ctx);
     register_scalar_names(con, "gpu_join_materialize",
         join_materialize_exec, DUCKDB_TYPE_BIGINT, 6, ctx);
+    register_scalar(con, "gpu_note_rows", note_rows_exec, DUCKDB_TYPE_BOOLEAN,
+                    {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar_names(con, "gpu_upload_begin",
         upload_begin_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
     register_scalar_names(con, "gpu_upload_finish",

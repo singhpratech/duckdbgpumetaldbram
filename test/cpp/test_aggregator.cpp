@@ -1263,9 +1263,10 @@ void test_backend(gpudb::Backend b) {
             std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
             for (std::size_t i = 0; i < N; ++i) {
                 const int p = pct(rng);
-                // 60% key 1 (one giant group), 3 x 12% keys 2..4, 3% tiny keys, 1% NULL
-                lanes[i * L + 0] = p < 60 ? 1 : p < 72 ? 2 : p < 84 ? 3 : p < 96 ? 4 : tiny(rng);
-                if (p == 99) valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+                // 60% key 1 (one giant group), 2 x 12% keys 2..3, 2% tiny keys, 14% NULL — a
+                // NULL-key group of ~180K rows, long enough for the threaded host fold
+                lanes[i * L + 0] = p < 60 ? 1 : p < 72 ? 2 : p < 84 ? 3 : tiny(rng);
+                if (p >= 86) valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
                 lanes[i * L + 1] = wide(rng);
                 if (pct(rng) < 7) valid[1][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
                 lanes[i * L + 2] = sel(rng);

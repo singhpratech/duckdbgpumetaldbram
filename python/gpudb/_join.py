@@ -69,6 +69,7 @@ class BaseSet:
     fqn: str
     upload_sql: str
     lanes: Dict[tuple, str] = field(default_factory=dict)   # lane id -> k | v | i<n> | f<n> | s<n>
+    sentinel: bool = False            # §4.13: a row-count sentinel (one scalar call, no table scan of its own)
 
 
 @dataclass
@@ -77,6 +78,8 @@ class JoinResidency:
     steps_sql: List[str]            # gpu_join_materialize calls, in order, then the drops of intermediates
     tag: str                        # the final joined set
     guards: List[Tuple[str, str, Identity]]   # (base tag, fqn, identity) per table
+    upload_sql: str = ""            # §4.13: the set is an upload of the join's RESULT (no device join)
+    root_fqn: str = ""              # ... segmented by this table's rowid
 
 
 def _split_and(e, out: list) -> None:
@@ -471,3 +474,271 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
         steps_sql.append("SELECT gpu_drop_resident('%s')" % name.replace("'", "''"))
     guards = [(b.tag, b.fqn, tables[b.table].ident) for b in base]
     return JoinResidency(base=base, steps_sql=steps_sql, tag=final_tag, guards=guards)
+
+
+# ---------------------------------------------------------------------------
+# §4.13 — joins the device operator cannot express: upload the JOIN'S RESULT
+# ---------------------------------------------------------------------------
+# LEFT JOIN, many-to-many, USING, composite or non-integer join keys, an ON
+# clause with more than an equality, an expression that mixes columns of two
+# tables: none of these fits "a subset of the fact rows with dimension columns
+# attached". For them DuckDB itself executes the join — once, in the
+# background upload — and the resident set holds lanes of the join's RESULT.
+# The statement is lowered to the same single virtual table, so everything
+# downstream is unchanged; what differs is residency (one uploaded set whose
+# upload statement scans the join, plus a row-count sentinel per base table
+# for the staleness guards) and that a lane may be any expression over the
+# joined row.
+
+@dataclass
+class LoweredUpload:
+    tree_json: str
+    tables: List[TableRef]
+    root: int                                   # the leftmost leaf: every result row has exactly one of its rows
+    colmap: Dict[str, Tuple[int, str]]
+    columns: Dict[str, str]
+    from_text: str                              # the statement's FROM clause, as DuckDB prints it
+    edge_where: str                             # join equalities that were written in WHERE ('' if none)
+    steps: List[Step] = field(default_factory=list)     # unused; keeps the two lowerings interchangeable
+
+    def qualified(self, v: str) -> str:
+        ti, real = self.colmap[v]
+        return f'"{self.tables[ti].alias}"."{real}"'
+
+    def derived(self, names: List[str], computed: Dict[str, object], with_rowid: bool) -> str:
+        """The join's result as a derived table exposing `names` (virtual and
+        computed columns) — the upload's and the probes' FROM."""
+        items = []
+        for n in names:
+            if n in computed:
+                c = computed[n]
+                items.append((f"CAST({c.probe_sql} AS TINYINT)" if c.native_type == "BOOLEAN" and not with_rowid
+                              else c.probe_sql) + f' AS "{n}"')
+            else:
+                items.append(f'{self.qualified(n)} AS "{n}"')
+        if with_rowid:
+            items.append(f'"{self.tables[self.root].alias}".rowid AS rowid')
+        where = f" WHERE {self.edge_where}" if self.edge_where else ""
+        return f"(SELECT {', '.join(items) or '1'} FROM {self.from_text}{where})"
+
+
+def lower_upload(tree_json: str,
+                 resolve_fn: Callable[[str, str, str], Tuple[Optional[Identity], str]],
+                 rows_fn: Callable[[Identity], int],
+                 deserialize_stmt: Callable[[str], str],
+                 validate_expr: Callable[[dict], None]) -> LoweredUpload:
+    j = json.loads(tree_json)
+    stmts = j.get("statements") or []
+    if len(stmts) != 1:
+        raise Decline("shape", "multi-statement")
+    node = stmts[0].get("node") or {}
+    if node.get("type") != "SELECT_NODE" or (node.get("cte_map") or {}).get("map"):
+        raise Decline("shape", "not a plain SELECT")
+    from_ast = json.loads(json.dumps(node.get("from_table") or {}))
+
+    leaves: List[dict] = []
+    on_conditions: list = []
+    using: List[Tuple[List[str], int]] = []       # (columns, number of leaves to the left when seen)
+
+    def flatten(ft):
+        t = ft.get("type")
+        if t == "BASE_TABLE":
+            if ft.get("sample") or ft.get("at_clause") or ft.get("column_name_alias"):
+                raise Decline("shape", "table sample/at/column aliases in a join")
+            leaves.append(ft)
+            return
+        if t != "JOIN":
+            raise Decline("shape", f"join leaf is {t}, not a base table")
+        if ft.get("join_type") not in ("INNER", "LEFT") or ft.get("ref_type") not in ("REGULAR", "CROSS"):
+            raise Decline("shape", f"{ft.get('join_type')} {ft.get('ref_type')} join")
+        if ft.get("sample") or ft.get("alias"):
+            raise Decline("shape", "aliased or sampled join")
+        flatten(ft.get("left") or {})
+        n_left = len(leaves)
+        flatten(ft.get("right") or {})
+        if ft.get("using_columns"):
+            using.append((list(ft["using_columns"]), n_left))
+        elif ft.get("ref_type") == "REGULAR":
+            if ft.get("condition") is None:
+                raise Decline("shape", "join without a condition")
+            on_conditions.append(ft["condition"])
+        elif ft.get("join_type") != "INNER":
+            raise Decline("shape", "outer join without a condition")
+
+    flatten(from_ast)
+    if not 2 <= len(leaves) <= MAX_TABLES:
+        raise Decline("shape", f"{len(leaves)} tables in the join")
+    tables: List[TableRef] = []
+    for lf in leaves:
+        ident, why = resolve_fn(lf.get("catalog_name") or "", lf.get("schema_name") or "", lf.get("table_name") or "")
+        if ident is None:
+            raise Decline(why or "shape", f"table {lf.get('table_name')}")
+        alias = lf.get("alias") or ident.table
+        if any(t.alias.casefold() == alias.casefold() for t in tables):
+            raise Decline("shape", "repeated table alias")
+        tables.append(TableRef(alias=alias, ident=ident, rows=0))
+    for t in tables:
+        t.rows = rows_fn(t.ident)
+
+    def real_column(ti: int, name: str) -> Optional[str]:
+        for c in tables[ti].ident.columns:
+            if c.casefold() == name.casefold():
+                return c
+        return None
+
+    using_cols = {c.casefold(): n_left for cols, n_left in using for c in cols}
+
+    def resolve_col(names: List[str]) -> Optional[Tuple[int, str]]:
+        if len(names) == 1:
+            hits = [(ti, rc) for ti in range(len(tables)) for rc in [real_column(ti, names[0])] if rc]
+            if len(hits) > 1 and names[0].casefold() in using_cols:
+                # a USING column: the merged column is the left side's value
+                # for the INNER and LEFT joins accepted here
+                return hits[0]
+            if len(hits) > 1:
+                raise Decline("shape", f"ambiguous column {names[0]}")
+            return hits[0] if hits else None
+        if len(names) == 2:
+            for ti, t in enumerate(tables):
+                if t.alias.casefold() == names[0].casefold():
+                    rc = real_column(ti, names[1])
+                    if rc is None:
+                        raise Decline("shape", f"no column {names[1]} in {names[0]}")
+                    return ti, rc
+            raise Decline("shape", f"unknown qualifier {names[0]}")
+        raise Decline("shape", "schema-qualified column reference")
+
+    # every table must be tied to the rest by at least one equality (a cross
+    # product is never uploaded); equalities written in WHERE move into the upload
+    parent = list(range(len(tables)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def is_edge(c):
+        if (isinstance(c, dict) and c.get("class") == "COMPARISON" and c.get("type") == "COMPARE_EQUAL"
+                and (c.get("left") or {}).get("class") == "COLUMN_REF"
+                and (c.get("right") or {}).get("class") == "COLUMN_REF"):
+            a = resolve_col(c["left"].get("column_names") or [])
+            b = resolve_col(c["right"].get("column_names") or [])
+            if a and b and a[0] != b[0]:
+                return a[0], b[0]
+        return None
+
+    for cond in on_conditions:
+        conj: list = []
+        _split_and(cond, conj)
+        for c in conj:
+            validate_expr(c)
+            e = is_edge(c)
+            if e:
+                parent[find(e[0])] = find(e[1])
+    for cols, n_left in using:
+        for c in cols:
+            owners = [ti for ti in range(len(tables)) if real_column(ti, c)]
+            for ti in owners[1:]:
+                parent[find(ti)] = find(owners[0])
+    where_conj: list = []
+    _split_and(node.get("where_clause"), where_conj)
+    edge_conj, residual = [], []
+    for c in where_conj:
+        e = is_edge(c)
+        if e:
+            parent[find(e[0])] = find(e[1])
+            edge_conj.append(c)
+        else:
+            residual.append(c)
+    if len({find(i) for i in range(len(tables))}) != 1:
+        raise Decline("shape", "a joined table is not tied to the others by an equality (cross product)")
+
+    # the FROM clause (and the WHERE equalities) as DuckDB prints them
+    probe = {"statements": [{"node": {"type": "SELECT_NODE", "modifiers": [], "cte_map": {"map": []},
+             "select_list": [{"class": "CONSTANT", "type": "VALUE_CONSTANT", "alias": "", "query_location": 0,
+                              "value": {"type": {"id": "INTEGER", "type_info": None}, "is_null": False, "value": 1}}],
+             "from_table": from_ast, "where_clause": _and(json.loads(json.dumps(edge_conj))),
+             "group_expressions": [], "group_sets": [], "aggregate_handling": "STANDARD_HANDLING",
+             "having": None, "sample": None, "qualify": None}, "named_param_map": []}]}
+    text = deserialize_stmt(json.dumps(probe))
+    if not text.startswith("SELECT 1 FROM "):
+        raise Decline("error", "FROM clause did not deserialize")
+    body = text[len("SELECT 1 FROM "):]
+    if edge_conj:
+        k = body.rfind(" WHERE ")
+        if k < 0:
+            raise Decline("error", "FROM clause did not deserialize")
+        from_text, edge_where = body[:k], body[k + 7:]
+    else:
+        from_text, edge_where = body, ""
+
+    # virtual columns, as in lower()
+    count: Dict[str, int] = {}
+    for t in tables:
+        for c in t.ident.columns:
+            count[c.casefold()] = count.get(c.casefold(), 0) + 1
+    vname: Dict[Tuple[int, str], str] = {}
+    colmap: Dict[str, Tuple[int, str]] = {}
+    columns: Dict[str, str] = {}
+    for ti, t in enumerate(tables):
+        for c, typ in t.ident.columns.items():
+            v = c if count[c.casefold()] == 1 else f"{t.alias}__{c}"
+            if any(ch in v for ch in ":,+'\"") or v in colmap:
+                continue
+            vname[(ti, c)] = v
+            colmap[v] = (ti, c)
+            columns[v] = typ
+
+    def rewrite_refs(e):
+        if isinstance(e, dict):
+            if e.get("class") == "COLUMN_REF":
+                r = resolve_col(e.get("column_names") or [])
+                if r is None:
+                    return
+                if r not in vname:
+                    raise Decline("shape", f"column {r[1]} is not representable")
+                e["column_names"] = [vname[r]]
+                return
+            for v in e.values():
+                rewrite_refs(v)
+        elif isinstance(e, list):
+            for v in e:
+                rewrite_refs(v)
+
+    r_ident = tables[0].ident
+    node["where_clause"] = _and(residual)
+    node["from_table"] = {"type": "BASE_TABLE", "alias": "", "sample": None,
+                          "query_location": 18446744073709551615, "schema_name": r_ident.schema,
+                          "table_name": r_ident.table, "column_name_alias": [],
+                          "catalog_name": r_ident.catalog, "at_clause": None}
+    for k, v in node.items():
+        if k != "from_table":
+            rewrite_refs(v)
+    return LoweredUpload(tree_json=json.dumps(j), tables=tables, root=0, colmap=colmap, columns=columns,
+                         from_text=from_text, edge_where=edge_where)
+
+
+def plan_upload_residency(low: LoweredUpload, plan: Plan, computed: Dict[str, object]) -> JoinResidency:
+    """One uploaded set over the join's result + one row-count sentinel per table."""
+    tables = low.tables
+    names = list(dict.fromkeys(list(plan.keys or [plan.key]) + list(plan.vals or ([plan.val] if plan.val else []))
+                               + list(plan.pred_cols)))
+    src = low.derived(names, computed, with_rowid=True)
+    desc = json.dumps({"from": low.from_text, "where": low.edge_where,
+                       "lanes": [computed[n].probe_sql if n in computed else low.qualified(n) for n in names],
+                       "tables": [t.ident.fqn for t in tables]}, sort_keys=True)
+    digest = hashlib.sha1(desc.encode()).hexdigest()[:16]
+    tag = tables[low.root].ident.tag(plan.upload_columns) + ":joinu-" + digest
+    plan.tag = tag
+    upload = _rewrite.upload_sql(plan, src + " gpudb_u")
+    sentinels = []
+    for t in tables:
+        stag = t.ident.tag(["rows"]) + ":sentinel"
+        sentinels.append(BaseSet(table=0, tag=stag, fqn=t.ident.fqn, sentinel=True,
+                                 upload_sql="SELECT gpu_note_rows('%s', (SELECT count(*) FROM %s))" % (
+                                     stag.replace("'", "''"), t.ident.fqn)))
+    return JoinResidency(base=sentinels, steps_sql=[], tag=tag,
+                         guards=[(s.tag, s.fqn, tables[i].ident) for i, s in enumerate(sentinels)],
+                         upload_sql=upload,            # the set itself is an ordinary (segmentable) upload
+                         root_fqn=tables[low.root].ident.fqn)
