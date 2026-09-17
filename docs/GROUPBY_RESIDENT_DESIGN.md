@@ -43,7 +43,13 @@ full native tuple — NULL-key group last, `count_star` counting NULL payloads,
 NULL `sum`/`min`/`max`/`avg` for an all-NULL group, and a two-limb 128-bit
 sum emitted as HUGEINT (docs/TRANSPARENT_DESIGN.md §4.1–4.2; the CPU backend
 is the executable reference, `Sum128` in gpu_backend.hpp fixes the limb
-arithmetic every backend must match). `gpu_last_stats()` reports the backend, dispatch
+arithmetic every backend must match). On Metal the exact tuple comes from
+`gbx_chunk_i64` / `gbx_finalize_i64` over the sorted valid-key prefix (the
+same run-start pipeline as the v0.6 GROUP BY, with the payload's validity
+bitmap read in the reduce and the two-limb sum carried by hand), the NULL-key
+suffix is folded into one trailing group on the host (UMA, cost ∝ NULL-key
+rows), and HAVING / top-k run on the device over the tuple — top-k on the sum
+is a 16-pass radix select over the 128-bit ordinal. `gpu_last_stats()` reports the backend, dispatch
 reason, `rows_in`, `groups`, and the wall / kernel / transfer split for the
 last call, as for the other resident ops. Group count is capped at `GPUDB_GROUPBY_ROWS_MAX_M`
 million (default 100) with a clean error naming the actual count — checked

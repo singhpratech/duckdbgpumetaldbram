@@ -771,3 +771,420 @@ kernel void gb_topk_compact_i64(
         if (with_sums != 0u) out_sums[pos] = sums[gid];
     }
 }
+
+// ---------------------------------------------------------------------------
+//  Exact GROUP BY (v0.7 milestone 3, docs/TRANSPARENT_DESIGN.md §4.1 / §4.2)
+//
+//  Same sorted-run pipeline as gb_* above (gb_block_counts_i64 /
+//  gb_run_starts_i64 give the run starts over the VALID-KEY PREFIX of the
+//  sorted cache; NULL-key rows sit in a suffix the host folds into one extra
+//  group), but the per-group tuple is the native one:
+//    sum   as a 128-bit two's-complement integer (lo ulong, hi long) — never
+//          wraps; the limb arithmetic is Sum128 in gpu_backend.hpp;
+//    cnt   = count(v): payloads that are not NULL (validity bitmap, DuckDB
+//          layout: row i valid iff bit i%64 of word i/64);
+//    cstar = count(*) = run length (finalize);
+//    mn/mx over non-NULL payloads; 0 when cnt == 0 (SQL surfaces NULL).
+//  Chunk partials are 5 longs per 64-element chunk: lo, hi, cnt, mn, mx.
+// ---------------------------------------------------------------------------
+
+constant long GBX_LMAX = 0x7FFFFFFFFFFFFFFFl;
+constant long GBX_LMIN = (long)0x8000000000000000ul;
+
+struct GbxAcc { ulong lo; long hi; long cnt; long mn; long mx; };
+
+inline GbxAcc gbx_zero() {
+    GbxAcc a; a.lo = 0ul; a.hi = 0l; a.cnt = 0l; a.mn = GBX_LMAX; a.mx = GBX_LMIN; return a;
+}
+inline void gbx_add(thread GbxAcc& a, long v) {
+    const ulong u = (ulong)v, old = a.lo;
+    a.lo += u;
+    a.hi += (v < 0l ? -1l : 0l) + (a.lo < old ? 1l : 0l);
+    a.cnt += 1l;
+    a.mn = min(a.mn, v);
+    a.mx = max(a.mx, v);
+}
+inline void gbx_merge(thread GbxAcc& a, GbxAcc b) {
+    const ulong old = a.lo;
+    a.lo += b.lo;
+    a.hi += b.hi + (a.lo < old ? 1l : 0l);
+    a.cnt += b.cnt;
+    a.mn = min(a.mn, b.mn);
+    a.mx = max(a.mx, b.mx);
+}
+inline void gbx_store(device long* p, uint i, GbxAcc a) {
+    p[5u * i + 0u] = (long)a.lo; p[5u * i + 1u] = a.hi; p[5u * i + 2u] = a.cnt;
+    p[5u * i + 3u] = a.mn;       p[5u * i + 4u] = a.mx;
+}
+inline GbxAcc gbx_load(device const long* p, uint i) {
+    GbxAcc a;
+    a.lo = (ulong)p[5u * i + 0u]; a.hi = p[5u * i + 1u]; a.cnt = p[5u * i + 2u];
+    a.mn = p[5u * i + 3u];        a.mx = p[5u * i + 4u];
+    return a;
+}
+inline void gbx_out(device long* lo, device long* hi, device long* cnt,
+                    device long* mn, device long* mx, uint seg, GbxAcc a) {
+    lo[seg] = (long)a.lo; hi[seg] = a.hi; cnt[seg] = a.cnt;
+    mn[seg] = a.cnt ? a.mn : 0l;
+    mx[seg] = a.cnt ? a.mx : 0l;
+}
+inline bool gbx_valid(device const ulong* valid, uint has_valid, ulong row) {
+    return has_valid == 0u || (((valid[row >> 6] >> (row & 63ul)) & 1ul) != 0ul);
+}
+
+kernel void gbx_chunk_i64(
+    device const long*  perm      [[buffer(0)]],   // sorted pos -> original index
+    device const long*  vals      [[buffer(1)]],   // original order
+    device const ulong* valid     [[buffer(2)]],   // payload validity (or a dummy)
+    constant uint&      has_valid [[buffer(3)]],
+    device const uint*  starts    [[buffer(4)]],
+    constant uint&      n         [[buffer(5)]],
+    constant uint&      num_segs  [[buffer(6)]],
+    device long*        out_lo    [[buffer(7)]],
+    device long*        out_hi    [[buffer(8)]],
+    device long*        out_cnt   [[buffer(9)]],
+    device long*        out_mn    [[buffer(10)]],
+    device long*        out_mx    [[buffer(11)]],
+    device long*        head      [[buffer(12)]],  // 5 longs per chunk
+    device long*        tail      [[buffer(13)]],
+    uint                gid       [[thread_position_in_grid]])
+{
+    const uint a = gid * GB_CHUNK;
+    if (a >= n) return;
+    const uint b = (n - a < GB_CHUNK) ? n : a + GB_CHUNK;
+    uint lo = 0, hi = num_segs;
+    while (lo < hi) {
+        const uint mid = (lo + hi) >> 1;
+        if (starts[mid] <= a) lo = mid + 1; else hi = mid;
+    }
+    uint seg = lo - 1;
+    uint i = a;
+    GbxAcc hs = gbx_zero(), ts = gbx_zero();
+    while (i < b) {
+        const uint rs = starts[seg];
+        const uint re = (seg + 1 < num_segs) ? starts[seg + 1] : n;
+        const uint e  = min(re, b);
+        GbxAcc s = gbx_zero();
+        for (uint j = i; j < e; ++j) {
+            const ulong row = (ulong)perm[j];
+            if (gbx_valid(valid, has_valid, row)) gbx_add(s, vals[row]);
+        }
+        if (rs < a)      hs = s;
+        else if (re > b) ts = s;
+        else             gbx_out(out_lo, out_hi, out_cnt, out_mn, out_mx, seg, s);
+        i = e; ++seg;
+    }
+    gbx_store(head, gid, hs);
+    gbx_store(tail, gid, ts);
+}
+
+// keys + count(*) for every segment; the tuple for boundary-crossing
+// segments (tail of the first chunk + heads of the chunks it spans). With
+// with_vals == 0 (keys-only form) every segment gets cnt = cstar and zeros.
+kernel void gbx_finalize_i64(
+    device const long* keys      [[buffer(0)]],
+    device const uint* starts    [[buffer(1)]],
+    constant uint&     n         [[buffer(2)]],
+    constant uint&     num_segs  [[buffer(3)]],
+    device const long* head      [[buffer(4)]],
+    device const long* tail      [[buffer(5)]],
+    device long*       out_keys  [[buffer(6)]],
+    device long*       out_cstar [[buffer(7)]],
+    device long*       out_lo    [[buffer(8)]],
+    device long*       out_hi    [[buffer(9)]],
+    device long*       out_cnt   [[buffer(10)]],
+    device long*       out_mn    [[buffer(11)]],
+    device long*       out_mx    [[buffer(12)]],
+    constant uint&     with_vals [[buffer(13)]],
+    uint               gid       [[thread_position_in_grid]])
+{
+    if (gid >= num_segs) return;
+    const uint rs = starts[gid];
+    const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
+    out_keys[gid]  = keys[rs];
+    out_cstar[gid] = (long)(re - rs);
+    if (with_vals == 0u) {
+        out_lo[gid] = 0l; out_hi[gid] = 0l; out_cnt[gid] = (long)(re - rs);
+        out_mn[gid] = 0l; out_mx[gid] = 0l;
+        return;
+    }
+    const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
+    if (c0 < c1) {
+        GbxAcc s = gbx_load(tail, c0);
+        for (uint t = c0 + 1u; t <= c1; ++t) gbx_merge(s, gbx_load(head, t));
+        gbx_out(out_lo, out_hi, out_cnt, out_mn, out_mx, gid, s);
+    }
+}
+
+// ---- GroupByFilter on the exact tuple ----
+//  agg: 0 sum (128-bit), 1 count(v), 2 count(*), 3 min, 4 max.
+//  cmp: 0 none, 1 >, 2 >=, 3 <, 4 <=, 5 "aggregate IS NULL" (used to append
+//  the NULL-aggregate groups that rank last under top-k).
+//  A NULL aggregate (cnt == 0 for sum/min/max) never passes 1..4.
+//  Top-k ranks by the 128-bit ordinal (ord_hi, ord_lo): for sum ord_hi is
+//  the order-preserving image of hi and ord_lo the raw lo limb; for the
+//  int64 aggregates ord_hi is the image of the value and ord_lo is 0.
+
+inline bool gbx_is_null(device const long* cnt, uint agg, uint gid) {
+    return (agg == 0u || agg == 3u || agg == 4u) && cnt[gid] == 0l;
+}
+inline long gbx_agg64(device const long* cnt, device const long* cstar,
+                      device const long* mn, device const long* mx, uint agg, uint gid) {
+    switch (agg) {
+        case 1u: return cnt[gid];
+        case 2u: return cstar[gid];
+        case 3u: return mn[gid];
+        default: return mx[gid];
+    }
+}
+inline bool gbx_keep(device const long* lo, device const long* hi, device const long* cnt,
+                     device const long* cstar, device const long* mn, device const long* mx,
+                     uint agg, uint cmp, long thr, uint gid) {
+    const bool is_null = gbx_is_null(cnt, agg, gid);
+    if (cmp == 5u) return is_null;
+    if (cmp == 0u) return !is_null;   // no HAVING: the non-NULL groups are the top-k candidates, NULL ones are appended last by the host
+    if (is_null) return false;
+    if (agg == 0u) {
+        const long  ah = hi[gid], th = (thr < 0l ? -1l : 0l);
+        const ulong al = (ulong)lo[gid], tl = (ulong)thr;
+        const bool lt = (ah != th) ? (ah < th) : (al < tl);   // a < t
+        const bool gt = (ah != th) ? (ah > th) : (al > tl);   // a > t
+        switch (cmp) {
+            case 1u: return gt;
+            case 2u: return !lt;
+            case 3u: return lt;
+            case 4u: return !gt;
+            default: return true;
+        }
+    }
+    return gb_keep(gbx_agg64(cnt, cstar, mn, mx, agg, gid), cmp, thr);
+}
+inline void gbx_ord(device const long* lo, device const long* hi, device const long* cnt,
+                    device const long* cstar, device const long* mn, device const long* mx,
+                    uint agg, uint gid, thread ulong& oh, thread ulong& ol) {
+    if (agg == 0u) { oh = gb_ord(hi[gid]); ol = (ulong)lo[gid]; }
+    else           { oh = gb_ord(gbx_agg64(cnt, cstar, mn, mx, agg, gid)); ol = 0ul; }
+}
+
+kernel void gbx_having_counts_i64(
+    device const long* lo           [[buffer(0)]],
+    device const long* hi           [[buffer(1)]],
+    device const long* cnt          [[buffer(2)]],
+    device const long* cstar        [[buffer(3)]],
+    device const long* mn           [[buffer(4)]],
+    device const long* mx           [[buffer(5)]],
+    constant uint&     num_segs     [[buffer(6)]],
+    constant uint&     agg          [[buffer(7)]],
+    constant uint&     cmp          [[buffer(8)]],
+    constant long&     thr          [[buffer(9)]],
+    device uint*       block_counts [[buffer(10)]],
+    uint               tid          [[thread_position_in_threadgroup]],
+    uint               gid          [[thread_position_in_grid]],
+    uint               block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    shm[tid] = (gid < num_segs && gbx_keep(lo, hi, cnt, cstar, mn, mx, agg, cmp, thr, gid)) ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
+}
+
+// Compacts the survivors (8 arrays) to out_* at base + rank, ranks >= limit
+// are dropped (used to take only the first `need` NULL-aggregate groups).
+kernel void gbx_having_compact_i64(
+    device const long*  lo            [[buffer(0)]],
+    device const long*  hi            [[buffer(1)]],
+    device const long*  cnt           [[buffer(2)]],
+    device const long*  cstar         [[buffer(3)]],
+    device const long*  mn            [[buffer(4)]],
+    device const long*  mx            [[buffer(5)]],
+    device const long*  keys          [[buffer(6)]],
+    device const uchar* knull         [[buffer(7)]],
+    constant uint&      num_segs      [[buffer(8)]],
+    constant uint&      agg           [[buffer(9)]],
+    constant uint&      cmp           [[buffer(10)]],
+    constant long&      thr           [[buffer(11)]],
+    device const uint*  block_offsets [[buffer(12)]],
+    constant uint&      base          [[buffer(13)]],
+    constant uint&      limit         [[buffer(14)]],
+    device long*        o_keys        [[buffer(15)]],
+    device uchar*       o_knull       [[buffer(16)]],
+    device long*        o_lo          [[buffer(17)]],
+    device long*        o_hi          [[buffer(18)]],
+    device long*        o_cnt         [[buffer(19)]],
+    device long*        o_cstar       [[buffer(20)]],
+    device long*        o_mn          [[buffer(21)]],
+    device long*        o_mx          [[buffer(22)]],
+    uint                gid           [[thread_position_in_grid]],
+    uint                block_id      [[threadgroup_position_in_grid]],
+    uint                lane          [[thread_index_in_simdgroup]],
+    uint                sg            [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint sg_tot[BLOCK];
+    const uint f = (gid < num_segs && gbx_keep(lo, hi, cnt, cstar, mn, mx, agg, cmp, thr, gid)) ? 1u : 0u;
+    const uint lane_ex = simd_prefix_exclusive_sum(f);
+    const uint sg_sum  = simd_sum(f);
+    if (lane == 0) sg_tot[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint sg_off = 0u;
+    for (uint s = 0; s < sg; ++s) sg_off += sg_tot[s];
+    if (f) {
+        const uint rank = block_offsets[block_id] + sg_off + lane_ex;
+        if (rank < limit) {
+            const uint pos = base + rank;
+            o_keys[pos] = keys[gid];   o_knull[pos] = knull[gid];
+            o_lo[pos] = lo[gid];       o_hi[pos] = hi[gid];
+            o_cnt[pos] = cnt[gid];     o_cstar[pos] = cstar[gid];
+            o_mn[pos] = mn[gid];       o_mx[pos] = mx[gid];
+        }
+    }
+}
+
+// Radix-select histogram over the 128-bit ordinal: `word` 0 = high word,
+// 1 = low word; candidates pass cmp and match (prefix_hi, prefix_lo) under
+// (mask_hi, mask_lo).
+kernel void gbx_topk_hist_i64(
+    device const long*  lo        [[buffer(0)]],
+    device const long*  hi        [[buffer(1)]],
+    device const long*  cnt       [[buffer(2)]],
+    device const long*  cstar     [[buffer(3)]],
+    device const long*  mn        [[buffer(4)]],
+    device const long*  mx        [[buffer(5)]],
+    constant uint&      num_segs  [[buffer(6)]],
+    constant uint&      agg       [[buffer(7)]],
+    constant uint&      cmp       [[buffer(8)]],
+    constant long&      thr       [[buffer(9)]],
+    constant ulong&     prefix_hi [[buffer(10)]],
+    constant ulong&     mask_hi   [[buffer(11)]],
+    constant ulong&     prefix_lo [[buffer(12)]],
+    constant ulong&     mask_lo   [[buffer(13)]],
+    constant uint&      word      [[buffer(14)]],
+    constant uint&      shift     [[buffer(15)]],
+    device atomic_uint* hist      [[buffer(16)]],
+    uint                tid       [[thread_position_in_threadgroup]],
+    uint                gid       [[thread_position_in_grid]])
+{
+    threadgroup atomic_uint h[256];
+    atomic_store_explicit(&h[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (gid < num_segs && gbx_keep(lo, hi, cnt, cstar, mn, mx, agg, cmp, thr, gid)) {
+        ulong oh, ol;
+        gbx_ord(lo, hi, cnt, cstar, mn, mx, agg, gid, oh, ol);
+        if ((oh & mask_hi) == prefix_hi && (ol & mask_lo) == prefix_lo) {
+            const ulong w = (word == 0u) ? oh : ol;
+            atomic_fetch_add_explicit(&h[(w >> shift) & 255ul], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint v = atomic_load_explicit(&h[tid], memory_order_relaxed);
+    if (v != 0u) atomic_fetch_add_explicit(&hist[tid], v, memory_order_relaxed);
+}
+
+inline void gbx_classes(ulong oh, ulong ol, ulong Th, ulong Tl, uint desc,
+                        thread uint& better, thread uint& equal) {
+    const bool lt = (oh != Th) ? (oh < Th) : (ol < Tl);
+    const bool gt = (oh != Th) ? (oh > Th) : (ol > Tl);
+    better = (desc != 0u) ? (gt ? 1u : 0u) : (lt ? 1u : 0u);
+    equal  = (!lt && !gt) ? 1u : 0u;
+}
+
+kernel void gbx_topk_counts_i64(
+    device const long* lo            [[buffer(0)]],
+    device const long* hi            [[buffer(1)]],
+    device const long* cnt           [[buffer(2)]],
+    device const long* cstar         [[buffer(3)]],
+    device const long* mn            [[buffer(4)]],
+    device const long* mx            [[buffer(5)]],
+    constant uint&     num_segs      [[buffer(6)]],
+    constant uint&     agg           [[buffer(7)]],
+    constant uint&     cmp           [[buffer(8)]],
+    constant long&     thr           [[buffer(9)]],
+    constant ulong&    T_hi          [[buffer(10)]],
+    constant ulong&    T_lo          [[buffer(11)]],
+    constant uint&     desc          [[buffer(12)]],
+    device uint*       better_counts [[buffer(13)]],
+    device uint*       equal_counts  [[buffer(14)]],
+    uint               tid           [[thread_position_in_threadgroup]],
+    uint               gid           [[thread_position_in_grid]],
+    uint               block_id      [[threadgroup_position_in_grid]])
+{
+    threadgroup uint sb[BLOCK];
+    threadgroup uint se[BLOCK];
+    uint b = 0u, e = 0u;
+    if (gid < num_segs && gbx_keep(lo, hi, cnt, cstar, mn, mx, agg, cmp, thr, gid)) {
+        ulong oh, ol;
+        gbx_ord(lo, hi, cnt, cstar, mn, mx, agg, gid, oh, ol);
+        gbx_classes(oh, ol, T_hi, T_lo, desc, b, e);
+    }
+    sb[tid] = b; se[tid] = e;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) { sb[tid] += sb[tid + s]; se[tid] += se[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { better_counts[block_id] = sb[0]; equal_counts[block_id] = se[0]; }
+}
+
+kernel void gbx_topk_compact_i64(
+    device const long*  lo             [[buffer(0)]],
+    device const long*  hi             [[buffer(1)]],
+    device const long*  cnt            [[buffer(2)]],
+    device const long*  cstar          [[buffer(3)]],
+    device const long*  mn             [[buffer(4)]],
+    device const long*  mx             [[buffer(5)]],
+    device const long*  keys           [[buffer(6)]],
+    device const uchar* knull          [[buffer(7)]],
+    constant uint&      num_segs       [[buffer(8)]],
+    constant uint&      agg            [[buffer(9)]],
+    constant uint&      cmp            [[buffer(10)]],
+    constant long&      thr            [[buffer(11)]],
+    constant ulong&     T_hi           [[buffer(12)]],
+    constant ulong&     T_lo           [[buffer(13)]],
+    constant uint&      desc           [[buffer(14)]],
+    device const uint*  better_offsets [[buffer(15)]],
+    device const uint*  equal_offsets  [[buffer(16)]],
+    constant uint&      equal_base     [[buffer(17)]],
+    constant uint&      need_equal     [[buffer(18)]],
+    device long*        o_keys         [[buffer(19)]],
+    device uchar*       o_knull        [[buffer(20)]],
+    device long*        o_lo           [[buffer(21)]],
+    device long*        o_hi           [[buffer(22)]],
+    device long*        o_cnt          [[buffer(23)]],
+    device long*        o_cstar        [[buffer(24)]],
+    device long*        o_mn           [[buffer(25)]],
+    device long*        o_mx           [[buffer(26)]],
+    uint                gid            [[thread_position_in_grid]],
+    uint                block_id       [[threadgroup_position_in_grid]],
+    uint                lane           [[thread_index_in_simdgroup]],
+    uint                sg             [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint tb[BLOCK];
+    threadgroup uint te[BLOCK];
+    uint b = 0u, e = 0u;
+    if (gid < num_segs && gbx_keep(lo, hi, cnt, cstar, mn, mx, agg, cmp, thr, gid)) {
+        ulong oh, ol;
+        gbx_ord(lo, hi, cnt, cstar, mn, mx, agg, gid, oh, ol);
+        gbx_classes(oh, ol, T_hi, T_lo, desc, b, e);
+    }
+    const uint b_ex = simd_prefix_exclusive_sum(b), b_sum = simd_sum(b);
+    const uint e_ex = simd_prefix_exclusive_sum(e), e_sum = simd_sum(e);
+    if (lane == 0) { tb[sg] = b_sum; te[sg] = e_sum; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint b_off = 0u, e_off = 0u;
+    for (uint s = 0; s < sg; ++s) { b_off += tb[s]; e_off += te[s]; }
+    uint pos = 0xFFFFFFFFu;
+    if (b) pos = better_offsets[block_id] + b_off + b_ex;
+    else if (e) {
+        const uint r = equal_offsets[block_id] + e_off + e_ex;
+        if (r < need_equal) pos = equal_base + r;
+    }
+    if (pos != 0xFFFFFFFFu) {
+        o_keys[pos] = keys[gid];   o_knull[pos] = knull[gid];
+        o_lo[pos] = lo[gid];       o_hi[pos] = hi[gid];
+        o_cnt[pos] = cnt[gid];     o_cstar[pos] = cstar[gid];
+        o_mn[pos] = mn[gid];       o_mx[pos] = mx[gid];
+    }
+}
