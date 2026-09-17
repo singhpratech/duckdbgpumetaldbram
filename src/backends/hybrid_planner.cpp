@@ -390,6 +390,39 @@ public:
         return gpu_ ? gpu_->exact_supported() : cpu_->exact_supported();
     }
 
+    // v0.7 §4.9: several payload columns — one side runs the whole call.
+    std::vector<GroupByResidentResult> groupby_exact_masked_multi(
+        const ResidentColumn& keys, const MultiPayload* pays, std::size_t n_pays, std::size_t filter_payload,
+        const Predicate* preds, std::size_t n_preds, std::size_t max_groups, const GroupByFilter& filter) override {
+        const auto& hk = check_hybrid(keys);
+        std::vector<MultiPayload> ip(pays, pays + n_pays);
+        std::vector<Predicate> inner(preds, preds + n_preds);
+        bool same = true;
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            if (!pays[p].vals) throw std::runtime_error("groupby_exact_masked_multi: payload without a column");
+            const auto& hv = check_hybrid(*pays[p].vals);
+            same = same && hv.on_gpu() == hk.on_gpu();
+            ip[p].vals = &hv.inner();
+        }
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            if (!preds[q].col) throw std::runtime_error("resident group by: predicate without a column");
+            const auto& hp = check_hybrid(*preds[q].col);
+            same = same && hp.on_gpu() == hk.on_gpu();
+            inner[q].col = &hp.inner();
+        }
+        if (!same)
+            throw std::runtime_error(
+                "resident group by: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        const bool on_gpu = gpu_ && hk.on_gpu();
+        last_ = make_decision(on_gpu ? gpu_backend_ : Backend::CPU,
+                              on_gpu ? DispatchReason::Hot_GpuAlwaysWins
+                                     : (gpu_ ? DispatchReason::Resident_OnCpu : DispatchReason::GpuUnavailable),
+                              hk.rows(), 0, /*resident*/true, /*borderline*/false);
+        return (on_gpu ? *gpu_ : *cpu_).groupby_exact_masked_multi(hk.inner(), ip.data(), n_pays, filter_payload,
+                                                                  inner.data(), n_preds, max_groups, filter);
+    }
+
     // v0.7 §4.8: the materialised key join runs where its columns live.
     bool join_supported() const noexcept override {
         return gpu_ ? gpu_->join_supported() : cpu_->join_supported();

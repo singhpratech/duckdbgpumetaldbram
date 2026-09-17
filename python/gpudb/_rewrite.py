@@ -54,6 +54,7 @@ class OutItem:
     name: str                 # output column name (alias or native auto-name)
     native_type: str          # from DESCRIBE of the original statement
     key_index: int = 0        # 'key': which GROUP BY component
+    pay: int = 0              # aggregates: index into Plan.vals (the payload column it reads)
 
 
 # A WHERE term (v0.7 §4.6): column, op in {> >= < <= = <> in isnull isnotnull},
@@ -94,6 +95,26 @@ class Plan:
     pred_types: Dict[str, str] = field(default_factory=dict)
     topk_agg: str = ""                 # aggregate kind the top-k push orders by
     guards: List[Tuple[str, str]] = field(default_factory=list)   # joined set (§4.8): (base tag, table fqn) per table
+    # several payload columns (§4.9): vals[0] == val is lane v, the others are
+    # BIGINT predicate lanes of the same set; aggregates carry their index
+    vals: List[str] = field(default_factory=list)
+    val_types: Dict[str, str] = field(default_factory=dict)
+    scales: Dict[str, int] = field(default_factory=dict)
+    having_pay: int = 0
+    topk_pay: int = 0
+
+    def add_payload(self, col: str) -> int:
+        if col not in self.vals:
+            if len(self.vals) >= 8:
+                raise Decline("shape", "more than eight payload columns")
+            self.vals.append(col)
+        if self.val is None:
+            self.val = self.vals[0]
+        return self.vals.index(col)
+
+    @property
+    def multi(self) -> bool:
+        return len(self.vals) > 1
 
     @property
     def packed(self) -> bool:
@@ -339,12 +360,10 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         if kind == "count_star":
             plan.outputs.append(OutItem("count_star", alias or "count_star()", ""))
             continue
-        if plan.val not in (None, col):
-            raise Decline("shape", "two payload columns")
-        plan.val = col
-        if kind == "sum":
+        pay = plan.add_payload(col)
+        if kind == "sum" and pay == 0:
             plan.needs_sum = True
-        plan.outputs.append(OutItem(kind, alias or f"{kind}({col})", ""))
+        plan.outputs.append(OutItem(kind, alias or f"{kind}({col})", "", pay=pay))
     if any(m.get("type") == "DISTINCT_MODIFIER" for m in node.get("modifiers") or []):
         raise Decline("shape", "DISTINCT")
 
@@ -367,10 +386,8 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         if akind == "count_star":
             plan.having = ("count_star", op, lit)
         else:
-            if plan.val not in (None, acol):
-                raise Decline("shape", "having over another payload")
-            plan.val = acol
-            if akind == "sum":
+            plan.having_pay = plan.add_payload(acol)
+            if akind == "sum" and plan.having_pay == 0:
                 plan.needs_sum = True
             plan.having = (akind, op, lit)
         plan.form = "having"
@@ -412,8 +429,15 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                     kind, col = a
                     if kind == "count_star":
                         target = ("count_star", None)
-                    elif col == plan.val:
-                        target = (kind, None)
+                    elif col in plan.vals:
+                        pay = plan.vals.index(col)
+                        hit = next((o for o in plan.outputs if o.kind == kind and o.pay == pay), None)
+                        if hit is not None:
+                            target = (kind, hit.name)
+                        elif pay == 0 and not plan.multi:
+                            target = (kind, None)
+                        else:
+                            raise Decline("shape", "order by an aggregate that is not selected")
                     else:
                         raise Decline("shape", "order by aggregate")
                 plan.order.append((target[0] + ("" if target[1] is None else ":" + target[1]),
@@ -440,12 +464,18 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             if d in ("ASCENDING", "DESCENDING", "ASC", "DESC"):
                 plan.form = "topk"
                 plan.topk_agg = base
+                name = tgt.partition(":")[2]
+                plan.topk_pay = next((o.pay for o in plan.outputs if name and o.name == name and o.kind == base), 0)
     # predicate columns of the set: WHERE columns other than the (single) key /
     # payload; a packed key's components are ordinary lanes
     for w in plan.where:
         skip = (plan.key,) if not plan.packed else ()
         if w.col not in skip and w.col != plan.val and w.col not in plan.pred_cols:
             plan.pred_cols.append(w.col)
+    # the payloads after the first are BIGINT lanes of the same set (§4.9)
+    for c in plan.vals[1:]:
+        if c not in plan.pred_cols:
+            plan.pred_cols.append(c)
     return plan
 
 
@@ -523,27 +553,35 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
                 raise Decline("shape", "temporal constant against a non-temporal column")
             if (ct in _STRING_TYPES) != is_s:
                 raise Decline("shape", "VARCHAR column and constant types differ")
-    if exact and plan.val is not None and any(o.kind == "avg" for o in plan.outputs) \
-            and decimal_scale(columns.get(plan.val, "")):
-        raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
+    if plan.multi and not exact:
+        raise Decline("shape", "several payload columns need the exact path")
+    if plan.val is not None and not plan.vals:
+        plan.vals = [plan.val]
+    for o in plan.outputs:
+        if exact and o.kind == "avg" and decimal_scale(columns.get(plan.vals[o.pay], "")):
+            raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
     if exact and plan.having is not None and plan.having[0] == "avg" \
-            and plan.val is not None and decimal_scale(columns.get(plan.val, "")):
+            and plan.vals and decimal_scale(columns.get(plan.vals[plan.having_pay], "")):
         raise Decline("decimal", "HAVING avg over a DECIMAL payload")
-    if plan.val is not None:
-        vt = columns.get(plan.val)
+    for i, vc in enumerate(plan.vals):
+        vt = columns.get(vc)
         if vt is None:
-            raise Decline("shape", f"unknown column {plan.val}")
+            raise Decline("shape", f"unknown column {vc}")
         if vt in ("DOUBLE", "FLOAT", "REAL"):
             raise Decline("double")
         d = decimal_scale(vt)
         if d:
-            p, s = d
+            p, sc = d
             if p > 18:
                 raise Decline("decimal", vt)
-            plan.scale = s
+            plan.scales[vc] = sc
         elif vt not in _INT_TYPES:
             raise Decline("shape", f"payload type {vt}")
-        plan.val_type = vt
+        else:
+            plan.scales[vc] = 0
+        plan.val_types[vc] = vt
+        if i == 0:
+            plan.scale, plan.val_type = plan.scales[vc], vt
 
 
 def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:
@@ -668,14 +706,24 @@ def _lit_sql(x) -> str:
     return str(x)
 
 
-def _native_type_of(plan: Plan, kind: str) -> str:
+def _native_type_of(plan: Plan, kind: str, pay: int = 0) -> str:
+    col = plan.vals[pay] if plan.vals else plan.val
+    scale = plan.scales.get(col, plan.scale)
     if kind == "sum":
-        return f"DECIMAL(38,{plan.scale})" if plan.scale else "HUGEINT"
+        return f"DECIMAL(38,{scale})" if scale else "HUGEINT"
     if kind in ("count", "count_star"):
         return "BIGINT"
     if kind in ("min", "max"):
-        return plan.val_type
+        return plan.val_types.get(col, plan.val_type)
     return "DOUBLE"
+
+
+def _agg_col(plan: Plan, kind: str, pay: int) -> str:
+    """The table function's column for an aggregate: the single-payload
+    functions name them sum / count / ..., gpu_groupby_exact_multi sum<p> ..."""
+    if kind in ("key", "count_star") or not plan.multi:
+        return kind
+    return f"{kind}{pay}"
 
 
 def _out_expr(plan: Plan, col: str, native_type: str) -> str:
@@ -719,26 +767,39 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     tag = plan.tag.replace("'", "''")
     fn, args = "gpu_groupby_exact_resident", [f"'{tag}'"]
     prog = _where_program(plan)
-    if prog:
+    multi = plan.multi
+    if prog and not multi:
         fn += "_where"
         args.append("'" + prog.replace("'", "''") + "'")
     extra_pred = ""
+    mfilter = ""                       # gpu_groupby_exact_multi's filter argument
     if plan.form == "having":
         akind, op, lit = plan.having
+        hp = plan.having_pay
         col = {"count": "count", "count_star": "count_star"}.get(akind, akind)
         if akind != "avg" and op in (">", ">=", "<", "<="):
-            scale = plan.scale if akind in ("sum", "min", "max") else 0
+            scale = plan.scales.get(plan.vals[hp], plan.scale) if akind in ("sum", "min", "max") and plan.vals else 0
             op2, thr = _rescale_threshold(op, lit, scale)
-            fn += "_having"
-            args += [f"'{col}'", f"'{op2}'", str(thr)]
+            if multi:
+                mfilter = f"having {hp} {col} {op2} {thr}"
+            else:
+                fn += "_having"
+                args += [f"'{col}'", f"'{op2}'", str(thr)]
         else:
-            extra_pred = f" AND {_out_expr(plan, col, _native_type_of(plan, akind))} {op} {lit}"
+            extra_pred = f" AND {_out_expr(plan, _agg_col(plan, col, hp), _native_type_of(plan, akind, hp))} {op} {lit}"
     elif plan.form == "topk":
         tgt, direction, _ = plan.order[0]
         d = direction if direction != "ORDER_DEFAULT" else default_order
         dir_word = "desc" if d in ("DESCENDING", "DESC") else "asc"
-        fn += "_topk"
-        args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
+        if multi:
+            mfilter = f"topk {plan.topk_pay} {plan.topk_agg} {plan.limit} {dir_word}"
+        else:
+            fn += "_topk"
+            args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
+    if multi:
+        lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
+        fn = "gpu_groupby_exact_multi"
+        args = [f"'{tag}'", "'" + prog.replace("'", "''") + "'", f"'{lanes}'", f"'{mfilter}'"]
     cols = []
     for out in plan.outputs:
         if out.kind == "key" and plan.dict_key:
@@ -750,7 +811,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         if out.kind == "key" and plan.packed:
             cols.append(f'{_key_component_expr(plan, out.key_index, out.native_type)} AS "{out.name}"')
             continue
-        col = "key" if out.kind == "key" else out.kind
+        col = "key" if out.kind == "key" else _agg_col(plan, out.kind, out.pay)
         cols.append(f'{_out_expr(plan, col, out.native_type)} AS "{out.name}"')
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key:

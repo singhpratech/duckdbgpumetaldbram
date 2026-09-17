@@ -32,6 +32,13 @@ sides). SF10 (60M x 15M rows): every one of 78 rows wins, the plain form
 1.08–1.28× at 1M groups returned, 1.12–1.14× at 320K under the 3% WHERE,
 HAVING / top-k 2.0–9.9×                               → join_plain_max_groups,
 join_plain_small_groups, join_plain_min_selectivity
+Several payload columns (§4.9; three of them, same machine, SF1): the fused
+operator shares the mask and the grouping, so HAVING / top-k keep their wins
+(1.06–3.0× single table, up to 4.8× over joins), but every extra aggregate is
+another output column on both sides and the plain form's margin shrinks to
+1.01–1.09× (one 0.93× at 10K groups under a three-term WHERE), 1.00–1.08× at
+100K groups over a join                               → multi_plain_max_groups,
+multi_join_plain_max_groups; the plain form under a WHERE runs native
 CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
 takes the exact path there today).
@@ -62,6 +69,9 @@ class Thresholds:
     join_plain_max_groups: int = 1_000_000      # measured up to 1M groups returned (SF10), 1.08x there
     join_plain_small_groups: int = 20_000       # at or below this the plain form wins at any selectivity
     join_plain_min_selectivity: float = 0.08    # above it, the plain form under a WHERE needs this much kept
+    # statements aggregating several payload columns (§4.9)
+    multi_plain_max_groups: int = 50_000        # plain form, single table, no WHERE (under a WHERE: native)
+    multi_join_plain_max_groups: int = 20_000   # plain form over a key join
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -73,7 +83,7 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
-           has_where: bool, join: bool = False) -> Tuple[bool, str]:
+           has_where: bool, join: bool = False, payloads: int = 1) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
     the statement is over a key join (its own table above)."""
@@ -82,6 +92,14 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         return False, f"no thresholds for backend {backend!r}"
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
+    if payloads > 1 and form == "plain" and est_groups is not None:
+        if join and est_groups > t.multi_join_plain_max_groups:
+            return False, (f"{est_groups} groups x {payloads} payload columns returned over a join "
+                           f"> {t.multi_join_plain_max_groups} (output-bound)")
+        if not join and has_where:
+            return False, f"plain form with {payloads} payload columns under a WHERE"
+        if not join and est_groups > t.multi_plain_max_groups:
+            return False, f"{est_groups} groups x {payloads} payload columns returned > {t.multi_plain_max_groups}"
     if join:
         if form != "plain":
             return True, ""

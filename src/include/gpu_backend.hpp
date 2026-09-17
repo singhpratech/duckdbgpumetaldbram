@@ -281,6 +281,14 @@ struct JoinLane {
     const ResidentColumn* col = nullptr;
     bool                  from_build = false;
 };
+// One payload of Aggregator::groupby_exact_masked_multi (v0.7 §4.9): a BIGINT
+// column row-aligned with the keys, and the result vectors the caller reads
+// for it (GroupByFilter::columns bits 1 sum, 2 count, 4 min, 5 max).
+struct MultiPayload {
+    const ResidentColumn* vals = nullptr;
+    std::uint32_t         columns = GroupByFilter::kAllColumns;
+};
+
 struct JoinMaterializeResult {
     std::vector<std::unique_ptr<ResidentColumn>> lanes;   // n_out columns, lane order
     std::size_t rows_probe = 0;
@@ -587,6 +595,24 @@ public:
     // the CPU reference — correct, but not the GPU, so the transparent
     // rewrite must not fire on it (rule 1). The hybrid reports its GPU side.
     [[nodiscard]] virtual bool exact_supported() const noexcept { return false; }
+
+    // ---- v0.7 §4.9: several payload columns in one GROUP BY ----
+    // groupby_exact_masked_resident over n_pays payload columns of one set:
+    // SELECT k, <aggs of pays[0]>, <aggs of pays[1]>, ... WHERE mask GROUP BY k.
+    // `filter` (HAVING / top-k) reads payload `filter_payload`. Returns one
+    // result per payload, row-aligned: result[p] holds sums / sums_hi /
+    // counts / mins / maxs of payload p (as pays[p].columns asks); the
+    // shared columns — keys, key_null, counts_star, groups_total, the timing
+    // diagnostics — are on result[filter_payload] only (filter.columns bits 0
+    // and 3). Semantics per payload are exactly the single-payload op's. The
+    // default runs one single-payload pass per column and aligns them (every
+    // pass sees the same keys and mask, hence the same groups in the same
+    // order; under a filter the others are looked up by key); a backend
+    // overrides it to share the mask and the grouping between the payloads.
+    virtual std::vector<GroupByResidentResult> groupby_exact_masked_multi(
+        const ResidentColumn& keys, const MultiPayload* pays, std::size_t n_pays,
+        std::size_t filter_payload, const Predicate* preds, std::size_t n_preds,
+        std::size_t max_groups, const GroupByFilter& filter = GroupByFilter{});
 
     // ---- v0.7 milestone 5: the materialised key join (§4.8) ----
     // Inner equi-join of a PROBE row set against a BUILD row set whose join

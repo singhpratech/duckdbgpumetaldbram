@@ -1130,6 +1130,116 @@ void test_backend(gpudb::Backend b) {
         }
         if (implemented) std::printf("    ok\n");
     }
+
+    // ---- Several payload columns in one GROUP BY (v0.7 §4.9) ----
+    // groupby_exact_masked_multi must equal one single-payload call per
+    // column, row for row: plain, both WHERE-mask variants (a selective and
+    // an unselective mask), a key-range predicate, HAVING and top-k on a
+    // payload other than the first, the NULL-key group among the survivors.
+    {
+        std::printf("  several payloads in one group by:\n");
+        using Op = gpudb::Predicate::Op;
+        using Cmp = gpudb::GroupByFilter::Cmp;
+        using Agg = gpudb::GroupByFilter::Agg;
+        bool implemented = true;
+        try {
+            std::mt19937_64 rng(0x3A11ULL);
+            const std::size_t N = 250'019, L = 5;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t> kd(-1500, 1500), sel(0, 999);
+            std::uniform_int_distribution<std::int64_t> wide(std::numeric_limits<std::int64_t>::min() / 2,
+                                                             std::numeric_limits<std::int64_t>::max() / 2);
+            std::vector<std::int64_t> lanes(N * L);
+            std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            for (std::size_t i = 0; i < N; ++i) {
+                lanes[i * L + 0] = kd(rng);
+                lanes[i * L + 1] = wide(rng);            // payload 0: sums overflow 64 bits
+                lanes[i * L + 2] = kd(rng) * 7;          // payload 1
+                lanes[i * L + 3] = wide(rng) / 3;        // payload 2
+                lanes[i * L + 4] = sel(rng);             // selector
+                const int nullp[5] = {2, 4, 30, 1, 0};
+                for (std::size_t l = 0; l < L; ++l)
+                    if (pct(rng) < nullp[l]) valid[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+            }
+            std::vector<const std::uint64_t*> vp(L);
+            for (std::size_t l = 0; l < L; ++l) vp[l] = valid[l].data();
+            gpudb::Aggregator::RowSpan sp; sp.lanes = lanes.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+            const gpudb::Dtype dts[5] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64};
+            auto cols = agg->upload_rows_exact(&sp, 1, dts, L);
+
+            struct Case { const char* name; std::vector<gpudb::Predicate> preds; gpudb::GroupByFilter f; std::size_t fp; };
+            auto pred = [&](std::size_t lane, Op op, std::int64_t v) { gpudb::Predicate p; p.col = cols[lane].get(); p.op = op; p.value = v; return p; };
+            std::vector<Case> cases;
+            cases.push_back({"plain", {}, {}, 0});
+            cases.push_back({"mask 10% (compacted)", {pred(4, Op::LT, 100)}, {}, 0});
+            cases.push_back({"mask 80% (in the reduce)", {pred(4, Op::GE, 200)}, {}, 0});
+            cases.push_back({"key range + payload predicate", {pred(0, Op::GE, -200), pred(0, Op::LT, 900), pred(2, Op::IsNotNull, 0)}, {}, 0});
+            { gpudb::GroupByFilter f; f.cmp = Cmp::GT; f.threshold_i64 = 0; f.agg = Agg::Sum;
+              cases.push_back({"having on payload 1", {pred(4, Op::GE, 200)}, f, 1}); }
+            { gpudb::GroupByFilter f; f.cmp = Cmp::GE; f.threshold_i64 = 80; f.agg = Agg::CountStar;
+              cases.push_back({"having count(*)", {}, f, 0}); }
+            { gpudb::GroupByFilter f; f.topk = 40; f.topk_desc = true; f.agg = Agg::Max;
+              cases.push_back({"top-k on payload 2", {pred(4, Op::LT, 600)}, f, 2}); }
+            { gpudb::GroupByFilter f; f.topk = 5000; f.topk_desc = false; f.agg = Agg::Sum;
+              cases.push_back({"top-k larger than the groups", {}, f, 1}); }
+            for (auto& c : cases) {
+                gpudb::MultiPayload mp[3];
+                for (int p = 0; p < 3; ++p) { mp[p].vals = cols[1 + p].get(); mp[p].columns = (1u << 1) | (1u << 2) | (1u << 4) | (1u << 5); }
+                gpudb::GroupByFilter f = c.f; f.columns = 0x9;      // keys + count(*)
+                auto got = agg->groupby_exact_masked_multi(*cols[0], mp, 3, c.fp, c.preds.data(), c.preds.size(), cap, f);
+                // reference: the filtered payload alone, then every other payload unfiltered, matched by key
+                gpudb::GroupByFilter fr = c.f;
+                auto prim = agg->groupby_exact_masked_resident(*cols[0], cols[1 + c.fp].get(), c.preds.data(), c.preds.size(), cap, fr);
+                bool ok = got.size() == 3 && got[c.fp].keys.size() == prim.keys.size() && got[c.fp].groups_total == prim.groups_total;
+                std::map<std::pair<int, std::int64_t>, std::size_t> row_of;      // (is_null, key) -> row in got
+                for (std::size_t i = 0; ok && i < got[c.fp].keys.size(); ++i)
+                    row_of[{got[c.fp].key_null[i], got[c.fp].key_null[i] ? 0 : got[c.fp].keys[i]}] = i;
+                ok = ok && row_of.size() == prim.keys.size();
+                for (int p = 0; ok && p < 3; ++p) {
+                    auto full = agg->groupby_exact_masked_resident(*cols[0], cols[1 + p].get(), c.preds.data(), c.preds.size(), cap);
+                    ok = got[p].sums.size() == prim.keys.size() && got[p].counts.size() == prim.keys.size() &&
+                         got[p].mins.size() == prim.keys.size() && got[p].maxs.size() == prim.keys.size();
+                    std::size_t seen = 0;
+                    for (std::size_t q = 0; ok && q < full.keys.size(); ++q) {
+                        auto it = row_of.find({full.key_null[q], full.key_null[q] ? 0 : full.keys[q]});
+                        if (it == row_of.end()) continue;               // dropped by the filter
+                        const std::size_t i = it->second;
+                        ++seen;
+                        ok = got[p].counts[i] == full.counts[q] && got[c.fp].counts_star[i] == full.counts_star[q] &&
+                             (full.counts[q] == 0 || (got[p].sums[i] == full.sums[q] && got[p].sums_hi[i] == full.sums_hi[q] &&
+                                                      got[p].mins[i] == full.mins[q] && got[p].maxs[i] == full.maxs[q]));
+                    }
+                    ok = ok && seen == prim.keys.size();
+                }
+                if (!ok) std::printf("    FAIL multi payload case '%s'\n", c.name);
+                EXPECT(ok);
+            }
+            // projection: a payload nobody reads costs nothing and returns nothing
+            {
+                gpudb::MultiPayload mp[2];
+                mp[0].vals = cols[1].get(); mp[0].columns = (1u << 1) | (1u << 2);
+                mp[1].vals = cols[2].get(); mp[1].columns = 0;
+                gpudb::GroupByFilter f; f.columns = 0x1;
+                auto got = agg->groupby_exact_masked_multi(*cols[0], mp, 2, 0, nullptr, 0, cap, f);
+                EXPECT(got.size() == 2 && got[1].sums.empty() && got[1].counts.empty() && !got[0].sums.empty() &&
+                       !got[0].keys.empty());
+            }
+            bool threw = false;
+            try { gpudb::GroupByFilter f; f.topk = 3; (void)agg->groupby_exact_masked_multi(*cols[0], nullptr, 0, 0, nullptr, 0, cap, f); }
+            catch (const std::runtime_error&) { threw = true; }
+            EXPECT(threw);
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
 }
 
 } // namespace

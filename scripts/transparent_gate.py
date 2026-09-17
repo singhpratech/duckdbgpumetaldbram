@@ -59,14 +59,20 @@ JOIN_WHERES = {          # predicate -> the table it needs in the join ('' = any
 }
 
 
-def build(key: str, where: str, form: str, having_thr: str, source: str = "lineitem") -> str:
+EXTRA_PAYLOADS = ["sum(l_extendedprice)", "max(l_tax)", "sum(l_discount)", "min(l_partkey)"]
+
+
+def build(key: str, where: str, form: str, having_thr: str, source: str = "lineitem", payloads: int = 1) -> str:
+    """`payloads` > 1 adds aggregates over further columns (§4.9: one device
+    pass per payload column)."""
     w = f" WHERE {where}" if where else ""
+    more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
-        return f"SELECT {key}, sum(l_quantity), count(*) FROM {source}{w} GROUP BY {key}"
+        return f"SELECT {key}, sum(l_quantity){more}, count(*) FROM {source}{w} GROUP BY {key}"
     if form == "having":
-        return (f"SELECT {key}, sum(l_quantity) AS q FROM {source}{w} GROUP BY {key} "
+        return (f"SELECT {key}, sum(l_quantity) AS q{more} FROM {source}{w} GROUP BY {key} "
                 f"HAVING sum(l_quantity) > {having_thr}")
-    return (f"SELECT {key}, sum(l_quantity) AS q FROM {source}{w} GROUP BY {key} "
+    return (f"SELECT {key}, sum(l_quantity) AS q{more} FROM {source}{w} GROUP BY {key} "
             f"ORDER BY q DESC LIMIT 10")
 
 
@@ -88,6 +94,7 @@ def main() -> int:
     ap.add_argument("--wheres", default="all", help="'all' or a ';'-separated list of predicates ('' = none)")
     ap.add_argument("--joins", default="all", help="'all', 'none' or a ';'-separated list of JOINS labels")
     ap.add_argument("--no-single", action="store_true", help="skip the single-table sweep")
+    ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")
@@ -100,7 +107,8 @@ def main() -> int:
                         thresholds=not args.no_thresholds)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
-    print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}")
+    print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}, "
+          f"payload columns {args.payloads}")
     print()
     print("| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |")
     print("|---|---|---|---|---|---|---|---|---|")
@@ -135,7 +143,7 @@ def main() -> int:
         thr_s = f"{thr:.2f}" if thr is not None else "0"
         if True:
             for form in FORMS:
-                sql = build(key, where, form, thr_s, source)
+                sql = build(key, where, form, thr_s, source, args.payloads)
                 # native
                 con.transparent = False
                 nat = con.execute(sql).fetchall()
@@ -154,7 +162,8 @@ def main() -> int:
                     # in SQL and differs between native runs too — compare the
                     # multiset of aggregate values (the kept ORDER BY makes the
                     # order native's problem, §2).
-                    identical = sorted(str(r[-1]) for r in got) == sorted(str(r[-1]) for r in nat)
+                    # (column 1 is the ORDER BY aggregate in every statement build() makes)
+                    identical = sorted(str(r[1]) for r in got) == sorted(str(r[1]) for r in nat)
                 else:
                     identical = sorted(map(str, got)) == sorted(map(str, nat))
                 t_tr = time_min(lambda: con.execute(sql).fetchall(), args.n)

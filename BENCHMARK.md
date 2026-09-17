@@ -2784,3 +2784,149 @@ shapes that lose on a single table win here; the plain form returning ~1M
 groups is bound by moving the rows out on both sides (1.08–1.28x). The one
 losing shape found (SF1, plain form, 32K groups under a 3% dimension filter,
 0.92–0.99x) is declined by `_thresholds.py`.
+
+## v0.7 several payload columns per statement — Metal, TPC-H SF1 (2026-09-17)
+
+`scripts/transparent_gate.py --payloads 3`: every statement aggregates three
+payload columns (`sum(l_quantity), sum(l_extendedprice), max(l_tax)`), single
+table and over key joins, through `gpudb.connect()` with the shipping
+thresholds. Apple M4 Max, N=5, statement vs statement, rows identical to
+native on every rewritten line. The fused Metal operator computes the WHERE
+mask and the grouping once and repeats only the reduce per payload
+(docs/TRANSPARENT_DESIGN.md §4.9); before the fusion the same sweep had 20
+rows at 0.56–0.99x.
+
+| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |
+|---|---|---|---|---|---|---|---|---|
+| l_linenumber | — | 100% | plain | 7 | 3.3 | — | — | declined (threshold) |
+| l_linenumber | — | 100% | having | 1 | 2.9 | — | — | declined (threshold) |
+| l_linenumber | — | 100% | topk | 7 | 2.8 | — | — | declined (threshold) |
+| l_suppkey | — | 100% | plain | 10000 | 21.2 | 17.9 | 1.19× | PASS |
+| l_suppkey | — | 100% | having | 100 | 7.4 | 4.5 | 1.65× | PASS |
+| l_suppkey | — | 100% | topk | 10 | 7.4 | — | — | declined (threshold) |
+| l_partkey | — | 100% | plain | 200000 | 278.5 | — | — | declined (threshold) |
+| l_partkey | — | 100% | having | 1981 | 22.6 | 7.1 | 3.18× | PASS |
+| l_partkey | — | 100% | topk | 10 | 20.5 | 7.2 | 2.86× | PASS |
+| l_orderkey | — | 100% | plain | 1500000 | 1914.8 | — | — | declined (threshold) |
+| l_orderkey | — | 100% | having | 14816 | 32.3 | 26.9 | 1.20× | PASS |
+| l_orderkey | — | 100% | topk | 10 | 13.9 | 9.6 | 1.44× | PASS |
+| l_linenumber | l_discount < 0.01 | 9% | plain | 7 | 2.1 | — | — | declined (threshold) |
+| l_linenumber | l_discount < 0.01 | 9% | having | 1 | 2.0 | — | — | declined (threshold) |
+| l_linenumber | l_discount < 0.01 | 9% | topk | 7 | 2.0 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | plain | 10000 | 16.2 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | having | 99 | 3.3 | — | — | declined (threshold) |
+| l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 3.2 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | plain | 186984 | 241.4 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | having | 1808 | 6.6 | — | — | declined (threshold) |
+| l_partkey | l_discount < 0.01 | 9% | topk | 10 | 4.5 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | plain | 455920 | 574.3 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | having | 4547 | 10.2 | — | — | declined (threshold) |
+| l_orderkey | l_discount < 0.01 | 9% | topk | 10 | 4.6 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | plain | 1 | 2.0 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | having | 0 | 2.0 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber = 1 | 25% | topk | 1 | 2.0 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | plain | 10000 | 17.2 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | having | 99 | 4.3 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber = 1 | 25% | topk | 10 | 4.1 | — | — | declined (threshold) |
+| l_partkey | l_linenumber = 1 | 25% | plain | 199893 | 263.8 | — | — | declined (threshold) |
+| l_partkey | l_linenumber = 1 | 25% | having | 1952 | 10.2 | 6.0 | 1.70× | PASS |
+| l_partkey | l_linenumber = 1 | 25% | topk | 10 | 8.1 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber = 1 | 25% | plain | 1500000 | 1878.5 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber = 1 | 25% | having | 0 | 9.2 | 4.8 | 1.92× | PASS |
+| l_orderkey | l_linenumber = 1 | 25% | topk | 10 | 9.3 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | plain | 3 | 3.1 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | having | 1 | 2.7 | — | — | declined (threshold) |
+| l_linenumber | l_linenumber <= 3 | 64% | topk | 3 | 2.8 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber <= 3 | 64% | plain | 10000 | 19.2 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber <= 3 | 64% | having | 100 | 6.0 | 4.7 | 1.27× | PASS |
+| l_suppkey | l_linenumber <= 3 | 64% | topk | 10 | 5.8 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | plain | 200000 | 276.1 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | having | 1994 | 16.9 | 8.2 | 2.06× | PASS |
+| l_partkey | l_linenumber <= 3 | 64% | topk | 10 | 14.4 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | plain | 1500000 | 1932.7 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | having | 13299 | 28.1 | 26.5 | 1.06× | PASS |
+| l_orderkey | l_linenumber <= 3 | 64% | topk | 10 | 11.8 | — | — | declined (threshold) |
+| l_linenumber | l_discount <= 0.09 | 91% | plain | 7 | 3.5 | — | — | declined (threshold) |
+| l_linenumber | l_discount <= 0.09 | 91% | having | 1 | 3.2 | — | — | declined (threshold) |
+| l_linenumber | l_discount <= 0.09 | 91% | topk | 7 | 3.3 | — | — | declined (threshold) |
+| l_suppkey | l_discount <= 0.09 | 91% | plain | 10000 | 20.2 | — | — | declined (threshold) |
+| l_suppkey | l_discount <= 0.09 | 91% | having | 100 | 7.0 | 5.3 | 1.32× | PASS |
+| l_suppkey | l_discount <= 0.09 | 91% | topk | 10 | 6.9 | — | — | declined (threshold) |
+| l_partkey | l_discount <= 0.09 | 91% | plain | 200000 | 276.2 | — | — | declined (threshold) |
+| l_partkey | l_discount <= 0.09 | 91% | having | 1985 | 21.1 | 8.8 | 2.41× | PASS |
+| l_partkey | l_discount <= 0.09 | 91% | topk | 10 | 18.7 | 8.6 | 2.18× | PASS |
+| l_orderkey | l_discount <= 0.09 | 91% | plain | 1478717 | 1927.7 | — | — | declined (threshold) |
+| l_orderkey | l_discount <= 0.09 | 91% | having | 14405 | 31.3 | 29.1 | 1.08× | PASS |
+| l_orderkey | l_discount <= 0.09 | 91% | topk | 10 | 13.8 | 12.0 | 1.15× | PASS |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 6 | 3.2 | — | — | declined (threshold) |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 1 | 3.0 | — | — | declined (threshold) |
+| l_linenumber | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 6 | 3.1 | — | — | declined (threshold) |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 10000 | 19.0 | — | — | declined (threshold) |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 100 | 6.0 | 5.3 | 1.13× | PASS |
+| l_suppkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 6.0 | — | — | declined (threshold) |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 200000 | 274.9 | — | — | declined (threshold) |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 1986 | 15.5 | 8.7 | 1.79× | PASS |
+| l_partkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 13.2 | — | — | declined (threshold) |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | plain | 1367799 | 1773.3 | — | — | declined (threshold) |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | having | 13644 | 28.7 | 27.5 | 1.04× | PASS |
+| l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 12.2 | — | — | declined (threshold) |
+| li x orders: o_custkey | — | 100% | plain | 99996 | 154.3 | — | — | declined (threshold) |
+| li x orders: o_custkey | — | 100% | having | 999 | 22.8 | 5.3 | 4.29× | PASS |
+| li x orders: o_custkey | — | 100% | topk | 10 | 21.6 | 6.1 | 3.55× | PASS |
+| li x orders: o_orderdate | — | 100% | plain | 2406 | 14.9 | 6.6 | 2.28× | PASS |
+| li x orders: o_orderdate | — | 100% | having | 25 | 11.1 | 3.1 | 3.58× | PASS |
+| li x orders: o_orderdate | — | 100% | topk | 10 | 11.1 | 2.9 | 3.77× | PASS |
+| li x orders: l_suppkey | — | 100% | plain | 10000 | 29.6 | 18.5 | 1.60× | PASS |
+| li x orders: l_suppkey | — | 100% | having | 100 | 15.6 | 4.4 | 3.51× | PASS |
+| li x orders: l_suppkey | — | 100% | topk | 10 | 15.7 | 7.4 | 2.14× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 99606 | 147.7 | — | — | declined (threshold) |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 992 | 16.6 | 5.6 | 2.98× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 16.2 | 6.6 | 2.47× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | plain | 1169 | 12.0 | 4.2 | 2.85× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | having | 12 | 10.2 | 2.2 | 4.56× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 10.2 | 3.8 | 2.71× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 10000 | 26.6 | 18.8 | 1.41× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | having | 100 | 13.2 | 4.2 | 3.16× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 13.0 | 4.1 | 3.22× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 31708 | 45.2 | — | — | declined (threshold) |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 317 | 5.2 | 3.0 | 1.74× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 4.8 | 3.3 | 1.45× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | plain | 63 | 4.0 | 1.6 | 2.41× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 3.9 | 1.9 | 2.08× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 3.9 | 1.5 | 2.54× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 10000 | 18.0 | 16.0 | 1.12× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 98 | 5.2 | 2.8 | 1.86× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 5.0 | 2.6 | 1.94× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | plain | 97490 | 138.3 | — | — | declined (threshold) |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | having | 962 | 11.7 | 4.6 | 2.57× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | topk | 10 | 10.6 | 5.5 | 1.91× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | plain | 2406 | 11.2 | 6.2 | 1.82× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | having | 25 | 8.2 | 2.7 | 3.02× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | topk | 10 | 8.7 | 2.5 | 3.49× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | plain | 10000 | 23.1 | 17.7 | 1.30× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | having | 99 | 10.2 | 3.0 | 3.45× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 10.1 | 2.7 | 3.74× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | plain | 25 | 13.6 | 5.9 | 2.30× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | having | 1 | 13.1 | 6.4 | 2.04× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | topk | 10 | 13.0 | 5.9 | 2.23× | PASS |
+| li x orders x customer: c_custkey | — | 100% | plain | 99996 | 158.0 | — | — | declined (threshold) |
+| li x orders x customer: c_custkey | — | 100% | having | 999 | 24.3 | 5.1 | 4.76× | PASS |
+| li x orders x customer: c_custkey | — | 100% | topk | 10 | 23.0 | 6.1 | 3.75× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 25 | 12.4 | 4.0 | 3.09× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | having | 1 | 11.9 | 4.6 | 2.58× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 11.9 | 4.4 | 2.70× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 99606 | 151.5 | — | — | declined (threshold) |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 992 | 18.8 | 5.5 | 3.42× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 17.6 | 5.9 | 2.95× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 25 | 5.7 | 5.1 | 1.11× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 5.7 | 2.6 | 2.23× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 5.7 | 5.3 | 1.09× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 31708 | 46.9 | — | — | declined (threshold) |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 317 | 6.5 | 3.1 | 2.10× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 6.3 | 3.4 | 1.87× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | plain | 25 | 9.2 | 2.6 | 3.55× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | having | 1 | 9.1 | 5.1 | 1.79× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | topk | 10 | 9.4 | 2.6 | 3.64× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | plain | 97490 | 139.6 | — | — | declined (threshold) |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | having | 962 | 13.3 | 4.8 | 2.76× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | topk | 10 | 12.1 | 5.7 | 2.13× | PASS |

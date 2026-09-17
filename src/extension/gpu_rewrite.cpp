@@ -632,7 +632,14 @@ const char* xagg_col(XAgg a) {
 }
 
 // The aggregate a FUNCTION node computes over the exact set, or None.
-XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::string& ta) {
+// A payload column an aggregate reads (§4.9): the set's payload (lane v) or a
+// BIGINT predicate lane of the same set. Collected in first-appearance order;
+// an aggregate carries its index.
+struct PayRef { std::string name; ColInfo info; std::string lane; };
+
+XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::string& ta,
+             std::vector<PayRef>& pays, int& pay) {
+    pay = -1;
     if (sfield(e, "class") != "FUNCTION") return XAgg::None;
     if (!is_null(e, "filter")) reject("shape", "FILTER on an aggregate");
     if (field(e, "distinct").get<bool>()) reject("shape", "DISTINCT inside an aggregate");
@@ -650,9 +657,24 @@ XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::
         if (ch.size() != 1) reject("shape", fn + " with " + std::to_string(ch.size()) + " arguments");
         const std::string col = column_ref(ch[0], t, ta);
         if (col.empty()) reject("shape", fn + " over an expression");
-        if (cx.val_col.empty() || !ieq(col, cx.val_col))
-            reject("shape", cx.val_col.empty() ? fn + " over a set that holds only the key column"
-                                              : fn + " over a column that is not the resident payload");
+        if (cx.val_col.empty()) reject("shape", fn + " over a set that holds only the key column");
+        PayRef ref;
+        if (ieq(col, cx.val_col)) {
+            ref = PayRef{cx.val_col, cx.val, "v"};
+        } else {
+            for (const auto& pc : cx.preds)
+                if (ieq(col, pc.name)) { ref = PayRef{pc.name, pc.info, pc.lane}; break; }
+            if (ref.name.empty()) reject("shape", fn + " over a column that is not resident in the set");
+        }
+        if (ref.info.floating) reject("double", "payload type " + ref.info.type);
+        if (ref.info.decimal && ref.info.width > 18) reject("decimal", "payload " + ref.info.type);
+        if (!ref.info.integer && !ref.info.decimal) reject("shape", "payload type '" + ref.info.type + "'");
+        for (std::size_t i = 0; i < pays.size() && pay < 0; ++i) if (ieq(pays[i].name, ref.name)) pay = static_cast<int>(i);
+        if (pay < 0) {
+            if (pays.size() >= 8) reject("shape", "more than eight payload columns");
+            pays.push_back(ref);
+            pay = static_cast<int>(pays.size()) - 1;
+        }
         if (fn == "count") return XAgg::CountV;
         if (fn == "sum")   return XAgg::Sum;
         if (fn == "min")   return XAgg::Min;
@@ -663,11 +685,11 @@ XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::
 }
 
 // Native output type of an aggregate over this set (what DESCRIBE reports).
-std::string xagg_native_type(XAgg a, const Context& cx) {
+std::string xagg_native_type(XAgg a, const ColInfo& val) {
     switch (a) {
-        case XAgg::Sum:       return cx.val.decimal ? "DECIMAL(38," + std::to_string(cx.val.scale) + ")" : "HUGEINT";
+        case XAgg::Sum:       return val.decimal ? "DECIMAL(38," + std::to_string(val.scale) + ")" : "HUGEINT";
         case XAgg::CountV: case XAgg::CountStar: return "BIGINT";
-        case XAgg::Min: case XAgg::Max: return cx.val.type;
+        case XAgg::Min: case XAgg::Max: return val.type;
         case XAgg::Avg:       return "DOUBLE";
         default: return "";
     }
@@ -1001,14 +1023,22 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
         if (!cx.val.integer && !cx.val.decimal) reject("shape", "payload type '" + cx.val.type + "'");
     }
-    const int scale = (!bare && cx.val.decimal) ? cx.val.scale : 0;
+    std::vector<PayRef> pays;                 // payload columns, first-appearance order (§4.9)
+    // One payload on lane v: the single-payload functions. Anything else
+    // (several payloads, or one that lives on a predicate lane): _multi.
+    auto is_multi = [&]() { return !pays.empty() && !(pays.size() == 1 && pays[0].lane == "v"); };
+    auto agg_col = [&](XAgg a, int pay) -> std::string {
+        if (a == XAgg::CountStar || !is_multi()) return xagg_col(a);
+        return std::string(xagg_col(a)) + std::to_string(pay);
+    };
+    auto pay_info = [&](int pay) -> const ColInfo& { return pay >= 0 ? pays[static_cast<std::size_t>(pay)].info : cx.val; };
 
     // ---- WHERE → program ----
     WhereOut where;
     if (!is_null(node, "where_clause")) where = where_program(node["where_clause"], cx, tname, talias);
 
     // ---- select list ----
-    struct Item { bool key; XAgg agg; std::string alias; std::size_t key_index; };
+    struct Item { bool key; XAgg agg; std::string alias; std::size_t key_index; int pay; };
     std::vector<Item> items;
     auto key_index_of = [&](const std::string& c) -> int {
         for (std::size_t i = 0; i < cx.keys.size(); ++i) if (ieq(c, cx.keys[i].name)) return static_cast<int>(i);
@@ -1026,13 +1056,14 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             const std::string c = column_ref(e, tname, talias);
             const int ki = c.empty() ? -1 : key_index_of(c);
             if (ki < 0) reject("shape", "column that is not a GROUP BY key");
-            items.push_back({true, XAgg::None, alias, static_cast<std::size_t>(ki)});
+            items.push_back({true, XAgg::None, alias, static_cast<std::size_t>(ki), -1});
             continue;
         }
-        const XAgg a = xagg_of(e, cx, tname, talias);
+        int pay = -1;
+        const XAgg a = xagg_of(e, cx, tname, talias, pays, pay);
         if (a == XAgg::None) reject("shape", "select-list expression of class " + cls);
-        if (a == XAgg::Avg && cx.val.decimal) reject("decimal", "avg over a DECIMAL payload is not on the exact path");
-        items.push_back({false, a, alias, 0});
+        if (a == XAgg::Avg && pay_info(pay).decimal) reject("decimal", "avg over a DECIMAL payload is not on the exact path");
+        items.push_back({false, a, alias, 0, pay});
     }
     if (cx.outputs.size() != items.size()) reject("error", "context.outputs does not match the select list");
 
@@ -1041,6 +1072,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     //      over the small result ----
     int cmp = 0;
     XAgg having_agg = XAgg::None;
+    int having_pay = -1;
     std::int64_t threshold = 0;
     bool having_dev = false;
     json host_pred;
@@ -1059,12 +1091,14 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         else if (ct == "COMPARE_EQUAL")                cmp = 5;
         else if (ct == "COMPARE_NOTEQUAL")             cmp = 6;
         else reject("shape", "HAVING comparison " + ct);
-        having_agg = xagg_of(*aggside, cx, tname, talias);
+        having_agg = xagg_of(*aggside, cx, tname, talias, pays, having_pay);
         if (having_agg == XAgg::None) reject("shape", "HAVING is not on an aggregate");
-        if (having_agg == XAgg::Avg && cx.val.decimal) reject("decimal", "HAVING avg over a DECIMAL payload");
+        if (having_agg == XAgg::Avg && pay_info(having_pay).decimal) reject("decimal", "HAVING avg over a DECIMAL payload");
         if (sfield(*cside, "class") != "CONSTANT") reject("shape", "HAVING threshold is not a constant");
         if (cmp <= 4 && having_agg != XAgg::Avg) {
-            const int tscale = (having_agg == XAgg::Sum || having_agg == XAgg::Min || having_agg == XAgg::Max) ? scale : 0;
+            const ColInfo& hv = pay_info(having_pay);
+            const int tscale = (having_agg == XAgg::Sum || having_agg == XAgg::Min || having_agg == XAgg::Max) && hv.decimal
+                                   ? hv.scale : 0;
             threshold = threshold_of(*cside, tscale, cmp).value;
             having_dev = true;
         } else {
@@ -1072,7 +1106,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             static const char* types[] = {"", "COMPARE_GREATERTHAN", "COMPARE_GREATERTHANOREQUALTO",
                                           "COMPARE_LESSTHAN", "COMPARE_LESSTHANOREQUALTO",
                                           "COMPARE_EQUAL", "COMPARE_NOTEQUAL"};
-            json lhs = j_output_exact(xagg_col(having_agg), xagg_native_type(having_agg, cx), "");
+            json lhs = j_output_exact(agg_col(having_agg, having_pay), xagg_native_type(having_agg, pay_info(having_pay)), "");
             host_pred = json{{"class", "COMPARISON"}, {"type", types[cmp]}, {"alias", ""},
                              {"query_location", kNoLocation}, {"left", lhs}, {"right", *cside}};
         }
@@ -1092,11 +1126,13 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         for (std::size_t i = 0; i < items.size(); ++i) if (items[i].key && items[i].key_index == ki) return cx.outputs[i].name;
         return "";
     };
-    auto output_name_for_agg = [&](XAgg a) -> std::string {
-        for (std::size_t i = 0; i < items.size(); ++i) if (!items[i].key && items[i].agg == a) return cx.outputs[i].name;
+    auto output_name_for_agg = [&](XAgg a, int pay) -> std::string {
+        for (std::size_t i = 0; i < items.size(); ++i)
+            if (!items[i].key && items[i].agg == a && (a == XAgg::CountStar || items[i].pay == pay)) return cx.outputs[i].name;
         return "";
     };
     XAgg order_agg = XAgg::None;   // the aggregate a single ORDER BY names (for the top-k push)
+    int order_pay = -1;
     auto remap = [&](const json& e) -> json {
         const std::string cls = sfield(e, "class");
         if (cls == "COLUMN_REF") {
@@ -1105,7 +1141,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                 const std::string n = names[0].get<std::string>();
                 for (std::size_t i = 0; i < items.size(); ++i)
                     if (ieq(n, cx.outputs[i].name) || (!items[i].alias.empty() && ieq(n, items[i].alias))) {
-                        if (!items[i].key) order_agg = items[i].agg;
+                        if (!items[i].key) { order_agg = items[i].agg; order_pay = items[i].pay; }
                         return j_colref(cx.outputs[i].name);
                     }
             }
@@ -1119,10 +1155,13 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             reject("shape", "ORDER BY an expression the rewrite cannot map");
         }
         if (cls == "FUNCTION") {
-            const XAgg a = xagg_of(e, cx, tname, talias);
-            const std::string on = output_name_for_agg(a);
+            const std::size_t n_pays = pays.size();
+            int pay = -1;
+            const XAgg a = xagg_of(e, cx, tname, talias, pays, pay);
+            const std::string on = (pays.size() == n_pays) ? output_name_for_agg(a, pay) : std::string();
             if (on.empty()) reject("shape", "ORDER BY an aggregate that is not selected");
             order_agg = a;
+            order_pay = pay;
             return j_colref(on);
         }
         if (cls == "CONSTANT") {
@@ -1130,7 +1169,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             if (!v.contains("value") || !v["value"].is_number_integer()) reject("shape", "non-integer ordinal ORDER BY");
             const std::int64_t i = v["value"].get<std::int64_t>();
             if (i < 1 || static_cast<std::size_t>(i) > items.size()) reject("shape", "ordinal ORDER BY out of range");
-            if (!items[static_cast<std::size_t>(i - 1)].key) order_agg = items[static_cast<std::size_t>(i - 1)].agg;
+            if (!items[static_cast<std::size_t>(i - 1)].key) {
+                order_agg = items[static_cast<std::size_t>(i - 1)].agg;
+                order_pay = items[static_cast<std::size_t>(i - 1)].pay;
+            }
             return j_colref(cx.outputs[static_cast<std::size_t>(i - 1)].name);
         }
         reject("shape", "ORDER BY expression of class " + cls);
@@ -1143,7 +1185,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         json om = *order_mod;
         json& orders = om["orders"];
         if (!orders.is_array() || orders.empty()) reject("shape", "empty ORDER BY");
-        for (json& o : orders) { order_agg = XAgg::None; o["expression"] = remap(o["expression"]); }
+        for (json& o : orders) { order_agg = XAgg::None; order_pay = -1; o["expression"] = remap(o["expression"]); }
         if (orders.size() == 1 && limit_mod && having_agg == XAgg::None &&
             order_agg != XAgg::None && order_agg != XAgg::Avg) {
             const json& o = orders[0];
@@ -1172,10 +1214,33 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     // ---- build the replacement ----
     std::string fn = "gpu_groupby_exact_resident";
     json args = json::array({j_const_varchar(cx.tag)});
-    if (!where.program.empty()) { fn += "_where"; args.push_back(j_const_varchar(where.program)); }
-    if (having_dev) {
+    static const char* ops[] = {"", ">", ">=", "<", "<="};
+    if (is_multi()) {
+        // gpu_groupby_exact_multi(tag, program, 'v, i0, ...', filter)
+        std::string lanes, filter;
+        for (std::size_t i = 0; i < pays.size(); ++i) lanes += (i ? ", " : "") + pays[i].lane;
+        const auto p_of = [](int pay) { return std::to_string(pay < 0 ? 0 : pay); };
+        if (having_dev) {
+            filter = "having " + p_of(having_pay) + " " + xagg_col(having_agg) + " " + ops[cmp] + " " + std::to_string(threshold);
+            r.form = "having";
+        } else if (having_agg != XAgg::None) {
+            r.form = "having";
+        } else if (topk > 0) {
+            filter = "topk " + p_of(order_pay) + " " + xagg_col(order_agg) + " " + std::to_string(topk) +
+                     (topk_desc ? " desc" : " asc");
+            r.form = "topk";
+        } else {
+            r.form = "plain";
+        }
+        fn = "gpu_groupby_exact_multi";
+        args.push_back(j_const_varchar(where.program));
+        args.push_back(j_const_varchar(lanes));
+        args.push_back(j_const_varchar(filter));
+    } else if (!where.program.empty()) { fn += "_where"; args.push_back(j_const_varchar(where.program)); }
+    if (is_multi()) {
+        // built above
+    } else if (having_dev) {
         fn += "_having";
-        static const char* ops[] = {"", ">", ">=", "<", "<="};
         args.push_back(j_const_varchar(xagg_col(having_agg)));
         args.push_back(j_const_varchar(ops[cmp]));
         args.push_back(j_const_bigint(threshold));
@@ -1226,7 +1291,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
             else if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
             else                  new_select.push_back(j_output_exact("key", o.type, o.name));
         } else {
-            new_select.push_back(j_output_exact(xagg_col(items[i].agg), o.type, o.name));
+            new_select.push_back(j_output_exact(agg_col(items[i].agg, items[i].pay), o.type, o.name));
         }
     }
 

@@ -564,6 +564,9 @@ class Connection:
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
         plan.outputs, plan.tag = cached.outputs, cached.tag
         plan.exact, plan.pred_types = cached.exact, cached.pred_types
+        if plan.vals != cached.vals:
+            return None
+        plan.val_types, plan.scales = cached.val_types, cached.scales
         plan.keys, plan.key_types, plan.pack, plan.dict_key = cached.keys, cached.key_types, cached.pack, cached.dict_key
         if plan.pred_cols != cached.pred_cols:
             return None
@@ -680,7 +683,7 @@ class Connection:
                     self._log(f"selectivity probe failed: {e}")
                     return Decision(False, "threshold")
             ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
-                                         join=low is not None)
+                                         join=low is not None, payloads=max(1, len(plan.vals)))
             if not ok:
                 self._log(f"threshold: {why}")
                 return Decision(False, "threshold")

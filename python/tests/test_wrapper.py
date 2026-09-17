@@ -36,6 +36,9 @@ CREATE TABLE t AS SELECT (i % 1000)::INTEGER AS k, (i % 97)::BIGINT AS v,
                          TIMESTAMP '2020-01-01' + INTERVAL (i % 86400) SECOND AS ts,
                          CASE WHEN i % 31 = 0 THEN NULL ELSE ['alpha','beta','it''s','delta','eps'][1 + i % 5] END AS s
                   FROM range({N}) r(i);
+CREATE TABLE tm AS SELECT (i % 1000)::INTEGER AS k, i::BIGINT AS a, ((i * 7919) % 1000003)::BIGINT AS b,
+                         CASE WHEN i % 11 = 0 THEN NULL ELSE ((i % 4999) / 10.0)::DECIMAL(12,1) END AS c,
+                         (i % 13)::SMALLINT AS z, (i * 0.25)::DOUBLE AS x FROM range({N}) r(i);
 CREATE TABLE tu AS SELECT (i % 1000)::INTEGER AS k, i::BIGINT AS v FROM range({N}) r(i);
 CREATE TABLE tn AS SELECT (i % 10)::BIGINT AS k, CASE WHEN i % 7 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range({N}) r(i);
 CREATE TABLE tn3 AS SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 40)::INTEGER END AS k,
@@ -98,6 +101,17 @@ def run():
         "three_keys_topk": "SELECT k, dt, sum(v) AS s FROM tn3 GROUP BY k, dt, z ORDER BY s DESC LIMIT 5",
         "str_key":    "SELECT s, sum(v), count(*) FROM t GROUP BY s ORDER BY s NULLS LAST",
         "str_key_pred": "SELECT s, count(*) FROM t WHERE s IN ('alpha', 'it''s') GROUP BY s ORDER BY s",
+        # several payload columns in one statement (§4.9)
+        "multi_sums": "SELECT k, sum(a), sum(b), sum(c), count(*) FROM tm GROUP BY k ORDER BY k",
+        "multi_mixed": "SELECT k, min(a), max(c), avg(b), count(c), count(*) FROM tm WHERE x > 250.5 AND z <> 3 GROUP BY k ORDER BY k",
+        "multi_payload_in_where": "SELECT k, sum(a), sum(b) FROM tm WHERE b > 500000 GROUP BY k ORDER BY k",
+        "multi_having_2nd": "SELECT k, sum(a) AS sa, sum(c) AS sc FROM tm GROUP BY k HAVING sum(c) > 67000.5 ORDER BY k",
+        "multi_having_cnt": "SELECT k, max(a), min(b) FROM tm WHERE z < 9 GROUP BY k HAVING count(*) >= 208 ORDER BY k",
+        "multi_having_eq": "SELECT k, sum(a), sum(b) FROM tm GROUP BY k HAVING max(b) = 1000002 ORDER BY k",
+        "multi_topk_2nd": "SELECT k, sum(a) AS sa, sum(b) AS sb FROM tm GROUP BY k ORDER BY sb DESC LIMIT 6",
+        "multi_topk_fn": "SELECT k, sum(b), min(a) FROM tm WHERE z > 1 GROUP BY k ORDER BY sum(b) LIMIT 4",
+        "multi_two_keys": "SELECT k, z, sum(a), sum(b) FROM tm GROUP BY k, z ORDER BY k, z",
+        "multi_same_col": "SELECT k, sum(a), min(a), max(a), avg(a), sum(b) FROM tm GROUP BY k ORDER BY k",
         "str_mixed":  "SELECT k, s, sum(v) FROM t WHERE s <> 'beta' AND k < 20 GROUP BY s, k ORDER BY k, s NULLS LAST",
         "str_pred":   "SELECT k, sum(v) FROM t WHERE s = 'delta' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
@@ -388,6 +402,9 @@ def run():
             "two_dims":       "SELECT bucket, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did JOIN je ON jf.eid = je.eid WHERE tier > 1 GROUP BY bucket ORDER BY bucket",
             "snowflake":      "SELECT continent, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did JOIN jn ON jd.nid = jn.nid WHERE mode = 'RAIL' GROUP BY continent ORDER BY continent",
             "on_extra_pred":  "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did AND jd.tier < 4 GROUP BY tier ORDER BY tier",
+            "multi_fact":     "SELECT tier, sum(v), sum(amt), min(g), count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE opened < DATE '2021-06-01' GROUP BY tier ORDER BY tier",
+            "multi_both_sides": "SELECT g, sum(v) AS sv, sum(jd.nid) AS sn, max(tier) FROM jf JOIN jd ON jf.did = jd.did GROUP BY g HAVING sum(jd.nid) > 11000 ORDER BY g",
+            "multi_topk_dim": "SELECT region, sum(amt) AS a, sum(v) AS b FROM jf JOIN jd ON jf.did = jd.did GROUP BY region ORDER BY b DESC LIMIT 3",
         }
         for name, sql in jcases.items():
             want = con._raw.execute(sql).fetchall()
