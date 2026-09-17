@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -119,15 +120,75 @@ struct JoinRowsResult {
 //   groupby_sum_resident_i64: keys, sums, counts
 //   groupby_sum_resident_f64: keys, sums_f64, counts
 //   groupby_count_resident:   keys, counts
+//   groupby_exact_resident:   keys, key_null, sums (LOW limb), sums_hi,
+//                             counts (= count(v)), counts_star, mins, maxs
+// The exact op (v0.7, docs/TRANSPARENT_DESIGN.md §4.1/§4.2) carries the
+// full per-group tuple native GROUP BY needs:
+//   - the sum is a 128-bit two's-complement integer: sums[i] holds the low
+//     64 bits (as the uint64 bit pattern), sums_hi[i] the high 64 bits —
+//     exactly a DuckDB HUGEINT {lower, upper}; it never wraps;
+//   - counts[i] is count(v) (payloads that are not NULL), counts_star[i] is
+//     count(*) (every row of the group); a group whose payload is entirely
+//     NULL has counts[i] == 0 and its sum/min/max are then MEANINGLESS
+//     (SQL surfaces NULL) — never read them as the identity;
+//   - key_null[i] == 1 marks the NULL-key group (there is at most one, its
+//     keys[i] is 0 and meaningless); it sorts after every valid key, as
+//     native ORDER BY key (NULLS LAST) does. key_null is sized like keys.
 struct GroupByResidentResult {
     std::vector<std::int64_t> keys;
-    std::vector<std::int64_t> sums;       // uint64 wrap-add, bit-exact
+    std::vector<std::int64_t> sums;       // uint64 wrap-add, bit-exact (exact op: low limb)
     std::vector<double>       sums_f64;   // backend-ordered, tolerance-checked
-    std::vector<std::int64_t> counts;
+    std::vector<std::int64_t> counts;     // exact op: count(v)
+    std::vector<std::int64_t> sums_hi;    // exact op only: high limb of the 128-bit sum
+    std::vector<std::int64_t> counts_star;// exact op only: count(*)
+    std::vector<std::int64_t> mins;       // exact op only: min(v) over non-NULL payloads
+    std::vector<std::int64_t> maxs;       // exact op only: max(v) over non-NULL payloads
+    std::vector<std::uint8_t> key_null;   // exact op only: 1 = this row is the NULL-key group
     std::size_t rows_in = 0;
     std::size_t groups_total = 0;         // distinct keys BEFORE any GroupByFilter
     double wall_ms = 0.0, kernel_ms = 0.0, transfer_ms = 0.0;
 };
+
+// ---- 128-bit two's-complement sum helpers (§4.2) ----
+// The exact op's sum is {lo = low 64 bits as uint64, hi = high 64 bits
+// signed} — the DuckDB HUGEINT layout. Every backend accumulates with the
+// same arithmetic so limbs bit-match; the CPU reference and the host-side
+// filter use these.
+struct Sum128 {
+    std::uint64_t lo = 0;
+    std::int64_t  hi = 0;
+    // Add a sign-extended int64.
+    void add(std::int64_t v) noexcept {
+        const std::uint64_t u = static_cast<std::uint64_t>(v);
+        const std::uint64_t old = lo;
+        lo += u;
+        hi += (v < 0 ? -1 : 0) + (lo < old ? 1 : 0);
+    }
+    static Sum128 from_i64(std::int64_t v) noexcept {
+        return Sum128{static_cast<std::uint64_t>(v), v < 0 ? -1 : 0};
+    }
+    // The DOUBLE value native DuckDB produces for this HUGEINT — what
+    // avg(BIGINT) returns as sum::DOUBLE / count. DuckDB's hugeint -> double
+    // cast is NOT correctly rounded: it is `double(lower) + double(upper) *
+    // 2^64` (two roundings), with upper == -1 special-cased as
+    // `-double(UINT64_MAX - lower) - 1` so small negatives stay exact.
+    // Reproduced here so avg matches native to the last bit (verified
+    // against native on 300k rows with 128-bit group sums, test/sql/
+    // gpu_groupby_exact.test). Do not "fix" this to a correctly rounded
+    // conversion: that would differ from native by 1 ulp on large sums.
+    double to_double() const noexcept {
+        if (hi == -1)
+            return -static_cast<double>(~std::uint64_t{0} - lo) - 1.0;
+        return static_cast<double>(lo) +
+               static_cast<double>(hi) * 18446744073709551616.0;   // 2^64
+    }
+};
+inline bool operator<(const Sum128& a, const Sum128& b) noexcept {
+    return a.hi != b.hi ? a.hi < b.hi : a.lo < b.lo;
+}
+inline bool operator==(const Sum128& a, const Sum128& b) noexcept {
+    return a.hi == b.hi && a.lo == b.lo;
+}
 
 // Optional device-side post-filter for the resident GROUP BY ops: HAVING on
 // the aggregate and/or "the k groups with the largest / smallest aggregate".
@@ -158,13 +219,25 @@ struct GroupByResidentResult {
 // above holds for the i64 sum and count ops on every backend.
 // max_groups bounds the rows RETURNED (the survivors), not the number of
 // groups; GroupByResidentResult::groups_total reports the unfiltered count.
+//
+// `agg` is read ONLY by groupby_exact_resident, whose tuple has several
+// aggregates: it names the one cmp and topk apply to. Sum compares the full
+// 128-bit sum against threshold_i64 sign-extended (a HUGEINT threshold
+// outside int64 is not expressible — the SQL layer declines such shapes);
+// CountV / CountStar / Min / Max compare the int64; Avg compares the
+// exact-sum-over-count double against threshold_f64 (DuckDB total order).
+// A group whose aggregate is NULL (count(v) == 0 for sum/min/max/avg) never
+// satisfies cmp (SQL three-valued HAVING) and sorts LAST under top-k in both
+// directions (NULLS LAST, DuckDB's default). The legacy ops ignore `agg`.
 struct GroupByFilter {
     enum class Cmp : std::uint8_t { None, GT, GE, LT, LE };
+    enum class Agg : std::uint8_t { Sum, CountV, CountStar, Min, Max, Avg };
     Cmp          cmp = Cmp::None;
     std::int64_t threshold_i64 = 0;
     double       threshold_f64 = 0.0;
     std::size_t  topk = 0;
     bool         topk_desc = true;
+    Agg          agg = Agg::Sum;
     bool active() const { return cmp != Cmp::None || topk != 0; }
 };
 
@@ -213,6 +286,17 @@ public:
     [[nodiscard]] virtual std::size_t resident_bytes() const noexcept {
         return rows() * 8;   // i64 and f64 are both 8 bytes wide
     }
+
+    // ---- v0.7 milestone 3: NULL-aware columns (§4.1) ----
+    // Number of NULL rows the column carries; rows() INCLUDES them. Columns
+    // from upload_i64/upload_f64/upload_pair_interleaved never carry NULLs
+    // (0). For a pair from upload_pair_exact: on the KEY column it is the
+    // length of the NULL-key SUFFIX (rows [rows()-null_count(), rows()) have
+    // a NULL key; the prefix is every valid key, original order preserved);
+    // on the PAYLOAD column it is the number of NULL payloads, positions
+    // given by the backend's validity bitmap. The legacy resident ops refuse
+    // a column with null_count() > 0 (they have no NULL semantics).
+    [[nodiscard]] virtual std::size_t null_count() const noexcept { return 0; }
 };
 
 // Minimal aggregator surface for week 1.
@@ -257,6 +341,13 @@ public:
     struct KvSpan {
         const std::int64_t* kv = nullptr;   // 2 * rows lanes
         std::size_t         rows = 0;
+        // §4.1 (read ONLY by upload_pair_exact; upload_pair_interleaved
+        // ignores them): validity bitmaps for this span, DuckDB's layout —
+        // row i is valid iff bit (i % 64) of word i / 64 is set. nullptr =
+        // every row of the span is valid. A NULL row's kv lanes hold
+        // unspecified bits and must not be read.
+        const std::uint64_t* key_valid = nullptr;
+        const std::uint64_t* val_valid = nullptr;
     };
     struct ResidentPair {
         std::unique_ptr<ResidentColumn> keys;
@@ -373,6 +464,36 @@ public:
                                                            std::size_t max_groups,
                                                            const GroupByFilter& filter = GroupByFilter{});
     virtual GroupByResidentResult groupby_count_resident(const ResidentColumn& keys,
+                                                         std::size_t max_groups,
+                                                         const GroupByFilter& filter = GroupByFilter{});
+
+    // ---- v0.7 milestone 3: exact GROUP BY (docs/TRANSPARENT_DESIGN.md §4.1, §4.2) ----
+    // The pair upload that keeps NULLs. Rows whose KEY is NULL are
+    // partitioned to a suffix of both columns (valid-key prefix keeps the
+    // input order; the suffix is one group); rows whose PAYLOAD is NULL stay
+    // in place under a validity bitmap the backend owns. Both columns report
+    // rows() = every input row and null_count() as documented on
+    // ResidentColumn. vdt must be I64 (DOUBLE sums are not on the exact
+    // path, §4.7; a DOUBLE payload throws). Default throws — backends opt in
+    // (CPU is the reference); the hybrid falls back to a CPU upload.
+    virtual ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans, Dtype vdt);
+
+    // SELECT key, sum(v), count(v), count(*), min(v), max(v) FROM pair
+    // GROUP BY key with native semantics, over columns from
+    // upload_pair_exact (keys.null_count() and vals->null_count() are the
+    // only NULL sources; columns without NULLs from any upload also work).
+    // vals may be nullptr: keys-only, fills keys/key_null/counts_star (and
+    // counts == counts_star). Output contract, every backend:
+    //   - one row per distinct key sorted ascending, then the NULL-key group
+    //     last if keys carry one (key_null marks it);
+    //   - sums/sums_hi is the exact 128-bit sum over non-NULL payloads,
+    //     bit-identical across backends; counts/counts_star/mins/maxs exact;
+    //     a group with counts[i] == 0 has unspecified sum/min/max;
+    //   - `filter` applies per GroupByFilter::agg; cap and error rules as
+    //     the legacy ops; not thread-safe, same as the legacy ops.
+    // Default throws — same opt-in / hybrid-fallback rule.
+    virtual GroupByResidentResult groupby_exact_resident(const ResidentColumn& keys,
+                                                         const ResidentColumn* vals,
                                                          std::size_t max_groups,
                                                          const GroupByFilter& filter = GroupByFilter{});
 

@@ -1,0 +1,90 @@
+# gpu_groupby_exact SQL test — the exact GROUP BY path (v0.7 milestone 3,
+# docs/TRANSPARENT_DESIGN.md §4.1 / §4.2): gpu_upload_pair_exact keeps NULL
+# keys and NULL payloads; gpu_groupby_exact_resident[_having|_topk] returns
+# (key, sum HUGEINT, count, count_star, min, max, avg) with native semantics.
+#
+# Parity is checked IN-PROCESS against native DuckDB: the same table is
+# aggregated natively and by the table function, and both EXCEPT directions
+# must be empty — types included (a HUGEINT sum and a BIGINT sum would not
+# be EXCEPT-equal on overflowed groups).
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_groupby_exact
+
+-- 1. Hand fixture: NULL key group, NULL payloads, all-NULL group, 64-bit overflow both ways
+-- setup: CREATE TABLE t1 AS SELECT * FROM (VALUES (1,10),(1,NULL),(NULL,5),(2,20),(NULL,NULL),(3,NULL),(3,NULL),(4,9223372036854775807),(4,9223372036854775807),(4,5),(5,-9223372036854775808),(5,-9223372036854775808),(5,-3)) t(k,v)
+-- setup: SELECT gpu_upload_pair_exact('e1', k, v) FROM t1
+SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident('e1') ORDER BY key NULLS LAST;
+-- expect: 1  10  1  2  10  10  10.0
+-- expect: 2  20  1  1  20  20  20.0
+-- expect: 3  NULL  0  2  NULL  NULL  NULL
+-- expect: 4  18446744073709551619  3  3  5  9223372036854775807  6.148914691236517e+18
+-- expect: 5  -18446744073709551619  3  3  -9223372036854775808  -3  -6.148914691236517e+18
+-- expect: NULL  5  1  2  5  5  5.0
+
+-- 2. Output types follow native: sum HUGEINT, counts BIGINT, min/max BIGINT, avg DOUBLE
+-- setup: CREATE TABLE t1 AS SELECT * FROM (VALUES (1,10),(1,NULL),(NULL,5)) t(k,v)
+-- setup: SELECT gpu_upload_pair_exact('e1', k, v) FROM t1
+SELECT typeof(key), typeof(sum), typeof(count), typeof(count_star), typeof(min), typeof(max), typeof(avg) FROM gpu_groupby_exact_resident('e1') LIMIT 1;
+-- expect: BIGINT  HUGEINT  BIGINT  BIGINT  BIGINT  BIGINT  DOUBLE
+
+-- 3. PARITY vs native, 300k rows: ~5% NULL keys, ~10% NULL payloads, half the payloads span the full BIGINT range
+-- setup: CREATE TABLE t3 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 3001)::BIGINT - 1500 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL WHEN (hash(i * 17) % 2) = 0 THEN (hash(i * 19)::HUGEINT - 9223372036854775808::HUGEINT)::BIGINT ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v FROM range(300000) r(i)
+-- setup: SELECT gpu_upload_pair_exact('e3', k, v) FROM t3
+SELECT (SELECT count(*) FROM ((SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident('e3')) EXCEPT (SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM t3 GROUP BY k))) AS gpu_minus_native, (SELECT count(*) FROM ((SELECT k, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM t3 GROUP BY k) EXCEPT (SELECT key, sum, count, count_star, min, max, avg FROM gpu_groupby_exact_resident('e3')))) AS native_minus_gpu, (SELECT count(*) FROM gpu_groupby_exact_resident('e3')) = (SELECT count(DISTINCT k) + max(CASE WHEN k IS NULL THEN 1 ELSE 0 END) FROM t3) AS same_group_count;
+-- expect: 0  0  true
+
+-- 4. Row order: key ascending, NULL key last (native ORDER BY k NULLS LAST)
+-- setup: CREATE TABLE t3 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 3001)::BIGINT - 1500 END AS k, (hash(i * 23) % 2001)::BIGINT - 1000 AS v FROM range(50000) r(i)
+-- setup: SELECT gpu_upload_pair_exact('e3', k, v) FROM t3
+SELECT count(*) FROM (SELECT key, row_number() OVER () AS rn FROM gpu_groupby_exact_resident('e3')) g JOIN (SELECT k, row_number() OVER (ORDER BY k NULLS LAST) AS rn FROM (SELECT DISTINCT k FROM t3)) n USING (rn) WHERE g.key IS DISTINCT FROM n.k;
+-- expect: 0
+
+-- 5. HAVING sum > t on the device matches native HAVING (128-bit compare; NULL sums never pass)
+-- setup: CREATE TABLE t3 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 3001)::BIGINT - 1500 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL WHEN (hash(i * 17) % 2) = 0 THEN (hash(i * 19)::HUGEINT - 9223372036854775808::HUGEINT)::BIGINT ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v FROM range(300000) r(i)
+-- setup: SELECT gpu_upload_pair_exact('e3', k, v) FROM t3
+SELECT (SELECT count(*) FROM ((SELECT key, sum FROM gpu_groupby_exact_resident_having('e3', 'sum', '>', 0)) EXCEPT (SELECT k, sum(v) FROM t3 GROUP BY k HAVING sum(v) > 0))) + (SELECT count(*) FROM ((SELECT k, sum(v) FROM t3 GROUP BY k HAVING sum(v) > 0) EXCEPT (SELECT key, sum FROM gpu_groupby_exact_resident_having('e3', 'sum', '>', 0)))) AS mismatches, (SELECT count(*) FROM gpu_groupby_exact_resident_having('e3', 'sum', '>', 0)) = (SELECT count(*) FROM (SELECT k FROM t3 GROUP BY k HAVING sum(v) > 0)) AS same_rows;
+-- expect: 0  true
+
+-- 6. HAVING count(*) and HAVING min on the device
+-- setup: CREATE TABLE t3 AS SELECT CASE WHEN (hash(i) % 100) < 5 THEN NULL ELSE (hash(i * 7) % 3001)::BIGINT - 1500 END AS k, CASE WHEN (hash(i * 13) % 100) < 10 THEN NULL ELSE (hash(i * 23) % 2001)::BIGINT - 1000 END AS v FROM range(300000) r(i)
+-- setup: SELECT gpu_upload_pair_exact('e3', k, v) FROM t3
+SELECT (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_having('e3', 'count_star', '>=', 110)) EXCEPT (SELECT k, count(*) FROM t3 GROUP BY k HAVING count(*) >= 110))) + (SELECT count(*) FROM ((SELECT k, count(*) FROM t3 GROUP BY k HAVING count(*) >= 110) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_having('e3', 'count_star', '>=', 110)))) AS cs_mismatches, (SELECT count(*) FROM ((SELECT key, min FROM gpu_groupby_exact_resident_having('e3', 'min', '<', -995)) EXCEPT (SELECT k, min(v) FROM t3 GROUP BY k HAVING min(v) < -995))) + (SELECT count(*) FROM ((SELECT k, min(v) FROM t3 GROUP BY k HAVING min(v) < -995) EXCEPT (SELECT key, min FROM gpu_groupby_exact_resident_having('e3', 'min', '<', -995)))) AS min_mismatches;
+-- expect: 0  0
+
+-- 7. top-k by count(*) DESC: the multiset of survivors equals native ORDER BY count(*) DESC LIMIT k (ties may differ in order, not membership when k lands on a tie-free boundary)
+-- setup: CREATE TABLE t7 AS SELECT (i % 7)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i) UNION ALL SELECT NULL, 1 FROM range(300)
+-- setup: SELECT gpu_upload_pair_exact('e7', k, v) FROM t7
+SELECT key, count_star FROM gpu_groupby_exact_resident_topk('e7', 'count_star', 2, 'desc') ORDER BY count_star DESC, key;
+-- expect: NULL  300
+-- expect: 0  143
+
+-- 8. top-k by sum ASC with an all-NULL group: NULL sums rank last in both directions
+-- setup: CREATE TABLE t8 AS SELECT * FROM (VALUES (1,5),(2,NULL),(2,NULL),(3,1),(4,-9)) t(k,v)
+-- setup: SELECT gpu_upload_pair_exact('e8', k, v) FROM t8
+SELECT key, sum FROM gpu_groupby_exact_resident_topk('e8', 'sum', 4, 'asc');
+-- expect: 4  -9
+-- expect: 3  1
+-- expect: 1  5
+-- expect: 2  NULL
+
+-- 9. GUARDRAIL: a legacy gpu_upload_pair set is refused (its NULLs were dropped at upload)
+-- setup: SELECT gpu_upload_pair('legacy', k, v) FROM (VALUES (1,10),(1,NULL)) t(k,v)
+-- expected_fail: not uploaded by gpu_upload_pair_exact
+SELECT * FROM gpu_groupby_exact_resident('legacy');
+
+-- 10. GUARDRAIL: unknown aggregate name is a clean bind error
+-- setup: SELECT gpu_upload_pair_exact('e1', k, v) FROM (VALUES (1,10)) t(k,v)
+-- expected_fail: aggregate must be one of
+SELECT * FROM gpu_groupby_exact_resident_having('e1', 'median', '>', 0);
+
+-- 11. GUARDRAIL: legacy GROUP BY refuses an exact (NULL-bearing) set instead of reading NULL rows as data
+-- setup: SELECT gpu_upload_pair_exact('e1', k, v) FROM (VALUES (1,10),(NULL,5)) t(k,v)
+-- expected_fail: carries NULL rows
+SELECT * FROM gpu_groupby_sum_resident('e1');
+
+-- 12. A NULL-free exact set: rows and count(*) agree with the legacy path on the same data
+-- setup: CREATE TABLE t12 AS SELECT (i % 11)::BIGINT AS k, (i * 3)::BIGINT AS v FROM range(10000) r(i)
+-- setup: SELECT gpu_upload_pair_exact('e12', k, v) FROM t12
+-- setup: SELECT gpu_upload_pair('l12', k, v) FROM t12
+SELECT count(*) FROM ((SELECT key, sum::BIGINT, count FROM gpu_groupby_exact_resident('e12')) EXCEPT (SELECT key, sum, count FROM gpu_groupby_sum_resident('l12')));
+-- expect: 0

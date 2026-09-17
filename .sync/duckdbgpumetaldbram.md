@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/ext-python-wrapper
-- working on: v0.7: #85 (Metal 0b) and #86 (scalar) merged to main, CI green; #87 (wrapper) rebased onto main, wrapper suite green, awaiting ready+merge; next: segments in the residency manager once 0c lands
+- branch: feat/core-exact-groupby
+- working on: v0.7 milestone 3: exact GROUP BY interface + CPU reference pushed (feat/core-exact-groupby, PR open); next: Metal kernels for upload_pair_exact / groupby_exact_resident
 - status: in_progress
 - blocked on: nothing
-- last update: 2026-09-04T00:37:02Z
+- last update: 2026-09-17T01:57:36Z
