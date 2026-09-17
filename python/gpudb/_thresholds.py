@@ -8,6 +8,9 @@ out even there. The losing side stays printed in the gate output.
 Metal (Apple M4 Max), TPC-H SF1 lineitem, 2026-09-17, min of 5, statement
 vs statement through the wrapper:
   * 7 groups: 0.23–0.67× on every form               → min_groups
+    (after the block-level reduce, 2026-09-17: 0.5–1.6× at SF1, 0.77–2.2× at
+    SF10 for 3–7 groups — native answers these in 1.5–3 ms per 6M rows, so
+    the bound stays; over a join the few-group shapes win and have no bound)
   * plain (every group returned): 1.04–1.48× at 10K groups, 1.11–1.12× at
     200K without a WHERE, 0.94–1.07× (noise around even) at 200K under any
     WHERE, 0.96–0.99× at 1.5M groups (output-bound)  → plain_max_groups,

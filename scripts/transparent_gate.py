@@ -83,13 +83,26 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
             f"ORDER BY q DESC LIMIT 10")
 
 
+PACE_S = 0.0     # --pace-ms: idle gap before EVERY timed statement
+
+
 def time_min(run, n: int) -> float:
-    best = float("inf")
+    """Hot loop: the minimum of n back-to-back runs. Paced (--pace-ms): the
+    MEDIAN of n runs, each after an idle gap — an interactive session's
+    cadence, where clocks have dropped between statements (on Apple silicon
+    the first statement after a 0.2 s pause runs 2-3x slower on both paths
+    and the device needs more back-to-back runs than the CPU to recover)."""
+    times = []
     for _ in range(n):
+        if PACE_S > 0:
+            time.sleep(PACE_S)
         t0 = time.perf_counter()
         run()
-        best = min(best, (time.perf_counter() - t0) * 1000.0)
-    return best
+        times.append((time.perf_counter() - t0) * 1000.0)
+    if PACE_S > 0:
+        times.sort()
+        return times[len(times) // 2]
+    return min(times)
 
 
 def main() -> int:
@@ -101,6 +114,8 @@ def main() -> int:
     ap.add_argument("--wheres", default="all", help="'all' or a ';'-separated list of predicates ('' = none)")
     ap.add_argument("--joins", default="all", help="'all', 'none' or a ';'-separated list of JOINS labels")
     ap.add_argument("--no-single", action="store_true", help="skip the single-table sweep")
+    ap.add_argument("--pace-ms", type=float, default=0.0,
+                    help="idle gap before every timed statement; reports medians (an interactive cadence)")
     ap.add_argument("--exprs", action="store_true",
                     help="aggregate l_extendedprice * (1 - l_discount) and add an expression WHERE (computed lanes)")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
@@ -108,6 +123,8 @@ def main() -> int:
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")
     args = ap.parse_args()
+    global PACE_S
+    PACE_S = args.pace_ms / 1000.0
     if args.exprs:
         global PAYLOAD
         PAYLOAD = REVENUE
@@ -123,7 +140,8 @@ def main() -> int:
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
     print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}, "
-          f"payload columns {args.payloads}")
+          f"payload columns {args.payloads}, "
+          + (f"paced {args.pace_ms:.0f} ms (medians)" if PACE_S > 0 else "hot loop (minimums)"))
     print()
     print("| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |")
     print("|---|---|---|---|---|---|---|---|---|")
@@ -197,8 +215,11 @@ def main() -> int:
                 # (device clock state, a background task). Before a row fails
                 # on speed it is re-measured, native and transparent
                 # interleaved, and the minimum over every run is kept for both.
-                for _ in range(2):
-                    if not identical or ratio >= args.min_ratio:
+                # (Apple silicon: the same ms-scale statement runs in one of two
+                # modes for seconds at a time, ~2.8 or ~4.2 ms here, depending on
+                # what the SoC did just before — hence the pause between rounds.)
+                for _ in range(3):
+                    if not identical or ratio >= args.min_ratio or PACE_S > 0:
                         break
                     for _ in range(args.n):
                         con.transparent = False

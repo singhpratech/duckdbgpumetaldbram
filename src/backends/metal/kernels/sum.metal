@@ -881,6 +881,28 @@ kernel void gbx_chunk_i64(
 // keys + count(*) for every segment; the tuple for boundary-crossing
 // segments (tail of the first chunk + heads of the chunks it spans). With
 // with_vals == 0 (keys-only form) every segment gets cnt = cstar and zeros.
+// Second reduction level: block b = the merge of head[b*256 .. b*256+255].
+// A group that spans many chunks (few groups over many rows: one thread per
+// group used to merge ~rows/64 chunk partials one by one) takes whole blocks
+// wherever 256 consecutive chunks lie inside it. The merge is an exact
+// 128-bit add / min / max, associative and commutative, so the grouping of
+// the partials cannot change a bit of the result.
+constant uint GBX_BLOCK = 256;
+
+kernel void gbx_blocks_i64(
+    device const long* head    [[buffer(0)]],
+    constant uint&     nchunks [[buffer(1)]],
+    device long*       blk     [[buffer(2)]],
+    uint               gid     [[thread_position_in_grid]])
+{
+    const uint a = gid * GBX_BLOCK;
+    if (a >= nchunks) return;
+    const uint b = min(a + GBX_BLOCK, nchunks);
+    GbxAcc s = gbx_load(head, a);
+    for (uint t = a + 1u; t < b; ++t) gbx_merge(s, gbx_load(head, t));
+    gbx_store(blk, gid, s);
+}
+
 kernel void gbx_finalize_i64(
     device const long* keys      [[buffer(0)]],
     device const uint* starts    [[buffer(1)]],
@@ -896,6 +918,7 @@ kernel void gbx_finalize_i64(
     device long*       out_mn    [[buffer(11)]],
     device long*       out_mx    [[buffer(12)]],
     constant uint&     with_vals [[buffer(13)]],
+    device const long* blk       [[buffer(14)]],
     uint               gid       [[thread_position_in_grid]])
 {
     if (gid >= num_segs) return;
@@ -911,7 +934,11 @@ kernel void gbx_finalize_i64(
     const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
     if (c0 < c1) {
         GbxAcc s = gbx_load(tail, c0);
-        for (uint t = c0 + 1u; t <= c1; ++t) gbx_merge(s, gbx_load(head, t));
+        uint t = c0 + 1u;
+        while (t <= c1) {
+            if ((t % GBX_BLOCK) == 0u && c1 - t >= GBX_BLOCK - 1u) { gbx_merge(s, gbx_load(blk, t / GBX_BLOCK)); t += GBX_BLOCK; }
+            else { gbx_merge(s, gbx_load(head, t)); ++t; }
+        }
         gbx_out(out_lo, out_hi, out_cnt, out_mn, out_mx, gid, s);
     }
 }
@@ -1363,6 +1390,20 @@ kernel void gbxm_chunk_i64(
     gbxm_store(tail, gid, ts);
 }
 
+kernel void gbxm_blocks_i64(
+    device const long* head    [[buffer(0)]],
+    constant uint&     nchunks [[buffer(1)]],
+    device long*       blk     [[buffer(2)]],
+    uint               gid     [[thread_position_in_grid]])
+{
+    const uint a = gid * GBX_BLOCK;
+    if (a >= nchunks) return;
+    const uint b = min(a + GBX_BLOCK, nchunks);
+    GbxmAcc s = gbxm_load(head, a);
+    for (uint t = a + 1u; t < b; ++t) gbxm_merge(s, gbxm_load(head, t));
+    gbxm_store(blk, gid, s);
+}
+
 kernel void gbxm_finalize_i64(
     device const long* keys      [[buffer(0)]],
     device const uint* starts    [[buffer(1)]],
@@ -1377,6 +1418,7 @@ kernel void gbxm_finalize_i64(
     device long*       out_cnt   [[buffer(10)]],
     device long*       out_mn    [[buffer(11)]],
     device long*       out_mx    [[buffer(12)]],
+    device const long* blk       [[buffer(13)]],
     uint               gid       [[thread_position_in_grid]])
 {
     if (gid >= num_segs) return;
@@ -1386,7 +1428,11 @@ kernel void gbxm_finalize_i64(
     const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
     if (c0 < c1) {
         GbxmAcc s = gbxm_load(tail, c0);
-        for (uint t = c0 + 1u; t <= c1; ++t) gbxm_merge(s, gbxm_load(head, t));
+        uint t = c0 + 1u;
+        while (t <= c1) {
+            if ((t % GBX_BLOCK) == 0u && c1 - t >= GBX_BLOCK - 1u) { gbxm_merge(s, gbxm_load(blk, t / GBX_BLOCK)); t += GBX_BLOCK; }
+            else { gbxm_merge(s, gbxm_load(head, t)); ++t; }
+        }
         gbxm_out(out_lo, out_hi, out_cnt, out_cstar, out_mn, out_mx, gid, s);
     }
 }
