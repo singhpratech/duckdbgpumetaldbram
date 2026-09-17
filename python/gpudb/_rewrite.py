@@ -505,6 +505,22 @@ def _where_program(plan: Plan) -> str:
     return "; ".join(terms)
 
 
+def where_sql(plan: Plan) -> str:
+    """The WHERE terms back as SQL (for the wrapper's selectivity probe)."""
+    parts = []
+    for w in plan.where:
+        c = f'"{w.col}"'
+        if w.op == "isnull":
+            parts.append(f"{c} IS NULL")
+        elif w.op == "isnotnull":
+            parts.append(f"{c} IS NOT NULL")
+        elif w.op == "in":
+            parts.append(f"{c} IN ({', '.join(str(x) for x in w.lit)})")
+        else:
+            parts.append(f"{c} {w.op} {w.lit}")
+    return " AND ".join(parts) if parts else "TRUE"
+
+
 def _native_type_of(plan: Plan, kind: str) -> str:
     if kind == "sum":
         return f"DECIMAL(38,{plan.scale})" if plan.scale else "HUGEINT"

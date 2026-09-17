@@ -41,6 +41,7 @@ CREATE TABLE tn AS SELECT (i % 10)::BIGINT AS k, CASE WHEN i % 7 = 0 THEN NULL E
 def fresh(**kw):
     kw.setdefault("residency", "eager")
     kw.setdefault("floor_rows", 0)
+    kw.setdefault("thresholds", False)     # parity tests: rewrite every shape the engine accepts
     con = gpudb.connect(**kw)
     con.execute(SETUP)
     return con
