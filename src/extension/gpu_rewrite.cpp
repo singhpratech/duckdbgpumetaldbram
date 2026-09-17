@@ -80,6 +80,9 @@ struct ColInfo {
     bool integer = false;    // integer family
     bool decimal = false;
     bool floating = false;
+    bool date = false;       // DATE: resident as days since 1970-01-01 (BIGINT lane)
+    bool timestamp = false;  // TIMESTAMP: resident as microseconds since the epoch (BIGINT lane)
+    bool temporal() const { return date || timestamp; }
 };
 
 struct Output { std::string name, type; };
@@ -117,6 +120,10 @@ ColInfo parse_type(std::string t) {
         if (std::sscanf(u.c_str() + 8, "%d,%d", &c.width, &c.scale) != 2) { c.width = 18; c.scale = 3; }
     } else if (u == "DOUBLE" || u == "FLOAT" || u == "REAL" || u == "FLOAT4" || u == "FLOAT8") {
         c.floating = true;
+    } else if (u == "DATE") {
+        c.date = true;
+    } else if (u == "TIMESTAMP" || u == "DATETIME" || u == "TIMESTAMP WITHOUT TIME ZONE") {
+        c.timestamp = true;
     }
     return c;
 }
@@ -273,6 +280,100 @@ Agg aggregate_of(const json& e, const Context& cx, const std::string& t, const s
         return fn == "sum" ? Agg::Sum : Agg::Count;
     }
     reject("shape", "aggregate " + fn + " is not on the transparent path yet");
+}
+
+// ---- temporal constants (DATE 'yyyy-mm-dd' serialises as CAST('yyyy-mm-dd' AS DATE)) ----
+// Days since 1970-01-01 for a proleptic Gregorian civil date (H. Hinnant).
+std::int64_t days_from_civil(std::int64_t y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const std::int64_t era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<std::int64_t>(doe) - 719468;
+}
+
+// Parses "yyyy-mm-dd" (optionally "[-]yyyy-mm-dd"); ok = false when not that shape.
+std::int64_t parse_date_days(const std::string& s, bool& ok) {
+    ok = false;
+    std::size_t i = 0;
+    bool neg = false;
+    if (i < s.size() && s[i] == '-') { neg = true; ++i; }
+    auto num = [&](std::size_t min_digits, std::int64_t& out) {
+        std::size_t st = i; out = 0;
+        while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) { out = out * 10 + (s[i] - '0'); ++i; }
+        return i - st >= min_digits;
+    };
+    std::int64_t y, m, d;
+    if (!num(1, y) || i >= s.size() || s[i] != '-') return 0; ++i;
+    if (!num(1, m) || i >= s.size() || s[i] != '-') return 0; ++i;
+    if (!num(1, d)) return 0;
+    while (i < s.size() && s[i] == ' ') ++i;
+    if (i != s.size()) return 0;
+    if (m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    ok = true;
+    return days_from_civil(neg ? -y : y, static_cast<unsigned>(m), static_cast<unsigned>(d));
+}
+
+// Parses "yyyy-mm-dd[ T]hh:mm[:ss[.ffffff]]" (or a bare date) to microseconds since
+// the epoch; ok = false for anything else (time zones, named specials).
+std::int64_t parse_timestamp_us(const std::string& s, bool& ok) {
+    ok = false;
+    const std::size_t sep = s.find_first_of(" T");
+    const std::string ds = sep == std::string::npos ? s : s.substr(0, sep);
+    bool dok = false;
+    const std::int64_t days = parse_date_days(ds, dok);
+    if (!dok) return 0;
+    std::int64_t us = 0;
+    if (sep != std::string::npos) {
+        const std::string ts = s.substr(sep + 1);
+        std::size_t i = 0;
+        auto num2 = [&](std::int64_t& out) {
+            std::size_t st = i; out = 0;
+            while (i < ts.size() && std::isdigit(static_cast<unsigned char>(ts[i]))) { out = out * 10 + (ts[i] - '0'); ++i; }
+            return i > st;
+        };
+        std::int64_t hh = 0, mm = 0, ss = 0;
+        if (!num2(hh) || i >= ts.size() || ts[i] != ':') return 0; ++i;
+        if (!num2(mm)) return 0;
+        if (i < ts.size() && ts[i] == ':') { ++i; if (!num2(ss)) return 0; }
+        std::int64_t frac = 0;
+        if (i < ts.size() && ts[i] == '.') {
+            ++i; int digits = 0;
+            while (i < ts.size() && std::isdigit(static_cast<unsigned char>(ts[i]))) {
+                if (digits < 6) { frac = frac * 10 + (ts[i] - '0'); ++digits; }
+                else if (ts[i] != '0') return 0;     // finer than microseconds: not representable
+                ++i;
+            }
+            while (digits < 6) { frac *= 10; ++digits; }
+        }
+        if (i != ts.size()) return 0;                 // time zone or trailing text: declined
+        if (hh > 23 || mm > 59 || ss > 59) return 0;
+        us = ((hh * 60 + mm) * 60 + ss) * 1000000 + frac;
+    }
+    ok = true;
+    return days * 86400000000LL + us;
+}
+
+// If `e` is CAST(<VARCHAR constant> AS DATE|TIMESTAMP), returns the integer
+// image the resident lane holds (days / microseconds) and sets kind to the
+// ColInfo flag; otherwise returns false.
+bool temporal_const(const json& e, ColInfo& kind, std::int64_t& value) {
+    if (sfield(e, "class") != "CAST") return false;
+    const json& ch = field(e, "child");
+    if (sfield(ch, "class") != "CONSTANT") return false;
+    const json& v = field(ch, "value");
+    if (field(v, "is_null").get<bool>()) reject("shape", "NULL temporal constant");
+    if (sfield(field(v, "type"), "id") != "VARCHAR") return false;
+    const std::string target = sfield(field(e, "cast_type"), "id");
+    const std::string text = field(v, "value").get<std::string>();
+    bool ok = false;
+    kind = ColInfo{};
+    if (target == "DATE") { kind.date = true; value = parse_date_days(text, ok); }
+    else if (target == "TIMESTAMP") { kind.timestamp = true; value = parse_timestamp_us(text, ok); }
+    else return false;
+    if (!ok) reject("shape", "temporal constant '" + text + "' is not a plain literal");
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,6 +600,12 @@ std::string xagg_native_type(XAgg a, const Context& cx) {
 // scaled multiply, then CAST to DECIMAL(p, s) when p != 38.
 json j_output_exact(const std::string& col, const std::string& type, const std::string& name) {
     ColInfo t = parse_type(type);
+    if (t.date) {
+        // DATE '1970-01-01' + CAST(col AS INTEGER)  (days since the epoch)
+        json epoch = j_cast(j_const_varchar("1970-01-01"), j_type("DATE"));
+        return j_function("+", json::array({epoch, j_cast(j_colref(col), j_type("INTEGER"))}), true, name);
+    }
+    if (t.timestamp) return j_function("make_timestamp", json::array({j_colref(col)}), false, name);
     if (t.decimal && t.width != 38 && t.scale > 0) {
         json inner = j_output(col, "DECIMAL(38," + std::to_string(t.scale) + ")", "");
         return j_cast(std::move(inner), j_decimal_type(t.width, t.scale), name);
@@ -600,6 +707,13 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
     auto const_text = [&](const json& c, const ColInfo& info, int cmp, bool& drop_term, bool& always_false) -> std::string {
         // cmp: 1 > 2 >= 3 < 4 <= 5 = 6 <>
         drop_term = false; always_false = false;
+        if (info.temporal()) {
+            ColInfo ck; std::int64_t v = 0;
+            if (!temporal_const(c, ck, v) || ck.date != info.date || ck.timestamp != info.timestamp)
+                reject("shape", "WHERE on a " + std::string(info.date ? "DATE" : "TIMESTAMP") +
+                                " column against a constant that is not a plain literal of that type");
+            return std::to_string(v);
+        }
         if (info.floating) return fmt_double(const_as_double(c));
         if (!info.integer && !info.decimal) reject("shape", "WHERE on a column of type " + info.type);
         const int scale = info.decimal ? info.scale : 0;
@@ -654,6 +768,11 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
             const std::string lane = lane_of(ch[0], info);
             std::vector<std::string> vals;
             for (std::size_t i = 1; i < ch.size(); ++i) {
+                if (info.temporal()) {
+                    bool drop = false, never = false;
+                    vals.push_back(const_text(ch[i], info, 5, drop, never));
+                    continue;
+                }
                 if (sfield(ch[i], "class") != "CONSTANT") reject("shape", "IN over a non-constant");
                 const json& v = field(ch[i], "value");
                 if (field(v, "is_null").get<bool>()) continue;    // x IN (.., NULL) is never TRUE for that element
@@ -691,7 +810,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     Result r;
     // ---- column types (rule 2 gates) ----
     const bool bare = cx.val_col.empty();
-    if (!cx.key.integer) reject(cx.key.floating ? "double" : "shape", "key type " + cx.key.type);
+    if (!cx.key.integer && !cx.key.temporal()) reject(cx.key.floating ? "double" : "shape", "key type " + cx.key.type);
     if (!bare) {
         if (cx.val.floating) reject("double", "payload type " + cx.val.type);
         if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
