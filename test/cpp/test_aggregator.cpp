@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <mutex>
 #include <atomic>
 #include <vector>
@@ -574,6 +575,172 @@ void test_backend(gpudb::Backend b) {
             } else {
                 std::printf("    FAIL: %s\n", e.what());
                 ++failures; ++total;
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
+
+    // ---- Exact GROUP BY (v0.7 milestone 3, §4.1 / §4.2) vs a host reference ----
+    // NULL keys form one trailing group; NULL payloads count for count(*)
+    // only; the sum is 128-bit and never wraps; an all-NULL-payload group has
+    // count(v) == 0. Backends opt in; "not implemented" is reported as SKIP.
+    {
+        std::printf("  exact group by (NULLs, 128-bit sums):\n");
+        using Cmp = gpudb::GroupByFilter::Cmp;
+        std::mt19937_64 rng(0xE7ACULL);
+        const std::size_t N = 200'003;
+        const std::int64_t K = 2'999;
+        std::vector<std::int64_t> keys(N), vals(N);
+        std::vector<std::uint64_t> kvalid((N + 63) / 64, ~std::uint64_t{0}), vvalid((N + 63) / 64, ~std::uint64_t{0});
+        std::uniform_int_distribution<std::int64_t> kd(-K, K);
+        std::uniform_int_distribution<int> pct(0, 99);
+        // Values span the full int64 range so per-group sums overflow 64 bits.
+        std::uniform_int_distribution<std::int64_t> big(std::numeric_limits<std::int64_t>::min(),
+                                                        std::numeric_limits<std::int64_t>::max());
+        auto clr = [](std::vector<std::uint64_t>& m, std::size_t i) { m[i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+        for (std::size_t i = 0; i < N; ++i) {
+            keys[i] = kd(rng);
+            vals[i] = (pct(rng) < 50) ? big(rng) : kd(rng);
+            if (pct(rng) < 7)  clr(kvalid, i);          // ~7% NULL keys
+            if (pct(rng) < 11) clr(vvalid, i);          // ~11% NULL payloads
+        }
+        // Key 4000 exists only with NULL payloads -> all-NULL group.
+        for (std::size_t i = 0; i < 5; ++i) { keys[i] = 4000; clr(vvalid, i); kvalid[i >> 6] |= std::uint64_t{1} << (i & 63); }
+        // Key 4001: a single valid row at each int64 extreme (min/max exact).
+        keys[5] = 4001; vals[5] = std::numeric_limits<std::int64_t>::max(); kvalid[0] |= std::uint64_t{1} << 5; vvalid[0] |= std::uint64_t{1} << 5;
+        keys[6] = 4001; vals[6] = std::numeric_limits<std::int64_t>::min(); kvalid[0] |= std::uint64_t{1} << 6; vvalid[0] |= std::uint64_t{1} << 6;
+        auto isv = [](const std::vector<std::uint64_t>& m, std::size_t i) { return (m[i >> 6] >> (i & 63)) & 1u; };
+
+        struct Ref { gpudb::Sum128 s; std::int64_t cv = 0, cs = 0;
+                     std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+                     std::int64_t mx = std::numeric_limits<std::int64_t>::min(); };
+        std::map<std::int64_t, Ref> ref; Ref ref_null; bool have_null_key = false;
+        for (std::size_t i = 0; i < N; ++i) {
+            Ref& e = isv(kvalid, i) ? ref[keys[i]] : (have_null_key = true, ref_null);
+            ++e.cs;
+            if (!isv(vvalid, i)) continue;
+            e.s.add(vals[i]); ++e.cv; e.mn = std::min(e.mn, vals[i]); e.mx = std::max(e.mx, vals[i]);
+        }
+        // Two spans with different bitmap alignment (second starts at row 1000).
+        const std::size_t split = 1000;
+        std::vector<std::int64_t> kv0(2 * split), kv1(2 * (N - split));
+        std::vector<std::uint64_t> kv0k((split + 63) / 64, 0), kv0v((split + 63) / 64, 0),
+                                   kv1k((N - split + 63) / 64, 0), kv1v((N - split + 63) / 64, 0);
+        for (std::size_t i = 0; i < N; ++i) {
+            const bool first = i < split;
+            const std::size_t r = first ? i : i - split;
+            auto& kv = first ? kv0 : kv1;
+            kv[2 * r] = keys[i]; kv[2 * r + 1] = vals[i];
+            if (isv(kvalid, i)) (first ? kv0k : kv1k)[r >> 6] |= std::uint64_t{1} << (r & 63);
+            if (isv(vvalid, i)) (first ? kv0v : kv1v)[r >> 6] |= std::uint64_t{1} << (r & 63);
+        }
+        gpudb::Aggregator::KvSpan spans[2];
+        spans[0].kv = kv0.data(); spans[0].rows = split;     spans[0].key_valid = kv0k.data(); spans[0].val_valid = kv0v.data();
+        spans[1].kv = kv1.data(); spans[1].rows = N - split; spans[1].key_valid = kv1k.data(); spans[1].val_valid = kv1v.data();
+        bool implemented = true;
+        try {
+            auto pair = agg->upload_pair_exact(spans, 2, gpudb::Dtype::I64);
+            std::size_t null_keys = 0, null_vals = 0;
+            for (std::size_t i = 0; i < N; ++i) { null_keys += !isv(kvalid, i); null_vals += !isv(vvalid, i); }
+            EXPECT_EQ(pair.keys->rows(), N);
+            EXPECT_EQ(pair.keys->null_count(), null_keys);
+            EXPECT_EQ(pair.vals->null_count(), null_vals);
+
+            // The legacy op must refuse a NULL-bearing column, never read it as data.
+            bool refused = false;
+            try { (void)agg->groupby_sum_resident_i64(*pair.keys, *pair.vals, std::size_t(100) * 1000000); }
+            catch (const std::runtime_error&) { refused = true; }
+            EXPECT(refused);
+
+            const std::size_t cap = std::size_t(100) * 1000000;
+            auto r = agg->groupby_exact_resident(*pair.keys, pair.vals.get(), cap);
+            const std::size_t expect_groups = ref.size() + (have_null_key ? 1 : 0);
+            EXPECT_EQ(r.keys.size(), expect_groups);
+            EXPECT_EQ(r.groups_total, expect_groups);
+            EXPECT_EQ(r.rows_in, N);
+            bool ok = r.keys.size() == expect_groups && r.key_null.size() == r.keys.size();
+            std::size_t j = 0;
+            auto same = [&](std::size_t jj, const Ref& e) {
+                return r.counts[jj] == e.cv && r.counts_star[jj] == e.cs &&
+                       (e.cv == 0 || (static_cast<std::uint64_t>(r.sums[jj]) == e.s.lo && r.sums_hi[jj] == e.s.hi &&
+                                      r.mins[jj] == e.mn && r.maxs[jj] == e.mx));
+            };
+            for (auto it = ref.begin(); ok && it != ref.end(); ++it, ++j)
+                ok = r.key_null[j] == 0 && r.keys[j] == it->first && same(j, it->second);
+            if (ok && have_null_key) ok = r.key_null[j] == 1 && same(j, ref_null);
+            EXPECT(ok);   // sorted ascending, NULL key last, exact 128-bit sums, exact counts/min/max
+            // The all-NULL-payload group is present with count(v) == 0.
+            {
+                auto it = ref.find(4000);
+                ok = it != ref.end() && it->second.cv == 0 && it->second.cs == 5;
+                EXPECT(ok);
+            }
+            // Keys-only form: count(*) per key.
+            auto c = agg->groupby_exact_resident(*pair.keys, nullptr, cap);
+            ok = c.keys.size() == expect_groups;
+            j = 0;
+            for (auto it = ref.begin(); ok && it != ref.end(); ++it, ++j)
+                ok = c.keys[j] == it->first && c.counts_star[j] == it->second.cs;
+            EXPECT(ok);
+
+            // Filters against the host reference on the unfiltered result.
+            using Agg = gpudb::GroupByFilter::Agg;
+            gpudb::GroupByResidentResult base = r;
+            struct FC { Cmp cmp; std::int64_t thr; std::size_t topk; bool desc; Agg agg; };
+            const std::int64_t mid_cs = base.counts_star[base.counts_star.size() / 2];
+            std::vector<FC> fcs = {
+                {Cmp::GT, 0, 0, true, Agg::Sum}, {Cmp::LE, 0, 0, true, Agg::Sum},
+                {Cmp::GE, mid_cs, 0, true, Agg::CountStar}, {Cmp::LT, mid_cs, 0, true, Agg::CountV},
+                {Cmp::GT, 0, 0, true, Agg::Min}, {Cmp::LT, 0, 0, true, Agg::Max},
+                {Cmp::None, 0, 5, true, Agg::Sum}, {Cmp::None, 0, 5, false, Agg::Sum},
+                {Cmp::None, 0, 9, true, Agg::CountStar}, {Cmp::None, 0, 9, false, Agg::Min},
+                {Cmp::None, 0, base.keys.size() + 3, true, Agg::Max},   // k > groups: NULL agg last
+                {Cmp::GT, 0, 4, true, Agg::Sum},
+            };
+            int idx = 0;
+            for (const auto& fc : fcs) {
+                gpudb::GroupByFilter fl; fl.cmp = fc.cmp; fl.threshold_i64 = fc.thr; fl.topk = fc.topk; fl.topk_desc = fc.desc; fl.agg = fc.agg;
+                gpudb::GroupByResidentResult want = base;
+                gpudb::apply_group_filter_host(want, fl, gpudb::FilterAgg::Exact, cap, "ref");
+                auto got = agg->groupby_exact_resident(*pair.keys, pair.vals.get(), cap, fl);
+                ok = got.keys.size() == want.keys.size() && got.groups_total == want.groups_total;
+                if (ok && fl.topk == 0) {
+                    for (std::size_t q = 0; ok && q < got.keys.size(); ++q)
+                        ok = got.keys[q] == want.keys[q] && got.key_null[q] == want.key_null[q] &&
+                             got.counts[q] == want.counts[q] && got.counts_star[q] == want.counts_star[q];
+                } else if (ok) {
+                    // top-k: tie order unspecified -> compare the multiset of (key, key_null, count_star)
+                    std::vector<std::tuple<std::int64_t, int, std::int64_t>> a, b;
+                    for (std::size_t q = 0; q < got.keys.size(); ++q) {
+                        a.emplace_back(got.keys[q], got.key_null[q], got.counts_star[q]);
+                        b.emplace_back(want.keys[q], want.key_null[q], want.counts_star[q]);
+                    }
+                    std::sort(a.begin(), a.end()); std::sort(b.begin(), b.end());
+                    ok = a == b;
+                }
+                if (!ok) std::printf("    FAIL exact filter case %d: got %zu rows, ref %zu\n", idx, got.keys.size(), want.keys.size());
+                EXPECT(ok);
+                ++idx;
+            }
+            // Cap: throws naming the count, never truncates.
+            bool threw = false;
+            try { (void)agg->groupby_exact_resident(*pair.keys, pair.vals.get(), 10); }
+            catch (const std::runtime_error& e) {
+                threw = std::string(e.what()).find(std::to_string(expect_groups)) != std::string::npos;
+            }
+            EXPECT(threw);
+            // DOUBLE payloads are not on the exact path.
+            bool dbl_refused = false;
+            try { (void)agg->upload_pair_exact(spans, 2, gpudb::Dtype::F64); }
+            catch (const std::runtime_error&) { dbl_refused = true; }
+            EXPECT(dbl_refused);
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
             }
         }
         if (implemented) std::printf("    ok\n");

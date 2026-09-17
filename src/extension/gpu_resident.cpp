@@ -19,7 +19,11 @@
 //   gpu_upload(name VARCHAR, v DOUBLE) -> BIGINT     column, upload once,
 //                                                    return rows uploaded
 //   gpu_upload_pair(name, k BIGINT, v BIGINT|DOUBLE) -> BIGINT   (key, payload)
-//                                                    pair in ONE scan
+//                                                    pair in ONE scan; rows
+//                                                    with a NULL half skipped
+//   gpu_upload_pair_exact(name, k BIGINT, v BIGINT) -> BIGINT   the pair WITH
+//                                                    its NULLs (v0.7 §4.1) for
+//                                                    gpu_groupby_exact_resident
 //   gpu_sum_resident(name)     -> BIGINT     reduce the resident column —
 //   gpu_min_resident(name)     -> BIGINT     no per-query transfer. i64 only:
 //   gpu_max_resident(name)     -> BIGINT     the v1 ABI has no resident f64
@@ -218,6 +222,21 @@ struct Segment {
     Segment(const Segment&) = delete;
     Segment& operator=(const Segment&) = delete;
     std::size_t room() const noexcept { return kLanes - n; }
+
+    // §4.1 (gpu_upload_pair_exact only): per-PAIR validity bitmaps, DuckDB
+    // layout, indexed by pair row (= lane / 2). Empty = every row valid;
+    // allocated all-ones on the first NULL so NULL-free segments cost
+    // nothing. Never touched by the legacy uploads.
+    std::vector<std::uint64_t> key_valid, val_valid;
+    void mark_pair_null(std::size_t row, bool key_null, bool val_null) {
+        if (!key_null && !val_null) return;
+        if (key_valid.empty()) {
+            key_valid.assign(kLanes / 2 / 64, ~std::uint64_t{0});
+            val_valid.assign(kLanes / 2 / 64, ~std::uint64_t{0});
+        }
+        if (key_null) key_valid[row >> 6] &= ~(std::uint64_t{1} << (row & 63));
+        if (val_null) val_valid[row >> 6] &= ~(std::uint64_t{1} << (row & 63));
+    }
 };
 
 // A view of a segment as seen by one buffer: `lanes` is frozen at the time
@@ -741,10 +760,12 @@ void upload_combine(duckdb_function_info info, duckdb_aggregate_state* source,
 // for a map insert. Throws std::runtime_error.
 void publish_set(ResidentContext& ctx, UploadBuf& b,
                  std::unique_ptr<gpudb::ResidentColumn> keys,
-                 std::unique_ptr<gpudb::ResidentColumn> vals, bool pair, const char* fn) {
+                 std::unique_ptr<gpudb::ResidentColumn> vals, bool pair, const char* fn,
+                 bool exact = false) {
     auto set = std::make_shared<ResidentSet>();
     set->name = b.name;
     set->managed = b.managed;
+    set->exact = exact;
     if (b.managed) {
         set->catalog = b.tag.catalog; set->schema = b.tag.schema; set->table = b.tag.table;
         set->table_oid = b.tag.table_oid; set->columns = b.tag.columns; set->extra = b.tag.extra;
@@ -982,6 +1003,143 @@ void upload_pair_finalize_t(duckdb_function_info info, duckdb_aggregate_state* s
         } catch (const std::exception& e) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_pair failed: ") + e.what()).c_str());
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gpu_upload_pair_exact aggregate (v0.7 milestone 3, §4.1) — the pair WITH
+// its NULLs. Same interleaved segments as gpu_upload_pair; a NULL half is
+// recorded in the segment's validity bitmaps (its lane holds 0) instead of
+// being skipped, so count(*), the NULL-key group and NULL payloads survive
+// to the exact GROUP BY. Backends partition NULL keys at upload (§4.1).
+// ---------------------------------------------------------------------------
+
+void upload_pair_exact_update(duckdb_function_info info, duckdb_data_chunk input,
+                              duckdb_aggregate_state* states) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector k_vec    = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector v_vec    = duckdb_data_chunk_get_vector(input, 2);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    const auto* kd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(k_vec));
+    const auto* vd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(v_vec));
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    if (!names || !kd || !vd || n == 0) return;
+
+    uint64_t* name_validity = duckdb_vector_get_validity(name_vec);
+    uint64_t* k_validity    = duckdb_vector_get_validity(k_vec);
+    uint64_t* v_validity    = duckdb_vector_get_validity(v_vec);
+
+    UploadState* s0 = probe_upload_state(states[0]);
+    if (!s0) return;
+    bool per_row = true;
+    if (n > 1) {
+        const idx_t probes[3] = { 1, n / 2, n - 1 };
+        for (idx_t k = 0; k < 3 && per_row; ++k) {
+            const idx_t i = probes[k];
+            if (i == 0) continue;
+            if (probe_upload_state(states[i]) == nullptr) per_row = false;
+        }
+    }
+
+    constexpr std::size_t kPair = 2 * sizeof(std::int64_t);
+    const std::size_t reserved = static_cast<std::size_t>(n) * kPair;
+    if (!pool_reserve(reserved)) {
+        duckdb_aggregate_function_set_error(info,
+            (std::string("gpu_upload_pair_exact: out of buffer memory") + kPoolCapHint).c_str());
+        return;
+    }
+    std::size_t used = 0;
+    auto append_row = [&](UploadState* s, idx_t i) -> bool {
+        UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        ++b.rows_seen;
+        if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
+            duckdb_aggregate_function_set_error(info, "gpu_upload_pair_exact: name may not be NULL");
+            return false;
+        }
+        const char*       nm_data = duckdb_string_t_data(&names[i]);
+        const std::size_t nm_len  = duckdb_string_t_length(names[i]);
+        if (!b.name_set) {
+            if (!set_buf_name(info, b, nm_data, nm_len, "gpu_upload_pair_exact")) return false;
+        } else if (b.name.size() != nm_len ||
+                   std::memcmp(b.name.data(), nm_data, nm_len) != 0) {
+            duckdb_aggregate_function_set_error(info,
+                ("gpu_upload_pair_exact: one aggregate received two different names ('" +
+                 b.name + "' and '" + std::string(nm_data, nm_len) +
+                 "') — use a constant name").c_str());
+            return false;
+        }
+        const bool k_null = k_validity && !duckdb_validity_row_is_valid(k_validity, i);
+        const bool v_null = v_validity && !duckdb_validity_row_is_valid(v_validity, i);
+        std::int64_t* dst = b.reserve_lanes(2);
+        dst[0] = k_null ? 0 : kd[i];
+        dst[1] = v_null ? 0 : vd[i];
+        b.open->mark_pair_null(static_cast<std::size_t>(dst - b.open->data) / 2, k_null, v_null);
+        b.charged += kPair;
+        used += kPair;
+        return true;
+    };
+
+    bool ok = true;
+    if (n == 1 || !per_row) {
+        for (idx_t i = 0; i < n && ok; ++i) ok = append_row(s0, i);
+    } else {
+        for (idx_t i = 0; i < n && ok; ++i) {
+            UploadState* s = probe_upload_state(states[i]);
+            if (s) ok = append_row(s, i);
+        }
+    }
+    pool_release(reserved - used);
+}
+
+void upload_pair_exact_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
+                                duckdb_vector result, idx_t count, idx_t offset) {
+    if (count == 0) return;
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
+
+    for (idx_t i = 0; i < count; ++i) {
+        UploadState* s = probe_upload_state(source[i]);
+        UploadBuf* b = (s && s->buf_id != 0) ? s->buf : nullptr;
+        const std::size_t lanes = b ? b->lanes() : 0;
+        if (!b || lanes == 0) {
+            out[offset + i] = 0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+            continue;
+        }
+        const std::size_t rows = lanes / 2;
+        try {
+            ResidentContext& ctx = ctx_of_aggregate(info);
+            const auto t0 = std::chrono::steady_clock::now();
+            auto& a = ctx.aggregator();
+            std::vector<gpudb::Aggregator::KvSpan> spans;
+            const auto views = b->all_views();
+            spans.reserve(views.size());
+            for (const auto& v : views) {
+                gpudb::Aggregator::KvSpan sp;
+                sp.kv = v.seg->data;
+                sp.rows = v.lanes / 2;
+                sp.key_valid = v.seg->key_valid.empty() ? nullptr : v.seg->key_valid.data();
+                sp.val_valid = v.seg->val_valid.empty() ? nullptr : v.seg->val_valid.data();
+                spans.push_back(sp);
+            }
+            gpudb::Aggregator::ResidentPair cols =
+                a.upload_pair_exact(spans.data(), spans.size(), gpudb::Dtype::I64);
+            auto kcol = std::move(cols.keys);
+            auto vcol = std::move(cols.vals);
+            if (upload_trace())
+                std::fprintf(stderr, "[gpudb upload] gpu_upload_pair_exact '%s': rows=%zu "
+                             "null_keys=%zu null_vals=%zu segments=%zu upload=%.1f ms\n",
+                             b->name.c_str(), rows, kcol->null_count(), vcol->null_count(),
+                             spans.size(), ms_since(t0));
+            publish_set(ctx, *b, std::move(kcol), std::move(vcol), /*pair*/true,
+                        "gpu_upload_pair_exact", /*exact*/true);
+            out[offset + i] = static_cast<std::int64_t>(rows);
+        } catch (const std::exception& e) {
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload_pair_exact failed: ") + e.what()).c_str());
             return;
         }
     }
@@ -1714,6 +1872,16 @@ void register_gpu_resident(duckdb_connection con,
         duckdb_destroy_aggregate_function_set(&pset);
         if (pst == DuckDBError) {
             throw std::runtime_error("gpu_upload_pair registration failed");
+        }
+
+        // gpu_upload_pair_exact(name, k BIGINT, v BIGINT) -> BIGINT (v0.7 §4.1)
+        duckdb_aggregate_function pex = make_pair_fn(DUCKDB_TYPE_BIGINT,
+            upload_pair_exact_update, upload_pair_exact_finalize);
+        duckdb_aggregate_function_set_name(pex, "gpu_upload_pair_exact");
+        duckdb_state est = duckdb_register_aggregate_function(con, pex);
+        duckdb_destroy_aggregate_function(&pex);
+        if (est == DuckDBError) {
+            throw std::runtime_error("gpu_upload_pair_exact registration failed");
         }
     }
 
