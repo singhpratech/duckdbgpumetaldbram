@@ -678,6 +678,55 @@ composite-key join, all forms, 60 rewritten rows at 1.03–7.9×. Through the
 wrapper: Q14 1.6×, a Q19-style `OR` across two tables 2.2×, the full Q3 with
 its three-column GROUP BY over two tables 1.5×.
 
+### 4.14 Nested rewriting: a rewritable SELECT inside a statement DuckDB keeps
+`o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING
+sum(l_quantity) > 300)` (TPC-H Q18), a derived table that aggregates before
+the outer statement groups again (Q13), a CTE, a scalar subquery, the arms of
+a UNION: the statement as a whole is not a transparent shape, but a SELECT
+inside it is. When the whole statement declines for shape (or reads something
+without an identity of its own — a CTE, a view, a derived table), the wrapper
+walks the tree top-down, and every SELECT node that aggregates is offered to
+the ordinary path as a statement of its own (`json_deserialize_sql` of the
+node): its own decision, thresholds, residency, guards and measured check. A
+SELECT that is accepted is not descended into; its rewritten SQL is
+serialized back and spliced in place of the node, the outer statement stays
+DuckDB's, and the result is one SQL text. A correlated subquery does not bind
+on its own, so it declines by itself. The composed statement is checked once
+against the original with `DESCRIBE` (names and types), cached by exact
+statement text (a nested plan is literal-sensitive by construction), and
+guarded per sub-statement: a stale set in any of them falls the whole
+statement back to native.
+
+TPC-H SF1: Q13 18.4 → 2.0 ms (the inner LEFT JOIN + GROUP BY is an uploaded
+join, §4.13), Q18 13.6 → 8.7 ms (the IN-subquery is the device HAVING over
+1.5M groups; the rest of Q18 stays native).
+
+`GROUP BY <select alias>` (`SELECT l_suppkey AS supplier_no … GROUP BY
+supplier_no`, Q15) is resolved during expression lowering, only when no
+column of the statement has that name, so the resolution cannot differ from
+DuckDB's.
+
+### 4.15 Wide keys and DECIMAL keys
+Up to three integer / temporal keys are packed (§4.4). Four to eight keys of
+any supported type, and any key with a VARCHAR or DECIMAL component, are one
+hashed tuple with a dictionary (§4.5): every component travels as text
+(`CAST(col AS VARCHAR)`, exact for the integer, temporal and DECIMAL types)
+and is cast back to its native type on the way out. A `WHERE` on a component
+reads that column through its own predicate lane; a single DECIMAL key is no
+exception (its key lane holds the hash of the TEXT, which a numeric literal
+cannot be compared with) and the pure rewrite function declines such a
+`WHERE` when the context gives the column no lane.
+
+The dictionary of a wide key is large (TPC-H Q10 groups by seven customer
+columns including the comment: ~100K tuples), and `gpu_resident_dictionary`
+copies and sorts all of it per statement — Q10 measured 0.46×. After a device
+HAVING or top-k only a handful of keys are left, so those forms decode each
+surviving key with the scalar `gpu_resident_dict_component(tag, key, i)`
+instead of joining the dictionary: Q10 17.5 → 4.0 ms (4.4×). The plain form
+returns every group and keeps the join. Columns without a zone-map distinct
+estimate (VARCHAR) get one `approx_count_distinct(hash(keys))` scan per
+statement template.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection

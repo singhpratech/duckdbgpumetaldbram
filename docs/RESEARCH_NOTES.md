@@ -570,12 +570,78 @@ aggregate without GROUP BY, where native wins by measurement.
 
 ---
 
+## 2026-09-18 — Working down the coverage map: nested SELECTs, wide keys
+
+**Nested rewriting (Q13, Q18).** Many statements are not a GROUP BY but
+*contain* one: Q18's `IN (SELECT l_orderkey … GROUP BY l_orderkey HAVING
+sum(l_quantity) > 300)` is exactly the device's best shape, wrapped in a
+statement we cannot touch. So when a statement declines as a whole, the
+wrapper walks its tree top-down and offers every aggregating SELECT node to
+the ordinary path as a statement of its own; an accepted node is replaced by
+its rewritten SQL, everything else stays DuckDB's. Correlated subqueries need
+no special detection: they do not bind on their own. Q13 went from 18.4 to
+2.0 ms (9×) — its inner LEFT JOIN + GROUP BY is an uploaded join — and Q18 to
+1.7× with only its subquery on the device.
+
+**A bug in the wrapper's cheapest check.** Under the shipping configuration
+Q3, Q5 and Q13 silently ran native. The fast path that skips statements over
+small tables looked only at the FIRST table after `FROM`; `FROM customer,
+orders, lineitem` was judged by `customer` (150K rows, under the 1M floor).
+The coverage script had hidden it by setting the floor to zero — it now runs
+with the real floor. The check is now a word match of any large table's name
+anywhere in the statement (a false positive costs one parse).
+
+**Wide keys (Q10).** Q10 groups by seven columns of two tables, one of them a
+DECIMAL. The hashed-tuple dictionary built for VARCHAR keys already handles
+any number of text components, so four to eight keys — and DECIMAL components
+— now take that path. It worked and measured 0.46×: the dictionary function
+copies and sorts ~100K seven-column tuples (comment text included) per
+statement, to decode the 20 keys a top-k returns. After a device HAVING or
+top-k the rewrite now decodes each surviving key with a scalar lookup
+instead: 17.5 → 4.0 ms (4.4×).
+
+**Declines that are correct.** Q15's inner GROUP BY is understood (its `GROUP
+BY <select alias>` is now resolved) and declined by a measured threshold: a
+4%-selective filter on a single table, where native wins. Q11's tables are
+under the row floor. Q6 is the single-table aggregate without GROUP BY.
+
+**Coverage, shipping configuration, rows identical on every rewritten query
+(4 → 6 → 9 of 22 over two days):**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.1 | 5.9 | 2.04× | True | |
+| Q2 | native (threshold) | 4.6 | — | — | — |  |
+| Q3 | GPU (plain) | 6.5 | 3.5 | 1.86× | True | |
+| Q4 | native (shape) | 7.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.8 | 1.9 | 3.60× | True | |
+| Q6 | native (shape) | 1.7 | — | — | — |  |
+| Q7 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q8 | native (shape) | 7.5 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q9 | native (shape) | 19.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q10 | GPU (topk) | 17.5 | 4.1 | 4.31× | True | |
+| Q11 | native (threshold) | 2.9 | — | — | — |  |
+| Q12 | GPU (plain) | 6.4 | 3.6 | 1.79× | True | |
+| Q13 | GPU (nested) | 18.3 | 1.9 | 9.46× | True | |
+| Q14 | GPU (projected) | 5.2 | 2.6 | 2.00× | True | |
+| Q15 | native (shape) | 3.4 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 12.9 | — | — | — |  |
+| Q17 | native (shape) | 6.3 | — | — | — | split failed: Binder Error: Referenced column "p_partkey" not found in FROM clause!
+| Q18 | GPU (nested) | 13.8 | 8.1 | 1.71× | True | |
+| Q19 | GPU (projected) | 10.3 | 2.8 | 3.67× | True | |
+| Q20 | native (shape) | 7.9 | — | — | — |  |
+| Q21 | native (shape) | 22.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.5 | — | — | — | split: the inner GROUP BY declined (threshold) |
+
+---
+
 ## Open questions
 
 - **`count(DISTINCT x)`, `median`, `stddev`**: new kernels; `count(DISTINCT)`
   needs values sorted within a group.
-- **RIGHT / FULL / semi / anti joins**, `IN (SELECT …)` and `EXISTS`
-  subqueries, CTEs and derived tables as inputs.
+- **RIGHT / FULL / semi / anti joins**, correlated subqueries and `EXISTS`
+  (Q2, Q4, Q17, Q20, Q21, Q22), select-project-join derived tables as the
+  FROM of an aggregate (Q7, Q8, Q9).
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
   and as the CPU reference; the CUDA side is to be written against the same
   interface and then swept with the same gate.

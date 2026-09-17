@@ -2467,6 +2467,56 @@ void split_tuple(const std::string& t, std::int64_t n, std::vector<std::pair<boo
     }
 }
 
+// gpu_resident_dict_component(name, key BIGINT, i BIGINT) -> VARCHAR: component
+// i of ONE key of a string-keyed set (NULL for a NULL component, a NULL key or
+// a key the set does not hold). The per-key form of gpu_resident_dictionary:
+// after a HAVING or a top-k only a handful of keys are left, and decoding them
+// one by one costs microseconds where materialising the whole dictionary (a
+// copy and a sort of every key tuple, per statement) cost tens of ms.
+void dict_component_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    static const char* fn = "gpu_resident_dict_component";
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector key_vec  = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector idx_vec  = duckdb_data_chunk_get_vector(input, 2);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    auto* keys  = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(key_vec));
+    auto* idxs  = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(idx_vec));
+    uint64_t* nv = duckdb_vector_get_validity(name_vec);
+    uint64_t* kv = duckdb_vector_get_validity(key_vec);
+    uint64_t* iv = duckdb_vector_get_validity(idx_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    duckdb_vector_ensure_validity_writable(output);
+    uint64_t* ov = duckdb_vector_get_validity(output);
+    ResidentContext& ctx = ctx_of(info);
+    std::string cur_name;
+    std::shared_ptr<ResidentSet> set;
+    std::vector<std::pair<bool, std::string>> parts;
+    try {
+        for (idx_t r = 0; r < n; ++r) {
+            if ((nv && !duckdb_validity_row_is_valid(nv, r)) || (iv && !duckdb_validity_row_is_valid(iv, r)))
+                throw std::runtime_error(std::string(fn) + ": name and component index may not be NULL");
+            if (kv && !duckdb_validity_row_is_valid(kv, r)) { duckdb_validity_set_row_invalid(ov, r); continue; }
+            const std::string name = read_name(names, r);
+            if (!set || name != cur_name) {
+                set = ctx.acquire(name, fn, /*count_hit*/false);
+                if (!set->exact || !set->key_str)
+                    throw std::runtime_error(std::string(fn) + ": '" + name + "' has no string key");
+                cur_name = name;
+            }
+            const std::int64_t i = idxs[r];
+            if (i < 0 || i >= 8) throw std::runtime_error(std::string(fn) + ": component index must be 0..7");
+            const auto it = set->key_dict.find(static_cast<std::uint64_t>(keys[r]));
+            if (it == set->key_dict.end()) { duckdb_validity_set_row_invalid(ov, r); continue; }
+            split_tuple(it->second, i + 1, parts);
+            if (!parts[static_cast<std::size_t>(i)].first) { duckdb_validity_set_row_invalid(ov, r); continue; }
+            const std::string& text = parts[static_cast<std::size_t>(i)].second;
+            duckdb_vector_assign_string_element_len(output, r, text.data(), text.size());
+        }
+    } catch (const std::exception& e) {
+        duckdb_scalar_function_set_error(info, e.what());
+    }
+}
+
 void dictionary_function(duckdb_function_info info, duckdb_data_chunk output) {
     auto* init = static_cast<DictInit*>(duckdb_function_get_init_data(info));
     if (!init) return;
@@ -3010,6 +3060,8 @@ void register_gpu_resident(duckdb_connection con,
         join_materialize_exec, DUCKDB_TYPE_BIGINT, 6, ctx);
     register_scalar(con, "gpu_note_rows", note_rows_exec, DUCKDB_TYPE_BOOLEAN,
                     {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT}, ctx);
+    register_scalar(con, "gpu_resident_dict_component", dict_component_exec, DUCKDB_TYPE_VARCHAR,
+                    {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar_names(con, "gpu_upload_begin",
         upload_begin_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
     register_scalar_names(con, "gpu_upload_finish",

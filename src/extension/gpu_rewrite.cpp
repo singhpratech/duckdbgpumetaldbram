@@ -258,8 +258,12 @@ Context parse_context(const json& c) {
                 }
             }
         }
-        if (x.keys.size() > 3) reject("shape", "more than three GROUP BY keys");
-        for (const auto& kp : x.keys) if (kp.info.string) x.dict = true;
+        // Up to three integer / temporal keys are packed into one BIGINT (§4.4). Anything
+        // else — a VARCHAR or DECIMAL component, or four to eight keys of any supported
+        // type — is a hashed tuple with a dictionary (§4.5).
+        if (x.keys.size() > 8) reject("shape", "more than eight GROUP BY keys");
+        for (const auto& kp : x.keys) if (kp.info.string || kp.info.decimal) x.dict = true;
+        if (x.keys.size() > 3) x.dict = true;
         if (x.dict) {
             const std::string coll = lower(x.default_collation);
             if (!coll.empty() && coll != "binary")
@@ -725,9 +729,16 @@ json j_key_component(const Context& cx, std::size_t i, const std::string& type, 
     return j_typed_expr(std::move(v), type, name);
 }
 
-// Component i of a dictionary key: d.c<i> (VARCHAR text) cast to the native type.
-json j_dict_component(std::size_t i, const std::string& type, const std::string& name) {
-    json ref = j_colref2("d", "c" + std::to_string(i));
+// Component i of a dictionary key, cast to the native type: d.c<i> of the joined
+// gpu_resident_dictionary, or — `tag` non-empty: a HAVING / top-k left only a few
+// keys — gpu_resident_dict_component(tag, r.key, i), which decodes that one key.
+json j_dict_component(std::size_t i, const std::string& type, const std::string& name,
+                      const std::string& tag = std::string()) {
+    json ref = tag.empty()
+        ? j_colref2("d", "c" + std::to_string(i))
+        : j_function("gpu_resident_dict_component",
+                     json::array({j_const_varchar(tag), j_colref2("r", "key"),
+                                  j_const_bigint(static_cast<std::int64_t>(i))}));
     ColInfo t = parse_type(type);
     if (t.string) { ref["alias"] = name; return ref; }
     if (t.decimal) return j_cast(std::move(ref), j_decimal_type(t.width, t.scale), name);
@@ -839,7 +850,12 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
         const std::string c = column_ref(e, t, ta);
         if (c.empty()) reject("shape", "WHERE on an expression");
         for (const auto& pc : cx.preds) if (ieq(c, pc.name)) { info = pc.info; return pc.lane; }
-        if (cx.keys.size() == 1 && ieq(c, cx.key_col)) { info = cx.key; return "k"; }
+        if (cx.keys.size() == 1 && ieq(c, cx.key_col)) {
+            // a dictionary key that is not text (a DECIMAL key) holds the hash of its TEXT:
+            // a numeric literal cannot be compared with it — the column needs its own lane
+            if (cx.dict && !cx.key.string) reject("shape", "WHERE on a non-VARCHAR dictionary key without its own lane");
+            info = cx.key; return "k";
+        }
         if (!cx.val_col.empty() && ieq(c, cx.val_col)) { info = cx.val; return "v"; }
         reject("shape", "WHERE column '" + c + "' is not in the resident set");
     };
@@ -1029,7 +1045,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     // ---- column types (rule 2 gates) ----
     const bool bare = cx.val_col.empty();
     for (const auto& kp : cx.keys)
-        if (!kp.info.integer && !kp.info.temporal() && !kp.info.string)
+        if (!kp.info.integer && !kp.info.temporal() && !kp.info.string && !kp.info.decimal)
             reject(kp.info.floating ? "double" : "shape", "key type " + kp.info.type);
     if (!bare) {
         if (cx.val.floating) reject("double", "payload type " + cx.val.type);
@@ -1276,8 +1292,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                    {"query_location", kNoLocation}, {"function", j_function(fn, args)},
                    {"column_name_alias", json::array()}, {"with_ordinality", "WITHOUT_ORDINALITY"}};
     json guard = j_guard(cx);
+    // a filtered result (device HAVING / top-k) decodes its few keys one by one
+    const bool dict_per_key = cx.dict && (having_dev || topk > 0);
     json left_side = tf;
-    if (cx.dict) {
+    if (cx.dict && !dict_per_key) {
         // r LEFT JOIN gpu_resident_dictionary(tag, n) d ON d.id = r.key
         json dtf = json{{"type", "TABLE_FUNCTION"}, {"alias", "d"}, {"sample", nullptr},
                         {"query_location", kNoLocation},
@@ -1302,7 +1320,8 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     for (std::size_t i = 0; i < items.size(); ++i) {
         const Output& o = cx.outputs[i];
         if (items[i].key) {
-            if (cx.dict)          new_select.push_back(j_dict_component(items[i].key_index, o.type, o.name));
+            if (cx.dict)          new_select.push_back(j_dict_component(items[i].key_index, o.type, o.name,
+                                                                        dict_per_key ? cx.tag : std::string()));
             else if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
             else                  new_select.push_back(j_output_exact("key", o.type, o.name));
         } else {
@@ -1370,7 +1389,7 @@ Result do_rewrite(json tree, const json& ctxj) {
 
     const json& gexp = field(node, "group_expressions");
     const json& gsets = field(node, "group_sets");
-    if (!gexp.is_array() || gexp.empty() || gexp.size() > 3) reject("shape", "GROUP BY must have one to three keys");
+    if (!gexp.is_array() || gexp.empty() || gexp.size() > 8) reject("shape", "GROUP BY must have one to eight keys");
     if (!gsets.is_array() || gsets.size() != 1 || !gsets[0].is_array() || gsets[0].size() != gexp.size())
         reject("shape", "ROLLUP / CUBE / GROUPING SETS");
     for (std::size_t i = 0; i < gexp.size(); ++i) {

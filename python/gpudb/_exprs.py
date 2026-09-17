@@ -234,8 +234,21 @@ class Lowerer:
             return tree_json
         node = stmts[0]["node"]
 
-        # GROUP BY expressions -> keys
+        # GROUP BY <select alias> (`SELECT l_suppkey AS supplier_no ... GROUP BY supplier_no`):
+        # the alias stands for its select expression — only when no column of the
+        # statement has that name, so the resolution cannot differ from DuckDB's
+        changed = False
         groups = node.get("group_expressions") or []
+        aliases = {(it.get("alias") or "").casefold(): it for it in (node.get("select_list") or [])
+                   if isinstance(it, dict) and it.get("alias")}
+        for i, g in enumerate(groups):
+            if _is_colref(g) and len(g.get("column_names") or []) == 1:
+                nm = g["column_names"][0].casefold()
+                if nm not in self._lower and nm in aliases:
+                    groups[i] = dict(json.loads(json.dumps(aliases[nm])), alias="")
+                    changed = True
+
+        # GROUP BY expressions -> keys
         group_trees = []
         for i, g in enumerate(groups):
             if isinstance(g, dict) and not _is_colref(g) and g.get("class") != "CONSTANT":
@@ -322,6 +335,6 @@ class Lowerer:
             else:
                 node["where_clause"] = {"class": "CONJUNCTION", "type": "CONJUNCTION_AND", "alias": "",
                                         "query_location": _NO_LOC, "children": new_conj}
-        if not self.computed:
+        if not self.computed and not changed:
             return tree_json
         return json.dumps(j)

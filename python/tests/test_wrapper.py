@@ -101,6 +101,14 @@ def run():
         "three_keys_topk": "SELECT k, dt, sum(v) AS s FROM tn3 GROUP BY k, dt, z ORDER BY s DESC LIMIT 5",
         "str_key":    "SELECT s, sum(v), count(*) FROM t GROUP BY s ORDER BY s NULLS LAST",
         "str_key_pred": "SELECT s, count(*) FROM t WHERE s IN ('alpha', 'it''s') GROUP BY s ORDER BY s",
+        # wide keys (four to eight components) and DECIMAL key columns ride on the hashed-tuple dictionary
+        "four_int_keys":  "SELECT k, z, dt, v % 4 AS m, count(*), sum(v) FROM tn3 GROUP BY k, z, dt, v % 4 ORDER BY k NULLS LAST, z, dt NULLS LAST, m",
+        "decimal_key":    "SELECT d, count(*), sum(v) FROM t GROUP BY d ORDER BY d",
+        "decimal_key_where": "SELECT d, count(*) FROM t WHERE d > 3.5 AND d <= 7.25 GROUP BY d ORDER BY d",
+        "decimal_key_having": "SELECT d, sum(v) AS sv FROM t GROUP BY d HAVING sum(v) > 15000 ORDER BY d",
+        "five_mixed_keys_topk": "SELECT k, s, d, dt, v, count(*) AS n FROM t GROUP BY k, s, d, dt, v ORDER BY n DESC, k, s NULLS LAST, d, dt, v LIMIT 5",
+        "seven_keys":     "SELECT k, s, d, dt, v, x > 1000 AS big, k % 3 AS r, count(*) AS n FROM t WHERE k < 20 GROUP BY k, s, d, dt, v, x > 1000, k % 3 ORDER BY k, s NULLS LAST, d, dt, v, big, r",
+        "str_key_topk_per_key": "SELECT s, sum(v) AS sv FROM t GROUP BY s ORDER BY sv DESC LIMIT 3",
         # several payload columns in one statement (§4.9)
         "multi_sums": "SELECT k, sum(a), sum(b), sum(c), count(*) FROM tm GROUP BY k ORDER BY k",
         "multi_mixed": "SELECT k, min(a), max(c), avg(b), count(c), count(*) FROM tm WHERE x > 250.5 AND z <> 3 GROUP BY k ORDER BY k",
@@ -422,7 +430,7 @@ def run():
             "double_payload": "SELECT k, sum(v / 2) FROM t GROUP BY k",
             "double_key":     "SELECT x * 2 AS xx, count(*) FROM t GROUP BY x * 2",
             "macro":          "SELECT k, sum(twice(v)) FROM t GROUP BY k",
-            "subquery":       "SELECT k, sum(v) FROM t WHERE v > (SELECT avg(v) FROM t) GROUP BY k",
+            "subquery":       "SELECT k, sum(v) FROM t WHERE v > (SELECT v FROM tu ORDER BY v LIMIT 1) GROUP BY k",
             "window":         "SELECT k, sum(v), row_number() OVER () FROM t GROUP BY k",
         }
         for name, sql in edeclines.items():
@@ -537,6 +545,61 @@ def run():
             got = con.execute(sql).fetchall()
             check(con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
                   f"post-agg literal variant x{m}: answer correct")
+    con.close()
+
+    # ---- nested rewriting (§4.14): rewritable SELECTs inside a statement DuckDB keeps ----
+    print("== nested rewriting")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        ncases = {
+            "in_subquery_having": "SELECT count(*), sum(a) FROM tm WHERE k IN (SELECT k FROM t GROUP BY k HAVING sum(v) > 14400)",
+            "derived_table":   "SELECT c, count(*) AS n FROM (SELECT k, count(v) AS c FROM tn3 GROUP BY k) x GROUP BY c ORDER BY c",
+            "derived_aliases": "SELECT bucket, max(total) FROM (SELECT k % 10, sum(a) FROM tm GROUP BY k % 10) AS x(bucket, total) GROUP BY bucket ORDER BY bucket",
+            "cte_twice":       "WITH r AS (SELECT k AS kk, sum(b) AS tot FROM tm WHERE z < 7 GROUP BY kk) SELECT kk, tot FROM r WHERE tot = (SELECT max(tot) FROM r) ORDER BY kk",
+            "scalar_subquery": "SELECT k, v FROM tu WHERE v > (SELECT max(s) FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) q) - 14540 ORDER BY k, v LIMIT 20",
+            "union_all":       "SELECT 'a' AS src, k, sum(a) AS s FROM tm GROUP BY k HAVING sum(a) > 45000000 UNION ALL SELECT 'b', k, sum(b) FROM tm GROUP BY k HAVING sum(b) > 160000000 ORDER BY src, k",
+            "join_to_aggregate": "SELECT t2.k, t2.s, x.n FROM (SELECT k, sum(v) AS s FROM t GROUP BY k) t2 JOIN (SELECT k, count(*) AS n FROM tm WHERE z = 1 GROUP BY k) x ON t2.k = x.k WHERE t2.k < 25 ORDER BY t2.k",
+            "group_by_alias":  "SELECT k % 7 AS wd, sum(v) AS s FROM t GROUP BY wd ORDER BY wd",
+        }
+        for name, sql in ncases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"nested {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want, f"nested {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"nested {name}: names and types identical")
+        check(con.last_rewrite()["form"] != "nested", "nested: GROUP BY <select alias> is an ordinary shape, not a nested one")
+        sql = ncases["in_subquery_having"]
+        con.execute(sql).fetchall()
+        check(con.last_rewrite()["form"] == "nested" and "gpu_groupby_exact_resident" in con.last_rewrite()["sql"]
+              and " tm " in con.last_rewrite()["sql"].replace("\n", " ") + " ",
+              "nested: the subquery runs on the device, the outer statement stays DuckDB's")
+        ndeclines = {
+            "correlated":     "SELECT k, v FROM tu o WHERE v > (SELECT sum(v) / 300 FROM t i WHERE i.k = o.k GROUP BY i.k) ORDER BY k, v LIMIT 5",
+            "lateral_like":   "SELECT k, (SELECT count(*) FROM tn WHERE tn.k = tu.k % 10 GROUP BY tn.k) AS c FROM tu WHERE k < 3 ORDER BY k, v LIMIT 5",
+        }
+        for name, sql in ndeclines.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"], f"nested decline {name}: runs native ({con.last_rewrite()['reason']})")
+            check(got == want, f"nested decline {name}: answer unchanged")
+        # a write invalidates the nested plan too; the next run is native, then resident again
+        sql = ncases["derived_table"]
+        con.execute("UPDATE tn3 SET v = v + 1 WHERE k = 3")
+        got = con.execute(sql).fetchall()
+        check(got == con._raw.execute(sql).fetchall(), "nested: answer correct right after a write")
+        got = con.execute(sql).fetchall()
+        check(con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
+              "nested: rewritten again after the re-upload, answer correct")
+        # a foreign write is caught by the sub-statement's guard
+        other3 = con._raw.cursor()
+        other3.execute("INSERT INTO tn3 VALUES (1, DATE '1995-01-02', 1, 5)")
+        got = con.execute(sql).fetchall()
+        check(con.last_rewrite()["fallback"] and got == con._raw.execute(sql).fetchall(),
+              "nested: foreign write -> GPUDB_STALE fallback, native answer")
     con.close()
 
     # ---- measured rule 1: a template whose rewritten runs are not faster than its own native runs is declined ----
