@@ -43,6 +43,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gpudb_ext {
@@ -312,9 +313,12 @@ void gb_function(duckdb_function_info info, duckdb_data_chunk output) {
 //   <col> in (c1, c2, ...)
 //   <col> is null | <col> is not null
 // where <col> is k (key), v (payload), i<n> (n-th BIGINT predicate column of
-// gpu_upload_rows_exact) or f<n> (n-th DOUBLE one). Constants are integer
-// literals for k / v / i<n> and decimal or 'nan' / 'inf' literals for f<n>.
-// The program is a conjunction; an empty program is no WHERE.
+// gpu_upload_rows_exact), f<n> (n-th DOUBLE one) or s<n> (n-th VARCHAR
+// one). Constants are integer literals for k / v / i<n>, decimal or 'nan' /
+// 'inf' literals for f<n>, and quoted strings ('it''s') for s<n> and for k
+// when the set's key is a VARCHAR tuple (only =, !=, in, is [not] null
+// there: string lanes hold hash64() of the text). The program is a
+// conjunction; an empty program is no WHERE.
 struct WhereTerm {
     std::string col;            // as written
     gpudb::Predicate::Op op = gpudb::Predicate::Op::EQ;
@@ -357,6 +361,29 @@ std::string parse_where_program(const std::string& prog, std::vector<WhereTerm>&
         t.col = lower_copy(term.substr(0, i));
         std::string rest = trim_copy(term.substr(i));
         std::string lrest = lower_copy(rest);
+        // A literal: a quoted string ('' escapes a quote) or a bare token up to
+        // the separator. Quoted literals are kept with their quotes so the
+        // resolver knows they are strings.
+        auto read_literal = [](const std::string& src, std::size_t& pos, std::string& out) -> bool {
+            while (pos < src.size() && std::isspace(static_cast<unsigned char>(src[pos]))) ++pos;
+            if (pos < src.size() && src[pos] == '\'') {
+                std::string v = "'";
+                ++pos;
+                while (pos < src.size()) {
+                    if (src[pos] == '\'') {
+                        if (pos + 1 < src.size() && src[pos + 1] == '\'') { v += "''"; pos += 2; continue; }
+                        ++pos; v += "'"; out = v; return true;
+                    }
+                    v += src[pos++];
+                }
+                return false;                                    // unterminated
+            }
+            const std::size_t st = pos;
+            while (pos < src.size() && src[pos] != ',' && src[pos] != ')') ++pos;
+            out = src.substr(st, pos - st);
+            while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back()))) out.pop_back();
+            return !out.empty();
+        };
         if (lrest == "is null")          { t.op = gpudb::Predicate::Op::IsNull; }
         else if (lrest == "is not null") { t.op = gpudb::Predicate::Op::IsNotNull; }
         else if (lrest.rfind("in", 0) == 0 && (lrest.size() == 2 || lrest[2] == ' ' || lrest[2] == '(')) {
@@ -365,13 +392,12 @@ std::string parse_where_program(const std::string& prog, std::vector<WhereTerm>&
                 return "WHERE program: 'in' needs a parenthesised list in '" + term + "'";
             body = body.substr(1, body.size() - 2);
             std::size_t p2 = 0;
-            while (p2 <= body.size()) {
-                std::size_t c = body.find(',', p2);
-                if (c == std::string::npos) c = body.size();
-                std::string item = trim_copy(body.substr(p2, c - p2));
-                if (!item.empty()) t.list.push_back(item);
-                p2 = c + 1;
-                if (c == body.size()) break;
+            while (p2 < body.size()) {
+                std::string item;
+                if (!read_literal(body, p2, item)) return "WHERE program: bad 'in' list in '" + term + "'";
+                t.list.push_back(item);
+                while (p2 < body.size() && std::isspace(static_cast<unsigned char>(body[p2]))) ++p2;
+                if (p2 < body.size()) { if (body[p2] != ',') return "WHERE program: bad 'in' list in '" + term + "'"; ++p2; }
             }
             if (t.list.empty()) return "WHERE program: empty 'in' list in '" + term + "'";
             t.op = gpudb::Predicate::Op::In;
@@ -386,8 +412,12 @@ std::string parse_where_program(const std::string& prog, std::vector<WhereTerm>&
             else if (op == ">")  t.op = gpudb::Predicate::Op::GT;
             else if (op == ">=") t.op = gpudb::Predicate::Op::GE;
             else return "WHERE program: unknown operator in '" + term + "'";
-            t.value = trim_copy(rest.substr(j));
-            if (t.value.empty()) return "WHERE program: missing constant in '" + term + "'";
+            std::size_t pv = j;
+            std::string v;
+            if (!read_literal(rest, pv, v)) return "WHERE program: missing constant in '" + term + "'";
+            t.value = v;
+            while (pv < rest.size() && std::isspace(static_cast<unsigned char>(rest[pv]))) ++pv;
+            if (pv != rest.size()) return "WHERE program: trailing text in '" + term + "'";
         }
         if (t.col.empty()) return "WHERE program: missing column in '" + term + "'";
         out.push_back(std::move(t));
@@ -429,6 +459,30 @@ std::int64_t parse_f64_literal_bits(const std::string& s, const std::string& ter
     return bits;
 }
 
+// A quoted program literal ('it''s') -> its text; ok = false when unquoted.
+bool unquote_literal(const std::string& s, std::string& out) {
+    if (s.size() < 2 || s.front() != '\'' || s.back() != '\'') return false;
+    out.clear();
+    for (std::size_t i = 1; i + 1 < s.size(); ++i) {
+        if (s[i] == '\'' && i + 2 < s.size() && s[i + 1] == '\'') { out.push_back('\''); ++i; }
+        else out.push_back(s[i]);
+    }
+    return true;
+}
+
+// The hash a string lane compares against for literal `text`, checked for a
+// collision against what the lane actually holds: a different text under the
+// same hash means the answer could be wrong, so the statement declines.
+std::int64_t string_lane_value(const std::unordered_map<std::uint64_t, std::string>& dict,
+                               const std::string& text, const char* fn) {
+    const std::uint64_t h = hash64(text.data(), text.size());
+    auto it = dict.find(h);
+    if (it != dict.end() && it->second != text)
+        throw std::runtime_error(std::string(fn) + ": WHERE literal collides with a resident string (64-bit hash) — "
+                                 "run this statement natively");
+    return static_cast<std::int64_t>(h);
+}
+
 ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>& terms, const char* fn) {
     ResolvedWhere rw;
     rw.lists.resize(terms.size());
@@ -438,26 +492,56 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
         p.op = w.op;
         const std::string& c = w.col;
         bool is_f64 = false;
-        if (c == "k")      p.col = set.keys.get();
+        const std::unordered_map<std::uint64_t, std::string>* sdict = nullptr;   // string lane: its dictionary
+        bool key_tuple = false;                                                   // k of a string-keyed set
+        if (c == "k") {
+            p.col = set.keys.get();
+            if (set.key_str) { sdict = &set.key_dict; key_tuple = true; }
+        }
         else if (c == "v") p.col = set.vals.get();
-        else if ((c[0] == 'i' || c[0] == 'f') && c.size() > 1) {
+        else if ((c[0] == 'i' || c[0] == 'f' || c[0] == 's') && c.size() > 1) {
             std::size_t idx = 0;
             for (std::size_t q = 1; q < c.size(); ++q) {
                 if (!std::isdigit(static_cast<unsigned char>(c[q])))
                     throw std::runtime_error(std::string(fn) + ": WHERE program: unknown column '" + c + "'");
                 idx = idx * 10 + static_cast<std::size_t>(c[q] - '0');
             }
-            const bool is_i = c[0] == 'i';
-            const std::size_t count = is_i ? set.pred_int : set.pred_dbl;
+            const char kind = c[0];
+            const std::size_t count = kind == 'i' ? set.pred_int : kind == 'f' ? set.pred_dbl : set.pred_str;
             if (idx >= count)
                 throw std::runtime_error(std::string(fn) + ": WHERE program: '" + c + "' but the set has " +
-                    std::to_string(count) + (is_i ? " BIGINT" : " DOUBLE") + " predicate column(s)");
-            p.col = set.preds[(is_i ? 0 : set.pred_int) + idx].get();
-            is_f64 = !is_i;
+                    std::to_string(count) + (kind == 'i' ? " BIGINT" : kind == 'f' ? " DOUBLE" : " VARCHAR") +
+                    " predicate column(s)");
+            const std::size_t base = kind == 'i' ? 0 : kind == 'f' ? set.pred_int : set.pred_int + set.pred_dbl;
+            p.col = set.preds[base + idx].get();
+            is_f64 = kind == 'f';
+            if (kind == 's') sdict = &set.str_dicts[idx];
         } else {
             throw std::runtime_error(std::string(fn) + ": WHERE program: unknown column '" + c + "'");
         }
         const std::string term = w.col + (w.value.empty() ? "" : " ... " + w.value);
+        if (sdict) {
+            // string lane: only = != in / is [not] null; literals must be quoted
+            using Op = gpudb::Predicate::Op;
+            if (p.op != Op::EQ && p.op != Op::NE && p.op != Op::In && p.op != Op::IsNull && p.op != Op::IsNotNull)
+                throw std::runtime_error(std::string(fn) + ": WHERE program: only =, !=, in and is [not] null apply to a string column (" + term + ")");
+            auto lane_value = [&](const std::string& lit) {
+                std::string text;
+                if (!unquote_literal(lit, text))
+                    throw std::runtime_error(std::string(fn) + ": WHERE program: '" + lit + "' must be a quoted string (" + term + ")");
+                if (key_tuple) text = tuple_component(text.data(), text.size());   // the key holds the 1-tuple text
+                return string_lane_value(*sdict, text, fn);
+            };
+            if (p.op == Op::In) {
+                for (const auto& s : w.list) rw.lists[t].push_back(lane_value(s));
+                p.list = rw.lists[t].data();
+                p.n_list = rw.lists[t].size();
+            } else if (p.op == Op::EQ || p.op == Op::NE) {
+                p.value = lane_value(w.value);
+            }
+            rw.preds.push_back(p);
+            continue;
+        }
         if (p.op == gpudb::Predicate::Op::In) {
             for (const auto& s : w.list)
                 rw.lists[t].push_back(is_f64 ? parse_f64_literal_bits(s, term) : parse_i64_literal(s, term));

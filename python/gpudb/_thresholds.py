@@ -17,8 +17,8 @@ vs statement through the wrapper:
     (2.1–2.6× at ≥ 200K groups there)                → having_min_selectivity,
     having_min_selectivity_big
   * top-k: 4.1× at 200K groups, 1.42× at 1.5M, 0.55–0.98× at 10K groups,
-    0.71–0.72× under a 9% WHERE and 0.98–1.03× (noise) at 1.5M groups under
-    a 25% WHERE                                      → topk_min_groups,
+    0.71–0.72× under a 9% WHERE, 0.98–1.06× (noise) at 1.5M groups under a
+    25–64% WHERE, 1.22× at 91%                       → topk_min_groups,
     topk_min_selectivity
 CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
@@ -44,7 +44,7 @@ class Thresholds:
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
                    plain_min_selectivity=0.5,
                    having_min_selectivity=0.3, having_min_selectivity_big=0.2,
-                   topk_min_groups=100_000, topk_min_selectivity=0.3)
+                   topk_min_groups=100_000, topk_min_selectivity=0.8)
 CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 

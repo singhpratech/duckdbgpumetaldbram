@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gpudb_ext {
@@ -67,7 +68,15 @@ struct ResidentSet {
     // BIGINT list's elements first (pred_int of them), then the DOUBLE
     // list's (pred_dbl). Addressed as i<n> / f<n> by the WHERE program.
     std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
-    std::size_t   pred_int = 0, pred_dbl = 0;
+    std::size_t   pred_int = 0, pred_dbl = 0, pred_str = 0;
+    // VARCHAR keys / predicate columns (v0.7 §4.5): a string lane holds
+    // hash64() of the text; the key lane the hash of the tuple text the
+    // wrapper built ("<len>:<bytes>" per component, "N" for NULL). Each
+    // string lane keeps hash -> text so a WHERE literal can be checked for a
+    // collision and gpu_resident_dictionary(tag, n) can map keys back.
+    bool          key_str = false;
+    std::unordered_map<std::uint64_t, std::string>              key_dict;      // key lane (when key_str)
+    std::vector<std::unordered_map<std::uint64_t, std::string>> str_dicts;     // one per s<n> lane
     std::size_t   rows = 0;          // rows in the column(s): NULL rows are skipped
                                      // (exact sets: every row, NULLs included)
     std::size_t   rows_seen = 0;     // rows the upload scan delivered (count(*) of its input)
@@ -88,6 +97,15 @@ struct ResidentSet {
 };
 
 class ResidentContext;
+
+// 64-bit hash of a byte string — the value a VARCHAR lane holds. Shared by the
+// uploads and the WHERE-program literal resolution; never exposed to SQL.
+std::uint64_t hash64(const char* p, std::size_t n) noexcept;
+
+// The tuple text one component contributes: "<byte length>:<bytes>", or "N"
+// for NULL — what the wrapper's upload expression produces and what
+// gpu_resident_dictionary() splits.
+std::string tuple_component(const char* p, std::size_t n);
 
 std::shared_ptr<ResidentContext> make_resident_context();
 

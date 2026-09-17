@@ -463,7 +463,7 @@ class Connection:
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
         plan.outputs, plan.tag = cached.outputs, cached.tag
         plan.exact, plan.pred_types = cached.exact, cached.pred_types
-        plan.keys, plan.key_types, plan.pack = cached.keys, cached.key_types, cached.pack
+        plan.keys, plan.key_types, plan.pack, plan.dict_key = cached.keys, cached.key_types, cached.pack, cached.dict_key
         if plan.pred_cols != cached.pred_cols:
             return None
         if plan.form == "topk" and cached.form != "topk":
@@ -515,8 +515,17 @@ class Connection:
                     return Decision(False, "overflow")
                 if nrows * bound >= 2.0 ** 63:
                     return Decision(False, "overflow")
-        if self._settings["default_collation"]:
-            pass   # integer keys only in this cut; VARCHAR keys arrive with §4.5
+        if plan.dict_key or any(t in _rewrite._STRING_TYPES for t in plan.pred_types.values()):
+            # byte-wise dictionary: only under binary collation, column and session
+            coll = (self._settings["default_collation"] or "").lower()
+            if coll and coll != "binary":
+                return Decision(False, "collation")
+            try:
+                ddl = self._raw.execute("SELECT sql FROM duckdb_tables() WHERE table_oid = ?", [ident.oid]).fetchone()
+                if ddl and ddl[0] and "COLLATE" in ddl[0].upper():
+                    return Decision(False, "collation")
+            except Exception:
+                return Decision(False, "collation")
         # packed keys (§4.4): each component's integer image bounds from stats()
         if plan.exact and plan.packed:
             pack = []
