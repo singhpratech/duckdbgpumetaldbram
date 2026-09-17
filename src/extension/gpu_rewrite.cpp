@@ -88,6 +88,11 @@ struct ColInfo {
 struct Output { std::string name, type; };
 
 struct PredCol { std::string name; ColInfo info; std::string lane; };   // lane: "i<n>" / "f<n>"
+// One component of the GROUP BY key. A single key is resident as is; two or
+// three (§4.4) are packed into one BIGINT as a mixed-radix number: component
+// i occupies slot (v - min + 1), 0 meaning NULL, with radix range = max - min
+// + 2 and stride = product of the later ranges.
+struct KeyPart { std::string name; ColInfo info; std::int64_t min = 0; std::int64_t range = 0; std::int64_t stride = 1; };
 
 struct Context {
     std::string tag;
@@ -96,6 +101,8 @@ struct Context {
     ColInfo key, val;
     bool exact = false;                    // the set was uploaded by gpu_upload_rows_exact (v0.7 §4)
     std::vector<PredCol> preds;            // tag columns after key/payload, in order (exact sets)
+    std::vector<KeyPart> keys;             // 1..3 key components (packed when > 1)
+    bool packed() const { return keys.size() > 1; }
     std::string backend;
     std::int64_t rows = 0;
     bool ready = false;
@@ -199,6 +206,51 @@ Context parse_context(const json& c) {
             if (pc.info.floating) pc.lane = "f" + std::to_string(nf++);
             else                  pc.lane = "i" + std::to_string(ni++);   // integer family and DECIMAL
         }
+    }
+    // Key components: the tag's key field is "a" or "a+b[+c]"; "keys" in the
+    // context carries each component's integer image bounds for packing.
+    {
+        std::vector<std::string> names;
+        std::size_t p0 = 0;
+        while (true) {
+            const std::size_t k = x.key_col.find('+', p0);
+            names.push_back(x.key_col.substr(p0, k == std::string::npos ? std::string::npos : k - p0));
+            if (k == std::string::npos) break;
+            p0 = k + 1;
+        }
+        for (const auto& n : names) { KeyPart kp; kp.name = n; kp.info = col_info(n); x.keys.push_back(kp); }
+        if (c.contains("keys") && c["keys"].is_array()) {
+            const json& ks = c["keys"];
+            if (ks.size() != x.keys.size()) reject("error", "context.keys does not match the tag's key field");
+            for (std::size_t i = 0; i < ks.size(); ++i) {
+                const json& k = ks[i];
+                if (k.is_object()) {
+                    if (k.contains("type") && k["type"].is_string()) x.keys[i].info = parse_type(k["type"].get<std::string>());
+                    if (k.contains("min") && k["min"].is_number_integer() && k.contains("max") && k["max"].is_number_integer()) {
+                        x.keys[i].min = k["min"].get<std::int64_t>();
+                        const std::int64_t mx = k["max"].get<std::int64_t>();
+                        if (mx < x.keys[i].min) reject("error", "context.keys max < min");
+                        // range = max - min + 2 (one slot for NULL), checked against int64
+                        const std::uint64_t span = static_cast<std::uint64_t>(mx) - static_cast<std::uint64_t>(x.keys[i].min);
+                        if (span > (std::uint64_t{1} << 62)) reject("shape", "packed key component range too wide");
+                        x.keys[i].range = static_cast<std::int64_t>(span) + 2;
+                    }
+                }
+            }
+        }
+        if (x.keys.size() > 3) reject("shape", "more than three GROUP BY keys");
+        if (x.keys.size() > 1) {
+            // strides from the right; the product must fit in int64
+            std::int64_t stride = 1;
+            for (std::size_t i = x.keys.size(); i-- > 0;) {
+                if (x.keys[i].range < 2) reject("error", "context.keys has no bounds for a packed key component");
+                x.keys[i].stride = stride;
+                if (stride > std::numeric_limits<std::int64_t>::max() / x.keys[i].range)
+                    reject("shape", "packed key does not fit in 64 bits");
+                stride *= x.keys[i].range;
+            }
+        }
+        x.key = x.keys.empty() ? ColInfo{} : x.keys[0].info;
     }
     // Stats: {"col": {"has_null": b, "min": n, "max": n}}
     if (c.contains("stats") && c["stats"].is_object()) {
@@ -598,6 +650,33 @@ std::string xagg_native_type(XAgg a, const Context& cx) {
 // Output expression for a column of the exact function, typed exactly as
 // native: integers and HUGEINT by cast; DECIMAL(p, s) through the exact
 // scaled multiply, then CAST to DECIMAL(p, s) when p != 38.
+// A BIGINT-valued expression typed as `type` (integer family / DATE / TIMESTAMP).
+json j_typed_expr(json expr, const std::string& type, const std::string& name) {
+    ColInfo t = parse_type(type);
+    if (t.date) {
+        json epoch = j_cast(j_const_varchar("1970-01-01"), j_type("DATE"));
+        return j_function("+", json::array({epoch, j_cast(std::move(expr), j_type("INTEGER"))}), true, name);
+    }
+    if (t.timestamp) return j_function("make_timestamp", json::array({std::move(expr)}), false, name);
+    std::string id = type;
+    for (auto& ch : id) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    if (id == "INT") id = "INTEGER";
+    json out = j_cast(std::move(expr), j_type(id), name);
+    return out;
+}
+
+// Component i of a packed key, back to its column: nullif((key // stride) % range, 0) - 1 + min.
+json j_key_component(const Context& cx, std::size_t i, const std::string& type, const std::string& name) {
+    const KeyPart& kp = cx.keys[i];
+    json slot = j_colref("key");
+    if (kp.stride > 1) slot = j_function("//", json::array({slot, j_const_bigint(kp.stride)}), true);
+    if (i > 0)         slot = j_function("%",  json::array({slot, j_const_bigint(kp.range)}), true);
+    json v = j_function("nullif", json::array({slot, j_const_bigint(0)}));
+    v = j_function("-", json::array({v, j_const_bigint(1)}), true);
+    v = j_function("+", json::array({v, j_const_bigint(kp.min)}), true);
+    return j_typed_expr(std::move(v), type, name);
+}
+
 json j_output_exact(const std::string& col, const std::string& type, const std::string& name) {
     ColInfo t = parse_type(type);
     if (t.date) {
@@ -699,9 +778,9 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
     auto lane_of = [&](const json& e, ColInfo& info) -> std::string {
         const std::string c = column_ref(e, t, ta);
         if (c.empty()) reject("shape", "WHERE on an expression");
-        if (ieq(c, cx.key_col)) { info = cx.key; return "k"; }
-        if (!cx.val_col.empty() && ieq(c, cx.val_col)) { info = cx.val; return "v"; }
         for (const auto& pc : cx.preds) if (ieq(c, pc.name)) { info = pc.info; return pc.lane; }
+        if (!cx.packed() && ieq(c, cx.key_col)) { info = cx.key; return "k"; }
+        if (!cx.val_col.empty() && ieq(c, cx.val_col)) { info = cx.val; return "v"; }
         reject("shape", "WHERE column '" + c + "' is not in the resident set");
     };
     auto const_text = [&](const json& c, const ColInfo& info, int cmp, bool& drop_term, bool& always_false) -> std::string {
@@ -810,7 +889,8 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     Result r;
     // ---- column types (rule 2 gates) ----
     const bool bare = cx.val_col.empty();
-    if (!cx.key.integer && !cx.key.temporal()) reject(cx.key.floating ? "double" : "shape", "key type " + cx.key.type);
+    for (const auto& kp : cx.keys)
+        if (!kp.info.integer && !kp.info.temporal()) reject(kp.info.floating ? "double" : "shape", "key type " + kp.info.type);
     if (!bare) {
         if (cx.val.floating) reject("double", "payload type " + cx.val.type);
         if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
@@ -823,8 +903,12 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     if (!is_null(node, "where_clause")) where = where_program(node["where_clause"], cx, tname, talias);
 
     // ---- select list ----
-    struct Item { bool key; XAgg agg; std::string alias; };
+    struct Item { bool key; XAgg agg; std::string alias; std::size_t key_index; };
     std::vector<Item> items;
+    auto key_index_of = [&](const std::string& c) -> int {
+        for (std::size_t i = 0; i < cx.keys.size(); ++i) if (ieq(c, cx.keys[i].name)) return static_cast<int>(i);
+        return -1;
+    };
     const json& sel = field(node, "select_list");
     if (!sel.is_array() || sel.empty()) reject("shape", "empty select list");
     for (const json& e : sel) {
@@ -835,14 +919,15 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         const std::string alias = sfield(e, "alias");
         if (cls == "COLUMN_REF") {
             const std::string c = column_ref(e, tname, talias);
-            if (c.empty() || !ieq(c, cx.key_col)) reject("shape", "column that is not the GROUP BY key");
-            items.push_back({true, XAgg::None, alias});
+            const int ki = c.empty() ? -1 : key_index_of(c);
+            if (ki < 0) reject("shape", "column that is not a GROUP BY key");
+            items.push_back({true, XAgg::None, alias, static_cast<std::size_t>(ki)});
             continue;
         }
         const XAgg a = xagg_of(e, cx, tname, talias);
         if (a == XAgg::None) reject("shape", "select-list expression of class " + cls);
         if (a == XAgg::Avg && cx.val.decimal) reject("decimal", "avg over a DECIMAL payload is not on the exact path");
-        items.push_back({false, a, alias});
+        items.push_back({false, a, alias, 0});
     }
     if (cx.outputs.size() != items.size()) reject("error", "context.outputs does not match the select list");
 
@@ -898,8 +983,8 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         else if (mt == "LIMIT_MODIFIER" && !limit_mod) limit_mod = &m;
         else reject("shape", "modifier " + mt);
     }
-    auto output_name_for_key = [&]() -> std::string {
-        for (std::size_t i = 0; i < items.size(); ++i) if (items[i].key) return cx.outputs[i].name;
+    auto output_name_for_key = [&](std::size_t ki) -> std::string {
+        for (std::size_t i = 0; i < items.size(); ++i) if (items[i].key && items[i].key_index == ki) return cx.outputs[i].name;
         return "";
     };
     auto output_name_for_agg = [&](XAgg a) -> std::string {
@@ -920,9 +1005,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                     }
             }
             const std::string c = column_ref(e, tname, talias);
-            if (!c.empty() && ieq(c, cx.key_col)) {
-                const std::string on = output_name_for_key();
-                if (on.empty()) reject("shape", "ORDER BY the key when the key is not selected");
+            const int ki = c.empty() ? -1 : key_index_of(c);
+            if (ki >= 0) {
+                const std::string on = output_name_for_key(static_cast<std::size_t>(ki));
+                if (on.empty()) reject("shape", "ORDER BY a key that is not selected");
                 return j_colref(on);
             }
             reject("shape", "ORDER BY an expression the rewrite cannot map");
@@ -1029,8 +1115,12 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     json new_select = json::array();
     for (std::size_t i = 0; i < items.size(); ++i) {
         const Output& o = cx.outputs[i];
-        if (items[i].key) new_select.push_back(j_output_exact("key", o.type, o.name));
-        else              new_select.push_back(j_output_exact(xagg_col(items[i].agg), o.type, o.name));
+        if (items[i].key) {
+            if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
+            else             new_select.push_back(j_output_exact("key", o.type, o.name));
+        } else {
+            new_select.push_back(j_output_exact(xagg_col(items[i].agg), o.type, o.name));
+        }
     }
 
     node["select_list"] = new_select;
@@ -1088,12 +1178,20 @@ Result do_rewrite(json tree, const json& ctxj) {
 
     const json& gexp = field(node, "group_expressions");
     const json& gsets = field(node, "group_sets");
-    if (!gexp.is_array() || gexp.size() != 1) reject("shape", "GROUP BY must have exactly one key");
-    if (!gsets.is_array() || gsets.size() != 1 || !gsets[0].is_array() || gsets[0].size() != 1)
+    if (!gexp.is_array() || gexp.empty() || gexp.size() > 3) reject("shape", "GROUP BY must have one to three keys");
+    if (!gsets.is_array() || gsets.size() != 1 || !gsets[0].is_array() || gsets[0].size() != gexp.size())
         reject("shape", "ROLLUP / CUBE / GROUPING SETS");
-    if (sfield(gexp[0], "class") == "CONSTANT") reject("shape", "ordinal GROUP BY");
-    const std::string gcol = column_ref(gexp[0], tname, talias);
-    if (gcol.empty() || !ieq(gcol, cx.key_col)) reject("shape", "GROUP BY key is not the resident key");
+    for (std::size_t i = 0; i < gexp.size(); ++i) {
+        if (!gsets[0][i].is_number_integer() || gsets[0][i].get<std::int64_t>() != static_cast<std::int64_t>(i))
+            reject("shape", "GROUPING SETS");
+        if (sfield(gexp[i], "class") == "CONSTANT") reject("shape", "ordinal GROUP BY");
+    }
+    if (gexp.size() != cx.keys.size()) reject("shape", "GROUP BY key count is not the resident set's");
+    for (std::size_t i = 0; i < gexp.size(); ++i) {
+        const std::string gcol = column_ref(gexp[i], tname, talias);
+        if (gcol.empty() || !ieq(gcol, cx.keys[i].name)) reject("shape", "GROUP BY key is not the resident key");
+    }
+    if (cx.packed() && !cx.exact) reject("shape", "packed keys need an exact set");
 
     if (cx.exact) return do_rewrite_exact(std::move(tree), std::move(node), cx, tname, talias);
     if (!is_null(node, "where_clause")) reject("shape", "WHERE needs an exact set (gpu_upload_rows_exact)");

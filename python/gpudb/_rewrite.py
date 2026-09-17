@@ -52,6 +52,7 @@ class OutItem:
     kind: str                 # 'key' | 'sum' | 'count' | 'count_star' | 'min' | 'max' | 'avg'
     name: str                 # output column name (alias or native auto-name)
     native_type: str          # from DESCRIBE of the original statement
+    key_index: int = 0        # 'key': which GROUP BY component
 
 
 # A WHERE term (v0.7 §4.6): column, op in {> >= < <= = <> in isnull isnotnull},
@@ -83,15 +84,26 @@ class Plan:
     tag: str = ""
     # v0.7 exact path
     exact: bool = False                # render for gpu_upload_rows_exact / gpu_groupby_exact_resident*
+    keys: List[str] = field(default_factory=list)        # GROUP BY components in order (key == keys[0])
+    key_types: List[str] = field(default_factory=list)
+    pack: List[Tuple[int, int, int]] = field(default_factory=list)   # per component (min, range, stride) when packed
     where: List[WhereTerm] = field(default_factory=list)
     pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
     pred_types: Dict[str, str] = field(default_factory=dict)
     topk_agg: str = ""                 # aggregate kind the top-k push orders by
 
     @property
+    def packed(self) -> bool:
+        return len(self.keys) > 1
+
+    @property
+    def key_field(self) -> str:
+        return "+".join(self.keys) if self.packed else self.key
+
+    @property
     def upload_columns(self) -> List[str]:
         if self.exact:
-            return [self.key, self.val if self.val else "-"] + list(self.pred_cols)
+            return [self.key_field, self.val if self.val else "-"] + list(self.pred_cols)
         return [self.key] + ([self.val] if self.val else [])
 
     def uses_exact_only(self) -> bool:
@@ -233,14 +245,18 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         pass
     groups = node.get("group_expressions") or []
     sets = node.get("group_sets") or []
-    if len(groups) != 1 or sets != [[0]]:
-        raise Decline("shape", "group by is not a single column")
-    key = _colref(groups[0])
-    if key is None:
+    if not 1 <= len(groups) <= 3 or sets != [list(range(len(groups)))]:
+        raise Decline("shape", "group by is not one to three columns")
+    keys = [_colref(g) for g in groups]
+    if any(k is None for k in keys):
         raise Decline("shape", "group by expression")
+    if len(set(keys)) != len(keys):
+        raise Decline("shape", "repeated group by column")
+    key = keys[0]
     alias_tbl = ft.get("alias") or table
     plan = Plan(catalog=ft.get("catalog_name") or "", schema=ft.get("schema_name") or "",
                 table=table, key=key)
+    plan.keys = list(keys)
 
     # where (v0.7 §4.6): a conjunction of column-vs-constant comparisons,
     # IN, BETWEEN, IS [NOT] NULL over columns of t
@@ -307,9 +323,9 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         alias = item.get("alias") or ""
         c = _colref(item)
         if c is not None:
-            if c != key:
+            if c not in plan.keys:
                 raise Decline("shape", f"non-key column {c}")
-            plan.outputs.append(OutItem("key", alias or c, ""))
+            plan.outputs.append(OutItem("key", alias or c, "", key_index=plan.keys.index(c)))
             continue
         a = _agg(item)
         if a is None:
@@ -371,8 +387,12 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                     out = plan.outputs[int(idx) - 1]
                     target = (out.kind, out.name)
                 elif c is not None:
-                    if c == key:
-                        target = ("key", key)
+                    if c in plan.keys:
+                        for out in plan.outputs:
+                            if out.kind == "key" and out.key_index == plan.keys.index(c):
+                                target = ("key", out.name)
+                        if target is None:
+                            raise Decline("shape", "order by a key that is not selected")
                     else:
                         # an output alias
                         for out in plan.outputs:
@@ -415,9 +435,11 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             if d in ("ASCENDING", "DESCENDING", "ASC", "DESC"):
                 plan.form = "topk"
                 plan.topk_agg = base
-    # predicate columns of the set: WHERE columns other than key / payload
+    # predicate columns of the set: WHERE columns other than the (single) key /
+    # payload; a packed key's components are ordinary lanes
     for w in plan.where:
-        if w.col not in (plan.key, plan.val) and w.col not in plan.pred_cols:
+        skip = (plan.key,) if not plan.packed else ()
+        if w.col not in skip and w.col != plan.val and w.col not in plan.pred_cols:
             plan.pred_cols.append(w.col)
     return plan
 
@@ -425,6 +447,21 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
 # ---------------------------------------------------------------------------
 # typing and rendering
 # ---------------------------------------------------------------------------
+def stat_image(x, col_type: str) -> Optional[int]:
+    """A stats() min/max as the integer the resident lane holds (days /
+    microseconds for temporal columns), or None when not parseable."""
+    if x is None:
+        return None
+    try:
+        if col_type == "DATE":
+            return _temporal_int(_dt.date.fromisoformat(str(x).strip()))
+        if col_type == "TIMESTAMP":
+            return _temporal_int(_dt.datetime.fromisoformat(str(x).strip().replace("T", " ")))
+        return int(x)
+    except (ValueError, TypeError):
+        return None
+
+
 def decimal_scale(t: str) -> Optional[Tuple[int, int]]:
     m = _DEC_RE.match(t.replace(" ", ""))
     return (int(m.group(1)), int(m.group(2))) if m else None
@@ -436,12 +473,17 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
         raise Decline("shape", "WHERE / min / max / avg need the exact path (backend without it)")
     if not exact and any(o.kind == "count" for o in plan.outputs):
         pass   # count(v) on a NULL-free v0.6 set is exact; NULLs are rejected by the stats gate
-    kt = columns.get(plan.key)
-    if kt is None:
-        raise Decline("shape", f"unknown column {plan.key}")
-    if kt not in _KEY_TYPES and not (exact and kt in _TEMPORAL_TYPES):
-        raise Decline("shape", f"key type {kt}")
-    plan.key_type = kt
+    if plan.packed and not exact:
+        raise Decline("shape", "several GROUP BY keys need the exact path")
+    plan.key_types = []
+    for kc in plan.keys:
+        kt = columns.get(kc)
+        if kt is None:
+            raise Decline("shape", f"unknown column {kc}")
+        if kt not in _KEY_TYPES and not (exact and kt in _TEMPORAL_TYPES):
+            raise Decline("shape", f"key type {kt}")
+        plan.key_types.append(kt)
+    plan.key_type = plan.key_types[0]
     for c in plan.pred_cols:
         pt = columns.get(c)
         if pt is None:
@@ -452,7 +494,7 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
             raise Decline("shape", f"WHERE column type {pt}")
     # a temporal column only compares against a plain literal of its own type
     for w in plan.where:
-        ct = plan.key_type if w.col == plan.key else plan.pred_types.get(w.col, columns.get(w.col, ""))
+        ct = plan.key_type if (w.col == plan.key and not plan.packed) else plan.pred_types.get(w.col, columns.get(w.col, ""))
         lits = w.lit if isinstance(w.lit, list) else ([] if w.lit is None else [w.lit])
         for x in lits:
             is_dt = isinstance(x, _dt.datetime)
@@ -515,7 +557,7 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
     """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col == plan.key:
+    if col == plan.key and not plan.packed:
         return "k", "i", 0
     if col == plan.val:
         return "v", "i", plan.scale
@@ -622,6 +664,25 @@ def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     return f'CAST(r."{col}" AS {native_type})'
 
 
+def _typed_expr(expr: str, native_type: str) -> str:
+    if native_type.upper() == "DATE":
+        return f"(DATE '1970-01-01' + CAST({expr} AS INTEGER))"
+    if native_type.upper() == "TIMESTAMP":
+        return f"make_timestamp({expr})"
+    return f"CAST({expr} AS {native_type})"
+
+
+def _key_component_expr(plan: Plan, i: int, native_type: str) -> str:
+    """Component i of a packed key: nullif((key // stride) % range, 0) - 1 + min."""
+    mn, rng, stride = plan.pack[i]
+    slot = 'r."key"'
+    if stride > 1:
+        slot = f"({slot} // {stride})"
+    if i > 0:
+        slot = f"({slot} % {rng})"
+    return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type)
+
+
 def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     tag = plan.tag.replace("'", "''")
     fn, args = "gpu_groupby_exact_resident", [f"'{tag}'"]
@@ -648,6 +709,9 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
     cols = []
     for out in plan.outputs:
+        if out.kind == "key" and plan.packed:
+            cols.append(f'{_key_component_expr(plan, out.key_index, out.native_type)} AS "{out.name}"')
+            continue
         col = "key" if out.kind == "key" else out.kind
         cols.append(f'{_out_expr(plan, col, out.native_type)} AS "{out.name}"')
     sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
@@ -737,6 +801,13 @@ def upload_sql(plan: Plan, fqn: str) -> str:
             return f'epoch_us("{col}")'
         return f'CAST("{col}" AS BIGINT)'
     k = lane(plan.key, plan.key_type)
+    if plan.exact and plan.packed:
+        # mixed-radix pack: slot_i = coalesce(image - min + 1, 0); key = sum(slot_i * stride_i)
+        parts = []
+        for kc, kt, (mn, rng, stride) in zip(plan.keys, plan.key_types, plan.pack):
+            slot = f"coalesce({lane(kc, kt)} - {mn} + 1, 0)"
+            parts.append(f"{slot} * {stride}" if stride > 1 else slot)
+        k = f"CAST({' + '.join(parts)} AS BIGINT)"
     if plan.exact:
         if plan.val is None:
             v = "CAST(NULL AS BIGINT)"

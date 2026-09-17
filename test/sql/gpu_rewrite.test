@@ -246,3 +246,33 @@ SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT d, sum(v) 
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT d, sum(v) FROM t WHERE d < TIMESTAMP ''1995-01-01 00:00:00'' GROUP BY d'), getvariable('ctx')), '$.gpudb.reason') AS mixed_types,
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT d, sum(v) FROM t WHERE ts < TIMESTAMP ''1995-01-01 00:00:00+02'' GROUP BY d'), getvariable('ctx')), '$.gpudb.reason') AS with_zone;
 -- expect: shape  shape  shape
+
+-- 25. EXACT: two GROUP BY keys (INTEGER + DATE, NULLs in both) packed into one BIGINT and unpacked on the way out — identical rows and types
+-- setup: CREATE TABLE t AS SELECT CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 50)::INTEGER END AS a, CASE WHEN i % 23 = 0 THEN NULL ELSE DATE '1995-01-01' + (i % 30)::INTEGER END AS d, (i % 1000)::BIGINT AS v FROM range(200000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:t:9:a+d,v', CAST(coalesce(CAST(a AS BIGINT) - 0 + 1, 0) * 31 + coalesce(CAST(d - DATE '1970-01-01' AS BIGINT) - 9131 + 1, 0) AS BIGINT), v, [], []) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:a+d,v","exact":true,"keys":[{"name":"a","type":"INTEGER","min":0,"max":49},{"name":"d","type":"DATE","min":9131,"max":9160}],"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"a":"INTEGER","d":"DATE","v":"BIGINT"},"backend":"METAL","rows":200000,"ready":true,"default_order":"ASC","outputs":[{"name":"a","type":"INTEGER"},{"name":"d","type":"DATE"},{"name":"sum(v)","type":"HUGEINT"},{"name":"count_star()","type":"BIGINT"}],"thresholds":{"min_rows":1000}}'
+-- setup: SET VARIABLE q = 'SELECT a, d, sum(v), count(*) FROM t GROUP BY a, d'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.reason') AS reason,
+       (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) EXCEPT SELECT a, d, sum(v), count(*) FROM t GROUP BY a, d)) AS extra,
+       (SELECT count(*) FROM (SELECT a, d, sum(v), count(*) FROM t GROUP BY a, d EXCEPT SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))))) AS missing,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) = (SELECT count(*) FROM (SELECT 1 FROM t GROUP BY a, d)) AS same_groups,
+       (SELECT typeof(a) || ' ' || typeof(d) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIMIT 1) AS types;
+-- expect: rewritten  0  0  true  INTEGER DATE
+
+-- 26. EXACT: three packed keys with a WHERE on a component (a predicate lane) and ORDER BY the second key; identical rows
+-- setup: CREATE TABLE t AS SELECT (i % 7)::INTEGER AS a, (i % 11)::BIGINT AS b, (i % 13)::SMALLINT AS c, (i % 100)::BIGINT AS v FROM range(300000) r(i)
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:t:9:a+b+c,v,b', CAST(coalesce(CAST(a AS BIGINT) - 0 + 1, 0) * 168 + coalesce(CAST(b AS BIGINT) - 0 + 1, 0) * 14 + coalesce(CAST(c AS BIGINT) - 0 + 1, 0) AS BIGINT), v, [CAST(b AS BIGINT)], []) FROM t
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:a+b+c,v,b","exact":true,"keys":[{"name":"a","type":"INTEGER","min":0,"max":6},{"name":"b","type":"BIGINT","min":0,"max":10},{"name":"c","type":"SMALLINT","min":0,"max":12}],"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"a":"INTEGER","b":"BIGINT","c":"SMALLINT","v":"BIGINT"},"backend":"METAL","rows":300000,"ready":true,"default_order":"ASC","outputs":[{"name":"c","type":"SMALLINT"},{"name":"b","type":"BIGINT"},{"name":"s","type":"HUGEINT"}],"thresholds":{"min_rows":1000}}'
+-- setup: SET VARIABLE q = 'SELECT c, b, sum(v) AS s FROM t WHERE b >= 4 GROUP BY a, b, c ORDER BY b, c, s'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.reason') AS reason,
+       (SELECT count(*) FROM (SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) EXCEPT SELECT c, b, sum(v) AS s FROM t WHERE b >= 4 GROUP BY a, b, c)) AS extra,
+       (SELECT count(*) FROM (SELECT c, b, sum(v) AS s FROM t WHERE b >= 4 GROUP BY a, b, c EXCEPT SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))))) AS missing,
+       (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) AS groups;
+-- expect: rewritten  0  0  637
+
+-- 27. EXACT: packed keys decline by field — GROUP BY in another order than the set, a fourth key, a component the set lacks
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:a+b,v","exact":true,"keys":[{"name":"a","type":"INTEGER","min":0,"max":6},{"name":"b","type":"BIGINT","min":0,"max":10}],"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"a":"INTEGER","b":"BIGINT","c":"SMALLINT","v":"BIGINT"},"backend":"METAL","rows":300000,"ready":true,"outputs":[{"name":"a","type":"INTEGER"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":1000}}'
+SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT a, sum(v) FROM t GROUP BY b, a'), getvariable('ctx')), '$.gpudb.reason') AS other_order,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT a, sum(v) FROM t GROUP BY a, b, c, v'), getvariable('ctx')), '$.gpudb.reason') AS four_keys,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT a, sum(v) FROM t GROUP BY a, c'), getvariable('ctx')), '$.gpudb.reason') AS wrong_component;
+-- expect: shape  shape  shape
