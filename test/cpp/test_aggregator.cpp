@@ -898,6 +898,238 @@ void test_backend(gpudb::Backend b) {
         }
         if (implemented) std::printf("    ok\n");
     }
+
+    // ---- Materialised key join (v0.7 §4.8) vs a host reference ----
+    // The join output is an ordinary exact row set, so it is checked through
+    // groupby_exact_[masked_]resident over its lanes: key from the probe or
+    // the build side, gathered I64 / F64 lanes with NULLs as predicates, a
+    // bitmap build key, a chained second join, and the error rules.
+    {
+        std::printf("  materialised key join:\n");
+        using Op = gpudb::Predicate::Op;
+        using Opt = std::pair<bool, std::int64_t>;               // (valid, value)
+        bool implemented = true;
+        try {
+            std::mt19937_64 rng(0x701AULL);
+            std::uniform_int_distribution<int> pct(0, 99);
+            const std::size_t D = 50'003, N = 300'007;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            auto bits_of = [](double d) { std::int64_t b; std::memcpy(&b, &d, sizeof(b)); return b; };
+            auto dbl_of  = [](std::int64_t b) { double d; std::memcpy(&d, &b, sizeof(d)); return d; };
+            // build side: unique key (1% NULL), I64 attr (5% NULL), F64 attr (5% NULL)
+            std::vector<Opt> bkey(D), battr(D), bf(D);
+            {
+                std::vector<std::int64_t> ids(D);
+                for (std::size_t i = 0; i < D; ++i) ids[i] = static_cast<std::int64_t>(i) * 3 - 1000;
+                std::shuffle(ids.begin(), ids.end(), rng);
+                std::uniform_int_distribution<std::int64_t> ad(-50, 50);
+                std::uniform_real_distribution<double> fd(0.0, 1.0);
+                for (std::size_t i = 0; i < D; ++i) {
+                    bkey[i]  = {pct(rng) >= 1, ids[i]};
+                    battr[i] = {pct(rng) >= 5, ad(rng)};
+                    bf[i]    = {pct(rng) >= 5, bits_of(fd(rng))};
+                }
+            }
+            // probe side: group key (3% NULL), payload spanning int64 (3% NULL), fk (5% NULL, 15% dangling)
+            std::vector<Opt> pgk(N), pval(N), pfk(N);
+            {
+                std::uniform_int_distribution<std::int64_t> gd(-2000, 2000);
+                std::uniform_int_distribution<std::int64_t> vd(std::numeric_limits<std::int64_t>::min() / 2,
+                                                               std::numeric_limits<std::int64_t>::max() / 2);
+                std::uniform_int_distribution<std::size_t> pick(0, D - 1);
+                for (std::size_t i = 0; i < N; ++i) {
+                    pgk[i]  = {pct(rng) >= 3, gd(rng)};
+                    pval[i] = {pct(rng) >= 3, vd(rng)};
+                    const int p = pct(rng);
+                    if (p < 5)       pfk[i] = {false, 0};
+                    else if (p < 20) pfk[i] = {true, static_cast<std::int64_t>(pick(rng)) * 3 - 999};   // never a build key
+                    else             pfk[i] = {true, bkey[pick(rng)].second};                          // may hit a NULL-key build row's value: no match
+                }
+            }
+            // Upload helper: lanes of Opt columns, lane 0 = key layout.
+            auto upload = [&](const std::vector<const std::vector<Opt>*>& cols, const std::vector<gpudb::Dtype>& dts) {
+                const std::size_t rows = cols[0]->size(), L = cols.size();
+                std::vector<std::int64_t> lanes(rows * L);
+                std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((rows + 63) / 64, ~std::uint64_t{0}));
+                for (std::size_t l = 0; l < L; ++l)
+                    for (std::size_t i = 0; i < rows; ++i) {
+                        lanes[i * L + l] = (*cols[l])[i].second;
+                        if (!(*cols[l])[i].first) valid[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+                    }
+                std::vector<const std::uint64_t*> vp(L);
+                for (std::size_t l = 0; l < L; ++l) vp[l] = valid[l].data();
+                gpudb::Aggregator::RowSpan sp; sp.lanes = lanes.data(); sp.rows = rows; sp.n_lanes = L; sp.valid = vp.data();
+                return agg->upload_rows_exact(&sp, 1, dts.data(), L);
+            };
+            using DT = gpudb::Dtype;
+            auto bset = upload({&bkey, &battr, &bf}, {DT::I64, DT::I64, DT::F64});           // build key = key layout
+            auto bset2 = upload({&battr, &battr, &bkey, &bf}, {DT::I64, DT::I64, DT::I64, DT::F64});   // build key under a bitmap
+            auto pset = upload({&pgk, &pval, &pfk}, {DT::I64, DT::I64, DT::I64});
+
+            // Host join: probe row -> build row (or none).
+            std::map<std::int64_t, std::size_t> bmap;
+            for (std::size_t i = 0; i < D; ++i) if (bkey[i].first) bmap[bkey[i].second] = i;
+            std::vector<std::int64_t> hit(N, -1);
+            std::size_t matched = 0;
+            for (std::size_t i = 0; i < N; ++i) {
+                if (!pfk[i].first) continue;
+                auto it = bmap.find(pfk[i].second);
+                if (it != bmap.end()) { hit[i] = static_cast<std::int64_t>(it->second); ++matched; }
+            }
+            struct Acc { gpudb::Sum128 s; std::int64_t cnt = 0, cstar = 0, mn = 0, mx = 0; };
+            // Reference GROUP BY over joined rows; `keep(i)` is the WHERE.
+            auto reference = [&](std::function<Opt(std::size_t)> key, std::function<bool(std::size_t)> keep) {
+                std::map<std::pair<int, std::int64_t>, Acc> g;      // (is_null, key): NULL group last
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (hit[i] < 0 || !keep(i)) continue;
+                    const Opt k = key(i);
+                    Acc& a = g[{k.first ? 0 : 1, k.first ? k.second : 0}];
+                    ++a.cstar;
+                    if (pval[i].first) {
+                        const std::int64_t v = pval[i].second;
+                        if (a.cnt == 0) { a.mn = v; a.mx = v; } else { a.mn = std::min(a.mn, v); a.mx = std::max(a.mx, v); }
+                        a.s.add(v); ++a.cnt;
+                    }
+                }
+                return g;
+            };
+            auto same = [&](const gpudb::GroupByResidentResult& got,
+                            const std::map<std::pair<int, std::int64_t>, Acc>& want, const char* what) {
+                bool ok = got.keys.size() == want.size();
+                std::size_t q = 0;
+                for (auto it = want.begin(); ok && it != want.end(); ++it, ++q) {
+                    const Acc& a = it->second;
+                    ok = got.key_null[q] == it->first.first && (it->first.first || got.keys[q] == it->first.second) &&
+                         got.counts[q] == a.cnt && got.counts_star[q] == a.cstar &&
+                         (a.cnt == 0 || (static_cast<std::uint64_t>(got.sums[q]) == a.s.lo && got.sums_hi[q] == a.s.hi &&
+                                         got.mins[q] == a.mn && got.maxs[q] == a.mx));
+                }
+                if (!ok) std::printf("    FAIL %s: got %zu groups, ref %zu\n", what, got.keys.size(), want.size());
+                return ok;
+            };
+
+            // A: key from the probe side; gathered I64 + F64 lanes as predicates.
+            for (int variant = 0; variant < 2; ++variant) {
+                const auto& bs = variant == 0 ? bset : bset2;
+                const gpudb::ResidentColumn& bk = variant == 0 ? *bs[0] : *bs[2];
+                const gpudb::ResidentColumn& ba = variant == 0 ? *bs[1] : *bs[0];   // variant 1: a key-layout source lane
+                const gpudb::ResidentColumn& bfl = variant == 0 ? *bs[2] : *bs[3];
+                gpudb::JoinLane outA[4] = {{pset[0].get(), false}, {pset[1].get(), false}, {&ba, true}, {&bfl, true}};
+                auto ja = agg->join_materialize(*pset[2], bk, outA, 4);
+                std::size_t null_keys = 0;
+                for (std::size_t i = 0; i < N; ++i) null_keys += (hit[i] >= 0 && !pgk[i].first);
+                EXPECT_EQ(ja.rows_out, matched);
+                EXPECT_EQ(ja.null_key_rows, null_keys);
+                EXPECT_EQ(ja.rows_probe, N);
+                EXPECT_EQ(ja.rows_build, D);
+                EXPECT_EQ(ja.lanes.size(), std::size_t(4));
+                EXPECT(ja.lanes[3]->dtype() == DT::F64);
+                auto got = agg->groupby_exact_resident(*ja.lanes[0], ja.lanes[1].get(), cap);
+                EXPECT(same(got, reference([&](std::size_t i) { return pgk[i]; }, [](std::size_t) { return true; }), "join A plain"));
+                gpudb::Predicate pr[2];
+                pr[0].col = ja.lanes[2].get(); pr[0].op = Op::GE; pr[0].value = 0;
+                pr[1].col = ja.lanes[3].get(); pr[1].op = Op::LT; pr[1].value = bits_of(0.5);
+                auto gotw = agg->groupby_exact_masked_resident(*ja.lanes[0], ja.lanes[1].get(), pr, 2, cap);
+                EXPECT(same(gotw, reference([&](std::size_t i) { return pgk[i]; },
+                    [&](std::size_t i) {
+                        const Opt a = battr[hit[i]], f = bf[hit[i]];
+                        return a.first && a.second >= 0 && f.first && dbl_of(f.second) < 0.5;
+                    }), "join A where"));
+                gpudb::Predicate isn; isn.col = ja.lanes[3].get(); isn.op = Op::IsNull;
+                auto gotn = agg->groupby_exact_masked_resident(*ja.lanes[0], ja.lanes[1].get(), &isn, 1, cap);
+                EXPECT(same(gotn, reference([&](std::size_t i) { return pgk[i]; },
+                    [&](std::size_t i) { return !bf[hit[i]].first; }), "join A is null"));
+            }
+            // B: key from the build side (NULL attr -> the NULL-key suffix).
+            gpudb::JoinLane outB[3] = {{bset[1].get(), true}, {pset[1].get(), false}, {pset[0].get(), false}};
+            auto jb = agg->join_materialize(*pset[2], *bset[0], outB, 3);
+            {
+                std::size_t null_keys = 0;
+                for (std::size_t i = 0; i < N; ++i) null_keys += (hit[i] >= 0 && !battr[hit[i]].first);
+                EXPECT_EQ(jb.rows_out, matched);
+                EXPECT_EQ(jb.null_key_rows, null_keys);
+                EXPECT(null_keys > 0);
+                auto got = agg->groupby_exact_resident(*jb.lanes[0], jb.lanes[1].get(), cap);
+                EXPECT(same(got, reference([&](std::size_t i) { return battr[hit[i]]; }, [](std::size_t) { return true; }), "join B plain"));
+                gpudb::Predicate p; p.col = jb.lanes[2].get(); p.op = Op::LT; p.value = 0;
+                auto gotw = agg->groupby_exact_masked_resident(*jb.lanes[0], jb.lanes[1].get(), &p, 1, cap);
+                EXPECT(same(gotw, reference([&](std::size_t i) { return battr[hit[i]]; },
+                    [&](std::size_t i) { return pgk[i].first && pgk[i].second < 0; }), "join B where"));
+            }
+            // C: chain — B's key lane (NULL suffix) probes a second dimension.
+            {
+                std::vector<Opt> d2k, d2a;
+                for (std::int64_t k = -50; k <= 50; ++k) if (k % 7 != 0) { d2k.push_back({true, k}); d2a.push_back({k % 5 != 0, k * 11}); }
+                auto d2 = upload({&d2k, &d2a}, {DT::I64, DT::I64});
+                gpudb::JoinLane outC[2] = {{d2[1].get(), true}, {jb.lanes[1].get(), false}};
+                auto jc = agg->join_materialize(*jb.lanes[0], *d2[0], outC, 2);
+                std::map<std::pair<int, std::int64_t>, Acc> want;
+                std::size_t rows = 0;
+                for (std::size_t i = 0; i < N; ++i) {
+                    if (hit[i] < 0 || !battr[hit[i]].first) continue;
+                    const std::int64_t k = battr[hit[i]].second;
+                    if (k % 7 == 0) continue;
+                    ++rows;
+                    Acc& a = want[{k % 5 != 0 ? 0 : 1, k % 5 != 0 ? k * 11 : 0}];
+                    ++a.cstar;
+                    if (pval[i].first) {
+                        const std::int64_t v = pval[i].second;
+                        if (a.cnt == 0) { a.mn = v; a.mx = v; } else { a.mn = std::min(a.mn, v); a.mx = std::max(a.mx, v); }
+                        a.s.add(v); ++a.cnt;
+                    }
+                }
+                EXPECT_EQ(jc.rows_out, rows);
+                auto got = agg->groupby_exact_resident(*jc.lanes[0], jc.lanes[1].get(), cap);
+                EXPECT(same(got, want, "join C chain"));
+            }
+            // Empty sides.
+            {
+                std::vector<Opt> none;
+                auto e = upload({&none, &none}, {DT::I64, DT::I64});
+                gpudb::JoinLane o1[1] = {{pset[0].get(), false}};
+                auto j1 = agg->join_materialize(*pset[2], *e[0], o1, 1);
+                EXPECT_EQ(j1.rows_out, std::size_t(0));
+                gpudb::JoinLane o2[1] = {{e[1].get(), false}};
+                auto j2 = agg->join_materialize(*e[0], *bset[0], o2, 1);
+                EXPECT_EQ(j2.rows_out, std::size_t(0));
+                auto g0 = agg->groupby_exact_resident(*j1.lanes[0], nullptr, cap);
+                EXPECT_EQ(g0.keys.size(), std::size_t(0));
+            }
+            // Errors: duplicate build key, lane row count, F64 key lane.
+            {
+                std::vector<Opt> dk = {{true, 5}, {true, 9}, {true, 5}}, da = {{true, 1}, {true, 2}, {true, 3}};
+                auto dup = upload({&dk, &da}, {DT::I64, DT::I64});
+                gpudb::JoinLane o[1] = {{pset[0].get(), false}};
+                bool threw = false;
+                try { (void)agg->join_materialize(*pset[2], *dup[0], o, 1); }
+                catch (const std::runtime_error& e) { threw = std::string(e.what()).find("not unique") != std::string::npos; }
+                EXPECT(threw);
+                // duplicates hidden behind NULLs are fine
+                std::vector<Opt> nk = {{false, 5}, {true, 9}, {false, 5}};
+                auto nul = upload({&da, &da, &nk}, {DT::I64, DT::I64, DT::I64});
+                bool ok = true;
+                try { (void)agg->join_materialize(*pset[2], *nul[2], o, 1); } catch (const std::runtime_error&) { ok = false; }
+                EXPECT(ok);
+                gpudb::JoinLane wrong[1] = {{pset[0].get(), true}};       // a probe lane declared as build
+                threw = false;
+                try { (void)agg->join_materialize(*pset[2], *bset[0], wrong, 1); } catch (const std::runtime_error&) { threw = true; }
+                EXPECT(threw);
+                gpudb::JoinLane fkey[1] = {{bset[2].get(), true}};        // F64 key lane
+                threw = false;
+                try { (void)agg->join_materialize(*pset[2], *bset[0], fkey, 1); } catch (const std::runtime_error&) { threw = true; }
+                EXPECT(threw);
+            }
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
 }
 
 } // namespace

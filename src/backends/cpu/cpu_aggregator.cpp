@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if GPUDB_HAVE_OPENMP
@@ -558,6 +559,93 @@ public:
                                                         std::size_t max_groups,
                                                         const GroupByFilter& filter) override {
         return exact_impl(keys, vals, preds, n_preds, max_groups, filter, "groupby_exact_masked_resident");
+    }
+
+    // ---- v0.7 §4.8: the materialised key join — reference implementation ----
+    bool join_supported() const noexcept override { return true; }
+
+    JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                           const ResidentColumn& build_key,
+                                           const JoinLane* out, std::size_t n_out) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64_nullable(probe_key);
+        const auto& bk = check_i64_nullable(build_key);
+        if (n_out == 0 || !out) throw std::runtime_error("join_materialize: no output lanes");
+        for (std::size_t l = 0; l < n_out; ++l) {
+            if (!out[l].col) throw std::runtime_error("join_materialize: output lane without a column");
+            if (out[l].col->backend_tag() != Backend::CPU)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            if (out[l].col->rows() != (out[l].from_build ? bk.rows() : pk.rows()))
+                throw std::runtime_error("join_materialize: lane " + std::to_string(l) +
+                                         " row count differs from its side of the join");
+        }
+        if (out[0].col->dtype() != Dtype::I64)
+            throw std::runtime_error("join_materialize: the key lane must be I64");
+        if (pk.rows() > 0xFFFFFFFEull || bk.rows() > 0xFFFFFFFEull)
+            throw std::runtime_error("join_materialize: > 2^32-2 rows unsupported");
+
+        JoinMaterializeResult r;
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+
+        // Build side: valid key -> row; a second row for one key is the error.
+        std::unordered_map<std::int64_t, std::uint32_t> map;
+        map.reserve(bk.rows() * 2);
+        const std::int64_t* bd = bk.as_i64();
+        for (std::size_t i = 0; i < bk.rows(); ++i) {
+            if (!bk.valid(i)) continue;
+            if (!map.emplace(bd[i], static_cast<std::uint32_t>(i)).second)
+                throw std::runtime_error("join_materialize: build key not unique");
+        }
+
+        // Probe: match row and output class (0 none, 1 valid out key, 2 NULL out key).
+        const std::size_t n = pk.rows();
+        const std::int64_t* pd = pk.as_i64();
+        const auto& kc = static_cast<const CpuResidentColumn&>(*out[0].col);
+        std::vector<std::uint32_t> match(n, 0xFFFFFFFFu);
+        std::vector<std::uint8_t>  cls(n, 0);
+        std::size_t n1 = 0, n2 = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!pk.valid(i)) continue;
+            const auto it = map.find(pd[i]);
+            if (it == map.end()) continue;
+            match[i] = it->second;
+            const std::size_t krow = out[0].from_build ? it->second : i;
+            if (kc.valid(krow)) { cls[i] = 1; ++n1; } else { cls[i] = 2; ++n2; }
+        }
+        const std::size_t rows_out = n1 + n2;
+        std::vector<std::uint32_t> pos(n, 0);
+        {
+            std::size_t a = 0, b = n1;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (cls[i] == 1) pos[i] = static_cast<std::uint32_t>(a++);
+                else if (cls[i] == 2) pos[i] = static_cast<std::uint32_t>(b++);
+            }
+        }
+        const std::size_t words = (rows_out + 63) / 64;
+        r.lanes.reserve(n_out);
+        for (std::size_t l = 0; l < n_out; ++l) {
+            const auto& sc = static_cast<const CpuResidentColumn&>(*out[l].col);
+            const std::int64_t* sd = sc.as_i64();          // raw 8-byte cells
+            std::vector<std::int64_t>  data(rows_out, 0);
+            std::vector<std::uint64_t> valid(words, ~std::uint64_t{0});
+            std::size_t nulls = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!cls[i]) continue;
+                const std::size_t srow = out[l].from_build ? match[i] : i;
+                const std::size_t d = pos[i];
+                if (sc.valid(srow)) data[d] = sd[srow];
+                else { valid[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); ++nulls; }
+            }
+            // Lane 0: its NULLs are exactly the suffix, no bitmap (key layout).
+            std::vector<std::uint64_t> vb = (l == 0 || nulls == 0) ? std::vector<std::uint64_t>{} : std::move(valid);
+            r.lanes.push_back(std::make_unique<CpuResidentColumn>(std::move(data), std::move(vb),
+                                                                  nulls, sc.dtype()));
+        }
+        r.rows_out = rows_out;
+        r.null_key_rows = n2;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
     }
 
     GroupByResidentResult exact_impl(const ResidentColumn& keys, const ResidentColumn* vals,

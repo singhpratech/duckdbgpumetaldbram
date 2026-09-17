@@ -479,6 +479,22 @@ public:
         return n;
     }
 
+    // Caller holds registry_mu. False (and the offending source's name) when
+    // a source of `set` is gone, replaced or stale.
+    bool deps_current_locked(const ResidentSet& set, std::string& changed, int depth) const {
+        for (const auto& d : set.deps) {
+            const auto src = d.second.lock();
+            const auto it = registry.find(d.first);
+            if (!src || it == registry.end() || it->second != src ||
+                src->state.load(std::memory_order_acquire) == SetState::Stale ||
+                depth > 8 || !deps_current_locked(*src, changed, depth + 1)) {
+                if (changed.empty()) changed = d.first;
+                return false;
+            }
+        }
+        return true;
+    }
+
     // Lookup with hit accounting. Throws when unknown or stale.
     std::shared_ptr<ResidentSet> acquire(const std::string& name, const char* fn,
                                          bool count_hit = true) {
@@ -496,6 +512,18 @@ public:
             throw std::runtime_error(std::string("GPUDB_STALE: ") + fn + ": resident set '" +
                 name + "' is stale (invalidated at epoch " + std::to_string(s->epoch) +
                 ") — re-upload it");
+        }
+        if (!s->deps.empty()) {
+            // A derived (joined) set lives only as long as each source — and,
+            // through a chain of joins, each source's sources — is the
+            // registry's current, non-stale entry for its name.
+            std::lock_guard<std::mutex> lock(registry_mu);
+            std::string changed;
+            if (!deps_current_locked(*s, changed, 0)) {
+                s->state.store(SetState::Stale);
+                throw std::runtime_error(std::string("GPUDB_STALE: ") + fn + ": resident set '" +
+                    name + "' was joined from '" + changed + "', which changed — materialize it again");
+            }
         }
         if (count_hit) {
             s->hits.fetch_add(1, std::memory_order_relaxed);
@@ -862,9 +890,11 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
                  std::unique_ptr<gpudb::ResidentColumn> vals, bool pair, const char* fn,
                  bool exact = false,
                  std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds = {},
-                 std::size_t pred_int = 0, std::size_t pred_dbl = 0, std::size_t pred_str = 0) {
+                 std::size_t pred_int = 0, std::size_t pred_dbl = 0, std::size_t pred_str = 0,
+                 std::vector<std::pair<std::string, std::weak_ptr<ResidentSet>>> deps = {}) {
     auto set = std::make_shared<ResidentSet>();
     set->name = b.name;
+    set->deps = std::move(deps);
     set->managed = b.managed;
     set->exact = exact;
     set->preds = std::move(preds);
@@ -2070,6 +2100,161 @@ void prepare_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
     }
 }
 
+// gpu_join_materialize(out, probe, probe_lane, build, build_lane, lanes) -> BIGINT
+// (v0.7 §4.8). Inner equi-join of two exact sets on the device, published as
+// a NEW exact set `out` that every gpu_groupby_exact_resident* form reads
+// like an uploaded one. build_lane must be unique among its non-NULL cells
+// (a primary / unique key); the call fails with "build key not unique"
+// otherwise. `lanes` lists the output columns, each `p.<lane>` (probe set)
+// or `b.<lane>` (build set) with <lane> one of k v i<n> f<n> s<n>: the first
+// is the new key, the second the new payload (BIGINT), the rest the new
+// predicate columns — BIGINT lanes first, then DOUBLE, then VARCHAR, which
+// become i<n> / f<n> / s<n> of `out` in that order. String lanes (and a
+// string key) carry their dictionaries along. Returns the joined row count.
+// `out` is stale as soon as either source set is stale, dropped or replaced.
+struct JoinLaneRef {
+    const gpudb::ResidentColumn* col = nullptr;
+    char kind = 'i';                                                         // i | f | s
+    const std::unordered_map<std::uint64_t, std::string>* dict = nullptr;    // s lanes
+};
+JoinLaneRef join_lane_of(const ResidentSet& set, const std::string& c, const char* fn) {
+    JoinLaneRef r;
+    auto bad = [&]() {
+        return std::runtime_error(std::string(fn) + ": unknown lane '" + c + "' in set '" + set.name +
+                                  "' (k, v, i<n>, f<n>, s<n>)");
+    };
+    if (c == "k") {
+        r.col = set.keys.get();
+        if (set.key_str) { r.kind = 's'; r.dict = &set.key_dict; }
+    } else if (c == "v") {
+        r.col = set.vals.get();
+    } else if (c.size() > 1 && (c[0] == 'i' || c[0] == 'f' || c[0] == 's')) {
+        std::size_t idx = 0;
+        for (std::size_t q = 1; q < c.size(); ++q) {
+            if (!std::isdigit(static_cast<unsigned char>(c[q])) || q > 6) throw bad();
+            idx = idx * 10 + static_cast<std::size_t>(c[q] - '0');
+        }
+        const std::size_t count = c[0] == 'i' ? set.pred_int : c[0] == 'f' ? set.pred_dbl : set.pred_str;
+        if (idx >= count) throw bad();
+        const std::size_t base = c[0] == 'i' ? 0 : c[0] == 'f' ? set.pred_int : set.pred_int + set.pred_dbl;
+        r.col = set.preds[base + idx].get();
+        r.kind = c[0];
+        if (c[0] == 's') r.dict = &set.str_dicts[idx];
+    } else {
+        throw bad();
+    }
+    if (!r.col) throw bad();
+    return r;
+}
+
+void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    static const char* fn = "gpu_join_materialize";
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    duckdb_string_t* arg[6];
+    uint64_t* val[6];
+    for (idx_t a = 0; a < 6; ++a) {
+        duckdb_vector v = duckdb_data_chunk_get_vector(input, a);
+        arg[a] = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(v));
+        val[a] = duckdb_vector_get_validity(v);
+    }
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(output));
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        try {
+            for (idx_t a = 0; a < 6; ++a)
+                if (val[a] && !duckdb_validity_row_is_valid(val[a], i))
+                    throw std::runtime_error(std::string(fn) + ": arguments may not be NULL");
+            const std::string out_name = read_name(arg[0], i), probe_name = read_name(arg[1], i),
+                              probe_lane = read_name(arg[2], i), build_name = read_name(arg[3], i),
+                              build_lane = read_name(arg[4], i), spec = read_name(arg[5], i);
+            if (out_name.empty()) throw std::runtime_error(std::string(fn) + ": empty output name");
+            if (out_name == probe_name || out_name == build_name)
+                throw std::runtime_error(std::string(fn) + ": the output name must differ from both inputs");
+            UploadBuf b;                       // carries the name / tag / sequence publish_set reads
+            b.name = out_name;
+            if (starts_with(b.name, kTagPrefix)) {
+                const std::string err = parse_tag(b.name, b.tag);
+                if (!err.empty()) throw std::runtime_error(std::string(fn) + ": " + err);
+                b.managed = true;
+            }
+            b.seq_at_start = ctx.inval_seq.load(std::memory_order_acquire);
+            const auto t0 = std::chrono::steady_clock::now();
+            std::shared_ptr<ResidentSet> ps = ctx.acquire(probe_name, fn);
+            std::shared_ptr<ResidentSet> bs = ctx.acquire(build_name, fn);
+            if (!ps->exact || !bs->exact)
+                throw std::runtime_error(std::string(fn) + ": both inputs must be exact sets "
+                                         "(gpu_upload_pair_exact / gpu_upload_rows_exact / gpu_join_materialize)");
+            const JoinLaneRef pk = join_lane_of(*ps, probe_lane, fn);
+            const JoinLaneRef bk = join_lane_of(*bs, build_lane, fn);
+            if (pk.kind != 'i' || bk.kind != 'i')
+                throw std::runtime_error(std::string(fn) + ": the join lanes must be BIGINT lanes");
+
+            // lanes spec: "p.k, b.i0, ..."
+            std::vector<gpudb::JoinLane> lanes;
+            std::vector<JoinLaneRef> refs;
+            std::size_t pos = 0;
+            while (pos <= spec.size()) {
+                std::size_t comma = spec.find(',', pos);
+                if (comma == std::string::npos) comma = spec.size();
+                std::string tok = spec.substr(pos, comma - pos);
+                tok.erase(0, tok.find_first_not_of(" \t"));
+                tok.erase(tok.find_last_not_of(" \t") + 1);
+                pos = comma + 1;
+                if (tok.empty()) { if (comma == spec.size()) break; throw std::runtime_error(std::string(fn) + ": empty lane in '" + spec + "'"); }
+                if (tok.size() < 3 || tok[1] != '.' || (tok[0] != 'p' && tok[0] != 'b'))
+                    throw std::runtime_error(std::string(fn) + ": lane '" + tok + "' must be p.<lane> or b.<lane>");
+                const bool from_build = tok[0] == 'b';
+                JoinLaneRef ref = join_lane_of(from_build ? *bs : *ps, tok.substr(2), fn);
+                lanes.push_back(gpudb::JoinLane{ref.col, from_build});
+                refs.push_back(ref);
+            }
+            if (lanes.size() < 2)
+                throw std::runtime_error(std::string(fn) + ": lanes needs at least a key and a payload");
+            if (lanes.size() > 66)
+                throw std::runtime_error(std::string(fn) + ": at most 66 output lanes");
+            if (refs[0].kind == 'f') throw std::runtime_error(std::string(fn) + ": the key lane may not be a DOUBLE lane");
+            if (refs[1].kind != 'i') throw std::runtime_error(std::string(fn) + ": the payload lane must be a BIGINT lane");
+            std::size_t n_i = 0, n_f = 0, n_s = 0;
+            for (std::size_t l = 2; l < refs.size(); ++l) {
+                const char k = refs[l].kind;
+                if ((k == 'i' && (n_f || n_s)) || (k == 'f' && n_s))
+                    throw std::runtime_error(std::string(fn) + ": predicate lanes must list BIGINT lanes first, then DOUBLE, then VARCHAR");
+                (k == 'i' ? n_i : k == 'f' ? n_f : n_s)++;
+            }
+
+            gpudb::JoinMaterializeResult jr;
+            {
+                auto dev = resident_device_lock(ctx);
+                jr = ctx.aggregator().join_materialize(*pk.col, *bk.col, lanes.data(), lanes.size());
+            }
+            // dictionaries travel with their lanes
+            b.key_str = refs[0].kind == 's';
+            if (b.key_str) b.dicts.push_back(*refs[0].dict);
+            for (std::size_t l = 2; l < refs.size(); ++l)
+                if (refs[l].kind == 's') b.dicts.push_back(*refs[l].dict);
+            b.rows_seen = jr.rows_out;
+            std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
+            for (std::size_t l = 2; l < jr.lanes.size(); ++l) preds.push_back(std::move(jr.lanes[l]));
+            std::vector<std::pair<std::string, std::weak_ptr<ResidentSet>>> deps;
+            deps.emplace_back(probe_name, ps);
+            deps.emplace_back(build_name, bs);
+            publish_set(ctx, b, std::move(jr.lanes[0]), std::move(jr.lanes[1]), /*pair*/true, fn,
+                        /*exact*/true, std::move(preds), n_i, n_f, n_s, std::move(deps));
+            char buf[512];
+            std::snprintf(buf, sizeof(buf),
+                "op=join_materialize set=%s rows_probe=%zu rows_build=%zu rows_out=%zu null_key_rows=%zu "
+                "lanes=%zu kernel_ms=%.3f wall_ms=%.3f total_ms=%.3f",
+                out_name.c_str(), jr.rows_probe, jr.rows_build, jr.rows_out, jr.null_key_rows,
+                lanes.size(), jr.kernel_ms, jr.wall_ms, ms_since(t0));
+            ctx.record_stats(nullptr, buf);
+            out[i] = static_cast<std::int64_t>(jr.rows_out);
+        } catch (const std::exception& e) {
+            duckdb_scalar_function_set_error(info, e.what());
+            return;
+        }
+    }
+}
+
 // gpu_assert_rows(name, n) -> BOOLEAN. The in-statement staleness guard
 // (docs/TRANSPARENT_DESIGN.md §5.4): raises a TYPED error, prefix
 // "GPUDB_STALE:", unless the set exists, is not stale, and was uploaded from
@@ -2768,6 +2953,8 @@ void register_gpu_resident(duckdb_connection con,
         prepare_resident_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
     register_scalar_names(con, "gpu_invalidate",
         invalidate_exec, DUCKDB_TYPE_BIGINT, 1, ctx);
+    register_scalar_names(con, "gpu_join_materialize",
+        join_materialize_exec, DUCKDB_TYPE_BIGINT, 6, ctx);
     register_scalar_names(con, "gpu_upload_begin",
         upload_begin_exec, DUCKDB_TYPE_BOOLEAN, 1, ctx);
     register_scalar_names(con, "gpu_upload_finish",

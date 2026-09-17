@@ -1438,3 +1438,144 @@ kernel void gbx_sel_compact_i64(
         o_perm[pos] = perm[gid];
     }
 }
+
+// =====================================================================
+//  v0.7 §4.8: the materialised key join (gpu_backend.hpp join_materialize)
+//
+//  Build side: the sorted valid build keys + the permutation back to build
+//  rows. jm_unique flags an adjacent equal pair (the build key must be
+//  unique). jm_probe binary-searches every valid probe key and classifies
+//  the row: 0 no match, 1 match with a valid output key, 2 match with a NULL
+//  output key. Class 1 rows fill [0, n1) of the output in probe order, class
+//  2 rows the suffix [n1, n1+n2): block counts -> host scan -> jm_pos writes
+//  every kept row's destination; jm_gather then moves one lane per dispatch,
+//  clearing the destination validity bit of a NULL source cell (the bitmap
+//  is DuckDB's uint64 layout, addressed as little-endian uint32 halves so
+//  the clear can be atomic).
+// =====================================================================
+inline bool jm_valid(device const ulong* valid, uint has_valid, uint null_from, ulong row) {
+    return row < (ulong)null_from && gbx_valid(valid, has_valid, row);
+}
+
+kernel void jm_unique_i64(
+    device const long* sorted [[buffer(0)]],
+    constant uint&     n      [[buffer(1)]],
+    device atomic_uint* flag  [[buffer(2)]],
+    uint               gid    [[thread_position_in_grid]])
+{
+    if (gid + 1u >= n) return;
+    if (sorted[gid] == sorted[gid + 1u]) atomic_store_explicit(flag, 1u, memory_order_relaxed);
+}
+
+kernel void jm_probe_i64(
+    device const long*  pkey         [[buffer(0)]],
+    device const ulong* pvalid       [[buffer(1)]],
+    constant uint&      p_has_valid  [[buffer(2)]],
+    constant uint&      p_null_from  [[buffer(3)]],
+    constant uint&      n            [[buffer(4)]],
+    device const long*  sorted       [[buffer(5)]],
+    device const long*  perm         [[buffer(6)]],
+    constant uint&      nb           [[buffer(7)]],
+    device const ulong* kvalid       [[buffer(8)]],
+    constant uint&      k_has_valid  [[buffer(9)]],
+    constant uint&      k_null_from  [[buffer(10)]],
+    constant uint&      k_from_build [[buffer(11)]],
+    device uint*        match        [[buffer(12)]],
+    device uchar*       cls          [[buffer(13)]],
+    uint                gid          [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    uint  m = 0xFFFFFFFFu;
+    uchar c = 0u;
+    if (jm_valid(pvalid, p_has_valid, p_null_from, (ulong)gid)) {
+        const long k = pkey[gid];
+        uint lo = 0u, hi = nb;
+        while (lo < hi) {
+            const uint mid = lo + ((hi - lo) >> 1);
+            if (sorted[mid] < k) lo = mid + 1u; else hi = mid;
+        }
+        if (lo < nb && sorted[lo] == k) {
+            m = (uint)perm[lo];
+            const ulong krow = (k_from_build != 0u) ? (ulong)m : (ulong)gid;
+            c = jm_valid(kvalid, k_has_valid, k_null_from, krow) ? 1u : 2u;
+        }
+    }
+    match[gid] = m;
+    cls[gid]   = c;
+}
+
+kernel void jm_counts(
+    device const uchar* cls      [[buffer(0)]],
+    constant uint&      n        [[buffer(1)]],
+    device uint*        counts1  [[buffer(2)]],
+    device uint*        counts2  [[buffer(3)]],
+    uint                tid      [[thread_position_in_threadgroup]],
+    uint                gid      [[thread_position_in_grid]],
+    uint                block_id [[threadgroup_position_in_grid]])
+{
+    threadgroup uint s1[BLOCK];
+    threadgroup uint s2[BLOCK];
+    const uchar c = (gid < n) ? cls[gid] : (uchar)0u;
+    s1[tid] = (c == 1u) ? 1u : 0u;
+    s2[tid] = (c == 2u) ? 1u : 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) { s1[tid] += s1[tid + s]; s2[tid] += s2[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) { counts1[block_id] = s1[0]; counts2[block_id] = s2[0]; }
+}
+
+kernel void jm_pos(
+    device const uchar* cls      [[buffer(0)]],
+    constant uint&      n        [[buffer(1)]],
+    device const uint*  off1     [[buffer(2)]],
+    device const uint*  off2     [[buffer(3)]],
+    constant uint&      n1       [[buffer(4)]],
+    device uint*        pos      [[buffer(5)]],
+    uint                gid      [[thread_position_in_grid]],
+    uint                block_id [[threadgroup_position_in_grid]],
+    uint                lane     [[thread_index_in_simdgroup]],
+    uint                sg       [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup uint t1[BLOCK];
+    threadgroup uint t2[BLOCK];
+    const uchar c = (gid < n) ? cls[gid] : (uchar)0u;
+    const uint f1 = (c == 1u) ? 1u : 0u;
+    const uint f2 = (c == 2u) ? 1u : 0u;
+    const uint ex1 = simd_prefix_exclusive_sum(f1);
+    const uint ex2 = simd_prefix_exclusive_sum(f2);
+    const uint sum1 = simd_sum(f1);
+    const uint sum2 = simd_sum(f2);
+    if (lane == 0) { t1[sg] = sum1; t2[sg] = sum2; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint o1 = 0u, o2 = 0u;
+    for (uint s = 0; s < sg; ++s) { o1 += t1[s]; o2 += t2[s]; }
+    if (f1)      pos[gid] = off1[block_id] + o1 + ex1;
+    else if (f2) pos[gid] = n1 + off2[block_id] + o2 + ex2;
+}
+
+kernel void jm_gather(
+    device const long*  src         [[buffer(0)]],
+    device const ulong* svalid      [[buffer(1)]],
+    constant uint&      s_has_valid [[buffer(2)]],
+    constant uint&      s_null_from [[buffer(3)]],
+    constant uint&      from_build  [[buffer(4)]],
+    device const uint*  match       [[buffer(5)]],
+    device const uchar* cls         [[buffer(6)]],
+    device const uint*  pos         [[buffer(7)]],
+    constant uint&      n           [[buffer(8)]],
+    device long*        dst         [[buffer(9)]],
+    device atomic_uint* dvalid      [[buffer(10)]],
+    uint                gid         [[thread_position_in_grid]])
+{
+    if (gid >= n || cls[gid] == 0u) return;
+    const ulong srow = (from_build != 0u) ? (ulong)match[gid] : (ulong)gid;
+    const uint  d = pos[gid];
+    if (jm_valid(svalid, s_has_valid, s_null_from, srow)) {
+        dst[d] = src[srow];
+    } else {
+        dst[d] = 0l;
+        atomic_fetch_and_explicit(&dvalid[d >> 5], ~(1u << (d & 31u)), memory_order_relaxed);
+    }
+}

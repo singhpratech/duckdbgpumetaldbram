@@ -371,6 +371,49 @@ already applies, and the device result there is deterministic run to run
 state. The double-double option stays a setting on the explicit path.
 Revisited in v0.8 only if a definition of exactness against native exists.
 
+### 4.8 Key joins, materialised on the device
+The join shapes analytics SQL is made of are fact-to-dimension: `lineitem
+JOIN orders ON l_orderkey = o_orderkey`, then `orders JOIN customer`, and so
+on. The dimension side is joined on a primary / unique key, so every fact row
+has at most one match and the inner join is *a subset of the fact rows with
+dimension columns attached*. That is an exact row set of the §4.6 kind, and
+it is produced on the device once and kept:
+
+`Aggregator::join_materialize(probe_key, build_key, out lanes)` takes two
+resident row sets and returns a NEW one in the `upload_rows_exact` layout
+(lane 0 = the GROUP BY key, NULL-key rows in a suffix, probe order kept).
+Each output lane is a probe lane (copied) or a build lane (gathered through
+the match). Every form of §4.1–§4.6 then runs over the joined set unchanged —
+plain, `WHERE` on columns of either table, device `HAVING`, top-k — and an
+output lane can probe a further dimension, so snowflake chains are repeated
+calls. Semantics are native's: NULL join keys never match, a fact row
+without a match is absent, a gathered cell is NULL iff its source is. The
+result is bit-identical across backends, row for row.
+
+The build key MUST be unique among its non-NULL cells; the operator verifies
+it on the device (one pass over the sorted keys) and throws `build key not
+unique` otherwise, and the statement then runs native. Many-to-many joins,
+outer / semi / anti joins, non-equality conditions and joins whose result is
+returned row by row (no GROUP BY) are not rewritten: the first multiplies
+rows (a different operator), the last is bound by moving the rows back
+through DuckDB (rule 1, same finding as the plain form at millions of
+groups).
+
+Metal: the build key's sort cache (sorted keys + permutation) is the index;
+one kernel binary-searches every probe key and classifies the row, block
+counts + a host scan give the destinations, one gather kernel per output
+lane clears validity bits atomically. TPC-H SF1 on an M4 Max: 6.0M × 1.5M
+rows joined with four output lanes in 12 ms warm (25 ms including the build
+side's sort); SF1 statements over the joined set, identical to native:
+GROUP BY o_custkey 1.44×, top-10 customers 4.29×, three tables by
+c_nationkey under a date predicate 4.17× (min of 5, statement vs statement,
+operator-level: the rewriter does not emit joins yet).
+
+SQL: `gpu_join_materialize(out, probe, probe_lane, build, build_lane,
+'p.<lane>, b.<lane>, ...')` publishes the joined set under `out`; it goes
+stale as soon as either source set is stale, dropped or replaced (checked by
+identity on every use, through chains).
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection

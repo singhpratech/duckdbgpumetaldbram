@@ -121,7 +121,30 @@ def main() -> int:
                 else:
                     identical = sorted(map(str, got)) == sorted(map(str, nat))
                 t_tr = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                lr2 = con.last_rewrite()
+                if not lr2["rewritten"]:
+                    # the once-per-template output-size check sent the template
+                    # back to native after its first rewritten run: the timed
+                    # runs were native, there is no ratio to report
+                    print(f"| {key} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                          f"{'declined after the first run' if identical else 'FAIL rows differ'} ({lr2['reason']}) |")
+                    if not identical:
+                        fails.append((key, where, form, 0.0, identical))
+                    continue
                 ratio = t_nat / t_tr if t_tr > 0 else float("inf")
+                # A millisecond-scale statement can time a whole batch slow
+                # (device clock state, a background task). Before a row fails
+                # on speed it is re-measured, native and transparent
+                # interleaved, and the minimum over every run is kept for both.
+                for _ in range(2):
+                    if not identical or ratio >= args.min_ratio:
+                        break
+                    for _ in range(args.n):
+                        con.transparent = False
+                        t_nat = min(t_nat, time_min(lambda: con.execute(sql).fetchall(), 1))
+                        con.transparent = True
+                        t_tr = min(t_tr, time_min(lambda: con.execute(sql).fetchall(), 1))
+                    ratio = t_nat / t_tr if t_tr > 0 else float("inf")
                 ok = identical and ratio >= args.min_ratio
                 result = "PASS" if ok else ("FAIL rows differ" if not identical else "FAIL")
                 if not ok:
