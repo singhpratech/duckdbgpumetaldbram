@@ -119,6 +119,8 @@ public:
             ps_gb_topk_compact_       = make_pso(lib, @"gb_topk_compact_i64");
             ps_gbx_chunk_             = make_pso(lib, @"gbx_chunk_i64");
             ps_gbx_finalize_          = make_pso(lib, @"gbx_finalize_i64");
+            ps_gbx_blocks_            = make_pso(lib, @"gbx_blocks_i64");
+            ps_gbxm_blocks_           = make_pso(lib, @"gbxm_blocks_i64");
             ps_gbx_having_counts_     = make_pso(lib, @"gbx_having_counts_i64");
             ps_gbx_having_compact_    = make_pso(lib, @"gbx_having_compact_i64");
             ps_gbx_topk_hist_         = make_pso(lib, @"gbx_topk_hist_i64");
@@ -1800,7 +1802,7 @@ private:
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                kernel_ms += cb_kernel_ms(cb);
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] mask/select: %.3f ms (rows=%zu)\n", ms_, (std::size_t)n_total); }
             }
 
             // ---- choose the reduce input: the range as is, its compaction (b), or masked (a) ----
@@ -1863,7 +1865,7 @@ private:
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                kernel_ms += cb_kernel_ms(cb);
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] stage A (run starts count): %.3f ms (n=%zu)\n", ms_, (std::size_t)run_n); }
                 auto* bc = static_cast<std::uint32_t*>([block_a contents]);
                 for (std::size_t b = 0; b < nblocks; ++b) {
                     const std::uint32_t c = bc[b];
@@ -1967,6 +1969,18 @@ private:
                     [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    {   // second level: blocks of 256 chunk partials
+                        const std::size_t nblk = (nchunks + 255) / 256;
+                        const std::uint32_t nch32 = static_cast<std::uint32_t>(nchunks);
+                        grow(gbxm_blk_buf_, nblk * 6 * sizeof(std::int64_t), "masked block partials");
+                        [ce setComputePipelineState:ps_gbxm_blocks_];
+                        [ce setBuffer:gbxm_head_buf_ offset:0 atIndex:0];
+                        [ce setBytes:&nch32 length:sizeof(nch32) atIndex:1];
+                        [ce setBuffer:gbxm_blk_buf_ offset:0 atIndex:2];
+                        [ce dispatchThreadgroups:MTLSizeMake((nblk + kBlock - 1) / kBlock, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
                     [ce setComputePipelineState:ps_gbxm_finalize_];
                     [ce setBuffer:run_sorted offset:soff atIndex:0];
                     [ce setBuffer:mult_buf_  offset:0 atIndex:1];
@@ -1981,6 +1995,7 @@ private:
                     [ce setBuffer:bb[2] offset:0 atIndex:10];
                     [ce setBuffer:bb[4] offset:0 atIndex:11];
                     [ce setBuffer:bb[5] offset:0 atIndex:12];
+                    [ce setBuffer:gbxm_blk_buf_ offset:0 atIndex:13];
                     [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 } else {
@@ -2005,6 +2020,17 @@ private:
                         [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                            threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                         [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        // second level: blocks of 256 chunk partials
+                        const std::size_t nblk = (nchunks + 255) / 256;
+                        const std::uint32_t nch32 = static_cast<std::uint32_t>(nchunks);
+                        grow(gbx_blk_buf_, nblk * 5 * sizeof(std::int64_t), "exact block partials");
+                        [ce setComputePipelineState:ps_gbx_blocks_];
+                        [ce setBuffer:gbx_head_buf_ offset:0 atIndex:0];
+                        [ce setBytes:&nch32 length:sizeof(nch32) atIndex:1];
+                        [ce setBuffer:gbx_blk_buf_ offset:0 atIndex:2];
+                        [ce dispatchThreadgroups:MTLSizeMake((nblk + kBlock - 1) / kBlock, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                     }
                     [ce setComputePipelineState:ps_gbx_finalize_];
                     [ce setBuffer:run_sorted offset:soff atIndex:0];
@@ -2021,6 +2047,7 @@ private:
                     [ce setBuffer:bb[4] offset:0 atIndex:11];   // mn
                     [ce setBuffer:bb[5] offset:0 atIndex:12];   // mx
                     [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:13];
+                    [ce setBuffer:(vc ? gbx_blk_buf_ : bb[0]) offset:0 atIndex:14];
                     [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
@@ -2040,7 +2067,7 @@ private:
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                kernel_ms += cb_kernel_ms(cb);
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] stage B (reduce): %.3f ms (n=%zu segs=%zu)\n", ms_, (std::size_t)run_n, (std::size_t)num_segs); }
             }
 
             if (null_group) {
@@ -2073,7 +2100,7 @@ private:
                     [ce endEncoding];
                     [cb commit];
                     [cb waitUntilCompleted];
-                    kernel_ms += cb_kernel_ms(cb);
+                    { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] extra payloads: %.3f ms (n=%zu segs=%zu)\n", ms_, (std::size_t)run_n, (std::size_t)num_segs); }
                 }
                 if (null_group) {
                     const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
@@ -2732,6 +2759,9 @@ private:
     id<MTLComputePipelineState> ps_gb_topk_compact_       = nil;
     id<MTLComputePipelineState> ps_gbx_chunk_             = nil;
     id<MTLComputePipelineState> ps_gbx_finalize_          = nil;
+    id<MTLComputePipelineState> ps_gbx_blocks_            = nil;   // second reduction level (256 chunks)
+    id<MTLComputePipelineState> ps_gbxm_blocks_           = nil;
+    id<MTLBuffer> gbx_blk_buf_ = nil, gbxm_blk_buf_ = nil;
     id<MTLComputePipelineState> ps_gbx_having_counts_     = nil;
     id<MTLComputePipelineState> ps_gbx_having_compact_    = nil;
     id<MTLComputePipelineState> ps_gbx_topk_hist_         = nil;
@@ -2782,6 +2812,7 @@ private:
     // (GPUDB_METAL_HOST_FILTER_BELOW, default 65536; 0 = always the device):
     // the tuples sit in shared memory and the device radix select has a
     // fixed cost. HAVING stays on the device at every size.
+    bool trace_exact_ = std::getenv("GPUDB_METAL_TRACE_EXACT") != nullptr;   // per-stage GPU times on stderr
     std::size_t host_filter_below_ = [] {
         std::size_t v = 65536;
         if (const char* e = std::getenv("GPUDB_METAL_HOST_FILTER_BELOW")) {

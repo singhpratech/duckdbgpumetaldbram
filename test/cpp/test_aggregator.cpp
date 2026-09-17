@@ -1240,6 +1240,84 @@ void test_backend(gpudb::Backend b) {
         }
         if (implemented) std::printf("    ok\n");
     }
+
+    // ---- Few groups over many rows: groups that span thousands of chunks ----
+    // (the second reduction level — blocks of 256 chunk partials — only
+    // engages when a group covers >= 256 whole chunks; the other exact tests
+    // have short groups). One giant group, a few large ones, many tiny ones
+    // and a NULL-key group, sums overflowing 64 bits, NULL payloads, plain
+    // and under both mask variants.
+    {
+        std::printf("  few groups over many rows (block-level reduce):\n");
+        using Op = gpudb::Predicate::Op;
+        bool implemented = true;
+        try {
+            std::mt19937_64 rng(0xB10CULL);
+            const std::size_t N = 1'300'037, L = 3;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t> wide(std::numeric_limits<std::int64_t>::min() / 2,
+                                                             std::numeric_limits<std::int64_t>::max() / 2);
+            std::uniform_int_distribution<std::int64_t> tiny(100, 5000), sel(0, 999);
+            std::vector<std::int64_t> lanes(N * L);
+            std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            for (std::size_t i = 0; i < N; ++i) {
+                const int p = pct(rng);
+                // 60% key 1 (one giant group), 3 x 12% keys 2..4, 3% tiny keys, 1% NULL
+                lanes[i * L + 0] = p < 60 ? 1 : p < 72 ? 2 : p < 84 ? 3 : p < 96 ? 4 : tiny(rng);
+                if (p == 99) valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+                lanes[i * L + 1] = wide(rng);
+                if (pct(rng) < 7) valid[1][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+                lanes[i * L + 2] = sel(rng);
+            }
+            std::vector<const std::uint64_t*> vp(L);
+            for (std::size_t l = 0; l < L; ++l) vp[l] = valid[l].data();
+            gpudb::Aggregator::RowSpan sp; sp.lanes = lanes.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+            const gpudb::Dtype dts[3] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64};
+            auto cols = agg->upload_rows_exact(&sp, 1, dts, L);
+            auto bit = [&](std::size_t l, std::size_t i) { return ((valid[l][i >> 6] >> (i & 63)) & 1u) != 0; };
+            struct Acc { gpudb::Sum128 s; std::int64_t cnt = 0, cstar = 0, mn = 0, mx = 0; };
+            for (int variant = 0; variant < 3; ++variant) {
+                // 0: no mask; 1: 90% kept (masked reduce); 2: 15% kept (compacted)
+                std::vector<gpudb::Predicate> preds;
+                if (variant) { gpudb::Predicate p; p.col = cols[2].get(); p.op = variant == 1 ? Op::GE : Op::LT; p.value = variant == 1 ? 100 : 150; preds.push_back(p); }
+                std::map<std::pair<int, std::int64_t>, Acc> want;
+                for (std::size_t i = 0; i < N; ++i) {
+                    const std::int64_t sv = lanes[i * L + 2];
+                    if (variant == 1 && !(sv >= 100)) continue;
+                    if (variant == 2 && !(sv < 150)) continue;
+                    Acc& a = want[{bit(0, i) ? 0 : 1, bit(0, i) ? lanes[i * L] : 0}];
+                    ++a.cstar;
+                    if (bit(1, i)) {
+                        const std::int64_t v = lanes[i * L + 1];
+                        if (a.cnt == 0) { a.mn = v; a.mx = v; } else { a.mn = std::min(a.mn, v); a.mx = std::max(a.mx, v); }
+                        a.s.add(v); ++a.cnt;
+                    }
+                }
+                auto got = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), preds.data(), preds.size(), cap);
+                bool ok = got.keys.size() == want.size();
+                std::size_t q = 0;
+                for (auto it = want.begin(); ok && it != want.end(); ++it, ++q) {
+                    const Acc& a = it->second;
+                    ok = got.key_null[q] == it->first.first && (it->first.first || got.keys[q] == it->first.second) &&
+                         got.counts[q] == a.cnt && got.counts_star[q] == a.cstar &&
+                         static_cast<std::uint64_t>(got.sums[q]) == a.s.lo && got.sums_hi[q] == a.s.hi &&
+                         got.mins[q] == a.mn && got.maxs[q] == a.mx;
+                }
+                if (!ok) std::printf("    FAIL few-groups variant %d: got %zu groups, ref %zu\n", variant, got.keys.size(), want.size());
+                EXPECT(ok);
+            }
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
 }
 
 } // namespace

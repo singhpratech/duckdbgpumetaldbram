@@ -3090,3 +3090,89 @@ every rewritten line (docs/TRANSPARENT_DESIGN.md §4.10).
 | li x orders x customer: c_custkey | o_orderpriority LIKE '1-%' OR o_orderpriority LIKE '2-%' | 40% | plain | 99063 | 68.7 | 61.2 | 1.12× | PASS |
 | li x orders x customer: c_custkey | o_orderpriority LIKE '1-%' OR o_orderpriority LIKE '2-%' | 40% | having | 991 | 14.8 | 3.3 | 4.49× | PASS |
 | li x orders x customer: c_custkey | o_orderpriority LIKE '1-%' OR o_orderpriority LIKE '2-%' | 40% | topk | 10 | 15.9 | 5.6 | 2.81× | PASS |
+
+## v0.7 paced gate — an interactive cadence, Metal, TPC-H SF1 (2026-09-17)
+
+The sweeps above are hot loops (minimum of N back-to-back runs). On Apple
+silicon the first statement after an idle gap of even 0.2 s runs 2-3x slower
+on BOTH paths (clocks drop between statements), and the device needs about
+ten back-to-back runs to recover where the CPU needs a few, so a hot loop
+flatters millisecond-scale device statements. `scripts/transparent_gate.py
+--pace-ms 250` sleeps 250 ms before every timed statement and reports the
+MEDIAN of N=7 — the cadence of someone typing queries. Absolute times rise on
+both sides; the ratios hold. Thresholds on, rows identical to native.
+
+| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |
+|---|---|---|---|---|---|---|---|---|
+| l_suppkey | — | 100% | plain | 10000 | 25.3 | 20.3 | 1.25× | PASS |
+| l_suppkey | — | 100% | having | 100 | 14.9 | 9.3 | 1.60× | PASS |
+| l_suppkey | — | 100% | topk | 10 | 15.1 | — | — | declined (threshold) |
+| l_suppkey | — | 100% | projected | 100 | 11.8 | 9.4 | 1.26× | PASS |
+| l_partkey | — | 100% | plain | 200000 | 137.5 | 133.8 | 1.03× | PASS |
+| l_partkey | — | 100% | having | 1981 | 35.3 | 11.7 | 3.02× | PASS |
+| l_partkey | — | 100% | topk | 10 | 33.3 | 12.6 | 2.64× | PASS |
+| l_partkey | — | 100% | projected | 1981 | 35.2 | 16.5 | 2.14× | PASS |
+| l_orderkey | — | 100% | plain | 1500000 | 758.3 | — | — | declined (threshold) |
+| l_orderkey | — | 100% | having | 14816 | 34.1 | 23.8 | 1.43× | PASS |
+| l_orderkey | — | 100% | topk | 10 | 22.7 | 20.8 | 1.09× | PASS |
+| l_orderkey | — | 100% | projected | 14816 | 27.1 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber <= 3 | 64% | plain | 10000 | 25.0 | 24.8 | 1.01× | PASS |
+| l_suppkey | l_linenumber <= 3 | 64% | having | 100 | 14.2 | 11.7 | 1.22× | PASS |
+| l_suppkey | l_linenumber <= 3 | 64% | topk | 10 | 15.8 | — | — | declined (threshold) |
+| l_suppkey | l_linenumber <= 3 | 64% | projected | 100 | 16.9 | 13.0 | 1.30× | PASS |
+| l_partkey | l_linenumber <= 3 | 64% | plain | 200000 | 134.4 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | having | 1994 | 27.0 | 14.4 | 1.88× | PASS |
+| l_partkey | l_linenumber <= 3 | 64% | topk | 10 | 23.4 | — | — | declined (threshold) |
+| l_partkey | l_linenumber <= 3 | 64% | projected | 1994 | 30.0 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | plain | 1500000 | 748.4 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | having | 13299 | 32.2 | 30.3 | 1.06× | PASS |
+| l_orderkey | l_linenumber <= 3 | 64% | topk | 10 | 21.0 | — | — | declined (threshold) |
+| l_orderkey | l_linenumber <= 3 | 64% | projected | 13299 | 26.9 | — | — | declined (threshold) |
+| li x orders: o_custkey | — | 100% | plain | 99996 | 97.2 | 84.4 | 1.15× | PASS |
+| li x orders: o_custkey | — | 100% | having | 999 | 38.5 | 11.0 | 3.52× | PASS |
+| li x orders: o_custkey | — | 100% | topk | 10 | 35.0 | 12.6 | 2.79× | PASS |
+| li x orders: o_custkey | — | 100% | projected | 999 | 36.2 | 9.1 | 3.99× | PASS |
+| li x orders: o_orderdate | — | 100% | plain | 2406 | 29.5 | 8.0 | 3.69× | PASS |
+| li x orders: o_orderdate | — | 100% | having | 25 | 21.6 | 8.9 | 2.42× | PASS |
+| li x orders: o_orderdate | — | 100% | topk | 10 | 26.5 | 8.4 | 3.16× | PASS |
+| li x orders: o_orderdate | — | 100% | projected | 25 | 18.8 | 8.9 | 2.11× | PASS |
+| li x orders: l_suppkey | — | 100% | plain | 10000 | 42.2 | 19.6 | 2.15× | PASS |
+| li x orders: l_suppkey | — | 100% | having | 100 | 29.8 | 8.0 | 3.72× | PASS |
+| li x orders: l_suppkey | — | 100% | topk | 10 | 28.5 | 7.5 | 3.81× | PASS |
+| li x orders: l_suppkey | — | 100% | projected | 100 | 20.1 | 6.9 | 2.92× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 99606 | 74.3 | 74.2 | 1.00× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 992 | 20.4 | 10.0 | 2.04× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 24.2 | 14.6 | 1.66× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | projected | 992 | 25.3 | 13.6 | 1.86× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | plain | 1169 | 22.2 | 8.5 | 2.60× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | having | 12 | 23.1 | 6.5 | 3.57× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 26.3 | 7.0 | 3.76× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | projected | 12 | 24.8 | 7.0 | 3.56× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 10000 | 32.1 | 23.3 | 1.38× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | having | 100 | 29.8 | 11.5 | 2.59× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 28.8 | 11.8 | 2.45× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | projected | 100 | 29.2 | 11.5 | 2.54× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 31708 | 38.9 | — | — | declined (threshold) |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 317 | 13.3 | 11.0 | 1.21× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 12.8 | 11.4 | 1.12× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | projected | 317 | 14.9 | — | — | declined (threshold) |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | plain | 63 | 13.9 | 5.6 | 2.49× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 13.0 | 5.3 | 2.43× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 12.2 | 5.1 | 2.38× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | projected | 1 | 12.1 | 3.4 | 3.59× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 10000 | 25.4 | 16.9 | 1.50× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 98 | 16.7 | 10.2 | 1.64× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 14.6 | 10.2 | 1.43× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | projected | 98 | 14.7 | 10.8 | 1.37× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | plain | 97490 | 84.4 | 84.3 | 1.00× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | having | 962 | 26.4 | 10.4 | 2.55× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | topk | 10 | 26.3 | 15.3 | 1.72× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | projected | 962 | 24.7 | 13.5 | 1.83× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | plain | 2406 | 24.7 | 12.7 | 1.94× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | having | 25 | 23.1 | 9.7 | 2.39× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | topk | 10 | 23.7 | 9.1 | 2.59× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | projected | 25 | 23.0 | 10.1 | 2.27× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | plain | 10000 | 32.9 | 22.2 | 1.48× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | having | 99 | 26.9 | 9.7 | 2.78× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 26.0 | 10.3 | 2.51× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | projected | 99 | 24.4 | 10.1 | 2.41× | PASS |
