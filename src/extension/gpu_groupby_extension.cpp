@@ -840,6 +840,293 @@ void gx_function(duckdb_function_info info, duckdb_data_chunk output) {
 }
 
 // ---------------------------------------------------------------------------
+// gpu_groupby_exact_multi(name, program, payloads, filter)  (v0.7 §4.9)
+//
+// The exact GROUP BY over SEVERAL payload lanes of one exact set in one
+// statement: SELECT k, sum(a), min(b), avg(c) ... GROUP BY k.
+//   program  : the WHERE program ('' = none), as gpu_groupby_exact_resident_where
+//   payloads : 'v, i0, i2' — payload lanes, v or a BIGINT predicate lane; 1..8
+//   filter   : '' | 'having <p> <agg> <cmp> <threshold>' | 'topk <p> <agg> <k> <asc|desc>'
+//              <p> = index into payloads, <agg> as the single-payload forms
+// Columns: key BIGINT, count_star BIGINT, then for payload p:
+//   sum<p> HUGEINT, count<p> BIGINT, min<p> BIGINT, max<p> BIGINT, avg<p> DOUBLE
+// One resident operator pass per payload the statement reads (projection
+// pushdown skips the rest). Every pass sees the same keys and the same WHERE
+// mask, so it emits the same groups in the same order (ascending key, the
+// NULL-key group last) and the passes are zipped by position; under a filter
+// the filtered payload runs first and the others are looked up by key.
+// ---------------------------------------------------------------------------
+struct GmBindData {
+    std::string name;
+    std::vector<WhereTerm> where;
+    std::vector<std::string> lanes;
+    gpudb::GroupByFilter filter;
+    std::size_t filter_payload = 0;
+};
+
+struct GmInitData {
+    std::vector<std::int64_t> keys;
+    std::vector<std::uint8_t> key_null;
+    std::vector<std::int64_t> counts_star;
+    std::vector<gpudb::GroupByResidentResult> pay;   // sums / sums_hi / counts / mins / maxs per payload
+    std::size_t rows = 0, offset = 0;
+    std::vector<idx_t> cols;
+};
+
+void gm_bind(duckdb_bind_info info) {
+    static const char* fn = "gpu_groupby_exact_multi";
+    std::string a[4];
+    for (idx_t i = 0; i < 4; ++i) {
+        duckdb_value v = duckdb_bind_get_parameter(info, i);
+        const bool null = !v || duckdb_is_null_value(v);
+        if (!null) a[i] = value_to_string(v);
+        if (v) duckdb_destroy_value(&v);
+        if (null) { duckdb_bind_set_error(info, (std::string(fn) + ": arguments may not be NULL").c_str()); return; }
+    }
+    auto bind = std::make_unique<GmBindData>();
+    bind->name = a[0];
+    std::string err = parse_where_program(a[1], bind->where);
+    // payload lanes
+    if (err.empty()) {
+        std::size_t pos = 0;
+        while (pos <= a[2].size()) {
+            std::size_t comma = a[2].find(',', pos);
+            if (comma == std::string::npos) comma = a[2].size();
+            const std::string tok = lower_copy(trim_copy(a[2].substr(pos, comma - pos)));
+            pos = comma + 1;
+            bool ok = tok == "v" || (tok.size() > 1 && tok.size() < 6 && tok[0] == 'i');
+            for (std::size_t q = 1; ok && tok != "v" && q < tok.size(); ++q) ok = std::isdigit(static_cast<unsigned char>(tok[q])) != 0;
+            if (!ok) { err = "payload lane '" + tok + "' must be v or i<n>"; break; }
+            bind->lanes.push_back(tok);
+            if (comma == a[2].size()) break;
+        }
+        if (err.empty() && (bind->lanes.empty() || bind->lanes.size() > 8)) err = "1 to 8 payload lanes";
+    }
+    // filter
+    if (err.empty()) {
+        std::vector<std::string> w;
+        std::size_t pos = 0;
+        const std::string f = trim_copy(a[3]);
+        while (pos < f.size()) {
+            while (pos < f.size() && std::isspace(static_cast<unsigned char>(f[pos]))) ++pos;
+            std::size_t e = pos;
+            while (e < f.size() && !std::isspace(static_cast<unsigned char>(f[e]))) ++e;
+            if (e > pos) w.push_back(f.substr(pos, e - pos));
+            pos = e;
+        }
+        if (!w.empty()) {
+            const std::string kind = lower_copy(w[0]);
+            auto to_i64 = [&](const std::string& s, std::int64_t& out) {
+                errno = 0; char* end = nullptr;
+                const long long v = std::strtoll(s.c_str(), &end, 10);
+                if (errno != 0 || !end || end == s.c_str() || *end != '\0') return false;
+                out = v; return true;
+            };
+            std::int64_t p = 0, n = 0;
+            if (w.size() != 5 || (kind != "having" && kind != "topk")) err = "filter must be '', 'having <p> <agg> <cmp> <threshold>' or 'topk <p> <agg> <k> <asc|desc>'";
+            else if (!to_i64(w[1], p) || p < 0 || static_cast<std::size_t>(p) >= bind->lanes.size()) err = "filter payload index out of range";
+            else if (!gx_parse_agg(lower_copy(w[2]), bind->filter.agg)) err = "filter aggregate must be one of sum, count, count_star, min, max";
+            else if (kind == "having") {
+                if      (w[3] == ">")  bind->filter.cmp = gpudb::GroupByFilter::Cmp::GT;
+                else if (w[3] == ">=") bind->filter.cmp = gpudb::GroupByFilter::Cmp::GE;
+                else if (w[3] == "<")  bind->filter.cmp = gpudb::GroupByFilter::Cmp::LT;
+                else if (w[3] == "<=") bind->filter.cmp = gpudb::GroupByFilter::Cmp::LE;
+                else err = "filter comparison must be one of > >= < <=";
+                if (err.empty() && !to_i64(w[4], n)) err = "filter threshold must be a BIGINT";
+                bind->filter.threshold_i64 = n;
+            } else {
+                const std::string ord = lower_copy(w[4]);
+                if (!to_i64(w[3], n) || n < 1) err = "k must be >= 1";
+                else if (ord != "asc" && ord != "desc") err = "order must be asc or desc";
+                bind->filter.topk = static_cast<std::size_t>(n);
+                bind->filter.topk_desc = ord == "desc";
+            }
+            bind->filter_payload = static_cast<std::size_t>(p);
+        }
+    }
+    if (!err.empty()) { duckdb_bind_set_error(info, (std::string(fn) + ": " + err).c_str()); return; }
+
+    duckdb_logical_type bigint  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+    duckdb_logical_type hugeint = duckdb_create_logical_type(DUCKDB_TYPE_HUGEINT);
+    duckdb_logical_type dbl     = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+    duckdb_bind_add_result_column(info, "key", bigint);
+    duckdb_bind_add_result_column(info, "count_star", bigint);
+    for (std::size_t p = 0; p < bind->lanes.size(); ++p) {
+        const std::string s = std::to_string(p);
+        duckdb_bind_add_result_column(info, ("sum" + s).c_str(),   hugeint);
+        duckdb_bind_add_result_column(info, ("count" + s).c_str(), bigint);
+        duckdb_bind_add_result_column(info, ("min" + s).c_str(),   bigint);
+        duckdb_bind_add_result_column(info, ("max" + s).c_str(),   bigint);
+        duckdb_bind_add_result_column(info, ("avg" + s).c_str(),   dbl);
+    }
+    duckdb_destroy_logical_type(&bigint);
+    duckdb_destroy_logical_type(&hugeint);
+    duckdb_destroy_logical_type(&dbl);
+    duckdb_bind_set_bind_data(info, bind.release(), [](void* p) { delete static_cast<GmBindData*>(p); });
+}
+
+void gm_init(duckdb_init_info info) {
+    static const char* fn = "gpu_groupby_exact_multi";
+    auto* bind = static_cast<GmBindData*>(duckdb_init_get_bind_data(info));
+    auto init = std::make_unique<GmInitData>();
+    const std::size_t P = bind->lanes.size();
+    // projection -> per-payload GroupByFilter::columns bits (1 sum, 2 count, 4 min, 5 max)
+    std::vector<std::uint32_t> want(P, 0);
+    bool want_key = false, want_cstar = false;
+    const idx_t nc = duckdb_init_get_column_count(info);
+    for (idx_t i = 0; i < nc; ++i) {
+        const idx_t c = duckdb_init_get_column_index(info, i);
+        init->cols.push_back(c);
+        if (c == 0) want_key = true;
+        else if (c == 1) want_cstar = true;
+        else if (c >= 2 && c < 2 + 5 * P) {
+            const std::size_t p = (c - 2) / 5;
+            switch ((c - 2) % 5) {
+                case 0: want[p] |= (1u << 1) | (1u << 2); break;
+                case 1: want[p] |= 1u << 2; break;
+                case 2: want[p] |= (1u << 4) | (1u << 2); break;
+                case 3: want[p] |= (1u << 5) | (1u << 2); break;
+                default: want[p] |= (1u << 1) | (1u << 2); break;
+            }
+        }
+    }
+    try {
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
+        std::shared_ptr<ResidentSet> set = resident_acquire_set(ctx, bind->name, fn);
+        if (!set->pair || !set->exact)
+            throw std::runtime_error(std::string(fn) + ": '" + bind->name + "' is not an exact set");
+        std::vector<const gpudb::ResidentColumn*> cols(P, nullptr);
+        for (std::size_t p = 0; p < P; ++p) {
+            const std::string& l = bind->lanes[p];
+            if (l == "v") cols[p] = set->vals.get();
+            else {
+                const std::size_t idx = static_cast<std::size_t>(std::strtoull(l.c_str() + 1, nullptr, 10));
+                if (idx >= set->pred_int)
+                    throw std::runtime_error(std::string(fn) + ": payload lane '" + l + "' but the set has " +
+                                             std::to_string(set->pred_int) + " BIGINT predicate column(s)");
+                cols[p] = set->preds[idx].get();
+            }
+            if (!cols[p] || cols[p]->dtype() != gpudb::Dtype::I64)
+                throw std::runtime_error(std::string(fn) + ": payload lane '" + l + "' is not a BIGINT lane");
+        }
+        ResolvedWhere rw = resolve_where(*set, bind->where, fn);
+        auto& agg = resident_aggregator(ctx);
+        const std::size_t cap = groupby_rows_cap();
+        const bool filtered = bind->filter.active();
+        const std::size_t fp = filtered ? bind->filter_payload : 0;
+        bool others = false;
+        for (std::size_t p = 0; p < P; ++p) if (p != fp && want[p]) others = true;
+
+        std::vector<gpudb::MultiPayload> mp(P);
+        for (std::size_t p = 0; p < P; ++p) { mp[p].vals = cols[p]; mp[p].columns = want[p]; }
+        gpudb::GroupByFilter f0 = bind->filter;
+        f0.columns = (want_cstar ? (1u << 3) : 0u) | (want_key ? 1u : 0u);
+        (void)others;
+        std::size_t passes = 0, rows_in = 0, groups_total = 0;
+        double wall = 0.0, kernel = 0.0;
+        {
+            auto dev = resident_device_lock(ctx);
+            init->pay = agg.groupby_exact_masked_multi(*set->keys, mp.data(), P, fp, rw.preds.data(), rw.preds.size(), cap, f0);
+        }
+        {
+            auto& prim = init->pay[fp];
+            for (const auto& r : init->pay)
+                init->rows = std::max({init->rows, r.keys.size(), r.sums.size(), r.counts.size(), r.counts_star.size(),
+                                       r.mins.size(), r.maxs.size()});
+            rows_in = prim.rows_in; groups_total = prim.groups_total; wall = prim.wall_ms; kernel = prim.kernel_ms;
+            for (std::size_t p = 0; p < P; ++p) if (p == fp || want[p]) ++passes;
+            init->keys = std::move(prim.keys);
+            init->key_null = std::move(prim.key_null);
+            init->counts_star = std::move(prim.counts_star);
+        }
+        const auto& d = agg.last_decision();
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+            "op=groupby_exact_multi backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu payloads=%zu passes=%zu "
+            "wall_ms=%.3f kernel_ms=%.3f transfer_ms=0.000",
+            gpudb::to_string(d.chosen), gpudb::to_string(d.reason), rows_in, groups_total, init->rows, P, passes,
+            wall, kernel);
+        resident_record_stats(ctx, set.get(), buf);
+    } catch (const std::exception& e) {
+        duckdb_init_set_error(info, e.what());
+        return;
+    }
+    duckdb_init_set_init_data(info, init.release(), [](void* p) { delete static_cast<GmInitData*>(p); });
+}
+
+void gm_function(duckdb_function_info info, duckdb_data_chunk output) {
+    auto* init = static_cast<GmInitData*>(duckdb_function_get_init_data(info));
+    if (!init) return;
+    const std::size_t remaining = init->rows - init->offset;
+    if (remaining == 0) return;
+    constexpr idx_t kChunk = 2048;
+    const idx_t out_n = static_cast<idx_t>(std::min<std::size_t>(remaining, kChunk));
+    const std::size_t off = init->offset;
+    auto null_at = [](duckdb_vector vec, uint64_t*& ok, idx_t i) {
+        if (!ok) { duckdb_vector_ensure_validity_writable(vec); ok = duckdb_vector_get_validity(vec); }
+        duckdb_validity_set_row_invalid(ok, i);
+    };
+    for (idx_t j = 0; j < init->cols.size(); ++j) {
+        duckdb_vector vec = duckdb_data_chunk_get_vector(output, j);
+        const idx_t c = init->cols[j];
+        uint64_t* ok = nullptr;
+        if (c == 0) {
+            auto* key = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+            for (idx_t i = 0; i < out_n; ++i) {
+                key[i] = init->keys[off + i];
+                if (!init->key_null.empty() && init->key_null[off + i]) null_at(vec, ok, i);
+            }
+            continue;
+        }
+        if (c == 1) {
+            auto* v = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+            for (idx_t i = 0; i < out_n; ++i) v[i] = init->counts_star[off + i];
+            continue;
+        }
+        const auto& r = init->pay[(c - 2) / 5];
+        switch ((c - 2) % 5) {
+            case 0: {
+                auto* sum = static_cast<duckdb_hugeint*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) {
+                    sum[i].lower = static_cast<std::uint64_t>(r.sums[off + i]);
+                    sum[i].upper = r.sums_hi[off + i];
+                    if (r.counts[off + i] == 0) null_at(vec, ok, i);
+                }
+                break;
+            }
+            case 1: {
+                auto* v = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) v[i] = r.counts[off + i];
+                break;
+            }
+            case 2: case 3: {
+                const auto& src = (c - 2) % 5 == 2 ? r.mins : r.maxs;
+                auto* v = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) {
+                    v[i] = src[off + i];
+                    if (r.counts[off + i] == 0) null_at(vec, ok, i);
+                }
+                break;
+            }
+            default: {
+                auto* a = static_cast<double*>(duckdb_vector_get_data(vec));
+                for (idx_t i = 0; i < out_n; ++i) {
+                    const std::int64_t cnt = r.counts[off + i];
+                    if (cnt == 0) { a[i] = 0.0; null_at(vec, ok, i); }
+                    else {
+                        const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[off + i]), r.sums_hi[off + i]};
+                        a[i] = sm.to_double() / static_cast<double>(cnt);
+                    }
+                }
+                break;
+            }
+        }
+    }
+    duckdb_data_chunk_set_size(output, out_n);
+    init->offset += static_cast<std::size_t>(out_n);
+}
+
+// ---------------------------------------------------------------------------
 // gpu_topk_resident(name VARCHAR, k BIGINT, order VARCHAR) -> (idx BIGINT, value BIGINT)
 // gpu_topk_resident_f64(...)                                 -> (idx BIGINT, value DOUBLE)
 // ---------------------------------------------------------------------------
@@ -1041,6 +1328,9 @@ void register_gpu_groupby(duckdb_connection con, const std::shared_ptr<ResidentC
     register_table_fn(con, "gpu_groupby_exact_resident_where_topk",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       gx_bind<GbForm::TopK, true>, gx_init, gx_function, ctx, /*projection_pushdown*/true);
+    register_table_fn(con, "gpu_groupby_exact_multi",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR},
+                      gm_bind, gm_init, gm_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_topk_resident",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       tk_bind<gpudb::Dtype::I64>, tk_init, tk_function, ctx);

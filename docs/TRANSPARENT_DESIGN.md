@@ -99,7 +99,9 @@ GROUP BY k1 [, k2, k3]
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.
 - Aggregates: `sum`, `count`, `count(*)`, `min`, `max`, `avg` (= sum/count,
   computed on the host from the two device results). Several aggregates over
-  the same payload in one query are one device pass.
+  the same payload in one query are one device pass; aggregates over up to
+  eight different payload columns share the mask and the grouping and add one
+  reduce each (§4.9).
 - `WHERE`: conjunctions of comparisons between a column of `t` and a
   constant, `IN (list)`, `BETWEEN`, `IS [NOT] NULL`. Evaluated on the device
   as a mask over the resident predicate columns (§4.6). Anything else (a
@@ -463,9 +465,47 @@ up to 18×.
 
 Not covered yet: a multi-column GROUP BY whose components come from
 different tables (the packed key is computed per table at upload), composite
-and non-integer join keys, several payload columns in one statement, and
-other language wrappers (the lowering lives in the Python wrapper; the
+and non-integer join keys, and other language wrappers (the lowering lives in the Python wrapper; the
 scalar only needs the `guards` field).
+
+### 4.9 Several payload columns in one statement
+`SELECT k, sum(a), min(b), avg(c) ... GROUP BY k` reads three payload columns.
+The resident set needs no new layout: the first payload is lane `v`, every
+other one is a BIGINT predicate lane of the same set (DECIMAL as its unscaled
+integer, exactly like `v`), whether or not the `WHERE` also reads it — the
+identity tag lists it among the set's columns, so one set serves both uses.
+
+`Aggregator::groupby_exact_masked_multi(keys, payloads[], filter_payload,
+preds, filter)` returns one row-aligned result per payload; the shared columns
+(keys, `count(*)`) ride on the filtered payload's result. The default
+implementation is one single-payload pass per column: every pass sees the
+same keys and the same mask, hence the same groups in the same order, so the
+passes are zipped by position, and under a HAVING / top-k the filtered
+payload runs first and the others are looked up by key. Metal overrides it:
+the mask, the selection (range, compaction) and the run starts are computed
+once, only the reduce (chunk partials → finalized tuple) repeats per payload,
+all extra payloads in one command buffer; the filter stage runs on the
+filtered payload's tuple and the others are gathered from shared memory by
+key. Measured with three payloads on TPC-H SF1: the unfused version lost 20
+gate rows (0.56–0.99×, each extra payload repeating the mask and the
+grouping), the fused one none.
+
+SQL: `gpu_groupby_exact_multi(name, program, 'v, i0, i2', filter)` →
+`key, count_star`, then per payload `sum<p> HUGEINT, count<p>, min<p>, max<p>,
+avg<p> DOUBLE`; `filter` is `''`, `'having <p> <agg> <cmp> <threshold>'` or
+`'topk <p> <agg> <k> <asc|desc>'`. Projection pushdown skips the payloads and
+columns a statement does not read. Both rewrite engines emit it when a
+statement aggregates more than one column (or one that is resident on a
+predicate lane); a single payload on lane `v` keeps the single-payload
+functions. Per-payload typing (DECIMAL scale, native `min`/`max` type) and the
+HAVING threshold's rescale follow the payload the aggregate reads.
+
+Thresholds: every extra aggregate is another output column on both sides, so
+the plain form's margin shrinks (1.01–1.09× with three payloads, one 0.93×
+under a three-term `WHERE`; 1.00–1.08× at 100K groups over a join) and
+`_thresholds.py` sends the multi-payload plain form native under a `WHERE`,
+above 50K groups on a single table and above 20K groups over a join. HAVING
+and top-k keep their wins (1.06–3.0× single table, up to 4.8× over joins).
 
 ## 5. Automatic residency (piece C)
 

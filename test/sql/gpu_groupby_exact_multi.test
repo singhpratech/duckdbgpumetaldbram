@@ -1,0 +1,54 @@
+# gpu_groupby_exact_multi SQL test — several payload lanes of one exact set in
+# one statement (v0.7, docs/TRANSPARENT_DESIGN.md §4.9):
+#   gpu_groupby_exact_multi(name, program, payloads, filter)
+#     -> key, count_star, then per payload p: sum<p> HUGEINT, count<p>, min<p>, max<p>, avg<p> DOUBLE
+#   payloads: 'v, i0, ...' (v or a BIGINT predicate lane)
+#   filter  : '' | 'having <p> <agg> <cmp> <threshold>' | 'topk <p> <agg> <k> <asc|desc>'
+# Parity is checked IN-PROCESS against native, both EXCEPT directions.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_groupby_exact_multi
+
+-- 1. Hand fixture: NULLs differ per payload, a NULL-key group, an all-NULL payload in one group
+-- setup: CREATE TABLE m AS SELECT * FROM (VALUES (1,10,100,5),(1,NULL,200,NULL),(2,NULL,NULL,7),(2,NULL,50,8),(NULL,3,NULL,1),(NULL,4,9,NULL)) t(k,a,b,c)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [b, c], []) FROM m
+SELECT key, count_star, sum0, count0, sum1, min1, max2, avg2 FROM gpu_groupby_exact_multi('m', '', 'v, i0, i1', '') ORDER BY key NULLS LAST;
+-- expect: 1  2  10  1  300  100  5  5.0
+-- expect: 2  2  NULL  0  50  50  8  7.5
+-- expect: NULL  2  7  2  9  9  1  1.0
+
+-- 2. One payload == the single-payload function; payload order is the caller's
+-- setup: CREATE TABLE m AS SELECT * FROM (VALUES (1,10,100,5),(1,NULL,200,NULL),(2,NULL,NULL,7),(2,NULL,50,8),(NULL,3,NULL,1),(NULL,4,9,NULL)) t(k,a,b,c)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [b, c], []) FROM m
+SELECT (SELECT count(*) FROM ((SELECT key, sum0, count0, count_star, min0, max0, avg0 FROM gpu_groupby_exact_multi('m', '', 'v', '')) EXCEPT (SELECT * FROM gpu_groupby_exact_resident('m')))) AS single_diff, (SELECT count(*) FROM ((SELECT key, sum0, sum1 FROM gpu_groupby_exact_multi('m', '', 'i1, v', '')) EXCEPT (SELECT k, sum(c), sum(a) FROM m GROUP BY k))) AS reordered_diff;
+-- expect: 0  0
+
+-- 3. Random parity, 300k rows, 3 payloads spanning int64, NULLs everywhere: plain, WHERE, HAVING on the 2nd payload, top-k on the 3rd, count(*)-only
+-- setup: SELECT setseed(0.17)
+-- setup: CREATE TABLE r AS SELECT CASE WHEN random() < 0.02 THEN NULL ELSE CAST(floor(random()*4000) AS BIGINT) END AS k, CASE WHEN random() < 0.05 THEN NULL ELSE CAST(floor((random()-0.5)*9e18) AS BIGINT) END AS a, CASE WHEN random() < 0.30 THEN NULL ELSE CAST(floor(random()*1000) AS BIGINT) END AS b, CASE WHEN random() < 0.01 THEN NULL ELSE CAST(floor((random()-0.5)*2e6) AS BIGINT) END AS c, random() AS x FROM range(300000)
+-- setup: SELECT gpu_upload_rows_exact('r', k, a, [b, c], [x]) FROM r
+SELECT (SELECT count(*) FROM ((SELECT key, count_star, sum0, count0, min0, max0, avg0, sum1, count1, min1, max1, avg1, sum2, count2, min2, max2, avg2 FROM gpu_groupby_exact_multi('r', '', 'v,i0,i1', '')) EXCEPT (SELECT k, count(*), sum(a), count(a), min(a), max(a), avg(a), sum(b), count(b), min(b), max(b), avg(b), sum(c), count(c), min(c), max(c), avg(c) FROM r GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, count(*), sum(a), count(a), min(a), max(a), avg(a), sum(b), count(b), min(b), max(b), avg(b), sum(c), count(c), min(c), max(c), avg(c) FROM r GROUP BY k) EXCEPT (SELECT key, count_star, sum0, count0, min0, max0, avg0, sum1, count1, min1, max1, avg1, sum2, count2, min2, max2, avg2 FROM gpu_groupby_exact_multi('r', '', 'v,i0,i1', '')))) AS plain, (SELECT count(*) FROM ((SELECT key, sum0, sum2, count_star FROM gpu_groupby_exact_multi('r', 'f0 < 0.3; i0 >= 100', 'v,i0,i1', '')) EXCEPT (SELECT k, sum(a), sum(c), count(*) FROM r WHERE x < 0.3 AND b >= 100 GROUP BY k))) + (SELECT count(*) FROM ((SELECT k, sum(a), sum(c), count(*) FROM r WHERE x < 0.3 AND b >= 100 GROUP BY k) EXCEPT (SELECT key, sum0, sum2, count_star FROM gpu_groupby_exact_multi('r', 'f0 < 0.3; i0 >= 100', 'v,i0,i1', '')))) AS filtered, (SELECT count(*) FROM ((SELECT key, sum0, sum1, max2 FROM gpu_groupby_exact_multi('r', 'f0 >= 0.5', 'v,i0,i1', 'having 1 sum > 14000')) EXCEPT (SELECT k, sum(a), sum(b), max(c) FROM r WHERE x >= 0.5 GROUP BY k HAVING sum(b) > 14000))) + (SELECT count(*) FROM ((SELECT k, sum(a), sum(b), max(c) FROM r WHERE x >= 0.5 GROUP BY k HAVING sum(b) > 14000) EXCEPT (SELECT key, sum0, sum1, max2 FROM gpu_groupby_exact_multi('r', 'f0 >= 0.5', 'v,i0,i1', 'having 1 sum > 14000')))) AS having_, (SELECT count(*) FROM ((SELECT key, sum2, sum0, count1 FROM gpu_groupby_exact_multi('r', '', 'v,i0,i1', 'topk 2 sum 25 desc')) EXCEPT (SELECT k, sum(c), sum(a), count(b) FROM r GROUP BY k ORDER BY sum(c) DESC NULLS LAST, k LIMIT 25))) AS topk, (SELECT count(*) FROM gpu_groupby_exact_multi('r', 'i1 > 0', 'v,i0', '')) - (SELECT count(*) FROM (SELECT k FROM r WHERE c > 0 GROUP BY k)) AS rows_only;
+-- expect: 0  0  0  0  0
+
+-- 4. HAVING on count_star with the payloads looked up by key, NULL-key group among the survivors
+-- setup: CREATE TABLE m AS SELECT CASE WHEN i % 7 = 0 THEN NULL ELSE i % 5 END AS k, i AS a, CASE WHEN i % 3 = 0 THEN NULL ELSE -i END AS b FROM range(1000) t(i)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [b], []) FROM m
+SELECT (SELECT count(*) FROM ((SELECT key, count_star, sum0, sum1 FROM gpu_groupby_exact_multi('m', '', 'v,i0', 'having 0 count_star >= 143')) EXCEPT (SELECT k, count(*), sum(a), sum(b) FROM m GROUP BY k HAVING count(*) >= 143))) + (SELECT count(*) FROM ((SELECT k, count(*), sum(a), sum(b) FROM m GROUP BY k HAVING count(*) >= 143) EXCEPT (SELECT key, count_star, sum0, sum1 FROM gpu_groupby_exact_multi('m', '', 'v,i0', 'having 0 count_star >= 143')))) AS mismatch, (SELECT count(*) FROM gpu_groupby_exact_multi('m', '', 'v,i0', 'having 0 count_star >= 143') WHERE key IS NULL) AS null_group_kept;
+-- expect: 0  1
+
+-- 5. A DOUBLE lane is not a payload
+-- setup: CREATE TABLE m AS SELECT i % 5 AS k, i AS a, i / 3.0 AS x FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [], [x]) FROM m
+-- expected_fail: must be v or i<n>
+SELECT * FROM gpu_groupby_exact_multi('m', '', 'v, f0', '');
+
+-- 6. A payload lane the set does not have
+-- setup: CREATE TABLE m AS SELECT i % 5 AS k, i AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [], []) FROM m
+-- expected_fail: BIGINT predicate column
+SELECT * FROM gpu_groupby_exact_multi('m', '', 'v, i0', '');
+
+-- 7. A malformed filter names the grammar
+-- setup: CREATE TABLE m AS SELECT i % 5 AS k, i AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('m', k, a, [], []) FROM m
+-- expected_fail: filter must be
+SELECT * FROM gpu_groupby_exact_multi('m', '', 'v', 'top 3');
