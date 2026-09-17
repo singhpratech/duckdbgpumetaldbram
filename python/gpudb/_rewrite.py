@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 _INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _KEY_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
+_STRING_TYPES = {"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"}
 _EPOCH = _dt.date(1970, 1, 1)
 _DEC_RE = re.compile(r"^DECIMAL\((\d+),(\d+)\)$")
 _CMP = {
@@ -87,6 +88,7 @@ class Plan:
     keys: List[str] = field(default_factory=list)        # GROUP BY components in order (key == keys[0])
     key_types: List[str] = field(default_factory=list)
     pack: List[Tuple[int, int, int]] = field(default_factory=list)   # per component (min, range, stride) when packed
+    dict_key: bool = False             # key is a hashed tuple with a dictionary (any VARCHAR component, §4.5)
     where: List[WhereTerm] = field(default_factory=list)
     pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
     pred_types: Dict[str, str] = field(default_factory=dict)
@@ -94,11 +96,11 @@ class Plan:
 
     @property
     def packed(self) -> bool:
-        return len(self.keys) > 1
+        return len(self.keys) > 1 and not self.dict_key
 
     @property
     def key_field(self) -> str:
-        return "+".join(self.keys) if self.packed else self.key
+        return "+".join(self.keys) if len(self.keys) > 1 else self.key
 
     @property
     def upload_columns(self) -> List[str]:
@@ -208,6 +210,8 @@ def _const(e):
         return Decimal(int(val)) / (Decimal(10) ** scale)
     if t in ("DOUBLE", "FLOAT"):
         return Decimal(repr(float(val)))
+    if t == "VARCHAR":
+        return str(val)
     raise Decline("shape", f"constant of type {t}")
 
 
@@ -480,15 +484,23 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
         kt = columns.get(kc)
         if kt is None:
             raise Decline("shape", f"unknown column {kc}")
-        if kt not in _KEY_TYPES and not (exact and kt in _TEMPORAL_TYPES):
+        if kt not in _KEY_TYPES and not (exact and (kt in _TEMPORAL_TYPES or kt in _STRING_TYPES)):
             raise Decline("shape", f"key type {kt}")
         plan.key_types.append(kt)
     plan.key_type = plan.key_types[0]
+    plan.dict_key = any(t in _STRING_TYPES for t in plan.key_types)
+    if plan.dict_key and len(plan.keys) > 1:
+        # components of a hashed tuple key are read back from the dictionary; a
+        # WHERE on one goes through its own lane, so they are predicate columns
+        for kc in plan.keys:
+            if any(w.col == kc for w in plan.where) and kc not in plan.pred_cols:
+                plan.pred_cols.append(kc)
     for c in plan.pred_cols:
         pt = columns.get(c)
         if pt is None:
             raise Decline("shape", f"unknown column {c}")
-        if pt in _INT_TYPES or pt in ("DOUBLE", "FLOAT", "REAL") or pt in _TEMPORAL_TYPES or decimal_scale(pt):
+        if pt in _INT_TYPES or pt in ("DOUBLE", "FLOAT", "REAL") or pt in _TEMPORAL_TYPES \
+                or pt in _STRING_TYPES or decimal_scale(pt):
             plan.pred_types[c] = pt
         else:
             raise Decline("shape", f"WHERE column type {pt}")
@@ -496,15 +508,20 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
     for w in plan.where:
         ct = plan.key_type if (w.col == plan.key and not plan.packed) else plan.pred_types.get(w.col, columns.get(w.col, ""))
         lits = w.lit if isinstance(w.lit, list) else ([] if w.lit is None else [w.lit])
+        if ct in _STRING_TYPES and w.op not in ("=", "<>", "in", "isnull", "isnotnull"):
+            raise Decline("shape", "ordering comparison on a VARCHAR column")
         for x in lits:
             is_dt = isinstance(x, _dt.datetime)
             is_d = isinstance(x, _dt.date) and not is_dt
+            is_s = isinstance(x, str)
             if ct == "DATE" and not is_d:
                 raise Decline("shape", "DATE column against a non-DATE constant")
             if ct == "TIMESTAMP" and not is_dt:
                 raise Decline("shape", "TIMESTAMP column against a non-TIMESTAMP constant")
             if ct not in _TEMPORAL_TYPES and (is_d or is_dt):
                 raise Decline("shape", "temporal constant against a non-temporal column")
+            if (ct in _STRING_TYPES) != is_s:
+                raise Decline("shape", "VARCHAR column and constant types differ")
     if exact and plan.val is not None and any(o.kind == "avg" for o in plan.outputs) \
             and decimal_scale(columns.get(plan.val, "")):
         raise Decline("decimal", "avg over a DECIMAL payload is not on the exact path")
@@ -557,17 +574,21 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
     """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col == plan.key and not plan.packed:
-        return "k", "i", 0
+    if col == plan.key and len(plan.keys) == 1:
+        return "k", ("s" if plan.dict_key else "i"), 0
     if col == plan.val:
         return "v", "i", plan.scale
-    ni = nf = 0
+    ni = nf = ns = 0
     for c in plan.pred_cols:
         t = plan.pred_types.get(c, "")
         if t in ("DOUBLE", "FLOAT", "REAL"):
             if c == col:
                 return f"f{nf}", "f", 0
             nf += 1
+        elif t in _STRING_TYPES:
+            if c == col:
+                return f"s{ns}", "s", 0
+            ns += 1
         else:
             if c == col:
                 d = decimal_scale(t)
@@ -582,6 +603,14 @@ def _where_program(plan: Plan) -> str:
         lane, kind, scale = _lane_of(plan, w.col)
         if w.op in ("isnull", "isnotnull"):
             terms.append(f"{lane} is null" if w.op == "isnull" else f"{lane} is not null")
+            continue
+        if kind == "s":
+            def q(x):
+                return "'" + str(x).replace("'", "''") + "'"
+            if w.op == "in":
+                terms.append(f"{lane} in ({', '.join(q(x) for x in w.lit)})")
+            else:
+                terms.append(f"{lane} {'!=' if w.op == '<>' else '='} {q(w.lit)}")
             continue
         if kind == "f":
             def f(x):
@@ -629,6 +658,8 @@ def where_sql(plan: Plan) -> str:
 
 
 def _lit_sql(x) -> str:
+    if isinstance(x, str):
+        return "'" + x.replace("'", "''") + "'"
     if isinstance(x, _dt.datetime):
         return f"TIMESTAMP '{x.isoformat(sep=' ')}'"
     if isinstance(x, _dt.date):
@@ -709,12 +740,21 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
     cols = []
     for out in plan.outputs:
+        if out.kind == "key" and plan.dict_key:
+            ref = 'd."c%d"' % out.key_index
+            t = out.native_type.upper()
+            expr = ref if t in _STRING_TYPES or t.startswith("VARCHAR") else f"CAST({ref} AS {out.native_type})"
+            cols.append(f'{expr} AS "{out.name}"')
+            continue
         if out.kind == "key" and plan.packed:
             cols.append(f'{_key_component_expr(plan, out.key_index, out.native_type)} AS "{out.name}"')
             continue
         col = "key" if out.kind == "key" else out.kind
         cols.append(f'{_out_expr(plan, col, out.native_type)} AS "{out.name}"')
-    sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
+    src = f"{fn}({', '.join(args)}) r"
+    if plan.dict_key:
+        src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
+    sql = (f"SELECT {', '.join(cols)} FROM {src}, "
            f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
            f"WHERE gd.ok{extra_pred}")
     return sql + _order_limit_sql(plan)
@@ -801,6 +841,12 @@ def upload_sql(plan: Plan, fqn: str) -> str:
             return f'epoch_us("{col}")'
         return f'CAST("{col}" AS BIGINT)'
     k = lane(plan.key, plan.key_type)
+    if plan.exact and plan.dict_key:
+        # the key tuple as text: "<byte length>:<text>" per component, "N" for NULL
+        tmpl = ("CASE WHEN \"{c}\" IS NULL THEN 'N' ELSE strlen(CAST(\"{c}\" AS VARCHAR))::VARCHAR"
+                " || ':' || CAST(\"{c}\" AS VARCHAR) END")
+        parts = [tmpl.format(c=kc) for kc in plan.keys]
+        k = " || ".join(parts) if len(parts) > 1 else parts[0]
     if plan.exact and plan.packed:
         # mixed-radix pack: slot_i = coalesce(image - min + 1, 0); key = sum(slot_i * stride_i)
         parts = []
@@ -815,18 +861,23 @@ def upload_sql(plan: Plan, fqn: str) -> str:
             v = f'CAST("{plan.val}" * {10 ** plan.scale} AS BIGINT)'
         else:
             v = f'CAST("{plan.val}" AS BIGINT)'
-        if not plan.pred_cols:
+        if not plan.pred_cols and not plan.dict_key:
             # no predicate lanes: the 2-lane exact upload (same set, no list
             # columns to plan per segment statement)
             return f"SELECT gpu_upload_pair_exact('{tag}', {k}, {v}) FROM {fqn}"
-        pi, pf = [], []
+        pi, pf, ps = [], [], []
         for c in plan.pred_cols:
             t = plan.pred_types.get(c, "")
             if t in ("DOUBLE", "FLOAT", "REAL"):
                 pf.append(f'CAST("{c}" AS DOUBLE)')
+            elif t in _STRING_TYPES:
+                ps.append(f'"{c}"')
             else:
                 d = decimal_scale(t)
                 pi.append(f'CAST("{c}" * {10 ** d[1]} AS BIGINT)' if d and d[1] else lane(c, t))
+        if ps or plan.dict_key:
+            return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
+                    f"[{', '.join(pf)}]::DOUBLE[], [{', '.join(ps)}]::VARCHAR[]) FROM {fqn}")
         return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
                 f"[{', '.join(pf)}]::DOUBLE[]) FROM {fqn}")
     if plan.val is None:

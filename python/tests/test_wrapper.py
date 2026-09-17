@@ -33,7 +33,8 @@ SETUP = f"""
 CREATE TABLE t AS SELECT (i % 1000)::INTEGER AS k, (i % 97)::BIGINT AS v,
                          ((i % 977) / 100.0)::DECIMAL(15,2) AS d, (i * 0.5)::DOUBLE AS x,
                          DATE '1995-01-01' + (i % 2000)::INTEGER AS dt,
-                         TIMESTAMP '2020-01-01' + INTERVAL (i % 86400) SECOND AS ts
+                         TIMESTAMP '2020-01-01' + INTERVAL (i % 86400) SECOND AS ts,
+                         CASE WHEN i % 31 = 0 THEN NULL ELSE ['alpha','beta','it''s','delta','eps'][1 + i % 5] END AS s
                   FROM range({N}) r(i);
 CREATE TABLE tu AS SELECT (i % 1000)::INTEGER AS k, i::BIGINT AS v FROM range({N}) r(i);
 CREATE TABLE tn AS SELECT (i % 10)::BIGINT AS k, CASE WHEN i % 7 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range({N}) r(i);
@@ -95,12 +96,17 @@ def run():
         "two_keys":   "SELECT k, dt, sum(v), count(*) FROM t GROUP BY k, dt ORDER BY k, dt",
         "two_keys_where": "SELECT dt, k, min(v) FROM t WHERE k < 300 AND dt >= DATE '1998-01-01' GROUP BY k, dt ORDER BY dt, k",
         "three_keys_topk": "SELECT k, dt, sum(v) AS s FROM tn3 GROUP BY k, dt, z ORDER BY s DESC LIMIT 5",
+        "str_key":    "SELECT s, sum(v), count(*) FROM t GROUP BY s ORDER BY s NULLS LAST",
+        "str_key_pred": "SELECT s, count(*) FROM t WHERE s IN ('alpha', 'it''s') GROUP BY s ORDER BY s",
+        "str_mixed":  "SELECT k, s, sum(v) FROM t WHERE s <> 'beta' AND k < 20 GROUP BY s, k ORDER BY k, s NULLS LAST",
+        "str_pred":   "SELECT k, sum(v) FROM t WHERE s = 'delta' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
     }
     if not con._exact:
         for name in ("nulls", "min_max_avg", "where_int", "where_mixed", "where_having", "where_topk",
                      "having_eq", "having_avg", "decimal_minmax", "date_key", "date_pred",
-                     "two_keys", "two_keys_where", "three_keys_topk"):
+                     "two_keys", "two_keys_where", "three_keys_topk",
+                     "str_key", "str_key_pred", "str_mixed", "str_pred"):
             cases.pop(name)
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
@@ -183,7 +189,7 @@ def run():
     check(con.last_rewrite()["reason"] in ("view", "threshold"), "registered relation: never rewritten")
     # a temp table that SHADOWS the resident base table: native, and the
     # answer is the temp table's, not the resident set's
-    con.execute("CREATE TEMP TABLE t AS SELECT k, v * 2 AS v, d, x, dt, ts FROM t")
+    con.execute("CREATE TEMP TABLE t AS SELECT k, v * 2 AS v, d, x, dt, ts, s FROM t")
     got = con.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
     lr = con.last_rewrite()
     check(not lr["rewritten"] and got == con._raw.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall(),
@@ -209,7 +215,7 @@ def run():
           "same-count UPDATE seen by the wrapper: set invalidated and re-uploaded, answer correct")
     # a writer the wrapper does not see, count changes -> guard fires, fallback
     raw = con._raw.cursor()
-    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
+    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01', 'alpha')")
     got = con.execute(q).fetchall()
     lr = con.last_rewrite()
     nat2 = [(k, s + (5 if k == 3 else 0)) for k, s in nat]
@@ -219,7 +225,7 @@ def run():
     con.execute(q).fetchall()
     con.execute(q).fetchall()
     check(con.last_rewrite()["rewritten"], "resident again after the delete")
-    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
+    raw.execute("INSERT INTO t VALUES (3, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01', 'alpha')")
     got = con.execute("SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > 10000000").fetchall()
     check(con.last_rewrite()["fallback"] and got == [],
           "unseen INSERT + empty resident result: guard still fires")
@@ -227,7 +233,7 @@ def run():
     # transactions
     con.execute(q).fetchall(); con.execute(q).fetchall()
     con.execute("BEGIN")
-    con.execute("INSERT INTO t VALUES (3, 7, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01')")
+    con.execute("INSERT INTO t VALUES (3, 7, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01', 'alpha')")
     con.execute(q).fetchall()
     check(not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "transaction",
           "inside BEGIN: never rewritten")
@@ -236,7 +242,7 @@ def run():
     check(got == nat and con.last_rewrite()["rewritten"], "after ROLLBACK: resident again, answer correct")
     # multi-statement string with DML
     attempts = con._manager.get(tag).attempts
-    con.execute("SELECT 1; INSERT INTO t VALUES (3, 9, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01'); SELECT 2")
+    con.execute("SELECT 1; INSERT INTO t VALUES (3, 9, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01', 'alpha'); SELECT 2")
     got = con.execute(q).fetchall()
     check(con._manager.get(tag).attempts == attempts + 1 and got == con._raw.execute(q).fetchall(),
           "multi-statement DML invalidates; re-uploaded; answer correct")

@@ -82,6 +82,7 @@ struct ColInfo {
     bool floating = false;
     bool date = false;       // DATE: resident as days since 1970-01-01 (BIGINT lane)
     bool timestamp = false;  // TIMESTAMP: resident as microseconds since the epoch (BIGINT lane)
+    bool string = false;     // VARCHAR: resident as hash64(text) with a dictionary (§4.5)
     bool temporal() const { return date || timestamp; }
 };
 
@@ -102,7 +103,9 @@ struct Context {
     bool exact = false;                    // the set was uploaded by gpu_upload_rows_exact (v0.7 §4)
     std::vector<PredCol> preds;            // tag columns after key/payload, in order (exact sets)
     std::vector<KeyPart> keys;             // 1..3 key components (packed when > 1)
-    bool packed() const { return keys.size() > 1; }
+    bool dict = false;                     // key is a hashed tuple with a dictionary (any VARCHAR component, §4.5)
+    std::string default_collation;
+    bool packed() const { return keys.size() > 1 && !dict; }
     std::string backend;
     std::int64_t rows = 0;
     bool ready = false;
@@ -131,6 +134,9 @@ ColInfo parse_type(std::string t) {
         c.date = true;
     } else if (u == "TIMESTAMP" || u == "DATETIME" || u == "TIMESTAMP WITHOUT TIME ZONE") {
         c.timestamp = true;
+    } else if (u == "VARCHAR" || u == "TEXT" || u == "STRING" || u == "CHAR" || u == "BPCHAR" ||
+               u.rfind("VARCHAR(", 0) == 0) {
+        c.string = true;
     }
     return c;
 }
@@ -149,6 +155,7 @@ Context parse_context(const json& c) {
     x.rows    = c.value("rows", std::int64_t{0});
     x.ready   = c.value("ready", false);
     x.exact   = c.value("exact", false);
+    x.default_collation = c.value("default_collation", "");
     x.default_order = c.value("default_order", "");
     if (c.contains("outputs") && c["outputs"].is_array()) {
         for (const auto& o : c["outputs"])
@@ -200,11 +207,12 @@ Context parse_context(const json& c) {
     x.key = col_info(x.key_col);
     x.val = col_info(x.val_col);
     {
-        int ni = 0, nf = 0;
+        int ni = 0, nf = 0, ns = 0;
         for (auto& pc : x.preds) {
             pc.info = col_info(pc.name);
-            if (pc.info.floating) pc.lane = "f" + std::to_string(nf++);
-            else                  pc.lane = "i" + std::to_string(ni++);   // integer family and DECIMAL
+            if (pc.info.floating)    pc.lane = "f" + std::to_string(nf++);
+            else if (pc.info.string) pc.lane = "s" + std::to_string(ns++);
+            else                     pc.lane = "i" + std::to_string(ni++);   // integer family, DECIMAL, DATE, TIMESTAMP
         }
     }
     // Key components: the tag's key field is "a" or "a+b[+c]"; "keys" in the
@@ -239,7 +247,13 @@ Context parse_context(const json& c) {
             }
         }
         if (x.keys.size() > 3) reject("shape", "more than three GROUP BY keys");
-        if (x.keys.size() > 1) {
+        for (const auto& kp : x.keys) if (kp.info.string) x.dict = true;
+        if (x.dict) {
+            const std::string coll = lower(x.default_collation);
+            if (!coll.empty() && coll != "binary")
+                reject("collation", "default_collation '" + x.default_collation + "' with a VARCHAR key");
+        }
+        if (x.keys.size() > 1 && !x.dict) {
             // strides from the right; the product must fit in int64
             std::int64_t stride = 1;
             for (std::size_t i = x.keys.size(); i-- > 0;) {
@@ -677,6 +691,18 @@ json j_key_component(const Context& cx, std::size_t i, const std::string& type, 
     return j_typed_expr(std::move(v), type, name);
 }
 
+// Component i of a dictionary key: d.c<i> (VARCHAR text) cast to the native type.
+json j_dict_component(std::size_t i, const std::string& type, const std::string& name) {
+    json ref = j_colref2("d", "c" + std::to_string(i));
+    ColInfo t = parse_type(type);
+    if (t.string) { ref["alias"] = name; return ref; }
+    if (t.decimal) return j_cast(std::move(ref), j_decimal_type(t.width, t.scale), name);
+    std::string id = type;
+    for (auto& ch : id) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    if (id == "INT") id = "INTEGER";
+    return j_cast(std::move(ref), j_type(id), name);
+}
+
 json j_output_exact(const std::string& col, const std::string& type, const std::string& name) {
     ColInfo t = parse_type(type);
     if (t.date) {
@@ -779,13 +805,26 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
         const std::string c = column_ref(e, t, ta);
         if (c.empty()) reject("shape", "WHERE on an expression");
         for (const auto& pc : cx.preds) if (ieq(c, pc.name)) { info = pc.info; return pc.lane; }
-        if (!cx.packed() && ieq(c, cx.key_col)) { info = cx.key; return "k"; }
+        if (cx.keys.size() == 1 && ieq(c, cx.key_col)) { info = cx.key; return "k"; }
         if (!cx.val_col.empty() && ieq(c, cx.val_col)) { info = cx.val; return "v"; }
         reject("shape", "WHERE column '" + c + "' is not in the resident set");
+    };
+    auto quote = [](const std::string& text) {
+        std::string q = "'";
+        for (char ch : text) { if (ch == '\'') q += "''"; else q.push_back(ch); }
+        return q + "'";
     };
     auto const_text = [&](const json& c, const ColInfo& info, int cmp, bool& drop_term, bool& always_false) -> std::string {
         // cmp: 1 > 2 >= 3 < 4 <= 5 = 6 <>
         drop_term = false; always_false = false;
+        if (info.string) {
+            if (cmp >= 1 && cmp <= 4) reject("shape", "ordering comparison on a VARCHAR column");
+            if (sfield(c, "class") != "CONSTANT") reject("shape", "VARCHAR column against a non-constant");
+            const json& v = field(c, "value");
+            if (field(v, "is_null").get<bool>()) reject("shape", "NULL constant");
+            if (sfield(field(v, "type"), "id") != "VARCHAR") reject("shape", "VARCHAR column against a non-VARCHAR constant");
+            return quote(field(v, "value").get<std::string>());
+        }
         if (info.temporal()) {
             ColInfo ck; std::int64_t v = 0;
             if (!temporal_const(c, ck, v) || ck.date != info.date || ck.timestamp != info.timestamp)
@@ -847,7 +886,9 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
             const std::string lane = lane_of(ch[0], info);
             std::vector<std::string> vals;
             for (std::size_t i = 1; i < ch.size(); ++i) {
-                if (info.temporal()) {
+                if (info.temporal() || info.string) {
+                    if (info.string && sfield(ch[i], "class") == "CONSTANT" &&
+                        field(field(ch[i], "value"), "is_null").get<bool>()) continue;
                     bool drop = false, never = false;
                     vals.push_back(const_text(ch[i], info, 5, drop, never));
                     continue;
@@ -890,7 +931,8 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     // ---- column types (rule 2 gates) ----
     const bool bare = cx.val_col.empty();
     for (const auto& kp : cx.keys)
-        if (!kp.info.integer && !kp.info.temporal()) reject(kp.info.floating ? "double" : "shape", "key type " + kp.info.type);
+        if (!kp.info.integer && !kp.info.temporal() && !kp.info.string)
+            reject(kp.info.floating ? "double" : "shape", "key type " + kp.info.type);
     if (!bare) {
         if (cx.val.floating) reject("double", "payload type " + cx.val.type);
         if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
@@ -1106,8 +1148,24 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                       {"query_location", kNoLocation},
                       {"subquery", json{{"node", guard_select}, {"named_param_map", json::array()}}},
                       {"column_name_alias", json::array()}};
+    json left_side = tf;
+    if (cx.dict) {
+        // r LEFT JOIN gpu_resident_dictionary(tag, n) d ON d.id = r.key
+        json dtf = json{{"type", "TABLE_FUNCTION"}, {"alias", "d"}, {"sample", nullptr},
+                        {"query_location", kNoLocation},
+                        {"function", j_function("gpu_resident_dictionary",
+                             json::array({j_const_varchar(cx.tag), j_const_bigint(static_cast<std::int64_t>(cx.keys.size()))}))},
+                        {"column_name_alias", json::array()}, {"with_ordinality", "WITHOUT_ORDINALITY"}};
+        json cond = json{{"class", "COMPARISON"}, {"type", "COMPARE_EQUAL"}, {"alias", ""},
+                         {"query_location", kNoLocation}, {"left", j_colref2("d", "id")}, {"right", j_colref2("r", "key")}};
+        left_side = json{{"type", "JOIN"}, {"alias", ""}, {"sample", nullptr},
+                         {"query_location", kNoLocation}, {"left", tf}, {"right", dtf},
+                         {"condition", cond}, {"join_type", "LEFT"}, {"ref_type", "REGULAR"},
+                         {"using_columns", json::array()}, {"delim_flipped", false},
+                         {"duplicate_eliminated_columns", json::array()}};
+    }
     json new_from = json{{"type", "JOIN"}, {"alias", ""}, {"sample", nullptr},
-                         {"query_location", kNoLocation}, {"left", tf}, {"right", guard},
+                         {"query_location", kNoLocation}, {"left", left_side}, {"right", guard},
                          {"condition", nullptr}, {"join_type", "INNER"}, {"ref_type", "CROSS"},
                          {"using_columns", json::array()}, {"delim_flipped", false},
                          {"duplicate_eliminated_columns", json::array()}};
@@ -1116,8 +1174,9 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     for (std::size_t i = 0; i < items.size(); ++i) {
         const Output& o = cx.outputs[i];
         if (items[i].key) {
-            if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
-            else             new_select.push_back(j_output_exact("key", o.type, o.name));
+            if (cx.dict)          new_select.push_back(j_dict_component(items[i].key_index, o.type, o.name));
+            else if (cx.packed()) new_select.push_back(j_key_component(cx, items[i].key_index, o.type, o.name));
+            else                  new_select.push_back(j_output_exact("key", o.type, o.name));
         } else {
             new_select.push_back(j_output_exact(xagg_col(items[i].agg), o.type, o.name));
         }
@@ -1191,7 +1250,7 @@ Result do_rewrite(json tree, const json& ctxj) {
         const std::string gcol = column_ref(gexp[i], tname, talias);
         if (gcol.empty() || !ieq(gcol, cx.keys[i].name)) reject("shape", "GROUP BY key is not the resident key");
     }
-    if (cx.packed() && !cx.exact) reject("shape", "packed keys need an exact set");
+    if ((cx.packed() || cx.dict) && !cx.exact) reject("shape", "packed or string keys need an exact set");
 
     if (cx.exact) return do_rewrite_exact(std::move(tree), std::move(node), cx, tname, talias);
     if (!is_null(node, "where_clause")) reject("shape", "WHERE needs an exact set (gpu_upload_rows_exact)");

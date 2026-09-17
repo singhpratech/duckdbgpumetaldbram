@@ -126,6 +126,25 @@ DUCKDB_EXTENSION_EXTERN
 
 namespace gpudb_ext {
 
+// FNV-1a over the bytes, then a 64-bit avalanche (splitmix64 finaliser):
+// FNV alone clusters on short similar strings; the finaliser spreads them.
+std::uint64_t hash64(const char* p, std::size_t n) noexcept {
+    std::uint64_t h = 1469598103934665603ULL;
+    for (std::size_t i = 0; i < n; ++i) { h ^= static_cast<unsigned char>(p[i]); h *= 1099511628211ULL; }
+    h ^= n;
+    h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h;
+}
+
+std::string tuple_component(const char* p, std::size_t n) {
+    std::string out = std::to_string(n);
+    out.push_back(':');
+    out.append(p, n);
+    return out;
+}
+
 const char* to_string(SetState s) noexcept {
     switch (s) {
         case SetState::Ready:    return "ready";
@@ -265,10 +284,22 @@ struct UploadBuf {
     std::size_t               rows_seen = 0;    // rows delivered to update()
     std::uint64_t             seq_at_start = 0; // invalidation seq when named
     std::size_t               charged = 0;      // bytes charged to the pool cap
-    // gpu_upload_rows_exact: lanes per row (2 + n_pi + n_pf), fixed by the
-    // first row; 0 for every other upload function.
+    // gpu_upload_rows_exact: lanes per row (2 + n_pi + n_pf + n_ps), fixed by
+    // the first row; 0 for every other upload function.
     std::size_t               lanes_per_row = 0;
-    std::size_t               n_pi = 0, n_pf = 0;
+    std::size_t               n_pi = 0, n_pf = 0, n_ps = 0;
+    bool                      key_str = false;   // key lane holds hash64(tuple text)
+    // hash -> text per string lane: [0] the key (when key_str), then one per
+    // s<n> lane. Filled lock-free per state, merged at combine / finish; a
+    // second text under one hash is a collision and fails the upload.
+    std::vector<std::unordered_map<std::uint64_t, std::string>> dicts;
+    void note_string(std::size_t slot, std::uint64_t h, const char* p, std::size_t n, bool& collision) {
+        if (dicts.size() <= slot) dicts.resize(slot + 1);
+        auto& m = dicts[slot];
+        auto it = m.find(h);
+        if (it == m.end()) { m.emplace(h, std::string(p, n)); return; }
+        if (it->second.size() != n || std::memcmp(it->second.data(), p, n) != 0) collision = true;
+    }
 
     std::size_t lanes() const noexcept {
         std::size_t t = open ? open->n : 0;
@@ -369,7 +400,9 @@ struct UploadSession {
     bool          pair = false;
     gpudb::Dtype  vdt = gpudb::Dtype::I64;          // payload (pair) / column (bare) dtype
     bool          exact = false;                    // gpu_upload_pair_exact / gpu_upload_rows_exact segments
-    std::size_t   lanes_per_row = 0, n_pi = 0, n_pf = 0;   // exact: lane layout (fixed by the first segment)
+    std::size_t   lanes_per_row = 0, n_pi = 0, n_pf = 0, n_ps = 0;   // exact: lane layout (fixed by the first segment)
+    bool          key_str = false;
+    std::vector<std::unordered_map<std::uint64_t, std::string>> dicts;   // string lanes, merged per segment
     std::vector<SegView> views;
     std::size_t   lanes = 0;
     std::size_t   rows_seen = 0;
@@ -776,13 +809,26 @@ void upload_combine(duckdb_function_info info, duckdb_aggregate_state* source,
             db.seq_at_start = sb.seq_at_start;
         }
         if (db.lanes_per_row == 0 && sb.lanes_per_row != 0) {
-            db.lanes_per_row = sb.lanes_per_row; db.n_pi = sb.n_pi; db.n_pf = sb.n_pf;
+            db.lanes_per_row = sb.lanes_per_row; db.n_pi = sb.n_pi; db.n_pf = sb.n_pf; db.n_ps = sb.n_ps;
+            db.key_str = sb.key_str;
         } else if (db.lanes_per_row != 0 && sb.lanes_per_row != 0 &&
-                   (db.n_pi != sb.n_pi || db.n_pf != sb.n_pf)) {
+                   (db.n_pi != sb.n_pi || db.n_pf != sb.n_pf || db.n_ps != sb.n_ps || db.key_str != sb.key_str)) {
             duckdb_aggregate_function_set_error(info,
                 "gpu_upload_rows_exact: combine merged two different predicate list lengths — "
                 "the lists must have the same length on every row");
             return;
+        }
+        if (!sb.dicts.empty()) {
+            bool collision = false;
+            for (std::size_t slot = 0; slot < sb.dicts.size(); ++slot)
+                for (const auto& kv : sb.dicts[slot])
+                    db.note_string(slot, kv.first, kv.second.data(), kv.second.size(), collision);
+            if (collision) {
+                duckdb_aggregate_function_set_error(info,
+                    "gpu_upload_rows_exact: two different strings hash alike (64-bit collision) — "
+                    "this set cannot be resident; the statement runs native");
+                return;
+            }
         } else if (db.name_set && sb.name_set) {
             if (db.name != sb.name) {
                 duckdb_aggregate_function_set_error(info,
@@ -816,7 +862,7 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
                  std::unique_ptr<gpudb::ResidentColumn> vals, bool pair, const char* fn,
                  bool exact = false,
                  std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds = {},
-                 std::size_t pred_int = 0, std::size_t pred_dbl = 0) {
+                 std::size_t pred_int = 0, std::size_t pred_dbl = 0, std::size_t pred_str = 0) {
     auto set = std::make_shared<ResidentSet>();
     set->name = b.name;
     set->managed = b.managed;
@@ -824,6 +870,14 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
     set->preds = std::move(preds);
     set->pred_int = pred_int;
     set->pred_dbl = pred_dbl;
+    set->pred_str = pred_str;
+    set->key_str = b.key_str;
+    if (b.key_str && !b.dicts.empty()) set->key_dict = std::move(b.dicts[0]);
+    for (std::size_t i = 0; i < pred_str; ++i) {
+        const std::size_t slot = (b.key_str ? 1 : 0) + i;
+        set->str_dicts.push_back(slot < b.dicts.size() ? std::move(b.dicts[slot])
+                                                       : std::unordered_map<std::uint64_t, std::string>{});
+    }
     if (b.managed) {
         set->catalog = b.tag.catalog; set->schema = b.tag.schema; set->table = b.tag.table;
         set->table_oid = b.tag.table_oid; set->columns = b.tag.columns; set->extra = b.tag.extra;
@@ -909,7 +963,8 @@ bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype 
     if (it == ctx.sessions.end()) return false;
     UploadSession& ss = *it->second;
     if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt || ss.exact != exact ||
-                        (exact && (ss.lanes_per_row != b.lanes_per_row || ss.n_pi != b.n_pi || ss.n_pf != b.n_pf))))
+                        (exact && (ss.lanes_per_row != b.lanes_per_row || ss.n_pi != b.n_pi || ss.n_pf != b.n_pf ||
+                                   ss.n_ps != b.n_ps || ss.key_str != b.key_str))))
         throw std::runtime_error(std::string(fn) + ": segment kind differs from the open upload "
             "session '" + b.name + "' (all segments must use the same upload function, types and "
             "predicate lists)");
@@ -918,7 +973,18 @@ bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype 
         throw std::runtime_error(std::string(fn) + ": out of buffer memory for the upload "
             "session '" + b.name + "'" + kPoolCapHint);
     ss.kind_set = true; ss.pair = pair; ss.vdt = vdt; ss.exact = exact;
-    if (exact) { ss.lanes_per_row = b.lanes_per_row; ss.n_pi = b.n_pi; ss.n_pf = b.n_pf; }
+    if (exact) {
+        ss.lanes_per_row = b.lanes_per_row; ss.n_pi = b.n_pi; ss.n_pf = b.n_pf; ss.n_ps = b.n_ps; ss.key_str = b.key_str;
+        if (ss.dicts.size() < b.dicts.size()) ss.dicts.resize(b.dicts.size());
+        for (std::size_t slot = 0; slot < b.dicts.size(); ++slot)
+            for (const auto& kv : b.dicts[slot]) {
+                auto it = ss.dicts[slot].find(kv.first);
+                if (it == ss.dicts[slot].end()) ss.dicts[slot].emplace(kv.first, kv.second);
+                else if (it->second != kv.second)
+                    throw std::runtime_error(std::string(fn) + ": two different strings hash alike (64-bit collision) — "
+                                             "this set cannot be resident; the statement runs native");
+            }
+    }
     ss.charged += bytes;
     ss.lanes += b.lanes();
     ss.rows_seen += b.rows_seen;
@@ -1382,7 +1448,7 @@ std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* 
     const std::size_t rows = lanes / L;
     const auto t0 = std::chrono::steady_clock::now();
     auto& a = ctx.aggregator();
-    std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);
+    std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);        // string lanes: I64 hashes
     for (std::size_t e = 0; e < b.n_pf; ++e) dtypes[2 + b.n_pi + e] = gpudb::Dtype::F64;
     const auto views = b.all_views();
     std::vector<gpudb::Aggregator::RowSpan> spans(views.size());
@@ -1411,8 +1477,178 @@ std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* 
                      fn, b.name.c_str(), rows, L, kcol->null_count(), vcol->null_count(),
                      spans.size(), ms_since(t0));
     publish_set(ctx, b, std::move(kcol), std::move(vcol), /*pair*/true, fn,
-                /*exact*/true, std::move(preds), b.n_pi, b.n_pf);
+                /*exact*/true, std::move(preds), b.n_pi, b.n_pf, b.n_ps);
     return rows;
+}
+
+// gpu_upload_rows_exact(name, k BIGINT|VARCHAR, v BIGINT, pi BIGINT[], pf DOUBLE[], ps VARCHAR[])
+// A VARCHAR key is the wrapper's tuple text, stored as hash64(text) with the
+// text kept in the buffer's dictionary; VARCHAR predicate lanes store
+// hash64(raw text), each with its own dictionary. Lane order: key, payload,
+// pi..., pf..., ps...
+template <bool KEY_STR>
+void upload_rows_exact_update6(duckdb_function_info info, duckdb_data_chunk input,
+                               duckdb_aggregate_state* states) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector k_vec    = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector v_vec    = duckdb_data_chunk_get_vector(input, 2);
+    duckdb_vector pi_vec   = duckdb_data_chunk_get_vector(input, 3);
+    duckdb_vector pf_vec   = duckdb_data_chunk_get_vector(input, 4);
+    duckdb_vector ps_vec   = duckdb_data_chunk_get_vector(input, 5);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    const auto* kd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(k_vec));
+    auto* ks = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(k_vec));
+    const auto* vd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(v_vec));
+    const auto* pi_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(pi_vec));
+    const auto* pf_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(pf_vec));
+    const auto* ps_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(ps_vec));
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    if (!names || (!kd && !ks) || !vd || !pi_ent || !pf_ent || !ps_ent || n == 0) return;
+
+    duckdb_vector pi_child = duckdb_list_vector_get_child(pi_vec);
+    duckdb_vector pf_child = duckdb_list_vector_get_child(pf_vec);
+    duckdb_vector ps_child = duckdb_list_vector_get_child(ps_vec);
+    const auto* pi_data = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(pi_child));
+    const auto* pf_data = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(pf_child));
+    auto* ps_data = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(ps_child));
+    uint64_t* name_validity = duckdb_vector_get_validity(name_vec);
+    uint64_t* k_validity    = duckdb_vector_get_validity(k_vec);
+    uint64_t* v_validity    = duckdb_vector_get_validity(v_vec);
+    uint64_t* pi_validity   = duckdb_vector_get_validity(pi_vec);
+    uint64_t* pf_validity   = duckdb_vector_get_validity(pf_vec);
+    uint64_t* ps_validity   = duckdb_vector_get_validity(ps_vec);
+    uint64_t* pic_validity  = duckdb_vector_get_validity(pi_child);
+    uint64_t* pfc_validity  = duckdb_vector_get_validity(pf_child);
+    uint64_t* psc_validity  = duckdb_vector_get_validity(ps_child);
+
+    UploadState* s0 = probe_upload_state(states[0]);
+    if (!s0) return;
+    bool per_row = true;
+    if (n > 1) {
+        const idx_t probes[3] = { 1, n / 2, n - 1 };
+        for (idx_t k = 0; k < 3 && per_row; ++k) {
+            const idx_t i = probes[k];
+            if (i == 0) continue;
+            if (probe_upload_state(states[i]) == nullptr) per_row = false;
+        }
+    }
+    std::size_t max_lanes = 2;
+    for (idx_t i = 0; i < n; ++i) {
+        const bool pi_ok = !pi_validity || duckdb_validity_row_is_valid(pi_validity, i);
+        const bool pf_ok = !pf_validity || duckdb_validity_row_is_valid(pf_validity, i);
+        const bool ps_ok = !ps_validity || duckdb_validity_row_is_valid(ps_validity, i);
+        const std::size_t L = std::size_t(2) + (pi_ok ? static_cast<std::size_t>(pi_ent[i].length) : 0) +
+                              (pf_ok ? static_cast<std::size_t>(pf_ent[i].length) : 0) +
+                              (ps_ok ? static_cast<std::size_t>(ps_ent[i].length) : 0);
+        max_lanes = std::max(max_lanes, L);
+    }
+    const std::size_t reserved = static_cast<std::size_t>(n) * max_lanes * sizeof(std::int64_t);
+    if (!pool_reserve(reserved)) {
+        duckdb_aggregate_function_set_error(info,
+            (std::string("gpu_upload_rows_exact: out of buffer memory") + kPoolCapHint).c_str());
+        return;
+    }
+    std::size_t used = 0;
+    auto append_row = [&](UploadState* s, idx_t i) -> bool {
+        UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        ++b.rows_seen;
+        if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
+            duckdb_aggregate_function_set_error(info, "gpu_upload_rows_exact: name may not be NULL");
+            return false;
+        }
+        if ((pi_validity && !duckdb_validity_row_is_valid(pi_validity, i)) ||
+            (pf_validity && !duckdb_validity_row_is_valid(pf_validity, i)) ||
+            (ps_validity && !duckdb_validity_row_is_valid(ps_validity, i))) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_rows_exact: the predicate lists may not be NULL (use [] for none)");
+            return false;
+        }
+        const char*       nm_data = duckdb_string_t_data(&names[i]);
+        const std::size_t nm_len  = duckdb_string_t_length(names[i]);
+        if (!b.name_set) {
+            if (!set_buf_name(info, b, nm_data, nm_len, "gpu_upload_rows_exact")) return false;
+        } else if (b.name.size() != nm_len ||
+                   std::memcmp(b.name.data(), nm_data, nm_len) != 0) {
+            duckdb_aggregate_function_set_error(info,
+                ("gpu_upload_rows_exact: one aggregate received two different names ('" +
+                 b.name + "' and '" + std::string(nm_data, nm_len) +
+                 "') — use a constant name").c_str());
+            return false;
+        }
+        const std::size_t n_pi = pi_ent[i].length, n_pf = pf_ent[i].length, n_ps = ps_ent[i].length;
+        if (b.lanes_per_row == 0) {
+            b.n_pi = n_pi; b.n_pf = n_pf; b.n_ps = n_ps; b.lanes_per_row = 2 + n_pi + n_pf + n_ps;
+            b.key_str = KEY_STR;
+        } else if (b.n_pi != n_pi || b.n_pf != n_pf || b.n_ps != n_ps) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_rows_exact: predicate list length changed between rows — every row must carry the same columns");
+            return false;
+        }
+        const std::size_t L = b.lanes_per_row;
+        std::int64_t* dst = b.reserve_lanes(L);
+        const std::size_t row = static_cast<std::size_t>(dst - b.open->data) / L;
+        const bool k_null = k_validity && !duckdb_validity_row_is_valid(k_validity, i);
+        const bool v_null = v_validity && !duckdb_validity_row_is_valid(v_validity, i);
+        bool collision = false;
+        if (KEY_STR) {
+            if (k_null) dst[0] = 0;
+            else {
+                const char* kp = duckdb_string_t_data(&ks[i]);
+                const std::size_t kn = duckdb_string_t_length(ks[i]);
+                const std::uint64_t h = hash64(kp, kn);
+                dst[0] = static_cast<std::int64_t>(h);
+                b.note_string(0, h, kp, kn, collision);
+            }
+        } else {
+            dst[0] = k_null ? 0 : kd[i];
+        }
+        dst[1] = v_null ? 0 : vd[i];
+        if (k_null) b.open->mark_lane_null(row, 0, L);
+        if (v_null) b.open->mark_lane_null(row, 1, L);
+        for (std::size_t e = 0; e < n_pi; ++e) {
+            const idx_t c = pi_ent[i].offset + e;
+            const bool nul = pic_validity && !duckdb_validity_row_is_valid(pic_validity, c);
+            dst[2 + e] = nul ? 0 : pi_data[c];
+            if (nul) b.open->mark_lane_null(row, 2 + e, L);
+        }
+        for (std::size_t e = 0; e < n_pf; ++e) {
+            const idx_t c = pf_ent[i].offset + e;
+            const bool nul = pfc_validity && !duckdb_validity_row_is_valid(pfc_validity, c);
+            dst[2 + n_pi + e] = nul ? 0 : pf_data[c];
+            if (nul) b.open->mark_lane_null(row, 2 + n_pi + e, L);
+        }
+        for (std::size_t e = 0; e < n_ps; ++e) {
+            const idx_t c = ps_ent[i].offset + e;
+            const std::size_t lane = 2 + n_pi + n_pf + e;
+            const bool nul = psc_validity && !duckdb_validity_row_is_valid(psc_validity, c);
+            if (nul) { dst[lane] = 0; b.open->mark_lane_null(row, lane, L); continue; }
+            const char* sp = duckdb_string_t_data(&ps_data[c]);
+            const std::size_t sn = duckdb_string_t_length(ps_data[c]);
+            const std::uint64_t h = hash64(sp, sn);
+            dst[lane] = static_cast<std::int64_t>(h);
+            b.note_string((KEY_STR ? 1 : 0) + e, h, sp, sn, collision);
+        }
+        if (collision) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_rows_exact: two different strings hash alike (64-bit collision) — "
+                "this set cannot be resident; the statement runs native");
+            return false;
+        }
+        b.charged += L * sizeof(std::int64_t);
+        used += L * sizeof(std::int64_t);
+        return true;
+    };
+
+    bool ok = true;
+    if (n == 1 || !per_row) {
+        for (idx_t i = 0; i < n && ok; ++i) ok = append_row(s0, i);
+    } else {
+        for (idx_t i = 0; i < n && ok; ++i) {
+            UploadState* s = probe_upload_state(states[i]);
+            if (s) ok = append_row(s, i);
+        }
+    }
+    pool_release(reserved - std::min(reserved, used));
 }
 
 void upload_rows_exact_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
@@ -1526,7 +1762,10 @@ void upload_finish_exec(duckdb_function_info info, duckdb_data_chunk input, duck
             b.name = ss->name; b.name_set = true; b.managed = ss->managed; b.tag = ss->tag;
             b.dtype = ss->vdt; b.views = ss->views; b.rows_seen = ss->rows_seen;
             b.seq_at_start = ss->seq_at_start;
-            if (ss->exact) { b.lanes_per_row = ss->lanes_per_row; b.n_pi = ss->n_pi; b.n_pf = ss->n_pf; }
+            if (ss->exact) {
+                b.lanes_per_row = ss->lanes_per_row; b.n_pi = ss->n_pi; b.n_pf = ss->n_pf; b.n_ps = ss->n_ps;
+                b.key_str = ss->key_str; b.dicts = std::move(ss->dicts);
+            }
             const std::size_t rows = finish_upload(ctx, b, ss->pair, ss->vdt, "gpu_upload_finish");
             pool_release(ss->charged);
             ss->charged = 0;
@@ -1904,6 +2143,118 @@ void invalidate_exec(duckdb_function_info info, duckdb_data_chunk input,
         }
         out[i] = ctx.invalidate(read_name(names, i));
     }
+}
+
+// ---------------------------------------------------------------------------
+// gpu_resident_dictionary(tag, n) -> (id BIGINT, c0 .. c<n-1> VARCHAR): the
+// key tuples of a VARCHAR-keyed exact set, one row per distinct key, split
+// back into their n components ("N" -> NULL). The rewritten statement joins
+// it on r.key = d.id to put the strings back.
+// ---------------------------------------------------------------------------
+
+struct DictBind { std::string name; std::int64_t n = 1; };
+struct DictInit {
+    std::vector<std::pair<std::uint64_t, std::string>> rows;
+    std::size_t offset = 0;
+    std::int64_t n = 1;
+};
+
+void dictionary_bind(duckdb_bind_info info) {
+    duckdb_value nv = duckdb_bind_get_parameter(info, 0);
+    duckdb_value cv = duckdb_bind_get_parameter(info, 1);
+    if (!nv || !cv || duckdb_is_null_value(nv) || duckdb_is_null_value(cv)) {
+        if (nv) duckdb_destroy_value(&nv);
+        if (cv) duckdb_destroy_value(&cv);
+        duckdb_bind_set_error(info, "gpu_resident_dictionary: name and n may not be NULL");
+        return;
+    }
+    auto* bind = new DictBind();
+    char* nm = duckdb_get_varchar(nv);
+    bind->name = nm ? nm : "";
+    if (nm) duckdb_free(nm);
+    bind->n = duckdb_get_int64(cv);
+    duckdb_destroy_value(&nv);
+    duckdb_destroy_value(&cv);
+    if (bind->n < 1 || bind->n > 8) {
+        delete bind;
+        duckdb_bind_set_error(info, "gpu_resident_dictionary: n must be between 1 and 8");
+        return;
+    }
+    duckdb_logical_type bigint = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+    duckdb_logical_type vc     = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+    duckdb_bind_add_result_column(info, "id", bigint);
+    for (std::int64_t i = 0; i < bind->n; ++i)
+        duckdb_bind_add_result_column(info, ("c" + std::to_string(i)).c_str(), vc);
+    duckdb_destroy_logical_type(&bigint);
+    duckdb_destroy_logical_type(&vc);
+    duckdb_bind_set_bind_data(info, bind, [](void* p) { delete static_cast<DictBind*>(p); });
+}
+
+void dictionary_init(duckdb_init_info info) {
+    auto* bind = static_cast<DictBind*>(duckdb_init_get_bind_data(info));
+    auto* init = new DictInit();
+    init->n = bind->n;
+    try {
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
+        std::shared_ptr<ResidentSet> set = resident_acquire_set(ctx, bind->name, "gpu_resident_dictionary");
+        if (!set->exact || !set->key_str)
+            throw std::runtime_error("gpu_resident_dictionary: '" + bind->name +
+                "' has no string key (upload it with gpu_upload_rows_exact and a VARCHAR key)");
+        init->rows.reserve(set->key_dict.size());
+        for (const auto& kv : set->key_dict) init->rows.emplace_back(kv.first, kv.second);
+        std::sort(init->rows.begin(), init->rows.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+    } catch (const std::exception& e) {
+        delete init;
+        duckdb_init_set_error(info, e.what());
+        return;
+    }
+    duckdb_init_set_init_data(info, init, [](void* p) { delete static_cast<DictInit*>(p); });
+}
+
+// Splits "<len>:<bytes>..." / "N" into n components; a malformed text (which
+// the wrapper never produces) yields NULLs rather than an error.
+void split_tuple(const std::string& t, std::int64_t n, std::vector<std::pair<bool, std::string>>& out) {
+    out.assign(static_cast<std::size_t>(n), {false, std::string()});
+    std::size_t i = 0;
+    for (std::int64_t c = 0; c < n && i < t.size(); ++c) {
+        if (t[i] == 'N') { ++i; continue; }                  // NULL component
+        std::size_t len = 0; bool any = false;
+        while (i < t.size() && std::isdigit(static_cast<unsigned char>(t[i]))) { len = len * 10 + (t[i] - '0'); ++i; any = true; }
+        if (!any || i >= t.size() || t[i] != ':') return;
+        ++i;
+        if (i + len > t.size()) return;
+        out[static_cast<std::size_t>(c)] = {true, t.substr(i, len)};
+        i += len;
+    }
+}
+
+void dictionary_function(duckdb_function_info info, duckdb_data_chunk output) {
+    auto* init = static_cast<DictInit*>(duckdb_function_get_init_data(info));
+    if (!init) return;
+    const std::size_t remaining = init->rows.size() - init->offset;
+    if (remaining == 0) return;
+    constexpr idx_t kChunk = 2048;
+    const idx_t out_n = static_cast<idx_t>(std::min<std::size_t>(remaining, kChunk));
+    auto* ids = static_cast<std::int64_t*>(duckdb_vector_get_data(duckdb_data_chunk_get_vector(output, 0)));
+    std::vector<std::pair<bool, std::string>> parts;
+    for (idx_t i = 0; i < out_n; ++i) {
+        const auto& row = init->rows[init->offset + i];
+        ids[i] = static_cast<std::int64_t>(row.first);
+        split_tuple(row.second, init->n, parts);
+        for (std::int64_t c = 0; c < init->n; ++c) {
+            duckdb_vector v = duckdb_data_chunk_get_vector(output, static_cast<idx_t>(1 + c));
+            const auto& pc = parts[static_cast<std::size_t>(c)];
+            if (!pc.first) {
+                duckdb_vector_ensure_validity_writable(v);
+                duckdb_validity_set_row_invalid(duckdb_vector_get_validity(v), i);
+            } else {
+                duckdb_vector_assign_string_element_len(v, i, pc.second.data(), pc.second.size());
+            }
+        }
+    }
+    duckdb_data_chunk_set_size(output, out_n);
+    init->offset += static_cast<std::size_t>(out_n);
 }
 
 // ---------------------------------------------------------------------------
@@ -2343,41 +2694,58 @@ void register_gpu_resident(duckdb_connection con,
             throw std::runtime_error("gpu_upload_pair_exact registration failed");
         }
 
-        // gpu_upload_rows_exact(name, k BIGINT, v BIGINT, pi BIGINT[], pf DOUBLE[]) -> BIGINT (v0.7 §4.6)
+        // gpu_upload_rows_exact overload set (v0.7 §4.6 / §4.5):
+        //   (name, k BIGINT,  v BIGINT, pi BIGINT[], pf DOUBLE[])               -> BIGINT
+        //   (name, k BIGINT,  v BIGINT, pi BIGINT[], pf DOUBLE[], ps VARCHAR[]) -> BIGINT
+        //   (name, k VARCHAR, v BIGINT, pi BIGINT[], pf DOUBLE[], ps VARCHAR[]) -> BIGINT
         {
-            duckdb_aggregate_function rfn = duckdb_create_aggregate_function();
-            duckdb_aggregate_function_set_name(rfn, "gpu_upload_rows_exact");
-            duckdb_logical_type t_name = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
-            duckdb_logical_type t_k    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
-            duckdb_logical_type t_v    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
-            duckdb_logical_type t_i    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
-            duckdb_logical_type t_d    = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
-            duckdb_logical_type t_pi   = duckdb_create_list_type(t_i);
-            duckdb_logical_type t_pf   = duckdb_create_list_type(t_d);
-            duckdb_logical_type t_ret  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
-            duckdb_aggregate_function_add_parameter(rfn, t_name);
-            duckdb_aggregate_function_add_parameter(rfn, t_k);
-            duckdb_aggregate_function_add_parameter(rfn, t_v);
-            duckdb_aggregate_function_add_parameter(rfn, t_pi);
-            duckdb_aggregate_function_add_parameter(rfn, t_pf);
-            duckdb_aggregate_function_set_return_type(rfn, t_ret);
-            duckdb_destroy_logical_type(&t_name);
-            duckdb_destroy_logical_type(&t_k);
-            duckdb_destroy_logical_type(&t_v);
-            duckdb_destroy_logical_type(&t_i);
-            duckdb_destroy_logical_type(&t_d);
-            duckdb_destroy_logical_type(&t_pi);
-            duckdb_destroy_logical_type(&t_pf);
-            duckdb_destroy_logical_type(&t_ret);
-            duckdb_aggregate_function_set_functions(rfn,
-                upload_state_size, upload_state_init, upload_rows_exact_update,
-                upload_combine, upload_rows_exact_finalize);
-            duckdb_aggregate_function_set_destructor(rfn, upload_state_destroy);
-            duckdb_aggregate_function_set_special_handling(rfn);
-            duckdb_aggregate_function_set_extra_info(rfn, resident_extra_info(ctx),
-                                                     resident_extra_info_destroy);
-            duckdb_state rst = duckdb_register_aggregate_function(con, rfn);
-            duckdb_destroy_aggregate_function(&rfn);
+            auto make_rows_fn = [&](bool key_str, bool with_ps, duckdb_aggregate_update_t update) {
+                duckdb_aggregate_function rfn = duckdb_create_aggregate_function();
+                duckdb_aggregate_function_set_name(rfn, "gpu_upload_rows_exact");
+                duckdb_logical_type t_name = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+                duckdb_logical_type t_k    = duckdb_create_logical_type(key_str ? DUCKDB_TYPE_VARCHAR : DUCKDB_TYPE_BIGINT);
+                duckdb_logical_type t_v    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+                duckdb_logical_type t_i    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+                duckdb_logical_type t_d    = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+                duckdb_logical_type t_s    = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+                duckdb_logical_type t_pi   = duckdb_create_list_type(t_i);
+                duckdb_logical_type t_pf   = duckdb_create_list_type(t_d);
+                duckdb_logical_type t_ps   = duckdb_create_list_type(t_s);
+                duckdb_logical_type t_ret  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+                duckdb_aggregate_function_add_parameter(rfn, t_name);
+                duckdb_aggregate_function_add_parameter(rfn, t_k);
+                duckdb_aggregate_function_add_parameter(rfn, t_v);
+                duckdb_aggregate_function_add_parameter(rfn, t_pi);
+                duckdb_aggregate_function_add_parameter(rfn, t_pf);
+                if (with_ps) duckdb_aggregate_function_add_parameter(rfn, t_ps);
+                duckdb_aggregate_function_set_return_type(rfn, t_ret);
+                for (auto* t : { &t_name, &t_k, &t_v, &t_i, &t_d, &t_s, &t_pi, &t_pf, &t_ps, &t_ret })
+                    duckdb_destroy_logical_type(t);
+                duckdb_aggregate_function_set_functions(rfn,
+                    upload_state_size, upload_state_init, update,
+                    upload_combine, upload_rows_exact_finalize);
+                duckdb_aggregate_function_set_destructor(rfn, upload_state_destroy);
+                duckdb_aggregate_function_set_special_handling(rfn);
+                duckdb_aggregate_function_set_extra_info(rfn, resident_extra_info(ctx),
+                                                         resident_extra_info_destroy);
+                return rfn;
+            };
+            duckdb_aggregate_function_set rset = duckdb_create_aggregate_function_set("gpu_upload_rows_exact");
+            duckdb_aggregate_function r5  = make_rows_fn(false, false, upload_rows_exact_update);
+            duckdb_aggregate_function r6i = make_rows_fn(false, true,  upload_rows_exact_update6<false>);
+            duckdb_aggregate_function r6s = make_rows_fn(true,  true,  upload_rows_exact_update6<true>);
+            duckdb_state a5 = duckdb_add_aggregate_function_to_set(rset, r5);
+            duckdb_state a6 = duckdb_add_aggregate_function_to_set(rset, r6i);
+            duckdb_state a7 = duckdb_add_aggregate_function_to_set(rset, r6s);
+            duckdb_destroy_aggregate_function(&r5);
+            duckdb_destroy_aggregate_function(&r6i);
+            duckdb_destroy_aggregate_function(&r6s);
+            if (a5 == DuckDBError || a6 == DuckDBError || a7 == DuckDBError) {
+                duckdb_destroy_aggregate_function_set(&rset);
+                throw std::runtime_error("gpu_upload_rows_exact overload set assembly failed");
+            }
+            duckdb_state rst = duckdb_register_aggregate_function_set(con, rset);
+            duckdb_destroy_aggregate_function_set(&rset);
             if (rst == DuckDBError) {
                 throw std::runtime_error("gpu_upload_rows_exact registration failed");
             }
@@ -2414,6 +2782,27 @@ void register_gpu_resident(duckdb_connection con,
         last_stats_exec, DUCKDB_TYPE_VARCHAR, 0, ctx);
     register_scalar_names(con, "gpu_build_info",
         build_info_exec, DUCKDB_TYPE_VARCHAR, 0, ctx);
+
+    // gpu_resident_dictionary(tag, n) table function (v0.7 §4.5).
+    {
+        duckdb_table_function tf = duckdb_create_table_function();
+        duckdb_table_function_set_name(tf, "gpu_resident_dictionary");
+        duckdb_logical_type vc = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+        duckdb_logical_type bi = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+        duckdb_table_function_add_parameter(tf, vc);
+        duckdb_table_function_add_parameter(tf, bi);
+        duckdb_destroy_logical_type(&vc);
+        duckdb_destroy_logical_type(&bi);
+        duckdb_table_function_set_bind(tf, dictionary_bind);
+        duckdb_table_function_set_init(tf, dictionary_init);
+        duckdb_table_function_set_function(tf, dictionary_function);
+        duckdb_table_function_set_extra_info(tf, resident_extra_info(ctx), resident_extra_info_destroy);
+        if (duckdb_register_table_function(con, tf) == DuckDBError) {
+            duckdb_destroy_table_function(&tf);
+            throw std::runtime_error("gpu_resident_dictionary registration failed");
+        }
+        duckdb_destroy_table_function(&tf);
+    }
 
     // gpu_residents() table function.
     {
