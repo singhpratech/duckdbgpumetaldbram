@@ -2032,7 +2032,47 @@ private:
                 static_cast<std::int64_t*>([b[6] contents])[num_segs] = 0;
             }
 
-            if (dev_path) {
+            // Measured on an M4 Max (TPC-H SF1 lineitem): top-k 4.3 ms on the
+            // device at any group count vs 2.1 ms on the host at 10K groups and
+            // 7.5 ms at 200K. HAVING is even at 10K (1.9 vs 2.0 ms) and the
+            // device wins above, so only top-k takes the host pass.
+            const std::size_t host_below = filter.topk > 0 ? host_filter_below_ : 0;
+            if (dev_path && total <= host_below) {
+                // Few groups: the tuples are already in shared memory, and a
+                // host pass over them costs less than the device filter's
+                // fixed work (top-k: 16 radix-select passes, each its own
+                // command buffer — ~4.5 ms however few groups there are).
+                // Same reference the device path is tested against.
+                const auto* lo = static_cast<const std::int64_t*>([b[0] contents]);
+                const auto* hi = static_cast<const std::int64_t*>([b[1] contents]);
+                const auto* cn = static_cast<const std::int64_t*>([b[2] contents]);
+                const auto* cs = static_cast<const std::int64_t*>([b[3] contents]);
+                const auto* mn = static_cast<const std::int64_t*>([b[4] contents]);
+                const auto* mx = static_cast<const std::int64_t*>([b[5] contents]);
+                const auto* ky = static_cast<const std::int64_t*>([b[6] contents]);
+                r.keys.reserve(total);   r.key_null.reserve(total);    r.sums.reserve(total);
+                r.sums_hi.reserve(total); r.counts.reserve(total);     r.counts_star.reserve(total);
+                r.mins.reserve(total);   r.maxs.reserve(total);
+                for (std::size_t i = 0; i < total; ++i) {
+                    if (cs[i] == 0) continue;          // every row of the group was masked out
+                    r.keys.push_back(ky[i]);      r.key_null.push_back(null_group && i == num_segs ? 1 : 0);
+                    r.sums.push_back(lo[i]);      r.sums_hi.push_back(hi[i]);
+                    r.counts.push_back(cn[i]);    r.counts_star.push_back(cs[i]);
+                    r.mins.push_back(mn[i]);      r.maxs.push_back(mx[i]);
+                }
+                if (filter.active()) {
+                    apply_group_filter_host(r, filter, FilterAgg::Exact, max_groups, op);
+                } else {
+                    r.groups_total = r.keys.size();
+                    cap_rows(r.keys.size(), max_groups, op);
+                }
+                if (!filter.wants(0)) { r.keys.clear(); r.key_null.clear(); }
+                if (!filter.wants(1)) { r.sums.clear(); r.sums_hi.clear(); }
+                if (!filter.wants(2)) r.counts.clear();
+                if (!filter.wants(3)) r.counts_star.clear();
+                if (!filter.wants(4)) r.mins.clear();
+                if (!filter.wants(5)) r.maxs.clear();
+            } else if (dev_path) {
                 auto* kn = static_cast<std::uint8_t*>([b[7] contents]);
                 std::memset(kn, 0, std::max<std::size_t>(1, total));
                 if (null_group) kn[num_segs] = 1;
@@ -2606,6 +2646,20 @@ private:
             char* end = nullptr;
             const double x = std::strtod(e, &end);
             if (end && end != e && *end == '\0' && x >= 0.0 && x <= 1.0) v = x;
+        }
+        return v;
+    }();
+
+    // top-k runs on the host when the group count is at or below this
+    // (GPUDB_METAL_HOST_FILTER_BELOW, default 65536; 0 = always the device):
+    // the tuples sit in shared memory and the device radix select has a
+    // fixed cost. HAVING stays on the device at every size.
+    std::size_t host_filter_below_ = [] {
+        std::size_t v = 65536;
+        if (const char* e = std::getenv("GPUDB_METAL_HOST_FILTER_BELOW")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end && end != e && *end == '\0') v = static_cast<std::size_t>(x);
         }
         return v;
     }();

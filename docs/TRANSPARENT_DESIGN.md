@@ -75,8 +75,8 @@ nothing in A–E has to be redone for them.
 
 ```sql
 SELECT k1 [, k2, k3], sum(v) | count(v) | count(*) | min(v) | max(v) | avg(v)
-FROM t
-[WHERE <predicate on columns of t>]
+FROM t [[INNER] JOIN d ON t.fk = d.key [JOIN ...]]      -- or: FROM t, d WHERE t.fk = d.key
+[WHERE <predicate on columns of t, d, ...>]
 GROUP BY k1 [, k2, k3]
 [HAVING <agg> {> >= < <= = <>} <constant> [AND …]]
 [ORDER BY <agg> | k [ASC|DESC] [NULLS FIRST|LAST]]
@@ -88,6 +88,13 @@ GROUP BY k1 [, k2, k3]
   and VARCHAR through a dictionary when the column is low-cardinality enough
   that a dictionary is cheap and the collation is binary (§4.5). UBIGINT and
   HUGEINT keys are not int64-orderable and run native.
+- `FROM`: one base table, or an inner equi-join tree of base tables in which
+  every join lands on a column that is unique in its table — the fact-to-
+  dimension joins of a star or snowflake schema (§4.8). Keys, the payload and
+  `WHERE` columns may come from any of the joined tables (all components of a
+  multi-column key from the same one). Outer / semi / anti joins, `USING`,
+  self joins, composite join keys, subqueries as join inputs and many-to-many
+  joins run native.
 - Payloads: integer family, DECIMAL (§4.3). DOUBLE/FLOAT payloads are not
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.
 - Aggregates: `sum`, `count`, `count(*)`, `min`, `max`, `avg` (= sum/count,
@@ -407,12 +414,58 @@ rows joined with four output lanes in 12 ms warm (25 ms including the build
 side's sort); SF1 statements over the joined set, identical to native:
 GROUP BY o_custkey 1.44×, top-10 customers 4.29×, three tables by
 c_nationkey under a date predicate 4.17× (min of 5, statement vs statement,
-operator-level: the rewriter does not emit joins yet).
+operator-level).
 
 SQL: `gpu_join_materialize(out, probe, probe_lane, build, build_lane,
 'p.<lane>, b.<lane>, ...')` publishes the joined set under `out`; it goes
-stale as soon as either source set is stale, dropped or replaced (checked by
-identity on every use, through chains).
+stale as soon as a base set it was built from is stale, dropped or replaced
+(checked by identity on every use). A joined set built from another joined
+set inherits that set's base sets as its sources — the rows were copied — so
+the intermediate sets of a chain are dropped as soon as the chain is done.
+
+**Plain SQL (the wrapper).** A statement whose `FROM` is a join is *lowered*
+to the single-table shape before anything else looks at it
+(`python/gpudb/_join.py`): the join tree is flattened, every `a.x = b.y`
+conjunct of the `ON` clauses and of `WHERE` between two tables becomes a join
+edge (the other `ON` conjuncts of an inner join are `WHERE` conjuncts and
+move there), column references are resolved to their tables (aliases,
+unqualified names that are unique across the join) and rewritten to the
+columns of one virtual table named as the root table. The matcher, the type
+checks, the thresholds, the pure rewrite scalar and the renderer then run
+unchanged on the lowered tree. The root is the largest table from which every
+edge points at a unique column; uniqueness comes from a `PRIMARY KEY` /
+`UNIQUE` constraint or from one `count(c) = count(DISTINCT c)` scan, cached
+until the next statement that can change data. No such root → native.
+
+Residency: one exact set per base table under its own identity tag
+(`…:<lanes>:join`; a dimension's lane `k` is its unique key, so its sort
+cache is the join index), then the `gpu_join_materialize` chain from the root
+outwards, the last step laying the lanes out as `key, payload, predicate
+lanes` — the order the rewriter addresses. In the residency manager the
+joined set is a *derived* set: it is picked only when every source is ready,
+its steps run in idle windows like an upload's finish, and invalidating a
+source invalidates it. The rewritten statement carries one staleness guard
+per base table (`gpu_assert_rows(<base tag>, (SELECT count(*) FROM <table>))`,
+context field `guards`), so a write to any joined table from any connection
+is caught exactly as for a single table; the wrapper then re-uploads that
+table and materialises again.
+
+Thresholds (`_thresholds.py`, from `scripts/transparent_gate.py`'s join
+sweep, TPC-H SF1 on an M4 Max, identical rows on every line): native has to
+run the join whatever the group count, so there is no lower bound on groups
+(25 groups: 2.3–4.4×); HAVING 1.4–7.4×, top-k 1.6–4.0×; the plain form
+1.25–1.28× at 100K groups returned, 1.09–1.13× under a 9–49% `WHERE`, and
+0.92–0.99× at 32K groups under a 3% `WHERE` — a selective dimension filter
+makes native's join tiny while the resident operator still masks every fact
+row; declined. SF10 (60M × 15M rows): all 78 swept rows win, the plain form
+1.08–1.28× at 1M groups returned, HAVING / top-k 2.0–9.9×, few-group shapes
+up to 18×.
+
+Not covered yet: a multi-column GROUP BY whose components come from
+different tables (the packed key is computed per table at upload), composite
+and non-integer join keys, several payload columns in one statement, and
+other language wrappers (the lowering lives in the Python wrapper; the
+scalar only needs the `guards` field).
 
 ## 5. Automatic residency (piece C)
 

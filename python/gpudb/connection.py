@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _resolve, _rewrite, _thresholds
+from . import _classify, _join, _resolve, _rewrite, _thresholds
 from ._residency import ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -42,6 +42,7 @@ class Decision:
     literals: Tuple[str, ...] = ()     # literal values of the template this was decided on
     scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
     output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
+    join: Optional[Any] = None         # _join.JoinResidency for a statement over a key join (§4.8)
 
 
 @dataclass
@@ -104,6 +105,7 @@ class Connection:
         self._tx_open = False
         self._last = LastRewrite()
         self._cache: Dict[Tuple[str, str], Decision] = {}
+        self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
         self._settings: Dict[str, str] = {}
         self._settings_key = ""
         self._backend = ""
@@ -162,6 +164,7 @@ class Connection:
         m = re.search(r"runtime=(\w+)", info)
         self._backend = (m.group(1) if m else "").upper()   # CPU | METAL | CUDA
         self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
+        self._join = self._exact and "join=true" in info     # ... and so does the materialised key join (§4.8)
         try:
             self._raw.execute("SELECT gpu_rewrite_ast('{}', '{}')").fetchall()
             self._has_rewrite_scalar = True
@@ -275,7 +278,10 @@ class Connection:
             return
         rows_out = int(m.group(1))
         has_where = bool(d.plan is not None and d.plan.where)
-        bound = t.plain_max_groups_where if has_where else t.plain_max_groups
+        if d.join is not None:
+            bound = t.join_plain_max_groups          # a key join has its own measured bound (§4.8)
+        else:
+            bound = t.plain_max_groups_where if has_where else t.plain_max_groups
         if rows_out > bound:
             self._log(f"threshold: {rows_out} rows returned by the resident operator > {bound} — "
                       f"template declined from now on")
@@ -321,14 +327,21 @@ class Connection:
         self._last.fallback = True
         tag = self._last.tag
         if tag:
-            self._manager.invalidate(tag)
             st = self._manager.get(tag)
+            # a joined set: the error does not say which table moved
+            for dep in (st.deps if st is not None else []):
+                self._manager.invalidate(dep)
+                ds = self._manager.get(dep)
+                if ds is not None:
+                    self._manager.note_candidate(dep, ds.upload_sql)
+            self._manager.invalidate(tag)
             if st is not None:
                 self._manager.note_candidate(tag, st.upload_sql)
 
     def _invalidate_all(self, why: str) -> None:
         self._manager.invalidate(None)
         self._cache.clear()
+        self._unique_cache.clear()
         self._big_tables = None
         try:
             self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
@@ -443,7 +456,12 @@ class Connection:
                 self._last.reason = "manual"
                 return None
         elif not self._manager.is_ready(d.tag):
-            st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn)
+            if d.join is not None:
+                for b in d.join.base:
+                    self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn)
+            st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
+                                              deps=[b.tag for b in d.join.base] if d.join is not None else None,
+                                              steps=d.join.steps_sql if d.join is not None else None)
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
             if not self._manager.is_ready(d.tag):
@@ -493,12 +511,56 @@ class Connection:
     def _serialize(self, sql: str) -> str:
         return self._raw.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0]
 
+    # ---- key joins (§4.8) ----
+    def _is_unique(self, ident: _resolve.Identity, col: str) -> bool:
+        """Is `col` unique among its non-NULL values? A PRIMARY KEY / UNIQUE
+        constraint answers from the catalog; otherwise one scan, cached until
+        the next statement that can change data."""
+        key = (ident.oid, col)
+        hit = self._unique_cache.get(key)
+        if hit is not None:
+            return hit
+        ok = False
+        try:
+            rows = self._raw.execute(
+                "SELECT constraint_column_names FROM duckdb_constraints() WHERE table_oid = ? "
+                "AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')", [ident.oid]).fetchall()
+            ok = any(list(r[0] or []) == [col] for r in rows)
+            if not ok:
+                ok = bool(self._raw.execute(
+                    f'SELECT count("{col}") = count(DISTINCT "{col}") FROM {ident.fqn}').fetchone()[0])
+        except Exception as e:
+            self._log(f"uniqueness probe failed: {e}")
+            ok = False
+        self._unique_cache[key] = ok
+        return ok
+
+    def _lower_join(self, tree: str) -> "_join.Lowered":
+        return _join.lower(
+            tree,
+            lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
+            lambda ident: self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0],
+            self._is_unique)
+
+    def _match(self, sql: str):
+        """(plan, lowered join or None). Raises _rewrite.Decline."""
+        tree = self._serialize(sql)
+        try:
+            return _rewrite.match(tree, self._settings["default_order"],
+                                  self._settings["default_null_order"]), None
+        except _rewrite.Decline:
+            if not (getattr(self, "_join", False) and _join.is_join_statement(tree)):
+                raise
+        low = self._lower_join(tree)
+        return _rewrite.match(low.tree_json, self._settings["default_order"],
+                              self._settings["default_null_order"]), low
+
     def _replan_literals(self, sql: str, cached: _rewrite.Plan) -> Optional[_rewrite.Plan]:
         try:
-            plan = _rewrite.match(self._serialize(sql), self._settings["default_order"],
-                                  self._settings["default_null_order"])
+            plan, _low = self._match(sql)
         except _rewrite.Decline:
             return None
+        plan.guards = cached.guards
         plan.key_type, plan.val_type, plan.scale = cached.key_type, cached.val_type, cached.scale
         plan.outputs, plan.tag = cached.outputs, cached.tag
         plan.exact, plan.pred_types = cached.exact, cached.pred_types
@@ -511,30 +573,43 @@ class Connection:
 
     def _decide(self, sql: str) -> Decision:
         try:
-            plan = _rewrite.match(self._serialize(sql), self._settings["default_order"],
-                                  self._settings["default_null_order"])
+            plan, low = self._match(sql)
         except _rewrite.Decline as e:
+            if e.detail:
+                self._log(f"declined ({e.reason}): {e.detail}")
             return Decision(False, e.reason)
         except Exception as e:
             self._log(f"rewrite error: {e}")
             return Decision(False, "error")
-        ident, why = _resolve.resolve(self._raw, plan.catalog, plan.schema, plan.table)
-        if ident is None:
-            return Decision(False, why)
+        if low is None:
+            ident, why = _resolve.resolve(self._raw, plan.catalog, plan.schema, plan.table)
+            if ident is None:
+                return Decision(False, why)
+            columns, probe_from = ident.columns, ident.fqn
+            idents = [ident]
+            col_home = lambda c: (ident, c)                     # noqa: E731
+        else:
+            # a key join lowered to one virtual table: the root (fact) table
+            # carries the identity, every column knows its own table
+            ident = low.tables[low.root].ident
+            columns, probe_from = low.columns, low.from_sql + " gpudb_j"
+            idents = [t.ident for t in low.tables]
+            col_home = lambda c: (low.tables[low.colmap[c][0]].ident, low.colmap[c][1])   # noqa: E731
         try:
-            _rewrite.check_types(plan, ident.columns, exact=getattr(self, "_exact", False))
+            _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False))
         except _rewrite.Decline as e:
             return Decision(False, e.reason)
         # thresholds: the row count floor (§9.1); group estimate comes from
         # the resident set once it exists
-        nrows = self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0]
+        nrows = (low.tables[low.root].rows if low is not None
+                 else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
         if nrows < self._floor_rows:
             return Decision(False, "threshold")
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
         stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
         for col in stat_cols:
-            st = _resolve.column_stats(self._raw, ident, col)
+            st = _resolve.column_stats(self._raw, *col_home(col))
             if plan.exact:
                 # the exact path keeps NULLs and never wraps: statistics are
                 # informative only (thresholds), never a gate
@@ -560,9 +635,10 @@ class Connection:
             if coll and coll != "binary":
                 return Decision(False, "collation")
             try:
-                ddl = self._raw.execute("SELECT sql FROM duckdb_tables() WHERE table_oid = ?", [ident.oid]).fetchone()
-                if ddl and ddl[0] and "COLLATE" in ddl[0].upper():
-                    return Decision(False, "collation")
+                for idn in idents:
+                    ddl = self._raw.execute("SELECT sql FROM duckdb_tables() WHERE table_oid = ?", [idn.oid]).fetchone()
+                    if ddl and ddl[0] and "COLLATE" in ddl[0].upper():
+                        return Decision(False, "collation")
             except Exception:
                 return Decision(False, "collation")
         # packed keys (§4.4): each component's integer image bounds from stats()
@@ -596,13 +672,15 @@ class Connection:
             sel = None
             if plan.where:
                 try:
-                    kept = self._raw.execute(
-                        f"SELECT count(*) FROM {ident.fqn} WHERE {_rewrite.where_sql(plan)}").fetchone()[0]
-                    sel = (kept / nrows) if nrows else 0.0
+                    kept, total = self._raw.execute(
+                        f"SELECT count(*) FILTER (WHERE {_rewrite.where_sql(plan)}), count(*) "
+                        f"FROM {probe_from}").fetchone()
+                    sel = (kept / total) if total else 0.0
                 except Exception as e:
                     self._log(f"selectivity probe failed: {e}")
                     return Decision(False, "threshold")
-            ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where))
+            ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
+                                         join=low is not None)
             if not ok:
                 self._log(f"threshold: {why}")
                 return Decision(False, "threshold")
@@ -614,9 +692,22 @@ class Connection:
         except Exception as e:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
-        plan.tag = ident.tag(plan.upload_columns)
-        d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
-                     upload_sql=_rewrite.upload_sql(plan, ident.fqn), form=plan.form)
+        if low is None:
+            plan.tag = ident.tag(plan.upload_columns)
+            d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
+                         upload_sql=_rewrite.upload_sql(plan, ident.fqn), form=plan.form)
+        else:
+            try:
+                jr = _join.plan_residency(low, plan)
+            except _rewrite.Decline as e:
+                self._log(f"declined ({e.reason}): {e.detail}")
+                return Decision(False, e.reason)
+            except ValueError:
+                return Decision(False, "shape")          # an identifier the tag cannot carry
+            plan.tag = jr.tag
+            plan.guards = [(g, f) for g, f, _i in jr.guards]
+            d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag, upload_sql="",
+                         form=plan.form, join=jr)
         if self._has_rewrite_scalar:
             # The extension's pure scalar is the authority on the decision and
             # renders the statement for these literals; `ready` is passed as
@@ -631,7 +722,7 @@ class Connection:
                 "table": {"catalog": ident.catalog, "schema": ident.schema, "name": ident.table,
                           "oid": ident.oid},
                 "columns": {c: {"type": t, "scale": (_rewrite.decimal_scale(t) or (0, 0))[1]}
-                            for c, t in ident.columns.items()},
+                            for c, t in columns.items()},
                 "backend": self._backend, "rows": nrows, "ready": True,
                 "default_order": "DESC" if self._settings["default_order"].upper().startswith("DESC") else "ASC",
                 "default_null_order": self._settings["default_null_order"],
@@ -640,8 +731,11 @@ class Connection:
                 "thresholds": {"min_rows": self._floor_rows},
                 "stats": stats,
             }
+            if low is not None:
+                ctx["guards"] = [{"tag": g, "catalog": i.catalog, "schema": i.schema, "table": i.table}
+                                 for g, _f, i in d.join.guards]
             try:
-                tree = self._serialize(sql)
+                tree = low.tree_json if low is not None else self._serialize(sql)
                 row = self._raw.execute(
                     "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
                     [tree, json.dumps(ctx)]).fetchone()

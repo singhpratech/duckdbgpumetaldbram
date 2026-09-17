@@ -42,16 +42,31 @@ WHERES = {
     "l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4": "mixed",
 }
 FORMS = ("plain", "having", "topk")
+# key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
+# applies where its table is part of the join
+JOINS = {
+    "li x orders":            ("lineitem JOIN orders ON l_orderkey = o_orderkey", ["o_custkey", "o_orderdate", "l_suppkey"]),
+    "li x orders x customer": ("lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey",
+                               ["c_nationkey", "c_custkey"]),
+    "li x part":              ("lineitem JOIN part ON l_partkey = p_partkey", ["p_brand", "p_size"]),
+}
+JOIN_WHERES = {          # predicate -> the table it needs in the join ('' = any)
+    "": "",
+    "o_orderdate < DATE '1995-03-15'": "orders",
+    "o_orderdate >= DATE '1998-06-01'": "orders",
+    "l_discount < 0.01": "lineitem",
+    "p_size <= 10 AND l_linenumber <= 3": "part",
+}
 
 
-def build(key: str, where: str, form: str, having_thr: str) -> str:
+def build(key: str, where: str, form: str, having_thr: str, source: str = "lineitem") -> str:
     w = f" WHERE {where}" if where else ""
     if form == "plain":
-        return f"SELECT {key}, sum(l_quantity), count(*) FROM lineitem{w} GROUP BY {key}"
+        return f"SELECT {key}, sum(l_quantity), count(*) FROM {source}{w} GROUP BY {key}"
     if form == "having":
-        return (f"SELECT {key}, sum(l_quantity) AS q FROM lineitem{w} GROUP BY {key} "
+        return (f"SELECT {key}, sum(l_quantity) AS q FROM {source}{w} GROUP BY {key} "
                 f"HAVING sum(l_quantity) > {having_thr}")
-    return (f"SELECT {key}, sum(l_quantity) AS q FROM lineitem{w} GROUP BY {key} "
+    return (f"SELECT {key}, sum(l_quantity) AS q FROM {source}{w} GROUP BY {key} "
             f"ORDER BY q DESC LIMIT 10")
 
 
@@ -71,12 +86,18 @@ def main() -> int:
     ap.add_argument("--min-ratio", type=float, default=1.0)
     ap.add_argument("--keys", default=",".join(KEYS))
     ap.add_argument("--wheres", default="all", help="'all' or a ';'-separated list of predicates ('' = none)")
+    ap.add_argument("--joins", default="all", help="'all', 'none' or a ';'-separated list of JOINS labels")
+    ap.add_argument("--no-single", action="store_true", help="skip the single-table sweep")
+    ap.add_argument("--no-thresholds", action="store_true",
+                    help="rewrite every shape the engine accepts (data collection for the thresholds; "
+                         "rows below the bound are reported, the exit code still fails on them)")
     args = ap.parse_args()
     if not os.path.exists(args.db):
         print(f"missing {args.db} — SF=1 ./scripts/gen_tpch.sh", file=sys.stderr)
         return 2
 
-    con = gpudb.connect(args.db, read_only=True, residency="eager", floor_rows=0)
+    con = gpudb.connect(args.db, read_only=True, residency="eager", floor_rows=0,
+                        thresholds=not args.no_thresholds)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
     print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}")
@@ -87,18 +108,34 @@ def main() -> int:
     keys = [k for k in args.keys.split(",") if k]
     wheres = list(WHERES) if args.wheres == "all" else args.wheres.split(";")
     fails = []
-    for where in wheres:
+    cells = []          # (source label, FROM clause, key, where)
+    if not args.no_single:
+        cells += [("", "lineitem", key, where) for where in wheres for key in keys]
+    if args.joins != "none":
+        labels = list(JOINS) if args.joins == "all" else args.joins.split(";")
+        for label in labels:
+            source, jkeys = JOINS[label]
+            for where, table in JOIN_WHERES.items():
+                if table and table not in source:
+                    continue
+                cells += [(label, source, key, where) for key in jkeys]
+    sel_cache = {}
+    for label, source, key, where in cells:
         w = f" WHERE {where}" if where else ""
-        sel_rows = con._raw.execute(f"SELECT count(*) FROM lineitem{w}").fetchone()[0]
-        sel = f"{100.0 * sel_rows / rows_total:.0f}%"
-        for key in keys:
-            # a HAVING threshold that keeps roughly 1% of the groups
-            thr = con._raw.execute(
-                f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum(l_quantity) q FROM lineitem{w} GROUP BY {key})"
-            ).fetchone()[0]
-            thr_s = f"{thr:.2f}" if thr is not None else "0"
+        if (source, where) not in sel_cache:
+            kept, total = con._raw.execute(
+                f"SELECT count(*) FILTER (WHERE {where or 'true'}), count(*) FROM {source}").fetchone()
+            sel_cache[(source, where)] = f"{100.0 * kept / total:.0f}%" if total else "—"
+        sel = sel_cache[(source, where)]
+        key_label = f"{label}: {key}" if label else key
+        # a HAVING threshold that keeps roughly 1% of the groups
+        thr = con._raw.execute(
+            f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum(l_quantity) q FROM {source}{w} GROUP BY {key})"
+        ).fetchone()[0]
+        thr_s = f"{thr:.2f}" if thr is not None else "0"
+        if True:
             for form in FORMS:
-                sql = build(key, where, form, thr_s)
+                sql = build(key, where, form, thr_s, source)
                 # native
                 con.transparent = False
                 nat = con.execute(sql).fetchall()
@@ -108,7 +145,7 @@ def main() -> int:
                 got = con.execute(sql).fetchall()
                 lr = con.last_rewrite()
                 if not lr["rewritten"]:
-                    print(f"| {key} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"declined ({lr['reason']}) |")
                     continue
                 if form == "topk":
@@ -126,10 +163,10 @@ def main() -> int:
                     # the once-per-template output-size check sent the template
                     # back to native after its first rewritten run: the timed
                     # runs were native, there is no ratio to report
-                    print(f"| {key} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"{'declined after the first run' if identical else 'FAIL rows differ'} ({lr2['reason']}) |")
                     if not identical:
-                        fails.append((key, where, form, 0.0, identical))
+                        fails.append((key_label, where, form, 0.0, identical))
                     continue
                 ratio = t_nat / t_tr if t_tr > 0 else float("inf")
                 # A millisecond-scale statement can time a whole batch slow
@@ -148,8 +185,8 @@ def main() -> int:
                 ok = identical and ratio >= args.min_ratio
                 result = "PASS" if ok else ("FAIL rows differ" if not identical else "FAIL")
                 if not ok:
-                    fails.append((key, where, form, ratio, identical))
-                print(f"| {key} | {where or '—'} | {sel} | {lr['form']} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
+                    fails.append((key_label, where, form, ratio, identical))
+                print(f"| {key_label} | {where or '—'} | {sel} | {lr['form']} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
                       f"{ratio:.2f}× | {result} |")
                 sys.stdout.flush()
     print()

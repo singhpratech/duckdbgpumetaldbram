@@ -20,6 +20,18 @@ vs statement through the wrapper:
     0.71–0.72× under a 9% WHERE, 0.98–1.06× (noise) at 1.5M groups under a
     25–64% WHERE, 1.22× at 91%                       → topk_min_groups,
     topk_min_selectivity
+Key joins (§4.8), same machine and data, lineitem x orders [x customer],
+lineitem x part, 2026-09-17: native has to run the join whatever the group
+count, so there is no lower bound on groups (25 groups: 2.3–4.4×). HAVING
+1.4–7.4× and top-k 1.6–4.0× on every row (top-k over <= 65K groups takes the
+operator's host pass). The plain form 1.25–1.28× at 100K groups without a
+WHERE, 1.09–1.13× under a 9–49% WHERE, 0.92–0.99× at 32K groups under a 3%
+WHERE (a selective dimension filter makes native's join tiny while the
+resident operator still masks every fact row; what is left is output on both
+sides). SF10 (60M x 15M rows): every one of 78 rows wins, the plain form
+1.08–1.28× at 1M groups returned, 1.12–1.14× at 320K under the 3% WHERE,
+HAVING / top-k 2.0–9.9×                               → join_plain_max_groups,
+join_plain_small_groups, join_plain_min_selectivity
 CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
 takes the exact path there today).
@@ -46,6 +58,10 @@ class Thresholds:
     having_min_selectivity_big: float   # ... when the key has >= topk_min_groups distinct values
     topk_min_groups: int
     topk_min_selectivity: float
+    # statements over a key join (§4.8)
+    join_plain_max_groups: int = 1_000_000      # measured up to 1M groups returned (SF10), 1.08x there
+    join_plain_small_groups: int = 20_000       # at or below this the plain form wins at any selectivity
+    join_plain_min_selectivity: float = 0.08    # above it, the plain form under a WHERE needs this much kept
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -57,14 +73,27 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
-           has_where: bool) -> Tuple[bool, str]:
+           has_where: bool, join: bool = False) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
-    (declines: a miss never rewrites). selectivity None = no WHERE."""
+    (declines: a miss never rewrites). selectivity None = no WHERE. join:
+    the statement is over a key join (its own table above)."""
     t = TABLE.get((backend or "").upper())
     if t is None:
         return False, f"no thresholds for backend {backend!r}"
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
+    if join:
+        if form != "plain":
+            return True, ""
+        if est_groups > t.join_plain_max_groups:
+            return False, f"{est_groups} groups returned over a join > {t.join_plain_max_groups} (output-bound)"
+        if has_where and est_groups > t.join_plain_small_groups:
+            if selectivity is None:
+                return False, "selectivity unknown"
+            if selectivity < t.join_plain_min_selectivity:
+                return False, (f"selectivity {selectivity:.2f} < {t.join_plain_min_selectivity} for the plain form "
+                               f"over a join with {est_groups} groups")
+        return True, ""
     if est_groups < t.min_groups:
         return False, f"{est_groups} groups < {t.min_groups}"
     sel = selectivity if has_where else 1.0

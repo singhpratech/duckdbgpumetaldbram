@@ -2602,3 +2602,185 @@ HAVING thresholds at the 99th percentile of the group sums.
 | l_orderkey | l_discount BETWEEN 0.02 AND 0.08 AND l_linenumber <> 4 | 55% | topk | 10 | 9.0 | 8.7 | 1.03× | PASS |
 
 all rewritten rows at or above the bound and identical to native
+
+## v0.7 key joins through the transparent path — Metal, TPC-H SF1 and SF10 (2026-09-17)
+
+Plain `JOIN` SQL through `gpudb.connect()` (docs/TRANSPARENT_DESIGN.md §4.8):
+the wrapper lowers the join, keeps one exact set per base table resident,
+materialises the join on the device once (`gpu_join_materialize`; SF1
+lineitem x orders, 6.0M x 1.5M rows, four lanes: 12 ms warm) and answers the
+statement from the joined set. Apple M4 Max, `scripts/transparent_gate.py`,
+statement vs statement in one process, warm, rows identical to native on
+every line, min of N.
+
+### SF1 (N=5, thresholds on — the shipping configuration)
+
+| join: key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |
+|---|---|---|---|---|---|---|---|---|
+| li x orders: o_custkey | — | 100% | plain | 99996 | 70.3 | 55.7 | 1.26× | PASS |
+| li x orders: o_custkey | — | 100% | having | 999 | 17.9 | 2.5 | 7.24× | PASS |
+| li x orders: o_custkey | — | 100% | topk | 10 | 18.2 | 4.5 | 4.03× | PASS |
+| li x orders: o_orderdate | — | 100% | plain | 2406 | 11.3 | 3.2 | 3.52× | PASS |
+| li x orders: o_orderdate | — | 100% | having | 25 | 9.6 | 2.1 | 4.48× | PASS |
+| li x orders: o_orderdate | — | 100% | topk | 10 | 9.4 | 3.5 | 2.70× | PASS |
+| li x orders: l_suppkey | — | 100% | plain | 10000 | 19.0 | 7.9 | 2.40× | PASS |
+| li x orders: l_suppkey | — | 100% | having | 100 | 13.3 | 2.5 | 5.33× | PASS |
+| li x orders: l_suppkey | — | 100% | topk | 10 | 13.5 | 2.6 | 5.20× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 99606 | 64.5 | 58.1 | 1.11× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 992 | 13.4 | 3.3 | 4.05× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 12.9 | 5.6 | 2.32× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | plain | 1169 | 10.2 | 3.0 | 3.38× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | having | 12 | 9.3 | 2.6 | 3.56× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 9.2 | 2.4 | 3.88× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 10000 | 17.1 | 8.1 | 2.10× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | having | 100 | 11.6 | 2.9 | 3.96× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 11.8 | 3.9 | 3.03× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 31708 | 19.6 | — | — | declined (threshold) |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 317 | 4.3 | 2.4 | 1.81× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 4.2 | 2.8 | 1.49× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | plain | 63 | 3.5 | 1.0 | 3.52× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 3.4 | 1.3 | 2.70× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 3.4 | 0.9 | 3.75× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 10000 | 9.4 | 9.0 | 1.05× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 98 | 4.5 | 2.3 | 1.96× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 4.4 | 2.3 | 1.95× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | plain | 97490 | 59.0 | 54.5 | 1.08× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | having | 962 | 9.9 | 5.8 | 1.69× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | topk | 10 | 9.5 | 5.1 | 1.87× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | plain | 2406 | 9.1 | 3.2 | 2.83× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | having | 25 | 8.2 | 2.3 | 3.50× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | topk | 10 | 7.9 | 2.2 | 3.65× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | plain | 10000 | 13.6 | 7.0 | 1.94× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | having | 99 | 9.0 | 2.4 | 3.78× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 8.5 | 4.8 | 1.76× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | plain | 25 | 12.5 | 2.8 | 4.45× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | having | 1 | 11.7 | 3.2 | 3.61× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | topk | 10 | 11.4 | 3.0 | 3.82× | PASS |
+| li x orders x customer: c_custkey | — | 100% | plain | 99996 | 75.0 | 57.3 | 1.31× | PASS |
+| li x orders x customer: c_custkey | — | 100% | having | 999 | 19.5 | 4.9 | 3.98× | PASS |
+| li x orders x customer: c_custkey | — | 100% | topk | 10 | 19.0 | 4.4 | 4.30× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 25 | 11.4 | 2.7 | 4.24× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | having | 1 | 11.0 | 3.1 | 3.51× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 11.1 | 6.9 | 1.61× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 99606 | 65.5 | 58.0 | 1.13× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 992 | 14.9 | 3.5 | 4.25× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 14.4 | 5.5 | 2.60× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 25 | 5.0 | 3.6 | 1.38× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 5.1 | 4.9 | 1.04× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 5.1 | 2.1 | 2.47× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 31708 | 20.9 | — | — | declined (threshold) |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 317 | 5.7 | 2.5 | 2.25× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 5.6 | 2.9 | 1.91× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | plain | 25 | 8.3 | 2.2 | 3.83× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | having | 1 | 8.1 | 2.9 | 2.75× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | topk | 10 | 8.2 | 4.7 | 1.73× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | plain | 97490 | 59.8 | 54.5 | 1.10× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | having | 962 | 10.5 | 5.8 | 1.81× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | topk | 10 | 9.9 | 5.6 | 1.77× | PASS |
+| li x part: p_brand | — | 100% | plain | 25 | 7.8 | 3.2 | 2.46× | PASS |
+| li x part: p_brand | — | 100% | having | 1 | 7.6 | 3.7 | 2.06× | PASS |
+| li x part: p_brand | — | 100% | topk | 10 | 7.7 | 4.1 | 1.87× | PASS |
+| li x part: p_size | — | 100% | plain | 50 | 4.2 | 2.6 | 1.63× | PASS |
+| li x part: p_size | — | 100% | having | 1 | 4.0 | 2.9 | 1.37× | PASS |
+| li x part: p_size | — | 100% | topk | 10 | 4.0 | 2.6 | 1.53× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | plain | 25 | 4.5 | 2.1 | 2.13× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | having | 1 | 4.6 | 2.7 | 1.66× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | topk | 10 | 4.5 | 2.7 | 1.65× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | plain | 50 | 3.4 | 2.0 | 1.69× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | having | 1 | 3.4 | 2.4 | 1.45× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | topk | 10 | 3.4 | 2.5 | 1.36× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | plain | 25 | 4.5 | 2.4 | 1.88× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | having | 1 | 4.5 | 2.9 | 1.53× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | topk | 10 | 4.6 | 4.0 | 1.17× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | plain | 10 | 3.7 | 2.2 | 1.69× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | having | 1 | 3.7 | 2.0 | 1.83× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | topk | 10 | 3.7 | 2.0 | 1.86× | PASS |
+
+### SF10 (59,986,052 x 15,000,000 rows; N=3, thresholds off — every shape the engine accepts)
+
+| join: key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |
+|---|---|---|---|---|---|---|---|---|
+| li x orders: o_custkey | — | 100% | plain | 999982 | 655.8 | 537.0 | 1.22× | PASS |
+| li x orders: o_custkey | — | 100% | having | 9994 | 152.8 | 18.1 | 8.46× | PASS |
+| li x orders: o_custkey | — | 100% | topk | 10 | 146.1 | 17.1 | 8.53× | PASS |
+| li x orders: o_orderdate | — | 100% | plain | 2406 | 92.2 | 14.2 | 6.47× | PASS |
+| li x orders: o_orderdate | — | 100% | having | 25 | 85.2 | 13.5 | 6.30× | PASS |
+| li x orders: o_orderdate | — | 100% | topk | 10 | 85.5 | 13.0 | 6.56× | PASS |
+| li x orders: l_suppkey | — | 100% | plain | 100000 | 233.3 | 74.2 | 3.14× | PASS |
+| li x orders: l_suppkey | — | 100% | having | 997 | 170.7 | 21.6 | 7.91× | PASS |
+| li x orders: l_suppkey | — | 100% | topk | 10 | 171.2 | 23.8 | 7.19× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 996205 | 629.4 | 548.1 | 1.15× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 9961 | 107.6 | 24.1 | 4.46× | PASS |
+| li x orders: o_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 103.6 | 23.0 | 4.50× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | plain | 1169 | 69.7 | 7.8 | 8.99× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | having | 12 | 67.7 | 7.1 | 9.56× | PASS |
+| li x orders: o_orderdate | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 67.2 | 6.8 | 9.90× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 100000 | 183.3 | 81.8 | 2.24× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | having | 999 | 128.3 | 28.5 | 4.49× | PASS |
+| li x orders: l_suppkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 127.6 | 29.7 | 4.30× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 319607 | 200.8 | 179.5 | 1.12× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 3161 | 34.7 | 14.5 | 2.39× | PASS |
+| li x orders: o_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 32.7 | 15.3 | 2.14× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | plain | 63 | 29.1 | 1.6 | 18.31× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 29.1 | 2.8 | 10.28× | PASS |
+| li x orders: o_orderdate | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 28.9 | 2.3 | 12.70× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 100000 | 88.5 | 68.0 | 1.30× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 996 | 37.6 | 16.6 | 2.27× | PASS |
+| li x orders: l_suppkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 37.3 | 18.6 | 2.00× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | plain | 975125 | 565.8 | 526.0 | 1.08× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | having | 9689 | 65.9 | 19.0 | 3.48× | PASS |
+| li x orders: o_custkey | l_discount < 0.01 | 9% | topk | 10 | 60.8 | 18.1 | 3.36× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | plain | 2406 | 45.7 | 14.9 | 3.07× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | having | 25 | 43.7 | 13.7 | 3.18× | PASS |
+| li x orders: o_orderdate | l_discount < 0.01 | 9% | topk | 10 | 44.1 | 13.7 | 3.22× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | plain | 100000 | 123.6 | 70.5 | 1.75× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | having | 1000 | 69.7 | 18.3 | 3.80× | PASS |
+| li x orders: l_suppkey | l_discount < 0.01 | 9% | topk | 10 | 68.5 | 20.2 | 3.39× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | plain | 25 | 117.0 | 25.4 | 4.60× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | having | 1 | 111.3 | 25.7 | 4.33× | PASS |
+| li x orders x customer: c_nationkey | — | 100% | topk | 10 | 110.9 | 25.5 | 4.35× | PASS |
+| li x orders x customer: c_custkey | — | 100% | plain | 999982 | 707.2 | 553.1 | 1.28× | PASS |
+| li x orders x customer: c_custkey | — | 100% | having | 9994 | 174.6 | 19.5 | 8.95× | PASS |
+| li x orders x customer: c_custkey | — | 100% | topk | 10 | 170.2 | 17.2 | 9.91× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 25 | 86.9 | 23.9 | 3.64× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | having | 1 | 92.0 | 24.0 | 3.83× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 83.6 | 23.8 | 3.51× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | plain | 996205 | 657.0 | 552.5 | 1.19× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | having | 9961 | 121.6 | 24.5 | 4.97× | PASS |
+| li x orders x customer: c_custkey | o_orderdate < DATE '1995-03-15' | 49% | topk | 10 | 115.6 | 22.9 | 5.04× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 25 | 36.1 | 12.2 | 2.95× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 1 | 35.8 | 12.4 | 2.89× | PASS |
+| li x orders x customer: c_nationkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 36.4 | 12.2 | 2.99× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | plain | 319607 | 205.8 | 181.0 | 1.14× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | having | 3161 | 42.4 | 14.5 | 2.92× | PASS |
+| li x orders x customer: c_custkey | o_orderdate >= DATE '1998-06-01' | 3% | topk | 10 | 39.1 | 15.4 | 2.54× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | plain | 25 | 55.1 | 14.6 | 3.78× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | having | 1 | 55.2 | 14.8 | 3.73× | PASS |
+| li x orders x customer: c_nationkey | l_discount < 0.01 | 9% | topk | 10 | 55.3 | 14.8 | 3.75× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | plain | 975125 | 590.6 | 527.1 | 1.12× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | having | 9689 | 76.6 | 19.5 | 3.92× | PASS |
+| li x orders x customer: c_custkey | l_discount < 0.01 | 9% | topk | 10 | 72.8 | 18.3 | 3.98× | PASS |
+| li x part: p_brand | — | 100% | plain | 25 | 131.9 | 30.5 | 4.33× | PASS |
+| li x part: p_brand | — | 100% | having | 1 | 130.2 | 30.9 | 4.21× | PASS |
+| li x part: p_brand | — | 100% | topk | 10 | 129.9 | 30.5 | 4.26× | PASS |
+| li x part: p_size | — | 100% | plain | 50 | 89.6 | 24.5 | 3.65× | PASS |
+| li x part: p_size | — | 100% | having | 1 | 87.2 | 24.9 | 3.50× | PASS |
+| li x part: p_size | — | 100% | topk | 10 | 87.7 | 24.6 | 3.57× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | plain | 25 | 32.4 | 15.3 | 2.13× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | having | 1 | 33.4 | 15.3 | 2.18× | PASS |
+| li x part: p_brand | l_discount < 0.01 | 9% | topk | 10 | 32.6 | 15.1 | 2.16× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | plain | 50 | 28.5 | 16.3 | 1.75× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | having | 1 | 28.1 | 16.7 | 1.68× | PASS |
+| li x part: p_size | l_discount < 0.01 | 9% | topk | 10 | 27.8 | 16.3 | 1.70× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | plain | 25 | 57.1 | 20.0 | 2.86× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | having | 1 | 55.8 | 20.4 | 2.73× | PASS |
+| li x part: p_brand | p_size <= 10 AND l_linenumber <= 3 | 13% | topk | 10 | 55.9 | 19.8 | 2.82× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | plain | 10 | 51.9 | 15.6 | 3.32× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | having | 1 | 51.1 | 15.6 | 3.29× | PASS |
+| li x part: p_size | p_size <= 10 AND l_linenumber <= 3 | 13% | topk | 10 | 50.6 | 15.4 | 3.29× | PASS |
+
+Reading: native has to run the join whatever comes out of it, so the few-group
+shapes that lose on a single table win here; the plain form returning ~1M
+groups is bound by moving the rows out on both sides (1.08–1.28x). The one
+losing shape found (SF1, plain form, 32K groups under a 3% dimension filter,
+0.92–0.99x) is declined by `_thresholds.py`.

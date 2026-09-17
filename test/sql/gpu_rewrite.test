@@ -303,3 +303,11 @@ SELECT (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rew
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT s, sum(v) FROM t WHERE s < ''m'' GROUP BY s'), getvariable('ctx1')), '$.gpudb.reason') AS ordering_on_string,
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT s, sum(v) FROM t GROUP BY s'), json_merge_patch(getvariable('ctx1'), '{"default_collation":"nocase"}')), '$.gpudb.reason') AS nocase;
 -- expect: 0  1  0  INTEGER VARCHAR  shape  collation
+
+-- 30. EXACT over a joined set (§4.8): "guards" in the context gives one staleness assert per base table, each count(*) a scalar subquery; a bad guard entry is an error
+-- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:f:9:tier,v,opened:join-0123456789abcdef","exact":true,"table":{"catalog":"memory","schema":"main","name":"f","oid":9},"columns":{"tier":"INTEGER","v":"BIGINT","opened":"DATE"},"guards":[{"tag":"gpudb:v1:memory:main:f:9:did,val=v:join","catalog":"memory","schema":"main","table":"f"},{"tag":"gpudb:v1:memory:main:d:11:did,key=tier,opened:join","catalog":"memory","schema":"main","table":"d"}],"backend":"METAL","rows":100000,"ready":true,"outputs":[{"name":"tier","type":"INTEGER"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":1000}}'
+-- setup: SET VARIABLE q = 'SELECT tier, sum(v) FROM memory.main.f WHERE opened >= DATE ''2021-01-01'' GROUP BY tier'
+SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%gpu_groupby_exact_resident_where(''gpudb:v1:memory:main:f:9:tier,v,opened:join-0123456789abcdef'', ''i0 >= 18628'')%' AS over_joined_set,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%gpu_assert_rows(''gpudb:v1:memory:main:f:9:did,val=v:join'', (SELECT count_star() FROM memory.main.f)) AND gpu_assert_rows(''gpudb:v1:memory:main:d:11:did,key=tier,opened:join'', (SELECT count_star() FROM memory.main.d))%' AS two_guards,
+       json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), replace(getvariable('ctx'), '"table":"d"', '"table":""')), '$.gpudb.reason') AS bad_guard;
+-- expect: true  true  error

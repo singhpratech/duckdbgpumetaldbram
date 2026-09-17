@@ -57,6 +57,15 @@ class SetState:
     session_ms: float = 0.0         # wall time of the last session, begin -> finish
     seg_ms: List[float] = field(default_factory=list)   # scan time of each landed segment (last session)
     finish_window: tuple = (0.0, 0.0)  # time.monotonic() start/end of the last gpu_upload_finish call
+    # a DERIVED set (a materialised join, §4.8): no table scan of its own —
+    # once every set in `deps` is ready, `steps` (gpu_join_materialize calls)
+    # run in order on the device
+    deps: List[str] = field(default_factory=list)
+    steps: List[str] = field(default_factory=list)
+
+    @property
+    def derived(self) -> bool:
+        return bool(self.steps)
 
     @property
     def pair(self) -> bool:
@@ -126,12 +135,15 @@ class ResidencyManager:
         s = self.get(tag)
         return s is not None and s.state == "ready"
 
-    def note_candidate(self, tag: str, upload_sql: str, fqn: str = "") -> SetState:
-        """A rewritable shape over a non-resident set was seen."""
+    def note_candidate(self, tag: str, upload_sql: str, fqn: str = "",
+                       deps: Optional[List[str]] = None, steps: Optional[List[str]] = None) -> SetState:
+        """A rewritable shape over a non-resident set was seen. With `steps`
+        the set is derived from `deps` (note those first)."""
         with self._cv:
             s = self._sets.get(tag)
             if s is None:
-                s = SetState(tag=tag, upload_sql=upload_sql, fqn=fqn)
+                s = SetState(tag=tag, upload_sql=upload_sql, fqn=fqn,
+                             deps=list(deps or []), steps=list(steps or []))
                 self._sets[tag] = s
             elif fqn and not s.fqn:
                 s.fqn = fqn
@@ -153,8 +165,11 @@ class ResidencyManager:
         (which also drops any open upload session under the name)."""
         with self._cv:
             now = time.monotonic()
+            hit = {t for t in self._sets if tag is None or t == tag}
+            # a derived set goes with any of its sources
+            hit |= {t for t, s in self._sets.items() if any(d in hit for d in s.deps)}
             for t, s in self._sets.items():
-                if tag is None or t == tag:
+                if t in hit:
                     s.epoch += 1
                     s.last_invalidate = now
                     s.resume_at = now + self.quiet_s
@@ -162,7 +177,7 @@ class ResidencyManager:
                         s.state = "stale"
             cur, utag = self._upload_cursor, self._uploading_tag
             self._cv.notify_all()
-        if cur is not None and utag is not None and (tag is None or tag == utag):
+        if cur is not None and utag is not None and (tag is None or utag in hit):
             self._interrupt(cur)
 
     def snapshot(self) -> Dict[str, str]:
@@ -186,13 +201,20 @@ class ResidencyManager:
         s = self.get(tag)
         if s is None:
             return False
+        for d in s.deps:
+            if not self.is_ready(d) and not self.upload_now(d, run):
+                with self._lock:
+                    s.state = "failed"
+                    s.error = f"source set {d} is not resident"
+                return False
         with self._lock:
             s.state = "uploading"
             s.attempts += 1
             s.last_upload_start = time.monotonic()
             epoch = s.epoch
         try:
-            run(s.upload_sql)
+            for stmt in (s.steps if s.derived else [s.upload_sql]):
+                run(stmt)
         except Exception as e:
             with self._lock:
                 s.state = "failed" if "GPUDB_UPLOAD_DISCARDED" not in str(e) else "stale"
@@ -215,8 +237,17 @@ class ResidencyManager:
     def _pick(self) -> Optional[SetState]:
         now = time.monotonic()
         for s in self._sets.values():
-            if s.state == "pending" and now >= s.resume_at:
-                return s
+            if s.state != "pending" or now < s.resume_at:
+                continue
+            if s.derived:
+                deps = [self._sets.get(d) for d in s.deps]
+                if any(d is None or d.state == "failed" for d in deps):
+                    s.state = "failed"
+                    s.error = "a source set failed to upload"
+                    continue
+                if any(d.state != "ready" for d in deps):
+                    continue                      # its sources first
+            return s
         return None
 
     def _idle_ms(self) -> float:
@@ -251,11 +282,19 @@ class ResidencyManager:
                 self._uploading_tag = None
 
     def _session_status(self, cur, s: SetState) -> Dict[str, object]:
-        try:
-            row = self._run(cur, s, "SELECT gpu_upload_status(?)", [s.tag])
-            return json.loads(row[0][0])
-        except Exception:
-            return {"open": False}
+        """The extension's view of the open session. Not interruptible (it
+        is a sub-millisecond scalar with no device work, so it may run beside
+        a user statement): an interrupted status read as "session closed"
+        would throw away every segment that already landed. A late interrupt
+        aimed at the segment statement can still hit it, hence the retries."""
+        for _ in range(5):
+            try:
+                row = cur.execute("SELECT gpu_upload_status(?)", [s.tag]).fetchall()
+                return json.loads(row[0][0])
+            except Exception as e:
+                if not _is_interrupt(str(e)):
+                    break
+        return {"open": False}
 
     def _abort(self, cur, s: SetState) -> None:
         try:
@@ -276,6 +315,8 @@ class ResidencyManager:
         """One upload session for the set. Returns the outcome:
         ready | pending (retry later) | stale (invalidated meanwhile) | failed."""
         t_start = time.monotonic()
+        if s.derived:
+            return self._session_derived(cur, s, epoch, t_start)
         fqn = s.fqn or s.upload_sql.split(" FROM ", 1)[1]
         seg_rows = self.segment_rows or s.segment_rows_default
         idle_ms = self.idle_ms
@@ -367,6 +408,32 @@ class ResidencyManager:
         with self._lock:
             s.rows_seen = rows
             s.finish_window = (t_fin, time.monotonic())
+            s.session_ms = (time.monotonic() - t_start) * 1000.0
+        return "ready"
+
+    def _session_derived(self, cur, s: SetState, epoch: int, t_start: float) -> str:
+        """Materialise a derived set: each step is one scalar call on the
+        device (tens of ms), issued only in an idle window like a finish."""
+        rows = 0
+        for stmt in s.steps:
+            with self._cv:
+                ok = self._wait_idle(s, epoch, self.idle_ms)
+            if not ok:
+                return "closed" if self._closed else "stale"
+            try:
+                row = self._run(cur, s, stmt)
+                if "gpu_join_materialize" in stmt and row:
+                    rows = int(row[0][0])
+            except Exception as e:
+                err = str(e)
+                if _is_interrupt(err):
+                    return "pending"              # steps are idempotent: run the chain again
+                if "GPUDB_STALE" in err or "GPUDB_UPLOAD_DISCARDED" in err or "no resident set" in err:
+                    return "stale"                # a source changed under the chain
+                return self._fail(s, e)
+        with self._lock:
+            s.rows_seen = rows
+            s.segments = s.segments_planned = len(s.steps)
             s.session_ms = (time.monotonic() - t_start) * 1000.0
         return "ready"
 
