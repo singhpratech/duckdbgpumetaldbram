@@ -43,7 +43,13 @@ CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
 takes the exact path there today).
 
-The bounds predict the win before a statement runs. After the FIRST rewritten
+The bounds predict the win before a statement runs; the wrapper also MEASURES
+it: every statement runs native while its set is being uploaded, so its own
+native time is known, and when the best of the first three rewritten runs is
+not faster than the best native run the template is declined from then on
+(connection._note_timing). Millisecond-scale statements on Metal are bimodal
+run to run (one join cell measured 2.2 ms in most processes and 4.2 ms in
+others, against 4.6 ms native), which no static bound captures. After the FIRST rewritten
 run of a template the wrapper also reads the operator's rows_out
 (gpu_last_stats) and declines the template when a HAVING or top-k kept more
 groups than the plain form's bound: a filter that passes most groups is

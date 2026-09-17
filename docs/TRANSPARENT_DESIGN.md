@@ -577,6 +577,28 @@ rewritten rows at 1.06–7.6×, none below native. Shapes with a handful of
 groups over a single table (Q1) stay native under the existing `min_groups`
 threshold: the resident reduce walks a huge group serially and loses there.
 
+### 4.11 Expressions over aggregates, compound HAVING
+`sum(a) / count(*)`, `100 * sum(x) / sum(y)`, `max(p) - min(p)`, `HAVING
+sum(a) > 10 AND count(*) > 5`, `ORDER BY sum(b) - sum(a)` are not aggregates
+the device computes; they are projections over aggregates it does. The
+wrapper (`python/gpudb/_split.py`) splits such a statement in two: an INNER
+GROUP BY that selects every group key (`__k<i>`) and every distinct plain
+aggregate (`__g<i>`) the statement mentions, and an OUTER statement — the
+original select list, HAVING and ORDER BY with those subtrees replaced by
+column references — over `(<inner>) AS gpudb_q`. The inner statement is an
+ordinary transparent shape (columns or computed lanes, joins, several
+payloads) and goes through the whole existing path; the outer one is plain
+SQL that DuckDB evaluates. Because the inner outputs carry native's values
+AND types, the outer expressions see exactly what native's would and produce
+the same values and types; their names are pinned by aliasing every outer
+select item with the original statement's DESCRIBE name. A HAVING that is one
+aggregate-vs-constant comparison stays in the inner statement (the device's
+HAVING); anything else becomes the outer WHERE. The decision is
+literal-sensitive (the outer text carries the literals). Declines: `avg` over
+DECIMAL and DOUBLE aggregates inside the expression (the inner declines),
+DISTINCT / FILTER aggregates, windows, subqueries, a bare column that is not
+a group key.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
