@@ -23,6 +23,13 @@ vs statement through the wrapper:
 CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
 takes the exact path there today).
+
+The bounds predict the win before a statement runs. After the FIRST rewritten
+run of a template the wrapper also reads the operator's rows_out
+(gpu_last_stats) and declines the template when a HAVING or top-k kept more
+groups than the plain form's bound: a filter that passes most groups is
+output-bound like the plain form (measured 0.97x on TPC-H orders by
+o_custkey HAVING count(*) >= 3, 59K of ~100K groups surviving).
 """
 from __future__ import annotations
 from dataclasses import dataclass

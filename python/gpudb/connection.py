@@ -41,6 +41,7 @@ class Decision:
     form: str = ""
     literals: Tuple[str, ...] = ()     # literal values of the template this was decided on
     scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
+    output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
 
 
 @dataclass
@@ -233,6 +234,8 @@ class Connection:
         try:
             try:
                 self._raw.execute(sql, parameters)
+                if self._last.rewritten:
+                    self._check_output_size()
             except duckdb.Error as e:
                 if self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
@@ -243,6 +246,41 @@ class Connection:
             self._manager.statement_end()
             self._after()
         return self
+
+    def _check_output_size(self) -> None:
+        """Once per template, after its first rewritten run: the shape's
+        thresholds predict the win from the key's distinct count and the
+        WHERE selectivity, but a HAVING or top-k that keeps most groups is
+        output-bound like the plain form (§9.1). Read the operator's rows_out
+        from gpu_last_stats() on a side cursor (the user's result stays
+        untouched) and, when it exceeds the plain-form bound, decline this
+        template from now on with reason 'threshold'."""
+        d = getattr(self, "_last_decision", None)
+        if d is None or d.output_checked or not getattr(self, "_thresholds", True):
+            return
+        d.output_checked = True
+        t = _thresholds.TABLE.get((self._backend or "").upper())
+        if t is None:
+            return
+        try:
+            cur = self._raw.cursor()
+            try:
+                line = cur.execute("SELECT gpu_last_stats()").fetchone()[0] or ""
+            finally:
+                cur.close()
+        except Exception:
+            return
+        m = re.search(r"rows_out=(\d+)", line)
+        if not m:
+            return
+        rows_out = int(m.group(1))
+        has_where = bool(d.plan is not None and d.plan.where)
+        bound = t.plain_max_groups_where if has_where else t.plain_max_groups
+        if rows_out > bound:
+            self._log(f"threshold: {rows_out} rows returned by the resident operator > {bound} — "
+                      f"template declined from now on")
+            d.rewritten = False
+            d.reason = "threshold"
 
     def sql(self, query, **kw):
         sql = self._route(query, None)
@@ -398,6 +436,7 @@ class Connection:
             return None
         self._last.form = d.form
         self._last.tag = d.tag
+        self._last_decision = d
         # residency
         if self._residency_mode == "manual":
             if not self._manager.is_ready(d.tag) and not self._extension_has_ready_set(d.tag):
