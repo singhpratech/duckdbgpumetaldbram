@@ -238,6 +238,16 @@ struct GroupByFilter {
     std::size_t  topk = 0;
     bool         topk_desc = true;
     Agg          agg = Agg::Sum;
+    // Exact ops only: which result vectors the caller will read, as a bit
+    // set — bit 0 keys (+ key_null), 1 sums + sums_hi, 2 counts, 3
+    // counts_star, 4 mins, 5 maxs. A backend may leave an unwanted vector
+    // EMPTY (it still computes the whole tuple on the device; this only
+    // skips allocating and writing host memory nobody reads — at millions of
+    // groups that memory costs more than the reduce). Filters read what they
+    // need regardless. kAllColumns = every vector filled.
+    static constexpr std::uint32_t kAllColumns = 0x3Fu;
+    std::uint32_t columns = kAllColumns;
+    bool wants(unsigned bit) const { return (columns >> bit) & 1u; }
     bool active() const { return cmp != Cmp::None || topk != 0; }
 };
 
