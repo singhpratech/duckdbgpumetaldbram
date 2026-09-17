@@ -2002,6 +2002,7 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   compiled=cpu           → built without a GPU toolchain
 //   compiled=cpu,cuda      → CUDA backend present (nvcc at build time)
 //   compiled=cpu,metal     → Metal backend present (macOS build)
+//   join=true|false        → the runtime backend runs join_materialize on its own device (§4.8)
 //   exact=true|false       → the runtime backend runs the v0.7 exact GROUP BY
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
@@ -2021,6 +2022,7 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
         default:                    info += "cpu";   break;
     }
     info += ctx_of(info_).aggregator().exact_supported() ? " exact=true" : " exact=false";
+    info += ctx_of(info_).aggregator().join_supported() ? " join=true" : " join=false";
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());
@@ -2236,8 +2238,13 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
             std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
             for (std::size_t l = 2; l < jr.lanes.size(); ++l) preds.push_back(std::move(jr.lanes[l]));
             std::vector<std::pair<std::string, std::weak_ptr<ResidentSet>>> deps;
-            deps.emplace_back(probe_name, ps);
-            deps.emplace_back(build_name, bs);
+            // A source that is itself a joined set hands down ITS sources:
+            // the rows were copied, so the intermediate may be dropped and
+            // only the base sets decide staleness.
+            for (const auto& src : {std::make_pair(probe_name, ps), std::make_pair(build_name, bs)}) {
+                if (src.second->deps.empty()) deps.emplace_back(src.first, src.second);
+                else for (const auto& d : src.second->deps) deps.push_back(d);
+            }
             publish_set(ctx, b, std::move(jr.lanes[0]), std::move(jr.lanes[1]), /*pair*/true, fn,
                         /*exact*/true, std::move(preds), n_i, n_f, n_s, std::move(deps));
             char buf[512];

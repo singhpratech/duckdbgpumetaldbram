@@ -357,6 +357,110 @@ def run():
     check(seen == (2000000,), f"big: rows_seen after re-upload: {seen}")
     con.close()
 
+    # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----
+    print("== key joins")
+    JOIN_SETUP = f"""
+    CREATE TABLE jf AS SELECT i::BIGINT AS id, (i % 5000)::INTEGER AS did, CASE WHEN i % 41 = 0 THEN NULL ELSE (i % 700)::INTEGER END AS eid,
+                              (i % 300)::INTEGER AS g, CASE WHEN i % 17 = 0 THEN NULL ELSE (i % 1013)::BIGINT END AS v,
+                              ((i % 977) / 100.0)::DECIMAL(15,2) AS amt, ['AIR','RAIL','SHIP'][1 + i % 3] AS mode
+                       FROM range({N}) r(i);
+    CREATE TABLE jd (did INTEGER PRIMARY KEY, region VARCHAR, tier INTEGER, opened DATE, score DOUBLE, nid INTEGER);
+    INSERT INTO jd SELECT i, CASE WHEN i % 23 = 0 THEN NULL ELSE ['north','south','east','west'][1 + i % 4] END, (i % 7)::INTEGER,
+                          DATE '2020-01-01' + (i % 900)::INTEGER, i / 5000.0, (i % 25)::INTEGER FROM range(4800) r(i);
+    CREATE TABLE je AS SELECT i::INTEGER AS eid, (i % 9)::INTEGER AS bucket FROM range(650) r(i);
+    CREATE TABLE jn AS SELECT i::INTEGER AS nid, (i % 5)::INTEGER AS continent FROM range(25) r(i);
+    CREATE TABLE jm AS SELECT (i % 100)::INTEGER AS did, i AS w FROM range(1000) r(i);
+    """
+    con = fresh()
+    con.execute(JOIN_SETUP)
+    if getattr(con, "_join", False):
+        jcases = {
+            "dim_key":        "SELECT tier, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
+            "fact_key_dim_where": "SELECT g, sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE tier IN (1, 3) AND opened >= DATE '2021-01-01' AND score < 0.75 GROUP BY g ORDER BY g",
+            "comma_join":     "SELECT tier, count(*) AS c FROM jf, jd WHERE jf.did = jd.did AND v > 500 GROUP BY tier ORDER BY tier",
+            "aliases":        "SELECT d.tier AS t, sum(f.amt) AS a FROM jf AS f JOIN jd d ON d.did = f.did WHERE f.mode = 'AIR' GROUP BY d.tier ORDER BY t",
+            "string_key":     "SELECT region, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY region ORDER BY region NULLS LAST",
+            "string_key_pred": "SELECT region, count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE region IN ('north', 'east') AND mode <> 'SHIP' GROUP BY region ORDER BY region",
+            "date_key":       "SELECT opened, sum(amt) FROM jf JOIN jd ON jf.did = jd.did WHERE g < 100 GROUP BY opened ORDER BY opened",
+            "packed_dim_keys": "SELECT tier, opened, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier, opened ORDER BY tier, opened",
+            "having":         "SELECT g, sum(v) AS s FROM jf JOIN jd ON jf.did = jd.did WHERE tier <> 2 GROUP BY g HAVING sum(v) > 400000 ORDER BY g",
+            "topk":           "SELECT g, sum(amt) AS s FROM jf JOIN jd ON jf.did = jd.did GROUP BY g ORDER BY s DESC, g LIMIT 7",
+            "two_dims":       "SELECT bucket, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did JOIN je ON jf.eid = je.eid WHERE tier > 1 GROUP BY bucket ORDER BY bucket",
+            "snowflake":      "SELECT continent, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did JOIN jn ON jd.nid = jn.nid WHERE mode = 'RAIL' GROUP BY continent ORDER BY continent",
+            "on_extra_pred":  "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did AND jd.tier < 4 GROUP BY tier ORDER BY tier",
+        }
+        for name, sql in jcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"join {name}: rewritten ({lr['reason']})")
+            check(got == want, f"join {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"join {name}: names and types identical")
+        declines = {
+            "many_to_many": "SELECT jf.did, count(*) FROM jf JOIN jm ON jf.did = jm.did GROUP BY jf.did",
+            "left_join":    "SELECT tier, count(*) FROM jf LEFT JOIN jd ON jf.did = jd.did GROUP BY tier",
+            "using":        "SELECT tier, count(*) FROM jf JOIN jd USING (did) GROUP BY tier",
+            "self_join":    "SELECT a.g, count(*) FROM jf a JOIN jf b ON a.id = b.id GROUP BY a.g",
+            "cross_keys":   "SELECT g, tier, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY g, tier",
+            "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did GROUP BY tier",
+            "subquery_leaf": "SELECT tier, count(*) FROM jf JOIN (SELECT * FROM jd) d ON jf.did = d.did GROUP BY tier",
+        }
+        for name, sql in declines.items():
+            want = sorted(map(str, con._raw.execute(sql).fetchall())) if name != "non_equi" else None
+            got = con.execute(sql).fetchall() if name != "non_equi" else None
+            if name == "non_equi":
+                con._route(sql, None)
+            check(not con.last_rewrite()["rewritten"], f"join decline {name}: runs native ({con.last_rewrite()['reason']})")
+            check(want is None or sorted(map(str, got)) == want, f"join decline {name}: answer unchanged")
+        # a write to a DIMENSION makes the joined set stale; the next sighting rebuilds it
+        q = jcases["dim_key"]
+        con.execute("UPDATE jd SET tier = tier + 10 WHERE did < 100")
+        got = con.execute(q).fetchall()
+        check(got == con._raw.execute(q).fetchall(), "join: answer correct right after a write to the dimension")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"] and got == con._raw.execute(q).fetchall(),
+              "join: rewritten again over the re-uploaded dimension, answer correct")
+        # a write from ANOTHER connection is caught by the per-table guard
+        other = con._raw.cursor()
+        other.execute("INSERT INTO jd VALUES (4999, 'north', 1, DATE '2020-01-01', 0.5, 1)")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["fallback"] and got == con._raw.execute(q).fetchall(),
+              "join: foreign write to a dimension -> GPUDB_STALE fallback, native answer")
+        got = con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"] and not con.last_rewrite()["fallback"] and got == con._raw.execute(q).fetchall(),
+              "join: resident again after the foreign write")
+        # a duplicate appearing in the dimension key: the uniqueness probe declines
+        con.execute("CREATE TABLE je2 AS SELECT * FROM je UNION ALL SELECT 5, 99")
+        sql = "SELECT bucket, count(*) FROM jf JOIN je2 ON jf.eid = je2.eid GROUP BY bucket ORDER BY bucket"
+        got = con.execute(sql).fetchall()
+        check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
+              "join: a dimension key with a duplicate runs native")
+        # intermediates of a chain are dropped, the final set survives
+        con.execute(jcases["snowflake"]).fetchall()
+        names = [r[0] for r in con._raw.execute("SELECT name FROM gpu_residents()").fetchall()]
+        check(not any(n.endswith(".0") for n in names), f"join: chain intermediates dropped ({len(names)} sets resident)")
+        con.close()
+        # background residency: sources first, then the materialise step, all in idle windows
+        con = fresh(residency="background", idle_ms=5.0)
+        con.execute(JOIN_SETUP)
+        q = jcases["two_dims"]
+        con.execute(q).fetchall()
+        check(not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "not_resident",
+              "join background: first sighting runs native")
+        ok = con._manager.wait_idle(60)
+        got = con.execute(q).fetchall()
+        check(ok and con.last_rewrite()["rewritten"] and got == con._raw.execute(q).fetchall(),
+              f"join background: resident after the idle uploads, answer correct ({con.residents()})")
+    else:
+        print("  backend without join_materialize on the device: joins stay native")
+        sql = "SELECT tier, count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier"
+        got = con.execute(sql).fetchall()
+        check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(), "join: native without the operator")
+    con.close()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0

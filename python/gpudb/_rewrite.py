@@ -93,6 +93,7 @@ class Plan:
     pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
     pred_types: Dict[str, str] = field(default_factory=dict)
     topk_agg: str = ""                 # aggregate kind the top-k push orders by
+    guards: List[Tuple[str, str]] = field(default_factory=list)   # joined set (§4.8): (base tag, table fqn) per table
 
     @property
     def packed(self) -> bool:
@@ -754,9 +755,14 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
-    sql = (f"SELECT {', '.join(cols)} FROM {src}, "
-           f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
-           f"WHERE gd.ok{extra_pred}")
+    if plan.guards:
+        # a joined set: one assert per base table, each against that table's own set
+        asserts = " AND ".join("gpu_assert_rows('%s', (SELECT count(*) FROM %s))" % (g.replace("'", "''"), f)
+                               for g, f in plan.guards)
+        guard = f"(SELECT ({asserts}) AS ok) gd"
+    else:
+        guard = f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd"
+    sql = f"SELECT {', '.join(cols)} FROM {src}, {guard} WHERE gd.ok{extra_pred}"
     return sql + _order_limit_sql(plan)
 
 
@@ -827,40 +833,66 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
     return sql + _order_limit_sql(plan)
 
 
-def upload_sql(plan: Plan, fqn: str) -> str:
-    """The upload statement for the plan's resident set (§5.5). Integer
-    payloads are cast to BIGINT (exact); DECIMAL(p<=18,s) payloads are
-    uploaded as (v * 10^s)::BIGINT, which is exact because v * 10^s is an
-    integral DECIMAL."""
-    tag = plan.tag.replace("'", "''")
+def _q_default(col: str) -> str:
+    return f'"{col}"'
 
-    def lane(col: str, t: str) -> str:
-        if t == "DATE":
-            return f'CAST("{col}" - DATE \'1970-01-01\' AS BIGINT)'
-        if t == "TIMESTAMP":
-            return f'epoch_us("{col}")'
-        return f'CAST("{col}" AS BIGINT)'
-    k = lane(plan.key, plan.key_type)
+
+def _int_image(qcol: str, t: str) -> str:
+    """The BIGINT image of a key / predicate column: days for DATE,
+    microseconds for TIMESTAMP, the value itself for the integer family."""
+    if t == "DATE":
+        return f"CAST({qcol} - DATE '1970-01-01' AS BIGINT)"
+    if t == "TIMESTAMP":
+        return f"epoch_us({qcol})"
+    return f"CAST({qcol} AS BIGINT)"
+
+
+def key_lane_expr(plan: Plan, q=_q_default) -> str:
+    """The resident key of the plan as a SQL expression over the table's
+    columns; `q` quotes a plan column (the join path maps virtual columns to
+    the real ones)."""
     if plan.exact and plan.dict_key:
         # the key tuple as text: "<byte length>:<text>" per component, "N" for NULL
-        tmpl = ("CASE WHEN \"{c}\" IS NULL THEN 'N' ELSE strlen(CAST(\"{c}\" AS VARCHAR))::VARCHAR"
-                " || ':' || CAST(\"{c}\" AS VARCHAR) END")
-        parts = [tmpl.format(c=kc) for kc in plan.keys]
-        k = " || ".join(parts) if len(parts) > 1 else parts[0]
+        tmpl = ("CASE WHEN {c} IS NULL THEN 'N' ELSE strlen(CAST({c} AS VARCHAR))::VARCHAR"
+                " || ':' || CAST({c} AS VARCHAR) END")
+        parts = [tmpl.format(c=q(kc)) for kc in plan.keys]
+        return " || ".join(parts) if len(parts) > 1 else parts[0]
     if plan.exact and plan.packed:
         # mixed-radix pack: slot_i = coalesce(image - min + 1, 0); key = sum(slot_i * stride_i)
         parts = []
         for kc, kt, (mn, rng, stride) in zip(plan.keys, plan.key_types, plan.pack):
-            slot = f"coalesce({lane(kc, kt)} - {mn} + 1, 0)"
+            slot = f"coalesce({_int_image(q(kc), kt)} - {mn} + 1, 0)"
             parts.append(f"{slot} * {stride}" if stride > 1 else slot)
-        k = f"CAST({' + '.join(parts)} AS BIGINT)"
+        return f"CAST({' + '.join(parts)} AS BIGINT)"
+    return _int_image(q(plan.key), plan.key_type)
+
+
+def val_lane_expr(plan: Plan, q=_q_default) -> str:
+    """The payload lane: integers cast to BIGINT (exact); DECIMAL(p<=18,s) as
+    (v * 10^s)::BIGINT, exact because v * 10^s is an integral DECIMAL."""
+    if plan.val is None:
+        return "CAST(NULL AS BIGINT)"
+    if plan.scale:
+        return f"CAST({q(plan.val)} * {10 ** plan.scale} AS BIGINT)"
+    return f"CAST({q(plan.val)} AS BIGINT)"
+
+
+def pred_lane_expr(plan: Plan, c: str, q=_q_default) -> str:
+    t = plan.pred_types.get(c, "")
+    if t in ("DOUBLE", "FLOAT", "REAL"):
+        return f"CAST({q(c)} AS DOUBLE)"
+    if t in _STRING_TYPES:
+        return q(c)
+    d = decimal_scale(t)
+    return f"CAST({q(c)} * {10 ** d[1]} AS BIGINT)" if d and d[1] else _int_image(q(c), t)
+
+
+def upload_sql(plan: Plan, fqn: str) -> str:
+    """The upload statement for the plan's resident set (§5.5)."""
+    tag = plan.tag.replace("'", "''")
+    k = key_lane_expr(plan)
     if plan.exact:
-        if plan.val is None:
-            v = "CAST(NULL AS BIGINT)"
-        elif plan.scale:
-            v = f'CAST("{plan.val}" * {10 ** plan.scale} AS BIGINT)'
-        else:
-            v = f'CAST("{plan.val}" AS BIGINT)'
+        v = val_lane_expr(plan)
         if not plan.pred_cols and not plan.dict_key:
             # no predicate lanes: the 2-lane exact upload (same set, no list
             # columns to plan per segment statement)
@@ -868,13 +900,8 @@ def upload_sql(plan: Plan, fqn: str) -> str:
         pi, pf, ps = [], [], []
         for c in plan.pred_cols:
             t = plan.pred_types.get(c, "")
-            if t in ("DOUBLE", "FLOAT", "REAL"):
-                pf.append(f'CAST("{c}" AS DOUBLE)')
-            elif t in _STRING_TYPES:
-                ps.append(f'"{c}"')
-            else:
-                d = decimal_scale(t)
-                pi.append(f'CAST("{c}" * {10 ** d[1]} AS BIGINT)' if d and d[1] else lane(c, t))
+            e = pred_lane_expr(plan, c)
+            (pf if t in ("DOUBLE", "FLOAT", "REAL") else ps if t in _STRING_TYPES else pi).append(e)
         if ps or plan.dict_key:
             return (f"SELECT gpu_upload_rows_exact('{tag}', {k}, {v}, [{', '.join(pi)}]::BIGINT[], "
                     f"[{', '.join(pf)}]::DOUBLE[], [{', '.join(ps)}]::VARCHAR[]) FROM {fqn}")
@@ -882,8 +909,4 @@ def upload_sql(plan: Plan, fqn: str) -> str:
                 f"[{', '.join(pf)}]::DOUBLE[]) FROM {fqn}")
     if plan.val is None:
         return f"SELECT gpu_upload('{tag}', {k}) FROM {fqn}"
-    if plan.scale:
-        v = f'CAST("{plan.val}" * {10 ** plan.scale} AS BIGINT)'
-    else:
-        v = f'CAST("{plan.val}" AS BIGINT)'
-    return f"SELECT gpu_upload_pair('{tag}', {k}, {v}) FROM {fqn}"
+    return f"SELECT gpu_upload_pair('{tag}', {k}, {val_lane_expr(plan)}) FROM {fqn}"

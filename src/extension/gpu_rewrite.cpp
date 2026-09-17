@@ -98,6 +98,10 @@ struct KeyPart { std::string name; ColInfo info; std::int64_t min = 0; std::int6
 struct Context {
     std::string tag;
     std::string catalog, schema, table;
+    // A joined set (§4.8): one staleness guard per base table, each against
+    // that table's own resident set. Empty = the single guard over `table`.
+    struct Guard { std::string tag, catalog, schema, table; };
+    std::vector<Guard> guards;
     std::string key_col, val_col;          // from the tag's column list
     ColInfo key, val;
     bool exact = false;                    // the set was uploaded by gpu_upload_rows_exact (v0.7 §4)
@@ -157,6 +161,14 @@ Context parse_context(const json& c) {
     x.exact   = c.value("exact", false);
     x.default_collation = c.value("default_collation", "");
     x.default_order = c.value("default_order", "");
+    if (c.contains("guards") && c["guards"].is_array()) {
+        for (const auto& g : c["guards"]) {
+            if (!g.is_object()) reject("error", "context.guards entry is not an object");
+            Context::Guard gd{g.value("tag", ""), g.value("catalog", ""), g.value("schema", ""), g.value("table", "")};
+            if (gd.tag.empty() || gd.table.empty()) reject("error", "context.guards entry needs a tag and a table");
+            x.guards.push_back(gd);
+        }
+    }
     if (c.contains("outputs") && c["outputs"].is_array()) {
         for (const auto& o : c["outputs"])
             x.outputs.push_back({o.value("name", ""), o.value("type", "")});
@@ -925,6 +937,57 @@ WhereOut where_program(const json& w, const Context& cx, const std::string& t, c
     return out;
 }
 
+// The staleness guard `gd` (one row, column ok): gpu_assert_rows(tag,
+// count(*)) over the table — or, for a joined set, the conjunction of one
+// assert per base table, each count(*) a scalar subquery.
+json j_count_star_select(const std::string& catalog, const std::string& schema, const std::string& table,
+                         json select_item, bool with_from) {
+    json from = with_from
+        ? json{{"type", "BASE_TABLE"}, {"alias", ""}, {"sample", nullptr},
+               {"query_location", kNoLocation}, {"schema_name", schema},
+               {"table_name", table}, {"column_name_alias", json::array()},
+               {"catalog_name", catalog}, {"at_clause", nullptr}}
+        : json{{"type", "EMPTY"}, {"alias", ""}, {"sample", nullptr}, {"query_location", kNoLocation}};
+    return json{{"type", "SELECT_NODE"}, {"modifiers", json::array()},
+                {"cte_map", json{{"map", json::array()}}},
+                {"select_list", json::array({std::move(select_item)})},
+                {"from_table", from},
+                {"where_clause", nullptr}, {"group_expressions", json::array()},
+                {"group_sets", json::array()}, {"aggregate_handling", "STANDARD_HANDLING"},
+                {"having", nullptr}, {"sample", nullptr}, {"qualify", nullptr}};
+}
+json j_guard(const Context& cx) {
+    json guard_select;
+    if (cx.guards.empty()) {
+        guard_select = j_count_star_select(cx.catalog, cx.schema, cx.table,
+            j_function("gpu_assert_rows",
+                       json::array({j_const_varchar(cx.tag), j_function("count_star", json::array())}),
+                       false, "ok"),
+            /*with_from*/true);
+    } else {
+        json asserts = json::array();
+        for (const auto& g : cx.guards) {
+            json sub = json{{"class", "SUBQUERY"}, {"type", "SUBQUERY"}, {"alias", ""},
+                            {"query_location", kNoLocation}, {"subquery_type", "SCALAR"},
+                            {"subquery", json{{"node", j_count_star_select(g.catalog, g.schema, g.table,
+                                                   j_function("count_star", json::array()), true)},
+                                              {"named_param_map", json::array()}}},
+                            {"child", nullptr}, {"comparison_type", "INVALID"}};
+            asserts.push_back(j_function("gpu_assert_rows", json::array({j_const_varchar(g.tag), sub}),
+                                         false, cx.guards.size() == 1 ? "ok" : ""));
+        }
+        json item = cx.guards.size() == 1
+            ? asserts[0]
+            : json{{"class", "CONJUNCTION"}, {"type", "CONJUNCTION_AND"}, {"alias", "ok"},
+                   {"query_location", kNoLocation}, {"children", asserts}};
+        guard_select = j_count_star_select("", "", "", item, /*with_from*/false);
+    }
+    return json{{"type", "SUBQUERY"}, {"alias", "gd"}, {"sample", nullptr},
+                {"query_location", kNoLocation},
+                {"subquery", json{{"node", guard_select}, {"named_param_map", json::array()}}},
+                {"column_name_alias", json::array()}};
+}
+
 Result do_rewrite_exact(json tree, json node, const Context& cx,
                         const std::string& tname, const std::string& talias) {
     Result r;
@@ -1132,22 +1195,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     json tf = json{{"type", "TABLE_FUNCTION"}, {"alias", "r"}, {"sample", nullptr},
                    {"query_location", kNoLocation}, {"function", j_function(fn, args)},
                    {"column_name_alias", json::array()}, {"with_ordinality", "WITHOUT_ORDINALITY"}};
-    json guard_select = json{{"type", "SELECT_NODE"}, {"modifiers", json::array()},
-                             {"cte_map", json{{"map", json::array()}}},
-                             {"select_list", json::array({j_function("gpu_assert_rows",
-                                 json::array({j_const_varchar(cx.tag), j_function("count_star", json::array())}),
-                                 false, "ok")})},
-                             {"from_table", json{{"type", "BASE_TABLE"}, {"alias", ""}, {"sample", nullptr},
-                                 {"query_location", kNoLocation}, {"schema_name", cx.schema},
-                                 {"table_name", cx.table}, {"column_name_alias", json::array()},
-                                 {"catalog_name", cx.catalog}, {"at_clause", nullptr}}},
-                             {"where_clause", nullptr}, {"group_expressions", json::array()},
-                             {"group_sets", json::array()}, {"aggregate_handling", "STANDARD_HANDLING"},
-                             {"having", nullptr}, {"sample", nullptr}, {"qualify", nullptr}};
-    json guard = json{{"type", "SUBQUERY"}, {"alias", "gd"}, {"sample", nullptr},
-                      {"query_location", kNoLocation},
-                      {"subquery", json{{"node", guard_select}, {"named_param_map", json::array()}}},
-                      {"column_name_alias", json::array()}};
+    json guard = j_guard(cx);
     json left_side = tf;
     if (cx.dict) {
         // r LEFT JOIN gpu_resident_dictionary(tag, n) d ON d.id = r.key

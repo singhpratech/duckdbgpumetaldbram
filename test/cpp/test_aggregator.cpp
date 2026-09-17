@@ -1485,6 +1485,12 @@ int main(int argc, char** argv) {
 #endif
 #if GPUDB_HAVE_METAL
     test_backend(gpudb::Backend::METAL);
+    // Small top-k results take a host pass by default; run the block again
+    // with the device radix select forced so both paths stay covered.
+    std::printf("\n(Metal again, GPUDB_METAL_HOST_FILTER_BELOW=0: device top-k at every size)\n");
+    setenv("GPUDB_METAL_HOST_FILTER_BELOW", "0", 1);
+    test_backend(gpudb::Backend::METAL);
+    unsetenv("GPUDB_METAL_HOST_FILTER_BELOW");
 #endif
 
     test_hybrid_aggregator();
