@@ -1,0 +1,100 @@
+# gpu_join_materialize SQL test — the materialised key join (v0.7,
+# docs/TRANSPARENT_DESIGN.md §4.8):
+#   gpu_join_materialize(out, probe, probe_lane, build, build_lane, lanes) -> BIGINT
+# Inner equi-join of two exact sets on the device, published as a new exact
+# set every gpu_groupby_exact_resident* form reads. The build lane must be
+# unique among its non-NULL cells. `lanes` = p.<lane> / b.<lane> items: new
+# key, new payload, then predicate lanes (BIGINT, then DOUBLE, then VARCHAR).
+# A VARCHAR key is uploaded as its tuple text ("<byte length>:<text>", "N" for
+# NULL), the form gpu_resident_dictionary decodes.
+# Parity is checked IN-PROCESS against native JOIN ... GROUP BY, both EXCEPT
+# directions.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_join_materialize
+
+-- 1. Hand fixture: NULL join keys never match, dangling rows vanish, a NULL build attribute is the NULL group
+-- setup: CREATE TABLE f AS SELECT * FROM (VALUES (1,10,100),(1,20,NULL),(2,30,100),(2,NULL,200),(3,40,300),(NULL,50,100),(4,60,999)) t(g,v,fk)
+-- setup: CREATE TABLE d AS SELECT * FROM (VALUES (100,7),(200,NULL),(300,8),(NULL,9),(400,7)) t(id,attr)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, attr, [], []) FROM d
+SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'p.k, p.v');
+-- expect: 5
+
+-- 2. Key from the probe side
+-- setup: CREATE TABLE f AS SELECT * FROM (VALUES (1,10,100),(1,20,NULL),(2,30,100),(2,NULL,200),(3,40,300),(NULL,50,100),(4,60,999)) t(g,v,fk)
+-- setup: CREATE TABLE d AS SELECT * FROM (VALUES (100,7),(200,NULL),(300,8),(NULL,9),(400,7)) t(id,attr)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, attr, [], []) FROM d
+-- setup: SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'p.k, p.v, b.v')
+SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident('j') ORDER BY key NULLS LAST;
+-- expect: 1  10  1  1
+-- expect: 2  30  1  2
+-- expect: 3  40  1  1
+-- expect: NULL  50  1  1
+
+-- 3. Key from the build side; a gathered lane as the predicate
+-- setup: CREATE TABLE f AS SELECT * FROM (VALUES (1,10,100),(1,20,NULL),(2,30,100),(2,NULL,200),(3,40,300),(NULL,50,100),(4,60,999)) t(g,v,fk)
+-- setup: CREATE TABLE d AS SELECT * FROM (VALUES (100,7),(200,NULL),(300,8),(NULL,9),(400,7)) t(id,attr)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, attr, [], []) FROM d
+-- setup: SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'b.v, p.v, p.k, b.k')
+SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('j', 'i1 <> 300') ORDER BY key NULLS LAST;
+-- expect: 7  90  3
+-- expect: NULL  NULL  1
+
+-- 4. Random parity, 200k x 20k with NULLs on every column, plain + WHERE + HAVING + top-k
+-- setup: SELECT setseed(0.42)
+-- setup: CREATE TABLE f AS SELECT CASE WHEN random() < 0.03 THEN NULL ELSE CAST(floor(random()*3000) AS BIGINT) END AS g, CASE WHEN random() < 0.03 THEN NULL ELSE CAST(floor((random()-0.5)*9e18) AS BIGINT) END AS v, CASE WHEN random() < 0.05 THEN NULL ELSE CAST(floor(random()*25000) AS BIGINT) END AS fk, random() AS x FROM range(200000)
+-- setup: CREATE TABLE d AS SELECT CASE WHEN i % 97 = 0 THEN NULL ELSE i END AS id, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 50 END AS attr, CASE WHEN i % 11 = 0 THEN NULL ELSE i / 20000.0 END AS w FROM range(20000) t(i)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], [x]) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, attr, [], [w]) FROM d
+-- setup: SELECT gpu_join_materialize('ja', 'f', 'i0', 'd', 'k', 'p.k, p.v, b.v, p.f0, b.f0')
+-- setup: SELECT gpu_join_materialize('jb', 'f', 'i0', 'd', 'k', 'b.v, p.v, p.k')
+-- setup: CREATE VIEW n AS SELECT f.*, d.attr, d.w FROM f JOIN d ON f.fk = d.id
+SELECT (SELECT count(*) FROM ((SELECT * FROM gpu_groupby_exact_resident('ja')) EXCEPT (SELECT g, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM n GROUP BY g))) + (SELECT count(*) FROM ((SELECT g, sum(v), count(v), count(*), min(v), max(v), avg(v) FROM n GROUP BY g) EXCEPT (SELECT * FROM gpu_groupby_exact_resident('ja')))) AS plain, (SELECT count(*) FROM ((SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('ja', 'i0 >= 10; f0 < 0.5; f1 > 0.25')) EXCEPT (SELECT g, sum(v), count(*) FROM n WHERE attr >= 10 AND x < 0.5 AND w > 0.25 GROUP BY g))) + (SELECT count(*) FROM ((SELECT g, sum(v), count(*) FROM n WHERE attr >= 10 AND x < 0.5 AND w > 0.25 GROUP BY g) EXCEPT (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('ja', 'i0 >= 10; f0 < 0.5; f1 > 0.25')))) AS filtered, (SELECT count(*) FROM ((SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('jb', 'i0 < 1500')) EXCEPT (SELECT attr, sum(v), count(*) FROM n WHERE g < 1500 GROUP BY attr))) + (SELECT count(*) FROM ((SELECT attr, sum(v), count(*) FROM n WHERE g < 1500 GROUP BY attr) EXCEPT (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('jb', 'i0 < 1500')))) AS build_key, (SELECT count(*) FROM ((SELECT key, count_star FROM gpu_groupby_exact_resident_having('ja', 'count_star', '>=', 70)) EXCEPT (SELECT g, count(*) FROM n GROUP BY g HAVING count(*) >= 70))) + (SELECT count(*) FROM ((SELECT g, count(*) FROM n GROUP BY g HAVING count(*) >= 70) EXCEPT (SELECT key, count_star FROM gpu_groupby_exact_resident_having('ja', 'count_star', '>=', 70)))) AS having_, (SELECT count(*) FROM n) - (SELECT sum(count_star) FROM gpu_groupby_exact_resident('jb')) AS row_diff;
+-- expect: 0  0  0  0  0
+
+-- 5. Chain: the joined set probes a second dimension (snowflake)
+-- setup: CREATE TABLE f AS SELECT i % 1000 AS g, i AS v, i % 500 AS fk FROM range(50000) t(i)
+-- setup: CREATE TABLE d AS SELECT i AS id, CASE WHEN i % 9 = 0 THEN NULL ELSE i % 40 END AS d2 FROM range(450) t(i)
+-- setup: CREATE TABLE e AS SELECT i AS id, i % 3 AS grp FROM range(35) t(i)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, d2, [], []) FROM d
+-- setup: SELECT gpu_upload_rows_exact('e', id, grp, [], []) FROM e
+-- setup: SELECT gpu_join_materialize('j1', 'f', 'i0', 'd', 'k', 'p.k, p.v, b.v')
+-- setup: SELECT gpu_join_materialize('j2', 'j1', 'i0', 'e', 'k', 'b.v, p.v, p.k')
+SELECT (SELECT count(*) FROM ((SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('j2', 'i0 < 700')) EXCEPT (SELECT e.grp, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id JOIN e ON d.d2 = e.id WHERE f.g < 700 GROUP BY e.grp))) + (SELECT count(*) FROM ((SELECT e.grp, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id JOIN e ON d.d2 = e.id WHERE f.g < 700 GROUP BY e.grp) EXCEPT (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where('j2', 'i0 < 700')))) AS chain_mismatch;
+-- expect: 0
+
+-- 6. VARCHAR lanes keep their dictionaries: a string key from the build side, a string predicate from the probe side
+-- setup: CREATE TABLE f AS SELECT i AS v, i % 6 AS fk, CASE WHEN i % 4 = 0 THEN 'AIR' WHEN i % 4 = 1 THEN 'RAIL' ELSE 'SHIP' END AS mode FROM range(1000) t(i)
+-- setup: CREATE TABLE d AS SELECT * FROM (VALUES (0,'north'),(1,'south'),(2,NULL),(3,'north'),(4,'east')) t(id,region)
+-- setup: SELECT gpu_upload_rows_exact('f', fk, v, []::BIGINT[], []::DOUBLE[], [mode]) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', CASE WHEN region IS NULL THEN 'N' ELSE strlen(region)::VARCHAR || ':' || region END, id, [id], []::DOUBLE[], []::VARCHAR[]) FROM d
+-- setup: SELECT gpu_join_materialize('j', 'f', 'k', 'd', 'i0', 'b.k, p.v, p.s0')
+SELECT (SELECT count(*) FROM ((SELECT x.c0, r.sum, r.count_star FROM gpu_groupby_exact_resident_where('j', 's0 in (''AIR'', ''SHIP'')') r LEFT JOIN gpu_resident_dictionary('j', 1) x ON x.id = r.key) EXCEPT (SELECT d.region, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id WHERE f.mode IN ('AIR', 'SHIP') GROUP BY d.region))) + (SELECT count(*) FROM ((SELECT d.region, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id WHERE f.mode IN ('AIR', 'SHIP') GROUP BY d.region) EXCEPT (SELECT x.c0, r.sum, r.count_star FROM gpu_groupby_exact_resident_where('j', 's0 in (''AIR'', ''SHIP'')') r LEFT JOIN gpu_resident_dictionary('j', 1) x ON x.id = r.key))) AS string_mismatch;
+-- expect: 0
+
+-- 7. A build key with duplicates is refused (the caller runs native)
+-- setup: CREATE TABLE f AS SELECT i AS g, i AS v, i % 5 AS fk FROM range(100) t(i)
+-- setup: CREATE TABLE d AS SELECT * FROM (VALUES (1,1),(2,2),(1,3)) t(id,a)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, a, [], []) FROM d
+-- expected_fail: build key not unique
+SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'p.k, p.v');
+
+-- 8. A joined set is stale once a source is replaced
+-- setup: CREATE TABLE f AS SELECT i AS g, i AS v, i % 5 AS fk FROM range(100) t(i)
+-- setup: CREATE TABLE d AS SELECT i AS id, i AS a FROM range(5) t(i)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f
+-- setup: SELECT gpu_upload_rows_exact('d', id, a, [], []) FROM d
+-- setup: SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'b.v, p.v')
+-- setup: SELECT gpu_upload_rows_exact('d', id, a, [], []) FROM d
+-- expected_fail: GPUDB_STALE
+SELECT count(*) FROM gpu_groupby_exact_resident('j');
+
+-- 9. Lane spec errors name the problem
+-- setup: CREATE TABLE f AS SELECT i AS g, i AS v, i % 5 AS fk, i / 7.0 AS x FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('f', g, v, [fk], [x]) FROM f
+-- expected_fail: BIGINT lanes first
+SELECT gpu_join_materialize('j', 'f', 'i0', 'f', 'k', 'p.k, p.v, p.f0, p.i0');

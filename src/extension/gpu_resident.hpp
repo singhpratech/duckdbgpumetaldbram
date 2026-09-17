@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -77,6 +78,10 @@ struct ResidentSet {
     bool          key_str = false;
     std::unordered_map<std::uint64_t, std::string>              key_dict;      // key lane (when key_str)
     std::vector<std::unordered_map<std::uint64_t, std::string>> str_dicts;     // one per s<n> lane
+    // gpu_join_materialize (v0.7 §4.8): the sets this one was derived from.
+    // A derived set is stale as soon as a source is stale, dropped or
+    // replaced (checked on every acquire, by identity).
+    std::vector<std::pair<std::string, std::weak_ptr<ResidentSet>>> deps;
     std::size_t   rows = 0;          // rows in the column(s): NULL rows are skipped
                                      // (exact sets: every row, NULLs included)
     std::size_t   rows_seen = 0;     // rows the upload scan delivered (count(*) of its input)

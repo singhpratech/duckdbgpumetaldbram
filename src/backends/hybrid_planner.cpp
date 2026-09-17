@@ -390,6 +390,42 @@ public:
         return gpu_ ? gpu_->exact_supported() : cpu_->exact_supported();
     }
 
+    // v0.7 §4.8: the materialised key join runs where its columns live.
+    bool join_supported() const noexcept override {
+        return gpu_ ? gpu_->join_supported() : cpu_->join_supported();
+    }
+    JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                           const ResidentColumn& build_key,
+                                           const JoinLane* out, std::size_t n_out) override {
+        const auto& hp = check_hybrid(probe_key);
+        const auto& hb = check_hybrid(build_key);
+        if (n_out == 0 || !out) throw std::runtime_error("join_materialize: no output lanes");
+        std::vector<JoinLane> inner(out, out + n_out);
+        bool same_side = hb.on_gpu() == hp.on_gpu();
+        for (std::size_t l = 0; l < n_out; ++l) {
+            if (!out[l].col) throw std::runtime_error("join_materialize: output lane without a column");
+            const auto& hl = check_hybrid(*out[l].col);
+            same_side = same_side && hl.on_gpu() == hp.on_gpu();
+            inner[l].col = &hl.inner();
+        }
+        if (!same_side)
+            throw std::runtime_error(
+                "join_materialize: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        const bool on_gpu = gpu_ && hp.on_gpu();
+        last_ = make_decision(on_gpu ? gpu_backend_ : Backend::CPU,
+                              on_gpu ? DispatchReason::Hot_GpuAlwaysWins
+                                     : (gpu_ ? DispatchReason::Resident_OnCpu : DispatchReason::GpuUnavailable),
+                              hp.rows(), 0, /*resident*/true, /*borderline*/false);
+        JoinMaterializeResult r = (on_gpu ? *gpu_ : *cpu_)
+            .join_materialize(hp.inner(), hb.inner(), inner.data(), n_out);
+        for (auto& lane : r.lanes) {
+            const Dtype dt = lane->dtype();
+            lane = std::make_unique<HybridResidentColumn>(Backend::CPU, std::move(lane), r.rows_out, dt, on_gpu);
+        }
+        return r;
+    }
+
     // v0.7 §4.6: multi-lane exact upload, same placement rule.
     std::vector<std::unique_ptr<ResidentColumn>>
     upload_rows_exact(const RowSpan* spans, std::size_t n_spans,

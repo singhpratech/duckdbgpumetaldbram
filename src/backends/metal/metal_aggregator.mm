@@ -129,6 +129,11 @@ public:
             ps_gbxm_finalize_         = make_pso(lib, @"gbxm_finalize_i64");
             ps_gbx_sel_counts_        = make_pso(lib, @"gbx_sel_counts_i64");
             ps_gbx_sel_compact_       = make_pso(lib, @"gbx_sel_compact_i64");
+            ps_jm_unique_             = make_pso(lib, @"jm_unique_i64");
+            ps_jm_probe_              = make_pso(lib, @"jm_probe_i64");
+            ps_jm_counts_             = make_pso(lib, @"jm_counts");
+            ps_jm_pos_                = make_pso(lib, @"jm_pos");
+            ps_jm_gather_             = make_pso(lib, @"jm_gather");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
@@ -217,6 +222,213 @@ public:
     // memory) partitions NULL-key rows to a suffix of both columns, keeps
     // NULL payloads in place under a validity bitmap, and de-interleaves.
     bool exact_supported() const noexcept override { return true; }
+
+    // ---- v0.7 §4.8: the materialised key join ----
+    bool join_supported() const noexcept override { return true; }
+
+    JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                           const ResidentColumn& build_key,
+                                           const JoinLane* out, std::size_t n_out) override {
+        @autoreleasepool {
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            const auto& pk = check_i64_nullable(probe_key);
+            const auto& bk = check_i64_nullable(build_key);
+            if (n_out == 0 || !out) throw std::runtime_error("join_materialize: no output lanes");
+            for (std::size_t l = 0; l < n_out; ++l) {
+                if (!out[l].col) throw std::runtime_error("join_materialize: output lane without a column");
+                if (out[l].col->backend_tag() != Backend::METAL)
+                    throw std::runtime_error("ResidentColumn mismatch (Metal join lane)");
+                if (out[l].col->rows() != (out[l].from_build ? bk.rows() : pk.rows()))
+                    throw std::runtime_error("join_materialize: lane " + std::to_string(l) +
+                                             " row count differs from its side of the join");
+            }
+            if (out[0].col->dtype() != Dtype::I64)
+                throw std::runtime_error("join_materialize: the key lane must be I64");
+            if (pk.rows() > 0xFFFFFFFFull - 64 || bk.rows() > 0xFFFFFFFFull - 64)
+                throw std::runtime_error("join_materialize: > 2^32-64 rows unsupported");
+
+            JoinMaterializeResult r;
+            r.rows_probe = pk.rows();
+            r.rows_build = bk.rows();
+            double kernel_ms = 0.0;
+            if (!gbx_dummy_valid_)
+                gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+
+            // ---- build side: sorted valid keys + permutation to build rows ----
+            id<MTLBuffer> sorted = nil, perm = nil;
+            std::size_t nb = 0;
+            if (bk.valid_buffer() == nil) {
+                // A key-layout column: the sort cache covers exactly the valid prefix.
+                nb = bk.sort_rows();
+                if (nb) { bk.build_sort_cache(&kernel_ms); sorted = bk.sorted_cache(); perm = bk.perm_cache(); }
+            } else {
+                // NULLs under a bitmap: sort the valid cells only.
+                const auto* bd = static_cast<const std::int64_t*>([bk.buffer() contents]);
+                const auto* bv = static_cast<const std::uint64_t*>([bk.valid_buffer() contents]);
+                std::vector<std::int64_t> ks, idx;
+                ks.reserve(bk.rows()); idx.reserve(bk.rows());
+                for (std::size_t i = 0; i < bk.rows(); ++i)
+                    if ((bv[i >> 6] >> (i & 63)) & 1u) { ks.push_back(bd[i]); idx.push_back(static_cast<std::int64_t>(i)); }
+                nb = ks.size();
+                if (nb) {
+                    sorted = [device_ newBufferWithLength:nb * sizeof(std::int64_t) options:MTLResourceStorageModeShared];
+                    perm   = [device_ newBufferWithLength:nb * sizeof(std::int64_t) options:MTLResourceStorageModeShared];
+                    if (!sorted || !perm) throw std::runtime_error("join_materialize: device allocation failed (Metal)");
+                    std::lock_guard<std::mutex> slock(sort_ctx_->mu);
+                    auto view = sort_ctx_->get().sort_device(ks.data(), idx.data(), static_cast<std::uint32_t>(nb));
+                    std::memcpy([sorted contents], [view.keys contents],     nb * sizeof(std::int64_t));
+                    std::memcpy([perm contents],   [view.payloads contents], nb * sizeof(std::int64_t));
+                    kernel_ms += view.kernel_ms;
+                }
+            }
+
+            const std::size_t n = pk.rows();
+            std::size_t n1 = 0, n2 = 0;
+            const std::size_t nblocks = (n + kBlock - 1) / kBlock;
+            const std::uint32_t n32  = static_cast<std::uint32_t>(n);
+            const std::uint32_t nb32 = static_cast<std::uint32_t>(nb);
+            auto null_from = [](const MetalResidentColumn& c) {
+                return c.null_suffix() ? static_cast<std::uint32_t>(c.sort_rows()) : 0xFFFFFFFFu;
+            };
+            if (n > 0 && nb > 0) {
+                grow(jm_flag_, sizeof(std::uint32_t), "join flag");
+                grow(jm_match_, n * sizeof(std::uint32_t), "join match");
+                grow(jm_cls_, n, "join class");
+                grow(gb_block_buf_,  nblocks * sizeof(std::uint32_t), "join block counts");
+                grow(gb_block2_buf_, nblocks * sizeof(std::uint32_t), "join block counts");
+                *static_cast<std::uint32_t*>([jm_flag_ contents]) = 0u;
+                const auto& kc = static_cast<const MetalResidentColumn&>(*out[0].col);
+                const std::uint32_t p_has = pk.valid_buffer() != nil ? 1u : 0u;
+                const std::uint32_t p_from = null_from(pk);
+                const std::uint32_t k_has = kc.valid_buffer() != nil ? 1u : 0u;
+                const std::uint32_t k_from = null_from(kc);
+                const std::uint32_t k_build = out[0].from_build ? 1u : 0u;
+                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                if (nb > 1) {
+                    [ce setComputePipelineState:ps_jm_unique_];
+                    [ce setBuffer:sorted offset:0 atIndex:0];
+                    [ce setBytes:&nb32 length:sizeof(nb32) atIndex:1];
+                    [ce setBuffer:jm_flag_ offset:0 atIndex:2];
+                    [ce dispatchThreadgroups:MTLSizeMake((nb + kBlock - 1) / kBlock, 1, 1)
+                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                }
+                [ce setComputePipelineState:ps_jm_probe_];
+                [ce setBuffer:pk.buffer() offset:0 atIndex:0];
+                [ce setBuffer:(p_has ? pk.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+                [ce setBytes:&p_has  length:sizeof(p_has)  atIndex:2];
+                [ce setBytes:&p_from length:sizeof(p_from) atIndex:3];
+                [ce setBytes:&n32    length:sizeof(n32)    atIndex:4];
+                [ce setBuffer:sorted offset:0 atIndex:5];
+                [ce setBuffer:perm   offset:0 atIndex:6];
+                [ce setBytes:&nb32   length:sizeof(nb32)   atIndex:7];
+                [ce setBuffer:(k_has ? kc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:8];
+                [ce setBytes:&k_has   length:sizeof(k_has)   atIndex:9];
+                [ce setBytes:&k_from  length:sizeof(k_from)  atIndex:10];
+                [ce setBytes:&k_build length:sizeof(k_build) atIndex:11];
+                [ce setBuffer:jm_match_ offset:0 atIndex:12];
+                [ce setBuffer:jm_cls_   offset:0 atIndex:13];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                [ce setComputePipelineState:ps_jm_counts_];
+                [ce setBuffer:jm_cls_ offset:0 atIndex:0];
+                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce setBuffer:gb_block_buf_  offset:0 atIndex:2];
+                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:3];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if ([cb status] == MTLCommandBufferStatusError)
+                    throw std::runtime_error("join_materialize: probe command buffer failed (Metal)");
+                kernel_ms += cb_kernel_ms(cb);
+                if (*static_cast<std::uint32_t*>([jm_flag_ contents]) != 0u)
+                    throw std::runtime_error("join_materialize: build key not unique");
+                n1 = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]),  nblocks);
+                n2 = host_scan_u32(static_cast<std::uint32_t*>([gb_block2_buf_ contents]), nblocks);
+            } else if (nb > 1) {
+                // No probe rows: uniqueness is still the contract.
+                const auto* sk = static_cast<const std::int64_t*>([sorted contents]);
+                for (std::size_t i = 0; i + 1 < nb; ++i)
+                    if (sk[i] == sk[i + 1]) throw std::runtime_error("join_materialize: build key not unique");
+            }
+            const std::size_t rows_out = n1 + n2;
+            const std::size_t words = (rows_out + 63) / 64;
+
+            // ---- outputs: data + an all-valid bitmap per lane, then gather ----
+            std::vector<id<MTLBuffer>> data(n_out, nil), vbits(n_out, nil);
+            for (std::size_t l = 0; l < n_out; ++l) {
+                data[l]  = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * sizeof(std::int64_t))
+                                                options:MTLResourceStorageModeShared];
+                vbits[l] = [device_ newBufferWithLength:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
+                                                options:MTLResourceStorageModeShared];
+                if (!data[l] || !vbits[l]) throw std::runtime_error("join_materialize: device allocation failed (Metal)");
+                std::memset([vbits[l] contents], 0xFF, [vbits[l] length]);
+            }
+            if (rows_out > 0) {
+                grow(jm_pos_buf_, n * sizeof(std::uint32_t), "join positions");
+                const std::uint32_t n1_32 = static_cast<std::uint32_t>(n1);
+                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps_jm_pos_];
+                [ce setBuffer:jm_cls_ offset:0 atIndex:0];
+                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce setBuffer:gb_block_buf_  offset:0 atIndex:2];
+                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:3];
+                [ce setBytes:&n1_32 length:sizeof(n1_32) atIndex:4];
+                [ce setBuffer:jm_pos_buf_ offset:0 atIndex:5];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                for (std::size_t l = 0; l < n_out; ++l) {
+                    const auto& sc = static_cast<const MetalResidentColumn&>(*out[l].col);
+                    const std::uint32_t s_has = sc.valid_buffer() != nil ? 1u : 0u;
+                    const std::uint32_t s_from = null_from(sc);
+                    const std::uint32_t fb = out[l].from_build ? 1u : 0u;
+                    [ce setComputePipelineState:ps_jm_gather_];
+                    [ce setBuffer:sc.buffer() offset:0 atIndex:0];
+                    [ce setBuffer:(s_has ? sc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+                    [ce setBytes:&s_has  length:sizeof(s_has)  atIndex:2];
+                    [ce setBytes:&s_from length:sizeof(s_from) atIndex:3];
+                    [ce setBytes:&fb     length:sizeof(fb)     atIndex:4];
+                    [ce setBuffer:jm_match_   offset:0 atIndex:5];
+                    [ce setBuffer:jm_cls_     offset:0 atIndex:6];
+                    [ce setBuffer:jm_pos_buf_ offset:0 atIndex:7];
+                    [ce setBytes:&n32 length:sizeof(n32) atIndex:8];
+                    [ce setBuffer:data[l]  offset:0 atIndex:9];
+                    [ce setBuffer:vbits[l] offset:0 atIndex:10];
+                    [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                }
+                [ce endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if ([cb status] == MTLCommandBufferStatusError)
+                    throw std::runtime_error("join_materialize: gather command buffer failed (Metal)");
+                kernel_ms += cb_kernel_ms(cb);
+            }
+            r.lanes.reserve(n_out);
+            for (std::size_t l = 0; l < n_out; ++l) {
+                const auto* w = static_cast<const std::uint64_t*>([vbits[l] contents]);
+                std::size_t set = 0;
+                for (std::size_t i = 0; i < words; ++i) {
+                    std::uint64_t x = w[i];
+                    if (i + 1 == words && (rows_out & 63)) x &= (std::uint64_t{1} << (rows_out & 63)) - 1;
+                    set += static_cast<std::size_t>(__builtin_popcountll(x));
+                }
+                const std::size_t nulls = rows_out - set;
+                // Lane 0: its NULLs are exactly the suffix (key layout, no bitmap).
+                const bool key = l == 0;
+                r.lanes.push_back(std::make_unique<MetalResidentColumn>(
+                    data[l], rows_out, out[l].col->dtype(), sort_ctx_,
+                    /*null_suffix*/ key ? n2 : 0, (key || nulls == 0) ? nil : vbits[l], nulls));
+            }
+            r.rows_out = rows_out;
+            r.null_key_rows = n2;
+            r.kernel_ms = kernel_ms;
+            r.wall_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_wall0).count();
+            return r;
+        }
+    }
 
     ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
                                    Dtype vdt) override {
@@ -2363,6 +2575,11 @@ private:
     id<MTLComputePipelineState> ps_gbxm_finalize_         = nil;
     id<MTLComputePipelineState> ps_gbx_sel_counts_        = nil;
     id<MTLComputePipelineState> ps_gbx_sel_compact_       = nil;
+    id<MTLComputePipelineState> ps_jm_unique_             = nil;
+    id<MTLComputePipelineState> ps_jm_probe_              = nil;
+    id<MTLComputePipelineState> ps_jm_counts_             = nil;
+    id<MTLComputePipelineState> ps_jm_pos_                = nil;
+    id<MTLComputePipelineState> ps_jm_gather_             = nil;
 
     // Exact GROUP BY scratch: 5-long chunk partials, the finalized tuple
     // arrays (lo, hi, cnt, cstar, mn, mx, keys, key_null) kept on the device
@@ -2376,6 +2593,8 @@ private:
     // lists, 6-long masked partials, and the compacted sorted keys /
     // permutation of variant (b).
     id<MTLBuffer> gbx_mask_buf_ = nil, gbx_list_buf_ = nil;
+    // join_materialize scratch (match row, class, destination per probe row; the uniqueness flag)
+    id<MTLBuffer> jm_match_ = nil, jm_cls_ = nil, jm_pos_buf_ = nil, jm_flag_ = nil;
     id<MTLBuffer> gbxm_head_buf_ = nil, gbxm_tail_buf_ = nil;
     id<MTLBuffer> gbx_sel_keys_ = nil, gbx_sel_perm_ = nil;
     // Variant choice: compact-then-reduce when the surviving fraction of the

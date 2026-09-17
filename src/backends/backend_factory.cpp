@@ -83,6 +83,11 @@ GroupByResidentResult Aggregator::groupby_exact_masked_resident(const ResidentCo
     throw std::runtime_error("groupby_exact_masked_resident: not implemented on this backend");
 }
 
+JoinMaterializeResult Aggregator::join_materialize(const ResidentColumn&, const ResidentColumn&,
+                                                   const JoinLane*, std::size_t) {
+    throw std::runtime_error("join_materialize: not implemented on this backend");
+}
+
 // Per-backend factory forward declarations (impls live in their respective TUs).
 // These are declared in `gpudb` so that the hybrid planner TU (which lives
 // in the same library) can call them without re-declaring.

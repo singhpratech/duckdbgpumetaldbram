@@ -273,6 +273,24 @@ struct Predicate {
     std::size_t           n_list = 0;
 };
 
+// ---- v0.7 milestone 5: the materialised key join (docs/TRANSPARENT_DESIGN.md §4.8) ----
+// One output lane of Aggregator::join_materialize: a column of the PROBE set
+// (row-aligned with probe_key) or of the BUILD set (row-aligned with
+// build_key, read through the match).
+struct JoinLane {
+    const ResidentColumn* col = nullptr;
+    bool                  from_build = false;
+};
+struct JoinMaterializeResult {
+    std::vector<std::unique_ptr<ResidentColumn>> lanes;   // n_out columns, lane order
+    std::size_t rows_probe = 0;
+    std::size_t rows_build = 0;
+    std::size_t rows_out = 0;        // probe rows that matched
+    std::size_t null_key_rows = 0;   // of those, rows whose lane-0 cell is NULL (the suffix)
+    double      wall_ms = 0.0;
+    double      kernel_ms = 0.0;
+};
+
 // Returned by Aggregator::topk_resident — k rows in the requested order.
 // idx is the ORIGINAL upload-order index of each row; values_i64 or
 // values_f64 is filled according to the column's dtype.
@@ -569,6 +587,32 @@ public:
     // the CPU reference — correct, but not the GPU, so the transparent
     // rewrite must not fire on it (rule 1). The hybrid reports its GPU side.
     [[nodiscard]] virtual bool exact_supported() const noexcept { return false; }
+
+    // ---- v0.7 milestone 5: the materialised key join (§4.8) ----
+    // Inner equi-join of a PROBE row set against a BUILD row set whose join
+    // key is UNIQUE among its valid cells (a primary / unique key: the
+    // dimension side of a star or snowflake join). Every probe row then has
+    // at most one match, so the join result is a subset of the probe rows
+    // with build columns attached, and it is produced as a NEW row set in
+    // the layout upload_rows_exact returns: lane 0 is the GROUP BY key (I64),
+    // rows whose lane-0 cell is NULL are a suffix of EVERY output column, the
+    // valid-key prefix and the suffix each keep probe order. The output
+    // columns are ordinary exact columns: groupby_exact_[masked_]resident and
+    // every form built on it run over the joined rows unchanged, and an
+    // output lane can be the probe key of a further join (snowflake chains).
+    //   - NULL join keys on either side never match (SQL equality);
+    //   - a probe row without a match is absent (inner join);
+    //   - an output cell is NULL iff its source cell is NULL;
+    //   - lanes keep their source dtype (F64 lanes travel as raw bits);
+    //   - throws std::runtime_error containing "build key not unique" when
+    //     two valid build cells are equal — the caller runs native then;
+    //   - bit-identical across backends, row for row.
+    // probe_key and build_key must be I64. Default throws (backends opt in);
+    // join_supported() is the rule-1 gate, as exact_supported().
+    virtual JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                                   const ResidentColumn& build_key,
+                                                   const JoinLane* out, std::size_t n_out);
+    [[nodiscard]] virtual bool join_supported() const noexcept { return false; }
 
     // ORDER BY col [DESC] LIMIT k over a resident column (I64 or F64).
     // Returns the k smallest (descending=false) or largest values with their
