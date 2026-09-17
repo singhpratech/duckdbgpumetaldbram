@@ -635,13 +635,84 @@ under the row floor. Q6 is the single-table aggregate without GROUP BY.
 
 ---
 
+## 2026-09-18 (later) — Derived tables, an expensive guard, count(DISTINCT)
+
+**Q7–Q9: fold the derived table.** These aggregate over a subquery that only
+renames and computes columns of a join. Folding it into the outer statement
+is an identity transformation, after which everything built earlier applies
+(Q7: a self-joined `nation`, keys from three tables; Q8: eight tables, a CASE
+share; Q9: a composite-key join and a cross-table expression). Two details
+cost a test failure each: folding changes the auto-name of an unnamed item
+(`sum(vv)` → `sum((v * 2))`), so every select item is aliased with the
+original statement's name; and a derived table over a derived table must fold
+innermost first.
+
+**Finding: the staleness guard was the most expensive part of Q8.** Q8 was
+rewritten and measured 0.96×. Profile: device operator 2.7 ms, statement
+7.0 ms. The guard — eight `(SELECT count(*) FROM t)` scalar subqueries in one
+SELECT — took 3.8 ms, although one count takes 0.05 ms:
+
+| tables | scalar subqueries | cross join of aggregates | UNION ALL + bool_and |
+|---|---|---|---|
+| 2 | 0.17 ms | 0.11 ms | 0.11 ms |
+| 4 | 0.31 ms | 0.21 ms | 0.17 ms |
+| 8 | 3.79 ms | 3.66 ms | 0.27 ms |
+
+DuckDB's join-order search over eight one-row relations is superlinear; a
+UNION ALL has no join to order. With the guard rewritten, Q8 is 2.5× and every
+multi-table query gained (Q5 3.6 → 4.8×, Q9 6.7 → 8.2×). Lesson: profile the
+*statement*, not the operator — twice now the cost was in the SQL around it
+(the dictionary join for Q10, the guard here).
+
+**count(DISTINCT x) without a kernel.** Group by (keys, x) on the device, let
+DuckDB count the pairs per key and re-aggregate the other aggregates exactly
+(sum of sums, sum of counts, min of mins). Correct on the first try, and the
+gate immediately showed where it loses: every pair travels back through
+DuckDB at ~0.25 ms per 1K pairs — 700K pairs 0.39–0.51×, 70K pairs fine
+without a WHERE but 0.82–1.13× under one. It shipped with a bound on pairs
+(100K; 20K under a WHERE; selectivity ≥ 5%): 22 rewritten gate rows at
+1.34–6.6×.
+
+**DATE / TIMESTAMP payloads** (`min(l_shipdate)`) came along: `min`, `max`
+and `count` over a lane of days / microseconds, typed back on the way out.
+
+**Coverage, shipping configuration, rows identical on every rewritten query
+(4 → 6 → 9 → 12 of 22):**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.2 | 7.3 | 1.67× | True | |
+| Q2 | native (threshold) | 5.0 | — | — | — |  |
+| Q3 | GPU (plain) | 6.4 | 3.1 | 2.08× | True | |
+| Q4 | native (shape) | 7.3 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q5 | GPU (plain) | 6.9 | 1.4 | 4.79× | True | |
+| Q6 | native (shape) | 1.7 | — | — | — |  |
+| Q7 | GPU (plain) | 7.3 | 3.9 | 1.86× | True | |
+| Q8 | GPU (projected) | 7.5 | 3.3 | 2.28× | True | |
+| Q9 | GPU (plain) | 19.2 | 2.4 | 7.93× | True | |
+| Q10 | GPU (topk) | 17.6 | 3.9 | 4.50× | True | |
+| Q11 | native (threshold) | 2.8 | — | — | — |  |
+| Q12 | GPU (plain) | 6.1 | 3.5 | 1.78× | True | |
+| Q13 | GPU (nested) | 18.3 | 1.9 | 9.57× | True | |
+| Q14 | GPU (projected) | 5.4 | 2.5 | 2.13× | True | |
+| Q15 | native (shape) | 3.3 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 13.1 | — | — | — |  |
+| Q17 | native (shape) | 6.2 | — | — | — | split failed: Binder Error: Referenced column "p_partkey" not found in FROM clause!
+| Q18 | GPU (nested) | 13.4 | 8.9 | 1.50× | True | |
+| Q19 | GPU (projected) | 10.6 | 2.5 | 4.32× | True | |
+| Q20 | native (shape) | 8.1 | — | — | — |  |
+| Q21 | native (shape) | 22.6 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q22 | native (shape) | 8.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
+
+---
+
 ## Open questions
 
-- **`count(DISTINCT x)`, `median`, `stddev`**: new kernels; `count(DISTINCT)`
-  needs values sorted within a group.
+- **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
+  need kernels or a different decomposition.
 - **RIGHT / FULL / semi / anti joins**, correlated subqueries and `EXISTS`
-  (Q2, Q4, Q17, Q20, Q21, Q22), select-project-join derived tables as the
-  FROM of an aggregate (Q7, Q8, Q9).
+  (Q2, Q4, Q17, Q20, Q21, Q22); Q16 combines `count(DISTINCT)` with a
+  `NOT IN` subquery over tables below the row floor.
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
   and as the CPU reference; the CUDA side is to be written against the same
   interface and then swept with the same gate.

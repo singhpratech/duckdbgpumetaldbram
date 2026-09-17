@@ -101,7 +101,11 @@ GROUP BY k1 [, k2, k3]
 - No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is accepted
   over a join (§4.12); on a single table native's filter-and-sum wins and the
   statement is left alone.
-- Payloads: integer family, DECIMAL (§4.3). DOUBLE/FLOAT payloads are not
+- Payloads: integer family, DECIMAL (§4.3); DATE / TIMESTAMP for `min`, `max`
+  and `count` (days / microseconds on the device, typed on the way out).
+  `count(DISTINCT x)`, one DISTINCT column per statement (§4.17).
+- A select-project-join derived table (or a single CTE) as the FROM is folded
+  into the statement first (§4.16). DOUBLE/FLOAT payloads are not
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.
 - Aggregates: `sum`, `count`, `count(*)`, `min`, `max`, `avg` (= sum/count,
   computed on the host from the two device results). Several aggregates over
@@ -726,6 +730,44 @@ instead of joining the dictionary: Q10 17.5 → 4.0 ms (4.4×). The plain form
 returns every group and keeps the join. Columns without a zone-map distinct
 estimate (VARCHAR) get one `approx_count_distinct(hash(keys))` scan per
 statement template.
+
+### 4.16 Select-project-join derived tables
+`SELECT supp_nation, l_year, sum(volume) FROM (SELECT n1.n_name AS
+supp_nation, extract(year FROM l_shipdate) AS l_year, l_extendedprice * (1 -
+l_discount) AS volume FROM supplier, lineitem, … WHERE …) AS shipping GROUP BY
+…` (TPC-H Q7, Q8, Q9): the derived table only renames and computes columns of
+a join — no aggregate, DISTINCT, GROUP BY, LIMIT, window, set operation or
+sample — so folding it into the outer statement changes nothing, and the
+folded statement is an ordinary shape (joins, computed lanes, the split).
+`python/gpudb/_flatten.py` replaces every outer reference to a derived column
+by a copy of its defining expression, merges the two WHERE clauses, takes the
+inner FROM, and aliases every select item with the ORIGINAL statement's
+output name (folding changes auto-names: `sum(vv)` would become `sum((v *
+2))`); innermost derived tables fold first, a single CTE that is the FROM
+folds the same way. The folded text is checked once against the original with
+DESCRIBE and is only used to decide and to build the rewritten statement:
+when the rewrite declines, the original text runs.
+
+Q8 joins eight tables, and it exposed the cost of the multi-table staleness
+guard: eight `(SELECT count(*) FROM t)` scalar subqueries in one SELECT took
+3.8 ms — DuckDB's join-order search over eight one-row relations — against
+0.05 ms for one count and 2.7 ms for the whole device operator (Q8 measured
+0.96×). The guard is now `SELECT bool_and(ok) FROM (SELECT gpu_assert_rows(tag,
+count(*)) AS ok FROM t1 UNION ALL …)`: 0.27 ms for eight tables. Q8 2.5×, and
+every multi-table statement gained (Q5 3.6 → 4.8×, Q9 6.7 → 8.2×).
+
+### 4.17 count(DISTINCT x)
+No kernel: `SELECT k, count(DISTINCT x), sum(v) … GROUP BY k` becomes an inner
+device GROUP BY over (k, x) and an outer statement in which DuckDB counts the
+pairs per key — `count(x)` over the inner rows skips a NULL x exactly as
+`count(DISTINCT x)` does — and re-aggregates the rest exactly: sum of sums,
+sum of counts cast back to BIGINT, min of mins, max of maxs. `avg` does not
+decompose and declines; one DISTINCT column per statement; `sum(DISTINCT)`
+declines. Every (key, x) pair travels back through DuckDB, ~0.25 ms per 1K
+pairs, so the form has its own bound (`_thresholds.py`): up to 17K pairs
+1.3–7.1×, 70K pairs 2.1–2.5× without a WHERE but 0.82–1.13× under a 9–10% one,
+700K pairs 0.39–0.51× — declined above 100K pairs, above 20K under a WHERE,
+and under a WHERE that keeps less than 5%.
 
 ## 5. Automatic residency (piece C)
 

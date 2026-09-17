@@ -672,7 +672,12 @@ XAgg xagg_of(const json& e, const Context& cx, const std::string& t, const std::
         }
         if (ref.info.floating) reject("double", "payload type " + ref.info.type);
         if (ref.info.decimal && ref.info.width > 18) reject("decimal", "payload " + ref.info.type);
-        if (!ref.info.integer && !ref.info.decimal) reject("shape", "payload type '" + ref.info.type + "'");
+        // a DATE / TIMESTAMP payload (days / microseconds on the device): min, max and count only
+        if (ref.info.temporal()) {
+            if (fn != "min" && fn != "max" && fn != "count") reject("shape", fn + " over a " + ref.info.type + " payload");
+        } else if (!ref.info.integer && !ref.info.decimal) {
+            reject("shape", "payload type '" + ref.info.type + "'");
+        }
         for (std::size_t i = 0; i < pays.size() && pay < 0; ++i) if (ieq(pays[i].name, ref.name)) pay = static_cast<int>(i);
         if (pay < 0) {
             if (pays.size() >= 8) reject("shape", "more than eight payload columns");
@@ -1003,22 +1008,32 @@ json j_guard(const Context& cx) {
                        false, "ok"),
             /*with_from*/true);
     } else {
-        json asserts = json::array();
+        // One assert per base table. NOT as scalar subqueries of one SELECT: DuckDB's
+        // join-order search over N one-row relations is what dominated the statement
+        // (8 tables: 3.8 ms against 0.27 ms for this form, measured) —
+        //   SELECT bool_and(ok) AS ok FROM (SELECT gpu_assert_rows(tag1, count(*)) AS ok FROM t1
+        //                                   UNION ALL SELECT gpu_assert_rows(tag2, count(*)) FROM t2 ...)
+        // gpu_assert_rows raises on a mismatch, so bool_and only ever sees TRUE.
+        json arms;
         for (const auto& g : cx.guards) {
-            json sub = json{{"class", "SUBQUERY"}, {"type", "SUBQUERY"}, {"alias", ""},
-                            {"query_location", kNoLocation}, {"subquery_type", "SCALAR"},
-                            {"subquery", json{{"node", j_count_star_select(g.catalog, g.schema, g.table,
-                                                   j_function("count_star", json::array()), true)},
-                                              {"named_param_map", json::array()}}},
-                            {"child", nullptr}, {"comparison_type", "INVALID"}};
-            asserts.push_back(j_function("gpu_assert_rows", json::array({j_const_varchar(g.tag), sub}),
-                                         false, cx.guards.size() == 1 ? "ok" : ""));
+            json arm = j_count_star_select(g.catalog, g.schema, g.table,
+                j_function("gpu_assert_rows",
+                           json::array({j_const_varchar(g.tag), j_function("count_star", json::array())}),
+                           false, "ok"),
+                /*with_from*/true);
+            if (arms.is_null()) { arms = std::move(arm); continue; }
+            arms = json{{"type", "SET_OPERATION_NODE"}, {"modifiers", json::array()},
+                        {"cte_map", json{{"map", json::array()}}}, {"setop_type", "UNION"},
+                        {"left", std::move(arms)}, {"right", std::move(arm)}, {"setop_all", true},
+                        {"children", json::array()}};
         }
-        json item = cx.guards.size() == 1
-            ? asserts[0]
-            : json{{"class", "CONJUNCTION"}, {"type", "CONJUNCTION_AND"}, {"alias", "ok"},
-                   {"query_location", kNoLocation}, {"children", asserts}};
-        guard_select = j_count_star_select("", "", "", item, /*with_from*/false);
+        json inner = json{{"type", "SUBQUERY"}, {"alias", "gpudb_g"}, {"sample", nullptr},
+                          {"query_location", kNoLocation},
+                          {"subquery", json{{"node", std::move(arms)}, {"named_param_map", json::array()}}},
+                          {"column_name_alias", json::array()}};
+        guard_select = j_count_star_select("", "", "",
+            j_function("bool_and", json::array({j_colref("ok")}), false, "ok"), /*with_from*/false);
+        guard_select["from_table"] = std::move(inner);
     }
     return json{{"type", "SUBQUERY"}, {"alias", "gd"}, {"sample", nullptr},
                 {"query_location", kNoLocation},
@@ -1050,7 +1065,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     if (!bare) {
         if (cx.val.floating) reject("double", "payload type " + cx.val.type);
         if (cx.val.decimal && cx.val.width > 18) reject("decimal", "payload " + cx.val.type);
-        if (!cx.val.integer && !cx.val.decimal) reject("shape", "payload type '" + cx.val.type + "'");
+        if (!cx.val.integer && !cx.val.decimal && !cx.val.temporal()) reject("shape", "payload type '" + cx.val.type + "'");
     }
     std::vector<PayRef> pays;                 // payload columns, first-appearance order (§4.9)
     // One payload on lane v: the single-payload functions. Anything else
@@ -1121,6 +1136,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         else reject("shape", "HAVING comparison " + ct);
         having_agg = xagg_of(*aggside, cx, tname, talias, pays, having_pay);
         if (having_agg == XAgg::None) reject("shape", "HAVING is not on an aggregate");
+        if (having_agg != XAgg::CountStar && pay_info(having_pay).temporal()) reject("shape", "HAVING over a temporal payload");
 
         if (sfield(*cside, "class") != "CONSTANT") reject("shape", "HAVING threshold is not a constant");
         if (cmp <= 4 && having_agg != XAgg::Avg) {
@@ -1217,8 +1233,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         json& orders = om["orders"];
         if (!orders.is_array() || orders.empty()) reject("shape", "empty ORDER BY");
         for (json& o : orders) { order_agg = XAgg::None; order_pay = -1; o["expression"] = remap(o["expression"]); }
+        const bool order_temporal = order_agg != XAgg::None && order_agg != XAgg::CountStar &&
+                                    order_agg != XAgg::CountV && pay_info(order_pay).temporal();
         if (orders.size() == 1 && limit_mod && having_agg == XAgg::None &&
-            order_agg != XAgg::None && order_agg != XAgg::Avg) {
+            order_agg != XAgg::None && order_agg != XAgg::Avg && !order_temporal) {
             const json& o = orders[0];
             const json& lim = field(*limit_mod, "limit");
             const bool off_null = is_null(*limit_mod, "offset");

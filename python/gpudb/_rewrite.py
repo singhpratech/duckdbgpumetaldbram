@@ -573,6 +573,18 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False) -> Non
             if p > 18:
                 raise Decline("decimal", vt)
             plan.scales[vc] = sc
+        elif exact and vt in _TEMPORAL_TYPES:
+            # a DATE / TIMESTAMP payload (days / microseconds on the device): min, max and
+            # count are exact and come back typed; sum / avg of a date do not exist natively
+            kinds = {o.kind for o in plan.outputs if o.kind != "key" and o.kind != "count_star" and o.pay == i}
+            if plan.having is not None and plan.having[0] != "count_star" and plan.having_pay == i:
+                raise Decline("shape", "HAVING over a temporal payload")
+            if plan.form == "topk" and plan.topk_agg not in ("count_star",) and plan.topk_pay == i \
+                    and plan.topk_agg != "count":
+                raise Decline("shape", "top-k by a temporal aggregate")
+            if not kinds <= {"min", "max", "count"}:
+                raise Decline("shape", f"{sorted(kinds)} over a {vt} payload")
+            plan.scales[vc] = 0
         elif vt not in _INT_TYPES:
             raise Decline("shape", f"payload type {vt}")
         else:
@@ -838,9 +850,11 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
     if plan.guards:
         # a joined set: one assert per base table, each against that table's own set
-        asserts = " AND ".join("gpu_assert_rows('%s', (SELECT count(*) FROM %s))" % (g.replace("'", "''"), f)
-                               for g, f in plan.guards)
-        guard = f"(SELECT ({asserts}) AS ok) gd"
+        # (not scalar subqueries of one SELECT: DuckDB's join-order search over N one-row
+        # relations cost 3.8 ms at 8 tables; this form costs 0.27 ms)
+        arms = " UNION ALL ".join("SELECT gpu_assert_rows('%s', count(*)) AS ok FROM %s" % (g.replace("'", "''"), f)
+                                  for g, f in plan.guards)
+        guard = f"(SELECT bool_and(ok) AS ok FROM ({arms}) gpudb_g) gd"
     else:
         guard = f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd"
     sql = f"SELECT {', '.join(cols)} FROM {src}, {guard} WHERE gd.ok{extra_pred}"
@@ -953,6 +967,8 @@ def val_lane_expr(plan: Plan, q=_q_default) -> str:
     (v * 10^s)::BIGINT, exact because v * 10^s is an integral DECIMAL."""
     if plan.val is None:
         return "CAST(NULL AS BIGINT)"
+    if plan.val_type in _TEMPORAL_TYPES:
+        return _int_image(q(plan.val), plan.val_type)
     if plan.scale:
         return f"CAST({q(plan.val)} * {10 ** plan.scale} AS BIGINT)"
     return f"CAST({q(plan.val)} AS BIGINT)"

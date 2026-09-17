@@ -209,3 +209,152 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
     onode["where_clause"] = outer_where
     onode["modifiers"] = outer_mods
     return json.dumps(inner), json.dumps(outer), is_global
+
+
+# ---------------------------------------------------------------------------
+# count(DISTINCT x) (§4.17)
+# ---------------------------------------------------------------------------
+def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tuple[str, str, bool]]:
+    """SELECT k, count(DISTINCT x), sum(v) FROM t GROUP BY k  becomes
+
+        SELECT __k0 AS k, count(__d) AS ..., sum(__g0) AS ...
+        FROM (SELECT k AS __k0, x AS __d, sum(v) AS __g0 FROM t GROUP BY k, x) GROUP BY __k0
+
+    The device groups by (keys, x); DuckDB counts the distinct x per key over
+    that result — count(__d) skips the NULL x exactly as count(DISTINCT x)
+    does. The other aggregates re-aggregate exactly: sum of sums, sum of
+    counts (cast back to BIGINT), min of mins, max of maxs; avg does not
+    decompose and declines. One DISTINCT column per statement."""
+    j = json.loads(tree_json)
+    stmts = j.get("statements") or []
+    if len(stmts) != 1:
+        return None
+    node = stmts[0].get("node") or {}
+    if node.get("type") != "SELECT_NODE" or (node.get("cte_map") or {}).get("map"):
+        return None
+    groups = node.get("group_expressions") or []
+    if not groups or node.get("group_sets") != [list(range(len(groups)))] or len(groups) > 7:
+        return None
+    if node.get("aggregate_handling") != "STANDARD_HANDLING" or node.get("qualify") or node.get("sample"):
+        return None
+    mods = node.get("modifiers") or []
+    if any(m.get("type") not in ("ORDER_MODIFIER", "LIMIT_MODIFIER") for m in mods):
+        return None
+    sel = node.get("select_list") or []
+    if len(sel) != len(names) or not sel:
+        return None
+    bad = lambda e: e.get("class") in ("WINDOW", "SUBQUERY", "PARAMETER", "STAR", "LAMBDA")   # noqa: E731
+    if any(_contains(x, bad) for x in (sel, node.get("having"), mods, groups)):
+        return None
+    if any(g.get("class") == "CONSTANT" for g in groups):
+        return None
+
+    distinct_arg: List[dict] = []
+    aggs: List[dict] = []
+    ok = [True]
+    select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
+
+    def key_of(e) -> Optional[int]:
+        for i, g in enumerate(groups):
+            if _same(g, e):
+                return i
+            if e.get("class") == "COLUMN_REF" and g.get("class") == "COLUMN_REF" and \
+                    (e.get("column_names") or [None])[-1].casefold() == (g.get("column_names") or [""])[-1].casefold():
+                return i
+        return None
+
+    def fn(name: str, child: dict, alias: str = "") -> dict:
+        return {"class": "FUNCTION", "type": "FUNCTION", "alias": alias, "query_location": _NO_LOC,
+                "function_name": name, "schema": "", "children": [child], "filter": None,
+                "order_bys": {"type": "ORDER_MODIFIER", "orders": []}, "distinct": False,
+                "is_operator": False, "export_state": False, "catalog": ""}
+
+    def sub(e, top_level_order: bool = False):
+        if isinstance(e, list):
+            return [sub(x) for x in e]
+        if not isinstance(e, dict):
+            return e
+        if "class" in e:
+            ki = key_of(e)
+            if ki is not None:
+                return dict(_ref(f"__k{ki}"), alias=e.get("alias") or "")
+            if _is_agg(e):
+                name = (e.get("function_name") or "").lower()
+                alias = e.get("alias") or ""
+                ch = e.get("children") or []
+                if e.get("filter") or ((e.get("order_bys") or {}).get("orders")) or any(_contains(c, _is_agg) for c in ch):
+                    ok[0] = False
+                    return e
+                if e.get("distinct"):
+                    if name != "count" or len(ch) != 1:
+                        ok[0] = False
+                        return e
+                    if not distinct_arg:
+                        distinct_arg.append(ch[0])
+                    elif not _same(distinct_arg[0], ch[0]):
+                        ok[0] = False              # two different DISTINCT columns
+                        return e
+                    return fn("count", _ref("__d"), alias)
+                if name == "avg":
+                    ok[0] = False
+                    return e
+                idx = next((i for i, a in enumerate(aggs) if _same(a, e)), None)
+                if idx is None:
+                    aggs.append(e)
+                    idx = len(aggs) - 1
+                r = _ref(f"__g{idx}")
+                if name in ("count", "count_star"):
+                    # sum(BIGINT) is a HUGEINT; native's count is a BIGINT
+                    return {"class": "CAST", "type": "OPERATOR_CAST", "alias": alias, "query_location": _NO_LOC,
+                            "child": fn("sum", r), "cast_type": {"id": "BIGINT", "type_info": None}, "try_cast": False}
+                return fn({"sum": "sum", "min": "min", "max": "max"}[name], r, alias)
+            if e.get("class") == "COLUMN_REF":
+                nm = e.get("column_names") or []
+                if not (top_level_order and len(nm) == 1 and nm[0].casefold() in select_aliases):
+                    ok[0] = False
+                return e
+        return {k: (v if k in ("value", "cast_type", "type_info") else sub(v)) for k, v in e.items()}
+
+    outer_sel = []
+    for item, name in zip(sel, names):
+        o = dict(sub(item))
+        o["alias"] = name
+        outer_sel.append(o)
+    outer_having = sub(node.get("having")) if node.get("having") is not None else None
+    outer_mods = []
+    for m in mods:
+        m2 = json.loads(json.dumps(m))
+        if m2.get("type") == "ORDER_MODIFIER":
+            for o in m2.get("orders") or []:
+                o["expression"] = sub(o.get("expression"), top_level_order=True)
+        outer_mods.append(m2)
+    if not ok[0] or not distinct_arg:
+        return None
+    if any(_same(distinct_arg[0], g) for g in groups):
+        return None                                   # count(DISTINCT k) GROUP BY k: leave it to native
+
+    inner = json.loads(json.dumps(j))
+    inode = inner["statements"][0]["node"]
+    d_expr = dict(json.loads(json.dumps(distinct_arg[0])), alias="")
+    inode["group_expressions"] = [json.loads(json.dumps(g)) for g in groups] + [d_expr]
+    inode["group_sets"] = [list(range(len(groups) + 1))]
+    inode["select_list"] = [dict(json.loads(json.dumps(g)), alias=f"__k{i}") for i, g in enumerate(groups)] + \
+                           [dict(json.loads(json.dumps(d_expr)), alias="__d")] + \
+                           [dict(json.loads(json.dumps(a)), alias=f"__g{i}") for i, a in enumerate(aggs)]
+    if not aggs:
+        # the device set needs something to aggregate: count(*) is free
+        inode["select_list"].append({"class": "FUNCTION", "type": "FUNCTION", "alias": "__n", "query_location": _NO_LOC,
+                                     "function_name": "count_star", "schema": "", "children": [], "filter": None,
+                                     "order_bys": {"type": "ORDER_MODIFIER", "orders": []}, "distinct": False,
+                                     "is_operator": False, "export_state": False, "catalog": ""})
+    inode["having"] = None
+    inode["modifiers"] = []
+
+    outer = json.loads(json.dumps(outer_template))
+    onode = outer["statements"][0]["node"]
+    onode["select_list"] = outer_sel
+    onode["group_expressions"] = [_ref(f"__k{i}") for i in range(len(groups))]
+    onode["group_sets"] = [list(range(len(groups)))]
+    onode["having"] = outer_having
+    onode["modifiers"] = outer_mods
+    return json.dumps(inner), json.dumps(outer), False
