@@ -386,14 +386,20 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
             return f'"{real}"'
         return q
 
-    key_tables = {low.colmap[k][0] for k in plan.keys}
-    if len(key_tables) != 1:
-        raise Decline("shape", "GROUP BY key components from different tables")
-    key_table = key_tables.pop()
+    # §4.12: a global aggregate has no GROUP BY key, so the joined set carries
+    # no key lane — not in a base set, not in the result. Lane 0 of the final
+    # set is the payload, and the extension points the set's key at it (it is
+    # never read as a key). Everything else about the plan is unchanged.
+    if not plan.no_key:
+        key_tables = {low.colmap[k][0] for k in plan.keys}
+        if len(key_tables) != 1:
+            raise Decline("shape", "GROUP BY key components from different tables")
+        key_table = key_tables.pop()
 
     # lane id -> (table, sql expression, kind)
     need: Dict[tuple, Tuple[int, str, str]] = {}
-    need[("key",)] = (key_table, _rewrite.key_lane_expr(plan, q_for(key_table)), "s" if plan.dict_key else "i")
+    if not plan.no_key:
+        need[("key",)] = (key_table, _rewrite.key_lane_expr(plan, q_for(key_table)), "s" if plan.dict_key else "i")
     if plan.val is not None:
         vt = low.colmap[plan.val][0]
         need[("val",)] = (vt, _rewrite.val_lane_expr(plan, q_for(vt)), "i")
@@ -408,7 +414,7 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
         need[("fk", s.parent, s.parent_col)] = (s.parent, f'CAST("{s.parent_col}" AS BIGINT)', "i")
 
     # final lane order = the single-table layout the rewriter addresses
-    finals: List[tuple] = [("key",), final_val]
+    finals: List[tuple] = ([] if plan.no_key else [("key",)]) + [final_val]
     for kind in ("i", "f", "s"):
         finals += [("pred", c) for c in plan.pred_cols if need[("pred", c)][2] == kind]
 
@@ -518,7 +524,12 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
             names = {}
             counters = {"i": 0, "f": 0, "s": 0}
             for pos, lid in enumerate(order):
-                nm = "k" if pos == 0 else "v" if pos == 1 else None
+                # a global set has no key lane: its lane 0 IS the payload
+                nm = None
+                if plan.no_key:
+                    nm = "v" if pos == 0 else None
+                else:
+                    nm = "k" if pos == 0 else "v" if pos == 1 else None
                 if nm is None:
                     kd = need[lid][2]
                     nm = f"{kd}{counters[kd]}"
@@ -801,7 +812,9 @@ def lower_upload(tree_json: str,
 def plan_upload_residency(low: LoweredUpload, plan: Plan, computed: Dict[str, object]) -> JoinResidency:
     """One uploaded set over the join's result + one row-count sentinel per table."""
     tables = low.tables
-    names = list(dict.fromkeys(list(plan.keys or [plan.key]) + list(plan.vals or ([plan.val] if plan.val else []))
+    # §4.12: a global aggregate has no key column to project
+    names = list(dict.fromkeys((list(plan.keys or [plan.key]) if not plan.no_key else [])
+                               + list(plan.vals or ([plan.val] if plan.val else []))
                                + list(plan.pred_cols)))
     src = low.derived(names, computed, with_rowid=True)
     desc = json.dumps({"from": low.from_text, "where": low.edge_where,

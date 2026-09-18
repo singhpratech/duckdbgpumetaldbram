@@ -1232,11 +1232,16 @@ class Connection:
                                                   store_lanes=list(d.store_lanes),
                                                   post_sql=["SELECT gpu_prepare_resident('%s')" % d.tag.replace("'", "''")])
             else:
+                # §4.12: a keyless set has no key lane and no sort cache. The
+                # estimate stays an upper bound either way — it still charges
+                # the '-' slot a full 8-byte lane — but not a cache that will
+                # never be built.
                 st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
                                                   deps=([b.tag for b in d.join.base] if d.join is not None
                                                         else [b.tag for b in d.sentinels] or None),
                                                   steps=d.join.steps_sql if d.join is not None else None,
-                                                  est_bytes=estimate_set_bytes(d.set_rows, _tag_lanes(d.tag)))
+                                                  est_bytes=estimate_set_bytes(d.set_rows, _tag_lanes(d.tag),
+                                                                               key_width=0 if (d.plan is not None and d.plan.no_key) else 8))
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
             if not self._manager.is_ready(d.tag):
@@ -1790,11 +1795,12 @@ class Connection:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
         if global_agg:
-            # §4.12: from here the plan has no GROUP BY. Over a single table the
-            # key lane goes with it (nothing uploads or sorts it); over a join the
-            # set is the join's materialised result, whose lane 0 stays — no
-            # operator ever reads it as a key.
-            _rewrite.make_global(plan, keep_key=low is not None)
+            # §4.12: from here the plan has no GROUP BY, and the key lane goes
+            # with it — over a single table (the set names no key lane at all)
+            # and over a join alike (an uploaded set's lane-0 slot arrives NULL
+            # and is dropped at publish; a device join gathers no key lane).
+            # Nothing uploads, stores or sorts a key for these statements.
+            _rewrite.make_global(plan)
         q = (lambda c: computed[c].sql if c in computed else f'"{c}"')   # noqa: E731
         if low is None:
             try:

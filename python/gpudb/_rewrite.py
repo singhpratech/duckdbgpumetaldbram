@@ -127,9 +127,10 @@ class Plan:
 
     @property
     def no_key(self) -> bool:
-        """§4.12: a global aggregate over a SINGLE table keeps no key lane. Over
-        a join the set is the join's materialised result, whose lane 0 is the
-        row set's own first lane — it stays, and nothing ever sorts it."""
+        """§4.12: a global aggregate keeps no key lane — over a single table
+        (the set is a view over the store and simply names none) and over a
+        join alike (the uploaded key slot is dropped when the set is published,
+        the device join never gathers one). Nothing sorts such a set."""
         return self.global_agg and not self.keys
 
     @property
@@ -617,7 +618,7 @@ def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:
         out.native_type = typ
 
 
-def make_global(plan: Plan, keep_key: bool = False) -> None:
+def make_global(plan: Plan) -> None:
     """§4.12: turn the split's constant-key GROUP BY plan into a global
     aggregate. Called once DESCRIBE has typed the outputs (the key is one of
     them, positionally): the key output goes, and with it the key lane, its
@@ -625,8 +626,6 @@ def make_global(plan: Plan, keep_key: bool = False) -> None:
     predicate lanes, computed lanes, scales — is what it was."""
     plan.global_agg = True
     plan.outputs = [o for o in plan.outputs if o.kind != "key"]
-    if keep_key:
-        return
     plan.keys = []
     plan.key = ""
     plan.key_type = ""
@@ -999,6 +998,12 @@ def key_lane_expr(plan: Plan, q=_q_default) -> str:
     """The resident key of the plan as a SQL expression over the table's
     columns; `q` quotes a plan column (the join path maps virtual columns to
     the real ones)."""
+    if plan.no_key:
+        # §4.12: there is no key. A set uploaded lane by lane (a join result)
+        # still has a lane-0 slot in the row-major upload; it arrives NULL and
+        # is dropped when the set is published, so it is never stored, never
+        # sorted and never read.
+        return "CAST(NULL AS BIGINT)"
     if plan.exact and plan.dict_key:
         # the key tuple as text: "<byte length>:<text>" per component, "N" for NULL
         tmpl = ("CASE WHEN {c} IS NULL THEN 'N' ELSE strlen(CAST({c} AS VARCHAR))::VARCHAR"

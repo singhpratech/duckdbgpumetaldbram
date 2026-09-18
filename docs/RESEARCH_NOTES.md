@@ -1667,6 +1667,78 @@ already does. The gate on the final state - `--subqueries --exprs`, SF1, alone
 on the machine - is 782 rows, 509 PASS, 273 declined, 0 below the bound, 0
 differing, exit 0.
 
+## 2026-09-18 — What a column stops needing
+
+The direct reduce (§7) reads a group-id lane and the distinct keys. The sort
+cache it was built from is not read again, and for a column that is a GROUP BY
+key and nothing else the key lane is not read either, because `key[row] =
+dkeys[gid[row]]` is the lane. At SF10 the 22 TPC-H queries held 23.47 GiB and
+9.4 GiB of it was key lanes and their caches, so the question was not whether to
+release them but how to be sure a release never costs an answer or a
+millisecond.
+
+Three decisions did that.
+
+**Shed after a call, not at prepare().** At prepare time a column is a column;
+at the end of a call the backend knows which path answered and which lanes that
+call read. So the release happens there, and the rule is the dispatch rule
+itself, evaluated at the least work a call can bring — one payload, no WHERE
+term. A 2-group key, a key above the id lane's limit, an input below the work
+rule and a device without the direct path all fail it, which is exactly the set
+of columns whose calls go to the sort path. The one case that needed no rule at
+all is the join build side: a build key is unique among its valid cells, so a
+column with at most 512 distinct values has at most 512 rows, and the row rule
+needs millions. It cannot reach the decision.
+
+**"Only ever a key" is a name, not a habit.** A WHERE on the GROUP BY key is an
+ordinary statement — TPC-H Q12 is one — so "nothing reads this lane as a value"
+cannot be inferred from the calls seen so far. It can be read off the name the
+extension gave the lane: a store column `k#<field>` is the tuple TEXT of a key
+and the raw column lives under its own name; lane 0 of a join RESULT is that
+statement's key. `gpu_backend.hpp` is frozen, so the extension leaves the mask
+of key-only lanes in a note beside the upload call, the way the path note
+already travels the other way. And even a marked lane is kept when THIS call
+read it — Q12 keeps its `l_shipmode` lane from the first query and sheds only
+the cache, which is why the rebuild counter over the whole workload is zero.
+
+**A rebuild pins.** Anything shed comes back on demand behind the single
+accessor that hands out the lane, and both rebuilds pin what they rebuilt. A
+column something reads as values is a column the rule misread, and one sort is
+worth more than the bytes; pinning bounds the cost at one rebuild per column per
+structure, and makes the counter a real signal rather than a rate.
+
+Beside that, a smaller thing that had been left behind: a global aggregate over
+a JOIN still carried the constant key the split invents so the statement reads
+as a GROUP BY — 1 byte a row, a 5-byte sort cache and a group-id lane over a
+column with one group, none of it ever read by `gagg_masked_i64`. Over a single
+table that key had already gone with stage B's views; over a join the set is
+uploaded or materialised lane by lane, so it needed the upload's lane-0 slot to
+arrive NULL and be dropped at publish, and the device join's lane spec to start
+at the payload. Q14, Q17, Q19 and Q11 lost 7 bytes a row each.
+
+The chained device join found the one sharp edge: an intermediate set carries
+the FINAL set's tag with `.<step>` appended, so reading "lane 0 is `-`" off that
+tag made the second step treat the intermediate's key as its payload and the
+join matched nothing. Q11's answer was still right — the empty set made the
+HAVING threshold NULL and native returns nothing at SF10 either — which is
+exactly the kind of agreement that proves nothing. The set's `rows = 0` in
+`gpu_residents()` is what gave it away, and the tag test now excludes any extra
+containing a dot.
+
+Measured, SF10, 22 queries back to back, unlimited budget, all identical on both
+sides: 23.472 GiB → 18.735 GiB, of which the store 5.319 → 4.042 and the 13
+join-result sets 18.153 → 14.693. `rebuilds=0/0`.
+
+Time is where a memory change earns the right to land, and there is none to
+report: over the 22 queries at SF1 and SF10 (medians of two runs of five, SF10
+at a 200 GB budget) no query is slower beyond the sub-5 ms band — SF10's largest
+ratio is Q4 at 1.058× on a 2.6 ms query, SF1's is Q5 at 1.091× on 1.1 ms, and
+everything above 10 ms sits inside ±1%. The gate (`--subqueries --exprs`, SF1,
+alone on the machine) is 782 cells, 510 PASS, 272 declined, 0 below the bound,
+0 differing, exit 0. It is also the only thing that found a rebuild: 3 lanes and
+4 caches over its shape sweep, one per column, 5.7 to 18.4 ms each — which is
+what "correct, slower once" was supposed to look like.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1693,10 +1765,11 @@ differing, exit 0.
   Q12's ~23 ms kernel at SF10. The global aggregate (§4.12) evaluates the whole
   program per row in one pass through `gpred_eval`, a function written to be
   called from anywhere; switching the mask stage to it is the obvious next move.
-- **Few-group keys without a sort cache**: a direct row-order reduce over a
-  narrow group-id lane would reuse the global aggregate's predicate evaluation,
-  128-bit partials and merge unchanged — the accumulators are already indexed
-  `[group × payloads + payload]` with one group.
+- **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
+  shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
+  they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
+  could be evaluated per GROUP (at most 512 of them) instead of per row, which
+  would let Q12's key lane go too.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client; an Arrow-native
   result path would move the plain-form bounds.
