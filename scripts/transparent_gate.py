@@ -11,9 +11,19 @@ Rows the wrapper rewrote and that came out below RATIO_MIN (default 1.0)
 FAIL; rows the wrapper declined are printed with the reason and never fail.
 The losing side of every sweep stays printed.
 
+`--probation` (§9.1) adds a second pass over the cells a SOFT threshold
+declined: the script keeps issuing the statement (which keeps running on
+DuckDB, as it would for any user) until the wrapper's own trial on a side
+cursor has either promoted it or given up, then measures the cell again the
+same way the first pass did. A cell that was promoted and comes out below
+RATIO_MIN in that second measurement FAILS like any other rewritten row — that
+is the whole point of the mode. Without the flag nothing about the output
+changes.
+
 Usage:
   python3 scripts/transparent_gate.py [--db data/tpch_sf1/tpch.duckdb] [--n 5]
                                       [--min-ratio 1.0] [--keys l_orderkey,l_partkey,...]
+                                      [--probation [--probation-timeout 90]]
 Needs a built extension (build-macos / build-linux) or GPUDB_EXTENSION_PATH.
 """
 from __future__ import annotations
@@ -122,6 +132,67 @@ def time_min(run, n: int) -> float:
     return min(times)
 
 
+def same_rows(got, nat, form):
+    """The comparison the first pass makes for this form (§2: top-k without a
+    tiebreaker is only defined up to which of the tied groups come back)."""
+    if form in ("global", "nested"):
+        return got == nat
+    if form == "topk":
+        return sorted(str(r[1]) for r in got) == sorted(str(r[1]) for r in nat)
+    return sorted(map(str, got)) == sorted(map(str, nat))
+
+
+def probation_pass(con, sql, nat, t_nat, n, min_ratio, timeout, form):
+    """One cell the thresholds declined softly (§9.1). Keep issuing the
+    statement — it runs on DuckDB throughout, exactly as it would for a user —
+    until the wrapper's trial promotes it or stops trying, then measure the cell
+    again the way the first pass did. Returns (verdict, ratio, native ms,
+    transparent ms, identical, rounds)."""
+    con.transparent = True
+    con._manager.wait_idle(timeout)          # the set uploads in idle windows first
+    deadline = time.time() + timeout
+    rounds = 0
+    while time.time() < deadline:
+        con.execute(sql).fetchall()
+        if con.last_rewrite()["rewritten"]:
+            break
+        d = getattr(con, "_timing_decision", None)      # this statement's own decision
+        rounds = getattr(d, "probe_rounds", 0)
+        if d is None or getattr(d, "probation", "") in ("", "retired"):
+            break
+        # a round that lost puts the next one behind a back-off; if that lands after the
+        # deadline there is nothing left to wait for
+        if rounds and getattr(d, "next_probe_at", 0.0) - time.monotonic() > deadline - time.time():
+            break
+        time.sleep(0.02)
+        if getattr(d, "probation", "") in ("candidate", "waiting"):
+            # the trial's set uploads only while the connection is genuinely quiet
+            # (§9.1: 250 ms, against 20 ms for a set a statement is waiting on), which a
+            # loop issuing a statement every 20 ms never gives it. Hand it the quiet.
+            con._manager.wait_idle(min(10.0, max(0.0, deadline - time.time())))
+    got = con.execute(sql).fetchall()
+    if not con.last_rewrite()["rewritten"]:
+        return "stayed native", None, t_nat, None, True, rounds
+    identical = same_rows(got, nat, form)
+    # the same instrument the first pass used: native and transparent interleaved,
+    # each side warmed before it is timed, minimum over every run kept for both
+    t_tr = time_min(lambda: con.execute(sql).fetchall(), n)
+    for _ in range(3):
+        if not identical or (t_nat / t_tr if t_tr > 0 else 0) >= min_ratio:
+            break
+        for transparent in (False, True):
+            con.transparent = transparent
+            for _w in range(20):
+                con.execute(sql).fetchall()
+            t = time_min(lambda: con.execute(sql).fetchall(), n)
+            if transparent:
+                t_tr = min(t_tr, t)
+            else:
+                t_nat = min(t_nat, t)
+        con.transparent = True
+    return "promoted", (t_nat / t_tr if t_tr > 0 else float("inf")), t_nat, t_tr, identical, rounds
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/tpch_sf1/tpch.duckdb")
@@ -144,6 +215,11 @@ def main() -> int:
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")
+    ap.add_argument("--probation", action="store_true",
+                    help="give the wrapper's side-cursor trial (§9.1) time to act on every SOFT-declined "
+                         "cell, then measure that cell again; a promoted cell below the bound fails")
+    ap.add_argument("--probation-timeout", type=float, default=90.0,
+                    help="seconds a cell is given before its trial is called off (default 90)")
     args = ap.parse_args()
     global PACE_S
     PACE_S = args.pace_ms / 1000.0
@@ -178,6 +254,7 @@ def main() -> int:
     keys = [k for k in args.keys.split(",") if k]
     wheres = list(WHERES) if args.wheres == "all" else args.wheres.split(";")
     fails = []
+    probation_rows = []
     cells = []          # (source label, FROM clause, key, where)
     if not args.no_single:
         cells += [("", "lineitem", key, where) for where in wheres for key in keys]
@@ -217,8 +294,25 @@ def main() -> int:
                 got = con.execute(sql).fetchall()
                 lr = con.last_rewrite()
                 if not lr["rewritten"]:
+                    soft = lr["reason"] == "threshold" and lr.get("detail", "").startswith(("soft", "probation"))
                     print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
-                          f"declined ({lr['reason']}) |")
+                          f"declined ({lr['reason']}{', soft' if soft else ''}) |")
+                    sys.stdout.flush()
+                    if args.probation and soft:
+                        verdict, ratio, t_nat2, t_tr, identical, rounds = probation_pass(
+                            con, sql, nat, t_nat, args.n, args.min_ratio, args.probation_timeout, form)
+                        ok = verdict == "stayed native" or (identical and ratio >= args.min_ratio)
+                        note = (f"{verdict} {ratio:.2f}×" if ratio is not None
+                                else f"{verdict} ({rounds} round(s))")
+                        if not ok:
+                            fails.append((key_label + " [probation]", where, form, ratio or 0.0, identical))
+                        probation_rows.append((key_label, where, form, verdict, ratio, t_nat2, t_tr,
+                                               rounds, identical))
+                        print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat2:.1f} | "
+                              f"{'—' if t_tr is None else f'{t_tr:.1f}'} | "
+                              f"{'—' if ratio is None else f'{ratio:.2f}×'} | probation: {note}"
+                              + ("" if ok else (" FAIL rows differ" if not identical else " FAIL")) + " |")
+                        sys.stdout.flush()
                     continue
                 if form in ("global", "nested"):
                     identical = got == nat
@@ -276,6 +370,22 @@ def main() -> int:
                       f"{ratio:.2f}× | {result} |")
                 sys.stdout.flush()
     print()
+    if args.probation:
+        promoted = [r for r in probation_rows if r[3] == "promoted"]
+        print(f"## probation (§9.1): {len(probation_rows)} softly declined cell(s), {len(promoted)} promoted")
+        print()
+        print("| key | WHERE | form | outcome | native ms | transparent ms | ratio | rounds |")
+        print("|---|---|---|---|---|---|---|---|")
+        for key, where, form, verdict, ratio, t_nat2, t_tr, rounds, identical in probation_rows:
+            print(f"| {key} | {where or '—'} | {form} | {verdict}{'' if identical else ' (ROWS DIFFER)'} | "
+                  f"{t_nat2:.1f} | {'—' if t_tr is None else f'{t_tr:.1f}'} | "
+                  f"{'—' if ratio is None else f'{ratio:.2f}×'} | {rounds} |")
+        pb = con.probation()
+        print()
+        print(f"probe budget: {pb['budget']['spent_ms_last_minute']:.1f} ms spent in the last minute of "
+              f"{pb['budget']['ms_per_min']:.0f} ms allowed; sets held for trials: "
+              f"{pb['bytes'] / 2 ** 20:.0f} MiB")
+        print()
     if fails:
         print(f"{len(fails)} row(s) below {args.min_ratio}× or not identical:")
         for key, where, form, ratio, identical in fails:

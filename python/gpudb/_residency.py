@@ -34,6 +34,8 @@ SEGMENT_BYTES = 8 << 20          # the extension's host segment (gpu_resident.cp
 RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling per consecutive interrupt
 EVICT_MIN_AGE_S = 60.0            # §5.5: a set is never evicted within this long of being uploaded (anti-thrash)
 MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget kept off the device
+PROBATION_IDLE_MS = 250.0        # §9.1: a set nobody has asked for waits for a genuinely quiet
+                                 # connection, not the 20 ms a rewritten statement's set waits for
 RETRY_PAUSE_MAX_MS = 1000.0      # the idle wait already yields to every statement; a longer cap only
                                  # delayed readiness (measured: 15 of 20 segments landed in 3 s, the
                                  # rest took 30+ s at a 5 s cap under a 0-10 ms statement cadence)
@@ -76,6 +78,11 @@ class SetState:
     store_key: str = ""
     store_lanes: List[str] = field(default_factory=list)
     post_sql: List[str] = field(default_factory=list)
+    # §9.1 probation: this set exists only so a soft-declined template can be
+    # TRIED on a side cursor. It never evicts anything (`_make_room`), it is not
+    # protected by the anti-thrash age, and it becomes an ordinary set the
+    # moment a template that is actually rewritten asks for it.
+    probation: bool = False
 
     @property
     def session_name(self) -> str:
@@ -104,10 +111,12 @@ class ResidencyManager:
                  idle_ms: float = 20.0, quiet_s: float = 2.0, rate_s: float = 30.0,
                  max_attempts: int = 20, segment_rows: Optional[int] = None,
                  memory_budget: Optional[int] = None, evict_min_age_s: float = EVICT_MIN_AGE_S,
+                 probation_idle_ms: float = PROBATION_IDLE_MS,
                  log: Optional[Callable[[str], None]] = None):
         self._cursor_factory = cursor_factory
         self.mode = mode
         self.idle_ms = idle_ms
+        self.probation_idle_ms = probation_idle_ms
         self.quiet_s = quiet_s
         self.rate_s = rate_s
         self.max_attempts = max_attempts
@@ -161,18 +170,25 @@ class ResidencyManager:
     def note_candidate(self, tag: str, upload_sql: str, fqn: str = "",
                        deps: Optional[List[str]] = None, steps: Optional[List[str]] = None,
                        est_bytes: int = 0, upload_name: str = "", store_key: str = "",
-                       store_lanes: Optional[List[str]] = None, post_sql: Optional[List[str]] = None) -> SetState:
+                       store_lanes: Optional[List[str]] = None, post_sql: Optional[List[str]] = None,
+                       probation: bool = False) -> SetState:
         """A rewritable shape over a non-resident set was seen. With `steps`
         the set is derived from `deps` (note those first). `est_bytes` is what
-        the set is expected to cost on the device (§5.5, the memory budget)."""
+        the set is expected to cost on the device (§5.5, the memory budget).
+        `probation` (§9.1): the shape is NOT being rewritten — the set is only
+        wanted so the shape can be timed on a side cursor. Such a set never
+        evicts anything; a later sighting without the flag makes it ordinary."""
         with self._cv:
             s = self._sets.get(tag)
             if s is None:
                 s = SetState(tag=tag, upload_sql=upload_sql, fqn=fqn,
-                             deps=list(deps or []), steps=list(steps or []))
+                             deps=list(deps or []), steps=list(steps or []),
+                             probation=bool(probation))
                 self._sets[tag] = s
             elif fqn and not s.fqn:
                 s.fqn = fqn
+            if not probation:
+                s.probation = False
             if est_bytes:
                 s.est_bytes = int(est_bytes)      # the table may have grown since the last sighting
             if s.state in ("missing", "stale", "failed"):
@@ -189,7 +205,10 @@ class ResidencyManager:
             if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
                 s.state = "pending"
                 self._cv.notify_all()
-            if self.mode == "background":
+            # a probationary set is always uploaded by the background worker, in idle
+            # windows — including in mode 'eager', where an upload on the caller's
+            # connection would make a user's statement wait for a set it is not using
+            if self.mode == "background" or (probation and self.mode != "manual"):
                 self._ensure_thread()
             return s
 
@@ -282,14 +301,29 @@ class ResidencyManager:
         used += sum(b for b, _u in cols.values())
         with self._lock:
             keep_cols = {(o.store_key, l) for t, o in self._sets.items() if t in keep for l in o.store_lanes}
-            young_cols = {c for c, at in self._col_uploaded.items() if time.monotonic() - at < self.evict_min_age_s}
+            # §9.1: a probationary lane is not protected by the anti-thrash age — a set
+            # that earned its place must always be able to take its room back
+            prob_cols = {(o.store_key, l) for o in self._sets.values() if o.probation for l in o.store_lanes}
+            young_cols = {c for c, at in self._col_uploaded.items()
+                          if time.monotonic() - at < self.evict_min_age_s and c not in prob_cols}
+        if s.probation and used + s.est_bytes > budget:
+            # §9.1: nothing is ever evicted for a set that is only being TRIED. It takes
+            # free room or it waits; its template keeps running on DuckDB either way.
+            with self._lock:
+                s.error = (f"{MEMORY_ERROR}{used / 2**20:.0f} MiB resident + about "
+                           f"{s.est_bytes / 2**20:.0f} MiB needed > {budget / 2**20:.0f} MiB, and a set on "
+                           f"probation never evicts a set that is in use")
+            self._log(f"not uploaded (probation): {s.tag}: {s.error}")
+            return False
         while used + s.est_bytes > budget:
             now = time.monotonic()
             with self._lock:
                 is_source = {d for t, o in self._sets.items() if t in live and t not in keep for d in o.deps}
-                # age by this manager's own clock (a set it did not upload is old by definition)
+                # age by this manager's own clock (a set it did not upload is old by definition);
+                # a probationary set is never protected by it (§9.1)
                 young = {t for t, o in self._sets.items()
-                         if o.last_upload_start and now - o.last_upload_start < self.evict_min_age_s}
+                         if o.last_upload_start and not o.probation
+                         and now - o.last_upload_start < self.evict_min_age_s}
             victims = [r for r in live.values()
                        if r[1] == "managed" and r[0] not in keep and r[0] not in is_source
                        and r[0] not in young and int(r[3] or 0) == 0 and int(r[2] or 0) > 0]
@@ -374,7 +408,29 @@ class ResidencyManager:
         with self._lock:
             return {"budget": self.memory_budget, "evictions": self.evictions,
                     "sets": {t: {"state": s.state, "est_bytes": s.est_bytes, "bytes": s.bytes,
-                                 "error": s.error} for t, s in self._sets.items()}}
+                                 "error": s.error, "probation": s.probation}
+                             for t, s in self._sets.items()}}
+
+    def probation_bytes(self) -> int:
+        """What the sets held only for a side-cursor trial cost right now: the
+        extension's figure once they landed, the estimate until then (§9.1)."""
+        with self._lock:
+            return sum(s.bytes or s.est_bytes for s in self._sets.values()
+                       if s.probation and s.state in ("pending", "uploading", "ready"))
+
+    def mark_probation(self, tag: str, on: bool) -> None:
+        """The template over this set was promoted (`on=False`: it is an ordinary
+        set from now on) or demoted back to a trial (`on=True`)."""
+        with self._lock:
+            s = self._sets.get(tag)
+            if s is not None:
+                s.probation = bool(on)
+
+    def others_in_flight(self) -> int:
+        """Statements of this connection family running right now, besides the
+        caller's own. A probe waits rather than contend with one (§9.1)."""
+        with self._lock:
+            return max(0, self._in_flight - 1)
 
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:
@@ -455,6 +511,14 @@ class ResidencyManager:
 
     def _idle_ms(self) -> float:
         return (time.monotonic() - self._last_activity) * 1000.0
+
+    def _idle_bar(self, s: SetState) -> float:
+        """How long the connection must have been idle before this set's next
+        statement runs. A set a rewritten statement is waiting on takes the
+        ordinary bar; one held only for a side-cursor trial (§9.1) takes a much
+        higher one, because nothing is waiting on it and its scan shares
+        DuckDB's worker pool with whatever the user is running."""
+        return max(self.idle_ms, self.probation_idle_ms) if s.probation else self.idle_ms
 
     def _wait_idle(self, s: SetState, epoch: int, idle_ms: float,
                    not_before: float = 0.0) -> bool:
@@ -537,7 +601,7 @@ class ResidencyManager:
             return "ready"
         fqn = s.fqn or s.upload_sql.split(" FROM ", 1)[1]
         seg_rows = self.segment_rows or s.segment_rows_default
-        idle_ms = self.idle_ms
+        idle_ms = self._idle_bar(s)
         # 1. bounds (metadata-fast; the rowid range is stable while no write
         #    lands, and every write through the wrapper invalidates the set)
         try:
@@ -598,7 +662,7 @@ class ResidencyManager:
         # 4. finish: device copy + prepare + publish (one scalar call; an
         #    interrupt arriving during it is only seen after it returns)
         with self._cv:
-            ok = self._wait_idle(s, epoch, self.idle_ms)
+            ok = self._wait_idle(s, epoch, self._idle_bar(s))
         if not ok:
             self._abort(cur, s)
             return "closed" if self._closed else "stale"
@@ -641,7 +705,7 @@ class ResidencyManager:
         rows = 0
         for stmt in s.steps:
             with self._cv:
-                ok = self._wait_idle(s, epoch, self.idle_ms)
+                ok = self._wait_idle(s, epoch, self._idle_bar(s))
             if not ok:
                 return "closed" if self._closed else "stale"
             try:
@@ -672,7 +736,7 @@ class ResidencyManager:
             with self._cv:
                 while not self._closed:
                     s = self._pick()
-                    if s is not None and self._in_flight == 0 and self._idle_ms() >= self.idle_ms:
+                    if s is not None and self._in_flight == 0 and self._idle_ms() >= self._idle_bar(s):
                         break
                     self._cv.wait(timeout=max(0.005, self.idle_ms / 1000.0))
                 if self._closed:

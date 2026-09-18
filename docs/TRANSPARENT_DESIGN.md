@@ -1206,7 +1206,9 @@ same database — the extension stays free of threads and hidden connections
   interrupt cannot stop; an interrupt seen after it returns is recognised by
   the set being `ready` in `gpu_residents()`, not treated as a lost session.
   A session that never goes idle never uploads and runs native throughout
-  — rule 1 holds, the win is simply not there yet.
+  — rule 1 holds, the win is simply not there yet. A set held only for a
+  side-cursor trial (§9.1 probation) takes the same path behind a higher idle
+  bar — 250 ms instead of 20 — because no statement is waiting on it.
 - **Quiet period and rate cap.** No upload session starts within 2 s of the
   last invalidation of that table, and no more than one session per table
   per 30 s (wrapper settings). A write-heavy session therefore runs native
@@ -1586,6 +1588,112 @@ and all (the first 56 rows of that sweep; it was stopped there, the machine
 being needed for the gate proper). A bound that admitted them would admit them at 0.5×. So the thresholds
 are unchanged and the win lands where the shapes are already admitted — the
 SF10 and SF50 end of the same rows.
+
+**Probation: a bound is not a verdict about this process (2026-09-18).** The two
+paragraphs above leave a gap. A threshold has to hold in both modes, so it is
+set for the slow one, and it then keeps a shape on DuckDB in *every* process —
+including the many where it would win twice over. The measured rule 1 above does
+not close the gap, because it only ever judges shapes the thresholds already let
+through: a shape the thresholds decline is never rewritten, so nothing about it
+is ever measured. Probation is the other half of the same idea, and it is
+implemented entirely in the wrapper (`python/gpudb/_probation.py`,
+`connection._probation_*`).
+
+*Hard and soft.* `_thresholds.decide` now returns, beside the verdict and its
+detail, which **kind** of bound declined the statement; the module docstring
+carries the classification and the evidence per bound.
+- **hard**: losing is structural or what a wrong bound costs has no ceiling.
+  Two families — *output-bound* (the decline is about how many rows come back:
+  `plain_max_groups`, `plain_max_groups_where`, `join_plain_max_groups`,
+  `multi_plain_max_groups`, `multi_join_plain_max_groups`, `reagg_max_pairs`,
+  `reagg_max_pairs_where`, and the once-per-template `rows_out` check; measured
+  losses there are 0.39–0.51× at 700K pairs and 0.96–0.99× at 1.5M groups, not
+  near-even) and *no information* (no distinct-count estimate, no selectivity,
+  no thresholds for the backend).
+- **soft**: the process's mode or a small fixed cost decides, one row or a few
+  thousand come back either way, and the worst case measured is a bounded
+  slowdown — `min_groups`, the VARCHAR-key rules, `plain_min_selectivity`,
+  `having_min_selectivity` and `_big`, `topk_min_groups`,
+  `topk_min_selectivity`, `join_plain_min_selectivity`, `reagg_min_selectivity`,
+  the global aggregate's row floors, and the multi-payload plain form under a
+  WHERE while its result stays inside `plain_max_groups_where`.
+
+The bounds themselves are unchanged and every statement is still decided by
+them; `last_rewrite()["reason"]` stays `threshold`, and a new
+`last_rewrite()["detail"]` says `hard: …` or `soft: …`.
+
+*What probation does.* A soft-declined template keeps running on DuckDB, exactly
+as before — **the user's statement is never the experiment, and never becomes
+one**. In the background the wrapper asks the residency manager for the shape's
+set under a probation flag: only ever a single-table view over a table's column
+store (never a device join or an uploaded join, whose sets are the size of the
+join's result), only after the template has been seen three times (a statement
+that runs once never causes an upload), and admitted only when the lanes the
+store still lacks are at most 5% of the memory budget and all trials together
+hold at most 10% of it. It uploads through the ordinary idle-segment path, but
+behind a much higher idle bar than an ordinary set — 250 ms of quiet against the
+usual 20 ms, because nothing is waiting on it and its scan shares DuckDB's
+worker pool with whatever the user is running. And — the rule that keeps this
+honest — `_make_room` never evicts anything for it. A set that earned its place
+is never dropped for one that has not; the reverse holds too, since a
+probationary set is exempt from the 60 s anti-thrash age.
+
+Once the set is there, the rewritten form is timed on a side cursor. A **round**
+is three executions, issued one per user statement — from the same point in
+`execute()` the measured re-measure above has always issued its native probe, so
+what any one statement carries is one extra execution rather than a burst, and
+the round's three samples come from three moments of the process. The round wins
+when their median is below 0.8× the median of the template's own recent native
+runs — the user's own statements, which is the only native timing probation
+uses. **Two** winning rounds, at least 5 s apart, promote the template. That
+spacing is the point: a process's mode lasts seconds, so one fast-mode moment
+cannot promote anything.
+
+*Medians, not minimums.* The minimum of a handful of native runs is a tail
+statistic, and the two tails are not comparable. Measured on the M4 Max at SF1
+with a 50 ms interactive cadence, `SELECT l_linenumber, sum(l_quantity) …`
+measured 2.14 ms native once and 4.84 ms typically, while the rewritten form
+measured 2.12–2.32 ms over 27 side-cursor probes — a 2.1× win that a
+minimum-against-minimum rule reads as a loss. The minimum keeps its job on the
+other side: a promoted template is an ordinary rewritten template, so
+`_note_timing`'s 60 s re-measure (minimum against minimum, unchanged) is what
+keeps it. A promotion the medians got wrong is taken back by the stricter rule,
+not by the user.
+
+*Demotion, back-off, retirement.* That re-measure demoting a promoted template
+puts it back on probation behind a doubling back-off (60 s to 16 min), so a
+shape that flaps does not burn probes; twelve rounds without a win retire a
+template for the life of the process. Probes are budgeted in milliseconds — at
+most 250 ms of side-cursor work per minute across the whole process, in a
+sliding window — and a round never starts while another statement of the
+connection is in flight. Nothing is tried in `residency='manual'`, inside a
+transaction, with `thresholds=False`, or on a backend without the exact path.
+A probe that raises `GPUDB_STALE` is how a trial learns that the table moved
+(its own statements run native and never touch the guard): the set is dropped
+and the trial starts again on the new rows. Everything a probe does runs on a
+cursor of its own, because a probe happens after the user's statement has
+executed and before they have fetched from it.
+
+*Instrument check.* The probe runs the rewritten statement as TEXT, not through
+the plan cache (§3.2) — which is how the native runs it is compared against are
+measured too. A promoted template then gets the cached plan and is faster than
+the probe said, so that error is in rule 1's favour. Two more, measured rather
+than assumed (SF1, M4 Max, BENCHMARK.md has the table). A FRESH cursor per probe
+costs about a millisecond on its first statement — 0.88 ms best but 1.93 ms
+median against 0.91 ms on a warm one, with native at 2.07 — so the trial keeps
+one cursor and warms it once. What is left is that a second connection running
+the same text can cost ~0.7 ms more than the first (1.93/2.26 against 1.11/1.52,
+min/median of 15). That bias under-reports the win and never the other way round,
+so what it costs is promotions: a shape whose real margin is 1.2–1.4× does not
+clear the 0.8× bar, and only a clear win does. Which is the side of the line
+rule 1 wants to be on.
+
+`con.probation()` lists the templates being tried, their state, rounds and wins,
+probes and milliseconds spent, the pair measured, and the bytes held.
+`scripts/transparent_gate.py --probation` adds a second pass over every softly
+declined cell: it keeps issuing the statement until the trial promotes it or
+gives up, then measures that cell again with the same instrument as the first
+pass. A cell that was promoted and comes out below the bound **fails the gate**.
 
 ### 9.2 Three-way parity
 `groupby_parity_check.sh` runs every scenario native

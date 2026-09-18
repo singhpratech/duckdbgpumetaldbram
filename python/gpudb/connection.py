@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax, _thresholds, _views
+from . import (_aggs, _classify, _exprs, _flatten, _join, _probation, _resolve, _rewrite, _split,
+               _syntax, _thresholds, _views)
 from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -175,6 +176,23 @@ class Decision:
     next_check_at: float = 0.0           # when the next side-cursor probe may run
     probe_sql: str = ""                  # the rewritten statement, for the probe of a declined template
     variants: Dict[Tuple[str, ...], "Decision"] = field(default_factory=dict)
+    # probation (§9.1, gpudb/_probation.py): a template only a SOFT threshold
+    # keeps on DuckDB. `threshold_kind` is what _thresholds.decide said about
+    # the bound that declined it ('hard' | 'soft'); `probation` is where the
+    # trial stands ('' = not on probation, else one of _probation.STATES).
+    threshold_kind: str = ""
+    threshold_why: str = ""
+    probation: str = ""
+    native_obs: List[float] = field(default_factory=list)   # native ms of the user's OWN runs, newest last
+    sightings: int = 0                   # times the user ran this template (admission, §9.1)
+    round_probes: List[float] = field(default_factory=list)   # probes of the round in progress
+    probe_rounds: int = 0                # rounds run
+    probe_wins: int = 0                  # consecutive winning rounds
+    probes_spent: int = 0
+    probe_ms_spent: float = 0.0
+    probe_ms: Optional[float] = None     # the last round's figure (the median of its probes)
+    next_probe_at: float = 0.0
+    backoff_s: float = 0.0
 
 
 @dataclass
@@ -189,6 +207,11 @@ class LastRewrite:
     error: str = ""              # ... the error text, when it was not staleness
     round_trip_ms: float = 0.0
     engine: str = ""             # 'scalar' (gpu_rewrite_ast) | 'python' (reference renderer)
+    # More about `reason`, never instead of it. For reason 'threshold' it says
+    # which kind of bound declined the statement ('hard: …' / 'soft: …') and,
+    # once the shape is being tried on a side cursor, where that stands:
+    # 'probation', 'promoted' or 'demoted', with the measured pair (§9.1).
+    detail: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -264,6 +287,7 @@ class Connection:
         self._big_tables: Optional[set] = None    # names of tables above the floor (§0)
         self._parent = _parent
         if _parent is None:
+            self._probe_budget = _probation.Budget()
             self._manager = ResidencyManager(lambda: self._raw.cursor(), mode=residency,
                                              idle_ms=idle_ms, log=self._log)
             self._refresh_settings()
@@ -276,6 +300,7 @@ class Connection:
                 budget = default_memory_budget(self._backend, getattr(self, "_device_bytes", 0))
             self._manager.memory_budget = budget or None       # 0 = no cap
         else:
+            self._probe_budget = _parent._probe_budget      # one probe budget per process
             self._manager = _parent._manager
             self._settings = dict(_parent._settings)
             self._settings_key = _parent._settings_key
@@ -305,6 +330,41 @@ class Connection:
 
     def residents(self) -> Dict[str, str]:
         return self._manager.snapshot()
+
+    def probation(self) -> Dict[str, Any]:
+        """The shapes a SOFT threshold keeps on DuckDB that are being TRIED on a
+        side cursor (§9.1, gpudb/_probation.py), one entry per statement
+        template of this connection: `state` (candidate / waiting / probing /
+        promoted / demoted / retired), `rounds` and `wins`, `probes` and
+        `probe_ms` spent on it, `round_ms` (the last round's median) against
+        `native_ms` (the median of the user's own runs), the `bytes` its
+        resident set holds, and the bound that declined it. `budget` is the process-wide probe budget and
+        what of it the last minute spent."""
+        now = time.monotonic()
+        mem = self._manager.memory().get("sets") or {}
+        out: Dict[str, Any] = {}
+        for (template, _settings), d in list(self._cache.items()):
+            for dd in [d] + list(d.variants.values()):
+                if not dd.probation:
+                    continue
+                native = _probation.median(dd.native_obs)
+                best = dd.probe_ms
+                out[template] = {
+                    "state": dd.probation, "form": dd.form, "tag": dd.tag,
+                    "rounds": dd.probe_rounds, "wins": dd.probe_wins,
+                    "probes": dd.probes_spent, "probe_ms": round(dd.probe_ms_spent, 3),
+                    "round_ms": None if best is None else round(best, 3),
+                    "native_ms": None if native is None else round(native, 3),
+                    "ratio": None if not (best and native) else round(native / best, 3),
+                    "bytes": int((mem.get(dd.tag) or {}).get("bytes") or 0),
+                    "resident": self._manager.is_ready(dd.tag),
+                    "threshold": f"{dd.threshold_kind}: {dd.threshold_why}" if dd.threshold_why else dd.threshold_kind,
+                    "next_probe_in_s": max(0.0, round(dd.next_probe_at - now, 1)),
+                }
+        return {"templates": out,
+                "budget": {"ms_per_min": self._probe_budget.ms_per_min,
+                           "spent_ms_last_minute": round(self._probe_budget.spent_ms(now), 3)},
+                "bytes": self._manager.probation_bytes()}
 
     def _refresh_settings(self) -> None:
         row = self._raw.execute(
@@ -357,6 +417,7 @@ class Connection:
     def close(self) -> None:
         if self._parent is None:
             self._manager.close()
+        self._close_probe_cursor()
         self._raw.close()
 
     def __enter__(self):
@@ -422,6 +483,14 @@ class Connection:
         if not self._last.rewritten:
             if self._last.reason in ("not_resident", "threshold"):
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
+            if d.probation:
+                # this run of the user's own statement IS the native measurement
+                # probation compares against — it never times native itself
+                d.native_obs.append(ms)
+                del d.native_obs[:-_probation.NATIVE_OBSERVATIONS]
+                if self._may_probe(d, now):
+                    self._probation_probe(d, now)
+                return
             if d.measured_declined and now >= d.next_check_at and d.probe_sql and isinstance(query, str):
                 d.next_check_at = now + _REMEASURE_S
                 probe = self._probe_ms(d.probe_sql, None)
@@ -464,10 +533,23 @@ class Connection:
             d.rewritten = False
             d.reason = "threshold"
             d.measured_declined = True
+            if d.probation:
+                # a promoted template is an ordinary one, so the 60 s re-measure is what
+                # takes it back when the process turns slow. It returns to the trial, but
+                # behind a doubling back-off: a shape that flaps must not burn probes.
+                d.probation = "demoted"
+                d.probe_wins, d.round_probes = 0, []
+                d.probe_ms = best
+                d.backoff_s = _probation.next_backoff(d.backoff_s)
+                d.next_probe_at = now + d.backoff_s
+                self._manager.mark_probation(d.tag, True)
+                self._log(f"probation: demoted — the next round is in {d.backoff_s:.0f} s")
 
     def _probe_ms(self, sql: str, parameters) -> Optional[float]:
         """Time one execution of `sql` on a side cursor (the caller still
-        fetches from self._raw); None when it fails."""
+        fetches from self._raw); None when it fails, with the error text left in
+        `self._probe_error` for the caller that cares which failure it was."""
+        self._probe_error = ""
         try:
             cur = self._raw.cursor()
             t0 = time.perf_counter()
@@ -476,8 +558,185 @@ class Connection:
             cur.close()
             return out
         except duckdb.Error as e:
+            self._probe_error = str(e)
             self._log(f"timing probe failed: {e}")
             return None
+
+    def _probe_rewritten_ms(self, sql: str) -> Optional[float]:
+        """Time the rewritten form on the trial's OWN cursor, which is kept
+        between probes. `_probe_ms` opens a fresh one every time, and a fresh
+        DuckDB connection pays about a millisecond on its first statement:
+        measured on the SF1 7-group statement, 0.88 ms best but 1.93 ms median
+        on a new cursor per run against 0.91 ms median on a warm one, with
+        native at 2.07 ms — enough to read a 2.3x win as a loss. That is a
+        property of the instrument, not of the statement; a promoted template
+        runs on the session's own warm connection. The statement is still run as
+        TEXT, so the plan cache (§3.2) stays out of the comparison on purpose."""
+        self._probe_error = ""
+        cur = getattr(self, "_probe_cur", None)
+        try:
+            if cur is None:
+                # one untimed run to warm the new cursor: the native runs on the other
+                # side of the comparison are warm, and the first statement on a fresh
+                # connection is not
+                cur = self._probe_cur = self._raw.cursor()
+                t0 = time.perf_counter()
+                cur.execute(sql)
+                self._probe_budget.spend((time.perf_counter() - t0) * 1000.0)
+            t0 = time.perf_counter()
+            cur.execute(sql)
+            return (time.perf_counter() - t0) * 1000.0
+        except duckdb.Error as e:
+            self._probe_error = str(e)
+            self._log(f"probation probe failed: {e}")
+            self._close_probe_cursor()
+            return None
+
+    def _close_probe_cursor(self) -> None:
+        cur, self._probe_cur = getattr(self, "_probe_cur", None), None
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+    # ---- probation (§9.1, gpudb/_probation.py) ----
+    def _probation_on(self) -> bool:
+        """Is the mechanism available at all on this connection? It is a
+        background mechanism: it needs the residency manager to be allowed to
+        upload, the thresholds to be the thing declining statements, and no
+        open transaction (whose writes the trial's set would not see). It is
+        also off inside the nested pass (§4.14): what is being decided there is
+        a SELECT lifted out of the user's statement, and the user's statement is
+        the only thing whose native time is ever measured."""
+        return (bool(getattr(self, "_thresholds", True)) and self._transparent
+                and self._residency_mode != "manual" and not self._tx_open
+                and not getattr(self, "_in_nested", False)
+                and bool(getattr(self, "_exact", False)))
+
+    def _may_probe(self, d: "Decision", now: float) -> bool:
+        """May a round start right now? Everything here is about not taking
+        anything from the user: the set has to be there already (no upload is
+        waited for), no other statement of this connection may be running (a
+        probe on a side cursor shares DuckDB's worker pool with it), the
+        template's own back-off has to have expired, and the process's probe
+        budget has to have room."""
+        return (d.probation in ("candidate", "waiting", "probing", "demoted")
+                and self._probation_on() and now >= d.next_probe_at
+                and bool(d.probe_sql)
+                and len(d.native_obs) >= _probation.MIN_NATIVE_OBSERVATIONS
+                and self._manager.is_ready(d.tag)
+                and self._manager.others_in_flight() == 0
+                and self._probe_budget.may_probe(now))
+
+    def _probation_probe(self, d: "Decision", now: float) -> None:
+        """ONE run of the rewritten form on a side cursor. A round is
+        PROBES_PER_ROUND of them, one per user statement rather than three back
+        to back, so what probation adds to the statement the user is waiting on
+        is one extra execution — the same order of cost the measured re-measure
+        above has always had.
+
+        The probe runs the statement as TEXT, the way the native runs it is
+        compared against were measured — a promoted template then also gets the
+        cached plan (§3.2) and is faster than the probe said, so the error the
+        comparison makes is the one rule 1 can afford."""
+        t = self._probe_rewritten_ms(d.probe_sql)
+        if t is None:
+            if STALE_MARKER in (getattr(self, "_probe_error", "") or ""):
+                # some connection wrote to the table. The probe is how a template on
+                # probation finds out, since its own statements run native and never
+                # touch the guard. The set goes, and the trial starts again on the new
+                # rows — what it had measured was for rows that are gone.
+                self._probation_stale(d)
+            else:
+                # the rewritten form does not even run here (a set dropped behind the
+                # wrapper's back, a defect): this shape is not a candidate at all
+                d.probation = "retired"
+                d.round_probes = []
+                self._manager.mark_probation(d.tag, False)
+            return
+        self._probe_budget.spend(t)
+        d.probes_spent += 1
+        d.probe_ms_spent += t
+        d.round_probes.append(t)
+        if len(d.round_probes) < _probation.PROBES_PER_ROUND:
+            return
+        self._probation_judge(d, now)
+
+    def _probation_judge(self, d: "Decision", now: float) -> None:
+        """A round is complete: its median against the median of the template's
+        own recent native runs (`_probation` says why the medians and not the
+        minimums)."""
+        native = _probation.median(d.native_obs)
+        got = _probation.median(d.round_probes)
+        d.round_probes = []
+        d.probe_ms = got
+        d.probe_rounds += 1
+        d.probation = "probing"
+        if got < _probation.PROMOTE_RATIO * native:
+            d.probe_wins += 1
+            d.next_probe_at = now + _probation.ROUND_INTERVAL_S
+            self._log(f"probation: round {d.probe_rounds} won, measured {got:.2f} ms rewritten vs "
+                      f"{native:.2f} ms native ({d.probe_wins} of {_probation.ROUNDS_TO_PROMOTE} rounds)")
+            if d.probe_wins >= _probation.ROUNDS_TO_PROMOTE:
+                self._promote(d, got, native, now)
+            return
+        d.probe_wins = 0
+        d.backoff_s = _probation.next_backoff(d.backoff_s)
+        d.next_probe_at = now + d.backoff_s
+        self._log(f"probation: round {d.probe_rounds} lost, measured {got:.2f} ms rewritten vs "
+                  f"{native:.2f} ms native — template stays native (next round in {d.backoff_s:.0f} s)")
+        if d.probe_rounds >= _probation.MAX_ROUNDS:
+            d.probation = "retired"
+            d.round_probes = []
+            self._manager.mark_probation(d.tag, False)
+            self._log(f"probation: {d.probe_rounds} rounds without a win — this template is not tried again")
+
+    def _probation_stale(self, d: "Decision") -> None:
+        """Drop the trial's set the way a rewritten statement's fallback does
+        (§5.4), and put its template back at the start of the trial.
+
+        Everything here runs on a cursor of its own. A probe happens after the
+        user's statement has executed but BEFORE they have fetched from it, and
+        anything issued on `self._raw` in that window replaces the result they
+        are about to read. (Cached plans are deliberately left alone for the
+        same reason: `DEALLOCATE` is per-connection, so it cannot be moved to a
+        side cursor — and it is not needed, because a plan over a set this just
+        invalidated raises GPUDB_STALE on its next execution and takes the
+        ordinary `_on_stale` path.)"""
+        if d.tag.startswith("gpudb:v1:"):
+            try:
+                cur = self._raw.cursor()
+                try:
+                    cur.execute("SELECT gpu_invalidate(?)", [":".join(d.tag.split(":")[:6])]).fetchall()
+                finally:
+                    cur.close()
+            except Exception:
+                pass
+        self._close_probe_cursor()
+        st = self._manager.get(d.tag)
+        self._manager.invalidate(d.tag)
+        if st is not None:
+            self._manager.note_candidate(d.tag, st.upload_sql, probation=True)
+        self._reset_probation([d.tag])
+        self._log(f"probation: the table under {d.tag} moved — the trial starts again")
+
+    def _promote(self, d: "Decision", best: float, native: float, now: float) -> None:
+        """The shape won ROUNDS_TO_PROMOTE rounds spread over more than the
+        seconds a process's mode lasts: it is an ordinary rewritten template
+        from now on, handed to the measured rule 1 with what the trial already
+        knows — so its next 60 s re-measure against native is what keeps it."""
+        d.rewritten, d.reason, d.measured_declined = True, "", False
+        d.probation = "promoted"
+        d.rewritten_ms = [best]
+        d.native_ms = native
+        d.timing_checked = True
+        d.next_check_at = now + _REMEASURE_S
+        d.backoff_s, d.round_probes = 0.0, []
+        self._manager.mark_probation(d.tag, False)
+        self._log(f"probation: promoted — {best:.2f} ms rewritten vs {native:.2f} ms native "
+                  f"({native / max(best, 1e-9):.2f}x) over {_probation.ROUNDS_TO_PROMOTE} rounds; "
+                  f"re-measured against native every {_REMEASURE_S:.0f} s from here")
 
     def execute(self, query, parameters=None):
         sql = self._route(query, parameters)
@@ -525,6 +784,7 @@ class Connection:
         if d is not None:
             d.rewritten = False
             d.reason = "error"
+            d.probation = ""        # a form that raises is not a candidate for anything
         for tag in [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]:
             self._manager.invalidate(tag)
 
@@ -565,6 +825,8 @@ class Connection:
                       f"template declined from now on")
             d.rewritten = False
             d.reason = "threshold"
+            d.threshold_kind, d.threshold_why = _thresholds.HARD, f"{rows_out} rows returned > {bound} (output-bound)"
+            d.probation = ""                     # output-bound: never tried on a side cursor
 
     def sql(self, query, **kw):
         sql = self._route(query, None)
@@ -657,6 +919,7 @@ class Connection:
         self._last.fallback = True
         self._drop_plans()
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        self._reset_probation(tags)
         # stage B: the table's STORE holds the stale columns — drop it (and every view on it)
         # in the extension, or the next upload would find its lanes "already there"
         for prefix in {":".join(t.split(":")[:6]) for t in tags if t.startswith("gpudb:v1:")}:
@@ -675,6 +938,27 @@ class Connection:
             self._manager.invalidate(tag)
             if st is not None:
                 self._manager.note_candidate(tag, st.upload_sql)
+
+    def _reset_probation(self, tags: List[str]) -> None:
+        """The data under these sets moved (§5.4). Every trial over them starts
+        again: the times measured were for rows that are gone, and a template
+        promoted on them has to earn it on the new data. (A write the wrapper
+        sees goes through `_invalidate_all`, which drops the decisions outright;
+        this is the path for a write the staleness guard caught.)"""
+        hit = set(tags)
+        for d in list(self._cache.values()):
+            for dd in [d] + list(d.variants.values()):
+                if not dd.probation or dd.tag not in hit:
+                    continue
+                if dd.probation == "promoted":
+                    dd.rewritten, dd.reason, dd.measured_declined = False, "threshold", False
+                    dd.rewritten_ms, dd.native_ms, dd.timing_checked = [], None, False
+                dd.probation = "candidate"
+                dd.probe_wins = dd.probe_rounds = dd.sightings = 0
+                dd.probe_ms = None
+                dd.round_probes = []
+                dd.native_obs, dd.probe_sql = [], ""
+                dd.backoff_s, dd.next_probe_at = 0.0, 0.0
 
     def _invalidate_all(self, why: str) -> None:
         self._resnap_after = True                 # the file changes when THIS write commits: not foreign
@@ -953,7 +1237,11 @@ class Connection:
                         except Exception:
                             sub_sql = None
                         if sub_sql:
-                            self._rewrite_text(sub_sql)
+                            self._in_nested = True
+                            try:
+                                self._rewrite_text(sub_sql)
+                            finally:
+                                self._in_nested = False
                             if self._last.rewritten or self._last.reason == "not_resident":
                                 subs.append((list(path), sub_sql))
                                 return                      # rewritten as a whole: do not descend
@@ -976,7 +1264,11 @@ class Connection:
             return None
         outs, tags, pending = [], [], False
         for _path, sub_sql in entry["subs"]:
-            o = self._rewrite_text(sub_sql)
+            self._in_nested = True
+            try:
+                o = self._rewrite_text(sub_sql)
+            finally:
+                self._in_nested = False
             if o is None:
                 pending = pending or self._last.reason == "not_resident"
                 outs.append(None)
@@ -1169,6 +1461,7 @@ class Connection:
             if v is None:
                 if len(d.variants) >= 16:
                     self._last.reason = "threshold"
+                    self._last.detail = f"{_thresholds.HARD}: 16 literal variants of one template"
                     return None
                 v = self._decide(sql)
                 v.literals = literals
@@ -1177,8 +1470,14 @@ class Connection:
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if not d.rewritten:
             self._last.reason = d.reason
-            if d.measured_declined:
+            self._last.detail = self._detail(d)
+            if d.measured_declined or d.probation:
                 self._timing_decision = d        # its native runs keep its native time; it may be re-measured
+            if d.probation:
+                # §9.1: the statement runs on DuckDB exactly as it would without any of
+                # this. What happens here is that the set is asked for in the background
+                # and, once it is there, the rewritten form is rendered for the side cursor.
+                self._probation_step(d, sql, literals)
             return None
         self._timing_decision = d
         self._last.form = d.form
@@ -1243,23 +1542,11 @@ class Connection:
                 self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
                                      else "not_resident")
                 return None
-        if d.scalar_sql and literals == d.literals:
-            out = d.scalar_sql
-            self._last.engine = "scalar"
-        else:
-            # literals differ from the cached template (or no scalar): re-render
-            # from the current statement's tree with the reference renderer
-            # (one serialize, no catalog work, no scalar call)
-            plan = d.plan
-            if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
-                plan = self._replan_literals(sql, plan)
-                if plan is None:
-                    self._last.reason = "shape"
-                    return None
-            out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
-            self._last.engine = "python"
-        if d.wrap is not None:
-            out = d.wrap[0] + out + d.wrap[1]
+        rendered = self._render(d, sql, literals)
+        if rendered is None:
+            self._last.reason = "shape"
+            return None
+        out, self._last.engine = rendered
         if self._foreign_write_seen():
             # some connection committed a write since the last look: every set may be stale
             # (an in-place UPDATE keeps the row count, so the guard would not know)
@@ -1270,7 +1557,88 @@ class Connection:
             return None
         self._last.rewritten = True
         self._last.sql = out
+        if d.probation:
+            self._last.detail = self._detail(d)     # 'promoted', with the pair the trial measured
         return out
+
+    def _render(self, d: "Decision", sql: str, literals) -> Optional[Tuple[str, str]]:
+        """(rewritten text, which renderer made it) for this statement's
+        literals, or None when the literals cannot be re-planned."""
+        if d.scalar_sql and literals == d.literals:
+            out, engine = d.scalar_sql, "scalar"
+        else:
+            # literals differ from the cached template (or no scalar): re-render
+            # from the current statement's tree with the reference renderer
+            # (one serialize, no catalog work, no scalar call)
+            plan = d.plan
+            if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
+                plan = self._replan_literals(sql, plan)
+                if plan is None:
+                    return None
+            out, engine = _rewrite.render(plan, d.fqn, self._settings["default_order"]), "python"
+        return ((d.wrap[0] + out + d.wrap[1]) if d.wrap is not None else out), engine
+
+    # ---- probation: the decline side (§9.1) ----
+    def _detail(self, d: "Decision") -> str:
+        """`last_rewrite()["detail"]`: which kind of bound declined the statement,
+        and where its trial stands if it has one (§9.1)."""
+        bound = f"{d.threshold_kind}: {d.threshold_why}" if d.threshold_why else d.threshold_kind
+        if not d.probation:
+            return bound
+        pair = ""
+        if d.probe_ms is not None and d.native_obs:
+            pair = f" ({d.probe_ms:.2f} ms rewritten vs {_probation.median(d.native_obs):.2f} ms native)"
+        state = "probation" if d.probation in ("candidate", "waiting", "probing") else d.probation
+        return f"{state}{pair}; {bound}" if bound else f"{state}{pair}"
+
+    def _probation_step(self, d: "Decision", sql: str, literals) -> None:
+        """Keep the trial of a soft-declined template moving, without touching
+        the user's statement: ask the background path for the set (under the
+        probation flag, so it never evicts anything that earned its place), and
+        once the set is there render the rewritten form for the side cursor.
+        The probe itself runs from `_note_timing`, after the user's statement
+        has returned."""
+        if d.probation == "retired" or not self._probation_on():
+            return
+        d.sightings += 1
+        if not self._manager.is_ready(d.tag):
+            if d.probation == "candidate" and d.sightings >= _probation.MIN_SIGHTINGS:
+                budget = self._manager.memory_budget
+                up_name, up_sql, missing = self._store_upload(d)
+                narrow = getattr(self, "_narrow", False)
+                widths = [d.lane_widths.get(n, 8) for n in missing] if narrow and missing else None
+                kw = (d.lane_widths.get(d.key_lane, 8) if narrow else 8) if d.key_lane in missing else 0
+                est = estimate_set_bytes(d.set_rows, max(1, len(missing)), widths, kw) if missing else 0
+                ok, why = _probation.admissible_bytes(budget, self._manager.probation_bytes(), est)
+                if not ok:
+                    d.probation = "retired"
+                    self._log(f"probation: not admitted ({why}) — {d.tag}")
+                    return
+                for b in d.sentinels:
+                    self._manager.note_candidate(b.tag, "", steps=[b.upload_sql], probation=True)
+                self._manager.note_candidate(d.tag, up_sql, fqn=d.fqn,
+                                             deps=[b.tag for b in d.sentinels] or None,
+                                             est_bytes=est, upload_name=up_name, store_key=d.store_key,
+                                             store_lanes=list(d.store_lanes),
+                                             post_sql=["SELECT gpu_prepare_resident('%s')" % d.tag.replace("'", "''")],
+                                             probation=True)
+                d.probation = "waiting"
+            return
+        if d.probation == "waiting":
+            # The native runs seen so far were taken while the background upload was
+            # scanning the table for this very set, so they are not what native costs
+            # in the steady state (measured: 2.5 ms during the upload, 10 ms after it,
+            # at an interactive cadence). The comparison starts from here.
+            d.probation, d.native_obs = "probing", []
+        # The rewritten text is rendered only when a probe could actually run next:
+        # for a template whose literals move run to run, rendering means re-planning
+        # them, and a statement on its way to DuckDB must not pay for that.
+        now = time.monotonic()
+        if (now >= d.next_probe_at
+                and len(d.native_obs) + 1 >= _probation.MIN_NATIVE_OBSERVATIONS
+                and self._probe_budget.may_probe(now)):
+            rendered = self._render(d, sql, literals)
+            d.probe_sql = rendered[0] if rendered is not None else ""
 
     def _store_upload(self, d: "Decision"):
         """(session name, upload statement, missing lanes) for a store-backed set:
@@ -1550,9 +1918,11 @@ class Connection:
         if outer_sql.count(_split.PLACEHOLDER) != 1:
             return None
         d = self._decide(inner_sql, allow_split=False, reagg=reagg, global_agg=is_global)
-        if not d.rewritten:
+        if not d.rewritten and not d.probation:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
-            return Decision(False, d.reason)
+            return Decision(False, d.reason, threshold_kind=d.threshold_kind, threshold_why=d.threshold_why)
+        # a softly declined inner statement keeps being built: what a trial has to time is
+        # the WHOLE statement the user wrote, wrap and all, not the GROUP BY inside it (§9.1)
         head, tail = outer_sql.split(_split.PLACEHOLDER)
         if is_global:
             # no GROUP BY: one row even when nothing qualifies, as native
@@ -1593,6 +1963,9 @@ class Connection:
 
     def _decide_body(self, sql: str, mode: str, reagg: bool = False,
                      global_agg: bool = False) -> Decision:
+        # (kind, why) of a SOFT threshold decline whose decision is built to the
+        # end anyway, so the shape can be tried on a side cursor (§9.1 probation)
+        soft: Optional[Tuple[str, str]] = None
         if global_agg and not getattr(self, "_global", False):
             return Decision(False, "backend")
         try:
@@ -1633,7 +2006,8 @@ class Connection:
             biggest = max(t.rows for t in low.tables)
             if join_rows > min(4 * biggest, 0xFFFFFFFF - 64):
                 self._log(f"declined (threshold): the join returns {join_rows} rows from tables of at most {biggest}")
-                return Decision(False, "threshold", is_join=True)
+                return Decision(False, "threshold", is_join=True, threshold_kind=_thresholds.HARD,
+                                threshold_why=f"the join returns {join_rows} rows from tables of at most {biggest}")
             columns = dict(columns)
             for cname, comp in computed.items():
                 columns[cname] = comp.lane_type
@@ -1659,7 +2033,8 @@ class Connection:
         nrows = (max(t.rows for t in low.tables) if low is not None     # the largest joined table decides
                  else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
         if nrows < self._floor_rows:
-            return Decision(False, "threshold")
+            return Decision(False, "threshold", threshold_kind=_thresholds.HARD,
+                            threshold_why=f"{nrows} rows < the floor of {self._floor_rows} (§0)")
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
         stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
@@ -1768,10 +2143,11 @@ class Connection:
                         est = max(1, min(est, int(kept)))
                 except Exception as e:
                     self._log(f"selectivity probe failed: {e}")
-                    return Decision(False, "threshold")
+                    return Decision(False, "threshold", threshold_kind=_thresholds.HARD,
+                                    threshold_why="the WHERE's selectivity could not be measured")
             # a lane with a subquery (EXISTS / IN / correlated scalar, §4.18) makes native run a
             # join too, whatever the FROM says: the join bounds apply
-            ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
+            ok, why, kind = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
                                          join=low is not None or any(c.dep_tables for c in computed.values()), payloads=max(1, len(plan.vals)),
                                          string_key=bool(plan.dict_key),
                                          limited=plan.limit is not None and plan.limit <= 10_000,
@@ -1779,8 +2155,16 @@ class Connection:
                                          reaggregated=reagg, global_agg=global_agg, rows=nrows,
                                          where_terms=len(plan.where))
             if not ok:
-                self._log(f"threshold: {why}")
-                return Decision(False, "threshold")
+                self._log(f"threshold ({kind}): {why}")
+                # §9.1 probation: a SOFT bound is one the process's mode or a small fixed
+                # cost decides, so the shape may be TRIED on a side cursor — but only the
+                # cheapest kind of set is ever built for a trial: a view over one table's
+                # column store. A join (device or uploaded) materialises a result the size
+                # of the join; nothing like that is built for a shape nobody asked for.
+                if not (kind == _thresholds.SOFT and low is None and getattr(self, "_store", False)
+                        and self._probation_on()):
+                    return Decision(False, "threshold", threshold_kind=kind, threshold_why=why)
+                soft = (kind, why)
         try:
             described = self._raw.execute("DESCRIBE " + sql).fetchall()
             _rewrite.apply_describe(plan, [(r[0], r[1]) for r in described])
@@ -1917,6 +2301,13 @@ class Connection:
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form
+        if soft is not None:
+            # the statement is declined exactly as before — reason 'threshold', DuckDB
+            # answers it. The decision was built to the end only so that the rewritten
+            # form exists to be TIMED on a side cursor (§9.1).
+            d.rewritten, d.reason = False, "threshold"
+            d.threshold_kind, d.threshold_why = soft
+            d.probation = "candidate" if d.store_key and d.join is None else ""
         return d
 
 

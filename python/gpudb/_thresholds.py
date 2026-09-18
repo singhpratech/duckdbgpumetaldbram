@@ -106,6 +106,46 @@ averaged over scale factors. What the direct path changes is the SF10 and SF50
 end of every shape that is ALREADY admitted, which is where it shows in the
 TPC-H tables.
 
+HARD and SOFT (2026-09-18)
+--------------------------
+Every bound above keeps a shape on DuckDB, but not for the same kind of reason,
+and `decide()` now says which kind each decline is. The third element of its
+answer is "hard" or "soft":
+
+  * **hard** — losing is structural, or what it costs if the bound is wrong has
+    no ceiling. Two families:
+    - *output-bound*: the decline is about how many rows come BACK. Native and
+      the device both have to produce them, the device adds a device-to-host
+      copy, and the number can be millions (`plain_max_groups`,
+      `plain_max_groups_where`, `join_plain_max_groups`, `multi_plain_max_groups`,
+      `multi_join_plain_max_groups`, `reagg_max_pairs`, `reagg_max_pairs_where`).
+      Measured losses here are not near-even: 0.96-0.99x at 1.5M groups,
+      0.39-0.51x at 700K pairs. A trial run of such a shape is itself expensive
+      (seconds of side-cursor work, a result set the size of the table), so it
+      is not something to find out by trying.
+    - *no information*: no distinct-count estimate, no selectivity, no
+      thresholds for the backend, a form the table does not know. Nothing can be
+      sized, so nothing may be admitted.
+  * **soft** — the outcome depends on the process's mode (see "Two modes of a
+    short kernel", §9.1) or on small fixed costs, one row or a few thousand
+    come back either way, and the worst case measured is a bounded slowdown:
+    `min_groups` (0.52-0.94x slow mode, 1.19-2.50x fast mode),
+    `string_key_min_selectivity` / `string_key_min_computed_payloads`
+    (0.57-0.82x), `plain_min_selectivity` (0.94-1.07x), `having_min_selectivity`
+    / `_big` (0.75-0.99x), `topk_min_groups` / `topk_min_selectivity`
+    (0.55-0.98x, 0.71-0.72x), `join_plain_min_selectivity` (0.92-0.99x),
+    `reagg_min_selectivity` (0.84x), `global_min_rows` / `global_min_row_terms`
+    (0.93-0.99x, one row out, no output risk at all), and the multi-payload
+    plain form under a WHERE (1.01-1.09x with one 0.93x) — that last one only
+    while the result stays inside `plain_max_groups_where`; above it the same
+    decline is output-bound and hard.
+
+The bounds themselves are unchanged and they still decide every statement: a
+soft decline runs on DuckDB exactly as a hard one does. What the kind buys is
+that a soft-declined shape may be tried on a SIDE cursor and promoted if it
+measurably wins in THIS process (§9.1, "Probation"); a hard-declined one never
+is.
+
 The bounds predict the win before a statement runs; the wrapper also MEASURES
 it: every statement runs native while its set is being uploaded, so its own
 native time is known, and when the best of the first three rewritten runs is
@@ -198,67 +238,79 @@ CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
+HARD = "hard"     # losing is structural, or what a wrong bound costs has no ceiling
+SOFT = "soft"     # the process's mode or a small fixed cost decides; the worst case is bounded
+
+
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
            limited: bool = False, computed_payloads: int = 0,
            reaggregated: bool = False, global_agg: bool = False, rows: int = 0,
-           where_terms: int = 0) -> Tuple[bool, str]:
-    """(ok, detail). form: plain | having | topk. est_groups None = unknown
-    (declines: a miss never rewrites). selectivity None = no WHERE. join:
-    the statement is over a key join (its own table above)."""
+           where_terms: int = 0) -> Tuple[bool, str, str]:
+    """(ok, detail, kind). form: plain | having | topk. est_groups None =
+    unknown (declines: a miss never rewrites). selectivity None = no WHERE.
+    join: the statement is over a key join (its own table above). `kind` is
+    "" when ok, else HARD or SOFT — see the module docstring for what each
+    bound is and why."""
     t = TABLE.get((backend or "").upper())
     if t is None:
-        return False, f"no thresholds for backend {backend!r}"
+        return False, f"no thresholds for backend {backend!r}", HARD
     if global_agg:
         # §4.12: one group, one row — no output-size risk and no distinct count
         if join:
             if rows < t.global_join_min_rows:
-                return False, f"{rows} rows < {t.global_join_min_rows} for an aggregate without GROUP BY over a join"
-            return True, ""
+                return False, f"{rows} rows < {t.global_join_min_rows} for an aggregate without GROUP BY over a join", SOFT
+            return True, "", ""
         if rows < t.global_min_rows:
-            return False, f"{rows} rows < {t.global_min_rows} for an aggregate without GROUP BY"
+            return False, f"{rows} rows < {t.global_min_rows} for an aggregate without GROUP BY", SOFT
         # past three terms native's per-row cost stops growing with the
         # conjunction (it short-circuits), so the bound stops counting there
         work = rows * (1 + min(3, max(0, where_terms)))
         if work < t.global_min_row_terms:
             return False, (f"{rows} rows x {where_terms} WHERE term(s) = {work} < {t.global_min_row_terms} "
-                           f"for an aggregate without GROUP BY over a single table")
-        return True, ""
+                           f"for an aggregate without GROUP BY over a single table"), SOFT
+        return True, "", ""
     if est_groups is None:
-        return False, "no distinct-count estimate for the key"
+        return False, "no distinct-count estimate for the key", HARD
     if reaggregated:
         # est_groups counts (key, x) pairs: every one of them goes back through DuckDB
         if est_groups > t.reagg_max_pairs:
-            return False, f"{est_groups} (key, value) pairs to re-aggregate > {t.reagg_max_pairs}"
+            return False, f"{est_groups} (key, value) pairs to re-aggregate > {t.reagg_max_pairs}", HARD
         if has_where and est_groups > t.reagg_max_pairs_where:
-            return False, f"{est_groups} (key, value) pairs under a WHERE > {t.reagg_max_pairs_where}"
+            return False, f"{est_groups} (key, value) pairs under a WHERE > {t.reagg_max_pairs_where}", HARD
         if has_where and (selectivity is None or selectivity < t.reagg_min_selectivity):
-            return False, f"selectivity below {t.reagg_min_selectivity} for count(DISTINCT)"
+            # the pair count is already inside the bound above: what is left is one 0.84x cell
+            kind = HARD if selectivity is None else SOFT
+            return False, f"selectivity below {t.reagg_min_selectivity} for count(DISTINCT)", kind
     # (a result of a few hundred groups is never output-bound, however many columns it has)
     if payloads > 1 and form == "plain" and est_groups >= t.min_groups:
         if join and est_groups > t.multi_join_plain_max_groups:
             return False, (f"{est_groups} groups x {payloads} payload columns returned over a join "
-                           f"> {t.multi_join_plain_max_groups} (output-bound)")
+                           f"> {t.multi_join_plain_max_groups} (output-bound)"), HARD
         if not join and has_where:
-            return False, f"plain form with {payloads} payload columns under a WHERE"
+            # soft only while the result stays inside what the single-payload plain form
+            # returns under a WHERE; above that the same decline is output-bound
+            kind = SOFT if est_groups <= t.plain_max_groups_where else HARD
+            return False, f"plain form with {payloads} payload columns under a WHERE", kind
         if not join and est_groups > t.multi_plain_max_groups:
-            return False, f"{est_groups} groups x {payloads} payload columns returned > {t.multi_plain_max_groups}"
+            return False, (f"{est_groups} groups x {payloads} payload columns returned "
+                           f"> {t.multi_plain_max_groups}"), HARD
     if join:
         # `limited`: the statement ends in a LIMIT that was not pushed as a top-k (ORDER BY
         # several terms): every group still leaves the operator, but only LIMIT rows reach
         # the client, so the fetch-bound reasoning behind the plain-form bounds does not
         # apply (TPC-H Q3: 11K groups under a 1% WHERE, LIMIT 10 — 1.5-1.7x)
         if form != "plain" or limited:
-            return True, ""
+            return True, "", ""
         if est_groups > t.join_plain_max_groups:
-            return False, f"{est_groups} groups returned over a join > {t.join_plain_max_groups} (output-bound)"
+            return False, f"{est_groups} groups returned over a join > {t.join_plain_max_groups} (output-bound)", HARD
         if has_where and est_groups > t.join_plain_small_groups:
             if selectivity is None:
-                return False, "selectivity unknown"
+                return False, "selectivity unknown", HARD
             if selectivity < t.join_plain_min_selectivity:
                 return False, (f"selectivity {selectivity:.2f} < {t.join_plain_min_selectivity} for the plain form "
-                               f"over a join with {est_groups} groups")
-        return True, ""
+                               f"over a join with {est_groups} groups"), SOFT
+        return True, "", ""
     # (count(DISTINCT) beside one expression payload keeps its win there: 1.26–1.84x, 0 of 8 below 1.0x —
     # native builds a second hash table for the DISTINCT)
     few_ok = string_key and (not has_where or ((computed_payloads >= t.string_key_min_computed_payloads
@@ -267,27 +319,27 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
                                                and selectivity >= t.string_key_min_selectivity))
     # (plain form only: with three groups HAVING / top-k save nothing and measured 0.98–1.07x)
     if est_groups < t.min_groups and not (few_ok and form == "plain"):
-        return False, f"{est_groups} groups < {t.min_groups}"
+        return False, f"{est_groups} groups < {t.min_groups}", SOFT
     sel = selectivity if has_where else 1.0
     if sel is None:
-        return False, "selectivity unknown"
+        return False, "selectivity unknown", HARD
     if form == "plain":
         if est_groups > t.plain_max_groups:
-            return False, f"{est_groups} groups returned > {t.plain_max_groups} (output-bound)"
+            return False, f"{est_groups} groups returned > {t.plain_max_groups} (output-bound)", HARD
         if has_where and est_groups > t.plain_max_groups_where:
-            return False, f"{est_groups} groups returned under a WHERE > {t.plain_max_groups_where}"
+            return False, f"{est_groups} groups returned under a WHERE > {t.plain_max_groups_where}", HARD
         if has_where and sel < t.plain_min_selectivity:
-            return False, f"selectivity {sel:.2f} < {t.plain_min_selectivity} for the plain form"
-        return True, ""
+            return False, f"selectivity {sel:.2f} < {t.plain_min_selectivity} for the plain form", SOFT
+        return True, "", ""
     if form == "having":
         bound = t.having_min_selectivity_big if est_groups >= t.topk_min_groups else t.having_min_selectivity
         if has_where and sel < bound:
-            return False, f"selectivity {sel:.2f} < {bound} for HAVING"
-        return True, ""
+            return False, f"selectivity {sel:.2f} < {bound} for HAVING", SOFT
+        return True, "", ""
     if form == "topk":
         if est_groups < t.topk_min_groups:
-            return False, f"{est_groups} groups < {t.topk_min_groups} for top-k"
+            return False, f"{est_groups} groups < {t.topk_min_groups} for top-k", SOFT
         if has_where and sel < t.topk_min_selectivity:
-            return False, f"selectivity {sel:.2f} < {t.topk_min_selectivity} for top-k"
-        return True, ""
-    return False, f"unknown form {form}"
+            return False, f"selectivity {sel:.2f} < {t.topk_min_selectivity} for top-k", SOFT
+        return True, "", ""
+    return False, f"unknown form {form}", HARD

@@ -1363,6 +1363,260 @@ def run():
         pass
     con.close()
 
+    # ---- probation (§9.1): a shape only a SOFT threshold keeps on DuckDB is TRIED on a side cursor ----
+    print("== probation")
+    from gpudb import _probation as _pb
+
+    # (1) the classification itself: which bound is which kind, and why
+    HARD, SOFT = _th.HARD, _th.SOFT
+    kinds = {
+        "few groups":        (("plain", 7, None, False), SOFT),
+        "plain output":      (("plain", 2_000_000, None, False), HARD),
+        "plain output/where": (("plain", 400_000, 0.9, True), HARD),
+        "plain selectivity": (("plain", 10_000, 0.1, True), SOFT),
+        "having selectivity": (("having", 10_000, 0.1, True), SOFT),
+        "topk groups":       (("topk", 10_000, None, False), SOFT),
+        "topk selectivity":  (("topk", 200_000, 0.1, True), SOFT),
+        "no estimate":       (("plain", None, None, False), HARD),
+    }
+    for name, ((form, est, sel, hw), want_kind) in kinds.items():
+        ok, why, kind = _th.decide("METAL", form, est, sel, hw)
+        check(not ok and kind == want_kind, f"threshold kind: {name} is {want_kind} ({kind}: {why})")
+    check(_th.decide("METAL", "plain", 2_000_000, None, False, join=True)[2] == HARD,
+          "threshold kind: groups returned over a join is hard (output-bound)")
+    check(_th.decide("METAL", "plain", 50_000, 0.02, True, join=True)[2] == SOFT,
+          "threshold kind: a selective WHERE over a join is soft")
+    check(_th.decide("METAL", "plain", 500_000, None, False, reaggregated=True)[2] == HARD,
+          "threshold kind: a distinct-pair bound is hard")
+    check(_th.decide("METAL", "plain", 10_000_000, None, False)[0] is False
+          and _th.decide("METAL", "plain", 5_000, None, False)[0] is True,
+          "threshold kind: the bounds themselves are unchanged")
+
+    # (2) a soft decline reaches probation, is promoted on a repeated win, and the answer never moves
+    con = fresh(residency="background", idle_ms=5.0, thresholds=True)
+    if getattr(con, "_exact", False) and getattr(con, "_store", False):
+        q = "SELECT k, sum(v), count(*) FROM tn GROUP BY k"          # 10 groups: below min_groups
+        want = sorted(con._raw.execute(q).fetchall())
+
+        def drive(n=1, con=con, q=q):
+            for _ in range(n):
+                got = sorted(con.execute(q).fetchall())
+                check(got == want, "probation: rule 2 — the rows are native's rows") if got != want else None
+            return got
+
+        drive()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "threshold" and lr["detail"].startswith("probation"),
+              f"probation: a soft decline enters probation, reason unchanged ({lr['reason']}, {lr['detail'][:60]})")
+        for _ in range(_pb.MIN_SIGHTINGS):        # a template seen once never causes an upload
+            drive()
+            con._manager.wait_idle(60)
+        check(con._manager.get(con._timing_decision.tag).probation,
+              "probation: its set is flagged as held for a trial only")
+        for _ in range(_pb.MIN_NATIVE_OBSERVATIONS):   # ... and a round needs native runs to judge against
+            drive()
+        d = con._timing_decision
+        check(d is not None and d.probation in ("probing", "promoted") and d.probe_sql,
+              f"probation: once the set is resident the rewritten form is rendered for the side cursor "
+              f"({getattr(d, 'probation', None)})")
+        saved_probe, saved_rw = con._probe_ms, con._probe_rewritten_ms
+        try:
+            # a deterministic probe, like the re-measure tests: 1 ms rewritten against 10 ms native
+            con._probe_rewritten_ms = lambda sql: 1.0
+            con._probe_ms = lambda sql, params: 1.0
+            # start the trial from a clean slate, whatever the real probes above did
+            d.rewritten, d.reason, d.measured_declined = False, "threshold", False
+            d.probation, d.round_probes, d.probe_ms = "probing", [], None
+            d.probe_rounds = d.probe_wins = d.probes_spent = 0
+            d.backoff_s, d.probe_ms_spent = 0.0, 0.0
+            con._manager.mark_probation(d.tag, True)
+
+            def a_round(drive=drive, d=None, con=con):
+                # a round is one probe per user statement (§9.1), against a native median
+                # this test holds at 10 ms
+                for _ in range(_pb.PROBES_PER_ROUND):
+                    d.native_obs = [10.0] * _pb.NATIVE_OBSERVATIONS
+                    d.next_probe_at = 0.0
+                    drive()
+            a_round(d=d)
+            check(not d.rewritten and d.probe_wins == 1 and d.probe_rounds == 1,
+                  f"probation: one winning round does not promote ({d.probe_wins} win(s), rewritten={d.rewritten})")
+            check(d.next_probe_at - time.monotonic() > _pb.ROUND_INTERVAL_S - 1.0,
+                  "probation: the second round is a whole interval later, so one fast moment cannot promote")
+            a_round(d=d)
+            check(d.rewritten and d.probation == "promoted" and con._manager.get(d.tag).probation is False,
+                  f"probation: a second winning round promotes; its set becomes an ordinary one ({d.probation})")
+            got = drive()
+            lr = con.last_rewrite()
+            check(lr["rewritten"] and lr["detail"].startswith("promoted") and got == want,
+                  f"probation: promoted statements are rewritten and identical to native ({lr['detail'][:60]})")
+            # (3) promoted, then the process turns slow: the 60 s re-measure demotes it, with a back-off
+            d.next_check_at = 0.0
+            con._probe_ms = lambda sql, params: 0.0        # native "instant"
+            drive()
+            check(not d.rewritten and d.probation == "demoted" and d.reason == "threshold"
+                  and d.backoff_s >= _pb.BACKOFF_START_S and d.next_probe_at > time.monotonic(),
+                  f"probation: promoted then slower than native -> demoted, back-off {d.backoff_s:.0f} s")
+            check(con._manager.get(d.tag).probation, "probation: a demoted template's set goes back to being a trial's")
+            got = drive()
+            check(con.last_rewrite()["reason"] == "threshold" and got == want,
+                  "probation: a demoted template runs native again, same rows")
+            # (4) a losing round never promotes, and backs off further
+            rounds, backoff = d.probe_rounds, d.backoff_s
+            con._probe_rewritten_ms = lambda sql: 100.0   # rewritten much slower than native
+            a_round(d=d)
+            check(not d.rewritten and d.probe_wins == 0 and d.probe_rounds == rounds + 1
+                  and d.backoff_s > backoff,
+                  f"probation: a losing round never promotes and backs off further ({d.backoff_s:.0f} s)")
+            # (5) a shape that never wins retires, and stops costing anything
+            con._probe_budget = _pb.Budget(ms_per_min=1e9)      # the budget has its own test below
+            for _ in range(_pb.MAX_ROUNDS + 1):
+                a_round(d=d)
+            check(d.probation == "retired" and d.probe_rounds <= _pb.MAX_ROUNDS + 1,
+                  f"probation: {d.probe_rounds} rounds without a win and the template retires ({d.probation})")
+            spent = d.probes_spent
+            a_round(d=d)
+            check(d.probes_spent == spent, "probation: a retired template is never probed again")
+        finally:
+            con._probe_ms, con._probe_rewritten_ms = saved_probe, saved_rw
+        # (6) the probe budget is a real cap
+        b = _pb.Budget(ms_per_min=10.0)
+        b.spend(9.0)
+        check(b.may_probe() and b.spent_ms() == 9.0, "probation: the probe budget counts what was spent")
+        b.spend(2.0)
+        check(not b.may_probe(), "probation: ... and refuses a probe once the minute's budget is gone")
+    con.close()
+
+    # (7) a HARD decline never enters probation, whatever it costs
+    con = fresh(residency="background", idle_ms=5.0, thresholds=True)
+    if getattr(con, "_exact", False):
+        saved_t = dict(_th.TABLE)
+        try:
+            _th.TABLE["METAL"] = dataclasses.replace(_th.METAL, plain_max_groups=100, plain_max_groups_where=100)
+            _th.TABLE["CUDA"] = _th.TABLE["METAL"]
+            q = "SELECT k, sum(v) FROM t GROUP BY k"                  # 1000 groups: output-bound now
+            want = sorted(con._raw.execute(q).fetchall())
+            got = sorted(con.execute(q).fetchall())
+            lr, d = con.last_rewrite(), con._timing_decision
+            check(not lr["rewritten"] and lr["reason"] == "threshold" and lr["detail"].startswith("hard")
+                  and (d is None or not d.probation) and got == want,
+                  f"probation: an output-bound (hard) decline never enters probation ({lr['detail'][:60]})")
+            con._manager.wait_idle(10)
+            check(not any(s.probation for s in con._manager._sets.values()),
+                  "probation: ... and no set is uploaded for it")
+        finally:
+            _th.TABLE.clear(); _th.TABLE.update(saved_t)
+    con.close()
+
+    # (8) the memory budget: a trial is admitted only inside its fraction of it, and never evicts
+    from gpudb import _residency as _rs
+    m = _rs.ResidencyManager(lambda: None, mode="manual")   # no worker: _make_room is called directly
+    m.memory_budget = 1000
+    proven = m.note_candidate("proven", "SELECT 1", est_bytes=600)
+    proven.state, proven.bytes, proven.last_upload_start = "ready", 600, time.monotonic()
+    trial = m.note_candidate("trial", "SELECT 2", est_bytes=600, probation=True)
+    rows = {"SELECT name, origin, bytes, refs, epoch_ms(last_used_at) AS used_ms FROM gpu_residents()":
+            [("proven", "managed", 600, 0, 1.0)]}
+    dropped = []
+    def fake_run(sql, _d=dropped):
+        if "gpu_drop" in sql:
+            _d.append(sql)
+            return []
+        return rows.get(sql, [])
+    check(m._make_room(fake_run, trial) is False and not dropped and proven.state == "ready",
+          "probation (budget): a trial that does not fit the free room is refused, and evicts nothing")
+    check(trial.error.startswith(_rs.MEMORY_ERROR), f"probation (budget): ... with the memory reason ({trial.error[:60]})")
+    trial.est_bytes = 300
+    check(m._make_room(fake_run, trial) is True and not dropped,
+          "probation (budget): a trial that fits the free room is admitted without evicting")
+    ok, why = _pb.admissible_bytes(1000, 0, 60)
+    check(not ok, f"probation (budget): a trial needing more than {100 * _pb.SET_FRACTION:.0f}% of the budget is not admitted")
+    check(_pb.admissible_bytes(1000, 0, 40)[0] and not _pb.admissible_bytes(1000, 90, 40)[0],
+          f"probation (budget): the trials together stay inside {100 * _pb.TOTAL_FRACTION:.0f}% of it")
+    check(_pb.admissible_bytes(None, 0, 1 << 40)[0], "probation (budget): 'unlimited' removes these fractions too")
+
+    # (9) off where it must be off
+    for label, kw, prep in (("manual residency", dict(residency="manual", thresholds=True), None),
+                            ("thresholds=False", dict(residency="background", idle_ms=5.0, thresholds=False), None),
+                            ("an open transaction", dict(residency="background", idle_ms=5.0, thresholds=True),
+                             lambda c: c.begin())):
+        con = fresh(**kw)
+        if getattr(con, "_exact", False):
+            if prep:
+                prep(con)
+            q = "SELECT k, sum(v), count(*) FROM tn GROUP BY k"
+            want = sorted(con._raw.execute(q).fetchall())
+            got = sorted(con.execute(q).fetchall())
+            d = con._timing_decision
+            check(got == want and (d is None or not d.probation) and not con.probation()["templates"],
+                  f"probation: nothing is tried in {label}")
+        con.close()
+
+    # (10) staleness: a write resets the trial for that table
+    con = fresh(residency="background", idle_ms=5.0, thresholds=True)
+    if getattr(con, "_exact", False) and getattr(con, "_store", False):
+        q = "SELECT k, sum(v), count(*) FROM tn GROUP BY k"
+        for _ in range(_pb.MIN_SIGHTINGS + 1):
+            con.execute(q).fetchall()
+            con._manager.wait_idle(60)
+        for _ in range(_pb.MIN_NATIVE_OBSERVATIONS):
+            con.execute(q).fetchall()
+        d = con._timing_decision
+        if d is not None and d.probation and con._manager.is_ready(d.tag):
+            want = sorted(con._raw.execute(q).fetchall())
+            # the probe is how a template on probation learns its table moved: its own
+            # statements run native and never touch the staleness guard
+            stale = lambda sql: (setattr(con, "_probe_error", "GPUDB_STALE " + q), None)[1]   # noqa: E731
+            saved_rw = con._probe_rewritten_ms
+            try:
+                con._probe_rewritten_ms = stale
+                d.native_obs = [10.0] * _pb.NATIVE_OBSERVATIONS
+                d.probe_rounds, d.probe_wins, d.probe_ms, d.next_probe_at = 3, 1, 1.0, 0.0
+                got = sorted(con.execute(q).fetchall())
+                check(got == want, "probation: a probe that finds the set stale must not touch the "
+                                   "user's result set — the rows are still native's")
+                check(d.probe_rounds == 0 and d.probe_wins == 0 and not d.native_obs
+                      and d.probation == "candidate",
+                      f"probation: a write under the trial's set starts it over "
+                      f"({d.probation}, {d.probe_rounds} rounds)")
+            finally:
+                con._probe_rewritten_ms = saved_rw
+            # and the real thing: a write from another connection, answers unchanged throughout
+            other = con._raw.cursor()
+            other.execute("INSERT INTO tn VALUES (3, 7)")
+            want = sorted(con._raw.execute(q).fetchall())
+            ok_rows = True
+            for _ in range(6):
+                ok_rows = ok_rows and sorted(con.execute(q).fetchall()) == want
+            con._manager.wait_idle(60)
+            ok_rows = ok_rows and sorted(con.execute(q).fetchall()) == want
+            check(ok_rows, "probation: a foreign write, and every answer before, during and after "
+                           "the rebuild is native's")
+    con.close()
+
+    # (11) two threads on one connection, one of them a template on probation
+    con = fresh(residency="background", idle_ms=5.0, thresholds=True)
+    if getattr(con, "_exact", False):
+        q = "SELECT k, sum(v), count(*) FROM tn GROUP BY k"
+        want = sorted(con._raw.execute(q).fetchall())
+        con.execute(q).fetchall()
+        con._manager.wait_idle(60)
+        outs, errs = [], []
+
+        def worker():
+            try:
+                c2 = con.cursor()                        # a thread runs on its own cursor, as always
+                for _ in range(25):
+                    outs.append(sorted(c2.execute(q).fetchall()) == want)
+            except Exception as e:                       # noqa: BLE001
+                errs.append(repr(e))
+        ths = [threading.Thread(target=worker) for _ in range(2)]
+        [t.start() for t in ths]
+        [t.join() for t in ths]
+        check(not errs and outs and all(outs),
+              f"probation: two threads on one connection, {len(outs)} answers all identical to native ({errs[:1]})")
+    con.close()
+
     # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----
     print("== key joins")
     JOIN_SETUP = JOIN_SETUP_EARLY

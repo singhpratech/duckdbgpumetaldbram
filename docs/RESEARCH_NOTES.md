@@ -1667,6 +1667,93 @@ already does. The gate on the final state - `--subqueries --exprs`, SF1, alone
 on the machine - is 782 rows, 509 PASS, 273 declined, 0 below the bound, 0
 differing, exit 0.
 
+## 2026-09-18 — A threshold is not a verdict about this process
+
+The entry above ends on a shrug I did not like: the same `l_linenumber` cell
+measured 0.80-0.94x one afternoon and 1.19-2.50x a few hours later, nothing in
+between had changed it by 0.1 ms, and the conclusion was that a bound set for
+the slow mode has to stay set for the slow mode. Which is right, and which also
+means the shape runs on DuckDB in every process, including the many where it
+would win twice over. This work is the other half of that thought.
+
+**Hard and soft.** Not every bound keeps a shape back for the same kind of
+reason, and until now nothing in the code said which. Going through
+`_thresholds.py` bound by bound against its own evidence, they fall in two
+piles. The output-bound ones - groups returned, (key, value) pairs
+re-aggregated - are about how many rows come back, the losses there are not
+near-even (0.39-0.51x at 700K pairs, 0.96-0.99x at 1.5M groups), and what it
+costs to be wrong has no ceiling. Those are hard, along with the declines that
+have no estimate to work from at all. The rest - `min_groups`, the VARCHAR-key
+rules, every selectivity bound, the global aggregate's row floors - are bounded
+slowdowns whose sign depends on the process's mode or on a millisecond of fixed
+cost. Those are soft, and a soft decline is a question, not an answer.
+
+**Probation.** A soft-declined template keeps running on DuckDB. In the
+background the wrapper asks for its set - only ever a view over one table's
+column store, only inside 5% of the memory budget, and never evicting anything
+that earned its place - and then times the rewritten form on a side cursor
+against the template's own native runs. Two winning rounds, five seconds apart,
+promote it; from then on it is an ordinary rewritten template and the existing
+60 s re-measure is what keeps it, which means the process turning slow demotes
+it again, behind a doubling back-off. The user's statement is never the
+experiment, before or after.
+
+**Two things the measurement corrected.** The first: I had written the rule as
+best-of-3 probes against the minimum of the recent native runs, matching the
+existing measured rule 1. It promoted nothing. The minimum of five native runs
+is a tail statistic, and the two tails are not comparable - at a 50 ms
+interactive cadence that same SF1 statement measured 2.14 ms native once and
+4.84 ms typically, while the rewritten form measured 2.12-2.32 ms over 27
+probes. A 2.1x win read as a loss. Median against median promotes it in 5.5 s
+and 6 probes, and the minimum keeps its job on the other side of promotion,
+where the stricter rule can only ever take a promotion back.
+
+The second: the first round kept losing on shapes that obviously won, because
+it was being judged against native runs taken *while the background upload was
+scanning that very table*. 2.5 ms during the upload, 10 ms after it. The
+comparison now starts when the set is ready.
+
+**A probe is not free, and where it runs matters.** The probe rides inside
+`execute()`, after the user's statement has run and before they fetch - which is
+where the existing native re-measure has always ridden. Three back-to-back
+probes would put 7 ms on one 2 ms statement, so a round now takes one probe per
+statement: what any single statement carries is one extra execution, the same
+order the wrapper already paid, and the three samples come from three moments of
+the process instead of one burst, which is a better instrument anyway. Forced on
+every statement the cost is +2.31 ms at the median (1.75 -> 4.06); under the
+rules as they ship, 1200 statements measured 1.705 ms median with the mechanism
+and 1.691 without, and spent 3 probes.
+
+That window - after execute, before fetch - is also where the one real bug of
+this work lived. The stale path ran `gpu_invalidate` on the main connection, and
+the user got the invalidate's empty result instead of their own rows. Rule 2,
+broken by a diagnostic. Everything a probe touches now runs on a cursor of its
+own; cached plans are left alone on purpose, because `DEALLOCATE` is
+per-connection and cannot be moved off it - and it is not needed, since a plan
+over a set that was just invalidated raises `GPUDB_STALE` and takes the ordinary
+fallback.
+
+**What it is worth, and what it is not.** One cell in thirty on the gate's own
+single-table sweep at SF1, promoted and measured at 1.05x; twenty-nine stayed
+native; none below the bound. That is a smaller harvest than the mechanism
+deserves, and the reason is the instrument, measured rather than guessed: a
+second DuckDB connection executing the same text costs about 0.7 ms more than the
+first even warm, and on a 1-3 ms statement whose real margin is 1.0-1.3x that is
+the margin. Where the margin is large the trial finds it in seconds - the same
+template at an interactive cadence, native ~10 ms, promoted in 5.5 s at 4.66x.
+The bias is entirely in rule 1's direction: what it costs is promotions, never a
+slower statement. Closing it would mean timing the rewritten form on the user's
+own connection, which is the one thing this mechanism exists not to do.
+
+Three process states - plain, after heavy native parallel queries, and with 15
+threads waking every 5 ms - all decline the same shape, so the slow mode does not
+produce a wrong promotion either. And no TPC-H query is promoted inside
+`tpch_coverage.py`: Q22 is a hard decline below the row floor, Q11/Q2/Q20 decline
+on shape, and Q6 - the one soft decline - enters probation but never gets its set,
+because the script issues each declined query once and a back-to-back loop never
+gives a trial's upload the quiet it waits for. Coverage is where it was: 15 of 22
+at SF1, 17 at SF10, none differing.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

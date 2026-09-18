@@ -4151,3 +4151,115 @@ kernel at 0.447 ms), so `min_groups` and the VARCHAR-key rules stay where they
 are and the run-time measured rule 1 keeps deciding these shapes. The only
 rows below 1.0× in that sweep are the global-aggregate form at SF1, which its
 own rule (`rows × (1 + terms) ≥ 60M`) already declines.
+
+## Probation — a soft threshold measured per process, Metal, SF1 (2026-09-18)
+
+**Hardware / build:** Apple M4 Max, macOS 26.6.2, `build-macos`
+(`runtime=metal exact=true join=true global=true narrow=true store=true`),
+DuckDB 1.4.5 through the Python wrapper, TPC-H SF1 `lineitem` (6,001,215 rows),
+alone on the machine. Mechanism: `docs/TRANSPARENT_DESIGN.md` §9.1,
+`python/gpudb/_probation.py`.
+
+A threshold has to hold in both of the process modes §9.1 describes, so it is
+set for the slow one and then keeps a shape on DuckDB in every process. Shapes
+declined by a **soft** bound are now tried on a side cursor and promoted only
+when they measurably win here; **hard** (output-bound, or no estimate) bounds are
+never tried. The user's statement is never the experiment.
+
+**How fair an instrument is a side cursor?** A probe runs the rewritten form as
+TEXT on a cursor of its own, which is also how the native runs it is compared
+against are measured (a promoted template then gets the cached plan, §3.2, and is
+faster than the probe said). Two things had to be measured rather than assumed:
+
+| same statement, same process | main connection | side cursor |
+|---|---|---|
+| native, as text, min of 9 | 1.62 ms | 1.61 ms |
+| rewritten, min of 9 | 1.02 ms (cached plan) | 0.94 ms (text, warm cursor) |
+| rewritten, a NEW cursor per run, 15 runs | — | 0.88 min / **1.93 median** |
+| rewritten, one kept cursor, 15 runs, another process state | 1.11 min / 1.52 median | 1.93 min / 2.26 median |
+
+Row three is why a probe keeps its cursor between runs and warms it once: a fresh
+DuckDB connection pays about a millisecond on its first statement, enough to read
+a 2.3x win as a loss. Row four is the bias that is left, and it does not go away:
+a second connection executing the same text can cost ~0.7 ms more than the first.
+It under-reports the win, never the other way round, so what it costs is
+promotions — a shape whose real margin is 1.2-1.4x will not clear the 0.8x bar,
+and only a clear win does.
+
+**Why the rule compares medians, not minimums.** `SELECT l_linenumber,
+sum(l_quantity) FROM lineitem GROUP BY l_linenumber`, 50 ms gap between
+statements (an interactive cadence):
+
+| | minimum | median |
+|---|---|---|
+| native, the user's own runs | 2.14 ms | 4.84 ms |
+| rewritten, 27 side-cursor probes | 2.12 ms | 2.32 ms |
+
+Minimum against minimum reads a 2.1× win as a loss. Median against median, with
+a 0.8× factor and two winning rounds ≥ 5 s apart, promoted this template after
+**5.5 s, 2 rounds, 6 probes, 19.3 ms** of side-cursor work; it stayed promoted
+for the remaining 316 statements of the run and every answer was identical to
+native throughout. Judging the first round against native runs taken *while the
+background upload was still scanning the table* (2.5 ms, against 10 ms once it
+was done) made it lose; the comparison now starts when the set is ready.
+
+**What it costs a user it never helps** — the same template with every round
+forced to lose, so the trial runs and never promotes:
+
+| | median | p90 | p99 | max |
+|---|---|---|---|---|
+| (A) a probe forced on **every** statement | 4.060 ms | 4.279 | 4.642 | 5.228 |
+| (A) the same statements with no probe | 1.747 ms | 1.873 | 2.017 | 2.064 |
+| (B) the rate limits as they ship, 1200 statements / 2.1 s | 1.705 ms | 1.802 | 1.930 | 3.318 |
+| (B) the same, mechanism off, 1200 statements / 2.0 s | 1.691 ms | 1.751 | 1.868 | 2.416 |
+
+(A) is the upper bound: a probe costs the statement it rides on exactly one
+execution of the rewritten form, +2.31 ms at the median here. (B) is what the
+rules allow: a round is one probe per statement, rounds are ≥ 5 s apart and a
+losing round doubles a 60 s back-off, so those 1200 statements paid **3 probes,
+4.3 ms** in total — 0.014 ms on the median statement. A template that never wins
+retires after 12 rounds (≈ 36 probes spread over about 1.4 h by the back-off,
+well inside the 250 ms/minute process budget).
+
+**What the gate's own cells do** — `transparent_gate.py --probation --keys
+l_linenumber,l_returnflag,l_suppkey --joins none --probation-timeout 40`, SF1,
+alone on the machine (the run was stopped after 30 of the softly declined cells;
+every one before that had settled):
+
+| softly declined cells given the trial | promoted | stayed native | below the bound |
+|---|---|---|---|
+| 30 | 1 (`l_linenumber` / `l_linenumber = 1` / `distinct`, **1.05×**) | 29 | 0 |
+
+One cell in thirty, and that one measured above the bound in the second
+measurement. The reason so few is the fourth row of the instrument table above:
+these are 1–3 ms statements whose real margin in a hot-loop process is 1.0–1.3×,
+and the ~0.7 ms a second connection costs is most of that margin. Where the
+margin is large the trial finds it easily — the same `l_linenumber` template at
+an interactive 50 ms cadence, where native is ~10 ms, promoted in 5.5 s at 4.66×.
+Rule 1 is on the right side of that trade: what the instrument's bias costs is
+promotions, never a slower statement.
+
+**And in a slow-mode process?** The §9.1 recipe, one process per condition,
+600 statements each at a 20 ms cadence, SF1 7-group plain form:
+
+| process state | native the user saw (median) | the round measured | promoted |
+|---|---|---|---|
+| plain | 2.82 ms | 2.85 ms vs 1.89 ms | no |
+| after heavy native parallel queries | 3.23 ms | 2.91 ms vs 2.24 ms | no |
+| 15 Python threads waking every 5 ms | 4.39 ms | 2.72 ms vs 2.49 ms | no |
+
+Native degrades in the slow conditions, and so does everything else; the trial
+declines in all three. The slow mode did not produce a wrong promotion, which is
+the property that matters — as before (2026-09-18) it would not reproduce as a
+clean 3× kernel slowdown on demand.
+
+**TPC-H at SF1, within the coverage script's run:** none. Q22 is declined by a
+HARD bound (150,000 rows, below the §0 floor) and is never tried; Q11, Q2 and
+Q20 decline on `shape`, which is not a threshold at all; Q6 is the one soft
+decline (6,001,215 rows against the global aggregate's 16M floor) and it enters
+probation, but over 1,236 back-to-back statements its set never goes resident —
+a session that never idles never uploads (§5.5), and a trial's set waits for
+250 ms of quiet rather than 20. The coverage script itself issues each declined
+query once, which is below the three sightings a trial needs, so nothing there
+is promoted by construction. Coverage is unchanged: **SF1 15 of 22, SF10 17 of
+22 (`GPUDB_MEMORY_BUDGET_MB=200000`), 0 with rows that differ from native.**
