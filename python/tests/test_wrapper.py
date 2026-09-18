@@ -1043,6 +1043,16 @@ def run():
     check(con.memory()["budget"] is None, "budget: 'unlimited' removes the cap")
     con.close()
 
+    # a join whose SOURCE set the budget refuses reports 'memory' too, not 'not_resident'
+    con = fresh(memory_budget=int(one * 0.5))
+    if getattr(con, "_join", False):
+        con.execute(JOIN_SETUP_EARLY)
+        qj = "SELECT tier, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier"
+        got = con.execute(qj).fetchall()
+        check(got == con._raw.execute(qj).fetchall() and con.last_rewrite()["reason"] == "memory",
+              f"budget (join): a refused source set makes the statement's reason 'memory' ({con.last_rewrite()['reason']})")
+    con.close()
+
     con = fresh()
     if getattr(con, "_join", False):
         con.execute(JOIN_SETUP_EARLY)
