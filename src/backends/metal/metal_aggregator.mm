@@ -996,8 +996,7 @@ private:
                 throw std::runtime_error("resident sort cache: > 2^32 rows unsupported (Metal)");
             @autoreleasepool {
                 const std::size_t n = sort_rows();   // valid-key prefix (== rows_ for legacy columns)
-                std::vector<std::int64_t> tk, idx(n);
-                for (std::size_t i = 0; i < n; ++i) idx[i] = static_cast<std::int64_t>(i);
+                std::vector<std::int64_t> tk;
                 const std::int64_t* keys = nullptr;
                 if (dtype_ == Dtype::I64) {
                     keys = static_cast<const std::int64_t*>([buf_ contents]);
@@ -1018,22 +1017,21 @@ private:
                     }
                     keys = tk.data();
                 }
-                id<MTLBuffer> sorted = [ctx_->device newBufferWithLength:n * sizeof(std::int64_t)
-                                                                 options:MTLResourceStorageModeShared];
-                id<MTLBuffer> perm   = [ctx_->device newBufferWithLength:n * sizeof(std::int64_t)
-                                                                 options:MTLResourceStorageModeShared];
-                if (!sorted || !perm)
-                    throw std::runtime_error("resident sort cache: device allocation failed (Metal)");
+                id<MTLBuffer> sorted = nil, perm = nil;
                 double ms = 0.0;
                 {
-                    // One sort at a time: the sorter's staging buffers are single-use.
+                    // One sort at a time: the sorter's staging buffers are single-use. The sorted
+                    // keys and the permutation are the sorter's own output buffers, handed over —
+                    // not copies (the build used to be five serial passes over the column around
+                    // the sort: index fill, two copies in, two copies out).
                     std::lock_guard<std::mutex> slock(ctx_->mu);
-                    auto view = ctx_->get().sort_device(keys, idx.data(),
-                                                        static_cast<std::uint32_t>(n));
-                    std::memcpy([sorted contents], [view.keys contents],     n * sizeof(std::int64_t));
-                    std::memcpy([perm contents],   [view.payloads contents], n * sizeof(std::int64_t));
+                    auto view = ctx_->get().sort_iota_take(keys, static_cast<std::uint32_t>(n));
+                    sorted = view.keys;
+                    perm   = view.payloads;
                     ms = view.kernel_ms;
                 }
+                if (!sorted || !perm)
+                    throw std::runtime_error("resident sort cache: device allocation failed (Metal)");
                 sorted_ = sorted;
                 perm_   = perm;
                 ready_.store(true, std::memory_order_release);
@@ -1596,11 +1594,20 @@ private:
             auto lane_valid = [](const RowSpan& sp, std::size_t lane) -> const std::uint64_t* {
                 return sp.valid ? sp.valid[lane] : nullptr;
             };
+            // NULL keys per span: zeros among the first `rows` bits of the key bitmap (a
+            // segment's bitmap may already carry bits of rows a later view owns — mask them)
+            std::vector<std::size_t> span_null_keys(n_spans, 0);
             for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
                 if (spans[sidx].n_lanes != n_lanes) throw std::runtime_error("upload_rows_exact: span lane count differs");
                 rows += spans[sidx].rows;
                 const std::uint64_t* kv = lane_valid(spans[sidx], 0);
-                if (kv) for (std::size_t j = 0; j < spans[sidx].rows; ++j) null_keys += !bit(kv, j);
+                if (!kv) continue;
+                const std::size_t r = spans[sidx].rows, full = r >> 6;
+                std::size_t z = 0;
+                for (std::size_t w = 0; w < full; ++w) z += static_cast<std::size_t>(__builtin_popcountll(~kv[w]));
+                if (r & 63) z += static_cast<std::size_t>(__builtin_popcountll(~kv[full] & ((std::uint64_t{1} << (r & 63)) - 1)));
+                span_null_keys[sidx] = z;
+                null_keys += z;
             }
             const std::size_t bytes = (rows == 0) ? 1 : rows * sizeof(std::int64_t);
             const std::size_t words = (rows + 63) / 64;
@@ -1611,22 +1618,76 @@ private:
                 if (!bufs[l]) throw std::runtime_error("upload_rows_exact: device allocation failed (Metal)");
                 dst[l] = static_cast<std::int64_t*>([bufs[l] contents]);
             }
-            std::vector<std::vector<std::uint64_t>> valid(n_lanes, std::vector<std::uint64_t>(words, ~std::uint64_t{0}));
-            std::vector<std::size_t> nulls(n_lanes, 0);
-            std::size_t head = 0, tail = rows - null_keys;
-            for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+            // Layout: rows with a valid key first (span order, row order), NULL-key rows after
+            // them in the same order. Every span's two output ranges follow from prefix sums,
+            // so spans are copied independently — and in parallel: this loop was one thread
+            // testing a validity bit per value (SF1, 2 lanes: 10-15 ms of a 39 ms upload;
+            // seconds at SF50). Output is byte-identical to the serial copy. Two spans can
+            // share a validity WORD at a range boundary, hence the atomic clear.
+            std::vector<std::size_t> head0(n_spans, 0), tail0(n_spans, 0);
+            {
+                std::size_t h = 0, t = rows - null_keys;
+                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+                    head0[sidx] = h; tail0[sidx] = t;
+                    h += spans[sidx].rows - span_null_keys[sidx];
+                    t += span_null_keys[sidx];
+                }
+            }
+            std::vector<std::vector<std::uint64_t>> valid(n_lanes);
+            std::vector<std::atomic<bool>> lane_has_null(n_lanes);
+            for (auto& f : lane_has_null) f.store(false, std::memory_order_relaxed);
+            bool any_validity = false;
+            for (std::size_t sidx = 0; sidx < n_spans && !any_validity; ++sidx)
+                if (spans[sidx].valid)
+                    for (std::size_t l = 0; l < n_lanes; ++l) any_validity |= spans[sidx].valid[l] != nullptr;
+            if (any_validity)
+                for (std::size_t l = 0; l < n_lanes; ++l) valid[l].assign(words, ~std::uint64_t{0});
+            std::vector<std::vector<std::size_t>> span_nulls(n_spans, std::vector<std::size_t>(n_lanes, 0));
+            auto copy_span = [&](std::size_t sidx) {
                 const RowSpan& sp = spans[sidx];
+                bool has_valid = false;
+                if (sp.valid) for (std::size_t l = 0; l < n_lanes; ++l) has_valid |= sp.valid[l] != nullptr;
+                if (!has_valid) {                        // the common case: no NULL anywhere in the span
+                    const std::size_t d0 = head0[sidx];
+                    for (std::size_t l = 0; l < n_lanes; ++l) {
+                        std::int64_t* out = dst[l] + d0;
+                        const std::int64_t* in = sp.lanes + l;
+                        for (std::size_t j = 0; j < sp.rows; ++j) out[j] = in[j * n_lanes];
+                    }
+                    return;
+                }
                 const std::uint64_t* kv = lane_valid(sp, 0);
+                std::size_t head = head0[sidx], tail = tail0[sidx];
                 for (std::size_t j = 0; j < sp.rows; ++j) {
                     const bool k_ok = bit(kv, j);
                     const std::size_t d = k_ok ? head++ : tail++;
                     for (std::size_t l = 0; l < n_lanes; ++l) {
                         const bool ok = (l == 0) ? k_ok : bit(lane_valid(sp, l), j);
                         dst[l][d] = ok ? sp.lanes[j * n_lanes + l] : 0;
-                        if (!ok) { valid[l][d >> 6] &= ~(std::uint64_t{1} << (d & 63)); ++nulls[l]; }
+                        if (!ok) {
+                            __atomic_and_fetch(&valid[l][d >> 6], ~(std::uint64_t{1} << (d & 63)), __ATOMIC_SEQ_CST);
+                            ++span_nulls[sidx][l];
+                        }
                     }
                 }
+            };
+            const std::size_t hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+            const std::size_t n_threads = (rows < (std::size_t{1} << 20)) ? 1 : std::min<std::size_t>({hw, 8, n_spans});
+            if (n_threads <= 1) {
+                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) copy_span(sidx);
+            } else {
+                std::atomic<std::size_t> next{0};
+                std::vector<std::thread> pool;
+                pool.reserve(n_threads);
+                for (std::size_t t = 0; t < n_threads; ++t)
+                    pool.emplace_back([&] {
+                        for (std::size_t sidx; (sidx = next.fetch_add(1, std::memory_order_relaxed)) < n_spans;) copy_span(sidx);
+                    });
+                for (auto& th : pool) th.join();
             }
+            std::vector<std::size_t> nulls(n_lanes, 0);
+            for (std::size_t sidx = 0; sidx < n_spans; ++sidx)
+                for (std::size_t l = 0; l < n_lanes; ++l) nulls[l] += span_nulls[sidx][l];
             std::vector<std::unique_ptr<ResidentColumn>> out;
             out.reserve(n_lanes);
             for (std::size_t l = 0; l < n_lanes; ++l) {

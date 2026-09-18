@@ -4,6 +4,7 @@
 
 #import <Metal/Metal.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace gpudb::metal_detail {
@@ -25,6 +26,14 @@ public:
         double kernel_ms = 0.0;
     };
     DeviceView sort_device(const std::int64_t* keys, const std::int64_t* payloads, std::uint32_t n);
+
+    //! Sort n keys with payload = row index 0..n-1 (the resident sort cache). The inputs
+    //! are staged in parallel and the index is generated in place — no host index array —
+    //! and the returned buffers BELONG TO THE CALLER: the sorter forgets them, so nothing
+    //! is copied out. Staging above `keep_bytes` per buffer is released afterwards (a 300M-row
+    //! sort would otherwise leave gigabytes parked here, outside any memory budget).
+    DeviceView sort_iota_take(const std::int64_t* keys, std::uint32_t n,
+                              std::size_t keep_bytes = std::size_t(256) << 20);
 
 private:
     double run_sort_on_staged(std::uint32_t n, __strong id<MTLBuffer>& in_keys, __strong id<MTLBuffer>& in_vals);

@@ -37,6 +37,9 @@ def main() -> int:
     ap.add_argument("--db", default="data/tpch_sf1/tpch.duckdb")
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--no-thresholds", action="store_true", help="rewrite every shape the engine accepts")
+    ap.add_argument("--memory-budget", default=None,
+                    help="device memory budget (§5.5), e.g. 40GB or unlimited; default: the wrapper's default "
+                         "(a quarter of unified memory) — at SF50 the 22 queries need more than that back-to-back")
     args = ap.parse_args()
     if not os.path.exists(args.db):
         print(f"missing {args.db} — SF=1 ./scripts/gen_tpch.sh", file=sys.stderr)
@@ -51,7 +54,7 @@ def main() -> int:
     logs = []
     # the shipping configuration, floor included (tables under 1M rows are never parsed);
     # --no-thresholds also drops the floor, to see every shape the engine accepts
-    con = gpudb.connect(args.db, read_only=True, residency="eager",
+    con = gpudb.connect(args.db, read_only=True, residency="eager", memory_budget=args.memory_budget,
                         floor_rows=0 if args.no_thresholds else 1_000_000,
                         thresholds=not args.no_thresholds, log=logs.append)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]

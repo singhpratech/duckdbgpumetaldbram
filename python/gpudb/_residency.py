@@ -32,6 +32,8 @@ from typing import Callable, Dict, List, Optional
 
 SEGMENT_BYTES = 8 << 20          # the extension's host segment (gpu_resident.cpp)
 RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling per consecutive interrupt
+EVICT_MIN_AGE_S = 60.0            # §5.5: a set is never evicted within this long of being uploaded (anti-thrash)
+MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget kept off the device
 RETRY_PAUSE_MAX_MS = 1000.0      # the idle wait already yields to every statement; a longer cap only
                                  # delayed readiness (measured: 15 of 20 segments landed in 3 s, the
                                  # rest took 30+ s at a 5 s cap under a 0-10 ms statement cadence)
@@ -62,6 +64,10 @@ class SetState:
     # run in order on the device
     deps: List[str] = field(default_factory=list)
     steps: List[str] = field(default_factory=list)
+    # §5.5 memory budget: what the wrapper expects the set to cost on the device
+    # (before the upload) and what the extension reports it costs (after)
+    est_bytes: int = 0
+    bytes: int = 0
 
     @property
     def derived(self) -> bool:
@@ -85,6 +91,7 @@ class ResidencyManager:
     def __init__(self, cursor_factory: Callable[[], object], *, mode: str = "background",
                  idle_ms: float = 20.0, quiet_s: float = 2.0, rate_s: float = 30.0,
                  max_attempts: int = 20, segment_rows: Optional[int] = None,
+                 memory_budget: Optional[int] = None, evict_min_age_s: float = EVICT_MIN_AGE_S,
                  log: Optional[Callable[[str], None]] = None):
         self._cursor_factory = cursor_factory
         self.mode = mode
@@ -93,6 +100,9 @@ class ResidencyManager:
         self.rate_s = rate_s
         self.max_attempts = max_attempts
         self.segment_rows = segment_rows        # None: 8 MiB worth of rows for the set's kind
+        self.memory_budget = memory_budget      # bytes of device memory for resident sets; None = no cap
+        self.evict_min_age_s = evict_min_age_s
+        self.evictions = 0
         self._log = log or (lambda m: None)
         self._sets: Dict[str, SetState] = {}
         self._lock = threading.Lock()
@@ -136,9 +146,11 @@ class ResidencyManager:
         return s is not None and s.state == "ready"
 
     def note_candidate(self, tag: str, upload_sql: str, fqn: str = "",
-                       deps: Optional[List[str]] = None, steps: Optional[List[str]] = None) -> SetState:
+                       deps: Optional[List[str]] = None, steps: Optional[List[str]] = None,
+                       est_bytes: int = 0) -> SetState:
         """A rewritable shape over a non-resident set was seen. With `steps`
-        the set is derived from `deps` (note those first)."""
+        the set is derived from `deps` (note those first). `est_bytes` is what
+        the set is expected to cost on the device (§5.5, the memory budget)."""
         with self._cv:
             s = self._sets.get(tag)
             if s is None:
@@ -147,7 +159,13 @@ class ResidencyManager:
                 self._sets[tag] = s
             elif fqn and not s.fqn:
                 s.fqn = fqn
-            if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts:
+            if est_bytes:
+                s.est_bytes = int(est_bytes)      # the table may have grown since the last sighting
+            # a set the memory budget refused stays refused until its retry time: re-queueing it on
+            # every sighting would hide the reason and make the worker ask again every few ms
+            refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
+                       and time.monotonic() < s.resume_at)
+            if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
                 s.state = "pending"
                 self._cv.notify_all()
             if self.mode == "background":
@@ -194,6 +212,103 @@ class ResidencyManager:
                         "finish_window": s.finish_window}
                     for t, s in self._sets.items()}
 
+    # ---- memory budget (§5.5) ----
+    def _protected(self, s: SetState) -> set:
+        """Tags that must stay while `s` uploads: itself and, transitively, its sources."""
+        keep, todo = {s.tag}, list(s.deps)
+        while todo:
+            t = todo.pop()
+            if t not in keep:
+                keep.add(t)
+                d = self._sets.get(t)
+                todo.extend(d.deps if d is not None else [])
+        return keep
+
+    def _make_room(self, run: Callable[[str], List[tuple]], s: SetState) -> bool:
+        """Before an upload: does the set fit the budget, evicting least
+        recently used sets if it has to? False (and s.error says why) when it
+        does not — the statement then keeps running native, which is what rule
+        1 asks for when the device cannot hold the data.
+
+        The extension is the source of truth for what is resident and what it
+        costs (`gpu_residents().bytes` counts lanes, validity and derived
+        structures); sets uploaded by hand count toward the total and are
+        never evicted. Not evictable: a set in use by a running operator, a
+        source of `s`, a source of another resident set (its dependents go
+        first), and anything uploaded less than evict_min_age_s ago."""
+        budget = self.memory_budget
+        if not budget or s.est_bytes <= 0:
+            return True
+        if s.est_bytes > budget:
+            with self._lock:
+                s.error = (f"{MEMORY_ERROR}the set needs about {s.est_bytes / 2**20:.0f} MiB, "
+                           f"the budget is {budget / 2**20:.0f} MiB")
+            self._log(f"not uploaded: {s.tag}: {s.error}")
+            return False
+        try:
+            rows = run("SELECT name, origin, bytes, refs, epoch_ms(last_used_at) AS used_ms "
+                       "FROM gpu_residents()")
+        except Exception as e:
+            self._log(f"memory budget: gpu_residents() failed ({str(e)[:80]}); uploading without a check")
+            return True
+        keep = self._protected(s)
+        live = {r[0]: r for r in rows}
+        used = sum(int(r[2] or 0) for r in rows if r[0] != s.tag)
+        while used + s.est_bytes > budget:
+            now = time.monotonic()
+            with self._lock:
+                is_source = {d for t, o in self._sets.items() if t in live and t not in keep for d in o.deps}
+                # age by this manager's own clock (a set it did not upload is old by definition)
+                young = {t for t, o in self._sets.items()
+                         if o.last_upload_start and now - o.last_upload_start < self.evict_min_age_s}
+            victims = [r for r in live.values()
+                       if r[1] == "managed" and r[0] not in keep and r[0] not in is_source
+                       and r[0] not in young and int(r[3] or 0) == 0 and int(r[2] or 0) > 0]
+            if not victims:
+                managed = [r for r in live.values() if r[1] == "managed" and int(r[2] or 0) > 0]
+                why = (f"{len(managed)} managed sets: {sum(r[0] in keep for r in managed)} needed by this upload, "
+                       f"{sum(r[0] in is_source for r in managed)} sources of resident sets, "
+                       f"{sum(r[0] in young for r in managed)} younger than {self.evict_min_age_s:.0f} s, "
+                       f"{sum(int(r[3] or 0) > 0 for r in managed)} in use")
+                with self._lock:
+                    s.error = (f"{MEMORY_ERROR}{used / 2**20:.0f} MiB resident + about "
+                               f"{s.est_bytes / 2**20:.0f} MiB needed > {budget / 2**20:.0f} MiB, "
+                               f"and nothing can be evicted yet ({why})")
+                self._log(f"not uploaded: {s.tag}: {s.error}")
+                return False
+            v = min(victims, key=lambda r: (r[4] is not None, r[4] or 0))  # never used, then least recently used
+            try:
+                run("SELECT gpu_drop_resident('%s')" % v[0].replace("'", "''"))
+            except Exception as e:
+                self._log(f"memory budget: could not evict {v[0]}: {str(e)[:80]}")
+                live.pop(v[0], None)
+                continue
+            used -= int(v[2] or 0)
+            live.pop(v[0], None)
+            with self._lock:
+                self.evictions += 1
+                o = self._sets.get(v[0])
+                if o is not None and o.state == "ready":
+                    o.state = "missing"            # a later sighting uploads it again
+                    o.bytes = 0
+            self._log(f"evicted (least recently used): {v[0]} ({int(v[2] or 0) / 2**20:.0f} MiB) for {s.tag}")
+        return True
+
+    def _note_bytes(self, run: Callable[[str], List[tuple]], s: SetState) -> None:
+        try:
+            row = run("SELECT bytes FROM gpu_residents() WHERE name = '%s'" % s.tag.replace("'", "''"))
+            with self._lock:
+                s.bytes = int(row[0][0]) if row else 0
+        except Exception:
+            pass
+
+    def memory(self) -> Dict[str, object]:
+        """Diagnostics: the budget, and per set the estimate and the extension's figure."""
+        with self._lock:
+            return {"budget": self.memory_budget, "evictions": self.evictions,
+                    "sets": {t: {"state": s.state, "est_bytes": s.est_bytes, "bytes": s.bytes,
+                                 "error": s.error} for t, s in self._sets.items()}}
+
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:
         """One statement over the whole table on the caller's connection: the
@@ -207,6 +322,11 @@ class ResidencyManager:
                     s.state = "failed"
                     s.error = f"source set {d} is not resident"
                 return False
+        if not self._make_room(run, s):
+            with self._lock:
+                s.state = "failed"
+                s.attempts += 1
+            return False
         with self._lock:
             s.state = "uploading"
             s.attempts += 1
@@ -220,6 +340,7 @@ class ResidencyManager:
                 s.state = "failed" if "GPUDB_UPLOAD_DISCARDED" not in str(e) else "stale"
                 s.error = str(e)[:200]
             return False
+        self._note_bytes(run, s)
         with self._lock:
             if s.epoch == epoch and s.state == "uploading":
                 s.state = "ready"
@@ -466,7 +587,13 @@ class ResidencyManager:
                         s.error = str(e)[:200]
                         continue
                 cur = self._upload_cursor
-            outcome = self._session(cur, s, epoch)
+            run = lambda q, _c=cur: _c.execute(q).fetchall()      # noqa: E731  (sub-millisecond, no device work)
+            if not self._make_room(run, s):
+                outcome = "failed"
+            else:
+                outcome = self._session(cur, s, epoch)
+                if outcome == "ready":
+                    self._note_bytes(run, s)
             with self._cv:
                 now = time.monotonic()
                 if outcome == "ready" and s.epoch == epoch and s.state == "uploading":

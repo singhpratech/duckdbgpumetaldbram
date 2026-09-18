@@ -120,6 +120,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <unordered_map>
 #include <vector>
 
+#include <unistd.h>
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
@@ -289,6 +290,7 @@ struct UploadBuf {
     std::size_t               lanes_per_row = 0;
     std::size_t               n_pi = 0, n_pf = 0, n_ps = 0;
     bool                      key_str = false;   // key lane holds hash64(tuple text)
+    bool                      exact = false;     // filled by an EXACT upload: charged against exact_pool_cap_bytes()
     // hash -> text per string lane: [0] the key (when key_str), then one per
     // s<n> lane. Filled lock-free per state, merged at combine / finish; a
     // second text under one hash is a collision and fails the upload.
@@ -358,6 +360,32 @@ std::size_t pool_cap_bytes() {
     return cap;
 }
 
+// The EXACT uploads (gpu_upload_pair_exact / gpu_upload_rows_exact) are the transparent
+// path's: the wrapper sizes every set against its device memory budget BEFORE the upload
+// (docs/TRANSPARENT_DESIGN.md §5.5), so the host staging of one set is bounded by that
+// budget — and a 4 GB wall here kept every set above ~250M row-lanes off the device
+// (TPC-H SF50: 0 of 22 queries resident, found 2026-09-17). They get their own cap:
+// GPUDB_EXACT_UPLOAD_POOL_MAX_MB, default half of physical memory (never below the
+// general cap). The window-frame guardrail keeps its meaning: there is still a wall.
+std::size_t exact_pool_cap_bytes() {
+    static const std::size_t cap = [] {
+        std::size_t c = pool_cap_bytes();
+        if (const char* s = std::getenv("GPUDB_EXACT_UPLOAD_POOL_MAX_MB")) {
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long long v = std::strtoull(s, &end, 10);
+            if (errno == 0 && end && end != s && *end == '\0' && v > 0 &&
+                v <= (static_cast<unsigned long long>(SIZE_MAX) >> 20)) return static_cast<std::size_t>(v) << 20;
+            std::fprintf(stderr, "[gpudb] ignoring GPUDB_EXACT_UPLOAD_POOL_MAX_MB='%s'\n", s);
+        }
+        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && page > 0)
+            c = std::max(c, static_cast<std::size_t>(pages) / 2 * static_cast<std::size_t>(page));
+        return c;
+    }();
+    return cap;
+}
+
 constexpr const char* kPoolCapHint =
     " (gpu_upload buffers exceed the pool cap; raise GPUDB_UPLOAD_POOL_MAX_MB"
     " if intentional — note gpu_upload inside a window frame buffers"
@@ -369,9 +397,9 @@ constexpr const char* kPoolCapHint =
 // threads is a contended cache line ~60M times per SF10 upload — measured as
 // the upload starving a native query on another connection 3–7×. The
 // per-buffer `charged` field is touched only by the owning thread.
-bool pool_reserve(std::size_t n) {
+bool pool_reserve(std::size_t n, bool exact = false) {
     Pool& P = pool();
-    if (P.bytes.load(std::memory_order_relaxed) + n > pool_cap_bytes()) return false;
+    if (P.bytes.load(std::memory_order_relaxed) + n > (exact ? exact_pool_cap_bytes() : pool_cap_bytes())) return false;
     P.bytes.fetch_add(n, std::memory_order_relaxed);
     return true;
 }
@@ -871,7 +899,7 @@ void upload_combine(duckdb_function_info info, duckdb_aggregate_state* source,
         // window-frame quadratic-buffering guardrail keeps its meaning: each
         // output row's state referencing its whole frame prefix still adds
         // up and still hits the wall.
-        if (delta > 0 && !pool_reserve(delta)) {
+        if (delta > 0 && !pool_reserve(delta, sb.exact || db.exact)) {
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload: out of buffer memory") + kPoolCapHint).c_str());
             return;
@@ -999,7 +1027,7 @@ bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype 
             "session '" + b.name + "' (all segments must use the same upload function, types and "
             "predicate lists)");
     const std::size_t bytes = b.lanes() * sizeof(std::int64_t);
-    if (bytes > 0 && !pool_reserve(bytes))
+    if (bytes > 0 && !pool_reserve(bytes, exact))
         throw std::runtime_error(std::string(fn) + ": out of buffer memory for the upload "
             "session '" + b.name + "'" + kPoolCapHint);
     ss.kind_set = true; ss.pair = pair; ss.vdt = vdt; ss.exact = exact;
@@ -1248,7 +1276,7 @@ void upload_pair_exact_update(duckdb_function_info info, duckdb_data_chunk input
 
     constexpr std::size_t kPair = 2 * sizeof(std::int64_t);
     const std::size_t reserved = static_cast<std::size_t>(n) * kPair;
-    if (!pool_reserve(reserved)) {
+    if (!pool_reserve(reserved, /*exact*/true)) {
         duckdb_aggregate_function_set_error(info,
             (std::string("gpu_upload_pair_exact: out of buffer memory") + kPoolCapHint).c_str());
         return;
@@ -1256,6 +1284,7 @@ void upload_pair_exact_update(duckdb_function_info info, duckdb_data_chunk input
     std::size_t used = 0;
     auto append_row = [&](UploadState* s, idx_t i) -> bool {
         UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        b.exact = true;
         ++b.rows_seen;
         if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
             duckdb_aggregate_function_set_error(info, "gpu_upload_pair_exact: name may not be NULL");
@@ -1388,7 +1417,7 @@ void upload_rows_exact_update(duckdb_function_info info, duckdb_data_chunk input
         max_lanes = std::max(max_lanes, L);
     }
     const std::size_t reserved = static_cast<std::size_t>(n) * max_lanes * sizeof(std::int64_t);
-    if (!pool_reserve(reserved)) {
+    if (!pool_reserve(reserved, /*exact*/true)) {
         duckdb_aggregate_function_set_error(info,
             (std::string("gpu_upload_rows_exact: out of buffer memory") + kPoolCapHint).c_str());
         return;
@@ -1396,6 +1425,7 @@ void upload_rows_exact_update(duckdb_function_info info, duckdb_data_chunk input
     std::size_t used = 0;
     auto append_row = [&](UploadState* s, idx_t i) -> bool {
         UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        b.exact = true;
         ++b.rows_seen;
         if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
             duckdb_aggregate_function_set_error(info, "gpu_upload_rows_exact: name may not be NULL");
@@ -1573,7 +1603,7 @@ void upload_rows_exact_update6(duckdb_function_info info, duckdb_data_chunk inpu
         max_lanes = std::max(max_lanes, L);
     }
     const std::size_t reserved = static_cast<std::size_t>(n) * max_lanes * sizeof(std::int64_t);
-    if (!pool_reserve(reserved)) {
+    if (!pool_reserve(reserved, /*exact*/true)) {
         duckdb_aggregate_function_set_error(info,
             (std::string("gpu_upload_rows_exact: out of buffer memory") + kPoolCapHint).c_str());
         return;
@@ -1581,6 +1611,7 @@ void upload_rows_exact_update6(duckdb_function_info info, duckdb_data_chunk inpu
     std::size_t used = 0;
     auto append_row = [&](UploadState* s, idx_t i) -> bool {
         UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        b.exact = true;
         ++b.rows_seen;
         if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
             duckdb_aggregate_function_set_error(info, "gpu_upload_rows_exact: name may not be NULL");
