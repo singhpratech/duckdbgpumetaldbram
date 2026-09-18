@@ -28,10 +28,11 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ._rewrite import Decline, Plan, _STRING_TYPES, decimal_scale
-from . import _rewrite
+from . import _rewrite, _scope
 from ._resolve import Identity
 
 MAX_TABLES = 8
+OUTER_ALIAS = "gpudb_o"      # the enclosing statement's row, as seen from inside a subquery (§4.18)
 _INT_JOIN_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _FLOAT_TYPES = {"DOUBLE", "FLOAT", "REAL"}
 
@@ -305,22 +306,27 @@ def lower(tree_json: str,
             colmap[v] = (ti, c)
             columns[v] = typ
 
-    def rewrite_refs(e):
+    def rewrite_refs(e, depth=0):
         if isinstance(e, dict):
             if e.get("class") == "COLUMN_REF":
+                if e.get("__inner"):
+                    return          # bound to a table of a subquery's own FROM (§4.18)
                 names = e.get("column_names") or []
                 r = resolve_col(names)
                 if r is None:
                     return          # a select-list alias (ORDER BY q): the matcher's business
                 if r not in vname:
                     raise Decline("shape", f"column {r[1]} is not representable")
-                e["column_names"] = [vname[r]]
+                # inside a subquery a bare name would re-bind to the subquery's own tables
+                # (EXISTS (... FROM lineitem l2 WHERE l2.l_orderkey = l_orderkey)): keep the
+                # correlation qualified with the virtual table's alias
+                e["column_names"] = [OUTER_ALIAS, vname[r]] if depth else [vname[r]]
                 return
-            for v in e.values():
-                rewrite_refs(v)
+            for k, v in e.items():
+                rewrite_refs(v, depth + 1 if (e.get("class") == "SUBQUERY" and k == "subquery") else depth)
         elif isinstance(e, list):
             for v in e:
-                rewrite_refs(v)
+                rewrite_refs(v, depth)
 
     r_ident = tables[root].ident
     node["where_clause"] = _and(residual)
@@ -328,9 +334,11 @@ def lower(tree_json: str,
                           "query_location": 18446744073709551615, "schema_name": r_ident.schema,
                           "table_name": r_ident.table, "column_name_alias": [],
                           "catalog_name": r_ident.catalog, "at_clause": None}
-    for k, v in node.items():
-        if k != "from_table":
-            rewrite_refs(v)
+    rest = {k: v for k, v in node.items() if k != "from_table"}
+    _scope.mark(rest, resolve_fn)
+    for v in rest.values():
+        rewrite_refs(v)
+    _scope.strip(rest)
 
     # the native join as a derived table of virtual columns (decision-time probes)
     proj = ", ".join(f'"{tables[ti].alias}"."{c}" AS "{v}"' for v, (ti, c) in colmap.items())
@@ -463,10 +471,10 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
         tq = tag.replace("'", "''")
         if kinds[0] == "s" or ps:
             sql = (f"SELECT gpu_upload_rows_exact('{tq}', {exprs[0]}, {exprs[1]}, [{', '.join(pi)}]::BIGINT[], "
-                   f"[{', '.join(pf)}]::DOUBLE[], [{', '.join(ps)}]::VARCHAR[]) FROM {t.ident.fqn}")
+                   f"[{', '.join(pf)}]::DOUBLE[], [{', '.join(ps)}]::VARCHAR[]) FROM {t.ident.fqn} AS {OUTER_ALIAS}")
         else:
             sql = (f"SELECT gpu_upload_rows_exact('{tq}', {exprs[0]}, {exprs[1]}, [{', '.join(pi)}]::BIGINT[], "
-                   f"[{', '.join(pf)}]::DOUBLE[]) FROM {t.ident.fqn}")
+                   f"[{', '.join(pf)}]::DOUBLE[]) FROM {t.ident.fqn} AS {OUTER_ALIAS}")
         if first is not None:
             names[first] = "k"
         base.append(BaseSet(table=ti, tag=tag, fqn=t.ident.fqn, upload_sql=sql, lanes=names))
@@ -741,21 +749,26 @@ def lower_upload(tree_json: str,
             colmap[v] = (ti, c)
             columns[v] = typ
 
-    def rewrite_refs(e):
+    def rewrite_refs(e, depth=0):
         if isinstance(e, dict):
             if e.get("class") == "COLUMN_REF":
+                if e.get("__inner"):
+                    return          # bound to a table of a subquery's own FROM (§4.18)
                 r = resolve_col(e.get("column_names") or [])
                 if r is None:
                     return
                 if r not in vname:
                     raise Decline("shape", f"column {r[1]} is not representable")
-                e["column_names"] = [vname[r]]
+                # inside a subquery a bare name would re-bind to the subquery's own tables
+                # (EXISTS (... FROM lineitem l2 WHERE l2.l_orderkey = l_orderkey)): keep the
+                # correlation qualified with the virtual table's alias
+                e["column_names"] = [OUTER_ALIAS, vname[r]] if depth else [vname[r]]
                 return
-            for v in e.values():
-                rewrite_refs(v)
+            for k, v in e.items():
+                rewrite_refs(v, depth + 1 if (e.get("class") == "SUBQUERY" and k == "subquery") else depth)
         elif isinstance(e, list):
             for v in e:
-                rewrite_refs(v)
+                rewrite_refs(v, depth)
 
     r_ident = tables[0].ident
     node["where_clause"] = _and(residual)
@@ -763,9 +776,11 @@ def lower_upload(tree_json: str,
                           "query_location": 18446744073709551615, "schema_name": r_ident.schema,
                           "table_name": r_ident.table, "column_name_alias": [],
                           "catalog_name": r_ident.catalog, "at_clause": None}
-    for k, v in node.items():
-        if k != "from_table":
-            rewrite_refs(v)
+    rest = {k: v for k, v in node.items() if k != "from_table"}
+    _scope.mark(rest, resolve_fn)
+    for v in rest.values():
+        rewrite_refs(v)
+    _scope.strip(rest)
     return LoweredUpload(tree_json=json.dumps(j), tables=tables, root=0, colmap=colmap, columns=columns,
                          from_text=from_text, edge_where=edge_where)
 

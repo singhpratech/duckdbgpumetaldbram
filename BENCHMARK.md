@@ -3272,3 +3272,55 @@ rewritten query faster than native.
 | Q21 | native (shape) | 22.6 | — | — | — | split: the inner GROUP BY declined (shape) |
 | Q22 | native (shape) | 8.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
 12 of 22 queries answered on the device; 0 with rows that differ from native
+
+## v0.7 TPC-H coverage map, fourth pass — Metal, SF1 (2026-09-17)
+
+Subquery predicates as BOOLEAN lanes (§4.18): Q4 (EXISTS), Q17 (correlated scalar
+subquery), Q21 (EXISTS and NOT EXISTS over a self-joined lineitem) move to the device,
+and Q18's `IN (SELECT … GROUP BY … HAVING …)` makes it one statement instead of a
+nested one. Q18 first measured 0.03× (446 ms): 57 result rows were decoded by joining
+a 1.5M-entry key dictionary. Decoding per returned key fixed it; the measured rule-1
+check now also covers sessions that never saw the statement run native. 15 of 22,
+every rewritten query faster than native.
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.4 | 6.1 | 2.02× | True | |
+| Q2 | native (threshold) | 4.7 | — | — | — |  |
+| Q3 | GPU (plain) | 6.5 | 3.3 | 1.98× | True | |
+| Q4 | GPU (plain) | 7.4 | 2.4 | 3.02× | True | |
+| Q5 | GPU (plain) | 7.0 | 1.4 | 5.04× | True | |
+| Q6 | native (shape) | 1.9 | — | — | — |  |
+| Q7 | GPU (plain) | 7.8 | 3.9 | 2.00× | True | |
+| Q8 | GPU (projected) | 7.6 | 3.2 | 2.38× | True | |
+| Q9 | GPU (plain) | 19.4 | 2.9 | 6.69× | True | |
+| Q10 | GPU (topk) | 17.9 | 3.8 | 4.71× | True | |
+| Q11 | native (threshold) | 2.8 | — | — | — |  |
+| Q12 | GPU (plain) | 6.1 | 3.4 | 1.80× | True | |
+| Q13 | GPU (nested) | 18.5 | 1.9 | 9.94× | True | |
+| Q14 | GPU (projected) | 5.3 | 2.5 | 2.10× | True | |
+| Q15 | native (shape) | 3.3 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 13.1 | — | — | — |  |
+| Q17 | GPU (projected) | 6.0 | 2.5 | 2.46× | True | |
+| Q18 | GPU (plain) | 14.5 | 2.3 | 6.24× | True | |
+| Q19 | GPU (projected) | 10.4 | 2.4 | 4.34× | True | |
+| Q20 | native (shape) | 8.0 | — | — | — |  |
+| Q21 | GPU (plain) | 22.6 | 7.7 | 2.91× | True | |
+| Q22 | native (threshold) | 8.9 | — | — | — |  |
+
+15 of 22 queries answered on the device; 0 with rows that differ from native
+
+Still native: Q2 and Q20 (no aggregate at the top level / a correlated subquery over
+an aggregate of another subquery), Q15 (a view), Q6 (single-table global aggregate,
+native wins), Q11, Q16, Q22 (tables below the row floor or under the bounds).
+
+Gate for the same build (`scripts/transparent_gate.py --subqueries --exprs`, hot loop,
+N=5): 771 statement variants — 526 rewritten, every one at or above 1.0× and identical
+to native; 245 declined by the bounds; 0 below the bound. Subquery predicates: EXISTS on
+lineitem 3.1–8.3×, NOT IN 1.4–6.1×, the Q17-shaped correlated scalar 3.3–13.3×, EXISTS
+over a join 2.6–36×, IN over a join 1.15–6.4×. A first run flagged one cell (VARCHAR key,
+3 groups, 55% WHERE, one expression payload: 0.80–0.86×); measured against the main
+branch over 12 alternating process starts it has the same 1.07× median on both and
+falls below 1.0× in a quarter of process starts on either, so the bound was tightened: that
+exemption now needs two expression payloads (1.08–1.59× on 27 cells).
+

@@ -769,6 +769,75 @@ pairs, so the form has its own bound (`_thresholds.py`): up to 17K pairs
 700K pairs 0.39–0.51× — declined above 100K pairs, above 20K under a WHERE,
 and under a WHERE that keeps less than 5%.
 
+### 4.18 Subquery predicates: EXISTS / IN / a correlated scalar subquery as a lane
+A WHERE term that contains a subquery — `EXISTS (…)`, `NOT EXISTS (…)`,
+`x IN (SELECT …)`, `x NOT IN (SELECT …)`, `v < (SELECT 0.2 * avg(…) … WHERE
+inner.k = outer.k)` — is row-local from the outer row's point of view: its
+value depends on that row's columns and on the contents of the tables the
+subquery reads. It is lowered like any other computed lane (§4.10): DuckDB
+evaluates it once per row during the upload (decorrelating it into a join, as
+it would natively), the BOOLEAN result is a predicate lane, and the device
+answers `lane = 1`. Three-valued logic needs nothing special: a `NOT IN` over
+a set that contains a NULL is NULL for every row, the lane holds NULL, and
+`= 1` rejects it exactly as WHERE rejects NULL.
+
+What the subquery may contain (`_exprs._validate_subquery`): a plain SELECT
+over base tables — no LIMIT, ORDER BY, sample, QUALIFY, window, DISTINCT ON,
+derived table or CTE reference; CONSISTENT scalar functions only; aggregates
+whose value does not depend on evaluation order (`count min max sum avg
+bool_and bool_or`, and `sum` / `avg` only over non-floating columns). GROUP BY
+and HAVING inside are fine (TPC-H Q18). Anything else declines and the
+statement runs native.
+
+**Scoping.** The lowerings rename columns (a joined column becomes a lane of
+the virtual table; a computed expression is re-emitted in the upload's SELECT).
+Inside a subquery only the references that reach OUT may be renamed, and a
+renamed outer reference must still not be captured by the subquery's own FROM:
+`FROM t o WHERE EXISTS (SELECT 1 FROM t i WHERE i.k = o.k + 1)` rewritten
+carelessly to `… WHERE i.k = k + 1` binds `k` to `i` and is true for no row —
+a wrong answer with no error. `_scope.mark` resolves each reference the way
+SQL does, innermost scope first, and tags the ones bound inside; every outer
+reference inside a subquery is emitted qualified with an alias the outer
+relation always carries (`gpudb_o` in uploads, DESCRIBE and single-table
+probes; `gpudb_j0` in join probes). The test suite holds self-correlated cases
+in which every column name exists on both sides.
+
+**Staleness.** A lane computed from another table is stale when THAT table
+changes. Every base table a subquery reads gets a sentinel set
+(`gpu_note_rows`) and an arm in the statement's guard; the wrapper's own writes
+to it invalidate the dependent set; a foreign write trips the guard, the
+statement falls back to native, and the set is rebuilt.
+
+**Thresholds.** Native has to run a join for such a statement whatever its FROM
+says, so the join bounds apply (`join=True`).
+
+Three fixes this work exposed, all general:
+- *Decode choice for dictionary keys.* TPC-H Q18 returns 57 groups keyed by a
+  five-column tuple whose dictionary holds 1.5M entries. Joining the dictionary
+  cost 416 ms per statement; decoding per key costs 4 ms. With every group
+  returned the order flips (1410 ms joined, 2200 ms per key). The wrapper
+  passes `decode_per_key` in the context when the rows that survive the WHERE
+  number at most a quarter of the distinct key tuples; device HAVING and top-k
+  always decode per key (§4.15).
+- *Measured rule 1 without a native observation.* A session with eager
+  residency never sees the statement run native, so the measured check (§4.11)
+  had nothing to compare with. When the best of the first three rewritten runs
+  is 20 ms or more — far outside a device answer — native is timed once, on a
+  cursor of its own, and the usual comparison decides.
+
+- *A VARCHAR key with few groups under a WHERE.* With ONE expression payload
+  the cell is a coin flip (median 1.07×, below 1.0× in a quarter of process
+  process starts, on the main branch as much as on this one); from two expression
+  payloads on it wins every time (1.08–1.59×, 27 cells). The exemption from
+  `min_groups` now requires two (`string_key_min_computed_payloads`);
+  `count(DISTINCT)` beside one expression payload keeps its own (1.25–1.84×).
+
+Measured (Metal, SF1, `transparent_gate.py --subqueries`): EXISTS on lineitem
+3.1–8.3×, NOT IN 1.4–6.1×, the Q17-shaped correlated scalar 3.3–13.3×, EXISTS
+over a join 2.6–36×, IN over a join 1.15–6.4×; 185 rewritten cells, none below
+1.0×, 31 declined by the bounds. TPC-H: Q4, Q17, Q21 move to the device and
+Q18 becomes one statement — 15 of 22.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection

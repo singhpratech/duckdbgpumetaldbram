@@ -90,6 +90,7 @@ class Plan:
     key_types: List[str] = field(default_factory=list)
     pack: List[Tuple[int, int, int]] = field(default_factory=list)   # per component (min, range, stride) when packed
     dict_key: bool = False             # key is a hashed tuple with a dictionary (any VARCHAR component, §4.5)
+    decode_per_key: bool = False       # few groups expected out of a large dictionary: decode each key on its own
     where: List[WhereTerm] = field(default_factory=list)
     pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
     pred_types: Dict[str, str] = field(default_factory=dict)
@@ -828,7 +829,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         args = [f"'{tag}'", "'" + prog.replace("'", "''") + "'", f"'{lanes}'", f"'{mfilter}'"]
     # a filtered result (device HAVING / top-k) decodes its few keys one by one instead of
     # joining the whole dictionary (tens of ms for 100K wide tuples, per statement)
-    dict_per_key = plan.dict_key and (fn.endswith(("_having", "_topk")) or bool(mfilter))
+    dict_per_key = plan.dict_key and (fn.endswith(("_having", "_topk")) or bool(mfilter) or plan.decode_per_key)
     cols = []
     for out in plan.outputs:
         if out.kind == "key" and plan.dict_key:

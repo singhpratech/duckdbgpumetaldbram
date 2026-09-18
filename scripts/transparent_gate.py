@@ -135,6 +135,8 @@ def main() -> int:
                     help="idle gap before every timed statement; reports medians (an interactive cadence)")
     ap.add_argument("--exprs", action="store_true",
                     help="aggregate l_extendedprice * (1 - l_discount) and add an expression WHERE (computed lanes)")
+    ap.add_argument("--subqueries", action="store_true",
+                    help="add EXISTS / IN / correlated scalar subquery predicates (BOOLEAN lanes, §4.18)")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
@@ -148,6 +150,13 @@ def main() -> int:
         WHERES["l_commitdate < l_receiptdate AND (l_shipmode = 'AIR' OR l_quantity > 40)"] = "computed"
         WHERES["extract(year FROM l_shipdate) = 1995"] = "computed"
         JOIN_WHERES["o_orderpriority LIKE '1-%' OR o_orderpriority LIKE '2-%'"] = "orders"
+    if args.subqueries:
+        WHERES["EXISTS (SELECT 1 FROM orders WHERE o_orderkey = l_orderkey AND o_orderpriority = '1-URGENT')"] = "exists"
+        WHERES["l_partkey NOT IN (SELECT p_partkey FROM part WHERE p_size <= 10)"] = "not in"
+        WHERES["l_quantity < (SELECT 0.2 * avg(l2.l_quantity) FROM lineitem l2 WHERE l2.l_partkey = lineitem.l_partkey)"] = "scalar"
+        JOIN_WHERES["EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = o_orderkey AND l2.l_commitdate < l2.l_receiptdate "
+                    "AND l2.l_suppkey <> lineitem.l_suppkey)"] = "orders"
+        JOIN_WHERES["l_suppkey IN (SELECT s_suppkey FROM supplier WHERE s_nationkey < 5)"] = "lineitem"
     if not os.path.exists(args.db):
         print(f"missing {args.db} — SF=1 ./scripts/gen_tpch.sh", file=sys.stderr)
         return 2

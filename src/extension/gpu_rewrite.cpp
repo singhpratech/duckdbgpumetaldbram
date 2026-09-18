@@ -108,6 +108,9 @@ struct Context {
     std::vector<PredCol> preds;            // tag columns after key/payload, in order (exact sets)
     std::vector<KeyPart> keys;             // 1..3 key components (packed when > 1)
     bool dict = false;                     // key is a hashed tuple with a dictionary (any VARCHAR component, §4.5)
+    // The caller expects far fewer groups out than the dictionary holds (a selective WHERE):
+    // decode each returned key on its own instead of joining the whole dictionary.
+    bool decode_per_key = false;
     std::string default_collation;
     bool packed() const { return keys.size() > 1 && !dict; }
     std::string backend;
@@ -159,6 +162,7 @@ Context parse_context(const json& c) {
     x.rows    = c.value("rows", std::int64_t{0});
     x.ready   = c.value("ready", false);
     x.exact   = c.value("exact", false);
+    x.decode_per_key = c.value("decode_per_key", false);
     x.default_collation = c.value("default_collation", "");
     x.default_order = c.value("default_order", "");
     if (c.contains("guards") && c["guards"].is_array()) {
@@ -1310,8 +1314,10 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                    {"query_location", kNoLocation}, {"function", j_function(fn, args)},
                    {"column_name_alias", json::array()}, {"with_ordinality", "WITHOUT_ORDINALITY"}};
     json guard = j_guard(cx);
-    // a filtered result (device HAVING / top-k) decodes its few keys one by one
-    const bool dict_per_key = cx.dict && (having_dev || topk > 0);
+    // a filtered result (device HAVING / top-k, or a WHERE the caller measured as selective)
+    // decodes its few keys one by one: joining a 1.5M-entry dictionary costs ~400 ms per
+    // statement however few rows come back; decoding per key costs ~1 us per row
+    const bool dict_per_key = cx.dict && (having_dev || topk > 0 || cx.decode_per_key);
     json left_side = tf;
     if (cx.dict && !dict_per_key) {
         // r LEFT JOIN gpu_resident_dictionary(tag, n) d ON d.id = r.key
