@@ -118,6 +118,29 @@ run of a template the wrapper also reads the operator's rows_out
 groups than the plain form's bound: a filter that passes most groups is
 output-bound like the plain form (measured 0.97x on TPC-H orders by
 o_custkey HAVING count(*) >= 3, 59K of ~100K groups surviving).
+
+Cutting the per-statement fixed cost (2026-09-18) did not move these either,
+and what the sweep said is worth keeping. The rewritten statement is planned
+once instead of per run (docs/TRANSPARENT_DESIGN.md §3.2), which takes
+0.06-0.10 ms off a few-group statement and 0.37-0.43 ms off the 10K-group and
+join forms; the whole fixed cost outside the operator at SF1 is now 0.12 ms of
+a 0.69 ms statement (BENCHMARK.md). `scripts/transparent_gate.py
+--no-thresholds --keys l_linenumber,l_returnflag --joins none`, SF1, N=9, run
+on the state before the change and on the state after:
+
+  * `l_linenumber` (7 groups, INTEGER key) measures 1.19-2.50x on plain /
+    HAVING / top-k / projected / nested, on BOTH states, at every selectivity
+  * the same sweep recorded 0.80-0.94x for those rows earlier the same day
+
+Nothing between the two runs changed those statements by more than 0.1 ms, so
+the difference is the process's mode (§9.1: a 0.45 ms kernel runs at three
+times that when the rest of the process keeps waking), and the slow mode did
+not reproduce on demand. One mode's worth of evidence does not relax a bound
+that has to hold in both, so min_groups stays at 1000 and the VARCHAR-key
+rules stay as they are; the continuous measured rule 1
+(connection._note_timing) keeps deciding these shapes at run time. The only
+rows below 1.0x in that sweep are the global-aggregate form at SF1, which its
+own rule (rows x (1 + terms) >= 60M) already declines.
 """
 from __future__ import annotations
 from dataclasses import dataclass

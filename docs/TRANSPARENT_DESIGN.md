@@ -179,14 +179,38 @@ therefore done on the **statement before DuckDB plans it**:
 
 ```
 statement text
-  → statement classification (DuckDB's own splitter, §5.2)          every statement
+  → statement classification (DuckDB's own splitter, §5.2)          every statement, memoised on the text
   → whitelist check: names a table above the §9.1 floor?              ~0.001 ms, regex on the text
   → template cache lookup (literal-normalised, §3.3)                  hit: 0 extra
   → one statement:
       SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(?), <context>))
                                                                        0.124 ms measured
   → the returned statement runs (rewritten, or the input unchanged)
+       — as EXECUTE of a plan DuckDB already built, from its second sighting on
 ```
+
+The rendered statement is **planned once, not per run**. DuckDB is handed SQL
+text, so it parses, binds and optimises the rewritten two or three relations on
+every execution; the text of a warm template is byte-identical run to run, so
+the second sighting of a rendered statement is `PREPARE`d and every later one
+is an `EXECUTE` (`connection.py:_planned`). Measured at SF1: 0.06–0.10 ms of a
+0.7–0.9 ms few-group statement, 0.37–0.43 ms of a 6.5–7.6 ms one with more
+relations (BENCHMARK.md, 2026-09-18). A statement whose literals change on
+every execution renders a new text every time, never comes back, and is never
+prepared.
+
+A plan may not freeze the answer, and it does not. The staleness guard (§5.4)
+is a volatile scalar over a live `count(*)` of the base table, inside the plan:
+it runs on every execution, and a write behind a prepared plan raises
+`GPUDB_STALE` exactly as before. The table function's `init` runs again and
+re-acquires the set. DuckDB re-binds a prepared statement when the catalog
+moves under it (DDL, a view redefinition). What it does **not** re-bind is a
+session setting or a name resolution — a temp table that shadows the name, a
+`USE`, `SET default_order` — so the plans are dropped wherever a decision is
+dropped: `_invalidate_all` (every non-SELECT the wrapper sees, including SET,
+ATTACH, DDL, a transaction and a foreign write), `_refresh_settings`,
+`_on_stale` and `_on_rewrite_error`. Names are never reused for a different
+statement, so two threads on one connection cannot execute each other's plan.
 
 Proven end to end on 2026-09-01 against the v0.6.0 build (Metal): a
 40-line rewriter over the serialized tree turned
@@ -1494,7 +1518,12 @@ BENCHMARK.md gains, per backend, at SF1/SF10/SF50:
 - mask variant (a) vs (b) across the selectivity sweep;
 - the `gpu_assert_rows` cross-join cost on a base table, clean and with 10%
   deleted rows, at each SF (SF1 on the M-series: 0.18 / 0.47 ms for the
-  count, 0.3–0.5 ms for the whole guard);
+  count, 0.3–0.5 ms for the whole guard — re-measured 2026-09-18 on DuckDB
+  1.4.5 at **0.05 ms**: `EXPLAIN ANALYZE` of the rewritten statement shows
+  the guard arm as a `COLUMN_DATA_SCAN` of one row, because an unfiltered
+  `count(*)` over a base table is answered from row-group metadata and never
+  scans. The 0.18 / 0.47 ms figures stand for the case the optimizer cannot
+  do that for);
 - wrapper overhead, measured on both machines: a plain `SELECT` (no
   `GROUP BY`) through `duckdb.connect` vs through `gpudb.connect` with
   `transparent=False` vs transparent — rule 1 has to hold for statements

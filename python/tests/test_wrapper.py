@@ -4,6 +4,7 @@ also collected by pytest if present. Needs a built extension (build-macos or
 build-linux) or GPUDB_EXTENSION_PATH."""
 import os
 import sys
+import threading
 import time
 import decimal
 
@@ -315,6 +316,91 @@ def run():
     check(lr["rewritten"] and lr["form"] == "topk" and "'desc'" in lr["sql"] and got == con._raw.execute(q7).fetchall(),
           "SET default_order='DESC': top-k pushed as desc, matches native")
     con.execute("RESET default_order")
+    con.close()
+
+    print("== cached plans: every event that re-decides one drops it (rule 2)")
+    con = fresh()
+    q = "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k"
+    for _ in range(3):
+        got = con.execute(q).fetchall()
+    nat0 = con._raw.execute(q).fetchall()
+    check(con.last_rewrite()["rewritten"] and got == nat0, "a repeated rewritten statement is still correct")
+    check(bool(con._plans), f"the second sighting of a rendered statement is prepared ({len(con._plans)})")
+    check(con._planned(con.last_rewrite()["sql"]).startswith("EXECUTE "), "it runs as EXECUTE from then on")
+    # a template whose literals change renders a new statement every time: no
+    # statement comes back, so nothing is prepared and nothing is lost
+    before = len(con._plans)
+    for thr in range(13000, 13010):
+        con.execute(f"SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > {thr}").fetchall()
+    check(len(con._plans) == before, "a distinct-literal loop prepares nothing")
+
+    def replays(what, prepare=3):
+        """Run the statement `prepare` times (so it is prepared), do `what`,
+        then check the next execution still answers what native answers."""
+        for _ in range(prepare):
+            con.execute(q).fetchall()
+        what()
+        return con.execute(q).fetchall() == con._raw.execute(q).fetchall()
+
+    ROW = "(5, 5, 1.00, 0.5, DATE '1995-01-01', TIMESTAMP '2020-01-01', 'alpha')"
+    check(replays(lambda: con.execute("UPDATE t SET v = v + 1 WHERE k = 5")),
+          "a write through the wrapper: native's answer")
+    check(not con._plans, "and the plans went with it")
+
+    cur = con.cursor()
+    check(replays(lambda: cur.execute("INSERT INTO t VALUES " + ROW)),
+          "a write through con.cursor(): native's answer")
+    con.execute("DELETE FROM t WHERE k = 5 AND v = 5")
+
+    raw = con._raw.cursor()
+    ok = replays(lambda: raw.execute("INSERT INTO t VALUES " + ROW))
+    check(ok and con.last_rewrite()["fallback"],
+          "a raw-cursor INSERT under a cached plan: the in-statement guard still fired")
+    raw.execute("DELETE FROM t WHERE k = 5 AND v = 5")
+
+    check(replays(lambda: con.execute("ALTER TABLE t ADD COLUMN extra INTEGER")), "after DDL: native's answer")
+    con.execute("ALTER TABLE t DROP COLUMN extra")
+    check(replays(lambda: con.execute("BEGIN")), "inside a transaction: native's answer")
+    con.execute("ROLLBACK")
+    check(replays(lambda: con._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()),
+          "the set evicted under a cached plan: native's answer")
+
+    con.execute("CREATE OR REPLACE VIEW pv AS SELECT * FROM t WHERE k < 500")
+    qv = "SELECT k, sum(v) FROM pv GROUP BY k ORDER BY k"
+    for _ in range(3):
+        con.execute(qv).fetchall()
+    con.execute("CREATE OR REPLACE VIEW pv AS SELECT * FROM t WHERE k < 100")
+    check(con.execute(qv).fetchall() == con._raw.execute(qv).fetchall(),
+          "after a view redefinition: native's answer")
+    con.execute("DROP VIEW pv")
+
+    q7 = "SELECT k, sum(v) AS s FROM tu GROUP BY k ORDER BY s LIMIT 7"
+    for _ in range(3):
+        con.execute(q7).fetchall()
+    con.execute("SET default_order = 'DESC'")
+    check(con.execute(q7).fetchall() == con._raw.execute(q7).fetchall(),
+          "SET default_order under a cached plan: native's answer")
+    con.execute("RESET default_order")
+
+    for _ in range(3):
+        con.execute(q).fetchall()
+    nat0 = con._raw.execute(q).fetchall()
+    outs, errs = [], []
+
+    def hammer():
+        try:
+            c2 = con.cursor()
+            for _ in range(20):
+                outs.append(c2.execute(q).fetchall())
+        except Exception as e:                      # noqa: BLE001
+            errs.append(e)
+    threads = [threading.Thread(target=hammer) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    check(not errs and len(outs) == 40 and all(o == nat0 for o in outs),
+          f"two threads on one cached template: {len(outs)} answers, {len(errs)} errors")
     con.close()
 
     print("== background residency: upload only when idle, interrupted by statements")
