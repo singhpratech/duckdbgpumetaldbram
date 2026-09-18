@@ -108,6 +108,32 @@ def normalise(tree_json: str, names: Optional[list] = None) -> Optional[str]:
                     return None
                 o["expression"] = _bare(sel[i - 1])
                 changed = True
+    # SELECT DISTINCT a, b FROM ... (no aggregate, no GROUP BY) is GROUP BY a, b
+    mods = node.get("modifiers") or []
+    dm = [m for m in mods if m.get("type") == "DISTINCT_MODIFIER"]
+    if dm and not dm[0].get("distinct_on_targets") and not (node.get("group_expressions") or []) \
+            and node.get("aggregate_handling") != "FORCE_AGGREGATES" and not any(_has_agg(it) for it in sel) \
+            and node.get("having") is None and node.get("qualify") is None:
+        node["modifiers"] = [m for m in mods if m.get("type") != "DISTINCT_MODIFIER"]
+        node["group_expressions"] = [_bare(it) for it in sel]
+        node["group_sets"] = [list(range(len(sel)))]
+        changed = True
+    # A RIGHT JOIN B ON c  is  B LEFT JOIN A ON c (column order is not observable: no STAR here)
+    def swap_right(f):
+        nonlocal changed
+        if not isinstance(f, dict):
+            return f
+        if f.get("type") == "JOIN":
+            f["left"] = swap_right(f.get("left")); f["right"] = swap_right(f.get("right"))
+            if f.get("join_type") == "RIGHT" and f.get("ref_type") in ("REGULAR", "NATURAL"):
+                f["left"], f["right"] = f["right"], f["left"]
+                f["join_type"] = "LEFT"
+                changed = True
+        elif f.get("type") == "SUBQUERY":
+            pass                                   # its own SELECT: not this pass
+        return f
+    if node.get("from_table") is not None:
+        node["from_table"] = swap_right(node["from_table"])
     if not changed:
         return None
     if names is not None:

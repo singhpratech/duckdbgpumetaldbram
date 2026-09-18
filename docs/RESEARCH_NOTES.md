@@ -1010,6 +1010,22 @@ three coverage items were (FILTER aggregates, views, shorthand): the machinery
 built for expressions, derived tables and name pinning is what makes each new
 spelling a tree rewrite rather than a feature.
 
+## 2026-09-18 — Probing 36 shapes, taking four
+
+A probe of 36 everyday analytic shapes through the wrapper: 24 already on the
+device, 12 native. Of the 12, four were identities waiting to be written:
+`SELECT DISTINCT a, b` is `GROUP BY a, b`; `A RIGHT JOIN B` is `B LEFT JOIN A`;
+`sum(DISTINCT x)` per key is `sum(x)` over rows the device already made unique
+per (key, x); several `count(DISTINCT)` columns are one device GROUP BY over
+the tuple with DuckDB keeping a DISTINCT per column over the small result. All
+four run identical to native on the first try. The other eight stay native for
+reasons that are either semantic (`any_value`, `arg_max`, `median`, `stddev`,
+windows, `list` — order- or algorithm-dependent, or no kernel) or measured: a
+single-table `count(DISTINCT k)` without GROUP BY takes DuckDB 4–13 ms at SF1
+while the device would first return every distinct value (200K rows for
+`l_partkey`); the rule that keeps single-table global aggregates native holds
+for it too.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

@@ -24,8 +24,11 @@ _GLOBAL_AGG_JOIN_RE = re.compile(
     r"\b(?:sum|count|min|max|avg)\s*\(.*\bFROM\b.*(?:\bJOIN\b|,)", re.IGNORECASE | re.DOTALL)
 
 
+_SELECT_DISTINCT_RE = re.compile(r"\bSELECT\s+DISTINCT\b(?!\s+ON\b)", re.IGNORECASE)   # a GROUP BY in disguise (§4.21)
+
+
 def _maybe_aggregate(sql: str) -> bool:
-    return bool(_GROUP_BY_RE.search(sql) or _GLOBAL_AGG_JOIN_RE.search(sql))
+    return bool(_GROUP_BY_RE.search(sql) or _GLOBAL_AGG_JOIN_RE.search(sql) or _SELECT_DISTINCT_RE.search(sql))
 _SELECT_START_RE = re.compile(r"^\s*(SELECT|FROM|VALUES)\b", re.IGNORECASE)
 _TABLE_REF_RE = re.compile(r'\bFROM\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)){0,2})', re.IGNORECASE)
 _MAX_STATEMENT_BYTES = 16 * 1024
@@ -852,8 +855,8 @@ class Connection:
             now[name] = m.group("body") if m else None
         return all(now.get(v) == body for v, body in snapshot.items())
 
-    _SYNTAX_RE = re.compile(r"\b(?:GROUP|ORDER)\s+BY\s+(?:ALL\b|\d|[^;]*?,\s*\d+\s*(?:,|$|\)|ASC|DESC|NULLS|LIMIT|HAVING|OFFSET))",
-                            re.IGNORECASE)
+    _SYNTAX_RE = re.compile(r"\b(?:GROUP|ORDER)\s+BY\s+(?:ALL\b|\d|[^;]*?,\s*\d+\s*(?:,|$|\)|ASC|DESC|NULLS|LIMIT|HAVING|OFFSET))"
+                            r"|\bSELECT\s+DISTINCT\b|\bRIGHT\s+(?:OUTER\s+)?JOIN\b", re.IGNORECASE)
 
     def _normalise_syntax(self, sql: str) -> str:
         """§4.21: GROUP BY ALL / ordinals and ORDER BY ALL / ordinals spelled out as
