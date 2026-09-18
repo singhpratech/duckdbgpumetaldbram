@@ -99,6 +99,7 @@
 #include "gpu_resident.hpp"
 #include "gpu_sum_extension.hpp"
 #include "gpu_backend.hpp"
+#include "resident_shed_note.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
 DUCKDB_EXTENSION_EXTERN
@@ -216,6 +217,29 @@ std::string parse_tag(const std::string& name, TagFields& out) {
     out.table_oid = oid; out.columns = f[6];
     out.extra = f.size() > 7 ? f[7] : std::string();
     return "";
+}
+
+// §4.12: the tag of a set only global aggregates read writes lane 0 as '-'.
+// There is no GROUP BY key, so nothing is sorted and no key lane is kept.
+// An INTERMEDIATE of a chained device join carries the FINAL set's tag with
+// '.<step>' appended, so its lane list describes the final set and not it:
+// its own lane 0 is whatever the step put there (the next step's probe key),
+// and it is never keyless.
+bool no_key_tag(const TagFields& t) {
+    if (t.extra.find('.') != std::string::npos) return false;
+    return t.columns.compare(0, 2, "-,") == 0 || t.columns == "-";
+}
+
+// A JOIN RESULT set — `join-<digest>` (materialised on the device) or
+// `joinu-<digest>` (DuckDB evaluated the join and the wrapper uploaded its
+// rows). Its lane 0 is the statement's GROUP BY key and nothing else, which
+// is what lets the backend release that lane once it holds the key's group-id
+// lane (docs/RESIDENT_COLUMNS_DESIGN.md §9). An INTERMEDIATE of a chained
+// device join is written '<digest>.<step>' and is NOT one: the next step
+// probes its lane 0 as a join key.
+bool join_result_tag(const TagFields& t) {
+    const bool kind = starts_with(t.extra, "join-") || starts_with(t.extra, "joinu-");
+    return kind && t.extra.find('.') == std::string::npos;
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,18 +1133,32 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
     set->rows_seen = b.rows_seen;
     set->keys = std::move(keys);
     set->vals = std::move(vals);
+    // §4.12: a set only global aggregates read writes its lane 0 as '-'. The
+    // single-table form is a view over the store and simply has no key lane;
+    // a set over a JOIN is uploaded or materialised lane by lane, so the key
+    // slot arrives and is dropped HERE — `keys` points at the payload purely
+    // so the set's invariants hold, nothing reads it as a key, and no sort
+    // cache is ever built for it.
+    if (set->managed && no_key_tag(b.tag) && set->vals) {
+        set->no_key = true;
+        set->key_str = false;
+        set->key_dict = nullptr;
+        set->rows = set->vals->rows();
+        set->keys = set->vals;
+    }
     set->uploaded_at_us = now_us();
     // Ready means uploaded AND prepared (§5.5). Managed sets are prepared
     // here so the first hit pays no sort; explicit sets keep the lazy build
     // (gpu_prepare_resident() exists for users who want it eager).
     const auto t_prep = std::chrono::steady_clock::now();
-    if (set->managed && set->keys) {
+    if (set->managed && set->keys && !set->no_key) {
         set->keys->prepare();
     }
     if (upload_trace())
         std::fprintf(stderr, "[gpudb upload] %s '%s': rows=%zu prepare=%.1f ms\n",
                      fn, b.name.c_str(), set->rows, ms_since(t_prep));
-    set->state.store(set->keys && set->keys->prepared() ? SetState::Ready : SetState::Uploaded);
+    set->state.store(set->no_key || (set->keys && set->keys->prepared())
+                     ? SetState::Ready : SetState::Uploaded);
     if (!ctx.publish(set, b.seq_at_start)) {
         throw std::runtime_error(std::string("GPUDB_UPLOAD_DISCARDED: ") + fn + ": upload of '" +
             b.name + "' discarded — the set was invalidated while the upload ran; "
@@ -1695,8 +1733,15 @@ std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* 
                 if (!v.seg->lane_valid[l].empty()) valid_ptrs[s2][l] = v.seg->lane_valid[l].data();
         spans[s2].valid = valid_ptrs[s2].data();
     }
-    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols =
-        a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+    {
+        // Lane 0 of a join result is that statement's GROUP BY key and is
+        // read as nothing else, so the backend may release it once it holds
+        // the key's group-id lane (§9). A no-key set has no key at all.
+        const bool key_only = b.managed && join_result_tag(b.tag) && !no_key_tag(b.tag);
+        gpudb::KeyOnlyLanes note(key_only ? std::uint64_t{1} : std::uint64_t{0});
+        cols = a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    }
     if (cols.size() != L) throw std::runtime_error("upload_rows_exact returned the wrong column count");
     auto kcol = std::move(cols[0]);
     auto vcol = std::move(cols[1]);
@@ -2371,8 +2416,19 @@ std::size_t finish_upload_columns(ResidentContext& ctx, UploadBuf& b, const char
     std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);
     for (std::size_t e = 0; e < b.n_pf; ++e) dtypes[1 + b.n_pi + e] = gpudb::Dtype::F64;
     auto& a = ctx.aggregator();
-    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols =
-        a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+    {
+        // A store lane named 'k#<field>' is the TUPLE TEXT of a GROUP BY key
+        // (_rewrite.store_lanes) — the raw column a WHERE or a payload reads
+        // lives under its own name, so this lane is only ever read as a key
+        // and the backend may release it once the key's group-id lane exists
+        // (§9). Lane 0 is the row id and is not published at all.
+        std::uint64_t key_only = 0;
+        for (std::size_t l = 1; l < L && l < 64; ++l)
+            if (starts_with(names[l - 1], "k#")) key_only |= std::uint64_t{1} << l;
+        gpudb::KeyOnlyLanes note(key_only);
+        cols = a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    }
     if (cols.size() != L) throw std::runtime_error(std::string(fn) + ": upload_rows_exact returned the wrong column count");
     const double up_ms = ms_since(t0);
     const std::string key = std::string("gpudb:v1:") + b.tag.catalog + ":" + b.tag.schema + ":" + b.tag.table + ":" +
@@ -2878,6 +2934,9 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   global=true|false      → ... and the global masked aggregate (§4.12) on its own device
 //   narrow=true|false      → lanes are stored at their narrowest width (docs/RESIDENT_COLUMNS_DESIGN.md
 //                            stage C); the wrapper's memory estimate sizes lanes from their type then
+//   rebuilds=<c>/<l>       → sort caches and key lanes a resident column shed and had to
+//                            rebuild, process-wide (docs/RESIDENT_COLUMNS_DESIGN.md §9).
+//                            Zero on a workload whose shapes the shed rule read right
 //   device_memory=<bytes>  → what the backend reports for the memory budget (0 = unknown, §5.5)
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
@@ -2902,6 +2961,8 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     info += ctx_of(info_).aggregator().narrow_lanes() ? " narrow=true" : " narrow=false";
     info += " device_memory=" + std::to_string(ctx_of(info_).aggregator().device_memory_bytes());
     info += " store=true";
+    info += " rebuilds=" + std::to_string(gpudb::resident_cache_rebuilds().load()) +
+            "/" + std::to_string(gpudb::resident_lane_rebuilds().load());
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());
@@ -3096,14 +3157,20 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
                 lanes.push_back(gpudb::JoinLane{ref.col, from_build});
                 refs.push_back(ref);
             }
-            if (lanes.size() < 2)
-                throw std::runtime_error(std::string(fn) + ": lanes needs at least a key and a payload");
+            // §4.12: a set only global aggregates read has no key lane at
+            // all — its spec starts at the payload, and the published set's
+            // key points at that same column.
+            const bool nokey = b.managed && no_key_tag(b.tag);
+            const std::size_t first_pred = nokey ? 1 : 2;
+            if (lanes.size() < first_pred)
+                throw std::runtime_error(std::string(fn) + (nokey ? ": lanes needs at least a payload"
+                                                                  : ": lanes needs at least a key and a payload"));
             if (lanes.size() > 66)
                 throw std::runtime_error(std::string(fn) + ": at most 66 output lanes");
-            if (refs[0].kind == 'f') throw std::runtime_error(std::string(fn) + ": the key lane may not be a DOUBLE lane");
-            if (refs[1].kind != 'i') throw std::runtime_error(std::string(fn) + ": the payload lane must be a BIGINT lane");
+            if (!nokey && refs[0].kind == 'f') throw std::runtime_error(std::string(fn) + ": the key lane may not be a DOUBLE lane");
+            if (refs[first_pred - 1].kind != 'i') throw std::runtime_error(std::string(fn) + ": the payload lane must be a BIGINT lane");
             std::size_t n_i = 0, n_f = 0, n_s = 0;
-            for (std::size_t l = 2; l < refs.size(); ++l) {
+            for (std::size_t l = first_pred; l < refs.size(); ++l) {
                 const char k = refs[l].kind;
                 if ((k == 'i' && (n_f || n_s)) || (k == 'f' && n_s))
                     throw std::runtime_error(std::string(fn) + ": predicate lanes must list BIGINT lanes first, then DOUBLE, then VARCHAR");
@@ -3112,17 +3179,23 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
 
             gpudb::JoinMaterializeResult jr;
             {
+                // As for an uploaded join: lane 0 of the RESULT of the last
+                // step is the statement's key and nothing else. An
+                // intermediate's lane 0 is the next step's probe key, and
+                // join_result_tag() says so.
+                const bool key_only = b.managed && join_result_tag(b.tag) && !no_key_tag(b.tag);
+                gpudb::KeyOnlyLanes note(key_only ? std::uint64_t{1} : std::uint64_t{0});
                 auto dev = resident_device_lock(ctx);
                 jr = ctx.aggregator().join_materialize(*pk.col, *bk.col, lanes.data(), lanes.size());
             }
             // dictionaries travel with their lanes
-            b.key_str = refs[0].kind == 's';
+            b.key_str = !nokey && refs[0].kind == 's';
             if (b.key_str) b.dicts.push_back(*refs[0].dict);
-            for (std::size_t l = 2; l < refs.size(); ++l)
+            for (std::size_t l = first_pred; l < refs.size(); ++l)
                 if (refs[l].kind == 's') b.dicts.push_back(*refs[l].dict);
             b.rows_seen = jr.rows_out;
             std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
-            for (std::size_t l = 2; l < jr.lanes.size(); ++l) preds.push_back(std::move(jr.lanes[l]));
+            for (std::size_t l = first_pred; l < jr.lanes.size(); ++l) preds.push_back(std::move(jr.lanes[l]));
             std::vector<std::pair<std::string, std::weak_ptr<ResidentSet>>> deps;
             // A source that is itself a joined set hands down ITS sources:
             // the rows were copied, so the intermediate may be dropped and
@@ -3131,7 +3204,8 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
                 if (src.second->deps.empty()) deps.emplace_back(src.first, src.second);
                 else for (const auto& d : src.second->deps) deps.push_back(d);
             }
-            publish_set(ctx, b, std::move(jr.lanes[0]), std::move(jr.lanes[1]), /*pair*/true, fn,
+            publish_set(ctx, b, nokey ? nullptr : std::move(jr.lanes[0]),
+                        std::move(jr.lanes[first_pred - 1]), /*pair*/true, fn,
                         /*exact*/true, std::move(preds), n_i, n_f, n_s, std::move(deps));
             char buf[512];
             std::snprintf(buf, sizeof(buf),

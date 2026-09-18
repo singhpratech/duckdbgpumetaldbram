@@ -3,6 +3,7 @@
 
 #include "gpu_backend.hpp"
 #include "exact_path_note.hpp"
+#include "resident_shed_note.hpp"
 #include "../../src/backends/groupby_filter.hpp"
 #include "../../src/backends/predicate_mask.hpp"
 
@@ -2729,6 +2730,451 @@ void test_direct_pso_fallback_body() {
 #endif  // GPUDB_HAVE_METAL
 
 // ---------------------------------------------------------------------------
+// Shedding a column's derived structures (docs/RESIDENT_COLUMNS_DESIGN.md §9).
+// Once a key column has a group-id lane and the dispatch rule sends its calls
+// to the direct path, the sort cache is dead weight and, for a column that is
+// a key and nothing else, so is the key lane: dkeys[gid[row]] reproduces it.
+// What this block pins is that neither is ever an answer: every exact form
+// stays bit-identical to the CPU reference over a shed column, a call that
+// wants what was shed rebuilds it exactly once, and the shapes the rule must
+// refuse (a 2-group key, more groups than the id lane holds, an input too
+// small, a device without the direct path) never shed at all.
+// ---------------------------------------------------------------------------
+#if GPUDB_HAVE_METAL
+void test_shed_derived_body();
+
+void test_shed_derived() {
+    std::printf("\n--- resident columns: shedding the sort cache and the key lane ---\n");
+    try {
+        test_shed_derived_body();
+    } catch (const std::exception& e) {
+        std::printf("  skipped (%s)\n", e.what());
+    }
+}
+
+void test_shed_derived_body() {
+    using DT = gpudb::Dtype;
+    const std::size_t cap = std::size_t(100) * 1000000;
+    // Small enough to upload in a moment, large enough that the dispatch rule
+    // admits it once GPUDB_METAL_DIRECT_MIN_WORK says so. The rule is the
+    // real one; only the constant it compares against is lowered, exactly as
+    // the sweeps do.
+    const std::size_t N = 300'003;
+    const std::size_t L = 4;                 // key, payload, second payload, i64 predicate
+
+    auto make_metal = [](const char* path, const char* min_work) {
+        setenv("GPUDB_METAL_GROUPBY_EXACT_PATH", path, 1);
+        if (min_work) setenv("GPUDB_METAL_DIRECT_MIN_WORK", min_work, 1);
+        auto a = gpudb::make_aggregator(gpudb::Backend::METAL);
+        unsetenv("GPUDB_METAL_GROUPBY_EXACT_PATH");
+        unsetenv("GPUDB_METAL_DIRECT_MIN_WORK");
+        return a;
+    };
+
+    // (key, payload, payload2, predicate) with NULLs in the key and the
+    // payload; `distinct` distinct keys, not dense, negative and positive.
+    struct Lanes {
+        std::vector<std::int64_t> flat;
+        std::vector<std::vector<std::uint64_t>> valid;
+        std::vector<const std::uint64_t*> vp;
+    };
+    auto build = [&](std::size_t distinct, bool null_keys) {
+        auto x = std::make_shared<Lanes>();
+        x->flat.resize(N * L);
+        x->valid.assign(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+        for (std::size_t i = 0; i < N; ++i) {
+            const std::size_t g = (i * 2654435761ull + (i >> 5)) % distinct;
+            x->flat[i * L + 0] = static_cast<std::int64_t>(g) * 0x100000001LL - 11;
+            x->flat[i * L + 1] = (std::int64_t{1} << 61) - static_cast<std::int64_t>(i % 1013) * 3;
+            x->flat[i * L + 2] = static_cast<std::int64_t>(i % 251) - 125;
+            x->flat[i * L + 3] = static_cast<std::int64_t>(i % 1000);
+            if (null_keys && i % 29 == 0) x->valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+            if (i % 37 == 0)              x->valid[1][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+        }
+        for (std::size_t l = 0; l < L; ++l) x->vp.push_back(x->valid[l].data());
+        return x;
+    };
+    const DT dts[L] = {DT::I64, DT::I64, DT::I64, DT::I64};
+    auto span_of = [&](const std::shared_ptr<Lanes>& x) {
+        gpudb::Aggregator::RowSpan sp;
+        sp.lanes = x->flat.data(); sp.rows = N; sp.n_lanes = L; sp.valid = x->vp.data();
+        return sp;
+    };
+    auto eq = [&](const gpudb::GroupByResidentResult& a, const gpudb::GroupByResidentResult& b,
+                  const char* what) {
+        const bool ok = a.keys == b.keys && a.key_null == b.key_null && a.sums == b.sums &&
+                        a.sums_hi == b.sums_hi && a.counts == b.counts &&
+                        a.counts_star == b.counts_star && a.mins == b.mins && a.maxs == b.maxs;
+        if (!ok) std::printf("    FAIL %s: the answer differs from the CPU reference\n", what);
+        EXPECT(ok);
+        return ok;
+    };
+
+    auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+    const char* disable = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
+    const std::string disabled = disable ? disable : "";
+
+    // Is the direct path available here at all? (A hosted runner's
+    // virtualised GPU refuses its pipelines; this block then asserts the
+    // opposite — that nothing sheds — and is just as much of a test.)
+    bool have_direct = false;
+    {
+        auto probe = make_metal("auto", "1000");
+        auto x = build(7, false);
+        auto sp = span_of(x);
+        auto c = probe->upload_rows_exact(&sp, 1, dts, L);
+        gpudb::GroupByFilter f;
+        f.columns = 0x0Fu;
+        gpudb::exact_path_note().clear();
+        (void)probe->groupby_exact_resident(*c[0], c[1].get(), cap, f);
+        have_direct = gpudb::exact_path_note() == "direct";
+    }
+    if (!have_direct)
+        std::printf("  the direct path is unavailable here: the assertions below are that "
+                    "nothing sheds (%s)\n", gpudb::exact_path_reason().c_str());
+    // A call that the direct path declines for its own reasons (an optional
+    // pipeline that will not build, under GPUDB_METAL_DIRECT_DISABLE_PSO=masked32)
+    // sheds nothing either, so every byte assertion below asks the path note
+    // what actually ran rather than assuming.
+
+    // ---- what sheds, and what the bytes then are ----
+    // The key is 8 bytes wide (values spread past int32) so the numbers are
+    // the interesting ones: lane 8, sort cache 8 + 4 per valid row, id lane
+    // 1 per row plus the distinct keys.
+    {
+        auto agg = make_metal("auto", "1000");
+        auto x = build(9, true);
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);          // lane 0 is a key and nothing else
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        const std::size_t nulls = cols[0]->null_count();
+        const std::size_t valid = N - nulls;
+        const std::size_t bitmap = ((N + 63) / 64) * 8;
+        // after prepare: lane + bitmap + sort cache + id lane + distinct keys
+        const std::size_t want_prepared = N * 8 + bitmap + valid * (8 + 4) + N * 1 + 9 * 8;
+        const std::size_t prepared_bytes = cols[0]->resident_bytes();
+        if (have_direct && prepared_bytes != want_prepared)
+            std::printf("    FAIL prepared bytes %zu, expected %zu\n", prepared_bytes, want_prepared);
+        EXPECT_EQ(!have_direct || prepared_bytes == want_prepared, true);
+
+        gpudb::GroupByFilter f;
+        f.columns = 0x3Fu;
+        gpudb::exact_path_note().clear();
+        auto got = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        eq(got, want, "first call (nothing shed yet)");
+        // where the path is unavailable this must be the sort path; where it
+        // is available, an optional pipeline may still decline THIS shape
+        EXPECT_EQ(have_direct || gpudb::exact_path_note() == "sort", true);
+
+        const bool direct1 = gpudb::exact_path_note() == "direct";
+        const std::size_t after = cols[0]->resident_bytes();
+        if (direct1) {
+            // the sort cache AND the lane are gone: what is left is the
+            // bitmap, the id lane and the distinct keys
+            const std::size_t want_shed = bitmap + N * 1 + 9 * 8;
+            if (after != want_shed)
+                std::printf("    FAIL shed bytes %zu, expected %zu (was %zu)\n",
+                            after, want_shed, prepared_bytes);
+            EXPECT_EQ(after, want_shed);
+            EXPECT(after < prepared_bytes / 2);
+        } else {
+            EXPECT_EQ(after, prepared_bytes);
+        }
+
+        // ---- every exact form, over the shed column ----
+        gpudb::exact_path_note().clear();
+        auto got2 = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(got2, want, "sum/count/min/max over a shed column");
+        EXPECT_EQ(gpudb::exact_path_note() == (direct1 ? "direct" : "sort"), true);
+        {   // a WHERE mask, and a predicate on a lane that is not the key
+            gpudb::Predicate p{};
+            p.col = cols[3].get(); p.op = gpudb::Predicate::Op::LT; p.value = 640;
+            gpudb::Predicate rp = p; rp.col = rc[3].get();
+            auto g = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), &p, 1, cap, f);
+            auto w = ref_agg->groupby_exact_masked_resident(*rc[0], rc[1].get(), &rp, 1, cap, f);
+            eq(g, w, "masked GROUP BY over a shed column");
+        }
+        {   // several payloads
+            gpudb::MultiPayload mp[2] = {{cols[1].get(), 0x3Fu}, {cols[2].get(), 0x3Fu}};
+            gpudb::MultiPayload rmp[2] = {{rc[1].get(), 0x3Fu}, {rc[2].get(), 0x3Fu}};
+            auto g = agg->groupby_exact_masked_multi(*cols[0], mp, 2, 0, nullptr, 0, cap, f);
+            auto w = ref_agg->groupby_exact_masked_multi(*rc[0], rmp, 2, 0, nullptr, 0, cap, f);
+            EXPECT_EQ(g.size(), w.size());
+            for (std::size_t p = 0; p < g.size() && p < w.size(); ++p)
+                eq(g[p], w[p], "two payloads over a shed column");
+        }
+        {   // HAVING, which reads the group rows the direct pass wrote
+            gpudb::GroupByFilter h;
+            h.agg = gpudb::GroupByFilter::Agg::CountStar;
+            h.cmp = gpudb::GroupByFilter::Cmp::GT;
+            h.threshold_i64 = 1000;
+            h.columns = 0x3Fu;
+            auto g = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, h);
+            auto w = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, h);
+            eq(g, w, "HAVING over a shed column");
+        }
+        EXPECT_EQ(cols[0]->resident_bytes(), after);      // still shed: nothing wanted the lane
+
+        // ---- a call that wants what was shed rebuilds it, once ----
+        // count(*) with no payload at all is the shape the work rule cannot
+        // admit (rows x 0 is 0), so it takes the sort path and needs the
+        // cache — and the cache is built out of the lane.
+        const long c0 = gpudb::resident_cache_rebuilds().load();
+        const long l0 = gpudb::resident_lane_rebuilds().load();
+        {
+            gpudb::GroupByFilter f0;
+            gpudb::exact_path_note().clear();
+            auto g = agg->groupby_exact_resident(*cols[0], nullptr, cap, f0);
+            auto w = ref_agg->groupby_exact_resident(*rc[0], nullptr, cap, f0);
+            const bool ok = g.keys == w.keys && g.key_null == w.key_null &&
+                            g.counts_star == w.counts_star;
+            if (!ok) std::printf("    FAIL count(*) over a shed column\n");
+            EXPECT(ok);
+            EXPECT_EQ(gpudb::exact_path_note() == "sort", true);
+        }
+        auto sort_agg = make_metal("sort", nullptr);
+        gpudb::exact_path_note().clear();
+        auto srt = sort_agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(srt, want, "the sort path over a shed column");
+        EXPECT_EQ(gpudb::exact_path_note() == "sort", true);
+        const long c1 = gpudb::resident_cache_rebuilds().load();
+        const long l1 = gpudb::resident_lane_rebuilds().load();
+        if (direct1) {
+            if (c1 - c0 != 1 || l1 - l0 != 1)
+                std::printf("    FAIL rebuilds: cache %ld, lane %ld (expected 1 each)\n",
+                            c1 - c0, l1 - l0);
+            EXPECT_EQ(c1 - c0, 1L);
+            EXPECT_EQ(l1 - l0, 1L);
+            // both are back, so the column costs what a prepared one costs
+            EXPECT_EQ(cols[0]->resident_bytes(), want_prepared);
+        }
+        // a further sort-path call rebuilds nothing: the rebuild pinned them
+        auto srt2 = sort_agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(srt2, want, "the sort path again");
+        EXPECT_EQ(gpudb::resident_cache_rebuilds().load() - c1, 0L);
+        EXPECT_EQ(gpudb::resident_lane_rebuilds().load() - l1, 0L);
+        // and a direct call may not shed them again
+        gpudb::exact_path_note().clear();
+        auto d3 = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(d3, want, "direct again, after the pin");
+        EXPECT_EQ(!direct1 || cols[0]->resident_bytes() == want_prepared, true);
+        std::printf("  8-byte key, %zu rows, 9 groups: %zu -> %zu bytes, rebuilt to %zu\n",
+                    N, prepared_bytes, after, cols[0]->resident_bytes());
+    }
+
+    // ---- a key that is NOT key-only keeps its lane (a WHERE reads it) ----
+    {
+        auto agg = make_metal("auto", "1000");
+        auto x = build(11, true);
+        auto sp = span_of(x);
+        auto cols = agg->upload_rows_exact(&sp, 1, dts, L);   // no key-only note
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        gpudb::exact_path_note().clear();
+        auto got = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        eq(got, want, "a column that is not key-only");
+        const bool direct = gpudb::exact_path_note() == "direct";
+        const std::size_t nulls = cols[0]->null_count(), valid = N - nulls;
+        const std::size_t bitmap = ((N + 63) / 64) * 8;
+        // the cache goes if the call went direct; the lane stays either way
+        const std::size_t want_bytes = N * 8 + bitmap + (direct ? 0 : valid * 12) +
+                                       (have_direct ? N * 1 + 11 * 8 : 0);
+        if (cols[0]->resident_bytes() != want_bytes)
+            std::printf("    FAIL not key-only: %zu bytes, expected %zu\n",
+                        cols[0]->resident_bytes(), want_bytes);
+        EXPECT_EQ(cols[0]->resident_bytes(), want_bytes);
+    }
+
+    // ---- a key-only column a call READS as a predicate lane keeps its lane ----
+    {
+        auto agg = make_metal("auto", "1000");
+        auto x = build(9, false);
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        gpudb::Predicate p{};                       // WHERE on the GROUP BY key itself
+        p.col = cols[0].get(); p.op = gpudb::Predicate::Op::NE; p.value = -11;
+        gpudb::Predicate rp = p; rp.col = rc[0].get();
+        const long l0 = gpudb::resident_lane_rebuilds().load();
+        auto got = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), &p, 1, cap, f);
+        auto want = ref_agg->groupby_exact_masked_resident(*rc[0], rc[1].get(), &rp, 1, cap, f);
+        eq(got, want, "a WHERE on the key of a key-only column");
+        const std::size_t bitmap = 0;               // no NULL keys in this one
+        (void)bitmap;
+        // the lane is still there (the call read it), the cache is not
+        EXPECT_EQ(cols[0]->resident_bytes() >= N * 8, true);
+        // and reading it did not cost a rebuild: it was never shed
+        EXPECT_EQ(gpudb::resident_lane_rebuilds().load() - l0, 0L);
+    }
+
+    // ---- the shapes that must never shed ----
+    // A 2-group key (the sort path's best case), a key with more distinct
+    // values than the id lane holds, and an input the work rule does not
+    // admit: for each, the column keeps everything it had.
+    struct Refusal { const char* name; std::size_t distinct; const char* min_work; };
+    const Refusal refusals[] = {
+        {"a 2-group key",              2,    "1000"},
+        {"more groups than the lane",  4096, "1000"},
+        {"an input below the work rule", 9,  nullptr},   // the shipping 6,000,000
+    };
+    for (const Refusal& r : refusals) {
+        auto agg = make_metal("auto", r.min_work);
+        auto x = build(r.distinct, false);
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        const std::size_t before = cols[0]->resident_bytes();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        auto got = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        eq(got, want, r.name);
+        if (cols[0]->resident_bytes() != before)
+            std::printf("    FAIL %s: shed %zu bytes and should have shed none\n",
+                        r.name, before - cols[0]->resident_bytes());
+        EXPECT_EQ(cols[0]->resident_bytes(), before);
+        EXPECT(before >= N * 8);
+    }
+
+    // ---- a hash key with NULLs: the lane comes back bit for bit ----
+    // The rebuild reads dkeys[gid[row]], so it has to reproduce every valid
+    // cell exactly — including keys that are 64-bit hashes with the top bits
+    // set, which is what a VARCHAR tuple key looks like.
+    {
+        auto agg = make_metal("auto", "1000");
+        auto x = std::make_shared<Lanes>();
+        x->flat.resize(N * L);
+        x->valid.assign(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+        const std::int64_t hashes[6] = {
+            static_cast<std::int64_t>(0x9E3779B97F4A7C15ull), static_cast<std::int64_t>(0xC2B2AE3D27D4EB4Full),
+            static_cast<std::int64_t>(0x165667B19E3779F9ull), static_cast<std::int64_t>(0x27D4EB2F165667C5ull),
+            static_cast<std::int64_t>(0x85EBCA77C2B2AE63ull), static_cast<std::int64_t>(0x0000000100000001ull)};
+        for (std::size_t i = 0; i < N; ++i) {
+            x->flat[i * L + 0] = hashes[i % 6];
+            x->flat[i * L + 1] = static_cast<std::int64_t>(i % 9973) - 5000;
+            x->flat[i * L + 2] = static_cast<std::int64_t>(i % 251) - 125;
+            x->flat[i * L + 3] = static_cast<std::int64_t>(i % 1000);
+            if (i % 23 == 0) x->valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+        }
+        for (std::size_t l = 0; l < L; ++l) x->vp.push_back(x->valid[l].data());
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        gpudb::exact_path_note().clear();
+        auto got = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(got, want, "a 64-bit hash key with NULLs");
+        const bool shed = cols[0]->resident_bytes() < N * 8;
+        EXPECT_EQ(shed, gpudb::exact_path_note() == "direct");
+        // force the lane back through the sort path and compare again
+        auto sort_agg = make_metal("sort", nullptr);
+        auto srt = sort_agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        eq(srt, want, "a rebuilt hash key lane, through the sort path");
+        // the rebuilt lane is the sorted keys' only source, so every distinct
+        // cell came back bit for bit; a NULL cell is never read (stage A).
+        EXPECT_EQ(srt.keys.size(), want.keys.size());
+    }
+
+    // ---- two threads on one shed column, one forcing each path ----
+    // The shed, the rebuild and the reads are all guarded; what this asserts
+    // is that neither thread ever sees half a structure and that both
+    // answers are the reference's.
+    {
+        auto agg = make_metal("auto", "1000");
+        auto sort_agg = make_metal("sort", nullptr);
+        auto x = build(13, true);
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        (void)agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);   // sheds
+        std::atomic<int> bad{0};
+        std::atomic<bool> go{false};
+        auto run = [&](gpudb::Aggregator* a, int rounds) {
+            while (!go.load()) std::this_thread::yield();
+            for (int i = 0; i < rounds; ++i) {
+                try {
+                    auto g = a->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+                    if (!(g.keys == want.keys && g.sums == want.sums && g.sums_hi == want.sums_hi &&
+                          g.counts == want.counts && g.counts_star == want.counts_star &&
+                          g.mins == want.mins && g.maxs == want.maxs))
+                        bad.fetch_add(1);
+                } catch (const std::exception&) {
+                    bad.fetch_add(1);
+                }
+            }
+        };
+        // The operators keep per-aggregator scratch, so each thread drives its
+        // own aggregator — what they share is the column.
+        std::thread t1(run, sort_agg.get(), 6);
+        std::thread t2(run, agg.get(), 6);
+        go.store(true);
+        t1.join();
+        t2.join();
+        if (bad.load()) std::printf("    FAIL %d concurrent answers differed or threw\n", bad.load());
+        EXPECT_EQ(bad.load(), 0);
+    }
+
+    // ---- a device without the direct path never sheds ----
+    // GPUDB_METAL_DIRECT_DISABLE_PSO=unsupported is the capability gate's
+    // device: nothing is offered to it, no id lane is built, and a column
+    // therefore keeps its lane and its cache whatever the calls are.
+    if (disabled == "unsupported") {
+        auto agg = make_metal("auto", "1000");
+        auto x = build(9, true);
+        auto sp = span_of(x);
+        std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols;
+        {
+            gpudb::KeyOnlyLanes note(1);
+            cols = agg->upload_rows_exact(&sp, 1, dts, L);
+        }
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        cols[0]->prepare();
+        const std::size_t before = cols[0]->resident_bytes();
+        gpudb::GroupByFilter f; f.columns = 0x3Fu;
+        gpudb::exact_path_note().clear();
+        auto got = agg->groupby_exact_resident(*cols[0], cols[1].get(), cap, f);
+        auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        eq(got, want, "the capability gate's device");
+        EXPECT_EQ(gpudb::exact_path_note() == "sort", true);
+        EXPECT_EQ(cols[0]->resident_bytes(), before);
+        EXPECT(before >= N * 8);
+        std::printf("  the direct path is unavailable: %zu bytes kept\n", before);
+    }
+}
+#endif  // GPUDB_HAVE_METAL
+
+// ---------------------------------------------------------------------------
 // ResidentColumn::prepare() (v0.7 milestone 0b, docs/TRANSPARENT_DESIGN.md
 // §5.5/§5.6): ready = uploaded AND prepared; prepare is idempotent, safe to
 // call concurrently with itself and with uploads on other threads, and
@@ -2881,6 +3327,9 @@ int main(int argc, char** argv) {
     test_hybrid_groupby();
 #if GPUDB_HAVE_METAL
     test_direct_groupby();
+    // before test_direct_pso_fallback: that block ends by unsetting
+    // GPUDB_METAL_DIRECT_DISABLE_PSO, and this one reads it
+    test_shed_derived();
     test_direct_pso_fallback();
 #endif
     test_resident_prepare();

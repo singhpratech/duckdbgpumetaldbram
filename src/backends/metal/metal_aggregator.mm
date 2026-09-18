@@ -17,6 +17,7 @@
 
 #include "gpu_backend.hpp"
 #include "exact_path_note.hpp"
+#include "resident_shed_note.hpp"
 #include "../groupby_filter.hpp"
 #include "metal_kernel_sources.hpp"
 #include "metal_radix_sort.hpp"
@@ -86,6 +87,25 @@ inline std::int64_t load_w(const void* base, unsigned w, std::size_t i) {
         case 2:  return static_cast<const std::int16_t*>(base)[i];
         case 4:  return static_cast<const std::int32_t*>(base)[i];
         default: return static_cast<const std::int64_t*>(base)[i];
+    }
+}
+// A rebuild of something a column shed (§9) is the one cost of that design
+// and should be rare, so it says so under the exact path's own trace flag.
+inline bool shed_trace() {
+    static const bool on = std::getenv("GPUDB_METAL_TRACE_EXACT") != nullptr;
+    return on;
+}
+
+// The two halves of a key column's sort cache. They are only ever read
+// together, so they travel together (MetalResidentColumn::sort_view).
+struct SortView { id<MTLBuffer> keys = nil, perm = nil; };
+
+inline void store_w(void* base, unsigned w, std::size_t i, std::int64_t v) {
+    switch (w) {
+        case 1:  static_cast<std::int8_t*>(base)[i]  = static_cast<std::int8_t>(v);  break;
+        case 2:  static_cast<std::int16_t*>(base)[i] = static_cast<std::int16_t>(v); break;
+        case 4:  static_cast<std::int32_t*>(base)[i] = static_cast<std::int32_t>(v); break;
+        default: static_cast<std::int64_t*>(base)[i] = v;                            break;
     }
 }
 // The narrowest signed width holding [mn, mx], boundaries inclusive. A lane
@@ -351,7 +371,7 @@ public:
             // by every statement that joins on this key)
             id<MTLBuffer> sorted = nil, perm = nil;
             const std::size_t nb = bk.sort_rows();
-            if (nb) { bk.build_sort_cache(&kernel_ms); sorted = bk.sorted_cache(); perm = bk.perm_cache(); }
+            if (nb) { auto sv = bk.ensure_sort_view(&kernel_ms); sorted = sv.keys; perm = sv.perm; }
 
             const std::size_t n = pk.rows();
             std::size_t n1 = 0, n2 = 0;
@@ -488,6 +508,7 @@ public:
                 kernel_ms += cb_kernel_ms(cb);
             }
             r.lanes.reserve(n_out);
+            const std::uint64_t key_only = key_only_lanes_note();
             for (std::size_t l = 0; l < n_out; ++l) {
                 const auto* w = static_cast<const std::uint64_t*>([vbits[l] contents]);
                 std::size_t set = 0;
@@ -498,7 +519,8 @@ public:
                 }
                 const std::size_t nulls = rows_out - set;
                 r.lanes.push_back(std::make_unique<MetalResidentColumn>(
-                    data[l], rows_out, out[l].col->dtype(), sort_ctx_, nulls == 0 ? nil : vbits[l], nulls, out_w[l]));
+                    data[l], rows_out, out[l].col->dtype(), sort_ctx_, nulls == 0 ? nil : vbits[l], nulls, out_w[l],
+                    l < 64 && ((key_only >> l) & 1u) != 0));
             }
             r.rows_out = rows_out;
             r.null_key_rows = n2;
@@ -615,11 +637,9 @@ public:
     // this is the lazy path an operator takes when the column was not
     // prepared. Sort cost is reported through *sort_kernel_ms on the call
     // that pays it; later calls reuse the cache for free.
-    id<MTLBuffer> ensure_sorted_cache(const ResidentColumn& build_col,
-                                      double* sort_kernel_ms) {
-        const auto& bk = check_i64(build_col);
-        bk.build_sort_cache(sort_kernel_ms);
-        return bk.sorted_cache();
+    SortView ensure_sorted_cache(const ResidentColumn& build_col,
+                                                      double* sort_kernel_ms) {
+        return check_i64(build_col).ensure_sort_view(sort_kernel_ms);
     }
 
     JoinAggResult join_sum_resident_i64(const ResidentColumn& probe_keys,
@@ -648,7 +668,7 @@ public:
                 throw std::runtime_error("join_sum_resident_i64: > 2^32 rows unsupported");
 
             double sort_kernel_ms = 0.0;
-            id<MTLBuffer> sorted = ensure_sorted_cache(bk, &sort_kernel_ms);
+            id<MTLBuffer> sorted = ensure_sorted_cache(bk, &sort_kernel_ms).keys;
 
             const NSUInteger grid = pick_grid(pk.rows());
             const std::uint32_t np32 = static_cast<std::uint32_t>(pk.rows());
@@ -729,7 +749,7 @@ public:
                 throw std::runtime_error("join_sum_resident_f64: > 2^32 rows unsupported");
 
             double sort_kernel_ms = 0.0;
-            id<MTLBuffer> sorted_buf = ensure_sorted_cache(bk, &sort_kernel_ms);
+            id<MTLBuffer> sorted_buf = ensure_sorted_cache(bk, &sort_kernel_ms).keys;
             const std::size_t n_probe = pk.rows();
             const std::size_t n_build = bk.rows();
 
@@ -829,8 +849,9 @@ public:
                 throw std::runtime_error("join_rows_resident: > 2^32 rows unsupported");
 
             double sort_kernel_ms = 0.0;
-            id<MTLBuffer> sorted_buf = ensure_sorted_cache(bk, &sort_kernel_ms);
-            id<MTLBuffer> perm_buf   = bk.perm_cache();
+            auto bk_cache = ensure_sorted_cache(bk, &sort_kernel_ms);
+            id<MTLBuffer> sorted_buf = bk_cache.keys;
+            id<MTLBuffer> perm_buf   = bk_cache.perm;
 
             // Stage 1 (GPU): match count + first sorted position per probe.
             const std::size_t u32_bytes = n_probe * sizeof(std::uint32_t);
@@ -1007,12 +1028,13 @@ public:
                 throw std::runtime_error("topk_resident: > 2^32 rows unsupported");
 
             double sort_kernel_ms = 0.0;
+            SortView cv;
             if (c.dtype() == Dtype::I64) {
-                ensure_sorted_cache(c, &sort_kernel_ms);
+                cv = ensure_sorted_cache(c, &sort_kernel_ms);
             } else {
-                ensure_sorted_cache_f64(c, &sort_kernel_ms);
+                cv = ensure_sorted_cache_f64(c, &sort_kernel_ms);
             }
-            const auto* perm = static_cast<const std::uint32_t*>([c.perm_cache() contents]);
+            const auto* perm = static_cast<const std::uint32_t*>([cv.perm contents]);
             r.idx.resize(kk);
             for (std::size_t i = 0; i < kk; ++i)
                 r.idx[i] = static_cast<std::int64_t>(descending ? perm[n - 1 - i] : perm[i]);
@@ -1050,14 +1072,21 @@ private:
         // min / max over its valid cells.
         MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt,
                             std::shared_ptr<SortCtx> ctx,
-                            id<MTLBuffer> valid, std::size_t nulls, unsigned width = 8)
+                            id<MTLBuffer> valid, std::size_t nulls, unsigned width = 8,
+                            bool key_only = false)
             : buf_(buf), rows_(n), dtype_(dt), ctx_(std::move(ctx)),
-              valid_(valid), nulls_(nulls), width_(dt == Dtype::F64 ? 8u : width) {}
+              valid_(valid), nulls_(nulls), width_(dt == Dtype::F64 ? 8u : width),
+              key_only_(key_only) {}
         Backend     backend_tag() const noexcept override { return Backend::METAL; }
         Dtype       dtype()       const noexcept override { return dtype_; }
         std::size_t rows()        const noexcept override { return rows_; }
         std::size_t null_count()  const noexcept override { return nulls_; }
-        id<MTLBuffer> buffer()    const noexcept { return buf_; }
+        // The lane. Shed columns (shed_lane below) rebuild it here, so every
+        // reader gets the values whatever the column is holding at the time;
+        // the returned buffer is retained by the caller (ARC) and by any
+        // command buffer it is bound to, so a concurrent shed cannot pull it
+        // out from under a running kernel.
+        id<MTLBuffer> buffer()    const { return ensure_lane(); }
         id<MTLBuffer> valid_buffer() const noexcept { return valid_; }
         unsigned    width()       const noexcept { return width_; }
         // The sorted keys keep the column's width; the F64 cache holds the
@@ -1084,11 +1113,15 @@ private:
                 if (ctx_->on_prepare) ctx_->on_prepare(*this);
             }
         }
+        // A column that shed its sort cache on purpose is prepared: what it
+        // keeps derived — the group-id lane the direct path reads — is built,
+        // and the cache comes back by itself if a call ever wants it again.
         bool prepared() const noexcept override {
-            return sort_rows() == 0 || ready_.load(std::memory_order_acquire);
+            return sort_rows() == 0 || ready_.load(std::memory_order_acquire) ||
+                   cache_shed_.load(std::memory_order_acquire);
         }
         std::size_t resident_bytes() const noexcept override {
-            const std::size_t base = rows_ * width_;                 // the real storage width
+            const std::size_t base = lane_shed_.load(std::memory_order_acquire) ? 0 : rows_ * width_;
             const std::size_t bitmap = valid_ ? [valid_ length] : 0;
             const std::size_t cache = sort_rows() * (sort_width() + sizeof(std::uint32_t));
             std::size_t gid = 0;
@@ -1122,15 +1155,111 @@ private:
         // greatest, as native DuckDB orders doubles) and the permutation as
         // u32 row ids; nil until built. Backend-private, dies with the column,
         // exempt from the host pool cap.
-        id<MTLBuffer> sorted_cache() const noexcept {
-            return ready_.load(std::memory_order_acquire) ? sorted_ : nil;
+        //
+        // The two halves are ALWAYS read together — a caller holding one and
+        // not the other would gather through a permutation that does not
+        // belong to its keys — so they are taken under the cache lock as one
+        // view. ensure_sort_view builds the cache and re-reads it afterwards,
+        // which is what makes a shed racing with a reader harmless: the reader
+        // either sees the whole cache or builds it again.
+        SortView sort_view() const {
+            std::lock_guard<std::mutex> lock(cache_mu_);
+            if (!ready_.load(std::memory_order_relaxed)) return SortView{};
+            return SortView{sorted_, perm_};
         }
-        id<MTLBuffer> perm_cache() const noexcept {
-            return ready_.load(std::memory_order_acquire) ? perm_ : nil;
+        SortView ensure_sort_view(double* sort_kernel_ms) const {
+            if (sort_rows() == 0) return SortView{};
+            for (;;) {
+                build_sort_cache(sort_kernel_ms);
+                SortView v = sort_view();
+                if (v.keys && v.perm) return v;
+                // A shed landed between the build and the read. That build
+                // pinned the cache, so this cannot go round more than twice.
+            }
+        }
+        id<MTLBuffer> sorted_cache() const { return sort_view().keys; }
+        id<MTLBuffer> perm_cache()   const { return sort_view().perm; }
+
+        // ---- shedding a derived structure (docs/RESIDENT_COLUMNS_DESIGN.md §9) ----
+        // Is this column nothing but a GROUP BY key? Decided by the NAME the
+        // extension gave the lane (resident_shed_note.hpp), not by what calls
+        // have so far happened to do with it.
+        bool key_only()   const noexcept { return key_only_; }
+        bool cache_shed() const noexcept { return cache_shed_.load(std::memory_order_acquire); }
+        bool lane_shed()  const noexcept { return lane_shed_.load(std::memory_order_acquire); }
+
+        // Release the sort cache. Only ever called on a column whose group-id
+        // lane answers every call the dispatch rule would send to this column
+        // (MetalAggregator::maybe_shed decides that); a call that wants the
+        // cache anyway rebuilds it and pins it, so a column pays that sort at
+        // most once.
+        void shed_sort_cache() const {
+            if (cache_pinned_.load(std::memory_order_acquire)) return;
+            std::lock_guard<std::mutex> lock(cache_mu_);
+            if (!ready_.load(std::memory_order_relaxed)) return;
+            ready_.store(false, std::memory_order_release);
+            sorted_ = nil;
+            perm_   = nil;
+            cache_shed_.store(true, std::memory_order_release);
+        }
+        // Release the key lane itself: `key[row] = dkeys[gid[row]]`, so the
+        // group-id lane and the distinct keys reproduce it. Refused unless the
+        // lane is a key and nothing else, and unless that lane exists.
+        void shed_lane() const {
+            if (!key_only_ || lane_pinned_.load(std::memory_order_acquire)) return;
+            if (gid_state_.load(std::memory_order_acquire) != kGidReady) return;
+            std::lock_guard<std::mutex> lock(lane_mu_);
+            if (lane_shed_.load(std::memory_order_relaxed)) return;
+            buf_ = nil;
+            lane_shed_.store(true, std::memory_order_release);
+        }
+
+        // The lane, rebuilt from the group-id lane if it was shed. Pins the
+        // lane afterwards: a column something reads as values is a column the
+        // shed rule misread, and one rebuild per column is the price of being
+        // wrong. Counted where the tests can see it.
+        id<MTLBuffer> ensure_lane() const {
+            if (!lane_shed_.load(std::memory_order_acquire)) return buf_;
+            std::lock_guard<std::mutex> lock(lane_mu_);
+            if (!lane_shed_.load(std::memory_order_relaxed)) return buf_;
+            @autoreleasepool {
+                id<MTLDevice> dev = ctx_ ? ctx_->device : nil;
+                if (!dev) throw std::runtime_error("resident key lane: the column has no device to rebuild on");
+                id<MTLBuffer> b = [dev newBufferWithLength:std::max<std::size_t>(1, rows_ * width_)
+                                                   options:MTLResourceStorageModeShared];
+                if (!b) throw std::runtime_error("resident key lane: device allocation failed (Metal)");
+                // A NULL-key row's cell is written zero: every reader of this
+                // lane gates on the validity bitmap (stage A), so the value
+                // under a zero bit is never part of an answer.
+                const void* ids = [gid_ contents];
+                const void* dk  = [dkeys_ contents];
+                void* dst = [b contents];
+                const unsigned gw = gid_width_, w = width_;
+                const std::size_t groups = gid_groups_;
+                for (std::size_t i = 0; i < rows_; ++i) {
+                    const std::size_t g = gw == 1 ? static_cast<std::size_t>(static_cast<const std::uint8_t*>(ids)[i])
+                                                  : static_cast<std::size_t>(static_cast<const std::uint16_t*>(ids)[i]);
+                    const std::int64_t v = g < groups ? load_w(dk, w, g) : 0;
+                    store_w(dst, w, i, v);
+                }
+                buf_ = b;
+                lane_shed_.store(false, std::memory_order_release);
+                lane_pinned_.store(true, std::memory_order_release);
+                resident_lane_rebuilds().fetch_add(1, std::memory_order_relaxed);
+                if (shed_trace())
+                    std::fprintf(stderr, "[gpudb metal exact] key lane rebuilt: %zu rows, %zu groups, width %u\n",
+                                 rows_, gid_groups_, width_);
+            }
+            return buf_;
         }
 
         void build_sort_cache(double* sort_kernel_ms) const {
             if (sort_rows() == 0 || ready_.load(std::memory_order_acquire)) return;
+            // The lane first, outside the cache lock: a shed column sorts the
+            // values it rebuilds, and the lock order is cache_mu_ -> lane_mu_
+            // everywhere.
+            id<MTLBuffer> lane = ensure_lane();
+            const bool rebuilt = cache_shed_.load(std::memory_order_acquire);
             std::lock_guard<std::mutex> lock(cache_mu_);
             if (ready_.load(std::memory_order_relaxed)) return;   // lost the race: built
             if (rows_ > 0xFFFFFFFFull)
@@ -1157,20 +1286,20 @@ private:
                     tk.resize(n); tidx.resize(n);
                     std::size_t o = 0;
                     if (dtype_ == Dtype::I64) {
-                        const void* d = [buf_ contents];
+                        const void* d = [lane contents];
                         for (std::size_t i = 0; i < rows_; ++i)
                             if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = load_w(d, width_, i); tidx[o] = static_cast<std::int64_t>(i); ++o; }
                     } else {
-                        const auto* d = static_cast<const double*>([buf_ contents]);
+                        const auto* d = static_cast<const double*>([lane contents]);
                         for (std::size_t i = 0; i < rows_; ++i)
                             if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = image(d[i]); tidx[o] = static_cast<std::int64_t>(i); ++o; }
                     }
                     if (o != n) throw std::runtime_error("resident sort cache: validity bitmap and null_count disagree");
                     keys = tk.data(); idx = tidx.data();
                 } else if (dtype_ == Dtype::I64) {
-                    keys = [buf_ contents]; keys_w = width_;   // the sorter widens while it stages
+                    keys = [lane contents]; keys_w = width_;   // the sorter widens while it stages
                 } else {
-                    const auto* d = static_cast<const double*>([buf_ contents]);
+                    const auto* d = static_cast<const double*>([lane contents]);
                     tk.resize(n);
                     for (std::size_t i = 0; i < n; ++i) tk[i] = image(d[i]);
                     keys = tk.data();
@@ -1194,11 +1323,20 @@ private:
                 sorted_ = sorted;
                 perm_   = perm;
                 ready_.store(true, std::memory_order_release);
+                if (rebuilt) {
+                    // a cache this column had shed: it is pinned from here, and
+                    // the rebuild is counted where the tests can read it
+                    cache_pinned_.store(true, std::memory_order_release);
+                    resident_cache_rebuilds().fetch_add(1, std::memory_order_relaxed);
+                    if (shed_trace())
+                        std::fprintf(stderr, "[gpudb metal exact] sort cache rebuilt: %zu rows, %zu groups, "
+                                     "width %u, %.3f ms\n", rows_, gid_groups_, width_, ms);
+                }
                 *sort_kernel_ms += ms;
             }
         }
     private:
-        id<MTLBuffer> buf_;
+        mutable id<MTLBuffer> buf_;               // nil while the lane is shed
         std::size_t   rows_;
         Dtype         dtype_;
         std::shared_ptr<SortCtx> ctx_;
@@ -1215,14 +1353,23 @@ private:
         mutable id<MTLBuffer>    dkeys_ = nil;
         mutable unsigned         gid_width_  = 1;
         mutable std::size_t      gid_groups_ = 0;
+        // Shedding (§9): what was released, and what may never be released
+        // again because a call asked for it back.
+        bool                      key_only_ = false;
+        mutable std::mutex        lane_mu_;        // guards the lane's release and rebuild
+        mutable std::atomic<bool> lane_shed_{false};
+        mutable std::atomic<bool> lane_pinned_{false};
+        mutable std::atomic<bool> cache_shed_{false};
+        mutable std::atomic<bool> cache_pinned_{false};
     };
 
     enum class GbMode { SumI64, SumF64, Count };
 
     // F64 sort cache (top-k by value): built on the column, see
     // MetalResidentColumn::build_sort_cache.
-    void ensure_sorted_cache_f64(const MetalResidentColumn& c, double* sort_kernel_ms) {
-        c.build_sort_cache(sort_kernel_ms);
+    SortView ensure_sorted_cache_f64(const MetalResidentColumn& c,
+                                                          double* sort_kernel_ms) {
+        return c.ensure_sort_view(sort_kernel_ms);
     }
 
     // Output buffer aliasing a std::vector's storage when it is page-aligned
@@ -1584,8 +1731,9 @@ private:
             throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
 
         double kernel_ms = 0.0;
-        id<MTLBuffer> sorted = ensure_sorted_cache(k, &kernel_ms);
-        id<MTLBuffer> perm   = k.perm_cache();
+        auto k_cache = ensure_sorted_cache(k, &kernel_ms);
+        id<MTLBuffer> sorted = k_cache.keys;
+        id<MTLBuffer> perm   = k_cache.perm;
         const std::uint32_t n32 = static_cast<std::uint32_t>(n);
         const std::uint32_t kw = k.sort_width(), kzero = 0u;
         const std::size_t nblocks = (n + kBlock - 1) / kBlock;
@@ -1963,6 +2111,9 @@ private:
             narrow_lanes(bufs, widths, rows, "upload_rows_exact");
             std::vector<std::unique_ptr<ResidentColumn>> out;
             out.reserve(n_lanes);
+            // Which of these lanes is nothing but a GROUP BY key: the caller
+            // knows the names, this backend does not (resident_shed_note.hpp).
+            const std::uint64_t key_only = key_only_lanes_note();
             for (std::size_t l = 0; l < n_lanes; ++l) {
                 id<MTLBuffer> vb = nil;
                 if (nulls[l]) {
@@ -1971,7 +2122,9 @@ private:
                                             options:MTLResourceStorageModeShared];
                     if (!vb) throw std::runtime_error("upload_rows_exact: validity allocation failed (Metal)");
                 }
-                out.push_back(std::make_unique<MetalResidentColumn>(bufs[l], rows, dtypes[l], sort_ctx_, vb, nulls[l], widths[l]));
+                out.push_back(std::make_unique<MetalResidentColumn>(
+                    bufs[l], rows, dtypes[l], sort_ctx_, vb, nulls[l], widths[l],
+                    l < 64 && ((key_only >> l) & 1u) != 0));
             }
             return out;
         }
@@ -2278,8 +2431,8 @@ private:
         std::lock_guard<std::mutex> dlock(dir_mu_);
         @autoreleasepool {
             const std::size_t rows = k.rows(), n = k.sort_rows();
-            if (n > 0) k.build_sort_cache(kernel_ms);
-            id<MTLBuffer> sorted = k.sorted_cache(), perm = k.perm_cache();
+            auto kv = n > 0 ? k.ensure_sort_view(kernel_ms) : SortView{};
+            id<MTLBuffer> sorted = kv.keys, perm = kv.perm;
             if (n > 0 && (!sorted || !perm)) { k.set_gid_none(); return false; }
             const std::uint32_t kw = static_cast<std::uint32_t>(k.sort_width());
             const std::uint32_t n32 = static_cast<std::uint32_t>(n);
@@ -2508,6 +2661,46 @@ private:
             }
         }
         return true;
+    }
+
+    // ---- shedding, after a call the direct path answered (§9) ----
+    // What the direct path reads of a key column is its group-id lane and the
+    // distinct keys; the sort cache it needed to BUILD that lane is dead
+    // weight from then on — 12 bytes a row for an 8-byte key — and for a
+    // column that is nothing but a key the lane itself is too, because
+    // `key[row] = dkeys[gid[row]]`.
+    //
+    // Releasing them is safe at any time (either comes back on demand) but it
+    // is only WORTH it when the next call on this column will take the direct
+    // path as well, so the rule is the dispatch rule (direct_plan) evaluated
+    // at the LEAST work a call can bring — one payload, no WHERE term:
+    //
+    //     groups in [direct_min_groups_, direct_max_groups_]  AND  rows >= direct_min_work_
+    //
+    // A 2-group key, a key above the group limit, a small input and a device
+    // where the direct path is unavailable therefore never shed, because for
+    // them the sort path is where calls go. The forms the direct path declines
+    // per call — a payload shape beyond the slab, min / max on a lane wider
+    // than 4 bytes, top-k by key, a join build side — are what the rebuild is
+    // for; a build side cannot reach here at all, since a unique key with at
+    // most direct_max_groups_ distinct values has at most that many rows and
+    // the row rule needs millions.
+    //
+    // The key LANE additionally needs the column to be a key by its name
+    // (key_only()) and needs THIS call not to have read it as a payload or a
+    // predicate lane — a WHERE on the GROUP BY key is an ordinary shape, and a
+    // set whose statement has one keeps its lane from the first call instead
+    // of rebuilding it.
+    void maybe_shed(const MetalResidentColumn& k, const DirectPlan& pl) {
+        if (!direct_available()) return;
+        if (k.gid_state() != MetalResidentColumn::kGidReady) return;
+        const std::size_t n_groups = k.gid_groups() + (k.null_count() ? 1 : 0);
+        if (n_groups < direct_min_groups_ || n_groups > direct_max_groups_) return;
+        if (k.rows() < direct_min_work_) return;
+        k.shed_sort_cache();
+        if (!k.key_only()) return;
+        for (const auto* c : pl.lane) if (c == &k) return;
+        k.shed_lane();
     }
 
     // Threadgroups for the direct pass. Enough to saturate the device, few
@@ -2772,8 +2965,10 @@ private:
                         throw std::runtime_error(std::string(op) + ": several payloads under a filter need the keys");
                     exact_path_note() = "direct";
                     exact_path_reason().clear();
-                    return direct_impl(k, v, n_preds, max_groups, filter, op, pl,
-                                       extras, n_extras, extra_out, t_wall0, dir_ms);
+                    GroupByResidentResult r2 = direct_impl(k, v, n_preds, max_groups, filter, op, pl,
+                                                           extras, n_extras, extra_out, t_wall0, dir_ms);
+                    maybe_shed(k, pl);
+                    return r2;
                 }
             }
             exact_path_note() = "sort";
@@ -2784,9 +2979,9 @@ private:
             double kernel_ms = 0.0;
             id<MTLBuffer> sorted = nil, perm = nil;
             if (n > 0) {
-                k.build_sort_cache(&kernel_ms);
-                sorted = k.sorted_cache();
-                perm   = k.perm_cache();
+                auto kv = k.ensure_sort_view(&kernel_ms);
+                sorted = kv.keys;
+                perm   = kv.perm;
             }
 
             // ---- key predicates → a contiguous range of the sort cache ----

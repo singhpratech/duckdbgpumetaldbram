@@ -77,3 +77,20 @@ SELECT * FROM gpu_agg_exact_global('g', '', 'v');
 -- 11. The build reports the capability
 SELECT gpu_build_info() LIKE '%global=true%' AS has_global;
 -- expect: true
+
+-- 12. A set only global aggregates read carries NO key lane, over a join too
+--     (§4.12, docs/RESIDENT_COLUMNS_DESIGN.md §9). Lane 0 of the tag is '-':
+--     the upload's key slot arrives NULL, the set drops it and points its key
+--     at the payload, so nothing is stored or sorted for a key that has no
+--     reader. Same answer, fewer bytes, and the set is ready without a sort.
+-- setup: CREATE TABLE gj AS SELECT CAST(i AS BIGINT) AS k, CAST(i % 1000 AS BIGINT) AS a, CAST(i % 7 AS BIGINT) AS b FROM range(200000) t(i)
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:gj:7001:k,a,b:joinu-11111111', k, a, [b], []) FROM gj
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:gj:7002:-,a,b:joinu-22222222', CAST(NULL AS BIGINT), a, [b], []) FROM gj
+SELECT (SELECT count(*) FROM ((SELECT count_star, sum0, count0, min0, max0 FROM gpu_agg_exact_global('gpudb:v1:memory:main:gj:7002:-,a,b:joinu-22222222', 'i0 = 3', 'v')) EXCEPT (SELECT count(*), sum(a), count(a), min(a), max(a) FROM gj WHERE b = 3))) AS mismatches, (SELECT count_star FROM gpu_agg_exact_global('gpudb:v1:memory:main:gj:7001:k,a,b:joinu-11111111', 'i0 = 3', 'v')) - (SELECT count_star FROM gpu_agg_exact_global('gpudb:v1:memory:main:gj:7002:-,a,b:joinu-22222222', 'i0 = 3', 'v')) AS same_count, (SELECT bytes FROM gpu_residents() WHERE name LIKE '%joinu-11111111') > (SELECT bytes FROM gpu_residents() WHERE name LIKE '%joinu-22222222') AS keyless_is_smaller, (SELECT state FROM gpu_residents() WHERE name LIKE '%joinu-22222222') AS keyless_state, (SELECT rows FROM gpu_residents() WHERE name LIKE '%joinu-22222222') AS keyless_rows;
+-- expect: 0  0  true  ready  200000
+
+-- 13. The keyless set still answers to its table's staleness guard
+-- setup: CREATE TABLE gj AS SELECT CAST(i AS BIGINT) AS a, CAST(i % 7 AS BIGINT) AS b FROM range(1000) t(i)
+-- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:gj:7003:-,a,b:joinu-33333333', CAST(NULL AS BIGINT), a, [b], []) FROM gj
+-- expected_fail: GPUDB_STALE
+SELECT gpu_assert_rows('gpudb:v1:memory:main:gj:7003:-,a,b:joinu-33333333', 999);

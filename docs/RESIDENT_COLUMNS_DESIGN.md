@@ -406,3 +406,136 @@ in probe order, so the reads are sequential runs); the CPU reference does the
 same, and the parity tests compare them. Chunks (appends, tables above the
 budget) come with the same stage: an index vector already addresses rows by
 id, and a chunk is a range of ids.
+
+## 9. Shedding — a derived structure a column stops needing
+
+Every structure §7 added is derived: the sort cache is derived from the lane,
+the group-id lane and its distinct keys are derived from the sort cache. Once
+the direct reduce runs, the derivation runs backwards too — `key[row] =
+dkeys[gid[row]]` — so a column that the dispatch rule keeps sending to the
+direct path can release what the direct path does not read and rebuild it if
+anything ever asks.
+
+Two things can go, and they are the ones the memory is in:
+
+| released | costs today | needed by |
+|---|---|---|
+| the sort cache (`sorted_` + `perm_`) | `sort_width + 4` per valid row — 12 bytes for an 8-byte key | the sort path: the run starts, the permutation gathers, the key-range binary search, top-k, a join build side |
+| the key lane itself | the storage width per row — 8 bytes for a hash key | every read of the key AS A VALUE: a WHERE on the GROUP BY key, a payload over it, the sort cache's own build |
+
+**When.** The decision is made at the end of a call the direct path answered,
+because that is the only moment the backend knows both the column and the shape
+of the calls it serves. The rule is the dispatch rule (§7) evaluated at the
+LEAST work a call can bring — one payload, no WHERE term:
+
+    groups in [3, 512]   AND   rows >= 6,000,000
+
+(`GPUDB_METAL_DIRECT_MIN_GROUPS` / `_MAX_GROUPS` / `_MIN_WORK`, the same
+constants the dispatch rule reads). So a 2-group key does not shed — the sort
+path's reduce over two runs is its best case and that is where its calls go; a
+key above the id lane's limit has no id lane to rebuild from and does not shed;
+an input below the work rule does not shed, because its next call takes the sort
+path too; and a device where the direct path is unavailable never sheds, since
+no call ever reaches the decision. The forms the direct path declines per call —
+a payload shape beyond the slab, `min` / `max` on a lane wider than 4 bytes,
+top-k by key, `count(*)` with no payload at all — are what the rebuild is for.
+
+A join BUILD side cannot reach the rule at all, and that is a proof rather than
+a hope: a build key is unique among its valid cells, so a column with at most
+512 distinct values has at most 512 valid rows, and the row rule needs millions.
+
+**The key lane needs one more thing: that it is a key and nothing else.** That
+is a fact about the NAME the extension gave the lane, so the extension says it
+(`src/include/resident_shed_note.hpp`, a note beside the upload call, the same
+shape as `exact_path_note.hpp` — `gpu_backend.hpp` is frozen and carries no
+field for it):
+
+- a store column named `k#<field>` is the tuple TEXT of a GROUP BY key
+  (`_rewrite.store_lanes`); the raw column a WHERE or a payload reads lives in
+  the store under its own name, so nothing else can reach this lane;
+- lane 0 of a join RESULT set (`…:join-<digest>`, `…:joinu-<digest>`) is that
+  statement's key. An INTERMEDIATE of a chained device join is written
+  `…:join-<digest>.<step>` and is explicitly NOT one — its lane 0 is the next
+  step's probe key.
+
+Everything else — a plain store column, a base set's key, a set uploaded by
+hand — is never marked, and keeps its lane.
+
+On top of that, the call that just ran must not have read the key lane itself.
+A WHERE on the GROUP BY key is an ordinary shape (TPC-H Q12 is one), the direct
+plan lists that column among its lanes, and a set whose statement has one
+therefore keeps its lane from the first call instead of rebuilding it later.
+
+**The rebuild.** `buffer()` is the one door to the lane and rebuilds it from
+(group ids, distinct keys) when it was shed; `build_sort_cache` gets the lane
+that way and sorts it as usual. A NULL-key row's cell comes back as zero: every
+reader gates on the validity bitmap (stage A), so the value under a zero bit is
+never part of an answer. Both rebuilds PIN what they rebuilt — a column that
+something reads as values is a column the rule misread, and one rebuild is the
+price of being wrong; a sort is worth more than the bytes. So a column pays this
+at most once per structure, and `gpu_build_info()` reports the two counts as
+`rebuilds=<caches>/<lanes>` so a workload can be checked;
+`GPUDB_METAL_TRACE_EXACT=1` prints a line per rebuild, with the rows, the
+groups and the width. Over the 22 TPC-H queries at SF10 both counts are zero,
+and over the coverage runs at SF1 and SF10 too. `scripts/transparent_gate.py
+--subqueries` — which sweeps every form over every key, including shapes no
+TPC-H template produces — rebuilds 3 lanes and 4 caches in 782 cells, each
+column once, 5.7 to 18.4 ms apiece, and stays exit 0 with every rewritten cell
+at or above its bound.
+
+**Reporting and the budget.** `resident_bytes()` counts what the column is
+holding at the time, so `gpu_residents()` and `gpu_store_columns()` follow a
+shed down and a rebuild back up, and the budget's LRU and eviction are
+unchanged. `prepared()` stays true across a shed: what the column keeps derived
+is built, and the rest comes back by itself. The wrapper's PRE-upload estimate
+is deliberately not adjusted — it must stay an upper bound over a set that has
+not been uploaded yet, so it keeps charging every lane 8 bytes (or its DuckDB
+type's width) and the key a `width + 4` sort cache.
+
+### 9.1 A set no key is ever read from
+
+§4.12's global masked aggregate reads payload and predicate lanes and never a
+key. Over a single table such a set is a view over the store that simply names
+no key lane (`-` in lane 0 of its tag). Over a JOIN it used to carry one anyway:
+the split hands the matcher a constant key so the statement reads as a GROUP BY,
+and that constant became a lane of the uploaded or materialised result — 1 byte
+a row, plus a 5-byte sort cache and a group-id lane over a column with exactly
+one group, none of it ever read.
+
+It is gone on both join paths. `make_global` now strips the key for a join as
+well; the uploaded set's lane-0 slot arrives as `CAST(NULL AS BIGINT)` (the
+row-major upload is positional, so the slot exists) and is dropped when the set
+is published, and a device join gathers no key lane at all — its `gpu_join_
+materialize` spec starts at the payload. The published set's `keys` points at
+the payload so the set's invariants hold, `no_key` is set, and nothing prepares
+or sorts it. Measured at SF10: Q14, Q17, Q19 lost 7 bytes a row each, Q11 lost 7
+of 19.
+
+### 9.2 Measured (SF10, the 22 TPC-H queries back to back, unlimited budget)
+
+M4 Max, Metal, `data/tpch_sf10/tpch.duckdb`, `residency="eager"`, every answer
+identical to native on both sides.
+
+| | before | after |
+|---|---:|---:|
+| store columns | 5.319 GiB | 4.042 GiB |
+| join-result sets (13) | 18.153 GiB | 14.693 GiB |
+| **total** | **23.472 GiB** | **18.735 GiB** |
+
+Per join-result set, bytes per row:
+
+| Q | set | before | after | what left |
+|---|---|---:|---:|---|
+| 9 | `joinu-04b669f1…` | 26 | 6 | key lane 8 + cache 12, id lane +1 |
+| 12 | `join-174ae33c…` | 27 | 15 | cache 12 (the WHERE reads the key lane), +1 |
+| 17 | `joinu-…` | 28 | 21 | the constant key 1 + its cache 5, +1 |
+| 19 | `joinu-…` | 28 | 21 | as Q17 |
+| 8 | `joinu-242fbba5…` | 35 | 27 | key 2 + cache 6, +1 |
+| 14 | `joinu-…` | 17 | 10 | the constant key and its cache |
+| 11 | `join-…` | 19 | 12 | the constant key and its cache |
+| 3, 5, 7, 10, 18, 21 | | — | unchanged | more distinct keys than the id lane holds, or too few rows |
+
+Q7's key looks like a 4-group key in the ANSWER; the column has 1250 distinct
+values before the WHERE, which is what the id lane is built over, so it keeps
+everything. Q3, Q10, Q18 and Q21 have millions of groups. Q5's set is 2.4M rows,
+below the work rule.
