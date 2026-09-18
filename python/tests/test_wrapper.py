@@ -199,8 +199,8 @@ def run():
 
     print("== rejections (must run native, answer unchanged)")
     rej = {
-        "group_by_all": ("SELECT k, sum(v) FROM t GROUP BY ALL", "shape"),
-        "ordinal":      ("SELECT k, sum(v) FROM t GROUP BY 1", "shape"),
+        # (GROUP BY ALL and ordinals are spelled out since §4.21; grouping sets are not)
+        "rollup":       ("SELECT k % 3, sum(v) FROM t GROUP BY ROLLUP (1)", "shape"),
         "rollup":       ("SELECT k, sum(v) FROM t GROUP BY ROLLUP(k)", "shape"),
         # (FILTER on sum / count / min / max / avg is rewritten since §4.19; a DISTINCT aggregate with one is not)
         "filter":       ("SELECT k, count(DISTINCT v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
@@ -804,6 +804,37 @@ def run():
             got = sorted(map(str, con.execute(sql).fetchall()))
             check(not con.last_rewrite()["rewritten"] and got == want,
                   f"spelling decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
+    con.close()
+
+    # ---- shorthand (§4.21): GROUP BY ALL / ordinals, ORDER BY ALL / ordinals ----
+    print("== shorthand")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        scases2 = {
+            "group_by_all":     "SELECT k, z % 2 AS m, sum(a), count(*) FROM tm GROUP BY ALL ORDER BY ALL",
+            "ordinals":         "SELECT k, z % 2 AS m, sum(a) FROM tm WHERE z < 9 GROUP BY 1, 2 ORDER BY 3 DESC, 1 LIMIT 20",
+            "mixed":            "SELECT z, k % 7 AS s7, max(b) FROM tm GROUP BY z, 2 ORDER BY 1, 2",
+            "order_all_having": "SELECT k, sum(a) AS s FROM tm GROUP BY ALL HAVING sum(a) > 45000000 ORDER BY ALL",
+            "expr_key_all":     "SELECT k % 10 AS bucket, sum(c) FROM tm GROUP BY ALL ORDER BY 2 DESC, 1",
+            "all_over_join":    "SELECT tier, region, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did GROUP BY ALL ORDER BY ALL",
+        }
+        con.execute(JOIN_SETUP_EARLY)
+        for name, sql in scases2.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + lr["sql"]).fetchall()] if lr["rewritten"] else want_desc
+            check(lr["rewritten"], f"shorthand {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want, f"shorthand {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc == want_desc, f"shorthand {name}: names and types identical")
+        for name, sql in {
+            "rollup":   "SELECT k % 3 AS ka, z % 2 AS zb, sum(a) FROM tm GROUP BY ROLLUP (1, 2) ORDER BY 1, 2",
+            "star":     "SELECT * FROM (SELECT k, sum(a) AS s FROM tm GROUP BY 1) x ORDER BY ALL LIMIT 5",
+        }.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(got == want, f"shorthand {name}: answer unchanged (rewritten={con.last_rewrite()['rewritten']}, {con.last_rewrite()['reason']})")
     con.close()
 
     # ---- views (§4.20): a view is its definition spliced in as a derived table ----
