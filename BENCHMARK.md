@@ -4044,3 +4044,11 @@ sort path on either kernel or whole-call time; the worst is 0.99x, a 15M-row
 `GPUDB_METAL_GROUPBY_EXACT_PATH=direct` forces past the rule (the parity tests
 use it); `GPUDB_METAL_DIRECT_MIN_WORK` and `GPUDB_METAL_DIRECT_MIN_GROUPS` move
 it.
+
+**The gate, re-run on the final code.** These are the numbers that hold for the
+direct reduce as it now stands; the 782 / 517 / 265 line in the section above is
+the first run, before the row-floor dispatch rule, and stays there as history.
+`PYTHONPATH=python python3 scripts/transparent_gate.py --subqueries --exprs`,
+SF1, alone on the machine: **782 rows, 511 PASS, 271 declined by the thresholds,
+0 slower and 0 differing, exit 0**, passing ratios **1.03× to 58.88×**. Same
+782 rows as the first run, six of them now declined rather than passing.

@@ -280,13 +280,21 @@ to `count(v)` while still counting for `count(*)`. Cost: one extra mask read
 per element in the reduce; measured, and the bitmap is skipped entirely for
 NULL-free columns so v0.6 numbers are unchanged on the benchmark tables.
 
-There is no spare int64 value to make NULL "sort last", so the NULL-key rows
-are partitioned out at upload (valid-key prefix, NULL-key suffix; one
-`DevicePartition` on CUDA, one compaction pass on Metal) and only the prefix
-is sorted. The suffix is one group at the end — `count(*)` and the sums of
-its payloads — and is naturally excluded from join build/probe, which is what
-SQL join semantics need (NULL never matches). One extra pass at upload, zero
-cost at query time. NULL payloads are handled by identity injection in the
+There is no spare int64 value to make NULL "sort last". The first revision of
+this section partitioned the NULL-key rows out at upload (valid-key prefix,
+NULL-key suffix) and sorted the prefix; **stage A of
+`docs/RESIDENT_COLUMNS_DESIGN.md` dropped that layout and nothing should be
+built against it.** A resident column keeps the table's row order — the store
+places scan chunks at their row-id rank (§5.10) and every lane of a set has to
+line up row for row — so **rows stay in input order and a NULL key is a zero
+bit in the key lane's validity bitmap**. What the prefix used to be is now the
+sort cache: `prepare()` compacts the valid rows through the bitmap and sorts
+them, holding the keys at the key's storage width and the permutation as row
+ids (stage C), so the sorted structure covers the valid keys only. The
+NULL-key group is still one group at the end — `count(*)` and the sums of its
+payloads — folded from the rows whose key bit is 0, and it is excluded from
+join build/probe, which is what SQL join semantics need (NULL never matches).
+NULL payloads are handled by identity injection in the
 reduce (0 for sum, ±limits for min/max) and the per-group tuple becomes
 `(sum, count_v, count_star, min, max)`. A group whose payload is all NULL
 returns **NULL** for `sum`/`min`/`max`/`avg` and 0 for `count(v)`, as
@@ -325,10 +333,13 @@ pins it for tests and sweeps.
 
 ### 4.2 128-bit sums, native output types
 `sum(BIGINT)` in DuckDB is HUGEINT and never overflows. The device
-accumulates in two 64-bit limbs. On CUDA `nvcc` supports `__int128` in
-device code (11.5+, 64-bit targets), so it is `reduce_by_key` with an
-`__int128` accumulator through a transform iterator, no hand carry; Metal
-does the carry by hand in the segmented reduce. The table function emits
+accumulates in two 64-bit limbs. Metal does the carry by hand in the
+segmented reduce. (A CUDA sketch from 2026-09-01, never measured: `nvcc`
+supports `__int128` in device code (11.5+, 64-bit targets), so `reduce_by_key`
+with an `__int128` accumulator through a transform iterator would avoid the
+hand carry. It is a suggestion, not a requirement — `docs/CUDA_EXACT_PATH.md`
+is what the CUDA port follows, and only the limb-for-limb result is fixed.)
+The table function emits
 the limbs directly as a HUGEINT vector (`duckdb_hugeint` in the C API), no
 host conversion. The extra limb costs 16 B per element in the tree and per
 group out — expected to be a small measurable hit at SF50 — so the
@@ -449,7 +460,9 @@ it is produced on the device once and kept:
 
 `Aggregator::join_materialize(probe_key, build_key, out lanes)` takes two
 resident row sets and returns a NEW one in the `upload_rows_exact` layout
-(lane 0 = the GROUP BY key, NULL-key rows in a suffix, probe order kept).
+(lane 0 = the GROUP BY key, probe order kept, NULLs under each lane's
+validity bitmap as §4.1 describes — the joined set has no NULL join keys,
+since an unmatched probe row is absent).
 Each output lane is a probe lane (copied) or a build lane (gathered through
 the match). Every form of §4.1–§4.6 then runs over the joined set unchanged —
 plain, `WHERE` on columns of either table, device `HAVING`, top-k — and an
@@ -1412,13 +1425,21 @@ and the gate are the proof. Join results are still copies — stage D.
 
 ## 7. Backend work (both, in parallel)
 
-| Kernel / path | Metal (macOS instance) | CUDA (Linux instance) |
+**Read this table as the 2026-09-01 plan, not as instructions.** The Metal
+column is what was built; the CUDA column was a set of suggestions written
+before anything was measured, and one of them (partitioning at upload) is a
+layout the design has since dropped — see §4.1. **The authority for the CUDA
+port is `docs/CUDA_EXACT_PATH.md`**: it lists the methods, the semantics, the
+tests that already run for every compiled backend, and the sweep that sets the
+thresholds. Nothing below overrides it.
+
+| Kernel / path | Metal (macOS instance) — built | CUDA (Linux instance) — early suggestions, none measured |
 |---|---|---|
-| NULL-key partition at upload + identity-injected reduce, all-NULL → NULL (4.1) | compaction pass; extend `sum.metal` reduce tuple to `(sum, count_v, count_star, min, max)` | `DevicePartition` on validity; transform iterator injects identities |
+| NULL keys as a validity bitmap over rows in input order + identity-injected reduce, all-NULL → NULL (4.1) | bitmap kept at upload, NULL-key group folded from the zero bits; `sum.metal` reduce tuple extended to `(sum, count_v, count_star, min, max)` | sort cache over the valid rows (compact through the bitmap, then `cub::DeviceRadixSort`); transform iterator injects identities. NOT an upload-time partition |
 | two-limb sum, HUGEINT/DECIMAL(38,s) output vectors (4.2) | manual carry in the segmented reduce | `reduce_by_key` with an `__int128` accumulator |
-| predicate mask, variants (a) masked reduce with empty-group drop and (b) compact-then-reduce; f64 total-order compare (4.6) | new kernels; (b) reuses the v0.6 block compaction | new kernels; (b) uses `DeviceSelect::Flagged` |
+| predicate mask, variants (a) masked reduce with empty-group drop and (b) compact-then-reduce; f64 total-order compare (4.6) | new kernels; (b) reuses the v0.6 block compaction | new kernels; (b) could use `DeviceSelect::Flagged` |
 | min/max group-by | fused into the per-group tuple: one pass for all aggregates of a query | same, `reduce_by_key` on the tuple |
-| `ResidentColumn::prepare()` on the upload stream + completion event (5.5) | command-queue event | stream event; `ensure_*_cache` called from prepare |
+| `ResidentColumn::prepare()` on the upload stream + completion event (5.5) | command-queue event; the sort cache takes the sorter's output buffers (keys at the key's width, u32 row ids) | stream event; `ensure_*_cache` called from prepare |
 | per-set state, refcount, lock-free `update` (5.6) | honours the shared state | owns the PR |
 
 The CPU reference backend implements every one of these first, in plain C++,
