@@ -99,6 +99,14 @@ def _is_interrupt(err: str) -> bool:
     return "INTERRUPT" in err.upper()
 
 
+def _not_resident(err: str) -> bool:
+    """The extension saying a set it was asked for is not there (or no longer
+    what it was): a view whose lanes left the store, a source of a join that
+    was replaced. Recoverable — the set is uploaded again."""
+    return ("no resident set" in err or "no resident column" in err
+            or "GPUDB_STALE" in err or "GPUDB_UPLOAD_DISCARDED" in err)
+
+
 class ResidencyManager:
     def __init__(self, cursor_factory: Callable[[], object], *, mode: str = "background",
                  idle_ms: float = 20.0, quiet_s: float = 2.0, rate_s: float = 30.0,
@@ -175,13 +183,27 @@ class ResidencyManager:
                 s.fqn = fqn
             if est_bytes:
                 s.est_bytes = int(est_bytes)      # the table may have grown since the last sighting
-            if s.state in ("missing", "stale", "failed"):
-                # what the next upload must fetch may have changed (lanes evicted or landed meanwhile)
-                s.upload_sql = upload_sql or s.upload_sql
-                s.upload_name = upload_name
-                s.store_key = store_key
-                s.store_lanes = list(store_lanes or [])
-                s.post_sql = list(post_sql or [])
+            if s.state in ("missing", "stale", "failed", "pending"):
+                # What the next upload must fetch may have changed (lanes evicted or
+                # landed meanwhile), so a sighting's recipe replaces the one the set
+                # holds — including an empty upload statement, which for a store-backed
+                # set means "every lane the view reads is already there". A set that is
+                # only queued (pending) is refreshed too: the sighting read the store a
+                # moment ago, the queued recipe may be older than the last invalidation.
+                if store_key:
+                    s.upload_sql = upload_sql
+                    s.upload_name = upload_name
+                    s.store_key = store_key
+                    s.store_lanes = list(store_lanes or [])
+                    s.post_sql = list(post_sql or [])
+                elif not s.store_key:
+                    s.upload_sql = upload_sql or s.upload_sql
+                    s.upload_name = upload_name
+                    s.store_lanes = list(store_lanes or [])
+                    s.post_sql = list(post_sql or [])
+                # a store-backed set sighted without a recipe keeps the one it has:
+                # erasing it would leave a view-backed set with nothing to upload and
+                # no sort cache to build, i.e. ready for free over columns that are gone
             # a set the memory budget refused stays refused until its retry time: re-queueing it on
             # every sighting would hide the reason and make the worker ask again every few ms
             refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
@@ -199,12 +221,17 @@ class ResidencyManager:
             if s is not None:
                 s.state = "ready"
 
-    def invalidate(self, tag: Optional[str] = None) -> None:
+    def invalidate(self, tag: Optional[str] = None, prefix: Optional[str] = None) -> None:
         """Local bookkeeping; the caller runs gpu_invalidate on the database
-        (which also drops any open upload session under the name)."""
+        (which also drops any open upload session under the name). `prefix` is
+        the extension's own form: a table store's key stands for every set over
+        it, the way gpu_invalidate('<store>') drops the store and every view on
+        it (§5.4)."""
+        def under(t: str) -> bool:
+            return prefix is not None and (t == prefix or t.startswith(prefix + ":"))
         with self._cv:
             now = time.monotonic()
-            hit = {t for t in self._sets if tag is None or t == tag}
+            hit = {t for t in self._sets if (tag is None and prefix is None) or t == tag or under(t)}
             # a derived set goes with any of its sources
             hit |= {t for t, s in self._sets.items() if any(d in hit for d in s.deps)}
             for t, s in self._sets.items():
@@ -216,8 +243,23 @@ class ResidencyManager:
                         s.state = "stale"
             cur, utag = self._upload_cursor, self._uploading_tag
             self._cv.notify_all()
-        if cur is not None and utag is not None and (tag is None or utag in hit):
+        if cur is not None and utag is not None and utag in hit:
             self._interrupt(cur)
+
+    def requeue(self, tag: str) -> None:
+        """Put a set back in the queue without touching its recipe. What the
+        next upload must fetch depends on what the store holds now, which only
+        a sighting knows (`note_candidate` recomputes it); this is the state
+        change alone, for a caller that has just dropped the set's backing."""
+        with self._cv:
+            s = self._sets.get(tag)
+            if s is None:
+                return
+            refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
+                       and time.monotonic() < s.resume_at)
+            if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
+                s.state = "pending"
+                self._cv.notify_all()
 
     def snapshot(self) -> Dict[str, str]:
         with self._lock:
@@ -310,10 +352,13 @@ class ResidencyManager:
                 with self._lock:
                     self.evictions += 1
                     self._col_uploaded.pop(c, None)
+                    gone = set()
                     for t, o in self._sets.items():
                         if o.store_key == c[0] and c[1] in o.store_lanes and o.state == "ready":
                             o.state = "missing"          # its next sighting uploads the missing lane
                             o.bytes = 0
+                            gone.add(t)
+                    self._demote_dependents_locked(gone)
                 self._log(f"evicted (least recently used): column {c[1]} of {c[0]} ({b / 2**20:.0f} MiB) for {s.tag}")
                 continue
             if not victims:
@@ -343,8 +388,53 @@ class ResidencyManager:
                 if o is not None and o.state == "ready":
                     o.state = "missing"            # a later sighting uploads it again
                     o.bytes = 0
+                    self._demote_dependents_locked({v[0]})
             self._log(f"evicted (least recently used): {v[0]} ({int(v[2] or 0) / 2**20:.0f} MiB) for {s.tag}")
         return True
+
+    def _store_holds(self, run: Callable[[str], List[tuple]], s: SetState) -> bool:
+        """Stage B: does the store still hold every lane the set's view reads?
+
+        A view is not a durable object — it is synthesised from the store on
+        lookup and exists only while every lane it names is there — so `ready`
+        for a view-backed set is never a stored fact. The one place that would
+        otherwise take it on trust is a session with nothing to upload, which
+        is where this is asked; it runs once per cold set, never per statement.
+        True when the question cannot be answered: an upload is then attempted
+        the usual way and the extension has the last word."""
+        if not s.store_key or not s.store_lanes:
+            return True
+        try:
+            rows = run("SELECT \"column\" FROM gpu_store_columns() WHERE store = '%s'"
+                       % s.store_key.replace("'", "''"))
+        except Exception:
+            return True
+        have = {r[0] for r in rows}
+        return all(l in have or ("k#" + l) in have for l in s.store_lanes)
+
+    def _extension_holds(self, run: Callable[[str], List[tuple]], s: SetState) -> bool:
+        """The extension's own answer to 'is this set there': the store's lanes
+        for a view, the registry for a set of its own."""
+        if s.store_key:
+            return self._store_holds(run, s)
+        try:
+            row = run("SELECT state FROM gpu_residents() WHERE name = '%s'" % s.tag.replace("'", "''"))
+        except Exception:
+            return True
+        return bool(row) and row[0][0] == "ready"
+
+    def _demote_dependents_locked(self, gone: set) -> None:
+        """A derived set was materialised FROM its sources: when one of them is
+        no longer resident the derived set is not ready either, however
+        recently it answered. Caller holds the lock."""
+        while gone:
+            nxt = set()
+            for t, o in self._sets.items():
+                if o.state == "ready" and t not in gone and any(d in gone for d in o.deps):
+                    o.state = "missing"        # its next sighting materialises it again
+                    o.bytes = 0
+                    nxt.add(t)
+            gone = nxt
 
     def _note_columns(self, s: SetState) -> None:
         if not s.store_key:
@@ -387,19 +477,33 @@ class ResidencyManager:
             if not self.is_ready(d) and not self.upload_now(d, run):
                 ds = self.get(d)
                 with self._lock:
-                    s.state = "failed"
                     # a source refused by the memory budget: this set is refused for the same reason
                     # (the statement's reason must read 'memory', not 'not_resident')
                     if ds is not None and ds.error.startswith(MEMORY_ERROR):
+                        s.state = "failed"
                         s.error = f"{MEMORY_ERROR}source set {d}: {ds.error[len(MEMORY_ERROR):]}"
                         s.resume_at = ds.resume_at
+                    elif ds is not None and ds.state == "missing":
+                        # the source has to be uploaded again first and knows how; this set
+                        # is simply not there yet, and its next sighting builds the chain
+                        s.state = "missing"
+                        s.error = f"source set {d} is being uploaded again: {ds.error[:120]}"
                     else:
+                        s.state = "failed"
                         s.error = f"source set {d} is not resident"
                 return False
         if not self._make_room(run, s):
             with self._lock:
                 s.state = "failed"
                 s.attempts += 1
+            return False
+        if not s.derived and not s.upload_sql and not self._store_holds(run, s):
+            # the recipe says every lane is in the store and the store says otherwise:
+            # it predates an invalidation, so the next sighting must recompute it
+            with self._lock:
+                s.state = "missing"
+                s.error = self._store_gone_error(s)
+            self._log(f"not uploaded: {s.tag}: {s.error}")
             return False
         with self._lock:
             s.state = "uploading"
@@ -412,9 +516,25 @@ class ResidencyManager:
             for stmt in s.post_sql:
                 run(stmt)
         except Exception as e:
+            err = str(e)
+            if "GPUDB_UPLOAD_DISCARDED" in err:
+                with self._lock:
+                    s.state = "stale"
+                    s.error = err[:200]
+                return False
+            if _not_resident(err):
+                # a set this one is built from is not there after all: say so where the
+                # statement can read it, re-derive the sources from the extension, and
+                # leave this set where its next sighting builds it again
+                self._recheck_sources(run, s, err)
+                with self._lock:
+                    s.state = "missing"
+                    s.error = err[:200]
+                self._log(f"not uploaded: {s.tag}: {err[:120]}")
+                return False
             with self._lock:
-                s.state = "failed" if "GPUDB_UPLOAD_DISCARDED" not in str(e) else "stale"
-                s.error = str(e)[:200]
+                s.state = "failed"
+                s.error = err[:200]
             return False
         self._note_bytes(run, s)
         self._note_columns(s)
@@ -522,18 +642,34 @@ class ResidencyManager:
             return None
 
     def _session(self, cur, s: SetState, epoch: int) -> str:
-        """One upload session for the set. Returns the outcome:
-        ready | pending (retry later) | stale (invalidated meanwhile) | failed."""
+        """One upload session for the set. Returns the outcome: ready | pending
+        (retry later) | recheck (the recipe predates an invalidation) | stale
+        (invalidated meanwhile) | failed."""
         t_start = time.monotonic()
+        run = lambda q: self._run(cur, s, q)     # noqa: E731
         if s.derived:
             return self._session_derived(cur, s, epoch, t_start)
         if not s.upload_sql:
             # every lane is already in the store: only the view's sort cache is missing
+            if not self._store_holds(run, s):
+                with self._lock:
+                    s.error = self._store_gone_error(s)
+                self._log(f"not uploaded: {s.tag}: {s.error}")
+                return "recheck"
             try:
                 for stmt in s.post_sql:
                     self._run(cur, s, stmt)
             except Exception as e:
-                return "pending" if _is_interrupt(str(e)) else self._fail(s, e)
+                err = str(e)
+                if _is_interrupt(err):
+                    return "pending"
+                if _not_resident(err):
+                    # the acquire the sort cache does is the second reader of the store,
+                    # and it has just said the lanes are not there after all
+                    with self._lock:
+                        s.error = self._store_gone_error(s)
+                    return "recheck"
+                return self._fail(s, e)
             return "ready"
         fqn = s.fqn or s.upload_sql.split(" FROM ", 1)[1]
         seg_rows = self.segment_rows or s.segment_rows_default
@@ -652,7 +788,8 @@ class ResidencyManager:
                 err = str(e)
                 if _is_interrupt(err):
                     return "pending"              # steps are idempotent: run the chain again
-                if "GPUDB_STALE" in err or "GPUDB_UPLOAD_DISCARDED" in err or "no resident set" in err:
+                if _not_resident(err):
+                    self._recheck_sources(lambda q: self._run(cur, s, q), s, err)
                     return "stale"                # a source changed under the chain
                 return self._fail(s, e)
         with self._lock:
@@ -660,6 +797,31 @@ class ResidencyManager:
             s.segments = s.segments_planned = len(s.steps)
             s.session_ms = (time.monotonic() - t_start) * 1000.0
         return "ready"
+
+    @staticmethod
+    def _store_gone_error(s: SetState) -> str:
+        return (f"the view's lanes ({', '.join(s.store_lanes)}) are no longer in the store "
+                f"{s.store_key} — the set is uploaded again on its next sighting")
+
+    def _recheck_sources(self, run: Callable[[str], List[tuple]], s: SetState, err: str) -> None:
+        """A materialise step said a source is gone or changed. A source is a
+        VIEW over its table's store, so its `ready` is not a stored fact: ask
+        the extension about each one and put back in the queue whichever it no
+        longer holds, or the chain would be retried against the same absence
+        for as long as the statement keeps being seen."""
+        for d in s.deps:
+            o = self._sets.get(d)
+            if o is None or o.state != "ready" or self._extension_holds(run, o):
+                continue
+            with self._lock:
+                o.state = "missing"           # its next sighting uploads it again
+                o.bytes = 0
+                o.error = (self._store_gone_error(o) if o.store_key else
+                           "the extension no longer holds this set — it is uploaded again on its next sighting")
+                self._demote_dependents_locked({d})
+            self._log(f"source not resident: {d} ({err[:100]})")
+        with self._lock:
+            s.error = err[:200]
 
     def _fail(self, s: SetState, e: Exception) -> str:
         with self._lock:
@@ -707,6 +869,8 @@ class ResidencyManager:
                 elif outcome == "pending" and s.epoch == epoch and s.state == "uploading":
                     s.state = "pending"           # retry once idle again; no rate wait
                     s.resume_at = now
+                elif outcome == "recheck" and s.epoch == epoch and s.state == "uploading":
+                    s.state = "missing"           # the recipe is out of date: the next sighting recomputes it
                 elif outcome == "failed":
                     s.state = "failed"
                     s.resume_at = s.last_upload_start + self.rate_s

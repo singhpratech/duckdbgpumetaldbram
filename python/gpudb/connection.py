@@ -186,7 +186,8 @@ class LastRewrite:
     tag: str = ""
     sql: str = ""
     fallback: bool = False       # the rewritten statement raised (GPUDB_STALE or any other error), native re-run
-    error: str = ""              # ... the error text, when it was not staleness
+    error: str = ""              # ... the error text, when it was not staleness; or, when the
+                                 # statement declined for residency, what the set is waiting on
     round_trip_ms: float = 0.0
     engine: str = ""             # 'scalar' (gpu_rewrite_ast) | 'python' (reference renderer)
 
@@ -657,24 +658,29 @@ class Connection:
         self._last.fallback = True
         self._drop_plans()
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        # a joined set: the error does not say which table moved, so every table the
+        # statement reads is suspect — the sources' stores go with the set's own
+        suspect = list(tags)
+        for t in tags:
+            st = self._manager.get(t)
+            suspect += st.deps if st is not None else []
         # stage B: the table's STORE holds the stale columns — drop it (and every view on it)
         # in the extension, or the next upload would find its lanes "already there"
-        for prefix in {":".join(t.split(":")[:6]) for t in tags if t.startswith("gpudb:v1:")}:
+        for prefix in {":".join(t.split(":")[:6]) for t in suspect if t.startswith("gpudb:v1:")}:
             try:
                 self._raw.execute("SELECT gpu_invalidate(?)", [prefix]).fetchall()
             except Exception:
                 pass
-        for tag in tags:
-            st = self._manager.get(tag)
-            # a joined set: the error does not say which table moved
-            for dep in (st.deps if st is not None else []):
-                self._manager.invalidate(dep)
-                ds = self._manager.get(dep)
-                if ds is not None:
-                    self._manager.note_candidate(dep, ds.upload_sql)
+            # ... and the store took every view on it, not only this statement's:
+            # the manager's sets over that table went with their columns (§5.5)
+            self._manager.invalidate(prefix=prefix)
+        for tag in suspect:
             self._manager.invalidate(tag)
-            if st is not None:
-                self._manager.note_candidate(tag, st.upload_sql)
+        for tag in suspect:
+            # after every invalidation, or one set's would put a sibling's dependent back
+            # to stale. The recipe is not touched here: what the next upload must fetch
+            # depends on what the store holds now, which the next sighting works out.
+            self._manager.requeue(tag)
 
     def _invalidate_all(self, why: str) -> None:
         self._resnap_after = True                 # the file changes when THIS write commits: not foreign
@@ -1247,6 +1253,9 @@ class Connection:
             if not self._manager.is_ready(d.tag):
                 self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
                                      else "not_resident")
+                # what the set is waiting on, in its own words (a source that has to be
+                # uploaded again, the budget's arithmetic, an upload that raised)
+                self._last.error = st.error[:300]
                 return None
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql

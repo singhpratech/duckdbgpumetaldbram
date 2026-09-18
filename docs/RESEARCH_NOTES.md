@@ -1739,6 +1739,67 @@ alone on the machine) is 782 cells, 510 PASS, 272 declined, 0 below the bound,
 4 caches over its shape sweep, one per column, 5.7 to 18.4 ms each — which is
 what "correct, slower once" was supposed to look like.
 
+## 2026-09-18 — A view is not a thing you can remember
+
+A report from a crowded connection: re-materialising a device join after a
+write failed with `gpu_join_materialize: no resident set named '…:join'`, the
+set went to `failed`, and the statement stayed on DuckDB from then on. The
+answers were right the whole time — the statement that cannot use its set runs
+unchanged — so what was broken was residency, permanently, on a connection that
+would otherwise have gone back to the GPU.
+
+It reproduces in four statements, and the fourth is the crowded part. A
+single-table query over each of the two joined tables puts the base views'
+lanes in their stores; the join then finds every lane it needs already there,
+so each base set's whole recipe is "nothing to upload, build the sort cache".
+A write behind the wrapper's back makes the guard fire, the wrapper drops the
+stores, and `_on_stale` puts the sets back in the queue with
+`note_candidate(tag, st.upload_sql)` — a call that carried no store recipe, and
+so erased the one the set had. A set with no store key, no lanes, no upload
+statement and no sort cache is a set with nothing to do: the next session ran
+zero statements and declared it ready. The join's sources were then both
+"ready" over columns that no longer existed, the materialise step asked for
+them, and the extension answered the only way it could.
+
+The shape of the fix is that `ready` for a view is not a fact you may store.
+Since stage B a set is synthesised from its table's columns on lookup and
+exists exactly as long as they do, so the manager's copy of it has to stay
+derivable from the extension's. Three rules do that. A re-queue never touches
+the recipe — what the next upload must fetch depends on what the store holds
+*then*, which only the next sighting knows, and a sighting may now refresh a
+set that is merely queued. The manager's invalidation learned the extension's
+own form, a store PREFIX, so `gpu_invalidate('<store>')` and the manager's
+bookkeeping hit the same sets — including the sources of a join, because the
+error names the statement's set and not the table that moved, which was a
+second way to get stuck: the dimension's store kept its old row count and the
+guard fired forever. And the one session that would otherwise take readiness on
+trust, the one whose recipe says every lane is already there, asks
+`gpu_store_columns()` first; so does a materialise step whose source the
+extension says is absent. A set the extension does not hold goes back to
+`missing` — where the next sighting rebuilds it — rather than to `failed`,
+which is a state nothing was going to clear.
+
+None of it is on the warm path, which was the constraint: a ready set is still
+answered from the manager's own state with no round trip, and these questions
+are asked only by a cold set's session, or by a step that has already failed.
+
+Two smaller things fell out. A column evicted under the budget marked the views
+that read it, but not the join materialised from those views, which stayed
+`ready` until a statement tried it and paid a native run to find out; dependents
+now go with their sources. And a statement declining for residency said only
+`not_resident` — `last_rewrite()["error"]` now carries the set's own account of
+what it is waiting on.
+
+Tests: three cases in `test/sql/gpu_store.test` pin the extension's half of the
+contract (a join over two base views; the lane one of them reads dropped, after
+which the derived set names the source that changed and materialising it again
+finds no such set; the lane uploaded again, after which the same call lands),
+and a `python/tests/test_wrapper.py` section pins the wrapper's — the recipe
+surviving a re-queue, a prefix invalidation matching whole segments, a derived
+set following its source, and both interleavings end to end: native answers
+throughout, back on the GPU afterwards, nothing left `failed`. The four
+connection-level checks fail on the code before this and pass after.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
