@@ -190,6 +190,7 @@ class Decision:
     probe_wins: int = 0                  # consecutive winning rounds
     probes_spent: int = 0
     probe_ms_spent: float = 0.0
+    probe_fails: int = 0                 # consecutive probes that raised something other than staleness
     probe_ms: Optional[float] = None     # the last round's figure (the median of its probes)
     next_probe_at: float = 0.0
     backoff_s: float = 0.0
@@ -417,7 +418,6 @@ class Connection:
     def close(self) -> None:
         if self._parent is None:
             self._manager.close()
-        self._close_probe_cursor()
         self._raw.close()
 
     def __enter__(self):
@@ -485,11 +485,10 @@ class Connection:
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
             if d.probation:
                 # this run of the user's own statement IS the native measurement
-                # probation compares against — it never times native itself
+                # probation compares against — it never times native itself. The probe
+                # does NOT run here: it runs before the next statement is sent (§9.1).
                 d.native_obs.append(ms)
                 del d.native_obs[:-_probation.NATIVE_OBSERVATIONS]
-                if self._may_probe(d, now):
-                    self._probation_probe(d, now)
                 return
             if d.measured_declined and now >= d.next_check_at and d.probe_sql and isinstance(query, str):
                 d.next_check_at = now + _REMEASURE_S
@@ -563,42 +562,38 @@ class Connection:
             return None
 
     def _probe_rewritten_ms(self, sql: str) -> Optional[float]:
-        """Time the rewritten form on the trial's OWN cursor, which is kept
-        between probes. `_probe_ms` opens a fresh one every time, and a fresh
-        DuckDB connection pays about a millisecond on its first statement:
-        measured on the SF1 7-group statement, 0.88 ms best but 1.93 ms median
-        on a new cursor per run against 0.91 ms median on a warm one, with
-        native at 2.07 ms — enough to read a 2.3x win as a loss. That is a
-        property of the instrument, not of the statement; a promoted template
-        runs on the session's own warm connection. The statement is still run as
-        TEXT, so the plan cache (§3.2) stays out of the comparison on purpose."""
+        """Time the rewritten form ON THE USER'S OWN CONNECTION, through the
+        same plan cache a promoted template would use — so what the trial
+        measures is what the user would actually pay, against native times taken
+        from their own runs on the same connection. A second connection is not
+        that: measured on the SF1 7-group statement, a cursor of its own runs the
+        same text at 1.93/2.26 ms (min/median of 15) where `self._raw` runs it at
+        1.11/1.52, and on a 1-3 ms statement that ~0.7 ms IS the margin.
+
+        **The invariant that makes this safe (rule 2).** A probe runs only from
+        `execute()`, only after routing and strictly BEFORE the user's statement
+        for that call has been sent. So (a) there is no result of theirs from
+        this call to disturb — it does not exist yet; (b) a result left unfetched
+        by an EARLIER statement on this connection is one the user's own
+        statement, sent unconditionally a few lines later, would have invalidated
+        anyway; (c) it never runs from `sql()`, whose relation may never execute
+        and so may never invalidate such a result; (d) it never runs while
+        another statement of the connection family is in flight. `_stmt_sent`
+        asserts it."""
+        assert not getattr(self, "_stmt_sent", False), \
+            "rule 2: a probation probe may not touch the connection once the user's statement has been sent"
         self._probe_error = ""
-        cur = getattr(self, "_probe_cur", None)
         try:
-            if cur is None:
-                # one untimed run to warm the new cursor: the native runs on the other
-                # side of the comparison are warm, and the first statement on a fresh
-                # connection is not
-                cur = self._probe_cur = self._raw.cursor()
-                t0 = time.perf_counter()
-                cur.execute(sql)
-                self._probe_budget.spend((time.perf_counter() - t0) * 1000.0)
+            run = self._planned(sql)          # the PREPARE, when there is one, is outside the timing
             t0 = time.perf_counter()
-            cur.execute(sql)
-            return (time.perf_counter() - t0) * 1000.0
+            self._raw.execute(run)
+            out = (time.perf_counter() - t0) * 1000.0
+            self._raw.fetchall()              # consume and discard: leave nothing pending
+            return out
         except duckdb.Error as e:
             self._probe_error = str(e)
-            self._log(f"probation probe failed: {e}")
-            self._close_probe_cursor()
+            self._log(f"probation probe failed: {str(e).splitlines()[0][:120]}")
             return None
-
-    def _close_probe_cursor(self) -> None:
-        cur, self._probe_cur = getattr(self, "_probe_cur", None), None
-        if cur is not None:
-            try:
-                cur.close()
-            except Exception:
-                pass
 
     # ---- probation (§9.1, gpudb/_probation.py) ----
     def _probation_on(self) -> bool:
@@ -615,18 +610,18 @@ class Connection:
                 and bool(getattr(self, "_exact", False)))
 
     def _may_probe(self, d: "Decision", now: float) -> bool:
-        """May a round start right now? Everything here is about not taking
+        """May a probe run right now? Everything here is about not taking
         anything from the user: the set has to be there already (no upload is
-        waited for), no other statement of this connection may be running (a
-        probe on a side cursor shares DuckDB's worker pool with it), the
-        template's own back-off has to have expired, and the process's probe
-        budget has to have room."""
+        waited for), NO statement of this connection family may be running (the
+        probe runs before this one has begun, so `in_flight` counts other
+        threads), the template's own back-off has to have expired, and the
+        process's probe budget has to have room."""
         return (d.probation in ("candidate", "waiting", "probing", "demoted")
                 and self._probation_on() and now >= d.next_probe_at
                 and bool(d.probe_sql)
                 and len(d.native_obs) >= _probation.MIN_NATIVE_OBSERVATIONS
                 and self._manager.is_ready(d.tag)
-                and self._manager.others_in_flight() == 0
+                and self._manager.in_flight() == 0
                 and self._probe_budget.may_probe(now))
 
     def _probation_probe(self, d: "Decision", now: float) -> None:
@@ -648,13 +643,22 @@ class Connection:
                 # touch the guard. The set goes, and the trial starts again on the new
                 # rows — what it had measured was for rows that are gone.
                 self._probation_stale(d)
+            elif "INTERRUPT" in (getattr(self, "_probe_error", "") or "").upper():
+                d.round_probes = []           # the user interrupted; nothing is learned, nothing is decided
             else:
-                # the rewritten form does not even run here (a set dropped behind the
-                # wrapper's back, a defect): this shape is not a candidate at all
-                d.probation = "retired"
+                # the rewritten form did not run (a set dropped behind the wrapper's back,
+                # a plan deallocated under it, a defect). One of those is transient; three
+                # in a row says this shape is not a candidate at all.
                 d.round_probes = []
-                self._manager.mark_probation(d.tag, False)
+                d.probe_fails += 1
+                d.backoff_s = _probation.next_backoff(d.backoff_s)
+                d.next_probe_at = now + d.backoff_s
+                if d.probe_fails >= 3:
+                    d.probation = "retired"
+                    self._manager.mark_probation(d.tag, False)
+                    self._log("probation: three probes in a row failed — this template is not tried again")
             return
+        d.probe_fails = 0
         self._probe_budget.spend(t)
         d.probes_spent += 1
         d.probe_ms_spent += t
@@ -713,7 +717,7 @@ class Connection:
                     cur.close()
             except Exception:
                 pass
-        self._close_probe_cursor()
+        self._drop_plans()                # the probe's own cached plan reads the set that just went
         st = self._manager.get(d.tag)
         self._manager.invalidate(d.tag)
         if st is not None:
@@ -739,7 +743,16 @@ class Connection:
                   f"re-measured against native every {_REMEASURE_S:.0f} s from here")
 
     def execute(self, query, parameters=None):
+        self._stmt_sent = False
         sql = self._route(query, parameters)
+        # §9.1 probation: the one window in which a probe may run (see _probation_probe).
+        # It is BEFORE the user's statement is sent, so there is no result of theirs to
+        # disturb, and their statement follows unconditionally a few lines below.
+        d = getattr(self, "_timing_decision", None)
+        if d is not None and d.probation and not self._last.rewritten:
+            now = time.monotonic()
+            if self._may_probe(d, now):
+                self._probation_probe(d, now)
         self._manager.statement_begin()
         try:
             try:
@@ -750,6 +763,7 @@ class Connection:
                 # it inside the timed region, so the measured rule 1 sees it.
                 run = self._planned(sql) if (self._last.rewritten and not parameters
                                              and sql == self._last.sql) else sql
+                self._stmt_sent = True        # from here no probe may touch this connection
                 self._raw.execute(run, parameters)
                 self._note_timing((time.perf_counter() - t0) * 1000.0, query, parameters)
                 if self._last.rewritten:
@@ -829,6 +843,10 @@ class Connection:
             d.probation = ""                     # output-bound: never tried on a side cursor
 
     def sql(self, query, **kw):
+        # no probe runs on this path at all: `sql()` hands back a relation that may never
+        # execute, so it would not itself invalidate a result the user left unfetched —
+        # which is the only reason a probe before it would be safe (§9.1).
+        self._stmt_sent = True
         sql = self._route(query, None)
         self._manager.statement_begin()
         try:
@@ -954,7 +972,7 @@ class Connection:
                     dd.rewritten, dd.reason, dd.measured_declined = False, "threshold", False
                     dd.rewritten_ms, dd.native_ms, dd.timing_checked = [], None, False
                 dd.probation = "candidate"
-                dd.probe_wins = dd.probe_rounds = dd.sightings = 0
+                dd.probe_wins = dd.probe_rounds = dd.sightings = dd.probe_fails = 0
                 dd.probe_ms = None
                 dd.round_probes = []
                 dd.native_obs, dd.probe_sql = [], ""

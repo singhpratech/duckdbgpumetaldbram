@@ -4226,25 +4226,40 @@ declined by a **soft** bound are now tried on a side cursor and promoted only
 when they measurably win here; **hard** (output-bound, or no estimate) bounds are
 never tried. The user's statement is never the experiment.
 
-**How fair an instrument is a side cursor?** A probe runs the rewritten form as
-TEXT on a cursor of its own, which is also how the native runs it is compared
-against are measured (a promoted template then gets the cached plan, §3.2, and is
-faster than the probe said). Two things had to be measured rather than assumed:
+**How fair an instrument is a side cursor? Not fair enough — the probe moved.**
+The first design timed the rewritten form on a cursor of its own. Measured, that
+is not the same statement:
 
-| same statement, same process | main connection | side cursor |
+| same statement, same process | the user's connection | a cursor of its own |
 |---|---|---|
 | native, as text, min of 9 | 1.62 ms | 1.61 ms |
-| rewritten, min of 9 | 1.02 ms (cached plan) | 0.94 ms (text, warm cursor) |
 | rewritten, a NEW cursor per run, 15 runs | — | 0.88 min / **1.93 median** |
-| rewritten, one kept cursor, 15 runs, another process state | 1.11 min / 1.52 median | 1.93 min / 2.26 median |
+| rewritten, one kept warm cursor, 15 runs | 1.11 min / 1.52 median | 1.93 min / **2.26 median** |
 
-Row three is why a probe keeps its cursor between runs and warms it once: a fresh
-DuckDB connection pays about a millisecond on its first statement, enough to read
-a 2.3x win as a loss. Row four is the bias that is left, and it does not go away:
-a second connection executing the same text can cost ~0.7 ms more than the first.
-It under-reports the win, never the other way round, so what it costs is
-promotions — a shape whose real margin is 1.2-1.4x will not clear the 0.8x bar,
-and only a clear win does.
+A second connection costs ~0.7 ms more on the same text even warm, and on a
+1–3 ms statement that is the whole margin. The probe therefore now runs on the
+**user's own connection**, through the same plan cache a promoted template would
+use, strictly before their statement is sent (the invariant and its rule-2
+argument are in §9.1 and in `_probe_rewritten_ms`).
+
+**What the fair instrument says, and whether 0.8× is the right bar.** Probe and
+native alternated on one connection, each after the same idle gap (a probe run
+immediately before a native statement warms the device for it, which flatters
+native — that is measured too and avoided here). SF1, 7-group plain form, 60
+pairs per gap:
+
+| gap between statements | native median | rewritten median | ratio | speedup |
+|---|---|---|---|---|
+| 0 ms (back to back) | 2.109 ms | 1.795 ms | 0.851 | 1.18× |
+| 20 ms (interactive) | 3.778 ms | 2.633 ms | 0.697 | 1.44× |
+| 50 ms | 3.865 ms | 2.707 ms | 0.700 | 1.43× |
+
+0.8× admits the interactive cadence (1.43–1.44×) and refuses the hot loop
+(1.18×), which is the line worth drawing: in a back-to-back loop this shape is
+genuinely not a win, and a min-of-5 sweep says 1.64× there only because the
+rewritten form is bimodal (min 0.72 ms, median 1.80) while native is tight.
+
+**Why the rule compares medians, not minimums.**
 
 **Why the rule compares medians, not minimums.** `SELECT l_linenumber,
 sum(l_quantity) FROM lineitem GROUP BY l_linenumber`, 50 ms gap between
@@ -4268,38 +4283,42 @@ forced to lose, so the trial runs and never promotes:
 
 | | median | p90 | p99 | max |
 |---|---|---|---|---|
-| (A) a probe forced on **every** statement | 4.060 ms | 4.279 | 4.642 | 5.228 |
-| (A) the same statements with no probe | 1.747 ms | 1.873 | 2.017 | 2.064 |
-| (B) the rate limits as they ship, 1200 statements / 2.1 s | 1.705 ms | 1.802 | 1.930 | 3.318 |
-| (B) the same, mechanism off, 1200 statements / 2.0 s | 1.691 ms | 1.751 | 1.868 | 2.416 |
+| (A) a probe forced on **every** statement | 3.789 ms | 4.246 | 4.494 | 5.936 |
+| (A) the same statements with no probe | 1.706 ms | 1.911 | 2.113 | 3.857 |
+| (B) the rate limits as they ship, 1200 statements / 2.4 s | 1.668 ms | 1.924 | 2.287 | 4.573 |
+| (B) the same, mechanism off, 1200 statements / 2.4 s | 1.708 ms | 1.927 | 2.743 | 4.010 |
 
-(A) is the upper bound: a probe costs the statement it rides on exactly one
-execution of the rewritten form, +2.31 ms at the median here. (B) is what the
-rules allow: a round is one probe per statement, rounds are ≥ 5 s apart and a
-losing round doubles a 60 s back-off, so those 1200 statements paid **3 probes,
-4.3 ms** in total — 0.014 ms on the median statement. A template that never wins
+(A) is the upper bound: a probe costs the statement it rides on one execution of
+the rewritten form, **+2.08 ms** at the median here (re-measured with the probe on
+the user's own connection). (B) is what the rules allow: a round is one probe per
+statement, rounds are ≥ 5 s apart and a losing round doubles a 60 s back-off, so
+those 1200 statements paid **3 probes, 7.0 ms** in total and their median came out
+0.04 ms *below* the run without the mechanism — inside the noise, which is the
+point. A template that never wins
 retires after 12 rounds (≈ 36 probes spread over about 1.4 h by the back-off,
 well inside the 250 ms/minute process budget).
 
-**What the gate's own cells do** — `transparent_gate.py --probation --keys
-l_linenumber,l_returnflag,l_suppkey --joins none --probation-timeout 40`, SF1,
-alone on the machine (the run was stopped after 30 of the softly declined cells;
-every one before that had settled):
+**What the gate's own cells do, with the probe on the user's connection.**
+`transparent_gate.py --probation --pace-ms 20 --keys
+l_linenumber,l_returnflag,l_suppkey --joins none --probation-timeout 40` (paced:
+an interactive cadence, medians — the mode whose statistic matches probation's
+own), alone on the machine:
 
-| softly declined cells given the trial | promoted | stayed native | below the bound |
-|---|---|---|---|
-| 30 | 1 (`l_linenumber` / `l_linenumber = 1` / `distinct`, **1.05×**) | 29 | 0 |
+| | soft cells tried | promoted | ratios | stayed native | below the bound |
+|---|---|---|---|---|---|
+| SF1 | 47 | **3** | 1.59×, 1.61×, 1.08× | 44 | **0** |
+| SF5 (30M rows, first WHERE groups; run stopped there) | 12 | **1** | 1.10× | 11 | **0** |
 
-One cell in thirty, and that one measured above the bound in the second
-measurement. The reason so few is the fourth row of the instrument table above:
-these are 1–3 ms statements whose real margin in a hot-loop process is 1.0–1.3×,
-and the ~0.7 ms a second connection costs is most of that margin. Where the
-margin is large the trial finds it easily — the same `l_linenumber` template at
-an interactive 50 ms cadence, where native is ~10 ms, promoted in 5.5 s at 4.66×.
-Rule 1 is on the right side of that trade: what the instrument's bias costs is
-promotions, never a slower statement.
+Nothing promoted came out slower than native, at either size — but three cells in
+forty-seven is not a harvest. The fair instrument raised what a promotion is
+worth (1.08–1.61× measured after the fact, against 1.05× before) without raising
+how often one happens, because what actually gates it is the shape's own margin:
+by the table above these statements win 1.18× in a back-to-back loop and 1.43×
+paced, and the 25% a round has to clear is right at that edge. The rate limits
+then mean a cell gets one or two rounds inside a 40 s window, and one unlucky
+round costs it the cell.
 
-**And in a slow-mode process?** The §9.1 recipe, one process per condition,
+**And in a slow-mode process?****And in a slow-mode process?** The §9.1 recipe, one process per condition,
 600 statements each at a 20 ms cadence, SF1 7-group plain form:
 
 | process state | native the user saw (median) | the round measured | promoted |

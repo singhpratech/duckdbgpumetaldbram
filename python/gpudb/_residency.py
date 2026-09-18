@@ -426,11 +426,12 @@ class ResidencyManager:
             if s is not None:
                 s.probation = bool(on)
 
-    def others_in_flight(self) -> int:
-        """Statements of this connection family running right now, besides the
-        caller's own. A probe waits rather than contend with one (§9.1)."""
+    def in_flight(self) -> int:
+        """Statements of this connection family running right now. A probe runs
+        before its own statement has begun, so it waits for this to be zero
+        (§9.1)."""
         with self._lock:
-            return max(0, self._in_flight - 1)
+            return self._in_flight
 
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:

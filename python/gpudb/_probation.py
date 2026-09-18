@@ -38,14 +38,14 @@ The rules, and what each is protecting:
   ROUNDS_TO_PROMOTE winning rounds, at least ROUND_INTERVAL_S apart, promote it.
   One fast-mode moment is therefore not enough, because the process's mode lasts
   seconds and the rounds are spread over more than that.
-* **One probe per user statement, not a burst.** A probe is issued from the same
-  place the measured re-measure above always issued its native probe: after the
-  user's statement has run, before `execute()` returns. So it is one extra
-  execution on the statement the user is waiting on, and a round takes its three
-  samples from three statements rather than three back to back. That keeps what
-  probation adds to any single statement to the same order the wrapper has
-  always paid, and it makes the three samples come from three moments of the
-  process — which is what they are compared against on the native side.
+* **One probe per user statement, not a burst.** A round takes its three samples
+  from three statements rather than three back to back, so what probation adds to
+  any single statement is one extra execution — the same order the wrapper has
+  always paid for the measured re-measure — and the three samples come from three
+  moments of the process, which is what they are compared against on the native
+  side. A probe does make the statement it rides on slower, by its own duration
+  and by leaving the device busy; that is why the rate limits below are what they
+  are.
 * **Median against median, not minimum against minimum.** The minimum of a
   handful of native runs is a tail statistic, and the tails of these two
   distributions are not comparable: at an interactive 50 ms cadence the same SF1
@@ -62,11 +62,16 @@ The rules, and what each is protecting:
   back on probation behind a doubling back-off (BACKOFF_START_S, capped at
   BACKOFF_MAX_S) so a shape that flaps does not burn probes. After MAX_ROUNDS
   losing rounds a template retires from probation for the life of the process.
-* **The probe is measured the pessimistic way on purpose.** It runs the
-  rewritten statement as TEXT, so DuckDB parses, binds and optimises it on every
-  probe — the native baseline is measured the same way (the user's own runs are
-  text too), while a promoted template gets the cached plan (§3.2) and is
-  therefore faster than the probe said. The error is in rule 1's favour.
+* **The probe runs on the user's OWN connection, through the same plan cache a
+  promoted template would use** (`connection._probe_rewritten_ms`), so what it
+  measures is what the user would actually pay, against native times taken from
+  their own runs on that same connection. A cursor of its own is not that: the
+  same SF1 text measured 1.93/2.26 ms (min/median of 15) on a second connection
+  against 1.11/1.52 on `self._raw`, and on a 1-3 ms statement that ~0.7 ms IS the
+  margin. What makes it safe is WHEN it runs, not where — see the invariant in
+  that method's docstring: only from `execute()`, only strictly before the
+  user's statement for that call has been sent, never from `sql()`, never while
+  another statement of the family is in flight, asserted by `_stmt_sent`.
 * **A budget, in milliseconds.** Probes cost side-cursor work, so the process
   spends at most BUDGET_MS_PER_MIN of it per minute across every template, in a
   sliding window. A probe that would exceed it is not started; a round part-way

@@ -178,7 +178,7 @@ def probation_pass(con, sql, nat, t_nat, n, min_ratio, timeout, form):
     # each side warmed before it is timed, minimum over every run kept for both
     t_tr = time_min(lambda: con.execute(sql).fetchall(), n)
     for _ in range(3):
-        if not identical or (t_nat / t_tr if t_tr > 0 else 0) >= min_ratio:
+        if not identical or (t_nat / t_tr if t_tr > 0 else 0) >= min_ratio or PACE_S > 0:
             break
         for transparent in (False, True):
             con.transparent = transparent

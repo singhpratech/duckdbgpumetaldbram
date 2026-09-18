@@ -1479,7 +1479,62 @@ def run():
             check(d.probes_spent == spent, "probation: a retired template is never probed again")
         finally:
             con._probe_ms, con._probe_rewritten_ms = saved_probe, saved_rw
-        # (6) the probe budget is a real cap
+        # (5b) rule 2, the invariant: a probe runs on the USER'S connection, only ever
+    # immediately BEFORE their statement is sent — never between their execute and fetch
+    if getattr(con, "_exact", False) and getattr(con, "_store", False):
+        d2 = con._timing_decision
+        saw = []
+        orig_probe = con._probe_rewritten_ms
+
+        def watched(sql, _o=orig_probe, _c=con):
+            saw.append(bool(getattr(_c, "_stmt_sent", False)))
+            return _o(sql)
+        con._probe_rewritten_ms = watched
+        try:
+            # a result the user left unfetched from an EARLIER statement: their next
+            # execute would invalidate it anyway, which is what makes a probe before it safe
+            q2 = "SELECT k, sum(v) FROM tn GROUP BY k"
+            con.execute(q2)                                  # pending, never fetched
+            d2 = con._timing_decision
+            if d2 is not None and d2.probation:
+                d2.native_obs = [10.0] * _pb.NATIVE_OBSERVATIONS
+                d2.next_probe_at = 0.0
+            plain = duckdb.connect()                         # what DuckDB itself does, for reference
+            plain.execute(SETUP)
+            plain.execute(q2)
+            plain.execute(q2)
+            base = plain.fetchall()
+            got = con.execute(q2).fetchall()
+            check(sorted(map(str, got)) == sorted(map(str, base)),
+                  "probation (rule 2): a result left unfetched, then another execute — the rows are "
+                  "the second statement's, exactly as without the wrapper")
+            plain.close()
+            check(saw and not any(saw),
+                  f"probation (rule 2): every probe ran before the user's statement was sent ({saw})")
+        finally:
+            con._probe_rewritten_ms = orig_probe
+        # the invariant is asserted in code, not just observed
+        con._stmt_sent = True
+        try:
+            con._probe_rewritten_ms("SELECT 1")
+            check(False, "probation (rule 2): probing after the statement was sent must assert")
+        except AssertionError:
+            check(True, "probation (rule 2): probing after the statement was sent asserts")
+        finally:
+            con._stmt_sent = False
+        # con.sql() never probes: its relation may never execute, so it would not itself
+        # invalidate a pending result
+        before = getattr(con._timing_decision, "probes_spent", 0)
+        d3 = con._timing_decision
+        if d3 is not None and d3.probation:
+            d3.native_obs = [10.0] * _pb.NATIVE_OBSERVATIONS
+            d3.next_probe_at = 0.0
+        con.sql("SELECT k, sum(v) FROM tn GROUP BY k").fetchall()
+        check(getattr(con._timing_decision, "probes_spent", 0) == before or d3 is None
+              or d3.probation == "",
+              "probation (rule 2): con.sql() never probes")
+
+    # (6) the probe budget is a real cap
         b = _pb.Budget(ms_per_min=10.0)
         b.spend(9.0)
         check(b.may_probe() and b.spent_ms() == 9.0, "probation: the probe budget counts what was spent")
@@ -1575,7 +1630,9 @@ def run():
                 got = sorted(con.execute(q).fetchall())
                 check(got == want, "probation: a probe that finds the set stale must not touch the "
                                    "user's result set — the rows are still native's")
-                check(d.probe_rounds == 0 and d.probe_wins == 0 and not d.native_obs
+                # (the probe now runs BEFORE the statement, so _note_timing appends this
+                #  run's native time after the reset: one observation, not none)
+                check(d.probe_rounds == 0 and d.probe_wins == 0 and len(d.native_obs) <= 1
                       and d.probation == "candidate",
                       f"probation: a write under the trial's set starts it over "
                       f"({d.probation}, {d.probe_rounds} rounds)")

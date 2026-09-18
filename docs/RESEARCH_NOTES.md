@@ -1826,6 +1826,57 @@ because the script issues each declined query once and a back-to-back loop never
 gives a trial's upload the quiet it waits for. Coverage is where it was: 15 of 22
 at SF1, 17 at SF10, none differing.
 
+## 2026-09-18 — The instrument was the answer, and it was not enough
+
+The review's verdict on probation was: safe, careful, fires too rarely to earn
+its place — and my own measurement said why. A second DuckDB connection running
+the same text costs about 0.7 ms more than the user's, and on a 1-3 ms statement
+that is the margin. So the probe moved onto the user's own connection.
+
+**Where it runs is not the hard part; when it runs is.** A probe now runs only
+from `execute()`, only after routing and strictly before the user's statement for
+that call has been sent. Three things follow, and together they are the whole
+rule-2 argument. There is no result of theirs from this call to disturb, because
+it does not exist yet. A result left unfetched by an earlier statement is one
+their own statement — sent unconditionally a few lines later — would have
+invalidated anyway, which a test pins against plain `duckdb.connect()`. And it
+never runs from `sql()`, whose relation may never execute and so may never
+invalidate such a result; that asymmetry is easy to miss and is the reason
+`sql()` is excluded rather than handled. `_stmt_sent` asserts the invariant, and
+a test pins that violating it raises. The defect the old design had — a probe
+touching the connection between the user's execute and their fetch — is now
+impossible by construction rather than by care.
+
+**Two measurement mistakes, both mine, both instructive.** The first: I measured
+the probe-vs-native distribution by running a probe immediately before each
+native sample. A probe leaves the device busy, so native came out at 4.82 ms
+where it is really 3.78 — I had manufactured a 1.75x win. Giving each side the
+same idle gap gives 1.44x, which is the real number. The second: the cost script
+never got its set resident, because a tight loop never clears the 250 ms idle bar
+a trial's upload waits for, so it reported a probe cost of -0.005 ms. Both bugs
+flattered the mechanism. Both were caught by asking why a number was surprising.
+
+**The fair instrument, and the bar.** SF1, 7-group plain form, 60 pairs per gap,
+same connection: back to back 2.109 ms native against 1.795 rewritten (1.18x);
+at a 20 ms cadence 3.778 against 2.633 (1.44x); at 50 ms 3.865 against 2.707
+(1.43x). So 0.8x is the right line - it admits the interactive cadence and
+refuses the hot loop, where this shape genuinely is not a win. A min-of-5 sweep
+reads 1.64x there only because the rewritten form is bimodal (0.72 min, 1.80
+median) while native is tight, which is exactly the argument for medians.
+
+**And it still is not enough.** Paced, alone on the machine: SF1 promoted 3 of 47
+softly declined cells (1.59x, 1.61x, 1.08x); SF5 promoted 1 of 12 (1.10x). Zero
+promoted cells came out slower than native at either size, which is the safety
+property, and the fair instrument did raise what a promotion is worth. It did not
+raise how often one happens, because what gates that is the shape's own margin:
+1.18x hot and 1.43x paced, against a bar that asks for 1.25x. The mechanism is
+sitting on top of statements whose win is right at the edge of what is worth
+measuring. My recommendation is to park it: the engineering is sound and the
+rule-2 argument is now airtight, but a mechanism that changes three cells in
+forty-seven is not carrying its own weight in the statement path yet. It becomes
+worth revisiting when the shapes it guards are bigger, or when the device's own
+variance narrows.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

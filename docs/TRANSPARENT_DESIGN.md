@@ -1682,19 +1682,36 @@ and the trial starts again on the new rows. Everything a probe does runs on a
 cursor of its own, because a probe happens after the user's statement has
 executed and before they have fetched from it.
 
-*Instrument check.* The probe runs the rewritten statement as TEXT, not through
-the plan cache (§3.2) — which is how the native runs it is compared against are
-measured too. A promoted template then gets the cached plan and is faster than
-the probe said, so that error is in rule 1's favour. Two more, measured rather
-than assumed (SF1, M4 Max, BENCHMARK.md has the table). A FRESH cursor per probe
-costs about a millisecond on its first statement — 0.88 ms best but 1.93 ms
-median against 0.91 ms on a warm one, with native at 2.07 — so the trial keeps
-one cursor and warms it once. What is left is that a second connection running
-the same text can cost ~0.7 ms more than the first (1.93/2.26 against 1.11/1.52,
-min/median of 15). That bias under-reports the win and never the other way round,
-so what it costs is promotions: a shape whose real margin is 1.2–1.4× does not
-clear the 0.8× bar, and only a clear win does. Which is the side of the line
-rule 1 wants to be on.
+*Where the probe runs, and the invariant that makes it safe.* The probe runs on
+the user's **own** connection, through the same plan cache (§3.2) a promoted
+template would use — so what it measures is what the user would actually pay,
+against native times taken from their own runs on that same connection. A cursor
+of its own was tried first and is not a fair instrument: the same SF1 text
+measured 1.93/2.26 ms (min/median of 15) on a second connection against
+1.11/1.52 on `self._raw`, and on a 1–3 ms statement that ~0.7 ms *is* the margin.
+
+What makes a same-connection probe safe is **when** it runs:
+
+> A probation probe runs only from `Connection.execute()`, only after routing and
+> **strictly before** the user's statement for that call has been sent, and never
+> at any other time.
+
+The consequences are the whole rule-2 argument. (a) There is no result of theirs
+from this call to disturb — it does not exist yet. (b) A result left unfetched by
+an **earlier** statement on this connection is one the user's own statement,
+sent unconditionally a few lines later, would have invalidated anyway — DuckDB's
+Python client invalidates on the next execute, so the probe changes nothing the
+user could observe (a wrapper test pins this against plain `duckdb.connect()`).
+(c) It never runs from `sql()`, whose relation may never execute and so may never
+invalidate such a result. (d) It never runs while another statement of the
+connection family is in flight. The invariant is asserted in code by
+`_stmt_sent`, and a test pins that probing after the statement has been sent
+raises. This also removes by construction the defect the side-cursor design had —
+a probe touching the connection between the user's `execute` and their `fetch`.
+
+The probe is not free to the statement it rides on: it costs that statement its
+own duration and leaves the device busy for it. That is what the rate limits are
+for, and what the cost table in BENCHMARK.md measures.
 
 `con.probation()` lists the templates being tried, their state, rounds and wins,
 probes and milliseconds spent, the pair measured, and the bytes held.
