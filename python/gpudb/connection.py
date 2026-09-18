@@ -1666,6 +1666,15 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     raw = duckdb.connect(database, read_only=read_only, config=cfg)
     if ext:
         raw.execute(f"LOAD '{ext}'")
+    else:
+        # no local build: the extension DuckDB itself has installed (INSTALL gpudb FROM community),
+        # if any; without it every statement runs native and gpu_build_info() says so. A locally
+        # INSTALLed unsigned build needs config={"allow_unsigned_extensions": "true"} to LOAD.
+        try:
+            raw.execute("LOAD gpudb")
+        except duckdb.Error as e:
+            if log:
+                log(f"extension not loaded ({str(e).splitlines()[0][:120]}); every statement runs native")
     con = Connection(raw, transparent=transparent, residency=residency,
                      floor_rows=floor_rows, idle_ms=idle_ms, log=log, memory_budget=memory_budget,
                      read_only=read_only)

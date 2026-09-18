@@ -1053,6 +1053,22 @@ invisible — the row-count guard is all there is. The fix for that is the same
 ask already on the list for the DuckDB team: a table version, or a change
 notification, in the C API.
 
+## 2026-09-18 — pip install gpudb
+
+A release needs an install story and there was none: no `pyproject.toml`, and
+the wrapper found the extension only in a build directory next to a source
+checkout. Now: `python/pyproject.toml` (plus a `setup.cfg` twin for setuptools
+older than 61 — the stock macOS Python ships 58, and it built an empty
+`UNKNOWN-0.0.0` wheel from the pyproject alone), a package README, and a last
+resort in `connect()`: with no local build, `LOAD gpudb` — the copy DuckDB
+itself installed with `INSTALL gpudb FROM community`. Verified in a clean venv:
+the wheel installs; without an extension every statement runs native and
+`last_rewrite()` says `backend`; with the extension installed into DuckDB's
+directory the fallback loads it and the statement runs on the device. A locally
+installed unsigned build needs `allow_unsigned_extensions`; the failure is now
+logged with DuckDB's reason instead of swallowed. CI builds and imports the
+wheel on Linux.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

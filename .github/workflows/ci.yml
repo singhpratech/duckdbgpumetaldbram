@@ -37,6 +37,13 @@ jobs:
         run: |
           ./build-linux/bin/gpudb-groupby-bench --rows 1000000 --groups 1000 --runs 2
 
+      - name: python wrapper packages and imports
+        run: |
+          python3 -m pip install --quiet --upgrade pip wheel
+          python3 -m pip wheel ./python -w /tmp/gpudb-wheel --no-deps --quiet
+          python3 -m pip install --quiet /tmp/gpudb-wheel/gpudb-*.whl
+          cd /tmp && python3 -c "import gpudb; con = gpudb.connect(); con.execute('SELECT 1').fetchall(); print('gpudb', gpudb.__version__, 'without an extension:', con.last_rewrite()['reason'])"
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2
