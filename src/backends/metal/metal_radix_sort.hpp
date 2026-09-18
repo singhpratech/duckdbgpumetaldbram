@@ -33,7 +33,13 @@ public:
     //! is copied out. Staging above `keep_bytes` per buffer is released afterwards (a 300M-row
     //! sort would otherwise leave gigabytes parked here, outside any memory budget).
     DeviceView sort_iota_take(const std::int64_t* keys, std::uint32_t n,
-                              std::size_t keep_bytes = std::size_t(256) << 20);
+                              std::size_t keep_bytes = std::size_t(256) << 20) {
+        return sort_take(keys, nullptr, n, keep_bytes);
+    }
+    //! As sort_iota_take, with an explicit payload (nullptr = the index 0..n-1): the
+    //! resident sort cache of a column with NULLs sorts its valid (value, row id) pairs.
+    DeviceView sort_take(const std::int64_t* keys, const std::int64_t* payloads, std::uint32_t n,
+                         std::size_t keep_bytes = std::size_t(256) << 20);
 
 private:
     double run_sort_on_staged(std::uint32_t n, __strong id<MTLBuffer>& in_keys, __strong id<MTLBuffer>& in_vals);

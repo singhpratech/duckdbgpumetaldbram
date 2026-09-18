@@ -1249,6 +1249,15 @@ wrapper's own cursors are seen), and a read-only connection watches nothing
 because nobody can write the file while it is open read-only. A checkpoint
 from another connection looks like a write and costs one rebuild.
 
+### 5.10 Towards resident columns
+The storage design that replaces per-statement sets with per-table columns —
+one resident copy per column in row-id order, sort caches per key column, joins
+as index vectors, chunks for appends and for tables above the budget — is
+`docs/RESIDENT_COLUMNS_DESIGN.md`. Stage A (2026-09-18) changed the exact
+columns' layout: rows stay in input order and a NULL key is a bit in the key's
+validity bitmap, no longer a trailing block. Nothing above the backend
+interface changed; every suite and the gate are the proof.
+
 ## 6. The rewrite (piece D)
 
 `gpu_rewrite_ast(tree, context)` over the serialized statement, pure:

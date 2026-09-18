@@ -15,7 +15,7 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 
 | method | contract (see the header's comment block) | reference | Metal notes |
 |---|---|---|---|
-| `upload_pair_exact(spans, n, vdt)` | key + payload with NULLs kept: NULL-key rows partitioned to a trailing suffix (input order otherwise kept), NULL payloads in place under a validity bitmap | `cpu_aggregator.cpp` | `metal_aggregator.mm` |
+| `upload_pair_exact(spans, n, vdt)` | key + payload with NULLs kept: rows in input order, a NULL key or payload is a zero bit in that column's validity bitmap (stage A of `docs/RESIDENT_COLUMNS_DESIGN.md`) | `cpu_aggregator.cpp` | `metal_aggregator.mm` |
 | `upload_rows_exact(spans, n, dtypes, L)` | the general form: lane 0 key, lane 1 payload, lanes 2.. predicate columns (I64 or F64), one validity bitmap per lane, same row layout for every lane. Spans arrive in any number (an upload session hands over 8 MiB segments): copy them in parallel, the output layout must be identical to a serial copy | same | per-span parallel copy with prefix-sum offsets and a NULL-free fast path (2026-09-17) |
 | `ResidentColumn::prepare()` / `prepared()` / `resident_bytes()` | build the derived structures now (sort cache), report memory INCLUDING them — the wrapper's budget reads `gpu_residents().bytes` | trivial | radix sort with the sorter's output buffers handed to the column, staging released after large sorts |
 | `groupby_exact_resident(keys, vals, cap, filter)` | one row per distinct key ascending, NULL-key group last; exact 128-bit sums (`sums`/`sums_hi`), counts, count(*), min, max; `filter` = device HAVING / top-k | same | sort-based: run starts over the sorted prefix |
@@ -30,8 +30,9 @@ Not needed: anything in `GroupByAggregator`, `WindowAggregator`, `HashJoinProbe`
 
 ## 2. Semantics that are easy to get wrong (each has a test)
 
-- **NULL keys** form one group, sorted last; the sort cache covers only the
-  valid-key prefix (`sort_rows()`).
+- **NULL keys** form one group, sorted last; they sit anywhere in the column
+  under its validity bitmap, and the sort cache covers the valid rows only
+  (`sort_rows()`), its permutation holding row ids.
 - **NULL payloads** are skipped by sum/count/min/max but counted by `count(*)`;
   a group whose payloads are all NULL has `counts == 0` and unspecified
   sum/min/max (the extension emits SQL NULL).
@@ -90,7 +91,7 @@ The extension stages rows in host segments and hands `RowSpan`s to
 transfer; on CUDA it is a host-side de-interleave into pinned staging plus
 `cudaMemcpyAsync` per lane — do the de-interleave in parallel (the Metal
 version is the model) and overlap the copies on the column's own stream.
-`prepare()` (sort cache: keys + permutation, `cub::DeviceRadixSort`) runs on
-that stream too; `prepared()` flips after the event completes. The memory
+`prepare()` (sort cache: valid keys + permutation to row ids, compacted through
+the validity bitmap first, `cub::DeviceRadixSort`) runs on that stream too; `prepared()` flips after the event completes. The memory
 budget counts `resident_bytes()`, so include the sort cache and any scratch
 that stays allocated.
