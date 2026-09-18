@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds, _views
+from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax, _thresholds, _views
 from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -801,7 +801,7 @@ class Connection:
                             self._log(f"fold: names / types changed ({want} -> {have}); not folded")
                 except Exception as e:
                     self._log(f"fold failed: {str(e)[:120]}")
-            flat = self._normalise_aggs(flat)
+            flat = self._normalise_aggs(self._normalise_syntax(flat))
             if len(self._flat_cache) > 1024:
                 self._flat_cache.clear()
             self._flat_cache[sql] = flat
@@ -851,6 +851,28 @@ class Connection:
             m = _views._CREATE_RE.match(sql or "")
             now[name] = m.group("body") if m else None
         return all(now.get(v) == body for v, body in snapshot.items())
+
+    _SYNTAX_RE = re.compile(r"\b(?:GROUP|ORDER)\s+BY\s+(?:ALL\b|\d|[^;]*?,\s*\d+\s*(?:,|$|\)|ASC|DESC|NULLS|LIMIT|HAVING|OFFSET))",
+                            re.IGNORECASE)
+
+    def _normalise_syntax(self, sql: str) -> str:
+        """§4.21: GROUP BY ALL / ordinals and ORDER BY ALL / ordinals spelled out as
+        the select items they stand for. Names pinned, names + types verified."""
+        if not self._SYNTAX_RE.search(sql):
+            return sql
+        try:
+            want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+            out = _syntax.normalise(self._serialize(sql), [w[0] for w in want])
+            if out is None:
+                return sql
+            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
+            if want == have:
+                return cand
+            self._log(f"syntax: names / types changed ({want} -> {have}); left as written")
+        except Exception as e:
+            self._log(f"syntax: {str(e)[:120]}")
+        return sql
 
     _AGG_SPELLING_RE = re.compile(r"\bFILTER\s*\(|\bcount_if\s*\(|\bbool_(?:and|or)\s*\(", re.IGNORECASE)
 

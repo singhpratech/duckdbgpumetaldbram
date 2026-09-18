@@ -997,6 +997,19 @@ Q15 in DuckDB's TPC-H module is a CTE, not a view, and it stays native for a
 measured reason: its GROUP BY keeps 4% of the rows and returns all 10K groups,
 which the gate showed the device loses. The rule held; nothing to fix.
 
+## 2026-09-18 — GROUP BY ALL
+
+DuckDB users write `GROUP BY ALL` and `ORDER BY 2 DESC, 1` constantly, and both
+were on the reject list. They are shorthand the binder expands by rule —
+`GROUP BY ALL` is every select item without an aggregate, an ordinal is the
+select item it points at, `ORDER BY ALL` is every select item in order — so the
+same expansion before the decision (`_syntax.normalise`, ~80 lines) makes them
+ordinary statements; the DESCRIBE check keeps names and types honest. Six shapes
+identical on the first run, ROLLUP left alone. Worth noting how cheap the last
+three coverage items were (FILTER aggregates, views, shorthand): the machinery
+built for expressions, derived tables and name pinning is what makes each new
+spelling a tree rewrite rather than a feature.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

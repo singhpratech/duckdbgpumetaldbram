@@ -877,6 +877,14 @@ re-reads `duckdb_views()` for those names on every run (~0.2 ms): a view
 redefined from any connection — or replaced by a table of the same name — is
 noticed on the next statement, which is rebuilt from the new definition.
 
+### 4.21 Shorthand: GROUP BY ALL, ordinals, ORDER BY ALL
+DuckDB's shorthand is spelled out before the decision (`_syntax.normalise`), by
+DuckDB's own definitions: `GROUP BY ALL` becomes every select item that holds no
+aggregate; `GROUP BY 1, 2` and `ORDER BY 3 DESC` become the select items they
+stand for; `ORDER BY ALL` becomes every select item in order. ROLLUP / CUBE /
+GROUPING SETS, `SELECT *` and an ordinal past the select list are left as
+written. Names pinned and verified with DESCRIBE, as §4.19.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
