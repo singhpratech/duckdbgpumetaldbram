@@ -67,9 +67,10 @@ def parse_memory_budget(value) -> Optional[int]:
 def default_memory_budget(backend: str, device_bytes: int = 0) -> int:
     """§5.5: a quarter of unified memory on Apple silicon (the GPU shares it
     with DuckDB and everything else), half of device memory on a discrete GPU.
-    When the extension does not report the device's memory, a discrete GPU gets
-    the smaller of a quarter of host memory and 8 GiB — conservative on purpose.
-    GPUDB_MEMORY_BUDGET_MB overrides the default."""
+    `device_bytes` is what gpu_build_info() reports (Metal: the recommended
+    working-set size; CUDA: total device memory once that backend reports it).
+    When it is 0, a discrete GPU gets the smaller of a quarter of host memory
+    and 8 GiB — conservative on purpose. GPUDB_MEMORY_BUDGET_MB overrides."""
     env = os.environ.get("GPUDB_MEMORY_BUDGET_MB")
     if env:
         try:
@@ -81,7 +82,9 @@ def default_memory_budget(backend: str, device_bytes: int = 0) -> int:
         if device_bytes > 0:
             return device_bytes // 2
         return min(host // 4, 8 * 2 ** 30) if host else 8 * 2 ** 30
-    return host // 4 if host else 8 * 2 ** 30
+    # unified memory: a quarter of host memory; never above what Metal recommends keeping resident
+    quarter = host // 4 if host else 8 * 2 ** 30
+    return min(quarter, device_bytes) if device_bytes > 0 else quarter
 
 
 def estimate_set_bytes(rows: int, lanes: int) -> int:
@@ -268,6 +271,8 @@ class Connection:
         self._backend = (m.group(1) if m else "").upper()   # CPU | METAL | CUDA
         self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
         self._join = self._exact and "join=true" in info     # ... and so does the materialised key join (§4.8)
+        dm = re.search(r"device_memory=(\d+)", info)
+        self._device_bytes = int(dm.group(1)) if dm else 0   # 0 = the backend does not report it (§5.5)
         try:
             self._raw.execute("SELECT gpu_rewrite_ast('{}', '{}')").fetchall()
             self._has_rewrite_scalar = True
