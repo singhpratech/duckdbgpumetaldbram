@@ -337,13 +337,13 @@ public:
     [[nodiscard]] virtual std::size_t rows()        const noexcept = 0;
 
     // ---- v0.7 milestone 0b: readiness (docs/TRANSPARENT_DESIGN.md §5.5) ----
-    // Backends may keep derived structures on a column (CUDA: the sorted-key
-    // + permutation cache every GROUP BY / join / top-k call needs). Those
-    // are built lazily on first use today, which makes the FIRST query after
-    // an upload pay seconds of sorting. prepare() builds them ahead of time,
-    // on the backend's own stream/queue, and returns only when they are
-    // complete and visible to every other stream (no event handshake is
-    // needed by the caller). Contract:
+    // Backends may keep derived structures on a column (both GPU backends:
+    // the sorted-key + permutation cache every GROUP BY / join / top-k call
+    // needs). Without prepare() they are built lazily on first use, which
+    // makes the FIRST query after an upload pay the sort. prepare() builds
+    // them ahead of time, on the backend's own stream/queue, and returns only
+    // when they are complete and visible to every other stream (no event
+    // handshake is needed by the caller). Contract:
     //   * idempotent and thread-safe: concurrent prepare() calls on one
     //     column serialize on a per-column lock, the second is a no-op;
     //   * throws std::runtime_error on failure (device OOM, fault) and
@@ -352,8 +352,9 @@ public:
     //     with nothing to derive (CPU) is prepared from birth.
     // resident_bytes() is the backend memory the column holds INCLUDING any
     // derived structures — the number a device memory budget accounts for.
-    // Defaults keep every existing backend building unchanged (CPU has
-    // nothing to prepare; Metal overrides when its perm cache moves here).
+    // The defaults are the CPU shape: nothing to derive, prepared from birth
+    // (the CPU backend overrides resident_bytes() alone). CUDA and Metal
+    // override all three and build their sort cache in prepare().
     virtual void prepare() {}
     [[nodiscard]] virtual bool prepared() const noexcept { return true; }
     [[nodiscard]] virtual std::size_t resident_bytes() const noexcept {
@@ -473,10 +474,10 @@ public:
     // column (gpu_drop_resident) and do NOT count against the host-side
     // GPUDB_UPLOAD_POOL_MAX_MB cap; a device-OOM while building one must
     // surface as a clean std::runtime_error.
-    // Default implementation throws: backends opt in by overriding (CPU and
-    // Metal implement it; CUDA pending — keeping this non-pure means the
-    // CUDA backend builds unchanged until its implementation lands). The
-    // hybrid planner catches the throw and falls back to CPU.
+    // Default implementation throws: backends opt in by overriding. All three
+    // (CPU, CUDA, Metal) implement it today; keeping it non-pure means a new
+    // backend builds before its implementation lands, and the hybrid planner
+    // catches the throw and falls back to CPU.
     // NOTE: the `kind = INNER` default argument binds by STATIC type in C++;
     // overrides must not declare a different default (callers always go
     // through this base interface, so the base default is the only one used).

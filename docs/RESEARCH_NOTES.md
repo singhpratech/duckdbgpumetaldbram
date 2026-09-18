@@ -1526,7 +1526,47 @@ win lands where the shapes are already admitted: the SF10 end of the same rows,
 where Q1 goes 37.2 -> 15.2 ms and Q12 25.3 -> 10.0. The gate on this state —
 `--subqueries --exprs`, SF1, alone on the machine — is 782 rows, 517 PASS, 265
 declined, 0 below the bound and 0 differing, exit 0, with the same bounds and
-therefore the same row set as before.
+therefore the same row set as before. Re-run alone on the final code, after the
+row-floor dispatch rule (`groups >= 3` and `rows x (payloads + WHERE terms) >=
+6,000,000`), the same gate is 782 rows, 511 PASS, 271 declined, 0 slower and 0
+differing, exit 0, ratios 1.03x-58.88x — the numbers that hold for this path as
+it stands, the line above being the first run.
+
+## 2026-09-18 — The documents still described a layout we had dropped
+
+Reading the design front to back as a CUDA implementer would read it turned up
+the one kind of stale text that is not merely untidy. §4.1 of
+`TRANSPARENT_DESIGN.md` still said that NULL-key rows are partitioned out at
+upload into a valid-key prefix and a NULL-key suffix, "one `DevicePartition` on
+CUDA"; §7's backend table said the same in the CUDA column. Stage A had removed
+that layout three entries ago — rows stay in input order, a NULL key is a zero
+bit in the key's validity bitmap, and the sort cache covers the valid rows with
+a permutation of row ids — and the store in stage B now depends on that order,
+since it places a scan chunk at its row-id rank. A CUDA instance following the
+design as written would have built the partition, and the first thing it broke
+would have been the thing the design changed the layout to get.
+
+So the correction is not cosmetic. §4.1 now states the bitmap layout and keeps
+the old one in one clause as history; §4.8's join-output sentence no longer
+promises a suffix; §7 is labelled as the 2026-09-01 plan, its CUDA column as
+suggestions that were never measured, with `CUDA_EXACT_PATH.md` named as the
+authority. The same sentence had been copied into the Metal backend's comments
+(`upload_pair_exact`, `upload_rows_exact`, the exact GROUP BY, `NullFold`) and
+into two claims in the frozen header — that derived structures are built lazily
+"today" when both GPU backends override `prepare()`, and that CUDA has yet to
+implement the resident join when it has implemented all three. `CUDA_EXACT_PATH.md`
+gained what its reader needs next: the packed sort cache Metal actually builds,
+that `topk_resident` and the resident joins are not part of the port, that
+`groupby_exact_masked_multi` comes free from the base-class default in
+`backend_factory.cpp`, current check counts, and the capability-gate lesson
+stated as a rule — do not ask an unsuitable device to compile an optional
+kernel, because on a virtualised Apple GPU one refused build left the whole
+process's compiler unusable. the contributor instructions's claim that one env override exists
+was replaced by the ones that do: eighteen read in `src/`, one in the wrapper.
+
+The lesson worth keeping: a document that only *describes* something stale
+wastes a reader's time, but a document that *prescribes* it to another instance
+is a defect, and it should be corrected with the same seriousness as code.
 
 ## Open questions
 
