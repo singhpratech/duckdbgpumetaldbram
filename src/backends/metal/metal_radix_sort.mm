@@ -57,6 +57,7 @@ void MetalRadixSort::ensure_library() {
         ps_radix_bucket_offsets_ = make_pso(@"radix_bucket_offsets");
         ps_radix_per_bucket_scan_ = make_pso(@"radix_per_bucket_scan");
         ps_radix_minmax_ = make_pso(@"radix_minmax_i64");
+        ps_radix_pack_cache_ = make_pso(@"radix_pack_cache");
     }
 }
 
@@ -265,28 +266,35 @@ MetalRadixSort::DeviceView MetalRadixSort::sort_device(const std::int64_t* keys,
     return view;
 }
 
-MetalRadixSort::DeviceView MetalRadixSort::sort_take(const std::int64_t* keys, const std::int64_t* payloads,
-                                                     std::uint32_t n, std::size_t keep_bytes) {
-    DeviceView view;
+MetalRadixSort::CacheView MetalRadixSort::sort_cache(const void* keys, unsigned in_width,
+                                                     const std::int64_t* payloads, std::uint32_t n,
+                                                     unsigned out_width, std::size_t keep_bytes) {
+    CacheView view;
     if (n == 0) return view;
     constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 1024;
     const std::uint32_t num_blocks = (n + RADIX_WORK_PER_BLOCK - 1) / RADIX_WORK_PER_BLOCK;
     @autoreleasepool {
-        // exact-size buffers: they become the column's cache, a larger leftover would be kept for life
-        if (b_keys_a_ && [b_keys_a_ length] != static_cast<std::size_t>(n) * sizeof(std::int64_t)) {
-            b_keys_a_ = nil; b_vals_a_ = nil; b_keys_b_ = nil; b_vals_b_ = nil;
-        }
         ensure_sort_buffers(n, num_blocks);
         if (!b_keys_a_ || !b_keys_b_ || !b_vals_a_ || !b_vals_b_)
             throw std::runtime_error("radix sort: device allocation failed (Metal)");
         auto* dk = static_cast<std::int64_t*>([b_keys_a_ contents]);
         auto* dv = static_cast<std::int64_t*>([b_vals_a_ contents]);
-        // stage in parallel: one serial memcpy + one serial index fill were ~2 of the 5 host
-        // passes that made a 300M-row cache build take 3 s around a much shorter sort
+        // Stage in parallel, widening the lane on the way in: the copy already
+        // runs per thread, so a narrow source costs a sign extension per value
+        // and reads 1/8 to 1/2 of the bytes an i64 lane reads.
         const std::size_t hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
         const std::size_t n_threads = (n < (1u << 20)) ? 1 : std::min<std::size_t>(hw, 8);
         auto stage = [&](std::size_t lo, std::size_t hi) {
-            std::memcpy(dk + lo, keys + lo, (hi - lo) * sizeof(std::int64_t));
+            switch (in_width) {
+                case 1: { const auto* s = static_cast<const std::int8_t*>(keys);
+                          for (std::size_t i = lo; i < hi; ++i) dk[i] = s[i]; break; }
+                case 2: { const auto* s = static_cast<const std::int16_t*>(keys);
+                          for (std::size_t i = lo; i < hi; ++i) dk[i] = s[i]; break; }
+                case 4: { const auto* s = static_cast<const std::int32_t*>(keys);
+                          for (std::size_t i = lo; i < hi; ++i) dk[i] = s[i]; break; }
+                default: std::memcpy(dk + lo, static_cast<const std::int64_t*>(keys) + lo,
+                                     (hi - lo) * sizeof(std::int64_t)); break;
+            }
             if (payloads) std::memcpy(dv + lo, payloads + lo, (hi - lo) * sizeof(std::int64_t));
             else for (std::size_t i = lo; i < hi; ++i) dv[i] = static_cast<std::int64_t>(i);
         };
@@ -305,14 +313,44 @@ MetalRadixSort::DeviceView MetalRadixSort::sort_take(const std::int64_t* keys, c
         id<MTLBuffer> in_keys = b_keys_a_;
         id<MTLBuffer> in_vals = b_vals_a_;
         view.kernel_ms = run_sort_on_staged(n, in_keys, in_vals);
-        view.keys = in_keys;
-        view.payloads = in_vals;
-        // The result pair now belongs to the caller. The other pair goes too: keeping half a
-        // staging set would need ensure_sort_buffers() to track the halves, and a shared buffer
-        // costs nothing to allocate next to a sort.
-        b_keys_a_ = nil; b_vals_a_ = nil; b_keys_b_ = nil; b_vals_b_ = nil;
-        const bool big = static_cast<std::size_t>(n) * sizeof(std::int64_t) > keep_bytes;
-        if (big) { b_hist_ = nil; b_scan_ = nil; }
+
+        // Pack the sorted pair down to the cache: keys at out_width, row ids
+        // as u32. On the GPU — the same loop over the same unified memory runs
+        // on the host at 13.4 ms against 3.68 ms here (60M rows, width 2;
+        // BENCHMARK.md 2026-09-18), so the device does it.
+        id<MTLBuffer> ok = [device_ newBufferWithLength:std::max<std::size_t>(16, static_cast<std::size_t>(n) * out_width)
+                                                options:MTLResourceStorageModeShared];
+        id<MTLBuffer> op = [device_ newBufferWithLength:std::max<std::size_t>(16, static_cast<std::size_t>(n) * sizeof(std::uint32_t))
+                                                options:MTLResourceStorageModeShared];
+        if (!ok || !op) throw std::runtime_error("radix sort: cache allocation failed (Metal)");
+        {
+            const std::uint32_t w32 = static_cast<std::uint32_t>(out_width);
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:ps_radix_pack_cache_];
+            [ce setBuffer:in_keys offset:0 atIndex:0];
+            [ce setBuffer:in_vals offset:0 atIndex:1];
+            [ce setBytes:&n   length:sizeof(n)   atIndex:2];
+            [ce setBytes:&w32 length:sizeof(w32) atIndex:3];
+            [ce setBuffer:ok offset:0 atIndex:4];
+            [ce setBuffer:op offset:0 atIndex:5];
+            [ce dispatchThreadgroups:MTLSizeMake((n + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError)
+                throw std::runtime_error("radix sort: cache pack failed (Metal)");
+            view.kernel_ms += ([cb GPUEndTime] - [cb GPUStartTime]) * 1000.0;
+        }
+        view.keys = ok;
+        view.perm = op;
+        // The staging pairs stay for the next sort unless they are large: a
+        // 300M-row build would otherwise park gigabytes outside any budget.
+        if (static_cast<std::size_t>(n) * sizeof(std::int64_t) > keep_bytes) {
+            b_keys_a_ = nil; b_vals_a_ = nil; b_keys_b_ = nil; b_vals_b_ = nil;
+            b_hist_ = nil; b_scan_ = nil;
+        }
     }
     return view;
 }

@@ -1297,6 +1297,223 @@ void test_backend(gpudb::Backend b) {
             else { ++failures; ++total; std::printf("    FAIL: %s\n", e.what()); }
         }
 
+        // ---- narrow lane storage (docs/RESIDENT_COLUMNS_DESIGN.md §6, stage C) ----
+        // An exact I64 lane is stored at the narrowest signed width its values
+        // fit. Lanes that sit exactly on the I8 / I16 / I32 boundaries and one
+        // past each, an all-NULL lane and a 64-bit hash-like lane go through
+        // every exact operator — plain, masked, HAVING, top-k, several
+        // payloads, a join with narrow lanes on both sides — and must match the
+        // CPU reference bit for bit. The widths are read back through
+        // resident_bytes(): the reference stores I64, so the expectation is the
+        // narrow byte count, not the reference's.
+        std::printf("  narrow lane storage:\n");
+        try {
+            std::mt19937_64 rng(0xC0FFEEULL);
+            const std::size_t N = 400'009, L = 8;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t>
+                k16(-32768, 32767), d8(-128, 127), d9(-129, 128), d17(-32769, 32768),
+                d32(-2147483648LL, 2147483647LL), d33(-2147483649LL, 2147483648LL);
+            std::uniform_int_distribution<std::uint64_t> h64(0, ~std::uint64_t{0});
+            std::vector<std::int64_t> lanes(N * L);
+            std::vector<std::vector<std::uint64_t>> vb(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            auto clr = [&](std::size_t l, std::size_t i) { vb[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+            for (std::size_t i = 0; i < N; ++i) {
+                lanes[i * L + 0] = k16(rng);                                // key, I16 range
+                lanes[i * L + 1] = d8(rng);                                 // I8 range
+                lanes[i * L + 2] = d9(rng);                                 // one past I8
+                lanes[i * L + 3] = d17(rng);                                // one past I16
+                lanes[i * L + 4] = d32(rng);                                // I32 range
+                lanes[i * L + 5] = d33(rng);                                // one past I32
+                lanes[i * L + 6] = 0;                                       // all NULL
+                lanes[i * L + 7] = static_cast<std::int64_t>(h64(rng));     // a string-hash lane
+                if (pct(rng) < 5) clr(0, i);
+                if (pct(rng) < 7) clr(1, i);
+                if (pct(rng) < 3) clr(4, i);
+                clr(6, i);
+            }
+            // the boundaries themselves, in two rows that stay valid
+            const std::int64_t ends[L][2] = {
+                {-32768, 32767}, {-128, 127}, {-129, 128}, {-32769, 32768},
+                {-2147483648LL, 2147483647LL}, {-2147483649LL, 2147483648LL}, {0, 0},
+                {std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::max()} };
+            for (std::size_t l = 0; l < L; ++l) {
+                lanes[0 * L + l] = ends[l][0];
+                lanes[1 * L + l] = ends[l][1];
+                if (l != 6) vb[l][0] |= 3u;                                 // rows 0 and 1 valid
+            }
+            const unsigned want_w[L] = {2, 1, 2, 4, 4, 8, 1, 8};
+            const gpudb::Dtype dts[L] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64,
+                                         gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64};
+            const std::uint64_t* vptr[L];
+            for (std::size_t l = 0; l < L; ++l) vptr[l] = vb[l].data();
+            gpudb::Aggregator::RowSpan sp;
+            sp.lanes = lanes.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vptr;
+            auto cols = agg->upload_rows_exact(&sp, 1, dts, L);
+            auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+            auto ref = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+            EXPECT_EQ(cols.size(), L);
+            for (std::size_t l = 0; l < L; ++l) EXPECT_EQ(cols[l]->null_count(), ref[l]->null_count());
+            EXPECT_EQ(cols[6]->null_count(), N);                            // the all-NULL lane
+            if (agg->backend() == gpudb::Backend::METAL) {
+                const std::size_t bm = ((N + 63) / 64) * sizeof(std::uint64_t);
+                for (std::size_t l = 0; l < L; ++l) {
+                    const std::size_t bits = cols[l]->null_count() ? bm : 0;
+                    EXPECT_EQ(cols[l]->resident_bytes(), N * want_w[l] + bits);
+                    if (want_w[l] < 8) EXPECT(cols[l]->resident_bytes() < N * 8);
+                }
+                // the sort cache is narrow too: sorted keys at the key's width
+                // plus a u32 row id each
+                const std::size_t before = cols[0]->resident_bytes();
+                cols[0]->prepare();
+                EXPECT_EQ(cols[0]->resident_bytes(),
+                          before + (N - cols[0]->null_count()) * (want_w[0] + sizeof(std::uint32_t)));
+                // the same lanes without any bitmap take the fast copy path and
+                // land at the same widths
+                gpudb::Aggregator::RowSpan bare;
+                bare.lanes = lanes.data(); bare.rows = N; bare.n_lanes = L; bare.valid = nullptr;
+                auto plain = agg->upload_rows_exact(&bare, 1, dts, L);
+                for (std::size_t l = 0; l < L; ++l) EXPECT_EQ(plain[l]->resident_bytes(), N * want_w[l]);
+            }
+
+            using Row = std::tuple<int, std::int64_t, std::uint64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t>;
+            auto rows_of = [](const gpudb::GroupByResidentResult& g) {
+                std::vector<Row> out;
+                for (std::size_t i = 0; i < g.keys.size(); ++i)
+                    out.emplace_back(g.key_null[i], g.key_null[i] ? 0 : g.keys[i], static_cast<std::uint64_t>(g.sums[i]), g.sums_hi[i],
+                                     g.counts[i], g.counts_star[i], g.counts[i] ? g.mins[i] : 0, g.counts[i] ? g.maxs[i] : 0);
+                std::sort(out.begin(), out.end());
+                return out;
+            };
+            // plain: one call per payload lane, every width
+            for (std::size_t l = 1; l < L; ++l) {
+                auto got  = agg->groupby_exact_resident(*cols[0], cols[l].get(), cap);
+                auto want = ref_agg->groupby_exact_resident(*ref[0], ref[l].get(), cap);
+                const bool ok = rows_of(got) == rows_of(want) && got.keys.size() > 60000;
+                if (!ok) std::printf("    FAIL narrow plain lane %zu: %zu groups vs %zu\n", l, got.keys.size(), want.keys.size());
+                EXPECT(ok);
+            }
+            // masked: predicates on narrow lanes, on the one-past lanes, on the
+            // all-NULL lane (IS NULL keeps every row) and an IN over the hash lane
+            {
+                std::vector<std::int64_t> in_list{lanes[7], lanes[1 * L + 7], lanes[5 * L + 7], 0};
+                struct Case { const char* name; std::vector<std::size_t> pc; std::vector<gpudb::Predicate::Op> op; std::vector<std::int64_t> val; };
+                const Case cases[] = {
+                    {"narrow range", {2, 4},   {gpudb::Predicate::Op::GE, gpudb::Predicate::Op::LT}, {0, 0}},
+                    {"one past",     {3, 5},   {gpudb::Predicate::Op::NE, gpudb::Predicate::Op::GT}, {0, -2147483648LL}},
+                    {"all null",     {6},      {gpudb::Predicate::Op::IsNull},                       {0}},
+                    {"key range",    {0, 1},   {gpudb::Predicate::Op::GE, gpudb::Predicate::Op::LE}, {-1000, 40}},
+                    {"selective",    {4},      {gpudb::Predicate::Op::LT},                           {-2147000000LL}},
+                };
+                for (const auto& c : cases) {
+                    std::vector<gpudb::Predicate> p(c.pc.size()), rp(c.pc.size());
+                    for (std::size_t i = 0; i < c.pc.size(); ++i) {
+                        p[i].col = cols[c.pc[i]].get(); p[i].op = c.op[i]; p[i].value = c.val[i];
+                        rp[i] = p[i]; rp[i].col = ref[c.pc[i]].get();
+                    }
+                    auto got  = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), p.data(), p.size(), cap);
+                    auto want = ref_agg->groupby_exact_masked_resident(*ref[0], ref[1].get(), rp.data(), rp.size(), cap);
+                    const bool ok = rows_of(got) == rows_of(want);
+                    if (!ok) std::printf("    FAIL narrow mask %s: %zu groups vs %zu\n", c.name, got.keys.size(), want.keys.size());
+                    EXPECT(ok);
+                }
+                gpudb::Predicate p, rp;
+                p.col = cols[7].get(); p.op = gpudb::Predicate::Op::In; p.list = in_list.data(); p.n_list = in_list.size();
+                rp = p; rp.col = ref[7].get();
+                auto got  = agg->groupby_exact_masked_resident(*cols[0], cols[4].get(), &p, 1, cap);
+                auto want = ref_agg->groupby_exact_masked_resident(*ref[0], ref[4].get(), &rp, 1, cap);
+                EXPECT(rows_of(got) == rows_of(want));
+            }
+            // HAVING and top-k over a narrow payload
+            {
+                gpudb::GroupByFilter f;
+                f.columns = gpudb::GroupByFilter::kAllColumns;
+                f.agg = gpudb::GroupByFilter::Agg::CountStar; f.cmp = gpudb::GroupByFilter::Cmp::GT; f.threshold_i64 = 6;
+                auto got  = agg->groupby_exact_resident(*cols[0], cols[2].get(), cap, f);
+                auto want = ref_agg->groupby_exact_resident(*ref[0], ref[2].get(), cap, f);
+                EXPECT(rows_of(got) == rows_of(want) && !got.keys.empty());
+                gpudb::GroupByFilter t;
+                t.columns = gpudb::GroupByFilter::kAllColumns;
+                t.agg = gpudb::GroupByFilter::Agg::Sum; t.topk = 25; t.topk_desc = true;
+                auto gt = agg->groupby_exact_resident(*cols[0], cols[4].get(), cap, t);
+                auto wt = ref_agg->groupby_exact_resident(*ref[0], ref[4].get(), cap, t);
+                EXPECT(gt.keys == wt.keys && gt.sums == wt.sums && gt.sums_hi == wt.sums_hi
+                       && gt.counts == wt.counts && gt.mins == wt.mins && gt.maxs == wt.maxs
+                       && gt.keys.size() == 25);
+            }
+            // several payloads of different widths in one call
+            {
+                const std::size_t which[3] = {1, 5, 7};
+                gpudb::MultiPayload mp[3], rmp[3];
+                for (int i = 0; i < 3; ++i) {
+                    mp[i].vals = cols[which[i]].get();  mp[i].columns = gpudb::GroupByFilter::kAllColumns;
+                    rmp[i].vals = ref[which[i]].get();  rmp[i].columns = gpudb::GroupByFilter::kAllColumns;
+                }
+                gpudb::GroupByFilter f; f.columns = gpudb::GroupByFilter::kAllColumns;
+                auto got  = agg->groupby_exact_masked_multi(*cols[0], mp, 3, 0, nullptr, 0, cap, f);
+                auto want = ref_agg->groupby_exact_masked_multi(*ref[0], rmp, 3, 0, nullptr, 0, cap, f);
+                bool ok = got.size() == want.size();
+                for (std::size_t i = 0; ok && i < got.size(); ++i)
+                    ok = got[i].sums == want[i].sums && got[i].sums_hi == want[i].sums_hi
+                      && got[i].counts == want[i].counts && got[i].mins == want[i].mins && got[i].maxs == want[i].maxs;
+                if (!ok) std::printf("    FAIL narrow multi payload\n");
+                EXPECT(ok);
+            }
+            // join_materialize with narrow lanes on both sides: a unique build
+            // key over the probe key's whole range, narrow and wide output lanes
+            {
+                const std::size_t B = 65536;
+                std::vector<std::int64_t> bl(B * 2);
+                for (std::size_t i = 0; i < B; ++i) {
+                    bl[2 * i]     = static_cast<std::int64_t>(i) - 32768;        // I16 range: width 2
+                    bl[2 * i + 1] = static_cast<std::int64_t>(i % 251) - 125;    // I8 range:  width 1
+                }
+                const gpudb::Dtype d2[2] = {gpudb::Dtype::I64, gpudb::Dtype::I64};
+                gpudb::Aggregator::RowSpan bs;
+                bs.lanes = bl.data(); bs.rows = B; bs.n_lanes = 2;
+                auto bc  = agg->upload_rows_exact(&bs, 1, d2, 2);
+                auto rbc = ref_agg->upload_rows_exact(&bs, 1, d2, 2);
+                if (agg->backend() == gpudb::Backend::METAL) {
+                    EXPECT_EQ(bc[0]->resident_bytes(), B * 2);
+                    EXPECT_EQ(bc[1]->resident_bytes(), B * 1);
+                }
+                gpudb::JoinLane jl[3], rjl[3];
+                const std::size_t src[3] = {1, 7, 0};
+                const bool from_build[3] = {false, false, true};
+                jl[0].col = cols[1].get();  jl[0].from_build = false;           // probe payload, width 1
+                jl[1].col = cols[7].get();  jl[1].from_build = false;           // probe hash lane, width 8
+                jl[2].col = bc[1].get();    jl[2].from_build = true;            // build payload, width 1
+                rjl[0].col = ref[1].get();  rjl[0].from_build = false;
+                rjl[1].col = ref[7].get();  rjl[1].from_build = false;
+                rjl[2].col = rbc[1].get();  rjl[2].from_build = true;
+                (void)src; (void)from_build;
+                auto jr  = agg->join_materialize(*cols[0], *bc[0], jl, 3);
+                auto rjr = ref_agg->join_materialize(*ref[0], *rbc[0], rjl, 3);
+                EXPECT_EQ(jr.rows_out, rjr.rows_out);
+                EXPECT_EQ(jr.null_key_rows, rjr.null_key_rows);
+                if (agg->backend() == gpudb::Backend::METAL) {
+                    // a gather cannot widen a lane: each output keeps its source width
+                    const unsigned lane_w[3] = {1, 8, 1};
+                    for (std::size_t l = 0; l < 3; ++l) {
+                        const std::size_t bits = jr.lanes[l]->null_count()
+                            ? ((jr.rows_out + 63) / 64) * sizeof(std::uint64_t) : 0;
+                        EXPECT_EQ(jr.lanes[l]->resident_bytes(), jr.rows_out * lane_w[l] + bits);
+                    }
+                }
+                auto jgot  = agg->groupby_exact_resident(*jr.lanes[2], jr.lanes[0].get(), cap);
+                auto jwant = ref_agg->groupby_exact_resident(*rjr.lanes[2], rjr.lanes[0].get(), cap);
+                EXPECT(rows_of(jgot) == rows_of(jwant) && jgot.keys.size() > 200);
+                auto hgot  = agg->groupby_exact_resident(*jr.lanes[0], jr.lanes[1].get(), cap);
+                auto hwant = ref_agg->groupby_exact_resident(*rjr.lanes[0], rjr.lanes[1].get(), cap);
+                EXPECT(rows_of(hgot) == rows_of(hwant));
+            }
+            std::printf("    ok\n");
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) std::printf("    SKIP (%s)\n", e.what());
+            else { ++failures; ++total; std::printf("    FAIL: %s\n", e.what()); }
+        }
+
         std::printf("  several payloads in one group by:\n");
         using Op = gpudb::Predicate::Op;
         using Cmp = gpudb::GroupByFilter::Cmp;

@@ -3435,3 +3435,76 @@ Gate on the stage B branch after the change (`--subqueries --exprs`, SF1):
 772 variants, 485 rewritten rows all faster than native and identical, 48
 declined by the measured check (the process was in the slow mode when they
 ran), 0 slower, 0 differing.
+
+## v0.7 resident columns, stage C — narrow lane storage, Metal, SF10 + SF1 (2026-09-18)
+
+Every exact I64 lane is stored at the narrowest signed width its values fit
+(`docs/RESIDENT_COLUMNS_DESIGN.md` §6); the sort cache keeps its key's width and
+holds u32 row ids. Apple M4 Max, the same script as the stage B section
+(`residency="eager"`, unlimited budget, the 22 TPC-H queries back to back at
+SF10), `main` at b742f5d against the branch.
+
+**Device memory.** 16 of 22 on the device on both, all identical on both.
+
+| | main | stage C |
+|---|---|---|
+| store, 35 columns | 11.43 GiB | 4.91 GiB |
+| … of it `lineitem`, 16 columns | 9.83 GiB | 4.13 GiB |
+| … `orders`, 7 columns | 1.23 GiB | 0.63 GiB |
+| uploaded join results, 10 sets | 25.58 GiB | 13.99 GiB |
+| device join results, 3 sets | 7.90 GiB | 3.82 GiB |
+| views (11) | 0 | 0 |
+| **total resident** | **44.91 GiB** | **22.71 GiB** |
+
+Where the `lineitem` store lands, bytes per row including a prepared sort cache
+where there is one: `l_discount` and three computed lanes at 1, `l_quantity`,
+`l_shipdate`, `l_receiptdate` at 2, `l_orderkey`, `l_suppkey`,
+`l_extendedprice` at 4, the string-hash key lanes at 8 (a hash fills the range,
+so the min/max rule keeps them wide). `orders.o_orderkey` is 12 B/row: 4 of
+storage plus a 4 + 4 sort cache, where it was 8 + 8 + 8.
+
+**Kernel time, SF1, `GPUDB_METAL_TRACE_EXACT=1`, `SET threads TO 1` on the raw
+connection, min of 10 after a warm-up.** `plain` is
+`SELECT l_shipdate, sum(l_extendedprice) FROM lineitem GROUP BY l_shipdate`;
+`mask wide` adds `WHERE l_quantity < 45` (the reduce takes the mask, variant a),
+`mask narrow` adds `WHERE l_quantity < 5` (the sorted positions are compacted
+first, variant b); `jm` is `gpu_join_materialize` over `lineitem` (6,001,215
+rows) against `orders` (1.5M unique keys), called by hand so `jm_probe_i64` runs
+on every iteration.
+
+| statement | stage | main | stage C | |
+|---|---|---|---|---|
+| plain | stage A (run starts) | 0.975 ms | 0.372 ms | −62% |
+| plain | stage B (reduce) | 2.892 ms | 0.939 ms | −68% |
+| mask wide | mask/select (`gbx_mask_i64`) | 0.649 ms | 0.641 ms | −1.2% |
+| mask wide | stage A | 0.306 ms | 0.299 ms | −2.3% |
+| mask wide | stage B (`gbxm_chunk_i64`) | 1.135 ms | 0.976 ms | −14% |
+| mask narrow | mask/select | 0.648 ms | 0.642 ms | −0.9% |
+| mask narrow | stage A | 0.400 ms | 0.399 ms | −0.2% |
+| mask narrow | stage B (`gbx_chunk_i64`) | 0.197 ms | 0.182 ms | −7.6% |
+| jm | whole call (`jm_probe` + gather) | 4.595 ms | 3.751 ms | −18% |
+
+No hot kernel lost time, so the runtime width argument stayed and the
+function-constant specialisation held in reserve was not built. `gbx_mask_i64`
+is flat because it reads one predicate lane and writes a byte a row: the lane it
+reads (`l_quantity`) narrows from 8 to 2, but the kernel is not bound by it.
+
+**Sort-cache packing.** The radix sorter still sorts i64 pairs; packing its
+output down to (keys at the column's width, u32 row ids) is one kernel. At 60M
+rows and width 2 (`l_shipdate` at SF10): 3.68 ms on the device against 13.4 ms
+for the identical parallel loop on the host over the same unified memory (both
+measured three times, spread under 0.8 ms). The device does it.
+
+**Upload cost.** The width needs a second pass over the lanes, so the store
+upload gets longer — `GPUDB_UPLOAD_TRACE=1`, `lineitem` at SF10, two samples per
+side:
+
+| store upload | main | stage C |
+|---|---|---|
+| 7 lanes | 112.3 / 110.5 ms | 195.0 / 186.4 ms |
+| 5 lanes | 90.8 / 82.2 ms | 150.1 / 159.1 ms |
+| 4 lanes | 80.2 / 86.7 ms | 149.9 / 143.4 ms |
+
+That is +65% to +85% on the upload. It is paid once per column, in the
+wrapper's idle background segments, and it buys a store that is 2.3× smaller
+and kernels that read fewer bytes on every statement afterwards.

@@ -56,6 +56,29 @@ NSUInteger pick_grid(std::size_t n) {
     return g;
 }
 
+// ---- narrow lane storage (docs/RESIDENT_COLUMNS_DESIGN.md §6, stage C) ----
+// An exact I64 lane is stored at the narrowest signed width its values fit.
+// The interface keeps saying I64 (gpu_backend.hpp is frozen for CUDA); the
+// width is backend-private and travels with the column. The host reads a lane
+// through the same widening the kernels do.
+inline std::int64_t load_w(const void* base, unsigned w, std::size_t i) {
+    switch (w) {
+        case 1:  return static_cast<const std::int8_t*>(base)[i];
+        case 2:  return static_cast<const std::int16_t*>(base)[i];
+        case 4:  return static_cast<const std::int32_t*>(base)[i];
+        default: return static_cast<const std::int64_t*>(base)[i];
+    }
+}
+// The narrowest signed width holding [mn, mx], boundaries inclusive. A lane
+// with no valid cell arrives as the empty range and takes one byte.
+inline unsigned width_for(std::int64_t mn, std::int64_t mx) {
+    if (mn > mx)                                          return 1;
+    if (mn >= -128 && mx <= 127)                          return 1;
+    if (mn >= -32768 && mx <= 32767)                      return 2;
+    if (mn >= -2147483648LL && mx <= 2147483647LL)        return 4;
+    return 8;
+}
+
 double cb_kernel_ms(id<MTLCommandBuffer> cb) {
     // GPUStart/EndTime are CFAbsoluteTime (seconds). Available after completion.
     const double s = [cb GPUStartTime];
@@ -288,11 +311,14 @@ public:
                 const std::uint32_t k_build = out[0].from_build ? 1u : 0u;
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                const std::uint32_t bs_w = bk.sort_width();
+                const std::uint32_t pk_w = pk.width();
                 if (nb > 1) {
                     [ce setComputePipelineState:ps_jm_unique_];
                     [ce setBuffer:sorted offset:0 atIndex:0];
                     [ce setBytes:&nb32 length:sizeof(nb32) atIndex:1];
                     [ce setBuffer:jm_flag_ offset:0 atIndex:2];
+                    [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:3];
                     [ce dispatchThreadgroups:MTLSizeMake((nb + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
@@ -311,6 +337,8 @@ public:
                 [ce setBytes:&k_build length:sizeof(k_build) atIndex:11];
                 [ce setBuffer:jm_match_ offset:0 atIndex:12];
                 [ce setBuffer:jm_cls_   offset:0 atIndex:13];
+                [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:14];
+                [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:15];
                 [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 [ce setComputePipelineState:ps_jm_counts_];
@@ -331,17 +359,23 @@ public:
                 n2 = host_scan_u32(static_cast<std::uint32_t*>([gb_block2_buf_ contents]), nblocks);
             } else if (nb > 1) {
                 // No probe rows: uniqueness is still the contract.
-                const auto* sk = static_cast<const std::int64_t*>([sorted contents]);
+                const void* sk = [sorted contents];
+                const unsigned sw = bk.sort_width();
                 for (std::size_t i = 0; i + 1 < nb; ++i)
-                    if (sk[i] == sk[i + 1]) throw std::runtime_error("join_materialize: build key not unique");
+                    if (load_w(sk, sw, i) == load_w(sk, sw, i + 1))
+                        throw std::runtime_error("join_materialize: build key not unique");
             }
             const std::size_t rows_out = n1 + n2;
             const std::size_t words = (rows_out + 63) / 64;
 
             // ---- outputs: data + an all-valid bitmap per lane, then gather ----
+            // A gather cannot widen a lane's range, so every output lane keeps
+            // its source lane's storage width.
             std::vector<id<MTLBuffer>> data(n_out, nil), vbits(n_out, nil);
+            std::vector<unsigned> out_w(n_out, 8);
             for (std::size_t l = 0; l < n_out; ++l) {
-                data[l]  = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * sizeof(std::int64_t))
+                out_w[l] = static_cast<const MetalResidentColumn&>(*out[l].col).width();
+                data[l]  = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * out_w[l])
                                                 options:MTLResourceStorageModeShared];
                 vbits[l] = [device_ newBufferWithLength:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
                                                 options:MTLResourceStorageModeShared];
@@ -379,6 +413,8 @@ public:
                     [ce setBytes:&n32 length:sizeof(n32) atIndex:8];
                     [ce setBuffer:data[l]  offset:0 atIndex:9];
                     [ce setBuffer:vbits[l] offset:0 atIndex:10];
+                    const std::uint32_t lw = out_w[l];
+                    [ce setBytes:&lw length:sizeof(lw) atIndex:11];
                     [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
                 [ce endEncoding];
@@ -399,7 +435,7 @@ public:
                 }
                 const std::size_t nulls = rows_out - set;
                 r.lanes.push_back(std::make_unique<MetalResidentColumn>(
-                    data[l], rows_out, out[l].col->dtype(), sort_ctx_, nulls == 0 ? nil : vbits[l], nulls));
+                    data[l], rows_out, out[l].col->dtype(), sort_ctx_, nulls == 0 ? nil : vbits[l], nulls, out_w[l]));
             }
             r.rows_out = rows_out;
             r.null_key_rows = n2;
@@ -437,6 +473,11 @@ public:
             std::size_t dst = 0, null_vals = 0;
             (void)null_keys;
             std::size_t nk = 0;
+            // The min / max of each lane over its valid cells decides its
+            // storage width (stage C); the copy below is the only pass that
+            // sees every value anyway.
+            std::int64_t kmn = std::numeric_limits<std::int64_t>::max(), kmx = std::numeric_limits<std::int64_t>::min();
+            std::int64_t vmn = kmn, vmx = kmx;
             for (std::size_t s = 0; s < n_spans; ++s) {
                 const KvSpan& sp = spans[s];
                 for (std::size_t j = 0; j < sp.rows; ++j, ++dst) {
@@ -444,8 +485,10 @@ public:
                     const bool vv_ok = bit(sp.val_valid, j);
                     k[dst] = kv_ok ? sp.kv[2 * j] : 0;
                     v[dst] = vv_ok ? sp.kv[2 * j + 1] : 0;
-                    if (!kv_ok) { kvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++nk; }
-                    if (!vv_ok) { vvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++null_vals; }
+                    if (kv_ok) { kmn = std::min(kmn, k[dst]); kmx = std::max(kmx, k[dst]); }
+                    else { kvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++nk; }
+                    if (vv_ok) { vmn = std::min(vmn, v[dst]); vmx = std::max(vmx, v[dst]); }
+                    else { vvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++null_vals; }
                 }
             }
             auto bitmap = [&](const std::vector<std::uint64_t>& bits, std::size_t nulls) -> id<MTLBuffer> {
@@ -456,26 +499,29 @@ public:
                 if (!b) throw std::runtime_error("upload_pair_exact: validity allocation failed (Metal)");
                 return b;
             };
+            const unsigned kw = width_for(kmn, kmx), vw = width_for(vmn, vmx);
             ResidentPair out;
-            out.keys = std::make_unique<MetalResidentColumn>(kb, rows, Dtype::I64, sort_ctx_, bitmap(kvalid, nk), nk);
-            out.vals = std::make_unique<MetalResidentColumn>(vb, rows, Dtype::I64, sort_ctx_, bitmap(vvalid, null_vals), null_vals);
+            out.keys = std::make_unique<MetalResidentColumn>(
+                narrow(kb, rows, kw, "upload_pair_exact"), rows, Dtype::I64, sort_ctx_, bitmap(kvalid, nk), nk, kw);
+            out.vals = std::make_unique<MetalResidentColumn>(
+                narrow(vb, rows, vw, "upload_pair_exact"), rows, Dtype::I64, sort_ctx_, bitmap(vvalid, null_vals), null_vals, vw);
             return out;
         }
     }
     AggResult sum_resident_i64(const ResidentColumn& c) override {
         const auto& r = check_i64(c);
-        return run_i64_resident(r.buffer(), r.rows(),
+        return run_i64_resident(r.buffer(), r.rows(), r.width(),
                                 ps_sum_i64_, ps_sum_partials_i64_, false, 0);
     }
     AggResult min_resident_i64(const ResidentColumn& c) override {
         const auto& r = check_i64(c);
-        return run_i64_resident(r.buffer(), r.rows(),
+        return run_i64_resident(r.buffer(), r.rows(), r.width(),
                                 ps_min_i64_, ps_min_partials_i64_, true,
                                 std::numeric_limits<std::int64_t>::max());
     }
     AggResult max_resident_i64(const ResidentColumn& c) override {
         const auto& r = check_i64(c);
-        return run_i64_resident(r.buffer(), r.rows(),
+        return run_i64_resident(r.buffer(), r.rows(), r.width(),
                                 ps_max_i64_, ps_max_partials_i64_, true,
                                 std::numeric_limits<std::int64_t>::min());
     }
@@ -489,7 +535,7 @@ public:
             const auto t_wall0 = std::chrono::steady_clock::now();
             if (n == 0) return empty_agg_all(n, t_wall0);
             id<MTLBuffer> in = stage_input(data, n * sizeof(std::int64_t));
-            return dispatch_agg_all_i64(in, n, t_wall0);
+            return dispatch_agg_all_i64(in, n, 8, t_wall0);
         }
     }
     AggAllResult agg_all_resident_i64(const ResidentColumn& c) override {
@@ -497,7 +543,7 @@ public:
             const auto& r = check_i64(c);
             const auto t_wall0 = std::chrono::steady_clock::now();
             if (r.rows() == 0) return empty_agg_all(0, t_wall0);
-            return dispatch_agg_all_i64(r.buffer(), r.rows(), t_wall0);
+            return dispatch_agg_all_i64(r.buffer(), r.rows(), r.width(), t_wall0);
         }
     }
 
@@ -545,6 +591,7 @@ public:
             const std::uint32_t np32 = static_cast<std::uint32_t>(pk.rows());
             const std::uint32_t nb32 = static_cast<std::uint32_t>(bk.rows());
             const std::uint32_t mode = static_cast<std::uint32_t>(kind);
+            const std::uint32_t pk_w = pk.width(), pl_w = pl.width(), bs_w = bk.sort_width();
 
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -559,6 +606,9 @@ public:
             [ce setBytes:&np32 length:sizeof(np32) atIndex:4];
             [ce setBytes:&nb32 length:sizeof(nb32) atIndex:5];
             [ce setBytes:&mode length:sizeof(mode) atIndex:6];
+            [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:7];
+            [ce setBytes:&pl_w length:sizeof(pl_w) atIndex:8];
+            [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:9];
             [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
 
@@ -637,6 +687,7 @@ public:
 
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            const std::uint32_t pk_w = pk.width(), bs_w = bk.sort_width();
             [ce setComputePipelineState:ps_join_mult_i64_];
             [ce setBuffer:pk.buffer() offset:0 atIndex:0];
             [ce setBuffer:sorted_buf  offset:0 atIndex:1];
@@ -644,6 +695,8 @@ public:
             [ce setBytes:&np32 length:sizeof(np32) atIndex:3];
             [ce setBytes:&nb32 length:sizeof(nb32) atIndex:4];
             [ce setBytes:&mode length:sizeof(mode) atIndex:5];
+            [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:6];
+            [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:7];
             [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             [ce endEncoding];
@@ -732,6 +785,7 @@ public:
             const std::uint32_t nb32 = static_cast<std::uint32_t>(n_build);
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            const std::uint32_t pk_w = pk.width(), bs_w = bk.sort_width();
             [ce setComputePipelineState:ps_join_lookup_i64_];
             [ce setBuffer:pk.buffer() offset:0 atIndex:0];
             [ce setBuffer:sorted_buf  offset:0 atIndex:1];
@@ -739,6 +793,8 @@ public:
             [ce setBuffer:first_buf_  offset:0 atIndex:3];
             [ce setBytes:&np32 length:sizeof(np32) atIndex:4];
             [ce setBytes:&nb32 length:sizeof(nb32) atIndex:5];
+            [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:6];
+            [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:7];
             [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             [ce endEncoding];
@@ -749,7 +805,7 @@ public:
             // output counts, then a parallel fill from the perm cache.
             const auto* mc    = static_cast<const std::uint32_t*>([mult_buf_ contents]);
             const auto* first = static_cast<const std::uint32_t*>([first_buf_ contents]);
-            const auto* perm  = static_cast<const std::int64_t*>([perm_buf contents]);
+            const auto* perm  = static_cast<const std::uint32_t*>([perm_buf contents]);
 
             auto count_of = [&](std::size_t i) -> std::size_t {
                 const std::uint32_t m = mc[i];
@@ -803,7 +859,7 @@ public:
                                 const std::uint32_t f = first[i];
                                 for (std::uint32_t t2 = 0; t2 < m; ++t2) {
                                     r.probe_idx[off] = static_cast<std::int64_t>(i);
-                                    r.build_idx[off] = perm[f + t2];
+                                    r.build_idx[off] = static_cast<std::int64_t>(perm[f + t2]);
                                     ++off;
                                 }
                             } else if (count_of(i)) {
@@ -875,7 +931,9 @@ public:
             const auto& c = static_cast<const MetalResidentColumn&>(col);
             TopKResult r{};
             r.rows_in = c.rows();
-            const std::size_t n = c.rows();
+            // the sort cache covers the valid rows only (a NULL is never among the top k):
+            // indexing it by rows() read past its end on a column with NULLs
+            const std::size_t n = c.sort_rows();
             const std::size_t kk = std::min(k, n);
             if (kk == 0) {
                 r.wall_ms = std::chrono::duration<double, std::milli>(
@@ -891,14 +949,15 @@ public:
             } else {
                 ensure_sorted_cache_f64(c, &sort_kernel_ms);
             }
-            const auto* perm = static_cast<const std::int64_t*>([c.perm_cache() contents]);
+            const auto* perm = static_cast<const std::uint32_t*>([c.perm_cache() contents]);
             r.idx.resize(kk);
             for (std::size_t i = 0; i < kk; ++i)
-                r.idx[i] = descending ? perm[n - 1 - i] : perm[i];
+                r.idx[i] = static_cast<std::int64_t>(descending ? perm[n - 1 - i] : perm[i]);
             if (c.dtype() == Dtype::I64) {
-                const auto* d = static_cast<const std::int64_t*>([c.buffer() contents]);
+                const void* d = [c.buffer() contents];
                 r.values_i64.resize(kk);
-                for (std::size_t i = 0; i < kk; ++i) r.values_i64[i] = d[r.idx[i]];
+                for (std::size_t i = 0; i < kk; ++i)
+                    r.values_i64[i] = load_w(d, c.width(), static_cast<std::size_t>(r.idx[i]));
             } else {
                 const auto* d = static_cast<const double*>([c.buffer() contents]);
                 r.values_f64.resize(kk);
@@ -923,17 +982,24 @@ private:
         // when NULL-free) and `nulls` the number of NULL rows — for a key column
         // and a payload column alike. The sort cache covers the valid rows and
         // its permutation holds row ids.
+        // `width` (stage C) is the lane's storage width in bytes — 1, 2, 4 or 8
+        // for I64, always 8 for F64 — chosen by the upload from the lane's
+        // min / max over its valid cells.
         MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt,
                             std::shared_ptr<SortCtx> ctx,
-                            id<MTLBuffer> valid, std::size_t nulls)
+                            id<MTLBuffer> valid, std::size_t nulls, unsigned width = 8)
             : buf_(buf), rows_(n), dtype_(dt), ctx_(std::move(ctx)),
-              valid_(valid), nulls_(nulls) {}
+              valid_(valid), nulls_(nulls), width_(dt == Dtype::F64 ? 8u : width) {}
         Backend     backend_tag() const noexcept override { return Backend::METAL; }
         Dtype       dtype()       const noexcept override { return dtype_; }
         std::size_t rows()        const noexcept override { return rows_; }
         std::size_t null_count()  const noexcept override { return nulls_; }
         id<MTLBuffer> buffer()    const noexcept { return buf_; }
         id<MTLBuffer> valid_buffer() const noexcept { return valid_; }
+        unsigned    width()       const noexcept { return width_; }
+        // The sorted keys keep the column's width; the F64 cache holds the
+        // order-preserving i64 image, which is always 8 bytes.
+        unsigned    sort_width()  const noexcept { return dtype_ == Dtype::F64 ? 8u : width_; }
         // Rows the sort cache covers: the valid ones.
         std::size_t sort_rows()   const noexcept { return rows_ - nulls_; }
 
@@ -950,16 +1016,17 @@ private:
             return sort_rows() == 0 || ready_.load(std::memory_order_acquire);
         }
         std::size_t resident_bytes() const noexcept override {
-            const std::size_t base = rows_ * sizeof(std::int64_t);   // i64 and f64: 8 B
+            const std::size_t base = rows_ * width_;                 // the real storage width
             const std::size_t bitmap = valid_ ? [valid_ length] : 0;
-            return base + bitmap +
-                   (ready_.load(std::memory_order_acquire) ? 2 * sort_rows() * sizeof(std::int64_t) : 0);
+            const std::size_t cache = sort_rows() * (sort_width() + sizeof(std::uint32_t));
+            return base + bitmap + (ready_.load(std::memory_order_acquire) ? cache : 0);
         }
 
-        // Sorted copy (i64 keys, or the order-preserving i64 image of f64
-        // values with NaN canonicalised greatest, as native DuckDB orders
-        // doubles) and the permutation; nil until built. Backend-private,
-        // dies with the column, exempt from the host pool cap.
+        // Sorted copy (keys at the column's storage width, or the
+        // order-preserving i64 image of f64 values with NaN canonicalised
+        // greatest, as native DuckDB orders doubles) and the permutation as
+        // u32 row ids; nil until built. Backend-private, dies with the column,
+        // exempt from the host pool cap.
         id<MTLBuffer> sorted_cache() const noexcept {
             return ready_.load(std::memory_order_acquire) ? sorted_ : nil;
         }
@@ -976,7 +1043,8 @@ private:
             @autoreleasepool {
                 const std::size_t n = sort_rows();   // valid rows (== rows_ without NULLs)
                 std::vector<std::int64_t> tk, tidx;
-                const std::int64_t* keys = nullptr;
+                const void* keys = nullptr;
+                unsigned    keys_w = 8;              // storage width of `keys`
                 const std::int64_t* idx = nullptr;   // nullptr: the row id is the position
                 auto image = [](double x) {
                     // Order-preserving i64 image of a double: NaN canonicalised
@@ -994,9 +1062,9 @@ private:
                     tk.resize(n); tidx.resize(n);
                     std::size_t o = 0;
                     if (dtype_ == Dtype::I64) {
-                        const auto* d = static_cast<const std::int64_t*>([buf_ contents]);
+                        const void* d = [buf_ contents];
                         for (std::size_t i = 0; i < rows_; ++i)
-                            if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = d[i]; tidx[o] = static_cast<std::int64_t>(i); ++o; }
+                            if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = load_w(d, width_, i); tidx[o] = static_cast<std::int64_t>(i); ++o; }
                     } else {
                         const auto* d = static_cast<const double*>([buf_ contents]);
                         for (std::size_t i = 0; i < rows_; ++i)
@@ -1005,7 +1073,7 @@ private:
                     if (o != n) throw std::runtime_error("resident sort cache: validity bitmap and null_count disagree");
                     keys = tk.data(); idx = tidx.data();
                 } else if (dtype_ == Dtype::I64) {
-                    keys = static_cast<const std::int64_t*>([buf_ contents]);
+                    keys = [buf_ contents]; keys_w = width_;   // the sorter widens while it stages
                 } else {
                     const auto* d = static_cast<const double*>([buf_ contents]);
                     tk.resize(n);
@@ -1015,14 +1083,15 @@ private:
                 id<MTLBuffer> sorted = nil, perm = nil;
                 double ms = 0.0;
                 {
-                    // One sort at a time: the sorter's staging buffers are single-use. The sorted
-                    // keys and the permutation are the sorter's own output buffers, handed over —
-                    // not copies (the build used to be five serial passes over the column around
-                    // the sort: index fill, two copies in, two copies out).
+                    // One sort at a time: the sorter's staging buffers are single-use. The cache
+                    // is the sorter's output packed down to (keys at sort_width(), u32 row ids) —
+                    // the build is the sort plus that one pass, where it used to be five serial
+                    // host passes over the column around the sort.
                     std::lock_guard<std::mutex> slock(ctx_->mu);
-                    auto view = ctx_->get().sort_take(keys, idx, static_cast<std::uint32_t>(n));
+                    auto view = ctx_->get().sort_cache(keys, keys_w, idx,
+                                                       static_cast<std::uint32_t>(n), sort_width());
                     sorted = view.keys;
-                    perm   = view.payloads;
+                    perm   = view.perm;
                     ms = view.kernel_ms;
                 }
                 if (!sorted || !perm)
@@ -1044,6 +1113,7 @@ private:
         mutable id<MTLBuffer> perm_   = nil;
         id<MTLBuffer> valid_ = nil;               // validity bitmap (nil = no NULLs)
         std::size_t   nulls_ = 0;                 // NULL rows (bitmap zeros)
+        unsigned      width_ = 8;                 // storage width in bytes (stage C)
     };
 
     enum class GbMode { SumI64, SumF64, Count };
@@ -1082,6 +1152,65 @@ private:
         if (!o.aliased && !vec.empty())
             std::memcpy(vec.data(), [o.buf contents], vec.size() * sizeof(std::int64_t));
     }
+    // Stage C: pack the i64 staging lanes down to their storage widths, in
+    // parallel over (lane, row range) — one pass over unified memory after the
+    // upload's own pass, which is where the min / max came from. A lane at
+    // width 8 keeps its buffer; a narrowed lane's staging dies with the vector
+    // slot it is replaced in.
+    void narrow_lanes(std::vector<id<MTLBuffer>>& bufs, const std::vector<unsigned>& w,
+                      std::size_t rows, const char* op) {
+        const std::size_t n_lanes = bufs.size();
+        std::vector<id<MTLBuffer>> out(n_lanes, nil);
+        struct Task { std::size_t lane, lo, hi; };
+        std::vector<Task> tasks;
+        const std::size_t chunk = std::max<std::size_t>(std::size_t{1} << 16, (rows + 7) / 8);
+        for (std::size_t l = 0; l < n_lanes; ++l) {
+            if (w[l] == 8 || rows == 0) continue;
+            out[l] = [device_ newBufferWithLength:std::max<std::size_t>(1, rows * w[l])
+                                          options:MTLResourceStorageModeShared];
+            if (!out[l]) throw std::runtime_error(std::string(op) + ": narrow allocation failed (Metal)");
+            for (std::size_t i = 0; i < rows; i += chunk)
+                tasks.push_back(Task{l, i, std::min(rows, i + chunk)});
+        }
+        if (tasks.empty()) return;
+        std::vector<const std::int64_t*> src(n_lanes, nullptr);
+        std::vector<void*> dst(n_lanes, nullptr);
+        for (std::size_t l = 0; l < n_lanes; ++l)
+            if (out[l]) { src[l] = static_cast<const std::int64_t*>([bufs[l] contents]); dst[l] = [out[l] contents]; }
+        auto run = [&](const Task& t) {
+            const std::int64_t* s = src[t.lane];
+            switch (w[t.lane]) {
+                case 1: { auto* d = static_cast<std::int8_t*>(dst[t.lane]);
+                          for (std::size_t i = t.lo; i < t.hi; ++i) d[i] = static_cast<std::int8_t>(s[i]); break; }
+                case 2: { auto* d = static_cast<std::int16_t*>(dst[t.lane]);
+                          for (std::size_t i = t.lo; i < t.hi; ++i) d[i] = static_cast<std::int16_t>(s[i]); break; }
+                default: { auto* d = static_cast<std::int32_t*>(dst[t.lane]);
+                           for (std::size_t i = t.lo; i < t.hi; ++i) d[i] = static_cast<std::int32_t>(s[i]); break; }
+            }
+        };
+        const std::size_t hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+        const std::size_t nt = (rows < (std::size_t{1} << 20))
+            ? 1 : std::min<std::size_t>({hw, 8, tasks.size()});
+        if (nt <= 1) {
+            for (const auto& t : tasks) run(t);
+        } else {
+            std::atomic<std::size_t> next{0};
+            std::vector<std::thread> pool;
+            pool.reserve(nt);
+            for (std::size_t t = 0; t < nt; ++t)
+                pool.emplace_back([&] {
+                    for (std::size_t i; (i = next.fetch_add(1, std::memory_order_relaxed)) < tasks.size();) run(tasks[i]);
+                });
+            for (auto& th : pool) th.join();
+        }
+        for (std::size_t l = 0; l < n_lanes; ++l) if (out[l]) bufs[l] = out[l];
+    }
+    id<MTLBuffer> narrow(id<MTLBuffer> src, std::size_t rows, unsigned w, const char* op) {
+        std::vector<id<MTLBuffer>> one{src};
+        narrow_lanes(one, std::vector<unsigned>{w}, rows, op);
+        return one[0];
+    }
+
     id<MTLBuffer> grow(__strong id<MTLBuffer>& b, std::size_t bytes, const char* what) {
         if (!b || [b length] < bytes) {
             b = [device_ newBufferWithLength:std::max<std::size_t>(bytes, 16)
@@ -1357,6 +1486,7 @@ private:
         id<MTLBuffer> sorted = ensure_sorted_cache(k, &kernel_ms);
         id<MTLBuffer> perm   = k.perm_cache();
         const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+        const std::uint32_t kw = k.sort_width(), kzero = 0u;
         const std::size_t nblocks = (n + kBlock - 1) / kBlock;
         const std::size_t nchunks = (n + 63) / 64;
 
@@ -1370,6 +1500,8 @@ private:
             [ce setBuffer:sorted        offset:0 atIndex:0];
             [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
             [ce setBuffer:gb_block_buf_ offset:0 atIndex:2];
+            [ce setBytes:&kw    length:sizeof(kw)    atIndex:3];
+            [ce setBytes:&kzero length:sizeof(kzero) atIndex:4];
             [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             [ce endEncoding];
@@ -1424,11 +1556,14 @@ private:
             [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
             [ce setBuffer:gb_block_buf_ offset:0 atIndex:2];
             [ce setBuffer:mult_buf_     offset:0 atIndex:3];
+            [ce setBytes:&kw    length:sizeof(kw)    atIndex:4];
+            [ce setBytes:&kzero length:sizeof(kzero) atIndex:5];
             [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             if (gpu_sums) {
+                const std::uint32_t vw = v->width();
                 [ce setComputePipelineState:ps_gb_chunk_sum_];
                 [ce setBuffer:sorted        offset:0 atIndex:0];
                 [ce setBuffer:perm          offset:0 atIndex:1];
@@ -1439,6 +1574,7 @@ private:
                 [ce setBuffer:bs            offset:0 atIndex:6];
                 [ce setBuffer:gb_head_buf_  offset:0 atIndex:7];
                 [ce setBuffer:gb_tail_buf_  offset:0 atIndex:8];
+                [ce setBytes:&vw   length:sizeof(vw)   atIndex:9];
                 [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1464,6 +1600,8 @@ private:
             [ce setBuffer:(gpu_sums ? bs : bc) offset:0 atIndex:7];
             [ce setBuffer:bc        offset:0 atIndex:8];
             [ce setBytes:&with_sums length:sizeof(with_sums) atIndex:9];
+            [ce setBytes:&kw    length:sizeof(kw)    atIndex:10];
+            [ce setBytes:&kzero length:sizeof(kzero) atIndex:11];
             [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
             [ce endEncoding];
@@ -1643,8 +1781,18 @@ private:
             if (any_validity)
                 for (std::size_t l = 0; l < n_lanes; ++l) valid[l].assign(words, ~std::uint64_t{0});
             std::vector<std::vector<std::size_t>> span_nulls(n_spans, std::vector<std::size_t>(n_lanes, 0));
+            // Stage C: each span reduces its own min / max per I64 lane over the
+            // cells it writes, NULLs excluded; the widths follow from the merge.
+            constexpr std::int64_t kNoMin = std::numeric_limits<std::int64_t>::max();
+            constexpr std::int64_t kNoMax = std::numeric_limits<std::int64_t>::min();
+            std::vector<std::vector<std::int64_t>> span_min(n_spans, std::vector<std::int64_t>(n_lanes, kNoMin));
+            std::vector<std::vector<std::int64_t>> span_max(n_spans, std::vector<std::int64_t>(n_lanes, kNoMax));
+            std::vector<char> narrowable(n_lanes, 0);
+            for (std::size_t l = 0; l < n_lanes; ++l) narrowable[l] = dtypes[l] == Dtype::I64;
             auto copy_span = [&](std::size_t sidx) {
                 const RowSpan& sp = spans[sidx];
+                std::int64_t* smn = span_min[sidx].data();
+                std::int64_t* smx = span_max[sidx].data();
                 bool has_valid = false;
                 if (sp.valid) for (std::size_t l = 0; l < n_lanes; ++l) has_valid |= sp.valid[l] != nullptr;
                 if (!has_valid) {                        // the common case: no NULL anywhere in the span
@@ -1652,7 +1800,17 @@ private:
                     for (std::size_t l = 0; l < n_lanes; ++l) {
                         std::int64_t* out = dst[l] + d0;
                         const std::int64_t* in = sp.lanes + l;
-                        for (std::size_t j = 0; j < sp.rows; ++j) out[j] = in[j * n_lanes];
+                        if (!narrowable[l]) {
+                            for (std::size_t j = 0; j < sp.rows; ++j) out[j] = in[j * n_lanes];
+                        } else {
+                            std::int64_t mn = kNoMin, mx = kNoMax;
+                            for (std::size_t j = 0; j < sp.rows; ++j) {
+                                const std::int64_t x = in[j * n_lanes];
+                                out[j] = x;
+                                mn = std::min(mn, x); mx = std::max(mx, x);
+                            }
+                            smn[l] = mn; smx[l] = mx;
+                        }
                     }
                     return;
                 }
@@ -1661,8 +1819,11 @@ private:
                     const std::size_t d = d0 + j;
                     for (std::size_t l = 0; l < n_lanes; ++l) {
                         const bool ok = bit(lane_valid(sp, l), sp.valid_bit + j);
-                        dst[l][d] = ok ? sp.lanes[j * n_lanes + l] : 0;
-                        if (!ok) {
+                        const std::int64_t x = ok ? sp.lanes[j * n_lanes + l] : 0;
+                        dst[l][d] = x;
+                        if (ok) {
+                            if (narrowable[l]) { smn[l] = std::min(smn[l], x); smx[l] = std::max(smx[l], x); }
+                        } else {
                             __atomic_and_fetch(&valid[l][d >> 6], ~(std::uint64_t{1} << (d & 63)), __ATOMIC_SEQ_CST);
                             ++span_nulls[sidx][l];
                         }
@@ -1684,8 +1845,17 @@ private:
                 for (auto& th : pool) th.join();
             }
             std::vector<std::size_t> nulls(n_lanes, 0);
+            std::vector<std::int64_t> mn(n_lanes, kNoMin), mx(n_lanes, kNoMax);
             for (std::size_t sidx = 0; sidx < n_spans; ++sidx)
-                for (std::size_t l = 0; l < n_lanes; ++l) nulls[l] += span_nulls[sidx][l];
+                for (std::size_t l = 0; l < n_lanes; ++l) {
+                    nulls[l] += span_nulls[sidx][l];
+                    mn[l] = std::min(mn[l], span_min[sidx][l]);
+                    mx[l] = std::max(mx[l], span_max[sidx][l]);
+                }
+            std::vector<unsigned> widths(n_lanes, 8);
+            for (std::size_t l = 0; l < n_lanes; ++l)
+                if (narrowable[l]) widths[l] = width_for(mn[l], mx[l]);
+            narrow_lanes(bufs, widths, rows, "upload_rows_exact");
             std::vector<std::unique_ptr<ResidentColumn>> out;
             out.reserve(n_lanes);
             for (std::size_t l = 0; l < n_lanes; ++l) {
@@ -1696,7 +1866,7 @@ private:
                                             options:MTLResourceStorageModeShared];
                     if (!vb) throw std::runtime_error("upload_rows_exact: validity allocation failed (Metal)");
                 }
-                out.push_back(std::make_unique<MetalResidentColumn>(bufs[l], rows, dtypes[l], sort_ctx_, vb, nulls[l]));
+                out.push_back(std::make_unique<MetalResidentColumn>(bufs[l], rows, dtypes[l], sort_ctx_, vb, nulls[l], widths[l]));
             }
             return out;
         }
@@ -1732,7 +1902,8 @@ private:
         const auto* kb = k.valid_buffer() ? static_cast<const std::uint64_t*>([k.valid_buffer() contents]) : nullptr;
         if (!kb) return NullFold{};
         const std::size_t rows = k.rows(), words = (rows + 63) / 64;
-        const auto* vd = v ? static_cast<const std::int64_t*>([v->buffer() contents]) : nullptr;
+        const void* vd = v ? [v->buffer() contents] : nullptr;
+        const unsigned vw = v ? v->width() : 8u;
         const auto* vv = (v && v->valid_buffer())
             ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
         auto range = [=](std::size_t w0, std::size_t w1) {
@@ -1747,7 +1918,7 @@ private:
                     ++f.cstar;
                     if (!vd) continue;
                     if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
-                    const std::int64_t x = vd[i];
+                    const std::int64_t x = load_w(vd, vw, i);
                     f.s.add(x); ++f.cnt; f.mn = std::min(f.mn, x); f.mx = std::max(f.mx, x);
                 }
             }
@@ -1835,9 +2006,21 @@ private:
             bool null_ok = true;
             std::vector<const Predicate*> maskp;
             if (n_preds) {
-                const auto* sk = sorted ? static_cast<const std::int64_t*>([sorted contents]) : nullptr;
-                auto lower = [&](std::int64_t x) { return sk ? static_cast<std::size_t>(std::lower_bound(sk, sk + n, x) - sk) : 0; };
-                auto upper = [&](std::int64_t x) { return sk ? static_cast<std::size_t>(std::upper_bound(sk, sk + n, x) - sk) : 0; };
+                const void* sk = sorted ? [sorted contents] : nullptr;
+                const unsigned skw = k.sort_width();
+                // lower / upper bound over the narrow sorted keys
+                auto bound = [&](std::int64_t x, bool upper_b) {
+                    if (!sk) return std::size_t{0};
+                    std::size_t a = 0, b = n;
+                    while (a < b) {
+                        const std::size_t mid = a + ((b - a) >> 1);
+                        const std::int64_t v = load_w(sk, skw, mid);
+                        if (upper_b ? (v <= x) : (v < x)) a = mid + 1; else b = mid;
+                    }
+                    return a;
+                };
+                auto lower = [&](std::int64_t x) { return bound(x, false); };
+                auto upper = [&](std::int64_t x) { return bound(x, true); };
                 for (std::size_t p = 0; p < n_preds; ++p) {
                     const Predicate& pr = preds[p];
                     if (pr.col != &k) { maskp.push_back(&pr); continue; }
@@ -1903,13 +2086,15 @@ private:
                     [ce setBytes:&n_list    length:sizeof(n_list)    atIndex:9];
                     [ce setBytes:&first     length:sizeof(first)     atIndex:10];
                     [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:11];
+                    const std::uint32_t cw = pc.width();
+                    [ce setBytes:&cw        length:sizeof(cw)        atIndex:12];
                     [ce dispatchThreadgroups:MTLSizeMake((n_total + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
                 if (range_n > 0) {
                     [ce setComputePipelineState:ps_gbx_sel_counts_];
-                    [ce setBuffer:perm offset:lo * sizeof(std::int64_t) atIndex:0];
+                    [ce setBuffer:perm offset:lo * sizeof(std::uint32_t) atIndex:0];
                     [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:1];
                     [ce setBytes:&rn32 length:sizeof(rn32) atIndex:2];
                     [ce setBuffer:gb_block_buf_ offset:0 atIndex:3];
@@ -1935,14 +2120,19 @@ private:
                 } else if (static_cast<double>(n_sel) < compact_below_ * static_cast<double>(range_n)) {
                     // variant (b): compact sorted keys + perm to the survivors
                     // (encoded below, in Stage A's command buffer)
-                    run_sorted = grow(gbx_sel_keys_, n_sel * sizeof(std::int64_t), "compacted keys");
-                    run_perm   = grow(gbx_sel_perm_, n_sel * sizeof(std::int64_t), "compacted perm");
+                    run_sorted = grow(gbx_sel_keys_, n_sel * k.sort_width(), "compacted keys");
+                    run_perm   = grow(gbx_sel_perm_, n_sel * sizeof(std::uint32_t), "compacted perm");
                     run_off = 0; run_n = n_sel; compact_pending = true; n_sel_b = n_sel;
                 } else {
                     mask_in_reduce = true;               // variant (a)
                 }
             }
-            const std::size_t soff = run_off * sizeof(std::int64_t);
+            // The sorted keys are narrow, so their range is passed as an element
+            // offset (koff) rather than a buffer offset; the u32 permutation is
+            // always 4-aligned and keeps a buffer offset.
+            const std::uint32_t kw    = k.sort_width();
+            const std::uint32_t koff  = static_cast<std::uint32_t>(run_off);
+            const std::size_t   poff  = run_off * sizeof(std::uint32_t);
             const std::uint32_t n32 = static_cast<std::uint32_t>(run_n);
             const std::size_t nblocks = (run_n + kBlock - 1) / kBlock;
             const std::size_t nchunks = (run_n + 63) / 64;
@@ -1961,21 +2151,26 @@ private:
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
                 if (compact_pending) {
                     const std::uint32_t rn32 = static_cast<std::uint32_t>(range_n);
+                    const std::uint32_t lo32 = static_cast<std::uint32_t>(lo);
                     [ce setComputePipelineState:ps_gbx_sel_compact_];
-                    [ce setBuffer:sorted offset:lo * sizeof(std::int64_t) atIndex:0];
-                    [ce setBuffer:perm   offset:lo * sizeof(std::int64_t) atIndex:1];
+                    [ce setBuffer:sorted offset:0 atIndex:0];
+                    [ce setBuffer:perm   offset:lo * sizeof(std::uint32_t) atIndex:1];
                     [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:2];
                     [ce setBytes:&rn32 length:sizeof(rn32) atIndex:3];
                     [ce setBuffer:gb_block_buf_ offset:0 atIndex:4];
                     [ce setBuffer:run_sorted offset:0 atIndex:5];
                     [ce setBuffer:run_perm   offset:0 atIndex:6];
+                    [ce setBytes:&kw   length:sizeof(kw)   atIndex:7];
+                    [ce setBytes:&lo32 length:sizeof(lo32) atIndex:8];
                     [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
                 [ce setComputePipelineState:ps_gb_block_counts_];
-                [ce setBuffer:run_sorted    offset:soff atIndex:0];
+                [ce setBuffer:run_sorted    offset:0 atIndex:0];
                 [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
                 [ce setBuffer:block_a offset:0 atIndex:2];
+                [ce setBytes:&kw   length:sizeof(kw)   atIndex:3];
+                [ce setBytes:&koff length:sizeof(koff) atIndex:4];
                 [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce endEncoding];
@@ -2056,7 +2251,7 @@ private:
                     grow(gbxm_head_buf_, nchunks * 6 * sizeof(std::int64_t), "masked head partials");
                     grow(gbxm_tail_buf_, nchunks * 6 * sizeof(std::int64_t), "masked tail partials");
                     [ce setComputePipelineState:ps_gbxm_chunk_];
-                    [ce setBuffer:run_perm      offset:soff atIndex:0];
+                    [ce setBuffer:run_perm      offset:poff atIndex:0];
                     [ce setBuffer:vbuf          offset:0 atIndex:1];
                     [ce setBuffer:valid         offset:0 atIndex:2];
                     [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:3];
@@ -2073,6 +2268,8 @@ private:
                     [ce setBuffer:bb[5] offset:0 atIndex:14];   // mx
                     [ce setBuffer:gbxm_head_buf_ offset:0 atIndex:15];
                     [ce setBuffer:gbxm_tail_buf_ offset:0 atIndex:16];
+                    const std::uint32_t vw = vc ? vc->width() : 8u;
+                    [ce setBytes:&vw length:sizeof(vw) atIndex:17];
                     [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -2089,7 +2286,7 @@ private:
                         [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                     }
                     [ce setComputePipelineState:ps_gbxm_finalize_];
-                    [ce setBuffer:run_sorted offset:soff atIndex:0];
+                    [ce setBuffer:run_sorted offset:0 atIndex:0];
                     [ce setBuffer:mult_buf_  offset:0 atIndex:1];
                     [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
                     [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
@@ -2103,6 +2300,8 @@ private:
                     [ce setBuffer:bb[4] offset:0 atIndex:11];
                     [ce setBuffer:bb[5] offset:0 atIndex:12];
                     [ce setBuffer:gbxm_blk_buf_ offset:0 atIndex:13];
+                    [ce setBytes:&kw   length:sizeof(kw)   atIndex:14];
+                    [ce setBytes:&koff length:sizeof(koff) atIndex:15];
                     [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 } else {
@@ -2110,7 +2309,7 @@ private:
                         grow(gbx_head_buf_, nchunks * 5 * sizeof(std::int64_t), "exact head partials");
                         grow(gbx_tail_buf_, nchunks * 5 * sizeof(std::int64_t), "exact tail partials");
                         [ce setComputePipelineState:ps_gbx_chunk_];
-                        [ce setBuffer:run_perm      offset:soff atIndex:0];
+                        [ce setBuffer:run_perm      offset:poff atIndex:0];
                         [ce setBuffer:vc->buffer()   offset:0 atIndex:1];
                         [ce setBuffer:valid         offset:0 atIndex:2];
                         [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:3];
@@ -2124,6 +2323,8 @@ private:
                         [ce setBuffer:bb[5] offset:0 atIndex:11];
                         [ce setBuffer:gbx_head_buf_ offset:0 atIndex:12];
                         [ce setBuffer:gbx_tail_buf_ offset:0 atIndex:13];
+                        const std::uint32_t vw = vc->width();
+                        [ce setBytes:&vw length:sizeof(vw) atIndex:14];
                         [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                            threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                         [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -2140,7 +2341,7 @@ private:
                         [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                     }
                     [ce setComputePipelineState:ps_gbx_finalize_];
-                    [ce setBuffer:run_sorted offset:soff atIndex:0];
+                    [ce setBuffer:run_sorted offset:0 atIndex:0];
                     [ce setBuffer:mult_buf_  offset:0 atIndex:1];
                     [ce setBytes:&n32  length:sizeof(n32)  atIndex:2];
                     [ce setBytes:&ns32 length:sizeof(ns32) atIndex:3];
@@ -2155,6 +2356,8 @@ private:
                     [ce setBuffer:bb[5] offset:0 atIndex:12];   // mx
                     [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:13];
                     [ce setBuffer:(vc ? gbx_blk_buf_ : bb[0]) offset:0 atIndex:14];
+                    [ce setBytes:&kw   length:sizeof(kw)   atIndex:15];
+                    [ce setBytes:&koff length:sizeof(koff) atIndex:16];
                     [ce dispatchThreadgroups:MTLSizeMake((num_segs + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
@@ -2163,10 +2366,12 @@ private:
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
                 [ce setComputePipelineState:ps_gb_run_starts_];
-                [ce setBuffer:run_sorted    offset:soff atIndex:0];
+                [ce setBuffer:run_sorted    offset:0 atIndex:0];
                 [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
                 [ce setBuffer:gb_block_buf_ offset:0 atIndex:2];
                 [ce setBuffer:mult_buf_     offset:0 atIndex:3];
+                [ce setBytes:&kw   length:sizeof(kw)   atIndex:4];
+                [ce setBytes:&koff length:sizeof(koff) atIndex:5];
                 [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -2663,11 +2868,11 @@ private:
                 return r;
             }
             id<MTLBuffer> in = stage_input(data, n * sizeof(std::int64_t));
-            return dispatch_reduce_i64(in, n, ps_main, ps_partials, has_init, init, t_wall0);
+            return dispatch_reduce_i64(in, n, 8, ps_main, ps_partials, has_init, init, t_wall0);
         }
     }
 
-    AggResult run_i64_resident(id<MTLBuffer> in, std::size_t n,
+    AggResult run_i64_resident(id<MTLBuffer> in, std::size_t n, unsigned w,
                                id<MTLComputePipelineState> ps_main,
                                id<MTLComputePipelineState> ps_partials,
                                bool has_init, std::int64_t init) {
@@ -2680,28 +2885,33 @@ private:
                                   std::chrono::steady_clock::now() - t_wall0).count();
                 return r;
             }
-            return dispatch_reduce_i64(in, n, ps_main, ps_partials, has_init, init, t_wall0);
+            return dispatch_reduce_i64(in, n, w, ps_main, ps_partials, has_init, init, t_wall0);
         }
     }
 
-    AggResult dispatch_reduce_i64(id<MTLBuffer> in, std::size_t n,
+    AggResult dispatch_reduce_i64(id<MTLBuffer> in, std::size_t n, unsigned w,
                                   id<MTLComputePipelineState> ps_main,
                                   id<MTLComputePipelineState> ps_partials,
                                   bool has_init, std::int64_t init,
                                   std::chrono::steady_clock::time_point t_wall0) {
         const NSUInteger grid = pick_grid(n);
         const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+        const std::uint32_t w32 = static_cast<std::uint32_t>(w);
 
         id<MTLCommandBuffer>        cb  = [queue_ commandBuffer];
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
 
         // ---- Pass 1: per-threadgroup reduction ----
+        // sum_i64 takes the width at 3; min_i64 / max_i64 keep `init` there.
         [ce setComputePipelineState:ps_main];
         [ce setBuffer:in            offset:0 atIndex:0];
         [ce setBuffer:partials_buf_ offset:0 atIndex:1];
         [ce setBytes:&n32 length:sizeof(n32) atIndex:2];
         if (has_init) {
             [ce setBytes:&init length:sizeof(init) atIndex:3];
+            [ce setBytes:&w32  length:sizeof(w32)  atIndex:4];
+        } else {
+            [ce setBytes:&w32  length:sizeof(w32)  atIndex:3];
         }
         [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
@@ -2786,10 +2996,11 @@ private:
         return r;
     }
 
-    AggAllResult dispatch_agg_all_i64(id<MTLBuffer> in, std::size_t n,
+    AggAllResult dispatch_agg_all_i64(id<MTLBuffer> in, std::size_t n, unsigned w,
                                       std::chrono::steady_clock::time_point t_wall0) {
         const NSUInteger grid = pick_grid(n);
         const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+        const std::uint32_t w32 = static_cast<std::uint32_t>(w);
 
         id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -2799,6 +3010,7 @@ private:
         [ce setBuffer:in                 offset:0 atIndex:0];
         [ce setBuffer:partials_quad_buf_ offset:0 atIndex:1];
         [ce setBytes:&n32 length:sizeof(n32) atIndex:2];
+        [ce setBytes:&w32 length:sizeof(w32) atIndex:3];
         [ce dispatchThreadgroups:MTLSizeMake(grid, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
 

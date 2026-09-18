@@ -18,12 +18,36 @@ using namespace metal;
 
 constant uint BLOCK = 256;
 
+// ---- narrow lane storage (docs/RESIDENT_COLUMNS_DESIGN.md §6, stage C) ----
+// An exact I64 lane lives at the narrowest signed width its values fit — 1, 2,
+// 4 or 8 bytes, chosen from the upload's min/max. A sorted-key cache keeps its
+// key's width and its permutation is u32. Every kernel that reads a lane or a
+// sorted key takes that width as a uniform and widens here; the branch is the
+// same for every thread of a dispatch, so it costs a scalar compare.
+inline long ldw(device const uchar* p, uint w, uint i) {
+    switch (w) {
+        case 1u: return (long)((device const char*)p)[i];
+        case 2u: return (long)((device const short*)p)[i];
+        case 4u: return (long)((device const int*)p)[i];
+        default: return ((device const long*)p)[i];
+    }
+}
+inline void stw(device uchar* p, uint w, uint i, long v) {
+    switch (w) {
+        case 1u: ((device char*)p)[i]  = (char)v;  break;
+        case 2u: ((device short*)p)[i] = (short)v; break;
+        case 4u: ((device int*)p)[i]   = (int)v;   break;
+        default: ((device long*)p)[i]  = v;        break;
+    }
+}
+
 // ===================== int64 SUM =====================
 
 kernel void sum_i64(
-    device const long*  in       [[buffer(0)]],
+    device const uchar* in       [[buffer(0)]],
     device long*        partials [[buffer(1)]],
     constant uint&      n        [[buffer(2)]],
+    constant uint&      w        [[buffer(3)]],
     uint                tid      [[thread_position_in_threadgroup]],
     uint                gid      [[thread_position_in_grid]],
     uint                gsize    [[threads_per_grid]],
@@ -31,7 +55,7 @@ kernel void sum_i64(
 {
     threadgroup long shm[BLOCK];
     long local = 0;
-    for (uint i = gid; i < n; i += gsize) local += in[i];
+    for (uint i = gid; i < n; i += gsize) local += ldw(in, w, i);
     shm[tid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = BLOCK / 2; s > 0; s >>= 1) {
@@ -62,10 +86,11 @@ kernel void sum_partials_i64(
 // ===================== int64 MIN =====================
 
 kernel void min_i64(
-    device const long*  in       [[buffer(0)]],
+    device const uchar* in       [[buffer(0)]],
     device long*        partials [[buffer(1)]],
     constant uint&      n        [[buffer(2)]],
     constant long&      init     [[buffer(3)]],
+    constant uint&      w        [[buffer(4)]],
     uint                tid      [[thread_position_in_threadgroup]],
     uint                gid      [[thread_position_in_grid]],
     uint                gsize    [[threads_per_grid]],
@@ -73,7 +98,7 @@ kernel void min_i64(
 {
     threadgroup long shm[BLOCK];
     long local = init;
-    for (uint i = gid; i < n; i += gsize) local = min(local, in[i]);
+    for (uint i = gid; i < n; i += gsize) local = min(local, ldw(in, w, i));
     shm[tid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = BLOCK / 2; s > 0; s >>= 1) {
@@ -104,10 +129,11 @@ kernel void min_partials_i64(
 // ===================== int64 MAX =====================
 
 kernel void max_i64(
-    device const long*  in       [[buffer(0)]],
+    device const uchar* in       [[buffer(0)]],
     device long*        partials [[buffer(1)]],
     constant uint&      n        [[buffer(2)]],
     constant long&      init     [[buffer(3)]],
+    constant uint&      w        [[buffer(4)]],
     uint                tid      [[thread_position_in_threadgroup]],
     uint                gid      [[thread_position_in_grid]],
     uint                gsize    [[threads_per_grid]],
@@ -115,7 +141,7 @@ kernel void max_i64(
 {
     threadgroup long shm[BLOCK];
     long local = init;
-    for (uint i = gid; i < n; i += gsize) local = max(local, in[i]);
+    for (uint i = gid; i < n; i += gsize) local = max(local, ldw(in, w, i));
     shm[tid] = local;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = BLOCK / 2; s > 0; s >>= 1) {
@@ -159,9 +185,10 @@ constant long INIT_MIN = 0x7FFFFFFFFFFFFFFFL;   // INT64_MAX
 constant long INIT_MAX = (long)0x8000000000000000L; // INT64_MIN as signed long
 
 kernel void agg_all_i64(
-    device const long*  in       [[buffer(0)]],
+    device const uchar* in       [[buffer(0)]],
     device long*        partials [[buffer(1)]],   // 4 longs per block
     constant uint&      n        [[buffer(2)]],
+    constant uint&      w        [[buffer(3)]],
     uint                tid      [[thread_position_in_threadgroup]],
     uint                gid      [[thread_position_in_grid]],
     uint                gsize    [[threads_per_grid]],
@@ -178,7 +205,7 @@ kernel void agg_all_i64(
     long local_cnt = 0;
 
     for (uint i = gid; i < n; i += gsize) {
-        long x = in[i];
+        long x = ldw(in, w, i);
         local_sum += x;
         local_min = min(local_min, x);
         local_max = max(local_max, x);
@@ -271,13 +298,16 @@ kernel void agg_all_partials_i64(
 // mode: 0=INNER (c=m), 1=LEFT (c=max(m,1)), 2=SEMI (c=m?1:0), 3=ANTI (c=m?0:1)
 // — mirrors gpudb::JoinKind; see the multiplier table in gpu_backend.hpp.
 kernel void join_sum_i64(
-    device const long*  probe_keys   [[buffer(0)]],
-    device const long*  payload      [[buffer(1)]],
-    device const long*  build_sorted [[buffer(2)]],
+    device const uchar* probe_keys   [[buffer(0)]],
+    device const uchar* payload      [[buffer(1)]],
+    device const uchar* build_sorted [[buffer(2)]],
     device long*        partials     [[buffer(3)]],   // 2 per block: sum, matched
     constant uint&      n_probe      [[buffer(4)]],
     constant uint&      n_build      [[buffer(5)]],
     constant uint&      mode         [[buffer(6)]],
+    constant uint&      pk_w         [[buffer(7)]],
+    constant uint&      pl_w         [[buffer(8)]],
+    constant uint&      bs_w         [[buffer(9)]],
     uint                tid          [[thread_position_in_threadgroup]],
     uint                gid          [[thread_position_in_grid]],
     uint                gsize        [[threads_per_grid]],
@@ -289,19 +319,19 @@ kernel void join_sum_i64(
     ulong local_sum = 0;
     long  local_cnt = 0;
     for (uint i = gid; i < n_probe; i += gsize) {
-        const long k = probe_keys[i];
+        const long k = ldw(probe_keys, pk_w, i);
         // lower_bound
         uint lo = 0, hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) < k) lo = mid + 1; else hi = mid;
         }
         const uint first = lo;
         // upper_bound, resuming from lower_bound
         hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) <= k) lo = mid + 1; else hi = mid;
         }
         const uint m = lo - first;
         uint c;
@@ -312,7 +342,7 @@ kernel void join_sum_i64(
             default: c = m;         break;   // INNER
         }
         if (c != 0) {
-            local_sum += (ulong)c * (ulong)payload[i];
+            local_sum += (ulong)c * (ulong)ldw(payload, pl_w, i);
             local_cnt += (long)c;
         }
     }
@@ -366,27 +396,29 @@ kernel void join_sum_partials_i64(
 // probe element's per-kind contribution count c[i]; the host then streams
 // sum += c[i] * payload_f64[i] in one sequential pass (no doubles in MSL).
 kernel void join_mult_i64(
-    device const long*  probe_keys   [[buffer(0)]],
-    device const long*  build_sorted [[buffer(1)]],
+    device const uchar* probe_keys   [[buffer(0)]],
+    device const uchar* build_sorted [[buffer(1)]],
     device uint*        mult         [[buffer(2)]],
     constant uint&      n_probe      [[buffer(3)]],
     constant uint&      n_build      [[buffer(4)]],
     constant uint&      mode         [[buffer(5)]],
+    constant uint&      pk_w         [[buffer(6)]],
+    constant uint&      bs_w         [[buffer(7)]],
     uint                gid          [[thread_position_in_grid]],
     uint                gsize        [[threads_per_grid]])
 {
     for (uint i = gid; i < n_probe; i += gsize) {
-        const long k = probe_keys[i];
+        const long k = ldw(probe_keys, pk_w, i);
         uint lo = 0, hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) < k) lo = mid + 1; else hi = mid;
         }
         const uint first = lo;
         hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) <= k) lo = mid + 1; else hi = mid;
         }
         const uint m = lo - first;
         uint c;
@@ -406,27 +438,29 @@ kernel void join_mult_i64(
 // the host applies the JoinKind emission rules using these two arrays plus
 // the sort permutation.
 kernel void join_lookup_i64(
-    device const long*  probe_keys   [[buffer(0)]],
-    device const long*  build_sorted [[buffer(1)]],
+    device const uchar* probe_keys   [[buffer(0)]],
+    device const uchar* build_sorted [[buffer(1)]],
     device uint*        mcount       [[buffer(2)]],
     device uint*        first        [[buffer(3)]],
     constant uint&      n_probe      [[buffer(4)]],
     constant uint&      n_build      [[buffer(5)]],
+    constant uint&      pk_w         [[buffer(6)]],
+    constant uint&      bs_w         [[buffer(7)]],
     uint                gid          [[thread_position_in_grid]],
     uint                gsize        [[threads_per_grid]])
 {
     for (uint i = gid; i < n_probe; i += gsize) {
-        const long k = probe_keys[i];
+        const long k = ldw(probe_keys, pk_w, i);
         uint lo = 0, hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] < k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) < k) lo = mid + 1; else hi = mid;
         }
         const uint f = lo;
         hi = n_build;
         while (lo < hi) {
             const uint mid = (lo + hi) >> 1;
-            if (build_sorted[mid] <= k) lo = mid + 1; else hi = mid;
+            if (ldw(build_sorted, bs_w, mid) <= k) lo = mid + 1; else hi = mid;
         }
         mcount[i] = lo - f;
         first[i]  = f;
@@ -454,17 +488,22 @@ kernel void join_lookup_i64(
 
 constant uint GB_CHUNK = 64;
 
+// The sorted-key cache is narrow (kw) and may start at an element offset
+// (koff): a narrow element offset is not a legal MTLBuffer offset, so the
+// range is passed as an index rather than bound into the buffer.
 kernel void gb_block_counts_i64(
-    device const long* keys         [[buffer(0)]],
+    device const uchar* keys        [[buffer(0)]],
     constant uint&     n            [[buffer(1)]],
     device uint*       block_counts [[buffer(2)]],
+    constant uint&     kw           [[buffer(3)]],
+    constant uint&     koff         [[buffer(4)]],
     uint               tid          [[thread_position_in_threadgroup]],
     uint               gid          [[thread_position_in_grid]],
     uint               block_id     [[threadgroup_position_in_grid]])
 {
     threadgroup uint shm[BLOCK];
     uint f = 0u;
-    if (gid < n) f = (gid == 0u || keys[gid] != keys[gid - 1u]) ? 1u : 0u;
+    if (gid < n) f = (gid == 0u || ldw(keys, kw, koff + gid) != ldw(keys, kw, koff + gid - 1u)) ? 1u : 0u;
     shm[tid] = f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = BLOCK / 2; s > 0; s >>= 1) {
@@ -475,10 +514,12 @@ kernel void gb_block_counts_i64(
 }
 
 kernel void gb_run_starts_i64(
-    device const long* keys          [[buffer(0)]],
+    device const uchar* keys         [[buffer(0)]],
     constant uint&     n             [[buffer(1)]],
     device const uint* block_offsets [[buffer(2)]],
     device uint*       starts        [[buffer(3)]],
+    constant uint&     kw            [[buffer(4)]],
+    constant uint&     koff          [[buffer(5)]],
     uint               tid           [[thread_position_in_threadgroup]],
     uint               gid           [[thread_position_in_grid]],
     uint               block_id      [[threadgroup_position_in_grid]],
@@ -488,7 +529,7 @@ kernel void gb_run_starts_i64(
 {
     threadgroup uint sg_tot[BLOCK];
     uint f = 0u;
-    if (gid < n) f = (gid == 0u || keys[gid] != keys[gid - 1u]) ? 1u : 0u;
+    if (gid < n) f = (gid == 0u || ldw(keys, kw, koff + gid) != ldw(keys, kw, koff + gid - 1u)) ? 1u : 0u;
     const uint lane_ex = simd_prefix_exclusive_sum(f);
     const uint sg_sum  = simd_sum(f);
     if (lane == 0) sg_tot[sg] = sg_sum;
@@ -500,15 +541,16 @@ kernel void gb_run_starts_i64(
 }
 
 kernel void gb_chunk_sum_i64(
-    device const long* keys     [[buffer(0)]],   // sorted
-    device const long* perm     [[buffer(1)]],   // sorted pos -> original index
-    device const long* vals     [[buffer(2)]],   // original order
+    device const uchar* keys    [[buffer(0)]],   // sorted (unused: the runs come from `starts`)
+    device const uint* perm     [[buffer(1)]],   // sorted pos -> original index
+    device const uchar* vals    [[buffer(2)]],   // original order
     device const uint* starts   [[buffer(3)]],
     constant uint&     n        [[buffer(4)]],
     constant uint&     num_segs [[buffer(5)]],
     device long*       out_sums [[buffer(6)]],
     device long*       head_sum [[buffer(7)]],
     device long*       tail_sum [[buffer(8)]],
+    constant uint&     vw       [[buffer(9)]],
     uint               gid      [[thread_position_in_grid]])
 {
     const uint a = gid * GB_CHUNK;
@@ -528,7 +570,7 @@ kernel void gb_chunk_sum_i64(
         const uint re = (seg + 1 < num_segs) ? starts[seg + 1] : n;
         const uint e  = min(re, b);
         ulong s = 0;
-        for (uint j = i; j < e; ++j) s += (ulong)vals[perm[j]];
+        for (uint j = i; j < e; ++j) s += (ulong)ldw(vals, vw, perm[j]);
         if (rs < a)      hs = s;                  // started before this chunk
         else if (re > b) ts = s;                  // started here, continues past
         else             out_sums[seg] = (long)s; // interior: exclusive owner
@@ -540,7 +582,7 @@ kernel void gb_chunk_sum_i64(
 }
 
 kernel void gb_finalize_i64(
-    device const long* keys       [[buffer(0)]],
+    device const uchar* keys      [[buffer(0)]],
     device const uint* starts     [[buffer(1)]],
     constant uint&     n          [[buffer(2)]],
     constant uint&     num_segs   [[buffer(3)]],
@@ -550,12 +592,14 @@ kernel void gb_finalize_i64(
     device long*       out_sums   [[buffer(7)]],
     device long*       out_counts [[buffer(8)]],
     constant uint&     with_sums  [[buffer(9)]],
+    constant uint&     kw         [[buffer(10)]],
+    constant uint&     koff       [[buffer(11)]],
     uint               gid        [[thread_position_in_grid]])
 {
     if (gid >= num_segs) return;
     const uint rs = starts[gid];
     const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
-    out_keys[gid]   = keys[rs];
+    out_keys[gid]   = ldw(keys, kw, koff + rs);
     out_counts[gid] = (long)(re - rs);
     if (with_sums != 0u) {
         const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
@@ -571,8 +615,8 @@ kernel void gb_finalize_i64(
 // in sorted-key order so the host can stream per-segment double sums
 // sequentially (no doubles in MSL; the gather is the random-access part).
 kernel void gb_gather_i64(
-    device const long* perm [[buffer(0)]],
-    device const long* src  [[buffer(1)]],
+    device const uint* perm [[buffer(0)]],
+    device const long* src  [[buffer(1)]],   // f64 lane: always 8 bytes wide
     device long*       dst  [[buffer(2)]],
     constant uint&     n    [[buffer(3)]],
     uint               gid  [[thread_position_in_grid]])
@@ -833,8 +877,8 @@ inline bool gbx_valid(device const ulong* valid, uint has_valid, ulong row) {
 }
 
 kernel void gbx_chunk_i64(
-    device const long*  perm      [[buffer(0)]],   // sorted pos -> original index
-    device const long*  vals      [[buffer(1)]],   // original order
+    device const uint*  perm      [[buffer(0)]],   // sorted pos -> original index
+    device const uchar* vals      [[buffer(1)]],   // original order
     device const ulong* valid     [[buffer(2)]],   // payload validity (or a dummy)
     constant uint&      has_valid [[buffer(3)]],
     device const uint*  starts    [[buffer(4)]],
@@ -847,6 +891,7 @@ kernel void gbx_chunk_i64(
     device long*        out_mx    [[buffer(11)]],
     device long*        head      [[buffer(12)]],  // 5 longs per chunk
     device long*        tail      [[buffer(13)]],
+    constant uint&      vw        [[buffer(14)]],
     uint                gid       [[thread_position_in_grid]])
 {
     const uint a = gid * GB_CHUNK;
@@ -866,8 +911,8 @@ kernel void gbx_chunk_i64(
         const uint e  = min(re, b);
         GbxAcc s = gbx_zero();
         for (uint j = i; j < e; ++j) {
-            const ulong row = (ulong)perm[j];
-            if (gbx_valid(valid, has_valid, row)) gbx_add(s, vals[row]);
+            const uint row = perm[j];
+            if (gbx_valid(valid, has_valid, (ulong)row)) gbx_add(s, ldw(vals, vw, row));
         }
         if (rs < a)      hs = s;
         else if (re > b) ts = s;
@@ -904,7 +949,7 @@ kernel void gbx_blocks_i64(
 }
 
 kernel void gbx_finalize_i64(
-    device const long* keys      [[buffer(0)]],
+    device const uchar* keys     [[buffer(0)]],
     device const uint* starts    [[buffer(1)]],
     constant uint&     n         [[buffer(2)]],
     constant uint&     num_segs  [[buffer(3)]],
@@ -919,12 +964,14 @@ kernel void gbx_finalize_i64(
     device long*       out_mx    [[buffer(12)]],
     constant uint&     with_vals [[buffer(13)]],
     device const long* blk       [[buffer(14)]],
+    constant uint&     kw        [[buffer(15)]],
+    constant uint&     koff      [[buffer(16)]],
     uint               gid       [[thread_position_in_grid]])
 {
     if (gid >= num_segs) return;
     const uint rs = starts[gid];
     const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
-    out_keys[gid]  = keys[rs];
+    out_keys[gid]  = ldw(keys, kw, koff + rs);
     out_cstar[gid] = (long)(re - rs);
     if (with_vals == 0u) {
         out_lo[gid] = 0l; out_hi[gid] = 0l; out_cnt[gid] = (long)(re - rs);
@@ -1262,7 +1309,7 @@ inline bool gbx_cmp_s(uint op, long a, long b) {
 }
 
 kernel void gbx_mask_i64(
-    device const long*  col              [[buffer(0)]],
+    device const uchar* col              [[buffer(0)]],
     device const ulong* valid            [[buffer(1)]],
     constant uint&      has_valid        [[buffer(2)]],
     constant uint&      null_suffix_from [[buffer(3)]],
@@ -1274,6 +1321,7 @@ kernel void gbx_mask_i64(
     constant uint&      n_list           [[buffer(9)]],
     constant uint&      first            [[buffer(10)]],
     device uchar*       mask             [[buffer(11)]],
+    constant uint&      cw               [[buffer(12)]],
     uint                gid              [[thread_position_in_grid]])
 {
     if (gid >= n) return;
@@ -1284,7 +1332,7 @@ kernel void gbx_mask_i64(
     else if (op == 7u) pass = v;
     else if (!v)       pass = false;
     else {
-        const long raw = col[gid];
+        const long raw = ldw(col, cw, gid);
         if (is_f64 != 0u) {
             const ulong a = gbx_f64_key(raw);
             if (op == 8u) {
@@ -1339,8 +1387,8 @@ inline void gbxm_out(device long* lo, device long* hi, device long* cnt, device 
 }
 
 kernel void gbxm_chunk_i64(
-    device const long*  perm      [[buffer(0)]],
-    device const long*  vals      [[buffer(1)]],
+    device const uint*  perm      [[buffer(0)]],
+    device const uchar* vals      [[buffer(1)]],
     device const ulong* valid     [[buffer(2)]],
     constant uint&      has_valid [[buffer(3)]],
     device const uint*  starts    [[buffer(4)]],
@@ -1356,6 +1404,7 @@ kernel void gbxm_chunk_i64(
     device long*        out_mx    [[buffer(14)]],
     device long*        head      [[buffer(15)]],  // 6 longs per chunk
     device long*        tail      [[buffer(16)]],
+    constant uint&      vw        [[buffer(17)]],
     uint                gid       [[thread_position_in_grid]])
 {
     const uint a = gid * GB_CHUNK;
@@ -1375,10 +1424,10 @@ kernel void gbxm_chunk_i64(
         const uint e  = min(re, b);
         GbxmAcc s = gbxm_zero();
         for (uint j = i; j < e; ++j) {
-            const ulong row = (ulong)perm[j];
+            const uint row = perm[j];
             if (mask[row] == 0u) continue;
             s.cstar += 1l;
-            if (with_vals != 0u && gbx_valid(valid, has_valid, row)) gbxm_add(s, vals[row]);
+            if (with_vals != 0u && gbx_valid(valid, has_valid, (ulong)row)) gbxm_add(s, ldw(vals, vw, row));
         }
         if (with_vals == 0u) s.cnt = s.cstar;
         if (rs < a)      hs = s;
@@ -1405,7 +1454,7 @@ kernel void gbxm_blocks_i64(
 }
 
 kernel void gbxm_finalize_i64(
-    device const long* keys      [[buffer(0)]],
+    device const uchar* keys     [[buffer(0)]],
     device const uint* starts    [[buffer(1)]],
     constant uint&     n         [[buffer(2)]],
     constant uint&     num_segs  [[buffer(3)]],
@@ -1419,12 +1468,14 @@ kernel void gbxm_finalize_i64(
     device long*       out_mn    [[buffer(11)]],
     device long*       out_mx    [[buffer(12)]],
     device const long* blk       [[buffer(13)]],
+    constant uint&     kw        [[buffer(14)]],
+    constant uint&     koff      [[buffer(15)]],
     uint               gid       [[thread_position_in_grid]])
 {
     if (gid >= num_segs) return;
     const uint rs = starts[gid];
     const uint re = (gid + 1 < num_segs) ? starts[gid + 1] : n;
-    out_keys[gid] = keys[rs];
+    out_keys[gid] = ldw(keys, kw, koff + rs);
     const uint c0 = rs / GB_CHUNK, c1 = (re - 1u) / GB_CHUNK;
     if (c0 < c1) {
         GbxmAcc s = gbxm_load(tail, c0);
@@ -1439,7 +1490,7 @@ kernel void gbxm_finalize_i64(
 
 // ---- variant (b): compact the sorted positions that survive the mask ----
 kernel void gbx_sel_counts_i64(
-    device const long*  perm         [[buffer(0)]],
+    device const uint*  perm         [[buffer(0)]],
     device const uchar* mask         [[buffer(1)]],
     constant uint&      n            [[buffer(2)]],
     device uint*        block_counts [[buffer(3)]],
@@ -1448,7 +1499,7 @@ kernel void gbx_sel_counts_i64(
     uint                block_id     [[threadgroup_position_in_grid]])
 {
     threadgroup uint shm[BLOCK];
-    shm[tid] = (gid < n && mask[(ulong)perm[gid]] != 0u) ? 1u : 0u;
+    shm[tid] = (gid < n && mask[perm[gid]] != 0u) ? 1u : 0u;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = BLOCK / 2; s > 0; s >>= 1) {
         if (tid < s) shm[tid] += shm[tid + s];
@@ -1458,20 +1509,22 @@ kernel void gbx_sel_counts_i64(
 }
 
 kernel void gbx_sel_compact_i64(
-    device const long*  keys          [[buffer(0)]],
-    device const long*  perm          [[buffer(1)]],
+    device const uchar* keys          [[buffer(0)]],
+    device const uint*  perm          [[buffer(1)]],
     device const uchar* mask          [[buffer(2)]],
     constant uint&      n             [[buffer(3)]],
     device const uint*  block_offsets [[buffer(4)]],
-    device long*        o_keys        [[buffer(5)]],
-    device long*        o_perm        [[buffer(6)]],
+    device uchar*       o_keys        [[buffer(5)]],
+    device uint*        o_perm        [[buffer(6)]],
+    constant uint&      kw            [[buffer(7)]],
+    constant uint&      koff          [[buffer(8)]],
     uint                gid           [[thread_position_in_grid]],
     uint                block_id      [[threadgroup_position_in_grid]],
     uint                lane          [[thread_index_in_simdgroup]],
     uint                sg            [[simdgroup_index_in_threadgroup]])
 {
     threadgroup uint sg_tot[BLOCK];
-    const uint f = (gid < n && mask[(ulong)perm[gid]] != 0u) ? 1u : 0u;
+    const uint f = (gid < n && mask[perm[gid]] != 0u) ? 1u : 0u;
     const uint lane_ex = simd_prefix_exclusive_sum(f);
     const uint sg_sum  = simd_sum(f);
     if (lane == 0) sg_tot[sg] = sg_sum;
@@ -1480,7 +1533,7 @@ kernel void gbx_sel_compact_i64(
     for (uint s = 0; s < sg; ++s) sg_off += sg_tot[s];
     if (f) {
         const uint pos = block_offsets[block_id] + sg_off + lane_ex;
-        o_keys[pos] = keys[gid];
+        stw(o_keys, kw, pos, ldw(keys, kw, koff + gid));
         o_perm[pos] = perm[gid];
     }
 }
@@ -1504,23 +1557,25 @@ inline bool jm_valid(device const ulong* valid, uint has_valid, uint null_from, 
 }
 
 kernel void jm_unique_i64(
-    device const long* sorted [[buffer(0)]],
+    device const uchar* sorted [[buffer(0)]],
     constant uint&     n      [[buffer(1)]],
     device atomic_uint* flag  [[buffer(2)]],
+    constant uint&     sw     [[buffer(3)]],
     uint               gid    [[thread_position_in_grid]])
 {
     if (gid + 1u >= n) return;
-    if (sorted[gid] == sorted[gid + 1u]) atomic_store_explicit(flag, 1u, memory_order_relaxed);
+    if (ldw(sorted, sw, gid) == ldw(sorted, sw, gid + 1u))
+        atomic_store_explicit(flag, 1u, memory_order_relaxed);
 }
 
 kernel void jm_probe_i64(
-    device const long*  pkey         [[buffer(0)]],
+    device const uchar* pkey         [[buffer(0)]],
     device const ulong* pvalid       [[buffer(1)]],
     constant uint&      p_has_valid  [[buffer(2)]],
     constant uint&      p_null_from  [[buffer(3)]],
     constant uint&      n            [[buffer(4)]],
-    device const long*  sorted       [[buffer(5)]],
-    device const long*  perm         [[buffer(6)]],
+    device const uchar* sorted       [[buffer(5)]],
+    device const uint*  perm         [[buffer(6)]],
     constant uint&      nb           [[buffer(7)]],
     device const ulong* kvalid       [[buffer(8)]],
     constant uint&      k_has_valid  [[buffer(9)]],
@@ -1528,20 +1583,22 @@ kernel void jm_probe_i64(
     constant uint&      k_from_build [[buffer(11)]],
     device uint*        match        [[buffer(12)]],
     device uchar*       cls          [[buffer(13)]],
+    constant uint&      pw           [[buffer(14)]],
+    constant uint&      sw           [[buffer(15)]],
     uint                gid          [[thread_position_in_grid]])
 {
     if (gid >= n) return;
     uint  m = 0xFFFFFFFFu;
     uchar c = 0u;
     if (jm_valid(pvalid, p_has_valid, p_null_from, (ulong)gid)) {
-        const long k = pkey[gid];
+        const long k = ldw(pkey, pw, gid);
         uint lo = 0u, hi = nb;
         while (lo < hi) {
             const uint mid = lo + ((hi - lo) >> 1);
-            if (sorted[mid] < k) lo = mid + 1u; else hi = mid;
+            if (ldw(sorted, sw, mid) < k) lo = mid + 1u; else hi = mid;
         }
-        if (lo < nb && sorted[lo] == k) {
-            m = (uint)perm[lo];
+        if (lo < nb && ldw(sorted, sw, lo) == k) {
+            m = perm[lo];
             const ulong krow = (k_from_build != 0u) ? (ulong)m : (ulong)gid;
             c = jm_valid(kvalid, k_has_valid, k_null_from, krow) ? 1u : 2u;
         }
@@ -1601,8 +1658,10 @@ kernel void jm_pos(
     else if (f2) pos[gid] = n1 + off2[block_id] + o2 + ex2;
 }
 
+// The gather does not change a lane's min/max, so the output keeps the
+// source lane's storage width.
 kernel void jm_gather(
-    device const long*  src         [[buffer(0)]],
+    device const uchar* src         [[buffer(0)]],
     device const ulong* svalid      [[buffer(1)]],
     constant uint&      s_has_valid [[buffer(2)]],
     constant uint&      s_null_from [[buffer(3)]],
@@ -1611,17 +1670,18 @@ kernel void jm_gather(
     device const uchar* cls         [[buffer(6)]],
     device const uint*  pos         [[buffer(7)]],
     constant uint&      n           [[buffer(8)]],
-    device long*        dst         [[buffer(9)]],
+    device uchar*       dst         [[buffer(9)]],
     device atomic_uint* dvalid      [[buffer(10)]],
+    constant uint&      w           [[buffer(11)]],
     uint                gid         [[thread_position_in_grid]])
 {
     if (gid >= n || cls[gid] == 0u) return;
-    const ulong srow = (from_build != 0u) ? (ulong)match[gid] : (ulong)gid;
+    const uint srow = (from_build != 0u) ? match[gid] : gid;
     const uint  d = pos[gid];
-    if (jm_valid(svalid, s_has_valid, s_null_from, srow)) {
-        dst[d] = src[srow];
+    if (jm_valid(svalid, s_has_valid, s_null_from, (ulong)srow)) {
+        stw(dst, w, d, ldw(src, w, srow));
     } else {
-        dst[d] = 0l;
+        stw(dst, w, d, 0l);
         atomic_fetch_and_explicit(&dvalid[d >> 5], ~(1u << (d & 31u)), memory_order_relaxed);
     }
 }
