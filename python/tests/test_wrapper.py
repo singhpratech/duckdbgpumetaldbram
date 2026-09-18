@@ -231,8 +231,11 @@ def run():
     con.execute("SELECT k, sum(v) FROM t2 GROUP BY k").fetchall()
     check(con.last_rewrite()["reason"] in ("temp", "threshold"), "temp table: never rewritten")
     con.execute("CREATE VIEW tv AS SELECT * FROM t")
-    con.execute("SELECT k, sum(v) FROM tv GROUP BY k").fetchall()
-    check(con.last_rewrite()["reason"] in ("view", "threshold"), "view: never rewritten")
+    want = sorted(con._raw.execute("SELECT k, sum(v) FROM tv GROUP BY k").fetchall())
+    got = sorted(con.execute("SELECT k, sum(v) FROM tv GROUP BY k").fetchall())
+    lr = con.last_rewrite()
+    check(got == want and (lr["rewritten"] or lr["reason"] in ("view", "threshold")),
+          f"view of the current schema: inlined (§4.20) and answered identically (rewritten={lr['rewritten']})")
     con.sql("SELECT (i % 5)::INTEGER k, i::BIGINT v FROM range(10) r(i)").create_view("rv")
     con.execute("SELECT k, sum(v) FROM rv GROUP BY k").fetchall()
     check(con.last_rewrite()["reason"] in ("view", "threshold"), "registered relation: never rewritten")
@@ -801,6 +804,55 @@ def run():
             got = sorted(map(str, con.execute(sql).fetchall()))
             check(not con.last_rewrite()["rewritten"] and got == want,
                   f"spelling decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
+    con.close()
+
+    # ---- views (§4.20): a view is its definition spliced in as a derived table ----
+    print("== views")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute("""CREATE VIEW rev AS SELECT k AS supplier_no, sum(d) AS total_revenue FROM t WHERE k % 13 < 9 GROUP BY k;
+                       CREATE VIEW rev2 AS SELECT supplier_no, total_revenue * 2 AS dbl FROM rev;
+                       CREATE VIEW cnt(kk, n) AS SELECT k, count(*) FROM t GROUP BY k;
+                       CREATE VIEW uni AS SELECT k, sum(v) AS s FROM t GROUP BY k UNION ALL SELECT k, sum(a) FROM tm GROUP BY k;
+                       CREATE SCHEMA other; CREATE VIEW other.rev AS SELECT k AS supplier_no, sum(v) AS total_revenue FROM t GROUP BY k;""")
+        vcases = {
+            "over_view":       "SELECT supplier_no, total_revenue FROM rev WHERE total_revenue > 1400 ORDER BY supplier_no",
+            "q15_shape":       "SELECT supplier_no, total_revenue FROM rev WHERE total_revenue = (SELECT max(total_revenue) FROM rev) ORDER BY supplier_no",
+            "agg_over_view":   "SELECT count(*), max(total_revenue) FROM rev",
+            "view_over_view":  "SELECT supplier_no, dbl FROM rev2 WHERE dbl > 2900 ORDER BY 1",
+            "column_aliases":  "SELECT kk, n FROM cnt WHERE n > 299 ORDER BY kk",
+            "join_view_table": "SELECT z, count(*), sum(total_revenue) FROM tm JOIN rev ON tm.k = rev.supplier_no WHERE tm.a < 30000 GROUP BY z ORDER BY z",
+            "aliased_ref":     "SELECT r.supplier_no, r.total_revenue FROM rev AS r WHERE r.total_revenue > 1450 ORDER BY 1",
+        }
+        for name, sql in vcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + lr["sql"]).fetchall()] if lr["rewritten"] else want_desc
+            check(lr["rewritten"], f"view {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want if "ORDER BY" in sql else sorted(map(str, got)) == sorted(map(str, want)),
+                  f"view {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc == want_desc, f"view {name}: names and types identical")
+        for name, sql in {
+            "other_schema":  "SELECT supplier_no, total_revenue FROM other.rev WHERE total_revenue > 14000 ORDER BY 1",
+            "set_op_body":   "SELECT k, s FROM uni WHERE s > 100000000 ORDER BY k, s",
+        }.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"] and got == want,
+                  f"view decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
+        # a view redefined from ANOTHER connection: the cached statement follows the new definition
+        q = vcases["over_view"]
+        other5 = con._raw.cursor()
+        other5.execute("CREATE OR REPLACE VIEW rev AS SELECT k AS supplier_no, sum(d) * 10 AS total_revenue FROM t WHERE k % 13 < 9 GROUP BY k")
+        want = con._raw.execute(q).fetchall()
+        got = con.execute(q).fetchall()
+        check(got == want and len(got) > 0, f"view: redefined elsewhere -> the new definition answers (rewritten={con.last_rewrite()['rewritten']})")
+        other5.execute("DROP VIEW rev2; CREATE TABLE rev2 AS SELECT 1 AS supplier_no, 2 AS dbl")   # now a TABLE of that name
+        q = vcases["view_over_view"]
+        got = con.execute(q).fetchall()
+        check(got == con._raw.execute(q).fetchall(), "view: replaced by a table of the same name -> the table answers")
     con.close()
 
     # ---- memory budget (§5.5): estimate, least-recently-used eviction, anti-thrash, "does not fit" ----

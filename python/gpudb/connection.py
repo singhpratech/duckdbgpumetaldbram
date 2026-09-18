@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds
+from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds, _views
 from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -199,6 +199,7 @@ class Connection:
         self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
         self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
         self._flat_cache: Dict[str, str] = {}                    # statement text -> the same with SPJ derived tables folded in
+        self._flat_views: Dict[str, Dict[str, str]] = {}         # statement text -> {view: definition} it was built on (§4.20)
         self._last_tags: List[str] = []
         self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
         self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
@@ -516,6 +517,8 @@ class Connection:
         self._unique_cache.clear()
         self._expr_types.clear()
         self._big_tables = None
+        self._view_catalog = None
+        self._flat_views.clear()
         try:
             self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
         except Exception:
@@ -530,9 +533,21 @@ class Connection:
                 "SELECT table_name FROM duckdb_tables() WHERE NOT internal AND NOT temporary "
                 "AND estimated_size >= ?", [self._floor_rows]).fetchall()
             self._big_tables = {r[0] for r in rows}
+            # a view whose definition names a big table stands for it (§4.20)
+            vc = self._view_catalog = _views.ViewCatalog(self._raw)
+            for vname, (body, _cols) in vc.views.items():
+                if any(re.search(r"(?<![A-Za-z0-9_])" + re.escape(t) + r"(?![A-Za-z0-9_])", body, re.I)
+                       for t in list(self._big_tables)):
+                    self._big_tables.add(vname)
         except Exception:
             self._big_tables = set()
         return self._big_tables
+
+    def _names_view(self, sql: str) -> bool:
+        vc = getattr(self, "_view_catalog", None)
+        if vc is None:
+            vc = self._view_catalog = _views.ViewCatalog(self._raw)
+        return any(re.search(r"(?<![A-Za-z0-9_])" + re.escape(v) + r"(?![A-Za-z0-9_])", sql, re.I) for v in vc.views)
 
     def _names_big_table(self, sql: str) -> bool:
         """Does the statement name a table at or above the floor — anywhere
@@ -562,10 +577,12 @@ class Connection:
         # split, no parse, no cache. A statement that starts with SELECT/FROM/
         # VALUES and carries no ';' cannot be DML (a CTE prefix can, so WITH
         # takes the full path), so nothing is invalidated either.
-        if ";" not in query and _SELECT_START_RE.match(query) and (
-                not _maybe_aggregate(query) or not self._names_big_table(query)):
-            self._last.reason = "threshold" if _maybe_aggregate(query) else "shape"
-            return query
+        if ";" not in query and _SELECT_START_RE.match(query):
+            big = self._names_big_table(query)
+            # a view stands for its definition: the aggregate may be inside it (§4.20)
+            if not big or (not _maybe_aggregate(query) and not self._names_view(query)):
+                self._last.reason = "threshold" if _maybe_aggregate(query) else "shape"
+                return query
         stmts = _classify.split(self._raw, query)
         if stmts is None:
             self._last.reason = "error"
@@ -611,7 +628,7 @@ class Connection:
         if len(sql) > _MAX_STATEMENT_BYTES:
             self._last.reason = "too_long"
             return None
-        if not _maybe_aggregate(sql):
+        if not _maybe_aggregate(sql) and not self._names_view(sql):     # a view may hold the aggregate (§4.20)
             self._last.reason = "shape"
             return None
         out = self._rewrite_text(sql)
@@ -620,7 +637,9 @@ class Connection:
         if out is None and getattr(self, "_exact", False) and \
                 self._last.reason in ("shape", "not_found", "view", "temp", "ambiguous", "double", "decimal"):
             whole = self._last.reason
-            out = self._rewrite_nested(sql)
+            # the nested pass walks the statement with its views spliced in (§4.20): a view's
+            # GROUP BY is a rewritable SELECT like any derived table's
+            out = self._rewrite_nested(self._inline_views(sql) if self._names_view(sql) else sql)
             if out is None and self._last.reason == "shape":
                 self._last.reason = whole
         return out
@@ -757,14 +776,21 @@ class Connection:
         into it — what the rewrite decides on and builds from. The original
         text is what runs when the rewrite declines."""
         flat = self._flat_cache.get(sql)
+        if flat is not None and sql in self._flat_views and not self._views_unchanged(self._flat_views[sql]):
+            # a view the statement uses was redefined (any connection): rebuild from the new definition
+            self._flat_cache.pop(sql, None); self._flat_views.pop(sql, None)
+            self._view_catalog = None
+            self._cache.pop((self._normalise(flat)[0], self._settings_key), None)
+            flat = None
         if flat is None:
-            flat = sql
-            if "(" in sql or sql.lstrip()[:4].upper() == "WITH":
+            flat = self._inline_views(sql)
+            sql_v = flat
+            if "(" in flat or flat.lstrip()[:4].upper() == "WITH":
                 try:
                     folded = None
-                    tree = self._serialize(sql)
+                    tree = self._serialize(sql_v)
                     if _flatten.fold(tree) is not None:                 # cheap structural test first
-                        want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+                        want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql_v).fetchall()]
                         folded = _flatten.fold(tree, [w[0] for w in want])
                     if folded is not None:
                         cand = self._raw.execute("SELECT json_deserialize_sql(?)", [folded]).fetchone()[0]
@@ -780,6 +806,51 @@ class Connection:
                 self._flat_cache.clear()
             self._flat_cache[sql] = flat
         return flat
+
+    def _inline_views(self, sql: str) -> str:
+        """§4.20: views named by the statement become derived tables holding their
+        definition — the statement is then a statement over base tables and the
+        fold / nested passes apply. Names pinned, names + types verified with
+        DESCRIBE; anything else keeps the text."""
+        vc = getattr(self, "_view_catalog", None)
+        if vc is None:
+            vc = self._view_catalog = _views.ViewCatalog(self._raw)
+        named = [v for v in vc.views
+                 if re.search(r"(?<![A-Za-z0-9_])" + re.escape(v) + r"(?![A-Za-z0-9_])", sql, re.I)]
+        if not named:
+            return sql
+        try:
+            want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+            out = _views.inline(self._serialize(sql), vc, self._serialize, [w[0] for w in want])
+            if out is None:
+                return sql
+            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
+            if want == have:
+                # remembered so a redefinition of any of these views (from any connection) is noticed
+                self._flat_views[sql] = {v: vc.views[v][0] for v in named}
+                return cand
+            self._log(f"views: names / types changed ({want} -> {have}); left as written")
+        except Exception as e:
+            self._log(f"views: {str(e)[:120]}")
+        return sql
+
+    def _views_unchanged(self, snapshot: Dict[str, str]) -> bool:
+        """One catalog read: do the views a cached statement was built on still have
+        the same definition? (~0.2 ms; a view is the one object whose text can change
+        under a running session without any table changing.)"""
+        try:
+            rows = self._raw.execute(
+                "SELECT lower(view_name), sql FROM duckdb_views() WHERE NOT internal AND NOT temporary "
+                "AND database_name = current_database() AND schema_name = current_schema() "
+                "AND lower(view_name) IN (" + ",".join("?" * len(snapshot)) + ")", list(snapshot)).fetchall()
+        except Exception:
+            return False
+        now = {}
+        for name, sql in rows:
+            m = _views._CREATE_RE.match(sql or "")
+            now[name] = m.group("body") if m else None
+        return all(now.get(v) == body for v, body in snapshot.items())
 
     _AGG_SPELLING_RE = re.compile(r"\bFILTER\s*\(|\bcount_if\s*\(|\bbool_(?:and|or)\s*\(", re.IGNORECASE)
 
