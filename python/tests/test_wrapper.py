@@ -878,6 +878,47 @@ def run():
                   f"distinct/right decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
     con.close()
 
+    # ---- foreign writes on a file-backed database (§5.9): the file and its WAL change on every committed write ----
+    print("== foreign writes (file-backed)")
+    import tempfile as _tf
+    fdb = os.path.join(_tf.mkdtemp(), "fw.duckdb")
+    con = gpudb.connect(fdb, residency="eager", floor_rows=0, thresholds=False)
+    if getattr(con, "_exact", False):
+        con.execute("CREATE TABLE ft AS SELECT (i % 100)::INTEGER AS k, (i % 7)::BIGINT AS v FROM range(200000) r(i)")
+        q = "SELECT k, sum(v) FROM ft GROUP BY k ORDER BY k"
+        check(len(con._watch_files) == 2, f"foreign write: the database file and its WAL are watched ({len(con._watch_files)} files)")
+        con.execute(q).fetchall(); con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"], "foreign write: resident, and a read is not mistaken for a write")
+        other6 = con._raw.cursor()
+        other6.execute("UPDATE ft SET v = v + 1 WHERE k = 5")             # same row count: the row-count guard cannot see it
+        want = con._raw.execute(q).fetchall()
+        got = con.execute(q).fetchall()
+        check(got == want and not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "not_resident",
+              "foreign write: an in-place UPDATE from another connection -> native answer, sets dropped")
+        got = con.execute(q).fetchall()
+        check(got == want and con.last_rewrite()["rewritten"], "foreign write: rebuilt and resident again on the next statement")
+        other6.execute("BEGIN"); other6.execute("UPDATE ft SET v = 0 WHERE k = 6"); other6.execute("ROLLBACK")
+        con.execute(q).fetchall()
+        check(con.last_rewrite()["rewritten"], "foreign write: a rolled-back write changes nothing")
+        con.execute("INSERT INTO ft VALUES (3, 100)")                    # our own write: seen as ours, not as foreign
+        r1 = con.execute(q).fetchall(); w1 = con.last_rewrite()["rewritten"]
+        r2 = con.execute(q).fetchall(); w2 = con.last_rewrite()["rewritten"]
+        check(r1 == r2 == con._raw.execute(q).fetchall() and w1 and w2, "foreign write: our own write re-snapshots, no second invalidation")
+        cur = con.cursor()
+        cur.execute(q).fetchall()
+        other6.execute("UPDATE ft SET v = 0 WHERE k = 8")
+        got = cur.execute(q).fetchall()
+        check(got == con._raw.execute(q).fetchall() and not cur.last_rewrite()["rewritten"],
+              "foreign write: a wrapper cursor shares the family's snapshot")
+        other6.execute("CHECKPOINT")
+        got = con.execute(q).fetchall()
+        check(got == con._raw.execute(q).fetchall(), "foreign write: a checkpoint (file rewritten) is at worst a rebuild")
+    con.close()
+    ro = gpudb.connect("data/tpch_sf1/tpch.duckdb", read_only=True) if os.path.exists("data/tpch_sf1/tpch.duckdb") else None
+    if ro is not None:
+        check(ro._watch_files == [], "foreign write: a read-only connection watches nothing (nobody can write the file)")
+        ro.close()
+
     # ---- views (§4.20): a view is its definition spliced in as a derived table ----
     print("== views")
     con = fresh()

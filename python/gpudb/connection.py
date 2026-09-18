@@ -189,7 +189,7 @@ class Connection:
 
     def __init__(self, raw: duckdb.DuckDBPyConnection, *, transparent: bool = True,
                  residency: str = "background", floor_rows: int = 1_000_000,
-                 idle_ms: float = 20.0, log=None, memory_budget=None,
+                 idle_ms: float = 20.0, log=None, memory_budget=None, read_only: bool = False,
                  _parent: Optional["Connection"] = None):
         self._raw = raw
         self._transparent = transparent
@@ -203,6 +203,10 @@ class Connection:
         self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
         self._flat_cache: Dict[str, str] = {}                    # statement text -> the same with SPJ derived tables folded in
         self._flat_views: Dict[str, Dict[str, str]] = {}         # statement text -> {view: definition} it was built on (§4.20)
+        self._resnap_after = False                                # take a new file snapshot after this statement (our own write)
+        self._read_only = False
+        self._watch_files: List[str] = []
+        self._write_snapshot: tuple = ()
         self._last_tags: List[str] = []
         self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
         self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
@@ -219,6 +223,9 @@ class Connection:
                                              idle_ms=idle_ms, log=self._log)
             self._refresh_settings()
             self._probe_extension()
+            self._read_only = bool(read_only)
+            self._watch_files = self._watched_files()
+            self._write_snapshot = self._snapshot_files()
             budget = parse_memory_budget(memory_budget)
             if budget is None:
                 budget = default_memory_budget(self._backend, getattr(self, "_device_bytes", 0))
@@ -490,8 +497,56 @@ class Connection:
             self._refresh_after = False
             try:
                 self._refresh_settings()
+                if not self._parent:
+                    self._watch_files = self._watched_files()
             except Exception:
                 pass
+        if self._resnap_after:
+            self._resnap_after = False
+            root = self._parent or self
+            root._write_snapshot = root._snapshot_files()
+
+    # ---- foreign writes (§5.9): the database file and its WAL change on every committed write ----
+    def _watched_files(self) -> List[str]:
+        """The files whose size / mtime move on a committed write: every attached
+        database file and its write-ahead log. Nothing for :memory: databases and
+        nothing for a read-only connection (nobody can write the file while it is
+        open read-only)."""
+        if getattr(self, "_read_only", False):
+            return []
+        out: List[str] = []
+        try:
+            for (path,) in self._raw.execute(
+                    "SELECT path FROM duckdb_databases() WHERE NOT internal AND path IS NOT NULL AND path <> ''").fetchall():
+                if path and path != ":memory:":
+                    out += [path, path + ".wal"]
+        except Exception:
+            pass
+        return out
+
+    def _snapshot_files(self) -> tuple:
+        snap = []
+        for f in self._watch_files:
+            try:
+                st = os.stat(f)
+                snap.append((st.st_size, st.st_mtime_ns))
+            except OSError:
+                snap.append(None)
+        return tuple(snap)
+
+    def _foreign_write_seen(self) -> bool:
+        """Did any watched file change since the last snapshot? 2-3 us per
+        statement. A change means some connection committed a write (an
+        in-place UPDATE keeps the row count and passes gpu_assert_rows: this is
+        the check that catches it); the sets are dropped and rebuilt."""
+        root = self._parent or self                # cursors share the family's snapshot
+        if not root._watch_files:
+            return False
+        now = root._snapshot_files()
+        if now == root._write_snapshot:
+            return False
+        root._write_snapshot = now
+        return True
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -513,6 +568,9 @@ class Connection:
                 self._manager.note_candidate(tag, st.upload_sql)
 
     def _invalidate_all(self, why: str) -> None:
+        self._resnap_after = True                 # the file changes when THIS write commits: not foreign
+        if why in ("ATTACH", "DETACH"):
+            self._refresh_after = True
         self._manager.invalidate(None)
         self._cache.clear()
         self._nested_cache.clear()
@@ -975,6 +1033,14 @@ class Connection:
             self._last.engine = "python"
         if d.wrap is not None:
             out = d.wrap[0] + out + d.wrap[1]
+        if self._foreign_write_seen():
+            # some connection committed a write since the last look: every set may be stale
+            # (an in-place UPDATE keeps the row count, so the guard would not know)
+            self._log("foreign write: the database file changed — resident sets dropped, statement runs native")
+            self._invalidate_all("foreign write")
+            self._resnap_after = False
+            self._last.reason = "not_resident"
+            return None
         self._last.rewritten = True
         self._last.sql = out
         return out
@@ -1601,6 +1667,7 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     if ext:
         raw.execute(f"LOAD '{ext}'")
     con = Connection(raw, transparent=transparent, residency=residency,
-                     floor_rows=floor_rows, idle_ms=idle_ms, log=log, memory_budget=memory_budget)
+                     floor_rows=floor_rows, idle_ms=idle_ms, log=log, memory_budget=memory_budget,
+                     read_only=read_only)
     con._thresholds = thresholds
     return con

@@ -1225,6 +1225,30 @@ A resident set is `{identity, columns, sorted key permutation, validity,
 state}`. The v0.5 join build side is the same object, which is what lets
 v0.8 route joins through the same manager (§10).
 
+### 5.9 Foreign writes: the file is the change log
+The staleness guard (`gpu_assert_rows`) compares row counts, so a write from
+another connection that keeps the count — an in-place `UPDATE`, a delete and
+an insert of the same size — passed it, and the device answered from stale
+values. Found and closed 2026-09-18. DuckDB has no table version to read, and
+its storage metadata (`pragma_storage_info`, whose `has_updates` and block
+positions would tell) costs 2.8 ms at SF1 and 175 ms at SF50 per look — not a
+per-statement guard. What is: the database file and its write-ahead log. Every
+committed write appends to the WAL (or, at a checkpoint, rewrites the file);
+reads and rolled-back transactions touch neither; and only connections of the
+same process can write a DuckDB file that is open, and they all share that WAL.
+So before every rewritten statement the wrapper stats the database files and
+their `.wal` (2–3 µs): a change since the last snapshot means some connection
+committed a write, every resident set is dropped and the statement runs native
+(`reason == "not_resident"`); the next statement rebuilds. The wrapper's own
+writes re-take the snapshot after they run, so they cost no second
+invalidation. Cursors of one connection share the snapshot.
+
+Not covered: an in-memory database (no file — writes made through a raw
+`duckdb` cursor rather than the wrapper's `cursor()` are invisible; the
+wrapper's own cursors are seen), and a read-only connection watches nothing
+because nobody can write the file while it is open read-only. A checkpoint
+from another connection looks like a write and costs one rebuild.
+
 ## 6. The rewrite (piece D)
 
 `gpu_rewrite_ast(tree, context)` over the serialized statement, pure:
