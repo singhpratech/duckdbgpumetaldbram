@@ -1212,6 +1212,66 @@ Left open: whether the wrapper could tell the mode without paying the probe
 (the kernel time itself is visible in `gpu_last_stats`; a template whose
 kernel time doubles could be re-checked at once instead of on the clock).
 
+## 2026-09-18 — Reinvention, stage C: the width the data asks for
+
+Stage C is the cheapest line in the design doc and the one that moved the most
+bytes. Every exact I64 lane is now stored at the narrowest signed width its
+values fit — 1, 2, 4 or 8 — and at SF10 the 22 TPC-H queries hold 22.71 GiB
+where they held 44.91. The store alone went from 11.43 GiB to 4.91;
+`lineitem`'s 16 columns from 9.83 to 4.13. `l_discount` is one byte a row.
+
+Three things made it small. The width comes free: the upload's parallel
+per-span copy already touches every value, so each span reduces a min and a max
+per lane over the cells it writes, and the width follows from the merged range
+with the boundaries inclusive — a NULL cell holds 0, which fits any width, so
+NULLs need no special case. The sort cache was the second half of the win and
+nobody had asked for it: its permutation had been i64 row ids all along on a
+backend that refuses a column above 2^32 rows, so it became u32, and the sorted
+keys took the column's width. A cache over a two-byte key costs 6 bytes a row
+where it cost 16; `orders.o_orderkey` is 12 B/row now against 24. And the
+interface did not move — `dtype()` still says I64, `gpu_backend.hpp` is
+untouched, the width is backend-private and the only thing that tells anyone
+about it is `resident_bytes()`.
+
+What I expected to cost something was the kernels. 20 of them read a lane or a
+sorted key, and each now takes the width as a uniform and loads through one
+helper; seven read the permutation, which went to u32. The plan held function-constant specialisation in
+reserve for any hot kernel that lost more than ~5%. None did. At SF1, with
+`SET threads TO 1` so the two-mode behaviour of a short kernel stays out of it
+and the minimum of ten runs: the reduce stages are 8% to 68% faster, because a
+reduce is bound by the bytes it reads and it reads a quarter of them;
+`gbx_mask_i64` is flat within 1%, which is the honest reading — it reads one
+predicate lane and writes a byte a row, and the lane was never what bound it;
+the join's whole materialize call is 18% faster. So the runtime width stayed and
+the PSO-per-width matrix was never built. That is the second time on this
+project that the measurement said the simpler thing was enough.
+
+Two things did get worse, and both are worth stating plainly. The upload grew
+65% to 85% — `lineitem`'s seven-lane store upload at SF10 goes from 112 ms to
+195 — because the width needs a second pass over the lanes to pack them. It is
+paid once per column, in the wrapper's idle background segments, and every
+statement afterwards reads fewer bytes. And the wrapper's pre-upload estimate
+still charges 8 bytes a row and lane, so it is now an over-estimate by up to 3×:
+the budget stays conservative, never optimistic, but a table that would fit can
+still be refused. The wrapper test that used to check the estimate against the
+truth within ±25% now measures one set's real footprint and sizes the budget
+from that; the estimate itself waits for stage D, when a set stops being a copy.
+
+Two details cost a round each. A narrow element offset is not a legal
+`MTLBuffer` offset, so every kernel that used to be bound at `lo * 8` into the
+sorted keys takes the range as an index instead. And packing the sorter's output
+down to the cache is a pass over 60M rows of two i64 lanes: on the host, in
+parallel over unified memory, 13.4 ms; as one kernel, 3.68 ms. On a machine
+where the GPU and the CPU read the same pages it is still worth asking, and the
+answer was not close.
+
+What stage C does not touch: F64 lanes (no narrower IEEE image, and the exact
+path never reduces a double on the device), the legacy `gpu_upload` /
+`gpu_upload_pair` columns and the v0.6 GROUP BY, and string-hash lanes, which
+fill the 64-bit range and land at 8 by the same rule that narrows everything
+else. Join results are narrow but only as narrow as the lanes they gather from
+— they are still copies, 17.8 GiB of the 22.7, and that is stage D.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1225,12 +1285,11 @@ kernel time doubles could be re-checked at once instead of on the clock).
   interface and then swept with the same gate.
 - **Other client languages**: the join / expression / split lowering lives in
   the Python wrapper; the pure rewrite function is language-neutral.
-- **Narrow lanes**: every lane is 8 bytes per row; at SF10 the 22 TPC-H
-  queries need 33 GiB of lanes, most of them small integers, dates and
-  two-decimal amounts. Storing a lane as I32 / I16 when its values fit (the
-  interface stays I64; kernels widen on load) halves to quarters memory and the
-  bytes every kernel reads. Sharing lanes between sets was measured at 0.0 GiB
-  of saving on that workload and dropped.
+- **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
+  TPC-H queries at SF10 became 22.7. What is left open is CUDA (the same choice
+  as a template parameter, `docs/CUDA_EXACT_PATH.md` §6) and the wrapper's
+  pre-upload estimate, which still charges 8 bytes a row and lane and is now an
+  over-estimate by up to 3×.
 - **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel

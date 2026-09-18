@@ -95,3 +95,38 @@ version is the model) and overlap the copies on the column's own stream.
 the validity bitmap first, `cub::DeviceRadixSort`) runs on that stream too; `prepared()` flips after the event completes. The memory
 budget counts `resident_bytes()`, so include the sort cache and any scratch
 that stays allocated.
+
+## 6. Storage width is backend-private (stage C)
+
+`src/include/gpu_backend.hpp` does not change for stage C of
+`docs/RESIDENT_COLUMNS_DESIGN.md`: `dtype()` keeps returning `I64`, `rows()` and
+`null_count()` keep their meanings, and every operator signature is what it was.
+A backend is free to store an I64 lane narrower than 8 bytes and widen on load,
+and `resident_bytes()` is what tells the budget it did.
+
+Metal does it this way, and CUDA should mirror it:
+
+- the width is chosen in the upload, from the lane's min and max over its valid
+  cells (NULL cells hold 0, which fits any width) — the per-span copy already
+  reads every value, so each span reduces its own partials and the width follows
+  from the merged range, boundaries inclusive: 1 byte for `[-128, 127]`, 2 for
+  `[-32768, 32767]`, 4 for `[-2147483648, 2147483647]`, else 8; a lane with no
+  valid cell takes 1;
+- a second parallel pass packs the staging into the chosen width — on CUDA that
+  pass belongs in the de-interleave or on the device after the copy;
+- F64 lanes stay 8, and so do string-hash lanes (the min/max rule lands them
+  there by itself);
+- the sort cache keeps the key's width and holds u32 row ids (Metal already
+  refuses a column above 2^32 rows; CUDA should decide its own cap);
+- a join's output lanes keep their source lanes' widths — a gather cannot widen
+  a lane's range;
+- every kernel that reads a lane, a sorted key or a permutation entry takes the
+  width and loads through one helper. On Metal that is a uniform branch and it
+  cost nothing measurable; on CUDA the same choice is a template parameter, and
+  the reason to reach for one is a measurement, not a guess.
+
+The proof is the same as for everything else here: the CPU reference stores I64,
+`test/cpp/test_aggregator.cpp`'s "narrow lane storage" block compares a backend
+against it bit for bit over lanes that sit exactly on the I8 / I16 / I32
+boundaries and one past each, an all-NULL lane and a 64-bit hash lane, and reads
+the widths back through `resident_bytes()`.

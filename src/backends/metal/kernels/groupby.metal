@@ -1320,3 +1320,32 @@ kernel void segment_run_sum_i64(
     out_keys[gid] = k;
     out_sums[gid] = sum;
 }
+
+// ---------------------------------------------------------------------------
+//  Sort-cache packing (docs/RESIDENT_COLUMNS_DESIGN.md §6, stage C)
+//
+//  The radix sort works on (i64 key, i64 payload) pairs. A column's sort cache
+//  keeps the sorted keys at the column's storage width and the permutation as
+//  u32 row ids, so the sorter's output is packed down before it becomes the
+//  cache. One pass over the pair, on the GPU: the host alternative reads the
+//  same two i64 lanes over the same unified memory.
+// ---------------------------------------------------------------------------
+kernel void radix_pack_cache(
+    device const long* keys   [[buffer(0)]],
+    device const long* perm   [[buffer(1)]],
+    constant uint&     n      [[buffer(2)]],
+    constant uint&     w      [[buffer(3)]],
+    device uchar*      o_keys [[buffer(4)]],
+    device uint*       o_perm [[buffer(5)]],
+    uint               gid    [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    const long k = keys[gid];
+    switch (w) {
+        case 1u: ((device char*)o_keys)[gid]  = (char)k;  break;
+        case 2u: ((device short*)o_keys)[gid] = (short)k; break;
+        case 4u: ((device int*)o_keys)[gid]   = (int)k;   break;
+        default: ((device long*)o_keys)[gid]  = k;        break;
+    }
+    o_perm[gid] = (uint)perm[gid];
+}

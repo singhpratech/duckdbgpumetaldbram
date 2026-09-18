@@ -1,6 +1,7 @@
 # Resident columns — the v0.8 storage design
 
-Status: design 2026-09-18; stage A merged (#123), stage B built 2026-09-18 (this PR); stages C and D next. Companion to
+Status: design 2026-09-18; stage A merged (#123), stage B merged (#124), stage C built
+2026-09-18 (this PR, Metal); stage D next. Companion to
 `docs/TRANSPARENT_DESIGN.md` (the rewrite, the rules, the thresholds), which it
 does not change: rule 1 (never slower than native) and rule 2 (never a
 different answer) are enforced by the same gate and the same tests.
@@ -60,11 +61,12 @@ Invariants:
 |---|---|---|---|
 | A | **Layout**: no NULL-key suffix; key columns carry a validity bitmap; the sort cache covers the valid keys and maps to row ids; rows stay in input order | Metal, CPU, the interface comments | all suites + gate unchanged; a layout unit test |
 | B | **TableStore**: columns uploaded by (table, expression) in row-id order (`gpu_upload_columns`), single-table sets and join base sets become views over the store; the wrapper asks what is resident and uploads only the missing columns; budget and LRU per column | extension, wrapper | done — §5: the single-table and join-base lanes of the 22 TPC-H queries at SF10 are 30 shared columns; what is left uploaded is join results (stage D) |
-| C | **Width**: I32 / I16 / I8 storage chosen from the upload's min/max; typed loads in the exact kernels (function constants, one PSO per width) | Metal, CPU | memory and kernel bytes measured; gate unchanged |
+| C | **Width**: I32 / I16 / I8 storage chosen from the upload's min/max; typed loads in the exact kernels | Metal | done — §6: the SF10 store is 4.91 GiB where it was 11.43, total resident 22.71 GiB against 44.91; no hot kernel lost time, so the runtime width stayed and no per-width PSO was needed |
 | D | **Index-vector joins and chunks**: a device join returns row ids; INSERTs append chunks; cold chunks stream | extension, Metal, wrapper | appends resident in ms; a table above the budget answers on the device for the shapes that win |
 
 CUDA implements the design once, after stage C, from `docs/CUDA_EXACT_PATH.md`
-(to be revised at that point).
+(revised for stage C: storage width is backend-private and the interface is
+unchanged).
 
 ## 4. Stage A in detail
 
@@ -147,7 +149,77 @@ device join does not plan yet (composite keys, cross-table expressions, keys
 from several tables) and the device join's own materialised results. That is
 stage D, three quarters of the memory.
 
-## 6. Stage D — joins as index vectors
+## 6. Stage C in detail — width
+
+A lane's width is a storage detail (invariant 4): `ResidentColumn::dtype()`
+keeps saying `I64`, `rows()` and `null_count()` mean what they meant, and
+`gpu_backend.hpp` is untouched — the interface is frozen for CUDA. What
+changed is inside the Metal backend.
+
+**What is narrow.** Every I64 lane that arrives through the exact path —
+`upload_rows_exact` (the store, join base sets, uploaded join results) and
+`upload_pair_exact` — is stored at the narrowest signed width its values fit:
+1, 2, 4 or 8 bytes. `MetalResidentColumn` carries that width; `resident_bytes()`
+reports the real bytes.
+
+**How the width is chosen.** The upload's own parallel per-span copy already
+sees every value, so each span reduces a min and a max per lane over the cells
+it writes, NULL cells excluded (a NULL is stored as 0, which fits any width).
+The per-span partials merge and the width follows from the range, boundaries
+inclusive: `[-128, 127]` → 1, `[-32768, 32767]` → 2,
+`[-2147483648, 2147483647]` → 4, otherwise 8. A lane with no valid cell at all
+takes 1 byte. A second parallel pass, over (lane, row range) tasks, packs each
+narrowing lane into a buffer of that width and drops the I64 staging.
+
+**The sort cache.** A column's cache is the sorted valid keys plus the
+permutation to row ids. The keys keep the column's width; the permutation is
+u32, which the Metal cache could always have been (it already refuses a column
+above 2^32 rows). The radix sorter still sorts i64 pairs: the lane is widened
+by the same per-thread copy that stages it, and the sorted pair is packed back
+down to (width, u32) by one kernel — 3.68 ms against 13.4 ms for the identical
+loop on the host, at 60M rows and width 2, so the device does it. A cache over
+a key of width 2 costs 6 bytes a row where it used to cost 16.
+
+**In the kernels.** Every kernel that reads a lane, a sorted key or a
+permutation entry takes the width as a uniform and loads through one helper
+(`ldw` in `sum.metal`; `stw` for the one kernel that writes a lane, the join's
+gather). 20 kernels of `sum.metal`'s 41 take a width and two more changed only
+because the permutation is u32; the branch is the same for every thread of a
+dispatch, and one new kernel in `groupby.metal` packs the sort cache. A narrow
+element offset is not a legal `MTLBuffer` offset, so where a kernel used to be
+bound at `lo * 8` into the sorted keys it now takes `koff` as an index instead. The host reads a lane through the same widening
+(`load_w`): the key-range binary search over the sorted cache, the NULL-key
+fold, top-k, the row-returning join.
+
+Measured at SF1 with `GPUDB_METAL_TRACE_EXACT=1` and `SET threads TO 1` (min of
+10) no hot kernel lost time — `gbx_mask_i64` is within 1%, the reduce stages
+are 8–68% faster because they read fewer bytes — so the runtime width stayed
+and the function-constant specialisation the plan held in reserve was not
+built. The numbers are in BENCHMARK.md.
+
+**What is not narrow, and why.**
+
+- **F64 lanes**: 8 bytes, always. The exact path never reduces a double on the
+  device (no doubles in MSL) and there is no narrower IEEE image to keep.
+- **The legacy columns** (`gpu_upload`, `gpu_upload_pair`,
+  `upload_pair_interleaved`) and the v0.6 GROUP BY in `groupby.metal`: not on
+  the exact path, no min/max pass, 8 bytes. Their sort caches do get the u32
+  permutation, which is why `gpu_residents().bytes` for a prepared
+  `gpu_upload_pair` set is 28 B/row rather than 32.
+- **String lanes**: a string key is a 64-bit hash with a dictionary beside it.
+  Hashes fill the range, so the min/max rule lands them at 8 by itself.
+- **Join results**: they are narrow, but only as narrow as their source lanes
+  — a gather cannot widen a lane's range, so each output lane keeps its
+  source's width. The result is still a copy; that is stage D.
+
+**The wrapper's estimate is now an over-estimate.** `estimate_set_bytes` still
+charges 8 bytes per row and lane, so the budget admits a set on a figure that
+can be three times what the set costs. Nothing is wrong — the budget is
+conservative, never optimistic — but a table that would now fit can still be
+refused. Sizing the estimate from the column's type (what the store knows
+before the upload) belongs with stage D, where a set stops being a copy at all.
+
+## 7. Stage D — joins as index vectors
 
 A join result today is a copy: every lane gathered into a new row-aligned set
 in the join's order, 8 bytes per row and lane. At SF10 that is 33.5 GiB for
