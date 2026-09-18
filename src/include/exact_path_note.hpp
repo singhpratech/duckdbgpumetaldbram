@@ -21,4 +21,13 @@ inline std::string& exact_path_note() {
     return s;
 }
 
+// Why an algorithm the caller asked for could not run, when that is worth
+// saying: a backend that cannot build one of its pipelines on this GPU leaves
+// the compiler's own text here and answers through the other path. Empty when
+// there is nothing to explain. Same lifetime rules as the note.
+inline std::string& exact_path_reason() {
+    static thread_local std::string s;
+    return s;
+}
+
 } // namespace gpudb
