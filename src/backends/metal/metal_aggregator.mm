@@ -2893,7 +2893,6 @@ private:
             std::size_t run_off = lo, run_n = range_n;
             bool mask_in_reduce = false;
             bool compact_pending = false;     // variant (b): compaction runs in Stage A's command buffer
-            std::size_t n_sel_b = 0;
             if (masked && range_n > 0) {
                 const std::size_t nb = sel_nb;
                 const std::size_t n_sel = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]), nb);
@@ -2904,7 +2903,7 @@ private:
                     // (encoded below, in Stage A's command buffer)
                     run_sorted = grow(gbx_sel_keys_, n_sel * k.sort_width(), "compacted keys");
                     run_perm   = grow(gbx_sel_perm_, n_sel * sizeof(std::uint32_t), "compacted perm");
-                    run_off = 0; run_n = n_sel; compact_pending = true; n_sel_b = n_sel;
+                    run_off = 0; run_n = n_sel; compact_pending = true;
                 } else {
                     mask_in_reduce = true;               // variant (a)
                 }
@@ -2968,7 +2967,6 @@ private:
                 if (compact_pending) {
                     // Stage B reads the block offsets from gb_block_buf_
                     std::memcpy([gb_block_buf_ contents], bc, nblocks * sizeof(std::uint32_t));
-                    (void)n_sel_b;
                 }
             }
 
@@ -4150,10 +4148,10 @@ private:
     std::vector<id<MTLBuffer>> gbx_f_ = std::vector<id<MTLBuffer>>(8, nil);
     id<MTLBuffer> gbx_dummy_valid_ = nil;
     id<MTLBuffer> gbx_knull_out_ = nil;
-    // §4.6 WHERE mask scratch: the mask (one byte per original row), IN
-    // lists, 6-long masked partials, and the compacted sorted keys /
-    // permutation of variant (b).
-    id<MTLBuffer> gbx_mask_buf_ = nil, gbx_list_buf_ = nil;
+    // §4.6 WHERE mask scratch: the mask (one byte per original row), 6-long
+    // masked partials, and the compacted sorted keys / permutation of
+    // variant (b).
+    id<MTLBuffer> gbx_mask_buf_ = nil;
     id<MTLBuffer> gagg_out_ = nil;          // §4.12 global aggregate partials
     // join_materialize scratch (match row, class, destination per probe row; the uniqueness flag)
     id<MTLBuffer> jm_match_ = nil, jm_cls_ = nil, jm_pos_buf_ = nil, jm_flag_ = nil;

@@ -607,11 +607,13 @@ public:
         }
         if (!k) return nullptr;
         set->keys = k->col; set->key_str = k->is_str; set->key_dict = k->dict;
+        set->store_cols.push_back(k);
         if (set->no_key) { set->key_str = false; set->key_dict = nullptr; }
         if (lanes[1] != "-") {
             auto v = lane(lanes[1]);
             if (!v || v->is_str) return nullptr;
             set->vals = v->col;
+            set->store_cols.push_back(v);
         } else {
             // no payload (count(*) only): the operators want a payload column to reduce; the
             // key column stands in — the rewrite reads count_star and the keys, nothing of it
@@ -626,7 +628,11 @@ public:
             else pi.push_back(c);
         }
         for (auto* grp : {&pi, &pf, &ps})
-            for (auto& c : *grp) { set->preds.push_back(c->col); if (c->is_str) set->str_dicts.push_back(c->dict); }
+            for (auto& c : *grp) {
+                set->preds.push_back(c->col);
+                set->store_cols.push_back(c);
+                if (c->is_str) set->str_dicts.push_back(c->dict);
+            }
         set->pred_int = pi.size(); set->pred_dbl = pf.size(); set->pred_str = ps.size();
         set->name = name; set->managed = true; set->pair = true; set->exact = true; set->view = true;
         set->store_key = key;
@@ -650,13 +656,14 @@ public:
         }
         return view_from_store_locked(name);
     }
-    void stamp_store_used_locked(const ResidentSet& v, std::int64_t t) {
-        auto st = stores.find(v.store_key);
-        if (st == stores.end()) return;
-        for (auto& kv : st->second->cols)
-            if (kv.second->col == v.keys || kv.second->col == v.vals ||
-                std::find(v.preds.begin(), v.preds.end(), kv.second->col) != v.preds.end())
-                kv.second->last_used_at_us.store(t, std::memory_order_relaxed);
+    // Recency for the memory budget's LRU. A view knows which store columns it
+    // reads, so this is one relaxed store per lane and needs no lock: it used to
+    // re-take the registry lock to walk every column of the store and search the
+    // set's lane list for each, per statement, for a number only
+    // gpu_store_columns() and the wrapper's budget ever read.
+    static void stamp_store_used(const ResidentSet& v, std::int64_t t) {
+        for (const auto& c : v.store_cols)
+            if (c) c->last_used_at_us.store(t, std::memory_order_relaxed);
     }
 
     std::shared_ptr<ResidentSet> acquire(const std::string& name, const char* fn,
@@ -706,7 +713,7 @@ public:
             const std::int64_t t = now_us();
             s->hits.fetch_add(1, std::memory_order_relaxed);
             s->last_used_at_us.store(t, std::memory_order_relaxed);
-            if (s->view) { std::lock_guard<std::mutex> lock(registry_mu); stamp_store_used_locked(*s, t); }
+            if (s->view) stamp_store_used(*s, t);
         }
         return s;
     }

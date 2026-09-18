@@ -1528,6 +1528,105 @@ where Q1 goes 37.2 -> 15.2 ms and Q12 25.3 -> 10.0. The gate on this state —
 declined, 0 below the bound and 0 differing, exit 0, with the same bounds and
 therefore the same row set as before.
 
+## 2026-09-18 — The millisecond that was not there
+
+The brief was to cut the per-statement fixed cost of a rewritten statement: at
+SF1 native answers a few-group GROUP BY in 1.5-2.5 ms, the device kernel is
+1-2 ms, and the whole statement measures 3.5-5 ms, so 1.5-3 ms is somewhere
+between the two and nobody had looked. A static read of the path had already
+listed every step with its file and line and ranked ten candidates. I measured
+before cutting, and the measurement said something I did not expect: on this
+state the statement is 0.74 ms, the kernel is 0.447, and the whole fixed cost
+outside the operator is 0.17 ms.
+
+The gap is the direct row-order reduce. The 3.5-5 ms was true when a few-group
+key still went through the sort path; a 0.45 ms kernel does not leave 3 ms of
+statement around it. What I could still take was 0.05 ms, and I took it.
+
+**Getting the instrument right came first, and cost two wrong answers.** The
+first run measured each layer as its own loop of N, in a fixed order, and read
+the wrapper as 0.42 ms more expensive than the same SQL run bare. That is an
+ordering artifact: the wrapper layer ran straight after the native layer, a
+14 ms query, and the bare layer ran after the wrapper's 0.7 ms one. Interleaving
+the layers - one round runs one repetition of each - and rotating the order per
+round made the wrapper and the bare statement agree to 0.03 ms, which is what
+the repo had always said. The second wrong answer was reading `wall_ms` from a
+single `gpu_last_stats()` sample: it came out larger than the whole statement it
+was part of. Min over rounds, like everything else.
+
+**Two numbers the subtraction corrected.** The staleness guard is 0.05 ms, not
+the 0.3-0.5 ms carried since the design: `EXPLAIN ANALYZE` of the rewritten
+statement shows the guard's arm as a `COLUMN_DATA_SCAN` of one row, because
+DuckDB 1.4.5 answers an unfiltered `count(*)` over a base table out of row-group
+metadata and never scans it. That is a happy accident of the form the guard
+already has - it has no WHERE - and it means the layer everyone assumed was the
+expensive part of the rewrite is a twentieth of a millisecond. And the Python
+wrapper is 0.022 ms per statement by cProfile, 3% of the statement: "wrapper is
+about zero" is now measured rather than inferred.
+
+**What was left, and what it was worth.** DuckDB is handed the rewritten
+statement as text on every run, so it parses, binds and optimises two or three
+relations every time; the text of a warm template is byte-identical run to run.
+The Python client has no `prepare()`, so the wrapper uses SQL `PREPARE` /
+`EXECUTE` on the second sighting of a rendered statement. A/B inside one process
+- alternating rounds with the cache on and off - gives 0.06-0.10 ms on a
+two-relation few-group statement and 0.37-0.43 ms on the 10K-group and join
+forms, where there is more to plan. `l_linenumber` at SF1 goes 2.19x -> 2.41x
+against native.
+
+The whole question is whether a cached plan can freeze an answer, and the answer
+had to come from the engine, not from reasoning. It does not: a write between
+two `EXECUTE`s is seen, `DROP`+`CREATE` of the same table re-binds, a
+`CREATE OR REPLACE VIEW` re-binds, an uncommitted write inside a transaction is
+seen and so is its rollback, a volatile scalar re-runs, and - the one that
+matters - the row-count guard inside the plan raised `GPUDB_STALE` on a raw
+INSERT behind a prepared statement, exactly as it does without one. What DuckDB
+does **not** re-bind is a session setting or a name resolution: `SET
+default_order='DESC'` left a prepared `ORDER BY` bound ascending, a temp table
+shadowing the name was not seen, `USE` was not seen. So the plans die where a
+decision dies - `_invalidate_all`, which the wrapper already runs on every
+non-SELECT it sees, plus `_refresh_settings`, `_on_stale` and
+`_on_rewrite_error`. Plan names are never reused for a different statement, so
+two threads on one connection cannot execute each other's plan; the test that
+pins it runs two threads over one cached template.
+
+Three smaller things came with it. `Connection.sql()` created the relation
+twice, on the theory that the second bind forces the guard to run early; neither
+one bind nor two raises on a stale set in DuckDB 1.4.5 - the guard raises at
+fetch either way - so the second bind was two or three relations bound for
+nothing. DuckDB's statement splitter is a round trip per statement whose answer
+depends on the text alone (0.012 ms, memoised). And `_maybe_aggregate` ran its
+two DOTALL regexes over the statement twice per call.
+
+Inside the extension the honest result is that nothing there is worth much at
+this scale: the operator's entire host half - D2H, the group merge, the stats
+line, the registry lookups - is 0.125 ms. I still took what was free and
+unambiguous: the error-message string `resolve_where` built for every predicate
+of every statement and threw away; the LRU stamp, which re-took the global
+registry lock to walk every column of the table's store and search the set's
+lane list for each, and is now a handful of relaxed atomic stores on the columns
+the view already holds; the device lock in `gx_init` / `gb_init` / `tk_init`,
+which was held across the stats formatting where `gm_init` and `gg_init` already
+scope it to the GPU call (the process-wide decision and path note are copied out
+under it, which those two were reading unlocked); and three pieces of dead code.
+Two connections running the same statement measure 1.758 ms per statement before
+and 1.766 after - the device lock is what serialises them, and the stats line
+inside it never was the cost. I am recording that as a measurement, not as a
+win.
+
+**Thresholds: nothing moved, and the reason is the instrument again.** The
+sweep that set `min_groups` measured `l_linenumber` at 0.80-0.94x. The same
+sweep on the same code today measures 1.19-2.50x. Nothing in between changed
+those rows by more than 0.1 ms, so the difference is the process's mode - the
+0.45 ms kernel runs at three times that when the rest of the process keeps
+waking. I could not produce the slow mode on demand (15 threads sleeping 5 ms
+left the kernel at 0.447 ms), so I have a bound's worth of evidence from one
+mode and none from the other, which is not enough to relax anything. The
+continuous measured rule 1 is what decides these shapes at run time, and it
+already does. The gate on the final state - `--subqueries --exprs`, SF1, alone
+on the machine - is 782 rows, 509 PASS, 273 declined, 0 below the bound, 0
+differing, exit 0.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

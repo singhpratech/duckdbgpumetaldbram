@@ -243,6 +243,11 @@ class Connection:
         self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
         self._flat_cache: Dict[str, str] = {}                    # statement text -> the same with SPJ derived tables folded in
         self._flat_views: Dict[str, Dict[str, str]] = {}         # statement text -> {view: definition} it was built on (§4.20)
+        self._split_cache: Dict[str, Any] = {}                   # statement text -> DuckDB's split of it (§5.2)
+        self._plans: Dict[str, str] = {}                         # rendered statement -> the name it is PREPAREd under
+        self._plan_seen: Dict[str, bool] = {}                    # rendered statements seen once (see _planned)
+        self._plan_seq = 0
+        self._plan_mu = threading.Lock()
         self._resnap_after = False                                # take a new file snapshot after this statement (our own write)
         self._read_only = False
         self._watch_files: List[str] = []
@@ -310,6 +315,8 @@ class Connection:
                           "default_collation": row[2] or "", "search_path": row[3] or "",
                           "database": row[4]}
         self._settings_key = "|".join(self._settings.values())
+        # a prepared plan keeps the ORDER BY direction it was bound under
+        self._drop_plans()
         self._cache.clear()
 
     def _probe_extension(self) -> None:
@@ -478,7 +485,13 @@ class Connection:
         try:
             try:
                 t0 = time.perf_counter()
-                self._raw.execute(sql, parameters)
+                # A rewritten statement DuckDB has planned before runs as
+                # EXECUTE; an EXPLAIN (whose sql carries its prefix) and
+                # everything native run as text. The run that PREPAREs pays for
+                # it inside the timed region, so the measured rule 1 sees it.
+                run = self._planned(sql) if (self._last.rewritten and not parameters
+                                             and sql == self._last.sql) else sql
+                self._raw.execute(run, parameters)
                 self._note_timing((time.perf_counter() - t0) * 1000.0, query, parameters)
                 if self._last.rewritten:
                     self._check_output_size()
@@ -505,6 +518,7 @@ class Connection:
         answer natively now, and keep this template native from here on (its
         sets are re-noted as stale so a healthy upload can replace them)."""
         self._last.fallback = True
+        self._drop_plans()
         self._last.error = str(e)[:300]
         self._log(f"rewritten statement failed, answered natively: {str(e)[:160]}")
         d = getattr(self, "_last_decision", None)
@@ -558,10 +572,14 @@ class Connection:
         try:
             try:
                 rel = self._raw.sql(sql, **kw)
-                # a lazy relation binds now; force the guard to run here so a
-                # stale set falls back inside this call, not at fetch time
+                # the relation binds here; reading its columns is what forces
+                # that bind to have happened, so a rewritten statement that
+                # cannot even bind fails inside this call. (The guard itself
+                # runs when the relation is executed — measured: neither one
+                # bind nor two raise on a stale set.) Binding it a second time
+                # cost a second bind of two or three relations and changed
+                # nothing.
                 if self._last.rewritten:
-                    rel = self._raw.sql(sql, **kw)
                     _ = rel.columns
                 return rel
             except duckdb.Error as e:
@@ -637,6 +655,7 @@ class Connection:
     # ---- the statement path ----
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
+        self._drop_plans()
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
         # stage B: the table's STORE holds the stale columns — drop it (and every view on it)
         # in the extension, or the next upload would find its lanes "already there"
@@ -662,6 +681,7 @@ class Connection:
         if why in ("ATTACH", "DETACH"):
             self._refresh_after = True
         self._manager.invalidate(None)
+        self._drop_plans()
         self._cache.clear()
         self._nested_cache.clear()
         self._flat_cache.clear()
@@ -714,6 +734,78 @@ class Connection:
             self._big_tables_rx = rx
         return rx[1].search(sql) is not None
 
+    # ---- cached plans: DuckDB plans a rewritten statement once, not per run ----
+    _MAX_PLANS = 48
+
+    def _planned(self, sql: str) -> str:
+        """`EXECUTE <name>` for a rewritten statement DuckDB has already
+        planned, or the text itself the first time it is seen.
+
+        DuckDB is handed the rewritten statement as TEXT on every run, so it
+        parses, binds and optimises two or three relations every time, while
+        the text of a warm template is byte-identical run to run. A statement
+        that comes back is PREPAREd once and EXECUTEd after that.
+
+        What a plan may never do is freeze the answer, and it does not: the
+        staleness guard is a volatile scalar over a live `count(*)` of the base
+        table, so it runs inside the plan on every execution (a write behind a
+        prepared plan still raises GPUDB_STALE), the table function's `init`
+        runs again and re-acquires the set, and DuckDB re-binds a prepared
+        statement when the catalog moves under it (DDL, a view redefinition).
+        What it does NOT re-bind is a session setting or a name resolution, so
+        the plans die wherever a decision dies — `_invalidate_all` (every
+        non-SELECT the wrapper sees: DDL, DML, SET, ATTACH, a transaction, a
+        foreign write), `_refresh_settings`, `_on_stale` and
+        `_on_rewrite_error`.
+
+        The first sighting of a rendered text runs as text: a statement whose
+        literals change on every execution renders a new text every time, and
+        preparing each one would be pure loss."""
+        with self._plan_mu:
+            name = self._plans.get(sql)
+            if name is not None:
+                return "EXECUTE " + name
+            if sql not in self._plan_seen:
+                if len(self._plan_seen) > self._MAX_PLANS:
+                    self._plan_seen.clear()
+                self._plan_seen[sql] = True
+                return sql
+            # A name is never reused for a different statement — two threads on
+            # one connection must not be able to EXECUTE each other's plan. Old
+            # names are deallocated, and a thread that reaches a name a moment
+            # after it was deallocated gets an error, which execute() answers
+            # natively like any other error from a rewritten statement.
+            self._plan_seq += 1
+            name = "gpudb_plan_%d" % self._plan_seq
+            try:
+                self._raw.execute("PREPARE " + name + " AS " + sql)
+            except duckdb.Error as e:
+                self._log(f"plan cache: {str(e).splitlines()[0][:120]}")
+                return sql
+            self._plans[sql] = name
+            if len(self._plans) > self._MAX_PLANS:
+                old = next(iter(self._plans))
+                self._deallocate([self._plans.pop(old)])
+            return "EXECUTE " + name
+
+    def _deallocate(self, names) -> None:
+        if not names:
+            return
+        try:
+            self._raw.execute("; ".join("DEALLOCATE " + n for n in names))
+        except duckdb.Error:
+            pass
+
+    def _drop_plans(self) -> None:
+        """Every cached plan goes: the statements it was built on are being
+        re-decided, and a plan DuckDB does not re-bind by itself (a session
+        setting, a name resolution) would otherwise outlive its decision."""
+        with self._plan_mu:
+            names = list(self._plans.values())
+            self._plans.clear()
+            self._plan_seen.clear()
+        self._deallocate(names)
+
     def _route(self, query: Any, parameters) -> Any:
         """Return the SQL to run in place of `query`."""
         self._last = LastRewrite(statement=query if isinstance(query, str) else "")
@@ -732,10 +824,20 @@ class Connection:
             big = self._names_big_table(query)
             # a view stands for its definition: the aggregate may be inside it (§4.20)
             sg = getattr(self, "_global", False)
-            if not big or (not _maybe_aggregate(query, sg) and not self._names_view(query)):
-                self._last.reason = "threshold" if _maybe_aggregate(query, sg) else "shape"
+            agg = _maybe_aggregate(query, sg)         # two DOTALL regexes over the text: run once
+            if not big or (not agg and not self._names_view(query)):
+                self._last.reason = "threshold" if agg else "shape"
                 return query
-        stmts = _classify.split(self._raw, query)
+        # DuckDB's splitter is a round trip, and what it answers depends on the
+        # text alone — so the same text is split once (§5.2 is unchanged: every
+        # statement is still classified, and a non-SELECT still invalidates
+        # before it runs)
+        stmts = self._split_cache.get(query, False)
+        if stmts is False:
+            stmts = _classify.split(self._raw, query)
+            if len(self._split_cache) > 256:
+                self._split_cache.clear()
+            self._split_cache[query] = stmts
         if stmts is None:
             self._last.reason = "error"
             return query

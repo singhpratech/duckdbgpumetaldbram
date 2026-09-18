@@ -219,28 +219,33 @@ void gb_init(duckdb_init_info info) {
         Resolved cols = resolve_pair(ctx, bind->name, need_vals, fn);
         auto& agg = resident_aggregator(ctx);
         const std::size_t cap = groupby_rows_cap();
-        auto dev = resident_device_lock(ctx);
-        switch (bind->op) {
-            case GbOp::SumI64:
-                if (cols.vals->dtype() != gpudb::Dtype::I64)
-                    throw std::runtime_error(std::string(fn) +
-                        ": '" + bind->name + ".v' is DOUBLE — use " + gb_fn_name(GbOp::SumF64, form));
-                init->res = agg.groupby_sum_resident_i64(*cols.keys, *cols.vals, cap, bind->filter);
-                break;
-            case GbOp::SumF64:
-                if (cols.vals->dtype() != gpudb::Dtype::F64)
-                    throw std::runtime_error(std::string(fn) +
-                        ": '" + bind->name + ".v' is BIGINT — use " + gb_fn_name(GbOp::SumI64, form));
-                init->res = agg.groupby_sum_resident_f64(*cols.keys, *cols.vals, cap, bind->filter);
-                break;
-            case GbOp::Count:
-                if (cols.keys->dtype() != gpudb::Dtype::I64)
-                    throw std::runtime_error(std::string(fn) +
-                        ": keys must be a BIGINT resident column");
-                init->res = agg.groupby_count_resident(*cols.keys, cap, bind->filter);
-                break;
+        // the lock is the GPU call's: the decision is copied out under it and
+        // the stats line formatted after (as in gm_init / gg_init)
+        gpudb::DispatchDecision d;
+        {
+            auto dev = resident_device_lock(ctx);
+            switch (bind->op) {
+                case GbOp::SumI64:
+                    if (cols.vals->dtype() != gpudb::Dtype::I64)
+                        throw std::runtime_error(std::string(fn) +
+                            ": '" + bind->name + ".v' is DOUBLE — use " + gb_fn_name(GbOp::SumF64, form));
+                    init->res = agg.groupby_sum_resident_i64(*cols.keys, *cols.vals, cap, bind->filter);
+                    break;
+                case GbOp::SumF64:
+                    if (cols.vals->dtype() != gpudb::Dtype::F64)
+                        throw std::runtime_error(std::string(fn) +
+                            ": '" + bind->name + ".v' is BIGINT — use " + gb_fn_name(GbOp::SumI64, form));
+                    init->res = agg.groupby_sum_resident_f64(*cols.keys, *cols.vals, cap, bind->filter);
+                    break;
+                case GbOp::Count:
+                    if (cols.keys->dtype() != gpudb::Dtype::I64)
+                        throw std::runtime_error(std::string(fn) +
+                            ": keys must be a BIGINT resident column");
+                    init->res = agg.groupby_count_resident(*cols.keys, cap, bind->filter);
+                    break;
+            }
+            d = agg.last_decision();
         }
-        const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=%s backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu "
@@ -434,15 +439,21 @@ struct ResolvedWhere {
     std::vector<std::vector<std::int64_t>> lists;   // In constants, one vector per term
 };
 
-std::int64_t parse_i64_literal(const std::string& s, const std::string& term) {
+// The term as the user wrote it — for an error message, and only then: built
+// per predicate of every statement it was two heap allocations nobody read.
+std::string term_text(const WhereTerm& w) {
+    return w.col + (w.value.empty() ? "" : " ... " + w.value);
+}
+
+std::int64_t parse_i64_literal(const std::string& s, const WhereTerm& w) {
     errno = 0;
     char* end = nullptr;
     const long long v = std::strtoll(s.c_str(), &end, 10);
     if (errno != 0 || !end || end == s.c_str() || *end != '\0')
-        throw std::runtime_error("WHERE program: '" + s + "' is not a BIGINT constant (" + term + ")");
+        throw std::runtime_error("WHERE program: '" + s + "' is not a BIGINT constant (" + term_text(w) + ")");
     return static_cast<std::int64_t>(v);
 }
-std::int64_t parse_f64_literal_bits(const std::string& s, const std::string& term) {
+std::int64_t parse_f64_literal_bits(const std::string& s, const WhereTerm& w) {
     const std::string l = lower_copy(s);
     double d;
     if (l == "nan" || l == "'nan'") d = std::nan("");
@@ -453,7 +464,7 @@ std::int64_t parse_f64_literal_bits(const std::string& s, const std::string& ter
         char* end = nullptr;
         d = std::strtod(s.c_str(), &end);
         if (errno != 0 || !end || end == s.c_str() || *end != '\0')
-            throw std::runtime_error("WHERE program: '" + s + "' is not a DOUBLE constant (" + term + ")");
+            throw std::runtime_error("WHERE program: '" + s + "' is not a DOUBLE constant (" + term_text(w) + ")");
     }
     std::int64_t bits;
     std::memcpy(&bits, &d, sizeof(bits));
@@ -487,6 +498,7 @@ std::int64_t string_lane_value(const std::unordered_map<std::uint64_t, std::stri
 ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>& terms, const char* fn) {
     ResolvedWhere rw;
     rw.lists.resize(terms.size());
+    rw.preds.reserve(terms.size());
     for (std::size_t t = 0; t < terms.size(); ++t) {
         const WhereTerm& w = terms[t];
         gpudb::Predicate p;
@@ -520,16 +532,15 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
         } else {
             throw std::runtime_error(std::string(fn) + ": WHERE program: unknown column '" + c + "'");
         }
-        const std::string term = w.col + (w.value.empty() ? "" : " ... " + w.value);
         if (sdict) {
             // string lane: only = != in / is [not] null; literals must be quoted
             using Op = gpudb::Predicate::Op;
             if (p.op != Op::EQ && p.op != Op::NE && p.op != Op::In && p.op != Op::IsNull && p.op != Op::IsNotNull)
-                throw std::runtime_error(std::string(fn) + ": WHERE program: only =, !=, in and is [not] null apply to a string column (" + term + ")");
+                throw std::runtime_error(std::string(fn) + ": WHERE program: only =, !=, in and is [not] null apply to a string column (" + term_text(w) + ")");
             auto lane_value = [&](const std::string& lit) {
                 std::string text;
                 if (!unquote_literal(lit, text))
-                    throw std::runtime_error(std::string(fn) + ": WHERE program: '" + lit + "' must be a quoted string (" + term + ")");
+                    throw std::runtime_error(std::string(fn) + ": WHERE program: '" + lit + "' must be a quoted string (" + term_text(w) + ")");
                 if (key_tuple) text = tuple_component(text.data(), text.size());   // the key holds the 1-tuple text
                 return string_lane_value(*sdict, text, fn);
             };
@@ -545,11 +556,11 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
         }
         if (p.op == gpudb::Predicate::Op::In) {
             for (const auto& s : w.list)
-                rw.lists[t].push_back(is_f64 ? parse_f64_literal_bits(s, term) : parse_i64_literal(s, term));
+                rw.lists[t].push_back(is_f64 ? parse_f64_literal_bits(s, w) : parse_i64_literal(s, w));
             p.list = rw.lists[t].data();
             p.n_list = rw.lists[t].size();
         } else if (p.op != gpudb::Predicate::Op::IsNull && p.op != gpudb::Predicate::Op::IsNotNull) {
-            p.value = is_f64 ? parse_f64_literal_bits(w.value, term) : parse_i64_literal(w.value, term);
+            p.value = is_f64 ? parse_f64_literal_bits(w.value, w) : parse_i64_literal(w.value, w);
         }
         rw.preds.push_back(p);
     }
@@ -726,19 +737,28 @@ void gx_init(duckdb_init_info info) {
         const std::size_t cap = groupby_rows_cap();
         gpudb::GroupByFilter filt = bind->filter;
         filt.columns = want;   // only the projected result vectors are materialised
-        auto dev = resident_device_lock(ctx);
-        gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
-        if (where)
-            init->res = agg.groupby_exact_masked_resident(*set->keys, set->vals.get(),
-                                                          rw.preds.data(), rw.preds.size(), cap, filt);
-        else
-            init->res = agg.groupby_exact_resident(*set->keys, set->vals.get(), cap, filt);
+        // The device lock is the GPU call's, not the statement's: what the
+        // backend left behind in process-wide state (the decision, the path
+        // note) is copied out under it, and the stats line is formatted after
+        // it is gone — the way gm_init and gg_init already do it.
+        gpudb::DispatchDecision d;
+        std::string path;
+        {
+            auto dev = resident_device_lock(ctx);
+            gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
+            if (where)
+                init->res = agg.groupby_exact_masked_resident(*set->keys, set->vals.get(),
+                                                              rw.preds.data(), rw.preds.size(), cap, filt);
+            else
+                init->res = agg.groupby_exact_resident(*set->keys, set->vals.get(), cap, filt);
+            d = agg.last_decision();
+            path = gpudb::exact_path_note();
+        }
         {
             const auto& rr = init->res;
             init->rows = std::max({ rr.keys.size(), rr.sums.size(), rr.counts.size(), rr.counts_star.size(),
                                     rr.mins.size(), rr.maxs.size() });
         }
-        const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=%s backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu "
@@ -747,7 +767,7 @@ void gx_init(duckdb_init_info info) {
             gpudb::to_string(d.reason), init->res.rows_in, init->res.groups_total,
             init->rows,
             init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms,
-            gpudb::exact_path_note().c_str());
+            path.c_str());
         resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
         delete init;
@@ -1017,20 +1037,22 @@ void gm_init(duckdb_init_info info) {
         const std::size_t cap = groupby_rows_cap();
         const bool filtered = bind->filter.active();
         const std::size_t fp = filtered ? bind->filter_payload : 0;
-        bool others = false;
-        for (std::size_t p = 0; p < P; ++p) if (p != fp && want[p]) others = true;
 
         std::vector<gpudb::MultiPayload> mp(P);
         for (std::size_t p = 0; p < P; ++p) { mp[p].vals = cols[p]; mp[p].columns = want[p]; }
         gpudb::GroupByFilter f0 = bind->filter;
         f0.columns = (want_cstar ? (1u << 3) : 0u) | (want_key ? 1u : 0u);
-        (void)others;
         std::size_t passes = 0, rows_in = 0, groups_total = 0;
         double wall = 0.0, kernel = 0.0;
+        gpudb::DispatchDecision d;
+        std::string path;
         {
             auto dev = resident_device_lock(ctx);
             gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
             init->pay = agg.groupby_exact_masked_multi(*set->keys, mp.data(), P, fp, rw.preds.data(), rw.preds.size(), cap, f0);
+            // process-wide state: copied out under the lock that wrote it
+            d = agg.last_decision();
+            path = gpudb::exact_path_note();
         }
         {
             auto& prim = init->pay[fp];
@@ -1043,13 +1065,12 @@ void gm_init(duckdb_init_info info) {
             init->key_null = std::move(prim.key_null);
             init->counts_star = std::move(prim.counts_star);
         }
-        const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=groupby_exact_multi backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu payloads=%zu passes=%zu "
             "wall_ms=%.3f kernel_ms=%.3f transfer_ms=0.000 path=%s",
             gpudb::to_string(d.chosen), gpudb::to_string(d.reason), rows_in, groups_total, init->rows, P, passes,
-            wall, kernel, gpudb::exact_path_note().c_str());
+            wall, kernel, path.c_str());
         resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
         duckdb_init_set_error(info, e.what());
@@ -1255,11 +1276,12 @@ void gg_init(duckdb_init_info info) {
         }
         ResolvedWhere rw = resolve_where(*set, bind->where, fn);
         auto& agg = resident_aggregator(ctx);
+        gpudb::DispatchDecision d;
         {
             auto dev = resident_device_lock(ctx);
             init->res = agg.aggregate_exact_masked(mp.data(), P, rw.preds.data(), rw.preds.size());
+            d = agg.last_decision();   // process-wide state: copied out under the lock that wrote it
         }
-        const auto& d = agg.last_decision();
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=agg_exact_global backend=%s reason=%s rows_in=%zu groups=1 rows_out=1 payloads=%zu "
@@ -1406,10 +1428,14 @@ void tk_init(duckdb_init_info info) {
                 (target->dtype() == gpudb::Dtype::F64 ? "DOUBLE — use gpu_topk_resident_f64"
                                                        : "BIGINT — use gpu_topk_resident"));
         auto& agg = resident_aggregator(ctx);
-        auto dev = resident_device_lock(ctx);
-        init->res = agg.topk_resident(*target, static_cast<std::size_t>(bind->k),
-                                      bind->descending);
-        const auto& d = agg.last_decision();
+        // the lock is the GPU call's; the stats line is formatted after it
+        gpudb::DispatchDecision d;
+        {
+            auto dev = resident_device_lock(ctx);
+            init->res = agg.topk_resident(*target, static_cast<std::size_t>(bind->k),
+                                          bind->descending);
+            d = agg.last_decision();
+        }
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=topk_resident backend=%s reason=%s rows_in=%zu k=%zu "

@@ -4044,3 +4044,102 @@ sort path on either kernel or whole-call time; the worst is 0.99x, a 15M-row
 `GPUDB_METAL_GROUPBY_EXACT_PATH=direct` forces past the rule (the parity tests
 use it); `GPUDB_METAL_DIRECT_MIN_WORK` and `GPUDB_METAL_DIRECT_MIN_GROUPS` move
 it.
+
+## Per-statement fixed cost of a rewritten statement — Metal, SF1 + SF10 (2026-09-18)
+
+Where the milliseconds of a rewritten statement go, by subtraction. Apple M4
+Max, `data/tpch_sf1` and `data/tpch_sf10`, one process, `thresholds=False` so
+the few-group shapes rewrite, `residency='eager'`. The layers are
+**interleaved** — one round runs one repetition of each, and the order rotates
+per round, so drift between layers cannot be read as a difference between them.
+Min and median of 31 rounds (SF1) / 21 (SF10). Both thread modes.
+
+Layers: `native` = a `transparent=False` connection; `wrapper` =
+`con.execute(q).fetchall()`; `bare` = the rewritten text on `con._raw`;
+`prepared` = the same text `PREPARE`d once and `EXECUTE`d; `noguard` = the
+rewritten text with the `gpu_assert_rows` relation removed (a measurement form
+only, never one that ships); `wall` / `kernel` = the operator's own numbers
+from `gpu_last_stats()`.
+
+**SF1, `SELECT l_linenumber, sum(l_quantity) FROM lineitem GROUP BY l_linenumber`**
+(6,001,215 rows, 7 groups), min ms:
+
+| layer | before, threads=16 | after, threads=16 | before, threads=1 | after, threads=1 |
+|---|---|---|---|---|
+| native | 1.64 | 1.62 | 13.99 | 14.02 |
+| wrapper | 0.74 | **0.69** | 0.73 | 0.82 |
+| bare text | 0.71 | 0.70 | 0.69 | 0.82 |
+| prepared | 0.66 | 0.64 | 0.64 | 0.63 |
+| without the guard | 0.66 | 0.66 | 0.66 | 0.73 |
+| `SELECT count(*) FROM lineitem` | 0.06 | 0.06 | 0.05 | 0.05 |
+| `SELECT 1` | 0.04 | 0.04 | 0.04 | 0.04 |
+| operator `wall_ms` | 0.572 | 0.570 | 0.639 | 0.645 |
+| operator `kernel_ms` | 0.447 | 0.445 | 0.450 | 0.457 |
+| Python inside `execute` (cProfile, 400 calls) | 0.042 | 0.022 | — | — |
+
+Read as a budget of the 0.74 ms statement (threads=16, before):
+
+| piece | ms | what it is |
+|---|---|---|
+| kernel | 0.447 | the direct row-order reduce |
+| operator host half | 0.125 | `wall − kernel`: D2H, the group merge, the stats line |
+| DuckDB around the operator | 0.14 | `bare − wall`, of which 0.05 parse/bind/optimise per run and 0.05 the guard relation |
+| Python wrapper | 0.02–0.04 | routing, caches, regexes, the residency bracket |
+
+So the fixed cost **outside the operator** was 0.17 ms and is 0.12 ms; the
+statement is 0.69 ms against native's 1.62. Two things the subtraction settled
+that had been carried as estimates: the staleness guard costs **0.05 ms**, not
+0.3–0.5 (`EXPLAIN ANALYZE` shows its arm as a `COLUMN_DATA_SCAN` of one row —
+DuckDB 1.4.5 answers an unfiltered `count(*)` over a base table from row-group
+metadata), and the Python wrapper costs **0.022 ms**, which is 3% of the
+statement and confirms the earlier "wrapper ≈ 0" by measuring it.
+
+**The plan cache, A/B inside one process** (alternating rounds with it on and
+off, 41 rounds, min / median ms, SF1):
+
+| statement | threads | text | plan | saved | native | ratio text → plan |
+|---|---|---|---|---|---|---|
+| `l_returnflag`, 3 groups | 16 | 0.888 / 1.579 | 0.787 / 1.360 | 0.101 / 0.219 | 2.111 | 2.38× → 2.68× |
+| `l_linenumber`, 7 groups | 16 | 0.730 / 0.917 | 0.666 / 0.833 | 0.065 / 0.084 | 1.602 | 2.19× → 2.41× |
+| `l_linenumber` + 9% WHERE | 16 | 0.848 / 0.950 | 0.786 / 0.810 | 0.061 / 0.140 | 1.424 | 1.68× → 1.81× |
+| `l_returnflag` + 9% WHERE | 16 | 0.969 / 1.357 | 0.874 / 1.245 | 0.096 / 0.112 | 1.354 | 1.40× → 1.55× |
+| global aggregate | 16 | 1.165 / 1.380 | 1.082 / 1.262 | 0.083 / 0.119 | 0.887 | 0.76× → 0.82× |
+| `l_suppkey`, 10K groups | 16 | 6.878 / 9.190 | 6.512 / 9.211 | 0.365 / −0.021 | 9.193 | 1.34× → 1.41× |
+| `l_suppkey` over a join | 16 | 7.616 / 9.565 | 7.185 / 9.418 | 0.431 / 0.147 | 17.882 | 2.35× → 2.49× |
+
+The saving is the parse / bind / optimise of the rewritten relations, so it
+grows with how many there are: 0.06–0.10 ms for a two-relation statement,
+0.37–0.43 ms for the join and 10K-group forms. It is the same absolute
+milliseconds at SF10, where a statement is 4–67 ms instead of 0.7–7.6, so it
+shows there as 2–3% rather than 8–13%.
+
+**SF10** (60M rows, `memory_budget=200GB`), min ms, threads=16:
+
+| statement | native | wrapper before | wrapper after | `wall` | `kernel` |
+|---|---|---|---|---|---|
+| `l_returnflag`, 3 groups | 18.35 → 18.13 | 4.00 | 3.82 | 3.65 | 3.51 |
+| `l_linenumber`, 7 groups | 13.83 → 13.27 | 4.21 | 4.07 | 3.90 | 3.76 |
+| `l_linenumber` + 9% WHERE | 11.32 → 10.78 | 5.06 | 4.94 | 4.83 | 4.68 |
+| global aggregate | 6.48 → 5.99 | 3.53 | 3.42 | 3.22 | 3.07 |
+| `l_suppkey`, 10K groups | 127.3 → 124.7 | 66.95 | 67.39 | 16.66 | 15.89 |
+| `l_suppkey` over a join | 216.9 → 215.4 | 68.27 | 66.16 | 17.06 | 15.92 |
+
+**Concurrency** (two connections on one context, the 7-group statement,
+`threads=1`, 200 statements each): 1.758 ms per statement before, 1.766 after —
+the device lock is what serialises them and the stats line inside it was never
+the cost. The lock-scope change is kept for the shape of the code, not for a
+number.
+
+**What did not move: the thresholds.** `transparent_gate.py --no-thresholds
+--keys l_linenumber,l_returnflag --joins none`, SF1, N=9, on both code states:
+every plain / HAVING / top-k / projected / nested cell of the 7-group INTEGER
+key measures **1.19–2.50×**, not the 0.80–0.94× the same sweep recorded on
+2026-09-18. Nothing in between changed those rows by more than 0.1 ms; the
+difference is the process's mode (§9.1 of the transparent design — a short
+kernel runs at 0.45 ms or at three times that depending on what else in the
+process is waking). A bound cannot be relaxed on the fast mode alone, and the
+slow mode did not reproduce on demand here (15 threads sleeping 5 ms left the
+kernel at 0.447 ms), so `min_groups` and the VARCHAR-key rules stay where they
+are and the run-time measured rule 1 keeps deciding these shapes. The only
+rows below 1.0× in that sweep are the global-aggregate form at SF1, which its
+own rule (`rows × (1 + terms) ≥ 60M`) already declines.

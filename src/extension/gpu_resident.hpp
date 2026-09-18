@@ -52,6 +52,8 @@ enum class SetState : std::uint8_t {
 };
 const char* to_string(SetState s) noexcept;
 
+struct StoreColumn;   // stage B, below: one resident copy of a table column
+
 // One registry entry: a bare column (`keys` only) or a (key, payload) pair.
 struct ResidentSet {
     std::string   name;             // registry key: the upload name / identity tag
@@ -87,6 +89,11 @@ struct ResidentSet {
     // store's columns, dictionaries and sort caches; it owns nothing.
     bool          view = false;
     std::string   store_key;
+    // The store columns this view was built from, in no particular order. A hit
+    // stamps their recency, and holding them here makes that a few relaxed
+    // stores instead of a second pass over the whole store under the registry
+    // lock, comparing every column against every lane of the set.
+    std::vector<std::shared_ptr<StoreColumn>> store_cols;
     // v0.7 §4.12: a set only global aggregates read (tag extra 'global', lane
     // 0 written '-'). It has no GROUP BY key, so no sort cache is built for it
     // — `keys` points at the first real lane purely so the set's invariants
