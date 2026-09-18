@@ -305,8 +305,10 @@ public:
 
     // v0.7 milestone 3 (§4.1): the pair WITH its NULLs. One host pass over
     // the interleaved segments (UMA: the shared buffers are the device
-    // memory) partitions NULL-key rows to a suffix of both columns, keeps
-    // NULL payloads in place under a validity bitmap, and de-interleaves.
+    // memory) de-interleaves them into the two columns. Rows keep their input
+    // order (stage A) — a NULL key, like a NULL payload, is a zero bit in
+    // that column's validity bitmap, not a row moved to a suffix. The sort
+    // cache built later covers the valid keys only.
     bool exact_supported() const noexcept override { return true; }
 
     // ---- v0.7 §4.8: the materialised key join ----
@@ -1065,10 +1067,12 @@ private:
         std::size_t sort_rows()   const noexcept { return rows_ - nulls_; }
 
         // ---- v0.7 milestone 0b: readiness (gpu_backend.hpp contract) ----
-        // The derived structure is the radix-sorted copy of the column plus
-        // the sort permutation as ORIGINAL upload indices (i64), which every
-        // GROUP BY, join build side and top-k call needs. prepare() builds it
-        // now; an operator builds it lazily on first use otherwise.
+        // The derived structure is the radix-sorted copy of the column's VALID
+        // rows (compacted through the validity bitmap) at the key's storage
+        // width, plus the sort permutation as u32 row ids into the column's
+        // input order, which every GROUP BY, join build side and top-k call
+        // needs. prepare() builds it now; an operator builds it lazily on
+        // first use otherwise.
         // Idempotent; concurrent calls serialize on cache_mu_ and the loser
         // is a no-op; a failure throws std::runtime_error and leaves the
         // column usable (the next caller retries the build).
@@ -1756,13 +1760,15 @@ private:
 
 
     // ---- v0.7 milestone 3: exact GROUP BY (§4.1 / §4.2) ----
-    // Same run-start pipeline as groupby_impl over the sorted VALID-KEY
-    // prefix; gbx_chunk_i64 / gbx_finalize_i64 produce the native tuple
+    // Same run-start pipeline as groupby_impl, over the sort cache — the
+    // VALID keys, sorted, with a permutation of row ids into the column's
+    // input order; gbx_chunk_i64 / gbx_finalize_i64 produce the native tuple
     // (128-bit sum, count(v), count(*), min, max) under the payload's
-    // validity bitmap; the NULL-key suffix is folded into one trailing group
-    // on the host (UMA, cost ∝ NULL-key rows); HAVING / top-k run on the
-    // device over the tuple (128-bit radix select for the sum) so only the
-    // survivors reach the result vectors.
+    // validity bitmap; the NULL-key group is folded on the host from the rows
+    // whose key bit is 0 (UMA, cost ∝ NULL-key rows) and appended as the one
+    // trailing group; HAVING / top-k run on the device over the tuple
+    // (128-bit radix select for the sum) so only the survivors reach the
+    // result vectors.
     // grow() for a buffer held in a vector slot (a reference to a vector
     // element cannot be passed as a __strong id& under ARC).
     id<MTLBuffer> grow_slot(std::vector<id<MTLBuffer>>& v, std::size_t i, std::size_t bytes,
@@ -1804,9 +1810,11 @@ private:
         return exact_impl(keys, vals, preds, n_preds, max_groups, filter, "groupby_exact_masked_resident");
     }
 
-    // §4.6: multi-lane exact upload — one host pass (UMA) partitions NULL-key
-    // rows to a suffix of every lane and de-interleaves into shared buffers;
-    // each non-key lane gets its own validity bitmap when it has NULLs.
+    // §4.6: multi-lane exact upload — the spans are de-interleaved into shared
+    // buffers (UMA), in parallel, every lane keeping the input row order so the
+    // lanes line up row for row and the store can place a span at its row-id
+    // rank (stage B). Each lane gets its own validity bitmap when it has
+    // NULLs; a NULL key is a zero bit in lane 0's, nothing is moved.
     std::vector<std::unique_ptr<ResidentColumn>>
     upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
                       const Dtype* dtypes, std::size_t n_lanes) override {
@@ -2157,11 +2165,12 @@ private:
     }
 
     // The exact GROUP BY, plain or masked (§4.1, §4.2, §4.6).
-    // The NULL-key group: rows [from, to) of the key-partitioned set, under the
-    // mask. Folded on the host (unified memory). A LEFT JOIN can put most of a
-    // set there (every unmatched row has a NULL dimension key), so a long
-    // suffix is folded by several threads; the 128-bit add / min / max merge is
-    // associative, the result does not depend on the split.
+    // The NULL-key group: every row whose key bit is 0, under the mask —
+    // scattered through the column, not a suffix (stage A). Folded on the host
+    // (unified memory). A LEFT JOIN can put most of a set there (every
+    // unmatched row has a NULL dimension key), so the bitmap's words are split
+    // across several threads; the 128-bit add / min / max merge is associative,
+    // the result does not depend on the split.
     struct NullFold {
         Sum128 s; std::int64_t cnt = 0, cstar = 0;
         std::int64_t mn = std::numeric_limits<std::int64_t>::max();
@@ -2780,7 +2789,7 @@ private:
                 perm   = k.perm_cache();
             }
 
-            // ---- key predicates → a contiguous range of the sorted prefix ----
+            // ---- key predicates → a contiguous range of the sort cache ----
             // (binary search on the UMA sorted cache, zero per-row cost); the
             // NULL-key group survives only IS NULL or the absence of any key
             // comparison. Everything else goes to the mask.
