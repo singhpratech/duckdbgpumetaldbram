@@ -265,8 +265,8 @@ MetalRadixSort::DeviceView MetalRadixSort::sort_device(const std::int64_t* keys,
     return view;
 }
 
-MetalRadixSort::DeviceView MetalRadixSort::sort_iota_take(const std::int64_t* keys, std::uint32_t n,
-                                                          std::size_t keep_bytes) {
+MetalRadixSort::DeviceView MetalRadixSort::sort_take(const std::int64_t* keys, const std::int64_t* payloads,
+                                                     std::uint32_t n, std::size_t keep_bytes) {
     DeviceView view;
     if (n == 0) return view;
     constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 1024;
@@ -287,7 +287,8 @@ MetalRadixSort::DeviceView MetalRadixSort::sort_iota_take(const std::int64_t* ke
         const std::size_t n_threads = (n < (1u << 20)) ? 1 : std::min<std::size_t>(hw, 8);
         auto stage = [&](std::size_t lo, std::size_t hi) {
             std::memcpy(dk + lo, keys + lo, (hi - lo) * sizeof(std::int64_t));
-            for (std::size_t i = lo; i < hi; ++i) dv[i] = static_cast<std::int64_t>(i);
+            if (payloads) std::memcpy(dv + lo, payloads + lo, (hi - lo) * sizeof(std::int64_t));
+            else for (std::size_t i = lo; i < hi; ++i) dv[i] = static_cast<std::int64_t>(i);
         };
         if (n_threads <= 1) {
             stage(0, n);

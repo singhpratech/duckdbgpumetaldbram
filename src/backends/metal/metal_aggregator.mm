@@ -261,41 +261,18 @@ public:
                 gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
 
             // ---- build side: sorted valid keys + permutation to build rows ----
+            // the column's own sort cache: valid keys sorted, permutation = row ids (shared
+            // by every statement that joins on this key)
             id<MTLBuffer> sorted = nil, perm = nil;
-            std::size_t nb = 0;
-            if (bk.valid_buffer() == nil) {
-                // A key-layout column: the sort cache covers exactly the valid prefix.
-                nb = bk.sort_rows();
-                if (nb) { bk.build_sort_cache(&kernel_ms); sorted = bk.sorted_cache(); perm = bk.perm_cache(); }
-            } else {
-                // NULLs under a bitmap: sort the valid cells only.
-                const auto* bd = static_cast<const std::int64_t*>([bk.buffer() contents]);
-                const auto* bv = static_cast<const std::uint64_t*>([bk.valid_buffer() contents]);
-                std::vector<std::int64_t> ks, idx;
-                ks.reserve(bk.rows()); idx.reserve(bk.rows());
-                for (std::size_t i = 0; i < bk.rows(); ++i)
-                    if ((bv[i >> 6] >> (i & 63)) & 1u) { ks.push_back(bd[i]); idx.push_back(static_cast<std::int64_t>(i)); }
-                nb = ks.size();
-                if (nb) {
-                    sorted = [device_ newBufferWithLength:nb * sizeof(std::int64_t) options:MTLResourceStorageModeShared];
-                    perm   = [device_ newBufferWithLength:nb * sizeof(std::int64_t) options:MTLResourceStorageModeShared];
-                    if (!sorted || !perm) throw std::runtime_error("join_materialize: device allocation failed (Metal)");
-                    std::lock_guard<std::mutex> slock(sort_ctx_->mu);
-                    auto view = sort_ctx_->get().sort_device(ks.data(), idx.data(), static_cast<std::uint32_t>(nb));
-                    std::memcpy([sorted contents], [view.keys contents],     nb * sizeof(std::int64_t));
-                    std::memcpy([perm contents],   [view.payloads contents], nb * sizeof(std::int64_t));
-                    kernel_ms += view.kernel_ms;
-                }
-            }
+            const std::size_t nb = bk.sort_rows();
+            if (nb) { bk.build_sort_cache(&kernel_ms); sorted = bk.sorted_cache(); perm = bk.perm_cache(); }
 
             const std::size_t n = pk.rows();
             std::size_t n1 = 0, n2 = 0;
             const std::size_t nblocks = (n + kBlock - 1) / kBlock;
             const std::uint32_t n32  = static_cast<std::uint32_t>(n);
             const std::uint32_t nb32 = static_cast<std::uint32_t>(nb);
-            auto null_from = [](const MetalResidentColumn& c) {
-                return c.null_suffix() ? static_cast<std::uint32_t>(c.sort_rows()) : 0xFFFFFFFFu;
-            };
+            auto null_from = [](const MetalResidentColumn&) { return 0xFFFFFFFFu; };   // NULLs: the bitmap
             if (n > 0 && nb > 0) {
                 grow(jm_flag_, sizeof(std::uint32_t), "join flag");
                 grow(jm_match_, n * sizeof(std::uint32_t), "join match");
@@ -421,11 +398,8 @@ public:
                     set += static_cast<std::size_t>(__builtin_popcountll(x));
                 }
                 const std::size_t nulls = rows_out - set;
-                // Lane 0: its NULLs are exactly the suffix (key layout, no bitmap).
-                const bool key = l == 0;
                 r.lanes.push_back(std::make_unique<MetalResidentColumn>(
-                    data[l], rows_out, out[l].col->dtype(), sort_ctx_,
-                    /*null_suffix*/ key ? n2 : 0, (key || nulls == 0) ? nil : vbits[l], nulls));
+                    data[l], rows_out, out[l].col->dtype(), sort_ctx_, nulls == 0 ? nil : vbits[l], nulls));
             }
             r.rows_out = rows_out;
             r.null_key_rows = n2;
@@ -459,31 +433,32 @@ public:
                 throw std::runtime_error("upload_pair_exact: device allocation failed (Metal)");
             auto* k = static_cast<std::int64_t*>([kb contents]);
             auto* v = static_cast<std::int64_t*>([vb contents]);
-            std::vector<std::uint64_t> vvalid(words, ~std::uint64_t{0});
-            std::size_t head = 0, tail = rows - null_keys, null_vals = 0;
+            std::vector<std::uint64_t> kvalid(words, ~std::uint64_t{0}), vvalid(words, ~std::uint64_t{0});
+            std::size_t dst = 0, null_vals = 0;
+            (void)null_keys;
+            std::size_t nk = 0;
             for (std::size_t s = 0; s < n_spans; ++s) {
                 const KvSpan& sp = spans[s];
-                for (std::size_t j = 0; j < sp.rows; ++j) {
+                for (std::size_t j = 0; j < sp.rows; ++j, ++dst) {
                     const bool kv_ok = bit(sp.key_valid, j);
                     const bool vv_ok = bit(sp.val_valid, j);
-                    const std::size_t dst = kv_ok ? head++ : tail++;
                     k[dst] = kv_ok ? sp.kv[2 * j] : 0;
                     v[dst] = vv_ok ? sp.kv[2 * j + 1] : 0;
+                    if (!kv_ok) { kvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++nk; }
                     if (!vv_ok) { vvalid[dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++null_vals; }
                 }
             }
-            id<MTLBuffer> valid = nil;
-            if (null_vals) {
-                valid = [device_ newBufferWithBytes:vvalid.data()
-                                            length:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
-                                           options:MTLResourceStorageModeShared];
-                if (!valid) throw std::runtime_error("upload_pair_exact: validity allocation failed (Metal)");
-            }
+            auto bitmap = [&](const std::vector<std::uint64_t>& bits, std::size_t nulls) -> id<MTLBuffer> {
+                if (!nulls) return nil;
+                id<MTLBuffer> b = [device_ newBufferWithBytes:bits.data()
+                                                       length:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
+                                                      options:MTLResourceStorageModeShared];
+                if (!b) throw std::runtime_error("upload_pair_exact: validity allocation failed (Metal)");
+                return b;
+            };
             ResidentPair out;
-            out.keys = std::make_unique<MetalResidentColumn>(kb, rows, Dtype::I64, sort_ctx_,
-                                                             null_keys, nil, null_keys);
-            out.vals = std::make_unique<MetalResidentColumn>(vb, rows, Dtype::I64, sort_ctx_,
-                                                             0, valid, null_vals);
+            out.keys = std::make_unique<MetalResidentColumn>(kb, rows, Dtype::I64, sort_ctx_, bitmap(kvalid, nk), nk);
+            out.vals = std::make_unique<MetalResidentColumn>(vb, rows, Dtype::I64, sort_ctx_, bitmap(vvalid, null_vals), null_vals);
             return out;
         }
     }
@@ -943,24 +918,24 @@ private:
         MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt,
                             std::shared_ptr<SortCtx> ctx)
             : buf_(buf), rows_(n), dtype_(dt), ctx_(std::move(ctx)) {}
-        // v0.7 §4.1 exact-path column. Key column: `null_suffix` trailing
-        // rows have a NULL key (the sort cache covers only the prefix).
-        // Payload column: `valid` is the DuckDB-layout validity bitmap (nil
-        // when NULL-free) and `nulls` the number of NULL payloads.
+        // v0.7 §4.1 exact-path column (stage A of docs/RESIDENT_COLUMNS_DESIGN.md):
+        // rows in input order; `valid` is the DuckDB-layout validity bitmap (nil
+        // when NULL-free) and `nulls` the number of NULL rows — for a key column
+        // and a payload column alike. The sort cache covers the valid rows and
+        // its permutation holds row ids.
         MetalResidentColumn(id<MTLBuffer> buf, std::size_t n, Dtype dt,
                             std::shared_ptr<SortCtx> ctx,
-                            std::size_t null_suffix, id<MTLBuffer> valid, std::size_t nulls)
+                            id<MTLBuffer> valid, std::size_t nulls)
             : buf_(buf), rows_(n), dtype_(dt), ctx_(std::move(ctx)),
-              null_suffix_(null_suffix), valid_(valid), nulls_(nulls) {}
+              valid_(valid), nulls_(nulls) {}
         Backend     backend_tag() const noexcept override { return Backend::METAL; }
         Dtype       dtype()       const noexcept override { return dtype_; }
         std::size_t rows()        const noexcept override { return rows_; }
         std::size_t null_count()  const noexcept override { return nulls_; }
         id<MTLBuffer> buffer()    const noexcept { return buf_; }
         id<MTLBuffer> valid_buffer() const noexcept { return valid_; }
-        std::size_t null_suffix() const noexcept { return null_suffix_; }
-        // Rows the sort cache covers: the valid-key prefix.
-        std::size_t sort_rows()   const noexcept { return rows_ - null_suffix_; }
+        // Rows the sort cache covers: the valid ones.
+        std::size_t sort_rows()   const noexcept { return rows_ - nulls_; }
 
         // ---- v0.7 milestone 0b: readiness (gpu_backend.hpp contract) ----
         // The derived structure is the radix-sorted copy of the column plus
@@ -999,26 +974,42 @@ private:
             if (rows_ > 0xFFFFFFFFull)
                 throw std::runtime_error("resident sort cache: > 2^32 rows unsupported (Metal)");
             @autoreleasepool {
-                const std::size_t n = sort_rows();   // valid-key prefix (== rows_ for legacy columns)
-                std::vector<std::int64_t> tk;
+                const std::size_t n = sort_rows();   // valid rows (== rows_ without NULLs)
+                std::vector<std::int64_t> tk, tidx;
                 const std::int64_t* keys = nullptr;
-                if (dtype_ == Dtype::I64) {
+                const std::int64_t* idx = nullptr;   // nullptr: the row id is the position
+                auto image = [](double x) {
+                    // Order-preserving i64 image of a double: NaN canonicalised
+                    // and sorted greatest, negatives reflected.
+                    std::uint64_t u;
+                    if (std::isnan(x)) u = 0x7FF8000000000000ull;
+                    else std::memcpy(&u, &x, sizeof(u));
+                    return static_cast<std::int64_t>(u) < 0
+                        ? -static_cast<std::int64_t>(u & 0x7FFFFFFFFFFFFFFFull) - 1
+                        : static_cast<std::int64_t>(u);
+                };
+                if (valid_ != nil) {
+                    // NULLs anywhere: sort the valid (value, row id) pairs only
+                    const auto* vb = static_cast<const std::uint64_t*>([valid_ contents]);
+                    tk.resize(n); tidx.resize(n);
+                    std::size_t o = 0;
+                    if (dtype_ == Dtype::I64) {
+                        const auto* d = static_cast<const std::int64_t*>([buf_ contents]);
+                        for (std::size_t i = 0; i < rows_; ++i)
+                            if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = d[i]; tidx[o] = static_cast<std::int64_t>(i); ++o; }
+                    } else {
+                        const auto* d = static_cast<const double*>([buf_ contents]);
+                        for (std::size_t i = 0; i < rows_; ++i)
+                            if ((vb[i >> 6] >> (i & 63)) & 1u) { tk[o] = image(d[i]); tidx[o] = static_cast<std::int64_t>(i); ++o; }
+                    }
+                    if (o != n) throw std::runtime_error("resident sort cache: validity bitmap and null_count disagree");
+                    keys = tk.data(); idx = tidx.data();
+                } else if (dtype_ == Dtype::I64) {
                     keys = static_cast<const std::int64_t*>([buf_ contents]);
                 } else {
-                    // Order-preserving i64 image of each double: NaN
-                    // canonicalised and sorted greatest, negatives reflected.
                     const auto* d = static_cast<const double*>([buf_ contents]);
                     tk.resize(n);
-                    for (std::size_t i = 0; i < n; ++i) {
-                        double x = d[i];
-                        std::uint64_t u;
-                        if (std::isnan(x)) u = 0x7FF8000000000000ull;
-                        else std::memcpy(&u, &x, sizeof(u));
-                        if (static_cast<std::int64_t>(u) < 0)
-                            tk[i] = -static_cast<std::int64_t>(u & 0x7FFFFFFFFFFFFFFFull) - 1;
-                        else
-                            tk[i] = static_cast<std::int64_t>(u);
-                    }
+                    for (std::size_t i = 0; i < n; ++i) tk[i] = image(d[i]);
                     keys = tk.data();
                 }
                 id<MTLBuffer> sorted = nil, perm = nil;
@@ -1029,7 +1020,7 @@ private:
                     // not copies (the build used to be five serial passes over the column around
                     // the sort: index fill, two copies in, two copies out).
                     std::lock_guard<std::mutex> slock(ctx_->mu);
-                    auto view = ctx_->get().sort_iota_take(keys, static_cast<std::uint32_t>(n));
+                    auto view = ctx_->get().sort_take(keys, idx, static_cast<std::uint32_t>(n));
                     sorted = view.keys;
                     perm   = view.payloads;
                     ms = view.kernel_ms;
@@ -1051,9 +1042,8 @@ private:
         mutable std::atomic<bool> ready_{false};  // release after sorted_/perm_ are set
         mutable id<MTLBuffer> sorted_ = nil;
         mutable id<MTLBuffer> perm_   = nil;
-        std::size_t   null_suffix_ = 0;           // key column: trailing NULL-key rows
-        id<MTLBuffer> valid_ = nil;               // payload column: validity bitmap (nil = none)
-        std::size_t   nulls_ = 0;                 // NULL rows (suffix length, or bitmap zeros)
+        id<MTLBuffer> valid_ = nil;               // validity bitmap (nil = no NULLs)
+        std::size_t   nulls_ = 0;                 // NULL rows (bitmap zeros)
     };
 
     enum class GbMode { SumI64, SumF64, Count };
@@ -1622,20 +1612,18 @@ private:
                 if (!bufs[l]) throw std::runtime_error("upload_rows_exact: device allocation failed (Metal)");
                 dst[l] = static_cast<std::int64_t*>([bufs[l] contents]);
             }
-            // Layout: rows with a valid key first (span order, row order), NULL-key rows after
-            // them in the same order. Every span's two output ranges follow from prefix sums,
-            // so spans are copied independently — and in parallel: this loop was one thread
-            // testing a validity bit per value (SF1, 2 lanes: 10-15 ms of a 39 ms upload;
-            // seconds at SF50). Output is byte-identical to the serial copy. Two spans can
-            // share a validity WORD at a range boundary, hence the atomic clear.
-            std::vector<std::size_t> head0(n_spans, 0), tail0(n_spans, 0);
+            // Layout: input order (span order, row order); a NULL in any lane, the key
+            // included, is a zero bit in that lane's bitmap. Every span's output range
+            // follows from a prefix sum of the span sizes, so spans are copied
+            // independently — and in parallel: this loop was one thread testing a
+            // validity bit per value (SF1, 2 lanes: 10-15 ms of a 39 ms upload; seconds
+            // at SF50). Two spans can share a validity WORD at a range boundary, hence
+            // the atomic clear.
+            (void)span_null_keys; (void)null_keys;
+            std::vector<std::size_t> head0(n_spans, 0);
             {
-                std::size_t h = 0, t = rows - null_keys;
-                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
-                    head0[sidx] = h; tail0[sidx] = t;
-                    h += spans[sidx].rows - span_null_keys[sidx];
-                    t += span_null_keys[sidx];
-                }
+                std::size_t h = 0;
+                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) { head0[sidx] = h; h += spans[sidx].rows; }
             }
             std::vector<std::vector<std::uint64_t>> valid(n_lanes);
             std::vector<std::atomic<bool>> lane_has_null(n_lanes);
@@ -1660,13 +1648,11 @@ private:
                     }
                     return;
                 }
-                const std::uint64_t* kv = lane_valid(sp, 0);
-                std::size_t head = head0[sidx], tail = tail0[sidx];
+                const std::size_t d0 = head0[sidx];
                 for (std::size_t j = 0; j < sp.rows; ++j) {
-                    const bool k_ok = bit(kv, j);
-                    const std::size_t d = k_ok ? head++ : tail++;
+                    const std::size_t d = d0 + j;
                     for (std::size_t l = 0; l < n_lanes; ++l) {
-                        const bool ok = (l == 0) ? k_ok : bit(lane_valid(sp, l), j);
+                        const bool ok = bit(lane_valid(sp, l), j);
                         dst[l][d] = ok ? sp.lanes[j * n_lanes + l] : 0;
                         if (!ok) {
                             __atomic_and_fetch(&valid[l][d >> 6], ~(std::uint64_t{1} << (d & 63)), __ATOMIC_SEQ_CST);
@@ -1696,15 +1682,13 @@ private:
             out.reserve(n_lanes);
             for (std::size_t l = 0; l < n_lanes; ++l) {
                 id<MTLBuffer> vb = nil;
-                if (l != 0 && nulls[l]) {
+                if (nulls[l]) {
                     vb = [device_ newBufferWithBytes:valid[l].data()
                                              length:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
                                             options:MTLResourceStorageModeShared];
                     if (!vb) throw std::runtime_error("upload_rows_exact: validity allocation failed (Metal)");
                 }
-                out.push_back(std::make_unique<MetalResidentColumn>(
-                    bufs[l], rows, dtypes[l], sort_ctx_,
-                    /*null_suffix*/ l == 0 ? null_keys : 0, vb, nulls[l]));
+                out.push_back(std::make_unique<MetalResidentColumn>(bufs[l], rows, dtypes[l], sort_ctx_, vb, nulls[l]));
             }
             return out;
         }
@@ -1732,31 +1716,42 @@ private:
         std::int64_t mn = std::numeric_limits<std::int64_t>::max();
         std::int64_t mx = std::numeric_limits<std::int64_t>::min();
     };
-    static NullFold fold_null_suffix(const MetalResidentColumn* v, const std::uint8_t* mk,
-                                     std::size_t from, std::size_t to) {
+    // The NULL-key group: every row whose key bit is 0 (under the WHERE mask),
+    // folded on the host through unified memory — words of the key bitmap in
+    // parallel, only the zero bits visited.
+    static NullFold fold_null_keys(const MetalResidentColumn& k, const MetalResidentColumn* v,
+                                   const std::uint8_t* mk) {
+        const auto* kb = k.valid_buffer() ? static_cast<const std::uint64_t*>([k.valid_buffer() contents]) : nullptr;
+        if (!kb) return NullFold{};
+        const std::size_t rows = k.rows(), words = (rows + 63) / 64;
         const auto* vd = v ? static_cast<const std::int64_t*>([v->buffer() contents]) : nullptr;
         const auto* vv = (v && v->valid_buffer())
             ? static_cast<const std::uint64_t*>([v->valid_buffer() contents]) : nullptr;
-        auto range = [=](std::size_t a, std::size_t b) {
+        auto range = [=](std::size_t w0, std::size_t w1) {
             NullFold f;
-            for (std::size_t i = a; i < b; ++i) {
-                if (mk && !mk[i]) continue;
-                ++f.cstar;
-                if (!vd) continue;
-                if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
-                const std::int64_t x = vd[i];
-                f.s.add(x); ++f.cnt; f.mn = std::min(f.mn, x); f.mx = std::max(f.mx, x);
+            for (std::size_t w = w0; w < w1; ++w) {
+                std::uint64_t z = ~kb[w];
+                if (w + 1 == words && (rows & 63)) z &= (std::uint64_t{1} << (rows & 63)) - 1;
+                while (z) {
+                    const std::size_t i = w * 64 + static_cast<std::size_t>(__builtin_ctzll(z));
+                    z &= z - 1;
+                    if (mk && !mk[i]) continue;
+                    ++f.cstar;
+                    if (!vd) continue;
+                    if (vv && !((vv[i >> 6] >> (i & 63)) & 1u)) continue;
+                    const std::int64_t x = vd[i];
+                    f.s.add(x); ++f.cnt; f.mn = std::min(f.mn, x); f.mx = std::max(f.mx, x);
+                }
             }
             return f;
         };
-        const std::size_t rows = to - from;
         unsigned nt = std::min<unsigned>(8, std::max<unsigned>(1, std::thread::hardware_concurrency()));
-        if (rows < (std::size_t(1) << 17) || nt < 2) return range(from, to);
+        if (words < (std::size_t(1) << 12) || nt < 2) return range(0, words);
         std::vector<NullFold> parts(nt);
         std::vector<std::thread> th;
-        const std::size_t step = (rows + nt - 1) / nt;
+        const std::size_t step = (words + nt - 1) / nt;
         for (unsigned t = 0; t < nt; ++t) {
-            const std::size_t a = from + t * step, b = std::min(to, a + step);
+            const std::size_t a = t * step, b = std::min(words, a + step);
             th.emplace_back([&parts, t, a, b, &range] { parts[t] = a < b ? range(a, b) : NullFold{}; });
         }
         for (auto& x : th) x.join();
@@ -1815,7 +1810,7 @@ private:
                     throw std::runtime_error(std::string(op) + ": predicate column row count differs from the keys");
             }
 
-            const std::size_t n = k.sort_rows();          // valid-key prefix
+            const std::size_t n = k.sort_rows();          // valid keys (the sort cache covers them)
             double kernel_ms = 0.0;
             id<MTLBuffer> sorted = nil, perm = nil;
             if (n > 0) {
@@ -1880,8 +1875,7 @@ private:
                     const auto& pc = static_cast<const MetalResidentColumn&>(*pr.col);
                     const bool has_bitmap = pc.valid_buffer() != nil;
                     const std::uint32_t has_valid = has_bitmap ? 1u : 0u;
-                    const std::uint32_t null_from = pc.null_suffix()
-                        ? static_cast<std::uint32_t>(pc.sort_rows()) : 0xFFFFFFFFu;
+                    const std::uint32_t null_from = 0xFFFFFFFFu;         // NULLs: the bitmap
                     const std::uint32_t is_f64 = pc.dtype() == Dtype::F64 ? 1u : 0u;
                     const std::uint32_t opc = pred_op_code(pr.op);
                     const std::int64_t  value = pr.value;
@@ -1993,13 +1987,13 @@ private:
                 }
             }
 
-            // ---- the NULL-key group: fold the suffix on the host (UMA), under the mask ----
+            // ---- the NULL-key group: fold the rows whose key bit is 0 on the host (UMA), under the mask ----
             Sum128 ns; std::int64_t ncnt = 0, ncstar = 0;
             std::int64_t nmn = std::numeric_limits<std::int64_t>::max();
             std::int64_t nmx = std::numeric_limits<std::int64_t>::min();
-            if (null_ok && k.null_suffix() > 0) {
+            if (null_ok && k.null_count() > 0) {
                 const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
-                const NullFold f = fold_null_suffix(v, mk, n, n_total);
+                const NullFold f = fold_null_keys(k, v, mk);
                 ns = f.s; ncnt = f.cnt; ncstar = f.cstar; nmn = f.mn; nmx = f.mx;
                 if (!v) ncnt = ncstar;
             }
@@ -2210,7 +2204,7 @@ private:
                 if (null_group) {
                     const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
                     for (std::size_t e = 0; e < n_extras; ++e) {
-                        const NullFold f = fold_null_suffix(ex[e], mk, n, n_total);
+                        const NullFold f = fold_null_keys(k, ex[e], mk);
                         const Sum128 es = f.s; const std::int64_t ecnt = f.cnt, emn = f.mn, emx = f.mx;
                         static_cast<std::int64_t*>([eb[e][0] contents])[num_segs] = static_cast<std::int64_t>(es.lo);
                         static_cast<std::int64_t*>([eb[e][1] contents])[num_segs] = es.hi;

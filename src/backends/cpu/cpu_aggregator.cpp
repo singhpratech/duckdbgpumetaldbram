@@ -63,8 +63,8 @@ public:
                     static_cast<const std::byte*>(src) + n * elem);
     }
     // §4.1 exact-path column: `valid` is a DuckDB-layout bitmap over the n
-    // rows (nullptr = all valid). For a key column the NULL rows are the
-    // suffix by construction; for a payload column they sit anywhere.
+    // rows (empty = all valid). Rows stay in input order; a NULL key is a
+    // zero bit like a NULL payload (docs/RESIDENT_COLUMNS_DESIGN.md, stage A).
     CpuResidentColumn(std::vector<std::int64_t>&& data, std::vector<std::uint64_t>&& valid,
                       std::size_t null_count, Dtype dt = Dtype::I64)
         : rows_(data.size()), dtype_(dt), valid_(std::move(valid)), nulls_(null_count) {
@@ -85,11 +85,10 @@ public:
     [[nodiscard]] const double* as_f64() const {
         return reinterpret_cast<const double*>(buf_.data());
     }
-    // Row i valid? Without a bitmap the NULLs (if any) are the trailing
-    // null_count() rows — the key column's partition; a legacy column has
-    // none. With a bitmap, its bit decides.
+    // Row i valid? Without a bitmap every row is (a column with NULLs always
+    // carries one). With a bitmap, its bit decides.
     [[nodiscard]] bool valid(std::size_t i) const noexcept {
-        if (valid_.empty()) return i < rows_ - nulls_;
+        if (valid_.empty()) return true;
         return ((valid_[i >> 6] >> (i & 63)) & 1u) != 0;
     }
 
@@ -452,8 +451,8 @@ public:
     }
 
     // ---- v0.7 milestone 3: exact path (§4.1 / §4.2) — the executable reference ----
-    // Partition: valid-key rows first in input order, NULL-key rows as the
-    // suffix; NULL payloads stay in place under a validity bitmap.
+    // Rows stay in input order; NULL keys and NULL payloads sit under
+    // validity bitmaps (stage A of docs/RESIDENT_COLUMNS_DESIGN.md).
     ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
                                    Dtype vdt) override {
         if (vdt != Dtype::I64)
@@ -465,28 +464,23 @@ public:
             return !m || ((m[i >> 6] >> (i & 63)) & 1u);
         };
         std::vector<std::int64_t> k(rows), v(rows);
-        std::vector<std::uint64_t> vvalid((rows + 63) / 64, 0);
-        std::size_t head = 0, null_keys = 0, null_vals = 0;
-        for (std::size_t s = 0; s < n_spans; ++s)
-            for (std::size_t j = 0; j < spans[s].rows; ++j)
-                null_keys += !bit(spans[s].key_valid, j);
-        std::size_t tail = rows - null_keys;          // suffix write cursor
-        bool any_null_val = false;
+        std::vector<std::uint64_t> kvalid((rows + 63) / 64, 0), vvalid((rows + 63) / 64, 0);
+        std::size_t dst = 0, null_keys = 0, null_vals = 0;
         for (std::size_t s = 0; s < n_spans; ++s) {
             const KvSpan& sp = spans[s];
-            for (std::size_t j = 0; j < sp.rows; ++j) {
+            for (std::size_t j = 0; j < sp.rows; ++j, ++dst) {
                 const bool kv_ok = bit(sp.key_valid, j);
                 const bool vv_ok = bit(sp.val_valid, j);
-                const std::size_t dst = kv_ok ? head++ : tail++;
                 k[dst] = kv_ok ? sp.kv[2 * j] : 0;
                 v[dst] = vv_ok ? sp.kv[2 * j + 1] : 0;
-                if (vv_ok) vvalid[dst >> 6] |= std::uint64_t{1} << (dst & 63);
-                else { ++null_vals; any_null_val = true; }
+                if (kv_ok) kvalid[dst >> 6] |= std::uint64_t{1} << (dst & 63); else ++null_keys;
+                if (vv_ok) vvalid[dst >> 6] |= std::uint64_t{1} << (dst & 63); else ++null_vals;
             }
         }
-        if (!any_null_val) vvalid.clear();            // no bitmap when NULL-free
+        if (!null_keys) kvalid.clear();               // no bitmap when NULL-free
+        if (!null_vals) vvalid.clear();
         ResidentPair out;
-        out.keys = std::make_unique<CpuResidentColumn>(std::move(k), std::vector<std::uint64_t>{}, null_keys);
+        out.keys = std::make_unique<CpuResidentColumn>(std::move(k), std::move(kvalid), null_keys);
         out.vals = std::make_unique<CpuResidentColumn>(std::move(v), std::move(vvalid), null_vals);
         return out;
     }
@@ -498,9 +492,9 @@ public:
         return exact_impl(keys, vals, nullptr, 0, max_groups, filter, "groupby_exact_resident");
     }
 
-    // §4.6: multi-lane exact upload. Lane 0 (the key) decides the partition;
-    // every lane is written in the same permuted order so the columns stay
-    // row-aligned. Each returned column carries its own validity bitmap.
+    // §4.6: multi-lane exact upload. Every lane is written in input order so
+    // the columns stay row-aligned; each returned column carries its own
+    // validity bitmap when it has NULLs (the key included).
     std::vector<std::unique_ptr<ResidentColumn>>
     upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
                       const Dtype* dtypes, std::size_t n_lanes) override {
@@ -526,15 +520,13 @@ public:
         std::vector<std::vector<std::int64_t>>  data(n_lanes, std::vector<std::int64_t>(rows));
         std::vector<std::vector<std::uint64_t>> valid(n_lanes, std::vector<std::uint64_t>(words, ~std::uint64_t{0}));
         std::vector<std::size_t> nulls(n_lanes, 0);
-        std::size_t head = 0, tail = rows - null_keys;
+        (void)null_keys;
+        std::size_t dst = 0;
         for (std::size_t s = 0; s < n_spans; ++s) {
             const RowSpan& sp = spans[s];
-            const std::uint64_t* kv = lane_valid(sp, 0);
-            for (std::size_t j = 0; j < sp.rows; ++j) {
-                const bool k_ok = bit(kv, j);
-                const std::size_t dst = k_ok ? head++ : tail++;
+            for (std::size_t j = 0; j < sp.rows; ++j, ++dst) {
                 for (std::size_t l = 0; l < n_lanes; ++l) {
-                    const bool ok = (l == 0) ? k_ok : bit(lane_valid(sp, l), j);
+                    const bool ok = bit(lane_valid(sp, l), j);
                     data[l][dst] = ok ? sp.lanes[j * n_lanes + l] : 0;
                     if (!ok) { valid[l][dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++nulls[l]; }
                 }
@@ -543,9 +535,8 @@ public:
         std::vector<std::unique_ptr<ResidentColumn>> out;
         out.reserve(n_lanes);
         for (std::size_t l = 0; l < n_lanes; ++l) {
-            // The key column carries no bitmap (its NULLs are the suffix);
-            // a NULL-free lane drops its bitmap.
-            std::vector<std::uint64_t> vb = (l == 0 || nulls[l] == 0) ? std::vector<std::uint64_t>{} : std::move(valid[l]);
+            // a NULL-free lane drops its bitmap
+            std::vector<std::uint64_t> vb = (nulls[l] == 0) ? std::vector<std::uint64_t>{} : std::move(valid[l]);
             out.push_back(std::make_unique<CpuResidentColumn>(std::move(data[l]), std::move(vb),
                                                               nulls[l], dtypes[l]));
         }
@@ -637,8 +628,7 @@ public:
                 if (sc.valid(srow)) data[d] = sd[srow];
                 else { valid[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); ++nulls; }
             }
-            // Lane 0: its NULLs are exactly the suffix, no bitmap (key layout).
-            std::vector<std::uint64_t> vb = (l == 0 || nulls == 0) ? std::vector<std::uint64_t>{} : std::move(valid);
+            std::vector<std::uint64_t> vb = (nulls == 0) ? std::vector<std::uint64_t>{} : std::move(valid);
             r.lanes.push_back(std::make_unique<CpuResidentColumn>(std::move(data), std::move(vb),
                                                                   nulls, sc.dtype()));
         }
@@ -662,7 +652,6 @@ public:
         if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
 
         const std::size_t n = k.rows();
-        const std::size_t n_valid = n - k.null_count();     // valid-key prefix
 
         // ---- WHERE mask (§4.6): one byte per row, conjunction of preds ----
         std::vector<std::uint8_t> mask;
@@ -686,17 +675,19 @@ public:
         }
         auto in_mask = [&](std::size_t row) { return mask.empty() || mask[row]; };
 
-        // Sort the prefix's (surviving) row indices by key.
-        std::vector<std::size_t> idx;
-        idx.reserve(n_valid);
-        for (std::size_t i = 0; i < n_valid; ++i) if (in_mask(i)) idx.push_back(i);
+        // Sort the surviving valid-key rows by key; the surviving NULL-key rows
+        // are one group (any position: the key's bitmap says which rows).
+        std::vector<std::size_t> idx, null_idx;
+        idx.reserve(n - k.null_count());
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!in_mask(i)) continue;
+            if (k.valid(i)) idx.push_back(i); else null_idx.push_back(i);
+        }
         const std::size_t n_sel = idx.size();
         const std::int64_t* kd = k.as_i64();
         std::stable_sort(idx.begin(), idx.end(),
                          [kd](std::size_t a, std::size_t b) { return kd[a] < kd[b]; });
-
-        std::size_t null_rows = 0;
-        for (std::size_t i = n_valid; i < n; ++i) null_rows += in_mask(i) ? 1 : 0;
+        const std::size_t null_rows = null_idx.size();
 
         std::size_t groups = 0;
         for (std::size_t i = 0; i < n_sel; ++i)
@@ -705,14 +696,13 @@ public:
         if (!filter.active()) check_group_cap(groups, max_groups, op);
 
         auto emit = [&](std::int64_t key, bool key_is_null, std::size_t b, std::size_t e,
-                        bool via_idx) {
+                        const std::vector<std::size_t>& ix) {
             Sum128 s; std::int64_t cnt_v = 0, cnt_star = 0;
             std::int64_t mn = std::numeric_limits<std::int64_t>::max();
             std::int64_t mx = std::numeric_limits<std::int64_t>::min();
             const std::int64_t* vd = v ? v->as_i64() : nullptr;
             for (std::size_t i = b; i < e; ++i) {
-                const std::size_t row = via_idx ? idx[i] : i;
-                if (!via_idx && !in_mask(row)) continue;   // suffix rows carry the mask directly
+                const std::size_t row = ix[i];               // mask already applied when ix was built
                 ++cnt_star;
                 if (!v) continue;
                 if (!v->valid(row)) continue;
@@ -736,10 +726,10 @@ public:
             const std::int64_t key = kd[idx[i]];
             std::size_t j = i + 1;
             while (j < n_sel && kd[idx[j]] == key) ++j;
-            emit(key, false, i, j, /*via_idx*/true);
+            emit(key, false, i, j, idx);
             i = j;
         }
-        if (null_rows) emit(0, true, n_valid, n, /*via_idx*/false);
+        if (null_rows) emit(0, true, 0, null_rows, null_idx);
         apply_group_filter_host(r, filter, FilterAgg::Exact, max_groups, op);
         r.wall_ms = elapsed_ms(t0);
         return r;

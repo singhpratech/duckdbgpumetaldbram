@@ -1088,6 +1088,32 @@ one. It touches every exact kernel, so it is a designed change, not tonight's;
 noted under open questions. The memory budget stays the right tool for what
 does not fit, and a refused source set now reports `memory` like any other set.
 
+## 2026-09-18 — Reinvention, stage A: the row order belongs to the table
+
+The user's word was "reinvent". The measurement behind it: 22 queries, 24
+private sets, 33 GiB, for a table that is 5 GB at its natural widths. The
+design that fixes it (`docs/RESIDENT_COLUMNS_DESIGN.md`) is the table's own
+organisation mirrored on the device — one resident copy per column in row-id
+order, shared by every statement, sort caches per key column, joins as index
+vectors, chunks for appends and for tables above the budget, widths chosen by
+the data.
+
+Stage A is the layout: the one thing every later stage needs is that all
+columns of a table are row-aligned in a canonical order, and the v0.7 exact
+columns were not — NULL-key rows were moved to a trailing block so the sort
+cache could cover a prefix. The change is smaller than it looked because both
+things the block bought work over a bitmap: the sort cache compacts the valid
+(key, row id) pairs before sorting, so its permutation still holds row ids and
+every gather stays as it is; the NULL-key group is folded over the zero bits
+of the key's bitmap (words in parallel, only the zeros visited) instead of a
+trailing range; the WHERE mask kernel already took a bitmap per column and
+simply never gets a "null from" cut any more; the join's build side uses the
+column's own sort cache in every case (it used to fall back to a serial host
+compaction for keys with a bitmap). The CPU reference makes the same move, so
+the tests that compare Metal against it are the proof: 804 unit checks, the
+SQL suite, 897 wrapper checks, then the gate. Nothing above the backend
+interface knew about the block, and nothing above it changed.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

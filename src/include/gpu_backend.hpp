@@ -348,12 +348,12 @@ public:
     // ---- v0.7 milestone 3: NULL-aware columns (§4.1) ----
     // Number of NULL rows the column carries; rows() INCLUDES them. Columns
     // from upload_i64/upload_f64/upload_pair_interleaved never carry NULLs
-    // (0). For a pair from upload_pair_exact: on the KEY column it is the
-    // length of the NULL-key SUFFIX (rows [rows()-null_count(), rows()) have
-    // a NULL key; the prefix is every valid key, original order preserved);
-    // on the PAYLOAD column it is the number of NULL payloads, positions
-    // given by the backend's validity bitmap. The legacy resident ops refuse
-    // a column with null_count() > 0 (they have no NULL semantics).
+    // (0). Exact-path columns (upload_pair_exact / upload_rows_exact) keep
+    // their rows in input order; a NULL key or payload is a zero bit in the
+    // backend's validity bitmap for that column (docs/RESIDENT_COLUMNS_DESIGN.md,
+    // stage A — before it, NULL-key rows were moved to a trailing block). The
+    // legacy resident ops refuse a column with null_count() > 0 (they have no
+    // NULL semantics).
     [[nodiscard]] virtual std::size_t null_count() const noexcept { return 0; }
 };
 
@@ -526,10 +526,9 @@ public:
                                                          const GroupByFilter& filter = GroupByFilter{});
 
     // ---- v0.7 milestone 3: exact GROUP BY (docs/TRANSPARENT_DESIGN.md §4.1, §4.2) ----
-    // The pair upload that keeps NULLs. Rows whose KEY is NULL are
-    // partitioned to a suffix of both columns (valid-key prefix keeps the
-    // input order; the suffix is one group); rows whose PAYLOAD is NULL stay
-    // in place under a validity bitmap the backend owns. Both columns report
+    // The pair upload that keeps NULLs. Rows stay in input order in both
+    // columns; a NULL key and a NULL payload each sit under a validity bitmap
+    // the backend owns (the NULL keys form one group). Both columns report
     // rows() = every input row and null_count() as documented on
     // ResidentColumn. vdt must be I64 (DOUBLE sums are not on the exact
     // path, §4.7; a DOUBLE payload throws). Default throws — backends opt in
@@ -560,10 +559,11 @@ public:
     // is the key, lane 1 the payload, lanes 2.. the predicate columns. Every
     // lane is 8 bytes (int64, or the IEEE-754 bits of a double when its
     // dtype is F64). `valid` holds one bitmap pointer per lane (nullptr =
-    // every row valid; the array itself may be nullptr). Rows whose KEY is
-    // NULL are partitioned to a suffix of EVERY returned column, so the
-    // columns stay row-aligned and the predicate columns can be read by the
-    // key's sort permutation. Returned in lane order. Default throws.
+    // every row valid; the array itself may be nullptr). Every returned
+    // column keeps the input row order, so the columns stay row-aligned and
+    // the predicate columns can be read by the key's sort permutation; a NULL
+    // in any lane, the key included, is a zero bit in that column's bitmap.
+    // Returned in lane order. Default throws.
     struct RowSpan {
         const std::int64_t*        lanes = nullptr;   // n_lanes * rows values
         std::size_t                rows = 0;
