@@ -697,17 +697,25 @@ public:
     }
 
 private:
+    // A build error names the function and quotes the compiler; a nameless
+    // "Compilation failed" is not something a CI log can be read from.
     id<MTLComputePipelineState> make_pso(id<MTLLibrary> lib, NSString* name) {
         @autoreleasepool {
             id<MTLFunction> fn = [lib newFunctionWithName:name];
             if (!fn) {
-                std::ostringstream os; os << "no function " << [name UTF8String];
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (group by): no such function";
                 throw std::runtime_error(os.str());
             }
             NSError* err = nil;
             id<MTLComputePipelineState> pso =
                 [device_ newComputePipelineStateWithFunction:fn error:&err];
-            if (!pso) metal_throw("newComputePipelineState", err);
+            if (!pso) {
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (group by) would not build";
+                if (err) os << ": " << [[err localizedDescription] UTF8String];
+                throw std::runtime_error(os.str());
+            }
             return pso;
         }
     }

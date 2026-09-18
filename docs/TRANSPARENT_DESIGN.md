@@ -292,6 +292,37 @@ reduce (0 for sum, ±limits for min/max) and the per-group tuple becomes
 returns **NULL** for `sum`/`min`/`max`/`avg` and 0 for `count(v)`, as
 native does — `count_v = 0` selects NULL on output, never the identity.
 
+**Two algorithms, chosen inside the backend (2026-09-18).** Everything above
+reads the key's sort cache: mask the rows, find the run starts of the sorted
+keys, reduce each payload through the permutation. That is the right shape
+for a key with many distinct values and the wrong one for a key with few —
+at SF10 the run starts are a flat 2.9–3.1 ms whether the answer has four rows
+or a hundred thousand, and the reduce gathers 60M rows through a permutation
+to produce them. So a key whose distinct count is small enough gets a dense
+**group-id lane** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) beside its sort
+cache, and the exact operators run a **direct** pass instead: one pass over
+the rows in storage order, the whole `WHERE` evaluated per row by §4.12's
+`gpred_eval`, every payload folded into the accumulator of that row's group
+id. No mask buffer, no run starts, no permutation, no gather.
+
+Which of the two runs is decided inside the backend, and rule 1 applies there
+too: the direct pass reads the id lane on top of the payloads, so it needs
+`groups >= 3` and `rows × (payloads + WHERE terms) >= 6,000,000` before it is
+worth taking — measured, BENCHMARK.md. Below that, or with two groups (where
+the sort path's reduce over two runs is already a sequential scan), the sort
+path runs and nothing is lost.
+
+Nothing above the backend changes. The ids are the ranks of the ascending
+distinct keys and a NULL key takes the reserved last id, so the output order,
+the NULL-key group's place and the absence of a group the `WHERE` emptied are
+what they were; `GroupByFilter` (HAVING, top-k) runs on the host over the few
+group rows through `apply_group_filter_host`, the same reference the device
+filter is tested against; and the interface is untouched
+(`gpu_backend.hpp` is frozen for the CUDA port). Which algorithm ran is a word
+in `gpu_last_stats()` — `path=direct` or `path=sort` — and in
+`GPUDB_METAL_TRACE_EXACT`; `GPUDB_METAL_GROUPBY_EXACT_PATH=direct|sort|auto`
+pins it for tests and sweeps.
+
 ### 4.2 128-bit sums, native output types
 `sum(BIGINT)` in DuckDB is HUGEINT and never overflows. The device
 accumulates in two 64-bit limbs. On CUDA `nvcc` supports `__int128` in
@@ -1490,6 +1521,21 @@ the rewritten form for a declined one — so the answer follows the process's
 state. The user's own statement is never the experiment. In the gate a row
 that measures slower in the slow mode reads `declined after the first run
 (threshold)`: no ratio, and no statement ran slower for a user.
+
+**A faster kernel is not a looser threshold (2026-09-18).** The direct grouped
+reduce (§4.1, `docs/RESIDENT_COLUMNS_DESIGN.md` §7) makes a few-group exact
+GROUP BY 1.65× to 8.57× faster at SF10, which is the obvious moment to ask
+whether `min_groups` and the VARCHAR-key rules were set against a cost that no
+longer exists. The sweep says no, and the reason is worth keeping: these bounds
+are group counts, so they apply at every scale factor, and the scale factor
+they have to hold at is the small one. At SF1 a 7-group aggregate over 6M rows
+is 1.5–2.5 ms of native and about 2.5 ms of wrapper round trip; the reduce is
+not what it is bound by, and the gate with `--no-thresholds` measures those
+shapes at 0.80–0.94× with no WHERE and 0.52–0.55× under a 9% one, direct path
+and all (the first 56 rows of that sweep; it was stopped there, the machine
+being needed for the gate proper). A bound that admitted them would admit them at 0.5×. So the thresholds
+are unchanged and the win lands where the shapes are already admitted — the
+SF10 and SF50 end of the same rows.
 
 ### 9.2 Three-way parity
 `groupby_parity_check.sh` runs every scenario native

@@ -16,6 +16,7 @@
 //     IEEE-754 double precision in MSL.
 
 #include "gpu_backend.hpp"
+#include "exact_path_note.hpp"
 #include "../groupby_filter.hpp"
 #include "metal_kernel_sources.hpp"
 #include "metal_radix_sort.hpp"
@@ -28,6 +29,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -41,6 +43,23 @@ namespace {
 
 constexpr NSUInteger kBlock = 256;
 constexpr NSUInteger kMaxGrid = 4096;
+
+// ---- the direct, row-order grouped reduce (docs/RESIDENT_COLUMNS_DESIGN.md §7) ----
+// The direct kernel keeps its accumulators per thread, so their size is what
+// bounds the groups it can hold. One instantiation per bucket; the host picks
+// the smallest that fits n_groups * max(1, n_pays), and a key with more
+// distinct values than the largest gets no id lane at all.
+// Two shapes of accumulator, measured at SF10 (below): thread-private ones
+// are the fastest thing there is while they stay in a handful of slots and
+// fall off a cliff after that (4.6 ms at 2 groups x 1 payload, 106 ms at
+// 4 x 5), so they keep the smallest calls and a threadgroup slab of 32-bit
+// atomics takes the rest.
+constexpr std::size_t kDirCaps[2]    = {8, 32};   // thread-private accumulator buckets
+constexpr std::size_t kDirMaxGroups  = 65535;     // the id lane's 2-byte ceiling
+constexpr std::size_t kDirSlabBytes  = 30720;     // of the 32 KiB a threadgroup may hold
+constexpr std::size_t kDirMinGrid    = 64;        // threadgroups worth keeping replicas for
+constexpr std::uint32_t kDirMaxCopies = 256;      // == kBlock: one slab copy per thread
+constexpr std::size_t kDirPartialCap = 64u << 20; // bytes of per-threadgroup partials
 
 [[noreturn]] void metal_throw(const char* what, NSError* err) {
     std::ostringstream os;
@@ -79,6 +98,24 @@ inline unsigned width_for(std::int64_t mn, std::int64_t mx) {
     return 8;
 }
 
+// The GPU families a device reports, for the record: a CI log that says which
+// ones the runner has is what turns "Compilation failed" into a decision.
+std::string metal_families(id<MTLDevice> dev) {
+    struct F { MTLGPUFamily f; const char* name; };
+    static const F known[] = {
+        {MTLGPUFamilyApple9, "Apple9"}, {MTLGPUFamilyApple8, "Apple8"},
+        {MTLGPUFamilyApple7, "Apple7"}, {MTLGPUFamilyApple6, "Apple6"},
+        {MTLGPUFamilyApple5, "Apple5"}, {MTLGPUFamilyApple4, "Apple4"},
+        {MTLGPUFamilyApple3, "Apple3"}, {MTLGPUFamilyApple2, "Apple2"},
+        {MTLGPUFamilyApple1, "Apple1"}, {MTLGPUFamilyMac2, "Mac2"},
+        {MTLGPUFamilyCommon3, "Common3"}, {MTLGPUFamilyCommon2, "Common2"},
+        {MTLGPUFamilyCommon1, "Common1"}, {MTLGPUFamilyMetal3, "Metal3"}};
+    std::string out;
+    for (const F& k : known)
+        if ([dev supportsFamily:k.f]) { if (!out.empty()) out += " "; out += k.name; }
+    return out.empty() ? std::string("no known family") : out;
+}
+
 double cb_kernel_ms(id<MTLCommandBuffer> cb) {
     // GPUStart/EndTime are CFAbsoluteTime (seconds). Available after completion.
     const double s = [cb GPUStartTime];
@@ -98,6 +135,15 @@ struct SortCtx {
         if (!sorter) sorter = std::make_unique<metal_detail::MetalRadixSort>(device, queue);
         return *sorter;
     }
+    // ResidentColumn::prepare() runs during the wrapper's upload, where
+    // seconds are already being spent. The aggregator installs here what a
+    // query would otherwise pay for on its first call: the column's dense
+    // group-id lane, and the operator scratch sized and touched once (a
+    // freshly allocated shared buffer costs 0.31 ms per million rows the
+    // first time the GPU reads it). Cleared when the aggregator dies, so a
+    // column that outlives it simply prepares less.
+    std::mutex                              prep_mu;
+    std::function<void(const ResidentColumn&)> on_prepare;
 };
 
 class MetalAggregator final : public Aggregator {
@@ -117,6 +163,7 @@ public:
             MTLCompileOptions* opts = [MTLCompileOptions new];
             id<MTLLibrary> lib = [device_ newLibraryWithSource:src options:opts error:&err];
             if (!lib) metal_throw("compile sum.metal", err);
+            lib_ = lib;   // the direct GROUP BY's pipelines are built on first use
 
             ps_sum_i64_           = make_pso(lib, @"sum_i64");
             ps_sum_partials_i64_  = make_pso(lib, @"sum_partials_i64");
@@ -171,18 +218,31 @@ public:
                                                       options:MTLResourceStorageModeShared];
             out_quad_buf_      = [device_ newBufferWithLength:(4 * sizeof(std::int64_t))
                                                       options:MTLResourceStorageModeShared];
+
+            // The direct path's slab is dynamic threadgroup memory: take what
+            // the device says it has, not what an M-series has. On an M4 Max
+            // this is 32768 * 15/16 = 30720, the value it was hard-coded at.
+            const std::size_t tg = static_cast<std::size_t>([device_ maxThreadgroupMemoryLength]);
+            dir_slab_bytes_ = std::min<std::size_t>(kDirSlabBytes, tg - tg / 16);
+
+            // What a column's prepare() does beyond its sort cache.
+            sort_ctx_->on_prepare = [this](const ResidentColumn& c) { on_column_prepared(c); };
         }
     }
 
-    ~MetalAggregator() override = default;  // ARC
+    ~MetalAggregator() override {   // ARC frees the buffers
+        if (sort_ctx_) {
+            std::lock_guard<std::mutex> lock(sort_ctx_->prep_mu);
+            sort_ctx_->on_prepare = nullptr;   // columns may outlive this aggregator
+        }
+    }
 
     Backend backend() const noexcept override { return Backend::METAL; }
 
     std::string device_name() const override {
         @autoreleasepool {
-            NSString* name = [device_ name];
             std::ostringstream os;
-            os << [name UTF8String] << " (Metal)";
+            os << [[device_ name] UTF8String] << " (Metal, " << metal_families(device_) << ")";
             return os.str();
         }
     }
@@ -1012,7 +1072,14 @@ private:
         // Idempotent; concurrent calls serialize on cache_mu_ and the loser
         // is a no-op; a failure throws std::runtime_error and leaves the
         // column usable (the next caller retries the build).
-        void prepare() override { double ms = 0.0; build_sort_cache(&ms); }
+        void prepare() override {
+            double ms = 0.0;
+            build_sort_cache(&ms);
+            if (ctx_) {
+                std::lock_guard<std::mutex> lock(ctx_->prep_mu);
+                if (ctx_->on_prepare) ctx_->on_prepare(*this);
+            }
+        }
         bool prepared() const noexcept override {
             return sort_rows() == 0 || ready_.load(std::memory_order_acquire);
         }
@@ -1020,8 +1087,31 @@ private:
             const std::size_t base = rows_ * width_;                 // the real storage width
             const std::size_t bitmap = valid_ ? [valid_ length] : 0;
             const std::size_t cache = sort_rows() * (sort_width() + sizeof(std::uint32_t));
-            return base + bitmap + (ready_.load(std::memory_order_acquire) ? cache : 0);
+            std::size_t gid = 0;
+            if (gid_state_.load(std::memory_order_acquire) == 2) {
+                gid = rows_ * gid_width_ + gid_groups_ * sort_width();   // ids + the distinct keys
+            }
+            return base + bitmap + (ready_.load(std::memory_order_acquire) ? cache : 0) + gid;
         }
+
+        // ---- the dense group-id lane (docs/RESIDENT_COLUMNS_DESIGN.md §7) ----
+        // gid_[row] = the rank of the row's key among the distinct valid keys
+        // ascending; a NULL-key row takes gid_groups_, the reserved last
+        // group. dkeys_ holds the distinct keys at the column's sort width.
+        // State: 0 unknown, 1 refused (too many distinct values — never
+        // retried), 2 built. Guarded by gid_mu_, like the sort cache.
+        enum : int { kGidUnknown = 0, kGidNone = 1, kGidReady = 2 };
+        int gid_state() const noexcept { return gid_state_.load(std::memory_order_acquire); }
+        id<MTLBuffer> gid_buffer()  const noexcept { return gid_state() == kGidReady ? gid_ : nil; }
+        id<MTLBuffer> gid_keys()    const noexcept { return gid_state() == kGidReady ? dkeys_ : nil; }
+        unsigned      gid_width()   const noexcept { return gid_width_; }
+        std::size_t   gid_groups()  const noexcept { return gid_groups_; }   // distinct VALID keys
+        std::mutex&   gid_mutex()   const noexcept { return gid_mu_; }
+        void set_gid_lane(id<MTLBuffer> ids, id<MTLBuffer> keys, unsigned w, std::size_t groups) const {
+            gid_ = ids; dkeys_ = keys; gid_width_ = w; gid_groups_ = groups;
+            gid_state_.store(kGidReady, std::memory_order_release);
+        }
+        void set_gid_none() const { gid_state_.store(kGidNone, std::memory_order_release); }
 
         // Sorted copy (keys at the column's storage width, or the
         // order-preserving i64 image of f64 values with NaN canonicalised
@@ -1115,6 +1205,12 @@ private:
         id<MTLBuffer> valid_ = nil;               // validity bitmap (nil = no NULLs)
         std::size_t   nulls_ = 0;                 // NULL rows (bitmap zeros)
         unsigned      width_ = 8;                 // storage width in bytes (stage C)
+        mutable std::mutex       gid_mu_;         // guards the group-id lane build
+        mutable std::atomic<int> gid_state_{0};   // release after gid_/dkeys_ are set
+        mutable id<MTLBuffer>    gid_   = nil;
+        mutable id<MTLBuffer>    dkeys_ = nil;
+        mutable unsigned         gid_width_  = 1;
+        mutable std::size_t      gid_groups_ = 0;
     };
 
     enum class GbMode { SumI64, SumF64, Count };
@@ -1895,6 +1991,11 @@ private:
     static constexpr std::size_t kGaggLanes = 12;   // must match GAGG_MAX_LANES in sum.metal
     static constexpr std::size_t kGaggAcc   = 8;    // must match GAGG_MAX_ACC
 
+    // One WHERE term as gpred_eval reads it (GPred in sum.metal).
+    struct GaggPred { std::uint32_t lane, op, list_off, n_list; std::int64_t value; };
+    // The per-lane part that travels in a buffer (GLaneMeta in sum.metal).
+    struct GaggLaneMeta { std::uint32_t width, has_valid, is_f64, pad; };
+
     bool global_supported() const noexcept override { return true; }
     // stage C: every exact I64 lane is stored at the narrowest width its values fit
     bool narrow_lanes() const noexcept override { return true; }
@@ -1934,7 +2035,7 @@ private:
                 note_rows(c, "payload");
                 pay_slot[p] = static_cast<std::uint32_t>(slot_of(&c));
             }
-            struct GPredHost { std::uint32_t lane, op, list_off, n_list; std::int64_t value; };
+            using GPredHost = GaggPred;
             std::vector<GPredHost> prog(n_preds);
             std::vector<std::int64_t> lists;
             for (std::size_t q = 0; q < n_preds; ++q) {
@@ -1966,7 +2067,7 @@ private:
             if (n > 0xFFFFFFFFull - 64)
                 throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
 
-            struct GLaneMetaHost { std::uint32_t width, has_valid, is_f64, pad; };
+            using GLaneMetaHost = GaggLaneMeta;
             std::vector<GLaneMetaHost> meta(kGaggLanes, GLaneMetaHost{8u, 0u, 0u, 0u});
             for (std::size_t i = 0; i < lane.size(); ++i)
                 meta[i] = GLaneMetaHost{lane[i]->width(), lane[i]->valid_buffer() ? 1u : 0u,
@@ -2117,6 +2218,496 @@ private:
         return out;
     }
 
+    // =====================================================================
+    // v0.8 — the direct, row-order grouped reduce (few distinct keys)
+    //
+    // The sort path answers a GROUP BY by masking every row, finding the run
+    // starts of the key's sort cache and gathering each payload through the
+    // permutation. With four distinct keys that is 35 ms of apparatus for a
+    // four-row answer. The direct path reads a dense group id per row
+    // instead: ONE pass in storage order, the whole WHERE evaluated by
+    // gpred_eval, every payload folded into acc[gid] — no mask buffer, no
+    // run starts, no permutation, no gather.
+    //
+    // It is chosen inside the backend and changes no answer: the ids are the
+    // ranks of the distinct valid keys ascending and a NULL key takes the
+    // reserved last id, so the groups come out in the operator's order, with
+    // the NULL-key group last and a group the WHERE emptied absent. HAVING
+    // and top-k run on the host over the (few) group rows, with
+    // apply_group_filter_host — the same reference the device filter is
+    // tested against.
+    // =====================================================================
+    enum class ExactPath { Auto, Direct, Sort };
+
+    // The dense group-id lane of a key column. Derived from its sort cache:
+    // the run index of each sorted position (the block-offset + simd-prefix
+    // scan gb_run_starts_i64 does) scattered to row order through the
+    // permutation, with the run's key kept as that group's key. Built once
+    // under the column's own mutex and released with the column; a key with
+    // more distinct values than kDirMaxGroups is refused once and never
+    // retried.
+    bool ensure_gid_lane(const MetalResidentColumn& k, double* kernel_ms) {
+        {
+            const int st = k.gid_state();
+            if (st == MetalResidentColumn::kGidReady) return true;
+            if (st == MetalResidentColumn::kGidNone)  return false;
+        }
+        if (k.dtype() != Dtype::I64 || k.rows() == 0) { k.set_gid_none(); return false; }
+        if (k.rows() > 0xFFFFFFFFull - 64) { k.set_gid_none(); return false; }
+        // Before the sort cache and before a byte is allocated: can this
+        // device run the path at all? A lane built for a path that turns out
+        // to be unavailable is memory nothing will ever read.
+        if (!direct_ensure_ready()) return false;
+        id<MTLComputePipelineState> ids_ps = dir_ids_pso();
+        id<MTLComputePipelineState> fill_ps = dir_fill_pso();
+        if (!ids_ps || !fill_ps) return false;
+        std::lock_guard<std::mutex> lock(k.gid_mutex());
+        if (k.gid_state() != MetalResidentColumn::kGidUnknown)
+            return k.gid_state() == MetalResidentColumn::kGidReady;
+        // prepare() runs on the upload's thread, without the extension's
+        // device lock, so the build's own scratch is guarded here.
+        std::lock_guard<std::mutex> dlock(dir_mu_);
+        @autoreleasepool {
+            const std::size_t rows = k.rows(), n = k.sort_rows();
+            if (n > 0) k.build_sort_cache(kernel_ms);
+            id<MTLBuffer> sorted = k.sorted_cache(), perm = k.perm_cache();
+            if (n > 0 && (!sorted || !perm)) { k.set_gid_none(); return false; }
+            const std::uint32_t kw = static_cast<std::uint32_t>(k.sort_width());
+            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+            const std::uint32_t zero = 0;
+            const std::size_t nblocks = (n + kBlock - 1) / kBlock;
+
+            // how many distinct valid keys: the run-start count over the cache
+            std::size_t groups = 0;
+            if (n > 0) {
+                grow(gdir_blk_buf_, nblocks * sizeof(std::uint32_t), "group id block counts");
+                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps_gb_block_counts_];
+                [ce setBuffer:sorted offset:0 atIndex:0];
+                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce setBuffer:gdir_blk_buf_ offset:0 atIndex:2];
+                [ce setBytes:&kw   length:sizeof(kw)   atIndex:3];
+                [ce setBytes:&zero length:sizeof(zero) atIndex:4];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if (kernel_ms) *kernel_ms += cb_kernel_ms(cb);
+                auto* bc = static_cast<std::uint32_t*>([gdir_blk_buf_ contents]);
+                for (std::size_t b = 0; b < nblocks; ++b) {
+                    const std::uint32_t c = bc[b];
+                    bc[b] = static_cast<std::uint32_t>(groups);
+                    groups += c;
+                }
+            }
+            const bool has_null = k.null_count() > 0;
+            const std::size_t n_groups = groups + (has_null ? 1 : 0);
+            // The lane is only worth its bytes where a direct reduce would
+            // use it, so the dispatch limit is the build limit.
+            if (n_groups == 0 || n_groups > direct_max_groups_) { k.set_gid_none(); return false; }
+            // the largest id written: the NULL group's when there is one
+            const std::size_t max_id = has_null ? groups : (groups ? groups - 1 : 0);
+            const unsigned gw = max_id <= 255 ? 1u : 2u;
+
+            id<MTLBuffer> ids = [device_ newBufferWithLength:std::max<std::size_t>(1, rows * gw)
+                                                    options:MTLResourceStorageModeShared];
+            id<MTLBuffer> dkeys = [device_ newBufferWithLength:std::max<std::size_t>(1, groups * kw)
+                                                      options:MTLResourceStorageModeShared];
+            if (!ids || !dkeys) { k.set_gid_none(); return false; }
+
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            if (has_null) {
+                const std::uint32_t r32 = static_cast<std::uint32_t>(rows);
+                const std::uint32_t gw32 = gw, null_id = static_cast<std::uint32_t>(groups);
+                [ce setComputePipelineState:fill_ps];
+                [ce setBuffer:ids offset:0 atIndex:0];
+                [ce setBytes:&r32     length:sizeof(r32)     atIndex:1];
+                [ce setBytes:&gw32    length:sizeof(gw32)    atIndex:2];
+                [ce setBytes:&null_id length:sizeof(null_id) atIndex:3];
+                [ce dispatchThreadgroups:MTLSizeMake((rows + kBlock - 1) / kBlock, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            if (n > 0) {
+                const std::uint32_t gw32 = gw;
+                [ce setComputePipelineState:ids_ps];
+                [ce setBuffer:sorted offset:0 atIndex:0];
+                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce setBuffer:gdir_blk_buf_ offset:0 atIndex:2];
+                [ce setBuffer:perm   offset:0 atIndex:3];
+                [ce setBuffer:ids    offset:0 atIndex:4];
+                [ce setBuffer:dkeys  offset:0 atIndex:5];
+                [ce setBytes:&kw   length:sizeof(kw)   atIndex:6];
+                [ce setBytes:&gw32 length:sizeof(gw32) atIndex:7];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            }
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if (kernel_ms) *kernel_ms += cb_kernel_ms(cb);
+            if (trace_exact_)
+                std::fprintf(stderr, "[gpudb metal exact] group id lane: %zu groups, %u B/row, %.3f ms (rows=%zu)\n",
+                             n_groups, gw, cb_kernel_ms(cb), rows);
+            k.set_gid_lane(ids, dkeys, gw, groups);
+            return true;
+        }
+    }
+
+    // What the direct path needs to know before it commits to a call.
+    struct DirectPlan {
+        std::size_t n_groups = 0;      // distinct valid keys + the NULL group
+        std::size_t n_pays   = 0;
+        std::size_t bucket   = 0;      // index into kDirCaps (the thread kernel)
+        bool        slab     = false;  // threadgroup slab instead of thread-private
+        bool        want_mm  = false;  // a caller reads min / max
+        std::uint32_t ncopy  = 1;      // slab replicas (power of two, <= 32)
+        std::size_t tg_bytes = 0;
+        std::size_t ntg      = 1;      // threadgroups, sized to the row work
+        std::vector<const MetalResidentColumn*> lane;
+        std::vector<const MetalResidentColumn*> pay;      // payload columns, in output order
+        std::vector<std::uint32_t> pay_slot;
+        std::vector<GaggPred>      prog;
+        std::vector<std::int64_t>  lists;
+    };
+
+    // Can the direct path answer this call? Everything it refuses the sort
+    // path answers identically, so a refusal is never an error.
+    bool direct_plan(const MetalResidentColumn& k, const MetalResidentColumn* v,
+                     const MultiPayload* extras, std::size_t n_extras,
+                     const Predicate* preds, std::size_t n_preds,
+                     const GroupByFilter& filter,
+                     DirectPlan& pl, double* kernel_ms) {
+        if (exact_path_ == ExactPath::Sort || !direct_ensure_ready()) return false;
+        if (!ensure_gid_lane(k, kernel_ms)) return false;
+        const bool has_null = k.null_count() > 0;
+        pl.n_groups = k.gid_groups() + (has_null ? 1 : 0);
+        if (exact_path_ != ExactPath::Direct && pl.n_groups > direct_max_groups_) return false;
+
+        auto slot_of = [&](const MetalResidentColumn* c) -> long {
+            for (std::size_t i = 0; i < pl.lane.size(); ++i) if (pl.lane[i] == c) return static_cast<long>(i);
+            if (pl.lane.size() >= kGaggLanes) return -1;
+            pl.lane.push_back(c);
+            return static_cast<long>(pl.lane.size() - 1);
+        };
+        // min / max: wanted when a caller reads those columns, or when the
+        // filter ranks on them. The slab keeps them as 32-bit atomics, which
+        // is exact for a lane stored at 4 bytes or narrower; a wider lane
+        // with min / max asked for leaves this path.
+        const bool filter_mm = filter.active() && (filter.agg == GroupByFilter::Agg::Min ||
+                                                   filter.agg == GroupByFilter::Agg::Max);
+        bool wide_mm = false;
+        auto note_mm = [&](const MetalResidentColumn* c, std::uint32_t columns, bool is_filter_pay) {
+            if (!((columns & 0x30u) || (filter_mm && is_filter_pay))) return;
+            pl.want_mm = true;
+            if (c->width() > 4) wide_mm = true;
+        };
+        if (v) { pl.pay.push_back(v); note_mm(v, filter.columns, true); }
+        for (std::size_t e = 0; e < n_extras; ++e) {
+            const auto& c = check_i64_nullable(*extras[e].vals);
+            pl.pay.push_back(&c);
+            note_mm(&c, extras[e].columns, false);
+        }
+        pl.n_pays = pl.pay.size();
+        const std::size_t rows = k.rows();
+        // Rule 1, inside the backend. The direct pass reads the group-id lane
+        // on TOP of the payloads; what it saves is one gather per payload and
+        // one mask pass per WHERE term. Two measured bounds (BENCHMARK.md):
+        // below a few million rows x (payloads + terms) there is not enough
+        // saving to pay the id lane back, and with two groups there is none at
+        // all — the sort path's reduce over two runs is already a sequential
+        // scan, the best case it has. GPUDB_METAL_GROUPBY_EXACT_PATH=direct
+        // forces past both.
+        if (exact_path_ != ExactPath::Direct) {
+            if (pl.n_groups < direct_min_groups_) return false;
+            if (rows * (pl.n_pays + n_preds) < direct_min_work_) return false;
+        }
+        const std::size_t slots = pl.n_groups * std::max<std::size_t>(1, pl.n_pays);
+        // the threadgroup slab: one copy is n_groups * (6 per payload + 1) +
+        // min / max, replicated while the replicas fit
+        const std::size_t per_copy = pl.n_groups * pl.n_pays * 6 + pl.n_groups +
+                                     (pl.want_mm ? pl.n_groups * pl.n_pays * 2 : 0);
+        // Replicas are how contention is paid for, and only that: what the 256
+        // threads of a threadgroup share is `n_groups * replicas` words, so the
+        // replicas wanted are the ones that bring that up to one word a thread
+        // and NOT the most that fit. Asking for the most is what starved TPC-H
+        // Q22 (25 groups, 1.5M rows): 32 replicas made a 22 KiB slab, one
+        // threadgroup a core, and 83 threadgroups for the whole query.
+        std::uint32_t ncopy = 0;
+        {
+            std::uint32_t want = 1;
+            while (want < kDirMaxCopies && want * pl.n_groups < kBlock) want <<= 1;
+            for (std::uint32_t r = want; r >= 1; r >>= 1)
+                if (r * per_copy * sizeof(std::uint32_t) <= dir_slab_bytes_) { ncopy = r; break; }
+        }
+        const bool slab_ok = !wide_mm && ncopy > 0;
+        std::size_t b = 0;
+        while (b < 2 && kDirCaps[b] < slots) ++b;
+        const bool thread_ok = b < 2;
+        // The thread kernel keeps the smallest calls (measured); the slab
+        // takes everything else it can express.
+        if (thread_ok && (!slab_ok || slots <= direct_thread_slots_ ||
+                          direct_kernel_ == DirectKernel::Thread)) {
+            pl.slab = false; pl.bucket = b;
+            pl.ntg = dir_grid(rows, pl.n_groups, pl.n_pays,
+                              8 * pl.n_groups * (1 + 5 * pl.n_pays), nullptr);
+        } else if (slab_ok && direct_kernel_ != DirectKernel::Thread) {
+            // Threadgroups and replicas together. A replica costs every
+            // threadgroup two passes over it — the init and the fold — whatever
+            // the rows, so with few rows both have to come down or the fixed
+            // cost IS the call. Bound it at an eighth of the row work, and take
+            // replicas away until enough threadgroups are left to fill the
+            // device.
+            while (true) {
+                pl.ntg = dir_grid(rows, pl.n_groups, pl.n_pays,
+                                  2 * static_cast<std::size_t>(ncopy) * per_copy, nullptr);
+                if (pl.ntg >= kDirMinGrid || ncopy == 1) break;
+                ncopy >>= 1;
+            }
+            pl.slab = true; pl.ncopy = ncopy;
+            pl.tg_bytes = ncopy * per_copy * sizeof(std::uint32_t);
+        } else {
+            return false;
+        }
+
+        pl.pay_slot.resize(pl.n_pays);
+        for (std::size_t p = 0; p < pl.n_pays; ++p) {
+            const long s = slot_of(pl.pay[p]);
+            if (s < 0) return false;
+            pl.pay_slot[p] = static_cast<std::uint32_t>(s);
+        }
+        // The slab and the merge are in the required set, so they exist by now;
+        // the thread-private kernel is optional and may not, in which case
+        // this call takes the sort path like any other it cannot express.
+        if (!pl.slab && !dir_pso(pl.bucket)) return false;
+        pl.prog.resize(n_preds);
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
+            const long s = slot_of(&c);
+            if (s < 0) return false;
+            pl.prog[q].lane = static_cast<std::uint32_t>(s);
+            pl.prog[q].op = pred_op_code(preds[q].op);
+            pl.prog[q].value = preds[q].value;
+            pl.prog[q].list_off = static_cast<std::uint32_t>(pl.lists.size());
+            pl.prog[q].n_list = 0;
+            if (preds[q].op == Predicate::Op::In) {
+                pl.prog[q].n_list = static_cast<std::uint32_t>(preds[q].n_list);
+                pl.lists.insert(pl.lists.end(), preds[q].list, preds[q].list + preds[q].n_list);
+            }
+        }
+        return true;
+    }
+
+    // Threadgroups for the direct pass. Enough to saturate the device, few
+    // enough that the per-(threadgroup, group) partials stay bounded AND that
+    // what a threadgroup pays before and after its rows — `fixed` words of
+    // accumulator to clear and fold — stays under an eighth of the row work it
+    // does. Each row costs about one atomic per payload plus count(*), so the
+    // row work is rows * (1 + 4 * payloads).
+    std::size_t dir_grid(std::size_t rows, std::size_t n_groups, std::size_t n_pays,
+                         std::size_t fixed, std::size_t* by_work_out) const {
+        const std::size_t stride = 1 + 5 * n_pays;
+        const std::size_t per_block = n_groups * stride * sizeof(std::int64_t);
+        const std::size_t by_mem = std::max<std::size_t>(1, kDirPartialCap /
+                                                            std::max<std::size_t>(1, per_block));
+        const std::size_t row_work = rows * (1 + 4 * n_pays);
+        const std::size_t by_work = row_work / std::max<std::size_t>(1, 8 * fixed);
+        if (by_work_out) *by_work_out = by_work;
+        std::size_t g = std::min<std::size_t>({static_cast<std::size_t>(pick_grid(rows)), by_mem,
+                                               std::max<std::size_t>(1, by_work)});
+        return std::max<std::size_t>(1, g);
+    }
+
+    GroupByResidentResult direct_impl(const MetalResidentColumn& k, const MetalResidentColumn* v,
+                                      std::size_t n_preds,
+                                      std::size_t max_groups, const GroupByFilter& filter,
+                                      const char* op, const DirectPlan& pl,
+                                      const MultiPayload* extras, std::size_t n_extras,
+                                      std::vector<GroupByResidentResult>* extra_out,
+                                      std::chrono::steady_clock::time_point t_wall0,
+                                      double kernel_ms) {
+        @autoreleasepool {
+            const std::size_t n = k.rows();
+            const std::size_t n_groups = pl.n_groups, n_pays = pl.n_pays;
+            const std::size_t stride = 1 + 5 * n_pays;
+
+            std::vector<GaggLaneMeta> meta(kGaggLanes, GaggLaneMeta{8u, 0u, 0u, 0u});
+            for (std::size_t i = 0; i < pl.lane.size(); ++i)
+                meta[i] = GaggLaneMeta{pl.lane[i]->width(), pl.lane[i]->valid_buffer() ? 1u : 0u,
+                                       pl.lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+            if (!gbx_dummy_valid_)
+                gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+            const NSUInteger ntg = static_cast<NSUInteger>(pl.ntg);
+            grow(gdir_out_, static_cast<std::size_t>(ntg) * n_groups * stride * sizeof(std::int64_t),
+                 "direct group by partials");
+            grow(gdir_res_, n_groups * stride * sizeof(std::int64_t), "direct group by totals");
+            // The lane table, the WHERE program, its IN lists and the payload
+            // slots are a few hundred bytes that used to be four fresh
+            // MTLBuffers per call. On a call whose kernel is under a
+            // millisecond that allocation is the call, so the buffers are the
+            // operator's and only their contents change.
+            auto upload_small = [&](__strong id<MTLBuffer>& b, const void* src, std::size_t bytes,
+                                    const char* what) -> id<MTLBuffer> {
+                if (bytes == 0) return gbx_dummy_valid_;
+                id<MTLBuffer> got = grow(b, bytes, what);
+                std::memcpy([got contents], src, bytes);
+                return got;
+            };
+            id<MTLBuffer> meta_b = upload_small(gdir_meta_, meta.data(),
+                                                meta.size() * sizeof(GaggLaneMeta), "direct lane table");
+            id<MTLBuffer> prog_b = upload_small(gdir_prog_, pl.prog.data(),
+                                                pl.prog.size() * sizeof(GaggPred), "direct where program");
+            id<MTLBuffer> list_b = upload_small(gdir_list_, pl.lists.data(),
+                                                pl.lists.size() * sizeof(std::int64_t), "direct IN lists");
+            id<MTLBuffer> pay_b  = upload_small(gdir_pay_, pl.pay_slot.data(),
+                                                pl.pay_slot.size() * sizeof(std::uint32_t), "direct payload slots");
+            if (!meta_b || !prog_b || !list_b || !pay_b)
+                throw std::runtime_error(std::string(op) + ": device allocation failed (Metal)");
+
+            struct { std::uint32_t n, n_preds, n_pays, n_groups, gw, ncopy, minmax, pad; } u{
+                static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(n_preds),
+                static_cast<std::uint32_t>(n_pays), static_cast<std::uint32_t>(n_groups),
+                k.gid_width(), pl.ncopy, pl.want_mm ? 1u : 0u, 0u};
+            struct { std::uint32_t ntg, n_groups, n_pays, pad; } mu{
+                static_cast<std::uint32_t>(ntg), static_cast<std::uint32_t>(n_groups),
+                static_cast<std::uint32_t>(n_pays), 0u};
+
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            id<MTLComputePipelineState> main_ps = pl.slab ? dir_slab_pso() : dir_pso(pl.bucket);
+            id<MTLComputePipelineState> merge_ps = dir_merge_pso();
+            if (!main_ps || !merge_ps)
+                throw std::runtime_error(std::string(op) + ": direct pipeline vanished");
+            [ce setComputePipelineState:main_ps];
+            if (pl.slab) [ce setThreadgroupMemoryLength:pl.tg_bytes atIndex:0];
+            for (std::size_t i = 0; i < kGaggLanes; ++i) {
+                const bool have = i < pl.lane.size();
+                [ce setBuffer:(have ? pl.lane[i]->buffer() : gbx_dummy_valid_) offset:0 atIndex:2 * i];
+                id<MTLBuffer> vb = (have && pl.lane[i]->valid_buffer()) ? pl.lane[i]->valid_buffer() : gbx_dummy_valid_;
+                [ce setBuffer:vb offset:0 atIndex:2 * i + 1];
+            }
+            [ce setBuffer:meta_b offset:0 atIndex:24];
+            [ce setBuffer:prog_b offset:0 atIndex:25];
+            [ce setBuffer:list_b offset:0 atIndex:26];
+            [ce setBuffer:pay_b  offset:0 atIndex:27];
+            [ce setBytes:&u length:sizeof(u) atIndex:28];
+            [ce setBuffer:gdir_out_ offset:0 atIndex:29];
+            [ce setBuffer:k.gid_buffer() offset:0 atIndex:30];
+            [ce dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            {
+                const std::size_t threads = n_groups * (1 + n_pays);
+                [ce setComputePipelineState:merge_ps];
+                [ce setBuffer:gdir_out_ offset:0 atIndex:0];
+                [ce setBytes:&mu length:sizeof(mu) atIndex:1];
+                [ce setBuffer:gdir_res_ offset:0 atIndex:2];
+                [ce dispatchThreadgroups:MTLSizeMake((threads + kBlock - 1) / kBlock, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            }
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            kernel_ms += cb_kernel_ms(cb);
+            if (trace_exact_) {
+                const std::string shape = pl.slab ? "copies=" + std::to_string(pl.ncopy)
+                                                  : "cap=" + std::to_string(kDirCaps[pl.bucket]);
+                std::fprintf(stderr, "[gpudb metal exact] direct reduce (%s): %.3f ms (rows=%zu groups=%zu "
+                                     "preds=%zu pays=%zu %s tg=%lu)\n",
+                             pl.slab ? "slab" : "thread", cb_kernel_ms(cb), n, n_groups, n_preds, n_pays,
+                             shape.c_str(), (unsigned long)ntg);
+            }
+
+            // ---- the group rows, in the operator's order ----
+            const auto* res = static_cast<const std::int64_t*>([gdir_res_ contents]);
+            const void* dk = [k.gid_keys() contents];
+            const unsigned kw = k.sort_width();
+            const std::size_t n_valid = k.gid_groups();
+            GroupByResidentResult r{};
+            r.rows_in = n;
+            std::vector<std::vector<std::int64_t>> ex(n_extras * 5);   // lo hi cnt mn mx per extra
+            const std::size_t prim = v ? 0 : std::size_t(-1);
+            // The slab computes min / max only when a caller reads them; the
+            // thread kernel always does. Where nothing computed them the
+            // column is 0, which is what a payload-less group reports too.
+            const bool mm = !pl.slab || pl.want_mm;
+            for (std::size_t g = 0; g < n_groups; ++g) {
+                const std::int64_t cstar = res[g * stride];
+                if (cstar == 0) continue;                     // the WHERE emptied this group
+                r.keys.push_back(g < n_valid ? load_w(dk, kw, g) : 0);
+                r.key_null.push_back(g < n_valid ? 0 : 1);
+                r.counts_star.push_back(cstar);
+                if (prim == std::size_t(-1)) {                 // count(*) only: the sort path's tuple
+                    r.sums.push_back(0); r.sums_hi.push_back(0); r.counts.push_back(cstar);
+                    r.mins.push_back(0); r.maxs.push_back(0);
+                } else {
+                    const std::int64_t* t = res + g * stride + 1;
+                    r.sums.push_back(t[0]); r.sums_hi.push_back(t[1]); r.counts.push_back(t[2]);
+                    r.mins.push_back(mm && t[2] ? t[3] : 0); r.maxs.push_back(mm && t[2] ? t[4] : 0);
+                }
+                for (std::size_t e = 0; e < n_extras; ++e) {
+                    const std::int64_t* t = res + g * stride + 1 + 5 * ((v ? 1 : 0) + e);
+                    ex[e * 5 + 0].push_back(t[0]); ex[e * 5 + 1].push_back(t[1]);
+                    ex[e * 5 + 2].push_back(t[2]);
+                    ex[e * 5 + 3].push_back(mm && t[2] ? t[3] : 0);
+                    ex[e * 5 + 4].push_back(mm && t[2] ? t[4] : 0);
+                }
+            }
+
+            // ---- HAVING / top-k, on the host over the group rows ----
+            const std::vector<std::int64_t> pre_keys = r.keys;
+            const std::size_t pre_rows = pre_keys.size();
+            const bool null_last = !r.key_null.empty() && r.key_null.back() == 1;
+            if (filter.active()) {
+                apply_group_filter_host(r, filter, FilterAgg::Exact, max_groups, op);
+            } else {
+                r.groups_total = r.keys.size();
+                cap_rows(r.keys.size(), max_groups, op);
+            }
+            if (n_extras && extra_out) {
+                // Row-align the other payloads with the result: positionally
+                // when no filter ran, by key when one reordered or dropped
+                // rows (the pre-filter keys are ascending, NULL key last).
+                std::vector<std::size_t> at(r.keys.size());
+                const std::size_t n_named = pre_rows - (null_last ? 1 : 0);
+                for (std::size_t i = 0; i < r.keys.size(); ++i) {
+                    if (!filter.active()) { at[i] = i; continue; }
+                    if (!r.key_null.empty() && r.key_null[i]) { at[i] = pre_rows - 1; continue; }
+                    const auto it = std::lower_bound(pre_keys.begin(), pre_keys.begin() + n_named, r.keys[i]);
+                    if (it == pre_keys.begin() + n_named || *it != r.keys[i])
+                        throw std::runtime_error(std::string(op) + ": a surviving group is missing from the tuple");
+                    at[i] = static_cast<std::size_t>(it - pre_keys.begin());
+                }
+                for (std::size_t e = 0; e < n_extras; ++e) {
+                    GroupByResidentResult& g = (*extra_out)[e];
+                    const std::uint32_t c = extras[e].columns;
+                    auto pull = [&](std::size_t slot, std::vector<std::int64_t>& dst) {
+                        const auto& src = ex[e * 5 + slot];
+                        dst.resize(at.size());
+                        for (std::size_t i = 0; i < at.size(); ++i) dst[i] = src[at[i]];
+                    };
+                    if (c & (1u << 1)) { pull(0, g.sums); pull(1, g.sums_hi); }
+                    if (c & (1u << 2)) pull(2, g.counts);
+                    if (c & (1u << 4)) pull(3, g.mins);
+                    if (c & (1u << 5)) pull(4, g.maxs);
+                }
+            }
+            if (!filter.wants(0)) { r.keys.clear(); r.key_null.clear(); }
+            if (!filter.wants(1)) { r.sums.clear(); r.sums_hi.clear(); }
+            if (!filter.wants(2)) r.counts.clear();
+            if (!filter.wants(3)) r.counts_star.clear();
+            if (!filter.wants(4)) r.mins.clear();
+            if (!filter.wants(5)) r.maxs.clear();
+            r.kernel_ms   = kernel_ms;
+            r.transfer_ms = 0.0;
+            r.wall_ms     = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_wall0).count();
+            return r;
+        }
+    }
+
     // `extras` (§4.9): further payload columns reduced over the SAME mask,
     // selection and run starts as `vals` — only Stage B repeats per payload.
     // Their tuples come back in `extra_out`, row-aligned with the returned
@@ -2160,6 +2751,25 @@ private:
                 if (preds[p].col->rows() != n_total)
                     throw std::runtime_error(std::string(op) + ": predicate column row count differs from the keys");
             }
+
+            // ---- the direct path: one row-order pass over a group-id lane ----
+            // Chosen here, inside the backend. It answers exactly what the
+            // sort path below answers; what it cannot express it declines.
+            {
+                DirectPlan pl;
+                double dir_ms = 0.0;
+                if (direct_plan(k, v, extras, n_extras, preds, n_preds, filter, pl, &dir_ms)) {
+                    if (n_extras && filter.active() && !filter.wants(0))
+                        throw std::runtime_error(std::string(op) + ": several payloads under a filter need the keys");
+                    exact_path_note() = "direct";
+                    exact_path_reason().clear();
+                    return direct_impl(k, v, n_preds, max_groups, filter, op, pl,
+                                       extras, n_extras, extra_out, t_wall0, dir_ms);
+                }
+            }
+            exact_path_note() = "sort";
+            exact_path_reason() = direct_available() ? std::string() : direct_reason();
+            adopt_warm_scratch();
 
             const std::size_t n = k.sort_rows();          // valid keys (the sort cache covers them)
             double kernel_ms = 0.0;
@@ -2559,8 +3169,11 @@ private:
                 static_cast<std::int64_t*>([b[1] contents])[num_segs] = ns.hi;
                 static_cast<std::int64_t*>([b[2] contents])[num_segs] = ncnt;
                 static_cast<std::int64_t*>([b[3] contents])[num_segs] = ncstar;
-                static_cast<std::int64_t*>([b[4] contents])[num_segs] = ncnt ? nmn : 0;
-                static_cast<std::int64_t*>([b[5] contents])[num_segs] = ncnt ? nmx : 0;
+                // With no payload there is nothing to take a min of: 0, as
+                // gbx_finalize_i64 writes for every other group (ncnt is
+                // count(*) there, so it cannot select the fold's identity).
+                static_cast<std::int64_t*>([b[4] contents])[num_segs] = (v && ncnt) ? nmn : 0;
+                static_cast<std::int64_t*>([b[5] contents])[num_segs] = (v && ncnt) ? nmx : 0;
                 static_cast<std::int64_t*>([b[6] contents])[num_segs] = 0;
             }
 
@@ -2999,17 +3612,286 @@ private:
         return static_cast<const MetalResidentColumn&>(c);
     }
 
+    // ---- the direct path's pipelines, built on first use ----
+    // Two instantiations of one kernel body plus the slab variant and three
+    // small helpers, ~20 ms of pipeline build each: a process that never
+    // groups by a few-valued key should not pay for them at startup.
+    //
+    // A pipeline that will not build is NOT an error. Some GPUs — the
+    // virtualised Apple device on a hosted macOS runner is the one that found
+    // this — compile the library and then refuse to lower one of these
+    // functions. When that happens the direct path is marked unavailable for
+    // the aggregator's lifetime, with the compiler's own text kept, and every
+    // exact call answers through the sort path. Nothing here throws.
+    // Why no group-id lane can outlive the decision: direct_unavailable_locked
+    // is reachable only from a REQUIRED build, every required build happens
+    // inside direct_ensure_ready(), and every caller that could leave a lane
+    // or a touched buffer behind — ensure_gid_lane, touch_scratch,
+    // direct_plan — calls it before it allocates anything. Once dir_probed_ is
+    // set no required build runs again, so direct_ok_ cannot flip after a lane
+    // exists and there is nothing to release.
+    bool direct_available() const { return direct_ok_.load(std::memory_order_acquire); }
+    std::string direct_reason() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return direct_why_;
+    }
+    // Records the first refusal, asks the rest of the path's functions whether
+    // they would build too, and disables the path. One CI run then names every
+    // function this GPU rejects instead of only the first one asked for.
+    // Called with dir_pso_mu_ held.
+    void direct_unavailable_locked(NSString* name, NSError* err) {
+        if (!direct_why_.empty()) return;
+        std::ostringstream os;
+        os << "pipeline " << [name UTF8String] << " would not build";
+        if (err) os << ": " << [[err localizedDescription] UTF8String];
+        direct_ok_.store(false, std::memory_order_release);
+        @autoreleasepool {
+            NSString* all[6] = {@"gdir_ids_i64", @"gdir_fill_ids", @"gdir_merge_i64",
+                                @"gdir_slab_i64", @"gdir_masked_8_i64", @"gdir_masked_32_i64"};
+            std::string good, bad;
+            for (NSString* n : all) {
+                if ([n isEqualToString:name]) continue;
+                bool ok = false;
+                metal_direct_pipeline_requests().fetch_add(1, std::memory_order_relaxed);
+                if (id<MTLFunction> f = [lib_ newFunctionWithName:dir_probe_name(n)]) {
+                    NSError* e = nil;
+                    ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
+                }
+                if (ok && dir_refuses(n)) ok = false;
+                std::string& into = ok ? good : bad;
+                if (!into.empty()) into.append(", ");
+                into.append([n UTF8String]);
+            }
+            if (!bad.empty())  os << "; also refused: " << bad;
+            if (!good.empty()) os << "; would build: " << good;
+        }
+        direct_why_ = os.str();
+        // Once per process: CI does not set the trace variable, and a red run
+        // that says only "Compilation failed" is what sent us looking.
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] exact GROUP BY direct path unavailable: %s\n",
+                         direct_why_.c_str());
+    }
+    // nil on refusal, never a throw. A REQUIRED pipeline's refusal disables the
+    // path; an optional one's does not — the thread-private kernel is only the
+    // fallback for a min / max the slab cannot hold exactly, and a device
+    // without it still runs every other shape.
+    id<MTLComputePipelineState> dir_make_locked(__strong id<MTLComputePipelineState>& slot, NSString* name,
+                                                bool required = true) {
+        if (slot) return slot;
+        if (!direct_ok_.load(std::memory_order_relaxed)) return nil;
+        @autoreleasepool {
+            // Metal is always asked, so the failure handling below is the same
+            // code a real refusal runs; the knob discards the answer rather
+            // than short-circuiting ahead of it.
+            NSError* err = nil;
+            id<MTLComputePipelineState> pso = nil;
+            metal_direct_pipeline_requests().fetch_add(1, std::memory_order_relaxed);
+            id<MTLFunction> fn = [lib_ newFunctionWithName:dir_probe_name(name)];
+            if (!fn) {
+                err = [NSError errorWithDomain:@"gpudb" code:2
+                                      userInfo:@{NSLocalizedDescriptionKey: @"no such function"}];
+            } else {
+                pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
+            }
+            if (pso && dir_refuses(name)) {               // GPUDB_METAL_DIRECT_DISABLE_PSO
+                pso = nil;
+                err = [NSError errorWithDomain:@"gpudb" code:3
+                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                 @"refused by GPUDB_METAL_DIRECT_DISABLE_PSO"}];
+            }
+            if (!pso) { if (required) direct_unavailable_locked(name, err); return nil; }
+            if ([pso maxTotalThreadsPerThreadgroup] < kBlock) {
+                // the tree reductions are written for a full threadgroup
+                std::ostringstream os;
+                os << "threadgroup of " << (unsigned long)[pso maxTotalThreadsPerThreadgroup]
+                   << " threads, below the " << (unsigned long)kBlock << " the reduce needs";
+                NSError* e2 = [NSError errorWithDomain:@"gpudb"
+                                                  code:1
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                         [NSString stringWithUTF8String:os.str().c_str()]}];
+                if (required) direct_unavailable_locked(name, e2);
+                return nil;
+            }
+            slot = pso;
+            return slot;
+        }
+    }
+    // Availability is decided ONCE, before anything the path would leave behind
+    // exists. The four pipelines below are what it needs to run at all:
+    // without the slab there is no general reduce, and a device that cannot
+    // build it must not pay for group-id lanes it will never read. The
+    // thread-private kernels are NOT required — the runner that found this
+    // builds them while refusing the slab, and they only serve a min / max
+    // over a payload lane wider than 4 bytes, a shape that measured no better
+    // than the sort path on any device we have. So: no slab, no direct path.
+    // Asked BEFORE any direct pipeline is requested, because on the virtualised
+    // Apple device of a hosted macOS runner ONE refused build leaves that
+    // process's compiler unusable: after `gdir_slab_i64` was refused on
+    // macos-15-arm64 ("Apple Paravirtual device"), `sum_i64`,
+    // `hashjoin_merge_sorted_i64` and `bitonic_step_i64` all failed in the
+    // same process, having built moments before. A fallback after the fact
+    // cannot repair that, so such a device is never offered the kernel at all.
+    // Empty means the path may be tried; anything else is the reason it may not.
+    std::string direct_capability_refusal() const {
+        if (dir_disable_pso_ == "unsupported")
+            return "GPUDB_METAL_DIRECT_DISABLE_PSO=unsupported";
+        @autoreleasepool {
+            NSString* nm = [device_ name];
+            if (nm && [nm rangeOfString:@"Paravirtual"].location != NSNotFound)
+                return std::string("device \"") + [nm UTF8String] + "\" is a virtualised Apple GPU, "
+                       "where one refused pipeline build makes every later build in the process fail";
+            if (![device_ supportsFamily:MTLGPUFamilyApple7])
+                return std::string("device \"") + [nm UTF8String] + "\" (" +
+                       metal_families(device_) + ") is below MTLGPUFamilyApple7, the families the "
+                       "slab reduce's threadgroup atomics were measured on";
+        }
+        return {};
+    }
+    // Disables the path without asking Metal for anything at all.
+    void direct_deny_locked(const std::string& why) {
+        if (!direct_why_.empty()) return;
+        direct_why_ = "not offered to this device: " + why;
+        direct_ok_.store(false, std::memory_order_release);
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] exact GROUP BY direct path %s\n", direct_why_.c_str());
+    }
+
+    bool direct_ensure_ready() {
+        if (!direct_ok_.load(std::memory_order_acquire)) return false;
+        if (dir_probed_.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        if (dir_probed_.load(std::memory_order_relaxed))
+            return direct_ok_.load(std::memory_order_relaxed);
+        if (const std::string why = direct_capability_refusal(); !why.empty()) {
+            direct_deny_locked(why);                 // nothing is compiled, nothing is probed
+            dir_probed_.store(true, std::memory_order_release);
+            return false;
+        }
+        const bool ok = dir_make_locked(ps_gdir_ids_,   @"gdir_ids_i64")   != nil
+                     && dir_make_locked(ps_gdir_fill_,  @"gdir_fill_ids")  != nil
+                     && dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64") != nil
+                     && dir_make_locked(ps_gdir_slab_,  @"gdir_slab_i64")  != nil;
+        dir_probed_.store(true, std::memory_order_release);
+        return ok;
+    }
+    id<MTLComputePipelineState> dir_pso(std::size_t b) {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        NSString* names[2] = {@"gdir_masked_8_i64", @"gdir_masked_32_i64"};
+        return dir_make_locked(ps_gdir_[b], names[b], /*required*/false);
+    }
+    id<MTLComputePipelineState> dir_slab_pso() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return dir_make_locked(ps_gdir_slab_, @"gdir_slab_i64");
+    }
+    id<MTLComputePipelineState> dir_ids_pso() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return dir_make_locked(ps_gdir_ids_, @"gdir_ids_i64");
+    }
+    id<MTLComputePipelineState> dir_fill_pso() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return dir_make_locked(ps_gdir_fill_, @"gdir_fill_ids");
+    }
+    id<MTLComputePipelineState> dir_merge_pso() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64");
+    }
+
+    // A freshly allocated shared buffer costs the GPU 0.31 ms per million
+    // rows the first time it reads or writes it — once per buffer, at that
+    // size. Paid here, where prepare() already spends the upload's time,
+    // rather than in the first query. gdir_fill_ids at width 1 writes a zero
+    // byte per element, which is the touch.
+    void touch_scratch(id<MTLBuffer> b, std::size_t bytes) {
+        if (!b || bytes == 0) return;
+        if (!direct_ensure_ready()) return;      // the path is unavailable; nothing to warm
+        id<MTLComputePipelineState> fill = dir_fill_pso();
+        if (!fill) return;
+        @autoreleasepool {
+            const std::uint32_t n32 = static_cast<std::uint32_t>(std::min<std::size_t>(bytes, 0xFFFFFFFFull));
+            const std::uint32_t one = 1, zero = 0;
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:fill];
+            [ce setBuffer:b offset:0 atIndex:0];
+            [ce setBytes:&n32  length:sizeof(n32)  atIndex:1];
+            [ce setBytes:&one  length:sizeof(one)  atIndex:2];
+            [ce setBytes:&zero length:sizeof(zero) atIndex:3];
+            [ce dispatchThreadgroups:MTLSizeMake((n32 + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+        }
+    }
+
+    // What a key column's prepare() does beyond its sort cache (§5.5: it runs
+    // inside the wrapper's upload, where seconds are already being spent).
+    // The group-id lane if the key has few enough distinct values, and
+    // otherwise the sort path's two row-sized scratch buffers, allocated and
+    // touched here and adopted by the next query — prepare() holds no device
+    // lock, so it never writes a buffer a running query may be reading.
+    void on_column_prepared(const ResidentColumn& col) {
+        if (!prewarm_) return;
+        if (col.backend_tag() != Backend::METAL || col.dtype() != Dtype::I64) return;
+        const auto& k = static_cast<const MetalResidentColumn&>(col);
+        const std::size_t n = k.rows();
+        if (n == 0 || n > 0xFFFFFFFFull - 64) return;
+        try {
+            double ms = 0.0;
+            if (exact_path_ != ExactPath::Sort && ensure_gid_lane(k, &ms) &&
+                (exact_path_ == ExactPath::Direct ||
+                 k.gid_groups() + (k.null_count() ? 1u : 0u) <= direct_max_groups_))
+                return;                      // the direct path reads no row-sized scratch
+            id<MTLBuffer> mask = [device_ newBufferWithLength:n options:MTLResourceStorageModeShared];
+            id<MTLBuffer> mult = [device_ newBufferWithLength:n * sizeof(std::uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+            touch_scratch(mask, n);
+            touch_scratch(mult, n * sizeof(std::uint32_t));
+            std::lock_guard<std::mutex> lock(dir_mu_);
+            if (mask && (!warm_mask_ || [warm_mask_ length] < [mask length])) warm_mask_ = mask;
+            if (mult && (!warm_mult_ || [warm_mult_ length] < [mult length])) warm_mult_ = mult;
+        } catch (const std::exception&) {
+            // preparing is an optimisation; a failure here is not the query's
+        }
+    }
+    // Take over what prepare() warmed, if it is at least as large as what is
+    // already installed. Runs on the query's thread, which holds the device
+    // lock, so nothing else is looking at the scratch slots.
+    void adopt_warm_scratch() {
+        std::lock_guard<std::mutex> lock(dir_mu_);
+        if (warm_mask_ && (!gbx_mask_buf_ || [gbx_mask_buf_ length] < [warm_mask_ length])) {
+            gbx_mask_buf_ = warm_mask_; warm_mask_ = nil;
+        }
+        if (warm_mult_ && (!mult_buf_ || [mult_buf_ length] < [warm_mult_ length])) {
+            mult_buf_ = warm_mult_; warm_mult_ = nil;
+        }
+    }
+
+    // Every pipeline this backend builds names itself and quotes the compiler
+    // when it fails. A CI log that says only "Compilation failed" cost two
+    // round trips to narrow down; it must not be possible any more.
     id<MTLComputePipelineState> make_pso(id<MTLLibrary> lib, NSString* name) {
         @autoreleasepool {
             id<MTLFunction> fn = [lib newFunctionWithName:name];
             if (!fn) {
-                std::ostringstream os; os << "no function " << [name UTF8String];
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (aggregator): no such function";
                 throw std::runtime_error(os.str());
             }
             NSError* err = nil;
             id<MTLComputePipelineState> pso =
                 [device_ newComputePipelineStateWithFunction:fn error:&err];
-            if (!pso) metal_throw("newComputePipelineState", err);
+            if (!pso) {
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (aggregator) would not build";
+                if (err) os << ": " << [[err localizedDescription] UTF8String];
+                throw std::runtime_error(os.str());
+            }
             return pso;
         }
     }
@@ -3296,6 +4178,128 @@ private:
     // the tuples sit in shared memory and the device radix select has a
     // fixed cost. HAVING stays on the device at every size.
     bool trace_exact_ = std::getenv("GPUDB_METAL_TRACE_EXACT") != nullptr;   // per-stage GPU times on stderr
+
+    // ---- the direct grouped reduce ----
+    id<MTLLibrary> lib_ = nil;                       // for the pipelines built on first use
+    std::mutex dir_pso_mu_;
+    std::vector<id<MTLComputePipelineState>> ps_gdir_ = std::vector<id<MTLComputePipelineState>>(2, nil);
+    id<MTLComputePipelineState> ps_gdir_ids_ = nil, ps_gdir_fill_ = nil, ps_gdir_merge_ = nil;
+    id<MTLComputePipelineState> ps_gdir_slab_ = nil;
+    // GPUDB_METAL_DIRECT_KERNEL = thread | slab | auto (default auto): which
+    // accumulator shape the direct pass uses, for the sweeps.
+    enum class DirectKernel { Auto, Thread, Slab };
+    DirectKernel direct_kernel_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_DIRECT_KERNEL");
+        if (!e) return DirectKernel::Auto;
+        if (std::strcmp(e, "thread") == 0) return DirectKernel::Thread;
+        if (std::strcmp(e, "slab") == 0)   return DirectKernel::Slab;
+        return DirectKernel::Auto;
+    }();
+    // At or below this many (group x payload) accumulator slots the
+    // thread-private kernel is used. Measured at SF10 it never wins — the
+    // slab is level with it at 2 slots and twice as fast at 6 — so the
+    // default is 0 and the thread kernel is only the fallback for a min /
+    // max the slab cannot keep exactly (a payload lane wider than 4 bytes).
+    // GPUDB_METAL_PREWARM=0 turns off what prepare() does beyond the sort
+    // cache (the id lane, the touched scratch), for measuring the first-call
+    // gap it removes.
+    bool prewarm_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_PREWARM");
+        return !(e && std::strcmp(e, "0") == 0);
+    }();
+    std::size_t direct_thread_slots_ = [] {
+        std::size_t v = 0;
+        if (const char* e = std::getenv("GPUDB_METAL_DIRECT_THREAD_SLOTS")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end && end != e && *end == '\0') v = static_cast<std::size_t>(x);
+        }
+        return v;
+    }();
+    std::mutex dir_mu_;                              // guards the id-lane scratch and the warm buffers
+    std::atomic<bool> direct_ok_{true};              // cleared for good when a required pipeline refuses
+    std::atomic<bool> dir_probed_{false};            // the required set has been asked for once
+    std::string direct_why_;                         // ... and why, in the compiler's words (dir_pso_mu_)
+    // GPUDB_METAL_DIRECT_DISABLE_PSO: `1` makes every direct pipeline refuse
+    // to build, `slab` only the slab kernel — which is what a hosted macOS
+    // runner's virtualised GPU does, and the harder case, because the id-lane
+    // helpers do build there. Both are for testing the fallback on a device
+    // where the path would otherwise work.
+    std::string dir_disable_pso_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
+        return e ? std::string(e) : std::string();
+    }();
+    // Which function the knob refuses. `1` / `all` every one of them, `slab`
+    // / `masked32` / `masked8` / `ids` / `fill` / `merge` that one, `missing`
+    // none of them by name but every request asks Metal for a function that
+    // does not exist (so the genuine nil-from-Metal branch runs), anything
+    // else is taken as a function name.
+    bool dir_refuses(NSString* name) const {
+        if (dir_disable_pso_.empty() || dir_disable_pso_ == "missing") return false;
+        if (dir_disable_pso_ == "1" || dir_disable_pso_ == "all") return true;
+        static const struct { const char* key; const char* fn; } alias[] = {
+            {"slab", "gdir_slab_i64"},       {"masked32", "gdir_masked_32_i64"},
+            {"masked8", "gdir_masked_8_i64"}, {"ids", "gdir_ids_i64"},
+            {"fill", "gdir_fill_ids"},        {"merge", "gdir_merge_i64"}};
+        for (const auto& a : alias)
+            if (dir_disable_pso_ == a.key) return [name isEqualToString:[NSString stringWithUTF8String:a.fn]];
+        return dir_disable_pso_ == [name UTF8String];
+    }
+    // The name to ask Metal for. `missing` sends a name nothing defines, which
+    // is the one way to make a real device return nil on a build we control.
+    NSString* dir_probe_name(NSString* name) const {
+        return dir_disable_pso_ == "missing"
+            ? [name stringByAppendingString:@"__no_such_function"] : name;
+    }
+    // What a threadgroup may hold, asked of the device rather than assumed.
+    // The slab kernel binds this much dynamically and nothing statically.
+    std::size_t dir_slab_bytes_ = kDirSlabBytes;
+    id<MTLBuffer> gdir_out_ = nil, gdir_res_ = nil, gdir_blk_buf_ = nil;
+    id<MTLBuffer> gdir_meta_ = nil, gdir_prog_ = nil, gdir_list_ = nil, gdir_pay_ = nil;
+    id<MTLBuffer> warm_mask_ = nil, warm_mult_ = nil;
+    // GPUDB_METAL_GROUPBY_EXACT_PATH = direct | sort | auto (default auto):
+    // which algorithm the exact GROUP BY runs. `direct` still falls back to
+    // the sort path where the direct one cannot express the call (too many
+    // lanes, too many groups) — the answers are identical either way, and
+    // gpu_last_stats / GPUDB_METAL_TRACE_EXACT say which one ran.
+    ExactPath exact_path_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_GROUPBY_EXACT_PATH");
+        if (!e) return ExactPath::Auto;
+        if (std::strcmp(e, "direct") == 0) return ExactPath::Direct;
+        if (std::strcmp(e, "sort") == 0)   return ExactPath::Sort;
+        return ExactPath::Auto;
+    }();
+    // rows x (payloads + WHERE terms) the direct pass needs before it is worth
+    // the id lane, and the fewest groups it is ever worth it at.
+    std::size_t direct_min_work_ = [] {
+        std::size_t v = 6'000'000;
+        if (const char* e = std::getenv("GPUDB_METAL_DIRECT_MIN_WORK")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end && end != e && *end == '\0') v = static_cast<std::size_t>(x);
+        }
+        return v;
+    }();
+    std::size_t direct_min_groups_ = [] {
+        std::size_t v = 3;
+        if (const char* e = std::getenv("GPUDB_METAL_DIRECT_MIN_GROUPS")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end && end != e && *end == '\0') v = static_cast<std::size_t>(x);
+        }
+        return v;
+    }();
+    // The measured crossover: above this many groups the sort path wins.
+    // GPUDB_METAL_DIRECT_MAX_GROUPS overrides it for the sweeps.
+    std::size_t direct_max_groups_ = [] {
+        std::size_t v = 512;
+        if (const char* e = std::getenv("GPUDB_METAL_DIRECT_MAX_GROUPS")) {
+            char* end = nullptr;
+            const unsigned long long x = std::strtoull(e, &end, 10);
+            if (end && end != e && *end == '\0') v = static_cast<std::size_t>(x);
+        }
+        return std::min<std::size_t>(v, kDirMaxGroups);
+    }();
     std::size_t host_filter_below_ = [] {
         std::size_t v = 65536;
         if (const char* e = std::getenv("GPUDB_METAL_HOST_FILTER_BELOW")) {
