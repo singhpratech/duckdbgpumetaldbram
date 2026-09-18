@@ -1,7 +1,8 @@
 # Resident columns — the v0.8 storage design
 
-Status: design 2026-09-18; stage A merged (#123), stage B merged (#124), stage C built
-2026-09-18 (this PR, Metal); stage D next. Companion to
+Status: design 2026-09-18; stage A merged (#123), stage B merged (#124), stage C
+merged (#125); the group-id lane of §7 built 2026-09-18 (this PR, Metal); stage
+D next. Companion to
 `docs/TRANSPARENT_DESIGN.md` (the rewrite, the rules, the thresholds), which it
 does not change: rule 1 (never slower than native) and rule 2 (never a
 different answer) are enforced by the same gate and the same tests.
@@ -66,7 +67,9 @@ Invariants:
 
 CUDA implements the design once, after stage C, from `docs/CUDA_EXACT_PATH.md`
 (revised for stage C: storage width is backend-private and the interface is
-unchanged).
+unchanged). §7 is a second derived structure beside the sort cache, also
+backend-private, and does not belong to a stage: it can land before or after
+stage D.
 
 ## 4. Stage A in detail
 
@@ -228,7 +231,103 @@ one. On a backend without narrow lanes — CUDA, the CPU reference — every lan
 charged 8 as before. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
 §4.12) is charged no sort cache.
 
-## 7. Stage D — joins as index vectors
+## 7. The group-id lane — a second derived structure
+
+The sort cache (invariant 3) is what the exact GROUP BY reads: sorted valid
+keys plus a permutation to row ids. It answers any key. A key with FEW
+distinct values does not need an answer that general, and paying for one is
+most of what those statements cost — at SF10 a flat 2.9–3.1 ms to find the
+run starts and 5.4–7.1 ms to gather the first payload through the
+permutation, with 2.5–3.7 ms for every further payload, for a result with
+four rows in it.
+
+So a key column gains a second derived structure beside the sort cache:
+
+```
+column "l_returnflag"   rows 0..n-1, hashed key lane, validity bitmap
+  ├── sort cache        sorted valid keys + u32 row ids          (any key)
+  └── group-id lane     gid[row] = rank of the row's key         (few keys only)
+                        among the distinct valid keys ascending;
+                        a NULL-key row takes the reserved id
+                        n_distinct, which is the LAST group
+      + the distinct keys, ascending, at the column's width
+```
+
+- **Stored at 1 or 2 bytes.** The width follows the largest id written — one
+  byte while that is 255 or less, two above. A key with more distinct values
+  than the direct reduce can hold gets no lane at all, and the column
+  remembers that so no statement asks twice.
+- **Built on the device from the sort cache**, under the column's own mutex:
+  run starts over the sorted keys give each sorted position its run index (the
+  block-offset plus simd-prefix scan the sort path already uses), the
+  permutation scatters that id to row order, and each run's key is kept as
+  that group's key. Rows with a NULL key are filled with the reserved id
+  first.
+- **Built by `prepare()`**, which runs inside the wrapper's upload where
+  seconds are already being spent, and lazily by the first exact call that
+  wants it otherwise. Counted in `resident_bytes()`; released with the column.
+- **It is a backend-private detail.** `gpu_backend.hpp` is untouched:
+  `dtype()`, `rows()` and `null_count()` mean what they meant, and which
+  algorithm ran is a word in `gpu_last_stats()` (`path=direct` / `path=sort`)
+  and in `GPUDB_METAL_TRACE_EXACT`, not a field of the interface.
+
+What reads it is the **direct reduce**: one pass over the rows in storage
+order, the whole `WHERE` evaluated per row by the same `gpred_eval` the global
+aggregate uses (§4.12 of `docs/TRANSPARENT_DESIGN.md`), every payload folded
+into the accumulator of `gid[row]`. No mask buffer, no run starts, no
+permutation, no gather. The ids are ranks of the ascending distinct keys, so
+the groups come out in the operator's order with the NULL-key group last, and
+a group the `WHERE` emptied is simply absent — the sort path's contract,
+unchanged.
+
+**Where the accumulators live is the whole design.** Two shapes, measured at
+SF10 and kept per range:
+
+| accumulators | holds | measured |
+|---|---|---|
+| thread-private (`GAggAcc[cap]`, the global aggregate's layout with more than one group) | a handful of (group × payload) slots | 4.6 ms at 2 groups × 1 payload; 106 ms at 4 × 5, 215 ms at 25 × 3 — 256 threads times the slots is the working set and no cache holds it |
+| one threadgroup slab of 32-bit atomics, replicated up to 32 times so a simdgroup's lanes never share a word | everything up to the id lane's limit | see BENCHMARK.md |
+
+Apple GPUs (through Apple9 / M4) have no 64-bit atomics at all — device or
+threadgroup — and no 64-bit simd reductions, so the slab is 32-bit
+throughout: `count(*)` and `count(v)` are u32 adds, the 128-bit sum is four
+u32 limbs whose carries each thread propagates itself (an atomic add returns
+the old value, so a thread knows when its own add wrapped), and negative
+values are added as their unsigned image and counted, the count being
+subtracted at 2^64 when the limbs are assembled. `min` and `max` are u32
+atomics over the order-preserving image of a 32-bit value, which is exact for
+a payload lane stored at 4 bytes or fewer — stage C stores a lane at the
+narrowest width its values fit, so that is every lane whose values fit int32.
+A payload whose values do not, with `min` or `max` asked for, keeps the
+thread-private accumulators while they hold it (32 slots) and the sort path
+above that: the answer is the same either way, and only the speed of that one
+shape is left. The exact version wants a second pass — the first gives the high
+word of the extreme per group, the second the low word among the rows that
+match it — and is worth building when something asks for it.
+
+**Where it stops.** Two of the three limits are memory. The slab is
+`n_groups × (6 × payloads + 1)` 32-bit words and a threadgroup may hold 30 KiB
+of them, so 512 groups fit with one payload, 404 with three and 247 with five;
+the id lane itself is built up to `GPUDB_METAL_DIRECT_MAX_GROUPS` distinct
+values, 512 by default. Both are hard declines to the sort path and both measure
+at 0.99–1.04×, the same algorithm on either side.
+
+The third is a real crossover, and it is in ROWS, not in groups. Every
+threadgroup clears its slab before its first row and folds it after its last,
+and none of that is proportional to rows; below a few million rows it is the
+whole call. Sizing the grid and the replicas to the row work removed most of it
+(BENCHMARK.md), and what is left is an admission rule:
+
+    groups >= 3   AND   rows × (payloads + WHERE terms) >= 6,000,000
+
+Two groups are excluded because the sort path's reduce over two runs is a
+sequential scan — its best case — while the direct path still reads the id lane;
+the work bound is there because what the direct path saves is one gather per
+payload and one mask pass per term. Of the 129 cells the sweep admits under this
+rule, none is slower than the sort path. `GPUDB_METAL_GROUPBY_EXACT_PATH=direct`
+forces past it.
+
+## 8. Stage D — joins as index vectors
 
 A join result today is a copy: every lane gathered into a new row-aligned set
 in the join's order, 8 bytes per row and lane. At SF10 that is 33.5 GiB for

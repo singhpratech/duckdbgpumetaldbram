@@ -26,6 +26,7 @@
 #include "gpu_groupby_extension.hpp"
 #include "gpu_resident.hpp"          // resident registry
 #include "gpu_backend.hpp"
+#include "exact_path_note.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
 DUCKDB_EXTENSION_EXTERN
@@ -726,6 +727,7 @@ void gx_init(duckdb_init_info info) {
         gpudb::GroupByFilter filt = bind->filter;
         filt.columns = want;   // only the projected result vectors are materialised
         auto dev = resident_device_lock(ctx);
+        gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
         if (where)
             init->res = agg.groupby_exact_masked_resident(*set->keys, set->vals.get(),
                                                           rw.preds.data(), rw.preds.size(), cap, filt);
@@ -740,11 +742,12 @@ void gx_init(duckdb_init_info info) {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=%s backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu "
-            "wall_ms=%.3f kernel_ms=%.3f transfer_ms=%.3f",
+            "wall_ms=%.3f kernel_ms=%.3f transfer_ms=%.3f path=%s",
             fn + 4 /* strip "gpu_" */, gpudb::to_string(d.chosen),
             gpudb::to_string(d.reason), init->res.rows_in, init->res.groups_total,
             init->rows,
-            init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms);
+            init->res.wall_ms, init->res.kernel_ms, init->res.transfer_ms,
+            gpudb::exact_path_note().c_str());
         resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
         delete init;
@@ -1026,6 +1029,7 @@ void gm_init(duckdb_init_info info) {
         double wall = 0.0, kernel = 0.0;
         {
             auto dev = resident_device_lock(ctx);
+            gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
             init->pay = agg.groupby_exact_masked_multi(*set->keys, mp.data(), P, fp, rw.preds.data(), rw.preds.size(), cap, f0);
         }
         {
@@ -1043,9 +1047,9 @@ void gm_init(duckdb_init_info info) {
         char buf[320];
         std::snprintf(buf, sizeof(buf),
             "op=groupby_exact_multi backend=%s reason=%s rows_in=%zu groups=%zu rows_out=%zu payloads=%zu passes=%zu "
-            "wall_ms=%.3f kernel_ms=%.3f transfer_ms=0.000",
+            "wall_ms=%.3f kernel_ms=%.3f transfer_ms=0.000 path=%s",
             gpudb::to_string(d.chosen), gpudb::to_string(d.reason), rows_in, groups_total, init->rows, P, passes,
-            wall, kernel);
+            wall, kernel, gpudb::exact_path_note().c_str());
         resident_record_stats(ctx, set.get(), buf);
     } catch (const std::exception& e) {
         duckdb_init_set_error(info, e.what());

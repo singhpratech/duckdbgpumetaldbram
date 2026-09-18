@@ -1358,6 +1358,176 @@ needs, and the backend says whether it applies at all (`narrow=true` in
 `gpu_build_info()`, from `Aggregator::narrow_lanes()`; CUDA and the CPU reference
 keep 8).
 
+## 2026-09-18 — Few keys do not need a sort: the direct grouped reduce
+
+The exact GROUP BY has always read the key's sort cache. Mask the rows, find
+the run starts of the sorted keys, gather each payload through the permutation
+into its segment. That is the right shape for a key with many distinct values
+and, it turns out, most of what a key with four costs. At SF10 the run starts
+are a flat 2.9–3.1 ms whether the answer has four rows or a hundred thousand,
+and the reduce gathers 60M rows through a permutation to produce them: TPC-H
+Q1 is 35.0 ms of kernel, of which 3.1 is stage A and 25.5 is the payload
+gathers, for a four-row result.
+
+So a key with few distinct values gets a second derived structure beside its
+sort cache — a **group-id lane**, `gid[row]` = the rank of the row's key among
+the distinct valid keys ascending, with a NULL key taking the reserved last id
+— and the operators run one pass in storage order: the whole `WHERE` per row
+through the `gpred_eval` the global aggregate left behind two entries ago, then
+every payload folded into `acc[gid]`. No mask buffer, no run starts, no
+permutation, no gather. At SF10 it wins on every cell of the sweep, 1.68× to
+8.57×, and Q1 goes from 37.2 ms to 15.2 through the wrapper — 7.6× native.
+
+Building the lane was the easy half: run starts over the sort cache give each
+sorted position its run index, the permutation scatters it to row order, the
+run's first key is kept as that group's key. One byte a row while the ids fit,
+two above 255, built inside `prepare()` where the upload is already spending
+seconds, counted in `resident_bytes()`, refused once and never retried for a
+key with too many distinct values. The one bug it had was an off-by-one I
+would have caught faster by writing the test first: the scan gives the number
+of run starts strictly before a position, and the run's index is the number at
+or before it, less one.
+
+**Where the accumulators live is the whole problem.** I started by copying the
+global aggregate: per-thread accumulators in `thread` space, `acc[group *
+n_pays + payload]`, which that kernel holds in 8 slots and runs at 2.6 ms over
+60M rows. With more than one group it collapses. At SF10: 4.6 ms at 2 groups ×
+1 payload, 23 ms at 4 × 3, 106 ms at 4 × 5, 215 ms at 25 × 3. The array is per
+thread, so 256 threads times the slots is the working set, and past a few
+hundred bytes a thread nothing caches it. Three payloads were slower than five
+in the first sweep purely because the five-payload shape crossed into a larger
+declared array and the compiler had already given up on registers. That is a
+cliff, not a slope.
+
+The fix is one slab per threadgroup, shared. Which on this hardware means
+32-bit atomics and nothing else: Apple GPUs through Apple9 (M4) have **no
+64-bit atomics at all** — not in device memory, not in threadgroup memory — and
+no 64-bit simd reductions either. I checked by compiling, not by reading, and
+the compiler is unambiguous. So:
+
+- `count(*)` and `count(v)` are u32 adds; a threadgroup's count cannot exceed
+  the row count, which the operator already caps below 2^32.
+- The **128-bit sum** is four u32 limbs with the carries propagated by hand. An
+  atomic add returns the old value, so each thread knows whether its own add
+  wrapped and owes 2^32 to the next limb; negatives are added as their unsigned
+  image and counted, and the count is subtracted at 2^64 when the limbs are
+  assembled. That is exact, because the true sum fits in 128 bits. It costs
+  two unconditional atomics per value plus the carries.
+- **Contention** would have killed it at four groups — 256 threads on four
+  words — so the slab is replicated up to 32 times and a thread uses copy
+  `tid % ncopy`. At 32 copies the 32 lanes of a simdgroup never touch the same
+  word, and the 8 simdgroups that share a copy are not running the same
+  instruction anyway. The host picks the largest power of two whose copies fit
+  30 KiB.
+
+`min` and `max` are where I stopped. They are u32 atomics over the
+order-preserving image of a 32-bit value, which is exact for a payload lane
+stored at 4 bytes or narrower — and since stage C stores every lane at the
+narrowest width its values fit, that is every lane whose values fit int32,
+which is every DECIMAL image and every date in TPC-H. A payload whose values do
+not, with `min` or `max` actually read, keeps the thread-private accumulators
+while they hold it (32 slots) and the sort path above that. The answer is the
+same either way; only the speed of that one shape is left on the table. The
+exact version wants a second pass — the first gives the high word of the
+extreme per group, the second the low word among the rows that match it — and
+it is worth building when something asks for it.
+
+**What the measurement said about the crossover, and what I got wrong.** I swept
+groups at one row count — 60M — and concluded there was no crossover: the direct
+path won 1.65× to 8.57× on every cell it served and the sort path was within
+noise of itself everywhere it declined. What bounds it, I wrote, is memory.
+
+That was true at 60M rows and false everywhere else, which is a bad way to be
+right. Sweeping ROWS as well put the direct path behind the sort path on **78 of
+192 cells** — everything under about 6M rows. The reason is entirely mine: every
+threadgroup clears its accumulator slab before its first row and folds it after
+its last, and the grid was `rows / 256` capped at 4096, so a million-row call
+started 3906 threadgroups to clear and fold up to 30 KiB apiece for 256 rows of
+work each. At 60M rows that setup is a rounding error. At 1M it is the call.
+
+Four changes took it out. The grid is now sized so a threadgroup's setup is at
+most an eighth of the rows it goes on to process. The replicas come down with it
+when the grid cannot reach 64 threadgroups. The replica cap went the other way,
+from 32 to 256 — one copy per thread — because the cells that still lost were
+losing to contention rather than setup: with two groups, 256 threads were
+sharing two words, and few groups is exactly where a copy per thread is
+affordable. 78 losing cells became 10.
+
+The fourth is the one I would not have found without a query. TPC-H Q22 was
+still slower, and its trace said why: 25 groups over 1.5M rows, asking for the
+32 replicas that fit rather than the ones it wanted, which made a 22 KiB slab,
+one threadgroup per core and 83 threadgroups for the whole query. What the 256
+threads of a threadgroup share is `n_groups × replicas` words, so the replicas
+worth having are the ones that bring that to about a word a thread — 16 here,
+not 32. Q22's kernel went 1.29 → 0.52 ms and its statement 1.53 → 1.06, against
+1.7 on the sort path. Taking the maximum that fits is not the same as taking
+what helps, and a synthetic sweep over round group counts never said so; a real
+query did. A fifth change, four small `MTLBuffer`s per call becoming four the
+operator keeps, is invisible in the kernel and half a millisecond of a
+millisecond-scale call.
+
+What I did NOT get to keep was a cut in the atomics per value — two instead of
+four for a lane narrow enough that its top limb is only a sign. Correct, and a
+median 1.00× over 192 cells. The pass is bandwidth-bound on the lane reads. The
+kernel kept the simpler form, which is the third time on this project that the
+measurement said so.
+
+What is left is a rule rather than a fix: `groups >= 3 AND rows × (payloads +
+terms) >= 6,000,000`. Two groups never pay, because the sort path's reduce over
+two runs is a sequential scan and the direct path still reads the id lane; and
+below a few million row-work units there is not enough saved gather to pay the
+lane back. Over a final 315-cell sweep run twice, every remaining loser is a
+2-group cell, and of the 208 cells the rule admits none is slower — the worst
+is 0.99×, which is even.
+
+At TPC-H SF10 the seven queries that take the direct path all improve — Q1
+2.50x, Q8 2.61x, Q9 2.33x, Q12 2.31x, Q5 2.03x, Q4 1.46x, Q22 1.19x — and the
+ten that do not are byte-identical code on both sides, which is how I know
+their 0.90-1.01 is the instrument: I read the path back from `gpu_last_stats()`
+instead of inferring it from the times. Q5 and Q22, the two the reviewer caught
+at 0.65x and 0.63x, are 2.03x and 1.19x.
+
+Setting that rule taught me more about the instrument than about the kernel.
+Two identical sweep runs differ by 3.90× at p90 on kernel time — until the
+kernel passes 0.5 ms, where the spread falls to 1.02×. One cell measured 0.42×
+in two consecutive runs and 1.11–1.78× in the three after. A bound fitted to
+those first two runs would have excluded three-group keys for good, on nothing.
+So the rule is fitted to medians over seven runs, only on cells above 0.5 ms,
+and the bound sits at 6M rather than the 4M the data also allows — both give up
+the same 16 winning cells and 6M leaves a 27% margin instead of 2%.
+
+**The first-call gap was not there.** The plan carried a measured 0.31 ms per
+million rows for the first GPU touch of a freshly allocated shared scratch
+buffer — 18.4 ms at SF10 — and the fix is obvious: size and touch that scratch
+in `prepare()`, inside the upload, and let the next query adopt it. I built it,
+and then measured 1.15 ms of first-call gap without it and 0.89 ms with. By the
+time the first statement runs, the upload has allocated and written lane buffers
+of the same order through the same allocator; the pages are not cold. I kept
+the prewarm — it runs inside an upload that takes 1.6 s and it costs nothing —
+but the honest number is 0.26 ms, not 18, and a statement on the direct path
+allocates no row-sized scratch at all.
+
+**Thresholds: none moved, and that is the measurement too.** A kernel that is
+three times faster is the obvious moment to ask whether `min_groups = 1000` and
+the VARCHAR-key rules were set against a cost that no longer exists. The gate
+with `--no-thresholds` says no, and the reason is the one I would have missed by
+reasoning from SF10. These bounds are group counts, so they apply at every scale
+factor, and the one they have to hold at is the small one: at SF1 a 7-group
+aggregate over 6M rows is 1.5-2.5 ms of native against about 2.5 ms of wrapper
+round trip, and the sweep measures `l_linenumber` at 0.80-0.94x with no WHERE
+and 0.52-0.55x under a 9% one — direct path and all. (I stopped that sweep
+after 56 of its ~780 rows: those are the rows these bounds decide, and the
+machine was needed for the gate proper.) `l_returnflag`, the
+three-group VARCHAR key that IS admitted without a WHERE, sits at 1.01-1.39x
+there and 0.57-0.62x under the same WHERE, which is exactly what
+`string_key_min_selectivity = 0.5` already declines. A bound that admitted the
+few-group shapes at SF1 would admit them at 0.5x. So nothing is relaxed, and the
+win lands where the shapes are already admitted: the SF10 end of the same rows,
+where Q1 goes 37.2 -> 15.2 ms and Q12 25.3 -> 10.0. The gate on this state —
+`--subqueries --exprs`, SF1, alone on the machine — is 782 rows, 517 PASS, 265
+declined, 0 below the bound and 0 differing, exit 0, with the same bounds and
+therefore the same row set as before.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
