@@ -1,6 +1,6 @@
 # Resident columns — the v0.8 storage design
 
-Status: design 2026-09-18; stage A in progress. Companion to
+Status: design 2026-09-18; stage A merged (#123), stage B built 2026-09-18 (this PR); stages C and D next. Companion to
 `docs/TRANSPARENT_DESIGN.md` (the rewrite, the rules, the thresholds), which it
 does not change: rule 1 (never slower than native) and rule 2 (never a
 different answer) are enforced by the same gate and the same tests.
@@ -59,7 +59,7 @@ Invariants:
 | stage | what | touches | done when |
 |---|---|---|---|
 | A | **Layout**: no NULL-key suffix; key columns carry a validity bitmap; the sort cache covers the valid keys and maps to row ids; rows stay in input order | Metal, CPU, the interface comments | all suites + gate unchanged; a layout unit test |
-| B | **TableStore**: columns uploaded by (table, expression) in row-id order (`gpu_upload_columns`), sets become references; the wrapper asks what is resident and uploads only the missing columns; budget and LRU per column | extension, wrapper | the 22 TPC-H queries at SF10 fit a 16 GiB budget; 33 GiB → measured |
+| B | **TableStore**: columns uploaded by (table, expression) in row-id order (`gpu_upload_columns`), single-table sets and join base sets become views over the store; the wrapper asks what is resident and uploads only the missing columns; budget and LRU per column | extension, wrapper | done — §5: the single-table and join-base lanes of the 22 TPC-H queries at SF10 are 30 shared columns; what is left uploaded is join results (stage D) |
 | C | **Width**: I32 / I16 / I8 storage chosen from the upload's min/max; typed loads in the exact kernels (function constants, one PSO per width) | Metal, CPU | memory and kernel bytes measured; gate unchanged |
 | D | **Index-vector joins and chunks**: a device join returns row ids; INSERTs append chunks; cold chunks stream | extension, Metal, wrapper | appends resident in ms; a table above the budget answers on the device for the shapes that win |
 
@@ -89,3 +89,85 @@ Nothing in the extension or the wrapper changes in stage A: `null_count()`
 keeps its meaning (number of NULL rows), the operators' output contract is
 unchanged, and the tests that compare every backend against the CPU reference
 are the proof.
+
+## 5. Stage B in detail — the store
+
+`gpu_upload_columns(tag, rowid, ints BIGINT[], dbls DOUBLE[], strs VARCHAR[])`
+uploads any number of lanes of one table in one scan. Lane 0 is DuckDB's
+`rowid`; the tag names the lanes (`gpudb:v1:<catalog>:<schema>:<table>:<oid>:<lane,…>:store`)
+in upload order (ints, doubles, strings), and each lane is a *store name*: a
+column name, the virtual name of a computed lane (`x_<digest>`, the same text
+every statement gets for the same expression), or `k#<field>` for a GROUP BY
+key that is the tuple text of its columns (it is not the column, so it never
+collides with a WHERE lane on the raw column). The columns land in the table's
+`TableStore`, keyed by that name; a second upload of a name replaces it.
+
+**Row-id order.** DuckDB scans in parallel, so chunks arrive in any order but
+rows inside a scan chunk are ascending; `upload_columns_update` records one
+chunk per (update call, segment) and `finish_upload_columns` sorts the chunk
+records and hands each to the backend as a `RowSpan` with `dst_row` /
+`valid_bit` — the rows are placed at their row-id rank without a sort of the
+data. When a lane's expression is a correlated subquery DuckDB evaluates it
+through a join and even that order is gone; then finish ranks every row by
+its row id (a dense position table when the ids are dense, a sort when they
+are not) and gathers the rows into fresh segments by destination segment in
+parallel — the placed path, 2× the upload's host memory while it runs, the
+same columns at the end.
+
+**Views.** A statement's set is now a *view* over the store: `acquire()` of a
+tag whose store holds every lane it names synthesises the `ResidentSet` —
+key column (`k#name` first, then `name`), payload column (`-` = none: the key
+stands in), predicate columns bucketed ints / doubles / strings — shares the
+dictionaries, and prepares the key column's sort cache once for every view
+on it. Views cost 0 bytes (`gpu_residents().kind = 'view'`); the memory is
+the store's (`gpu_store_columns()`), and the budget counts, ages and evicts
+*columns* (`gpu_drop_column`) — a view whose lane went is simply
+re-synthesised after the wrapper uploads the lane again. Invalidating a table
+drops its store with its sets; a store upload that finds another row count
+replaces the store and marks every view on it stale.
+
+**The wrapper** (`_rewrite.store_lanes` / `store_upload_sql`, `_residency`,
+`connection._store_upload`) asks `gpu_store_columns()` what the table already
+holds, uploads only the missing lanes, then runs `gpu_prepare_resident(tag)`
+so the view exists and its sort cache is built before the statement is
+rewritten. A device join's base sets (`…:join`) take the same route: their
+lanes are the table's columns under the same names, so Q12's `l_orderkey` is
+one column for the single-table statements and the join.
+
+**Measured (SF10, 22 TPC-H queries back to back, unlimited budget, M4 Max,
+16 of 22 on the device, all identical, on both).** On main every statement
+owns its lanes: 32 sets, 45.5 GiB — 11 single-table sets 4.8 GiB, 8 join
+base sets 7.2 GiB, 13 join-result sets 33.5 GiB. With the store: the
+single-table and join-base lanes are 35 shared columns, 11.4 GiB (`lineitem`
+16 columns 9.8 GiB, sort caches included), 11 views at 0 bytes, and the same
+33.5 GiB of join results — 44.9 GiB. The saving on this workload is 0.6 GiB:
+its sets barely overlapped in lanes. What is still uploaded per statement is
+join *results* — the uploaded joins DuckDB evaluates for the shapes the
+device join does not plan yet (composite keys, cross-table expressions, keys
+from several tables) and the device join's own materialised results. That is
+stage D, three quarters of the memory.
+
+## 6. Stage D — joins as index vectors
+
+A join result today is a copy: every lane gathered into a new row-aligned set
+in the join's order, 8 bytes per row and lane. At SF10 that is 33.5 GiB for
+the TPC-H joins, three times the store that holds every base column.
+The design replaces the copy with a **join set** = one index vector per joined
+table (the row id of that table's row for each result row) plus, only when a
+lane cannot come from a store, a lane in result order:
+
+- a device join (`gpu_join_materialize`) returns the probe and build row ids
+  instead of gathered lanes — 16 bytes per result row;
+- an uploaded join (DuckDB evaluated it) uploads `(rowid_1, …, rowid_n)` per
+  result row, and a cross-table expression lane (`x_…` over columns of two
+  tables) as its own lane in result order — 8 bytes per table plus 8 per such
+  lane, instead of 8 per lane read;
+- the exact operators take an optional index per input column: a key,
+  payload or predicate lane of a join set is `store_col[index[i]]`; the sort
+  cache of a join set's key is built over the gathered key, as now.
+
+The kernels gather through the index on unified memory (the index is mostly
+in probe order, so the reads are sequential runs); the CPU reference does the
+same, and the parity tests compare them. Chunks (appends, tables above the
+budget) come with the same stage: an index vector already addresses rows by
+id, and a chunk is a range of ids.

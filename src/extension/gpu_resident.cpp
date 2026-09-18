@@ -117,6 +117,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -291,6 +292,21 @@ struct UploadBuf {
     std::size_t               n_pi = 0, n_pf = 0, n_ps = 0;
     bool                      key_str = false;   // key lane holds hash64(tuple text)
     bool                      exact = false;     // filled by an EXACT upload: charged against exact_pool_cap_bytes()
+    // Stage B column upload (gpu_upload_columns): lane 0 is the row id. The
+    // FAST PATH is a plain scan, whose rows arrive in ascending row-id order
+    // inside each update call: every call's rows are remembered as a chunk with
+    // the row ids it spans, and finish orders the chunks by first row id and
+    // places each at its rank (RowSpan::dst_row / valid_bit) — no data moves.
+    // Any other order (a lane expression carrying a correlated subquery is
+    // evaluated through a join, which reorders the rows inside a chunk) sets
+    // `unordered`, or shows up as chunks overlapping in row-id order; finish
+    // then takes the PLACED PATH and gathers the rows into fresh segments at
+    // their row-id rank.
+    bool                      columns = false;
+    struct ChunkRec { std::int64_t first_rowid, last_rowid; std::shared_ptr<Segment> seg; std::size_t row0, rows; };
+    std::vector<ChunkRec>     chunks;
+    std::uint64_t             chunk_call = 0;      // the update call the open chunk belongs to
+    bool                      unordered = false;   // a row id went backwards inside one call
     // hash -> text per string lane: [0] the key (when key_str), then one per
     // s<n> lane. Filled lock-free per state, merged at combine / finish; a
     // second text under one hash is a collision and fails the upload.
@@ -407,6 +423,22 @@ void pool_release(std::size_t n) {
     if (n) pool().bytes.fetch_sub(n, std::memory_order_relaxed);
 }
 
+// A scoped charge for a temporary buffer: whatever is still held goes back to
+// the pool on every exit, the throwing ones included.
+struct PoolCharge {
+    std::size_t bytes = 0;
+    bool take(std::size_t n, bool exact) {
+        if (!pool_reserve(n, exact)) return false;
+        bytes += n;
+        return true;
+    }
+    void give(std::size_t n) { n = std::min(n, bytes); pool_release(n); bytes -= n; }
+    ~PoolCharge() { pool_release(bytes); }
+    PoolCharge() = default;
+    PoolCharge(const PoolCharge&) = delete;
+    PoolCharge& operator=(const PoolCharge&) = delete;
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -428,6 +460,9 @@ struct UploadSession {
     bool          pair = false;
     gpudb::Dtype  vdt = gpudb::Dtype::I64;          // payload (pair) / column (bare) dtype
     bool          exact = false;                    // gpu_upload_pair_exact / gpu_upload_rows_exact segments
+    bool          columns = false;                  // gpu_upload_columns segments (stage B)
+    std::vector<UploadBuf::ChunkRec> chunks;
+    bool          unordered = false;
     std::size_t   lanes_per_row = 0, n_pi = 0, n_pf = 0, n_ps = 0;   // exact: lane layout (fixed by the first segment)
     bool          key_str = false;
     std::vector<std::unordered_map<std::uint64_t, std::string>> dicts;   // string lanes, merged per segment
@@ -446,6 +481,7 @@ public:
     std::mutex registry_mu;
     std::unordered_map<std::string, std::shared_ptr<ResidentSet>> registry;
     std::unordered_map<std::string, std::shared_ptr<UploadSession>> sessions;   // open sessions, by name
+    std::unordered_map<std::string, std::shared_ptr<TableStore>>    stores;     // stage B: by store key
 
     // Invalidation log: (prefix, seq). An upload whose name matches a record
     // with seq > its seq_at_start is discarded at finalize (§5.5 epoch
@@ -491,6 +527,10 @@ public:
             SetState expect = kv.second->state.load();
             if (expect != SetState::Stale) { kv.second->state.store(SetState::Stale); ++n; }
         }
+        for (auto it = stores.begin(); it != stores.end();) {
+            if (matches(it->first, prefix)) { ++n; it = stores.erase(it); }   // the columns go with the last view
+            else ++it;
+        }
         for (auto it = sessions.begin(); it != sessions.end();) {
             if (matches(it->first, prefix)) {
                 pool_release(it->second->charged);
@@ -524,13 +564,107 @@ public:
     }
 
     // Lookup with hit accounting. Throws when unknown or stale.
+    // Stage B: a plain identity tag with no set of its own is answered by a VIEW
+    // over the table's store when every lane it names is resident there. The
+    // view is registered under the tag (guards, deps and stats see a set like
+    // any other) and shares the store's columns, dictionaries and sort caches.
+    // Caller holds registry_mu. Returns null when the store cannot serve it.
+    std::shared_ptr<ResidentSet> view_from_store_locked(const std::string& name) {
+        if (!starts_with(name, kTagPrefix)) return nullptr;
+        TagFields t;
+        if (!parse_tag(name, t).empty()) return nullptr;
+        if (!t.extra.empty() && t.extra != "join") return nullptr;   // a plain set, or a join's base set
+        const std::string key = std::string("gpudb:v1:") + t.catalog + ":" + t.schema + ":" + t.table + ":" + std::to_string(t.table_oid);
+        auto st = stores.find(key);
+        if (st == stores.end()) return nullptr;
+        TableStore& store = *st->second;
+        std::vector<std::string> lanes;
+        for (std::size_t a = 0, b; a <= t.columns.size(); a = b + 1) {
+            b = t.columns.find(',', a);
+            if (b == std::string::npos) b = t.columns.size();
+            lanes.push_back(t.columns.substr(a, b - a));
+        }
+        if (lanes.size() < 2) return nullptr;
+        auto lane = [&](const std::string& e) -> std::shared_ptr<StoreColumn> {
+            auto it = store.cols.find(e);
+            return it == store.cols.end() ? nullptr : it->second;
+        };
+        auto set = std::make_shared<ResidentSet>();
+        auto k = lane("k#" + lanes[0]);          // a tuple-text key lives under its role prefix
+        if (!k) k = lane(lanes[0]);
+        if (!k) return nullptr;
+        set->keys = k->col; set->key_str = k->is_str; set->key_dict = k->dict;
+        if (lanes[1] != "-") {
+            auto v = lane(lanes[1]);
+            if (!v || v->is_str) return nullptr;
+            set->vals = v->col;
+        } else {
+            // no payload (count(*) only): the operators want a payload column to reduce; the
+            // key column stands in — the rewrite reads count_star and the keys, nothing of it
+            set->vals = set->keys;
+        }
+        std::vector<std::shared_ptr<StoreColumn>> pi, pf, ps;     // the WHERE program's i<n> / f<n> / s<n> order
+        for (std::size_t l = 2; l < lanes.size(); ++l) {
+            auto c = lane(lanes[l]);
+            if (!c) return nullptr;
+            if (c->is_str) ps.push_back(c);
+            else if (c->col->dtype() == gpudb::Dtype::F64) pf.push_back(c);
+            else pi.push_back(c);
+        }
+        for (auto* grp : {&pi, &pf, &ps})
+            for (auto& c : *grp) { set->preds.push_back(c->col); if (c->is_str) set->str_dicts.push_back(c->dict); }
+        set->pred_int = pi.size(); set->pred_dbl = pf.size(); set->pred_str = ps.size();
+        set->name = name; set->managed = true; set->pair = true; set->exact = true; set->view = true;
+        set->store_key = key;
+        set->catalog = t.catalog; set->schema = t.schema; set->table = t.table; set->table_oid = t.table_oid;
+        set->columns = t.columns; set->extra = t.extra;
+        set->rows = set->rows_seen = store.rows_seen;
+        set->epoch = store.epoch;
+        set->uploaded_at_us = now_us();
+        set->state.store(SetState::Uploaded);
+        registry[name] = set;
+        return set;
+    }
+    // A set by name, or a view synthesised for it. Caller holds registry_mu.
+    std::shared_ptr<ResidentSet> find_or_view_locked(const std::string& name) {
+        auto it = registry.find(name);
+        if (it != registry.end()) {
+            // a stale view is only a stale name: the store may hold fresh columns again
+            if (!(it->second->view && it->second->state.load(std::memory_order_acquire) == SetState::Stale))
+                return it->second;
+            registry.erase(it);
+        }
+        return view_from_store_locked(name);
+    }
+    void stamp_store_used_locked(const ResidentSet& v, std::int64_t t) {
+        auto st = stores.find(v.store_key);
+        if (st == stores.end()) return;
+        for (auto& kv : st->second->cols)
+            if (kv.second->col == v.keys || kv.second->col == v.vals ||
+                std::find(v.preds.begin(), v.preds.end(), kv.second->col) != v.preds.end())
+                kv.second->last_used_at_us.store(t, std::memory_order_relaxed);
+    }
+
     std::shared_ptr<ResidentSet> acquire(const std::string& name, const char* fn,
                                          bool count_hit = true) {
         std::shared_ptr<ResidentSet> s;
+        bool fresh_view = false;
         {
             std::lock_guard<std::mutex> lock(registry_mu);
             auto it = registry.find(name);
-            if (it != registry.end()) s = it->second;
+            if (it != registry.end() &&
+                !(it->second->view && it->second->state.load(std::memory_order_acquire) == SetState::Stale)) {
+                s = it->second;
+            } else {
+                if (it != registry.end()) registry.erase(it);       // a stale view: re-synthesise from the store
+                s = view_from_store_locked(name);
+                fresh_view = s != nullptr;
+            }
+        }
+        if (fresh_view && s->keys) {
+            // the sort cache belongs to the (shared) key column: built once, used by every view on it
+            s->keys->prepare();
+            s->state.store(SetState::Ready);
         }
         if (!s) {
             throw std::runtime_error(std::string(fn) + ": no resident set named '" + name +
@@ -554,8 +688,10 @@ public:
             }
         }
         if (count_hit) {
+            const std::int64_t t = now_us();
             s->hits.fetch_add(1, std::memory_order_relaxed);
-            s->last_used_at_us.store(now_us(), std::memory_order_relaxed);
+            s->last_used_at_us.store(t, std::memory_order_relaxed);
+            if (s->view) { std::lock_guard<std::mutex> lock(registry_mu); stamp_store_used_locked(*s, t); }
         }
         return s;
     }
@@ -589,11 +725,11 @@ public:
                 return r;
             }
         }
-        // A pair name used where a column is expected: hand out the keys.
+        // A pair name used where a column is expected: hand out the keys
+        // (a plain identity tag may be a view over the table's store, stage B).
         {
             std::lock_guard<std::mutex> lock(registry_mu);
-            auto it = registry.find(name);
-            if (it != registry.end()) s = it->second;
+            s = find_or_view_locked(name);
         }
         if (s) {
             ResidentRef r{acquire(name, fn), nullptr};
@@ -907,6 +1043,11 @@ void upload_combine(duckdb_function_info info, duckdb_aggregate_state* source,
         db.charged += delta;
         db.rows_seen += sb.rows_seen;
         for (const auto& v : sb.all_views()) db.views.push_back(v);
+        if (sb.columns) {
+            db.columns = true;
+            db.unordered = db.unordered || sb.unordered;
+            db.chunks.insert(db.chunks.end(), sb.chunks.begin(), sb.chunks.end());
+        }
     }
 }
 
@@ -925,16 +1066,17 @@ void publish_set(ResidentContext& ctx, UploadBuf& b,
     set->deps = std::move(deps);
     set->managed = b.managed;
     set->exact = exact;
-    set->preds = std::move(preds);
+    for (auto& p : preds) set->preds.emplace_back(std::move(p));
     set->pred_int = pred_int;
     set->pred_dbl = pred_dbl;
     set->pred_str = pred_str;
     set->key_str = b.key_str;
-    if (b.key_str && !b.dicts.empty()) set->key_dict = std::move(b.dicts[0]);
+    if (b.key_str) set->key_dict = std::make_shared<const ResidentSet::Dict>(
+        b.dicts.empty() ? ResidentSet::Dict{} : std::move(b.dicts[0]));
     for (std::size_t i = 0; i < pred_str; ++i) {
         const std::size_t slot = (b.key_str ? 1 : 0) + i;
-        set->str_dicts.push_back(slot < b.dicts.size() ? std::move(b.dicts[slot])
-                                                       : std::unordered_map<std::uint64_t, std::string>{});
+        set->str_dicts.push_back(std::make_shared<const ResidentSet::Dict>(
+            slot < b.dicts.size() ? std::move(b.dicts[slot]) : ResidentSet::Dict{}));
     }
     if (b.managed) {
         set->catalog = b.tag.catalog; set->schema = b.tag.schema; set->table = b.tag.table;
@@ -976,8 +1118,10 @@ inline std::string read_name(duckdb_string_t* names, idx_t row) {
 // device). Returns the rows resident. Throws std::runtime_error.
 std::size_t finish_upload_exact(ResidentContext& ctx, UploadBuf& b, const char* fn);
 
+std::size_t finish_upload_columns(ResidentContext& ctx, UploadBuf& b, const char* fn);
 std::size_t finish_upload(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype vdt,
                           const char* fn) {
+    if (b.columns) return finish_upload_columns(ctx, b, fn);            // stage B store upload
     if (b.lanes_per_row != 0) return finish_upload_exact(ctx, b, fn);   // exact (§4.1 / §4.6) buffer
     auto& a = ctx.aggregator();
     const std::size_t lanes = b.lanes();
@@ -1020,7 +1164,7 @@ bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype 
     auto it = ctx.sessions.find(b.name);
     if (it == ctx.sessions.end()) return false;
     UploadSession& ss = *it->second;
-    if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt || ss.exact != exact ||
+    if (ss.kind_set && (ss.pair != pair || ss.vdt != vdt || ss.exact != exact || ss.columns != b.columns ||
                         (exact && (ss.lanes_per_row != b.lanes_per_row || ss.n_pi != b.n_pi || ss.n_pf != b.n_pf ||
                                    ss.n_ps != b.n_ps || ss.key_str != b.key_str))))
         throw std::runtime_error(std::string(fn) + ": segment kind differs from the open upload "
@@ -1048,6 +1192,11 @@ bool session_append(ResidentContext& ctx, UploadBuf& b, bool pair, gpudb::Dtype 
     ss.rows_seen += b.rows_seen;
     ss.segments += 1;
     for (const auto& v : b.all_views()) ss.views.push_back(v);
+    if (b.columns) {
+        ss.columns = true;
+        ss.unordered = ss.unordered || b.unordered;
+        ss.chunks.insert(ss.chunks.end(), b.chunks.begin(), b.chunks.end());
+    }
     return true;
 }
 
@@ -1748,6 +1897,673 @@ void upload_rows_exact_finalize(duckdb_function_info info, duckdb_aggregate_stat
 // gpu_upload_status.
 // ---------------------------------------------------------------------------
 
+
+// ---------------------------------------------------------------------------
+// Stage B (docs/RESIDENT_COLUMNS_DESIGN.md): gpu_upload_columns.
+//   gpu_upload_columns(tag, rowid BIGINT, ci BIGINT[], cf DOUBLE[], cs VARCHAR[]) -> BIGINT
+// The tag names a TABLE STORE and the lanes in upload order:
+//   gpudb:v1:<catalog>:<schema>:<table>:<oid>:<ci names>,<cf names>,<cs names>:store
+// Lane 0 of the buffer is the row id. Rows of ONE update call of a plain scan
+// arrive in ascending row-id order (a DuckDB scan hands a chunk of one row
+// group in storage order), so every call's rows are remembered as a chunk with
+// the row ids it spans; finish orders the chunks by first row id and places
+// each at its rank (RowSpan::dst_row) — the columns end up in row-id order
+// without a sort of the data. A scan that delivers rows in another order (a
+// join under a correlated subquery) is placed by row-id rank at finish
+// instead. Either way every column of the store is row-aligned with every
+// other whatever scan produced it.
+// ---------------------------------------------------------------------------
+std::atomic<std::uint64_t> g_upload_call { 0 };
+
+void upload_columns_update(duckdb_function_info info, duckdb_data_chunk input,
+                           duckdb_aggregate_state* states) {
+    duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector r_vec    = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector ci_vec   = duckdb_data_chunk_get_vector(input, 2);
+    duckdb_vector cf_vec   = duckdb_data_chunk_get_vector(input, 3);
+    duckdb_vector cs_vec   = duckdb_data_chunk_get_vector(input, 4);
+    auto* names = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(name_vec));
+    const auto* rd = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(r_vec));
+    const auto* ci_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(ci_vec));
+    const auto* cf_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(cf_vec));
+    const auto* cs_ent = reinterpret_cast<const duckdb_list_entry*>(duckdb_vector_get_data(cs_vec));
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    if (!names || !rd || !ci_ent || !cf_ent || !cs_ent || n == 0) return;
+    duckdb_vector ci_child = duckdb_list_vector_get_child(ci_vec);
+    duckdb_vector cf_child = duckdb_list_vector_get_child(cf_vec);
+    duckdb_vector cs_child = duckdb_list_vector_get_child(cs_vec);
+    const auto* ci_data = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(ci_child));
+    const auto* cf_data = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(cf_child));
+    auto* cs_data = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(cs_child));
+    uint64_t* name_validity = duckdb_vector_get_validity(name_vec);
+    uint64_t* r_validity    = duckdb_vector_get_validity(r_vec);
+    uint64_t* ci_validity   = duckdb_vector_get_validity(ci_vec);
+    uint64_t* cf_validity   = duckdb_vector_get_validity(cf_vec);
+    uint64_t* cs_validity   = duckdb_vector_get_validity(cs_vec);
+    uint64_t* cic_validity  = duckdb_vector_get_validity(ci_child);
+    uint64_t* cfc_validity  = duckdb_vector_get_validity(cf_child);
+    uint64_t* csc_validity  = duckdb_vector_get_validity(cs_child);
+
+    UploadState* s0 = probe_upload_state(states[0]);
+    if (!s0) return;
+    bool per_row = true;
+    if (n > 1) {
+        const idx_t probes[3] = { 1, n / 2, n - 1 };
+        for (idx_t k = 0; k < 3 && per_row; ++k) {
+            const idx_t i = probes[k];
+            if (i == 0) continue;
+            if (probe_upload_state(states[i]) == nullptr) per_row = false;
+        }
+    }
+    std::size_t max_lanes = 1;
+    for (idx_t i = 0; i < n; ++i) {
+        const bool ci_ok = !ci_validity || duckdb_validity_row_is_valid(ci_validity, i);
+        const bool cf_ok = !cf_validity || duckdb_validity_row_is_valid(cf_validity, i);
+        const bool cs_ok = !cs_validity || duckdb_validity_row_is_valid(cs_validity, i);
+        const std::size_t L = 1 + (ci_ok ? static_cast<std::size_t>(ci_ent[i].length) : 0) +
+                              (cf_ok ? static_cast<std::size_t>(cf_ent[i].length) : 0) +
+                              (cs_ok ? static_cast<std::size_t>(cs_ent[i].length) : 0);
+        max_lanes = std::max(max_lanes, L);
+    }
+    const std::size_t reserved = static_cast<std::size_t>(n) * max_lanes * sizeof(std::int64_t);
+    if (!pool_reserve(reserved, /*exact*/true)) {
+        duckdb_aggregate_function_set_error(info,
+            (std::string("gpu_upload_columns: out of buffer memory") + kPoolCapHint).c_str());
+        return;
+    }
+    const std::uint64_t call = g_upload_call.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::size_t used = 0;
+    auto append_row = [&](UploadState* s, idx_t i) -> bool {
+        UploadBuf& b = state_buf(s, gpudb::Dtype::I64);
+        b.exact = true; b.columns = true;
+        ++b.rows_seen;
+        if (name_validity && !duckdb_validity_row_is_valid(name_validity, i)) {
+            duckdb_aggregate_function_set_error(info, "gpu_upload_columns: name may not be NULL");
+            return false;
+        }
+        if (r_validity && !duckdb_validity_row_is_valid(r_validity, i)) {
+            duckdb_aggregate_function_set_error(info, "gpu_upload_columns: the row id may not be NULL");
+            return false;
+        }
+        if ((ci_validity && !duckdb_validity_row_is_valid(ci_validity, i)) ||
+            (cf_validity && !duckdb_validity_row_is_valid(cf_validity, i)) ||
+            (cs_validity && !duckdb_validity_row_is_valid(cs_validity, i))) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_columns: the column lists may not be NULL (use [] for none)");
+            return false;
+        }
+        const char*       nm_data = duckdb_string_t_data(&names[i]);
+        const std::size_t nm_len  = duckdb_string_t_length(names[i]);
+        if (!b.name_set) {
+            if (!set_buf_name(info, b, nm_data, nm_len, "gpu_upload_columns")) return false;
+            if (!b.managed || b.tag.extra != "store") {
+                duckdb_aggregate_function_set_error(info,
+                    "gpu_upload_columns: the name must be a store tag (gpudb:v1:<catalog>:<schema>:<table>:<oid>:<lanes>:store)");
+                return false;
+            }
+        } else if (b.name.size() != nm_len || std::memcmp(b.name.data(), nm_data, nm_len) != 0) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_columns: one aggregate received two different names — use a constant name");
+            return false;
+        }
+        const std::size_t n_ci = ci_ent[i].length, n_cf = cf_ent[i].length, n_cs = cs_ent[i].length;
+        if (b.lanes_per_row == 0) {
+            b.n_pi = n_ci; b.n_pf = n_cf; b.n_ps = n_cs; b.lanes_per_row = 1 + n_ci + n_cf + n_cs;
+        } else if (b.n_pi != n_ci || b.n_pf != n_cf || b.n_ps != n_cs) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_columns: list length changed between rows — every row must carry the same columns");
+            return false;
+        }
+        const std::size_t L = b.lanes_per_row;
+        std::int64_t* dst = b.reserve_lanes(L);
+        const std::size_t row = static_cast<std::size_t>(dst - b.open->data) / L;
+        const std::int64_t rowid = rd[i];
+        // chunk bookkeeping: a new update call or a new segment opens a chunk
+        if (b.chunks.empty() || b.chunk_call != call || b.chunks.back().seg.get() != b.open.get()) {
+            b.chunks.push_back(UploadBuf::ChunkRec{rowid, rowid, b.open, row, 0});
+            b.chunk_call = call;
+        } else if (rowid <= b.chunks.back().last_rowid) {
+            b.unordered = true;
+        }
+        b.chunks.back().last_rowid = rowid;
+        b.chunks.back().rows += 1;
+        dst[0] = rowid;
+        bool collision = false;
+        for (std::size_t e = 0; e < n_ci; ++e) {
+            const idx_t c = ci_ent[i].offset + e;
+            const bool nul = cic_validity && !duckdb_validity_row_is_valid(cic_validity, c);
+            dst[1 + e] = nul ? 0 : ci_data[c];
+            if (nul) b.open->mark_lane_null(row, 1 + e, L);
+        }
+        for (std::size_t e = 0; e < n_cf; ++e) {
+            const idx_t c = cf_ent[i].offset + e;
+            const bool nul = cfc_validity && !duckdb_validity_row_is_valid(cfc_validity, c);
+            dst[1 + n_ci + e] = nul ? 0 : cf_data[c];
+            if (nul) b.open->mark_lane_null(row, 1 + n_ci + e, L);
+        }
+        for (std::size_t e = 0; e < n_cs; ++e) {
+            const idx_t c = cs_ent[i].offset + e;
+            const std::size_t lane = 1 + n_ci + n_cf + e;
+            const bool nul = csc_validity && !duckdb_validity_row_is_valid(csc_validity, c);
+            if (nul) { dst[lane] = 0; b.open->mark_lane_null(row, lane, L); continue; }
+            const char* sp = duckdb_string_t_data(&cs_data[c]);
+            const std::size_t sn = duckdb_string_t_length(cs_data[c]);
+            const std::uint64_t h = hash64(sp, sn);
+            dst[lane] = static_cast<std::int64_t>(h);
+            b.note_string(e, h, sp, sn, collision);
+        }
+        if (collision) {
+            duckdb_aggregate_function_set_error(info,
+                "gpu_upload_columns: two different strings hash alike (64-bit collision) — "
+                "this column cannot be resident; the statement runs native");
+            return false;
+        }
+        b.charged += L * sizeof(std::int64_t);
+        used += L * sizeof(std::int64_t);
+        return true;
+    };
+    bool ok = true;
+    if (n == 1 || !per_row) {
+        for (idx_t i = 0; i < n && ok; ++i) ok = append_row(s0, i);
+    } else {
+        for (idx_t i = 0; i < n && ok; ++i) {
+            UploadState* st = probe_upload_state(states[i]);
+            if (st) ok = append_row(st, i);
+        }
+    }
+    pool_release(reserved - std::min(reserved, used));
+}
+
+// The columns of a finished column upload go into the table's store in row-id
+// order. A store that exists with another row count (the table changed) is
+// replaced and its views marked stale; an upload begun before an invalidation
+// of the table is discarded like any set upload.
+std::size_t finish_upload_columns(ResidentContext& ctx, UploadBuf& b, const char* fn) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::size_t L = b.lanes_per_row;
+    if (L < 2) throw std::runtime_error(std::string(fn) + ": no columns to upload");
+    std::vector<std::string> names;
+    for (std::size_t a = 0, e; a <= b.tag.columns.size(); a = e + 1) {
+        e = b.tag.columns.find(',', a);
+        if (e == std::string::npos) e = b.tag.columns.size();
+        names.push_back(b.tag.columns.substr(a, e - a));
+    }
+    if (names.size() != L - 1)
+        throw std::runtime_error(std::string(fn) + ": the tag names " + std::to_string(names.size()) +
+                                 " lanes but " + std::to_string(L - 1) + " were uploaded");
+    std::vector<UploadBuf::ChunkRec> chunks = b.chunks;
+    // Fast path unless a chunk's rows came back out of order, or two chunks
+    // cover the same row ids (both mean a scan that is not a plain table scan).
+    bool placed = b.unordered;
+    if (!placed) {
+        std::sort(chunks.begin(), chunks.end(),
+                  [](const UploadBuf::ChunkRec& x, const UploadBuf::ChunkRec& y) { return x.first_rowid < y.first_rowid; });
+        for (std::size_t c = 1; c < chunks.size() && !placed; ++c)
+            if (chunks[c].first_rowid <= chunks[c - 1].last_rowid) placed = true;
+    }
+    std::size_t rows = 0;
+    for (const auto& ch : chunks) rows += ch.rows;
+    if (rows != b.rows_seen) throw std::runtime_error(std::string(fn) + ": chunk bookkeeping lost rows");
+
+    std::vector<gpudb::Aggregator::RowSpan> spans;
+    std::vector<std::vector<const std::uint64_t*>> valid_ptrs;
+    std::vector<std::shared_ptr<Segment>> placed_segs;   // alive until upload_rows_exact has read them
+    PoolCharge charge;                                   // the placed path's temporaries
+    double order_ms = 0.0;
+    if (!placed) {
+        spans.resize(chunks.size());
+        valid_ptrs.resize(chunks.size());
+        std::size_t at = 0;
+        for (std::size_t c = 0; c < chunks.size(); ++c) {
+            const auto& ch = chunks[c];
+            spans[c].lanes = ch.seg->data + ch.row0 * L;
+            spans[c].rows = ch.rows;
+            spans[c].n_lanes = L;
+            spans[c].dst_row = at;
+            spans[c].valid_bit = ch.row0;
+            valid_ptrs[c].assign(L, nullptr);
+            if (!ch.seg->lane_valid.empty())
+                for (std::size_t l = 0; l < L && l < ch.seg->lane_valid.size(); ++l)
+                    if (!ch.seg->lane_valid[l].empty()) valid_ptrs[c][l] = ch.seg->lane_valid[l].data();
+            spans[c].valid = valid_ptrs[c].data();
+            at += ch.rows;
+        }
+    } else {
+        // ---- placed path ----
+        // Rank every row by its row id, then gather the rows into fresh
+        // segments in rank order. Peak host memory is 2x the upload: the
+        // source segments and the placed copy are both live until
+        // upload_rows_exact has read the copy (plus, while the rank is being
+        // computed, ~24 bytes per row of index).
+        const auto t_ord = std::chrono::steady_clock::now();
+        if (rows >= (std::size_t(1) << 32))
+            throw std::runtime_error(std::string(fn) + ": " + std::to_string(rows) +
+                                     " rows is above the placed path's limit of 2^32 rows");
+        // A row's source is (segment index << 32) | row within segment; a chunk
+        // lives in exactly one segment and a segment holds at most 2^20 rows.
+        std::vector<Segment*> segs;
+        std::vector<std::uint64_t> chunk_sid(chunks.size(), 0);
+        {
+            std::unordered_map<const Segment*, std::uint32_t> seg_id;
+            for (std::size_t c = 0; c < chunks.size(); ++c) {
+                auto it = seg_id.find(chunks[c].seg.get());
+                if (it == seg_id.end()) {
+                    it = seg_id.emplace(chunks[c].seg.get(), static_cast<std::uint32_t>(segs.size())).first;
+                    segs.push_back(chunks[c].seg.get());
+                }
+                chunk_sid[c] = std::uint64_t(it->second) << 32;
+            }
+        }
+        std::vector<std::size_t> base(chunks.size() + 1, 0);
+        for (std::size_t c = 0; c < chunks.size(); ++c) base[c + 1] = base[c] + chunks[c].rows;
+        const unsigned hw = std::thread::hardware_concurrency();
+        const std::size_t workers =
+            std::max<std::size_t>(1, std::min<std::size_t>(hw ? hw : 1, rows / 65536 + 1));
+        struct RowKey { std::int64_t rowid; std::uint64_t src; };
+        std::vector<RowKey>        keys;
+        // dense: row id - min -> row index + 1, 0 = no row; atomic because two rows with one
+        // id (a broken upload) store to the same slot from two threads — relaxed stores cost
+        // nothing and keep the race defined, the verify pass then reports the duplicate
+        std::unique_ptr<std::atomic<std::uint32_t>[]> pos;
+        std::vector<std::uint64_t> order;    // order[rank] = source
+        std::size_t idx_bytes = rows * (sizeof(RowKey) + sizeof(std::uint64_t));
+        if (!charge.take(idx_bytes, /*exact*/true))
+            throw std::runtime_error(std::string(fn) + ": out of buffer memory ordering the rows by row id" +
+                                     kPoolCapHint);
+        keys.resize(rows);
+        order.resize(rows);
+        // Pass 1: (row id, source) per row, and the row-id range.
+        std::vector<std::int64_t> lo(workers, INT64_MAX), hi(workers, INT64_MIN);
+        {
+            std::vector<std::thread> ts;
+            const std::size_t per = (chunks.size() + workers - 1) / workers;
+            for (std::size_t w = 0; w < workers; ++w) {
+                const std::size_t cb = std::min(chunks.size(), w * per), ce = std::min(chunks.size(), cb + per);
+                ts.emplace_back([&, w, cb, ce] {
+                    std::int64_t mn = INT64_MAX, mx = INT64_MIN;
+                    for (std::size_t c = cb; c < ce; ++c) {
+                        const auto& ch = chunks[c];
+                        const std::int64_t* p = ch.seg->data + ch.row0 * L;
+                        for (std::size_t r = 0; r < ch.rows; ++r) {
+                            const std::int64_t id = p[r * L];
+                            keys[base[c] + r] = RowKey{ id, chunk_sid[c] | std::uint64_t(ch.row0 + r) };
+                            if (id < mn) mn = id;
+                            if (id > mx) mx = id;
+                        }
+                    }
+                    lo[w] = mn; hi[w] = mx;
+                });
+            }
+            for (auto& t : ts) t.join();
+        }
+        std::int64_t mn = INT64_MAX, mx = INT64_MIN;
+        for (std::size_t w = 0; w < workers; ++w) { mn = std::min(mn, lo[w]); mx = std::max(mx, hi[w]); }
+        const std::uint64_t span = std::uint64_t(mx) - std::uint64_t(mn) + 1;
+        std::vector<char>         dup_hit(workers, 0);
+        std::vector<std::int64_t> dup_id(workers, 0);
+        if (span <= std::uint64_t(rows) * 2 + 4096) {
+            // Dense row ids (a full scan of a table): one slot per id, no sort.
+            const std::size_t dense_bytes = std::size_t(span) * sizeof(std::uint32_t);
+            if (!charge.take(dense_bytes, /*exact*/true))
+                throw std::runtime_error(std::string(fn) + ": out of buffer memory ordering the rows by row id" +
+                                         kPoolCapHint);
+            idx_bytes += dense_bytes;
+            pos.reset(new std::atomic<std::uint32_t>[std::size_t(span)]());   // () zero-initialises
+            const std::size_t per = (rows + workers - 1) / workers;
+            {
+                std::vector<std::thread> ts;
+                for (std::size_t w = 0; w < workers; ++w) {
+                    const std::size_t g0 = std::min(rows, w * per), g1 = std::min(rows, g0 + per);
+                    ts.emplace_back([&, g0, g1] {
+                        for (std::size_t g = g0; g < g1; ++g)
+                            pos[std::size_t(std::uint64_t(keys[g].rowid) - std::uint64_t(mn))].store(
+                                static_cast<std::uint32_t>(g + 1), std::memory_order_relaxed);
+                    });
+                }
+                for (auto& t : ts) t.join();
+            }
+            // A slot claimed by another row is a duplicate row id (the writes
+            // above raced only if two rows share a slot, so this read-only pass
+            // is what reports it).
+            {
+                std::vector<std::thread> ts;
+                for (std::size_t w = 0; w < workers; ++w) {
+                    const std::size_t g0 = std::min(rows, w * per), g1 = std::min(rows, g0 + per);
+                    ts.emplace_back([&, w, g0, g1] {
+                        for (std::size_t g = g0; g < g1; ++g)
+                            if (pos[std::size_t(std::uint64_t(keys[g].rowid) - std::uint64_t(mn))].load(
+                                    std::memory_order_relaxed) != g + 1) {
+                                dup_hit[w] = 1; dup_id[w] = keys[g].rowid;
+                                return;
+                            }
+                    });
+                }
+                for (auto& t : ts) t.join();
+            }
+            for (std::size_t w = 0; w < workers; ++w)
+                if (dup_hit[w])
+                    throw std::runtime_error(std::string(fn) + ": duplicate row id " +
+                                             std::to_string(dup_id[w]) + " in the upload");
+            // Compact the slots into order[rank]: per-block count, prefix, write.
+            const std::size_t bper = (std::size_t(span) + workers - 1) / workers;
+            std::vector<std::size_t> cnt(workers, 0), off(workers, 0);
+            {
+                std::vector<std::thread> ts;
+                for (std::size_t w = 0; w < workers; ++w) {
+                    const std::size_t i0 = std::min(std::size_t(span), w * bper), i1 = std::min(std::size_t(span), i0 + bper);
+                    ts.emplace_back([&, w, i0, i1] {
+                        std::size_t n_seen = 0;
+                        for (std::size_t i = i0; i < i1; ++i) n_seen += pos[i].load(std::memory_order_relaxed) != 0;
+                        cnt[w] = n_seen;
+                    });
+                }
+                for (auto& t : ts) t.join();
+            }
+            std::size_t total = 0;
+            for (std::size_t w = 0; w < workers; ++w) { off[w] = total; total += cnt[w]; }
+            if (total != rows) throw std::runtime_error(std::string(fn) + ": row-id ranking lost rows");
+            {
+                std::vector<std::thread> ts;
+                for (std::size_t w = 0; w < workers; ++w) {
+                    const std::size_t i0 = std::min(std::size_t(span), w * bper), i1 = std::min(std::size_t(span), i0 + bper);
+                    ts.emplace_back([&, w, i0, i1] {
+                        std::size_t o = off[w];
+                        for (std::size_t i = i0; i < i1; ++i)
+                            if (const std::uint32_t k = pos[i].load(std::memory_order_relaxed)) order[o++] = keys[k - 1].src;
+                    });
+                }
+                for (auto& t : ts) t.join();
+            }
+        } else {
+            // Sparse row ids (a scan over part of a table): sort the pairs.
+            std::sort(keys.begin(), keys.end(),
+                      [](const RowKey& x, const RowKey& y) { return x.rowid < y.rowid; });
+            for (std::size_t g = 1; g < rows; ++g)
+                if (keys[g].rowid == keys[g - 1].rowid)
+                    throw std::runtime_error(std::string(fn) + ": duplicate row id " +
+                                             std::to_string(keys[g].rowid) + " in the upload");
+            for (std::size_t g = 0; g < rows; ++g) order[g] = keys[g].src;
+        }
+        std::vector<RowKey>().swap(keys);
+        pos.reset();
+        charge.give(idx_bytes - rows * sizeof(std::uint64_t));   // only order[] is still live
+        // Gather into fresh segments, parallel BY DESTINATION SEGMENT: one
+        // thread owns whole segments, so lane_valid allocation and the
+        // validity bit writes never race.
+        const std::size_t rps  = Segment::kLanes / L;            // rows per destination segment
+        const std::size_t nseg = (rows + rps - 1) / rps;
+        if (!charge.take(nseg * Segment::kLanes * sizeof(std::int64_t), /*exact*/true))
+            throw std::runtime_error(std::string(fn) + ": out of buffer memory placing the rows by row id" +
+                                     kPoolCapHint);
+        placed_segs.resize(nseg);
+        for (auto& s : placed_segs) s = std::make_shared<Segment>();
+        std::vector<std::vector<std::size_t>> null_lanes(segs.size());
+        for (std::size_t s = 0; s < segs.size(); ++s)
+            for (std::size_t l = 0; l < L && l < segs[s]->lane_valid.size(); ++l)
+                if (!segs[s]->lane_valid[l].empty()) null_lanes[s].push_back(l);
+        {
+            const std::size_t nw = std::max<std::size_t>(1, std::min(workers, nseg));
+            std::vector<std::thread> ts;
+            for (std::size_t w = 0; w < nw; ++w) {
+                ts.emplace_back([&, w, nw] {
+                    for (std::size_t s = w; s < nseg; s += nw) {
+                        Segment& d = *placed_segs[s];
+                        const std::size_t g0 = s * rps, g1 = std::min(rows, g0 + rps);
+                        for (std::size_t g = g0; g < g1; ++g) {
+                            const std::uint64_t src = order[g];
+                            const std::size_t sid = std::size_t(src >> 32);
+                            const std::size_t srow = std::size_t(src & 0xFFFFFFFFu);
+                            const Segment& sg = *segs[sid];
+                            const std::size_t drow = g - g0;
+                            std::memcpy(d.data + drow * L, sg.data + srow * L, L * sizeof(std::int64_t));
+                            for (std::size_t l : null_lanes[sid])
+                                if (!(sg.lane_valid[l][srow >> 6] & (std::uint64_t{1} << (srow & 63))))
+                                    d.mark_lane_null(drow, l, L);
+                        }
+                        d.n = (g1 - g0) * L;
+                    }
+                });
+            }
+            for (auto& t : ts) t.join();
+        }
+        std::vector<std::uint64_t>().swap(order);
+        charge.give(rows * sizeof(std::uint64_t));
+        spans.resize(nseg);
+        valid_ptrs.resize(nseg);
+        std::size_t at = 0;
+        for (std::size_t s = 0; s < nseg; ++s) {
+            Segment& d = *placed_segs[s];
+            spans[s].lanes = d.data;
+            spans[s].rows = d.n / L;
+            spans[s].n_lanes = L;
+            spans[s].dst_row = at;
+            spans[s].valid_bit = 0;
+            valid_ptrs[s].assign(L, nullptr);
+            for (std::size_t l = 0; l < L && l < d.lane_valid.size(); ++l)
+                if (!d.lane_valid[l].empty()) valid_ptrs[s][l] = d.lane_valid[l].data();
+            spans[s].valid = valid_ptrs[s].data();
+            at += spans[s].rows;
+        }
+        order_ms = ms_since(t_ord);
+    }
+    std::vector<gpudb::Dtype> dtypes(L, gpudb::Dtype::I64);
+    for (std::size_t e = 0; e < b.n_pf; ++e) dtypes[1 + b.n_pi + e] = gpudb::Dtype::F64;
+    auto& a = ctx.aggregator();
+    std::vector<std::unique_ptr<gpudb::ResidentColumn>> cols =
+        a.upload_rows_exact(spans.data(), spans.size(), dtypes.data(), L);
+    if (cols.size() != L) throw std::runtime_error(std::string(fn) + ": upload_rows_exact returned the wrong column count");
+    const double up_ms = ms_since(t0);
+    const std::string key = std::string("gpudb:v1:") + b.tag.catalog + ":" + b.tag.schema + ":" + b.tag.table + ":" +
+                            std::to_string(b.tag.table_oid);
+    std::size_t published = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx.registry_mu);
+        if (ctx.invalidated_since_locked(key, b.seq_at_start))
+            throw std::runtime_error(std::string("GPUDB_UPLOAD_DISCARDED: ") + fn + ": upload into '" + key +
+                "' discarded — the table was invalidated while the upload ran; run the upload again");
+        auto it = ctx.stores.find(key);
+        std::shared_ptr<TableStore> store;
+        if (it != ctx.stores.end() && it->second->rows_seen == b.rows_seen) {
+            store = it->second;
+        } else {
+            if (it != ctx.stores.end()) {
+                // another row count: the table changed — every view on the old store is stale
+                for (auto& kv : ctx.registry)
+                    if (kv.second->view && kv.second->store_key == key) kv.second->state.store(SetState::Stale);
+            }
+            store = std::make_shared<TableStore>();
+            store->key = key; store->catalog = b.tag.catalog; store->schema = b.tag.schema; store->table = b.tag.table;
+            store->table_oid = b.tag.table_oid; store->rows_seen = b.rows_seen;
+            store->epoch = ctx.inval_seq.load(std::memory_order_acquire);
+            ctx.stores[key] = store;
+        }
+        const std::int64_t now = now_us();
+        for (std::size_t l = 1; l < L; ++l) {
+            auto sc = std::make_shared<StoreColumn>();
+            sc->expr = names[l - 1];
+            sc->col = std::move(cols[l]);
+            sc->is_str = l >= 1 + b.n_pi + b.n_pf;
+            if (sc->is_str) {
+                const std::size_t slot = l - (1 + b.n_pi + b.n_pf);
+                sc->dict = std::make_shared<const ResidentSet::Dict>(
+                    slot < b.dicts.size() ? std::move(b.dicts[slot]) : ResidentSet::Dict{});
+            }
+            sc->uploaded_at_us = now;
+            sc->last_used_at_us.store(now, std::memory_order_relaxed);
+            store->cols[sc->expr] = sc;                  // a re-upload of a lane replaces it
+            ++published;
+        }
+    }
+    if (upload_trace())
+        std::fprintf(stderr, "[gpudb upload] %s '%s': rows=%zu lanes=%zu chunks=%zu placed=%d order=%.1f ms "
+                     "upload=%.1f ms (store %s)\n",
+                     fn, b.name.c_str(), rows, L - 1, chunks.size(), placed ? 1 : 0, order_ms, up_ms, key.c_str());
+    return rows;
+}
+
+void upload_columns_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
+                             duckdb_vector result, idx_t count, idx_t offset) {
+    if (count == 0) return;
+    auto* out = reinterpret_cast<std::int64_t*>(duckdb_vector_get_data(result));
+    duckdb_vector_ensure_validity_writable(result);
+    uint64_t* validity = duckdb_vector_get_validity(result);
+    for (idx_t i = 0; i < count; ++i) {
+        UploadState* s = probe_upload_state(source[i]);
+        UploadBuf* b = (s && s->buf_id != 0) ? s->buf : nullptr;
+        const std::size_t lanes = b ? b->lanes() : 0;
+        if (!b || lanes == 0 || b->lanes_per_row == 0) {
+            out[offset + i] = 0;
+            duckdb_validity_set_row_invalid(validity, offset + i);
+            continue;
+        }
+        try {
+            ResidentContext& ctx = ctx_of_aggregate(info);
+            if (session_append(ctx, *b, /*pair*/true, gpudb::Dtype::I64, "gpu_upload_columns", /*exact*/true)) {
+                out[offset + i] = static_cast<std::int64_t>(lanes / b->lanes_per_row);
+                continue;
+            }
+            out[offset + i] = static_cast<std::int64_t>(finish_upload_columns(ctx, *b, "gpu_upload_columns"));
+        } catch (const std::exception& e) {
+            duckdb_aggregate_function_set_error(info,
+                (std::string("gpu_upload_columns failed: ") + e.what()).c_str());
+            return;
+        }
+    }
+}
+
+// gpu_drop_column(store, lane) -> BOOLEAN: free one column of a table store
+// (the wrapper's memory budget evicts columns, least recently used first).
+// Every view that reads the lane is dropped with it.
+void drop_column_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector s_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector c_vec = duckdb_data_chunk_get_vector(input, 1);
+    auto* stores = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(s_vec));
+    auto* cols = reinterpret_cast<duckdb_string_t*>(duckdb_vector_get_data(c_vec));
+    uint64_t* sv = duckdb_vector_get_validity(s_vec);
+    uint64_t* cv = duckdb_vector_get_validity(c_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<bool*>(duckdb_vector_get_data(output));
+    ResidentContext& ctx = ctx_of(info);
+    for (idx_t i = 0; i < n; ++i) {
+        if ((sv && !duckdb_validity_row_is_valid(sv, i)) || (cv && !duckdb_validity_row_is_valid(cv, i))) {
+            out[i] = false;
+            continue;
+        }
+        const std::string key = read_name(stores, i), lane = read_name(cols, i);
+        std::lock_guard<std::mutex> lock(ctx.registry_mu);
+        auto it = ctx.stores.find(key);
+        if (it == ctx.stores.end()) { out[i] = false; continue; }
+        auto& store = *it->second;
+        auto cit = store.cols.find(lane);
+        if (cit == store.cols.end()) { out[i] = false; continue; }
+        const auto col = cit->second->col;
+        store.cols.erase(cit);
+        for (auto r = ctx.registry.begin(); r != ctx.registry.end();) {
+            const auto& v = r->second;
+            const bool uses = v->view && v->store_key == key &&
+                (v->keys == col || v->vals == col || std::find(v->preds.begin(), v->preds.end(), col) != v->preds.end());
+            if (uses) { v->state.store(SetState::Stale); r = ctx.registry.erase(r); } else ++r;
+        }
+        if (store.cols.empty()) ctx.stores.erase(it);
+        out[i] = true;
+    }
+}
+
+// gpu_store_columns() -> TABLE: every resident table column (stage B), what it
+// costs and when it was last read — what the memory budget accounts for.
+struct StoreColumnsRow {
+    std::string store, catalog, schema, table, column, dtype;
+    std::int64_t table_oid = -1, rows = 0, bytes = 0, epoch = 0, uploaded_at_us = 0, last_used_at_us = 0;
+    bool prepared = false;
+};
+struct StoreColumnsInit { std::vector<StoreColumnsRow> rows; std::size_t offset = 0; };
+
+void store_columns_bind(duckdb_bind_info info) {
+    auto add = [&](const char* name, duckdb_type t) {
+        duckdb_logical_type lt = duckdb_create_logical_type(t);
+        duckdb_bind_add_result_column(info, name, lt);
+        duckdb_destroy_logical_type(&lt);
+    };
+    add("store",        DUCKDB_TYPE_VARCHAR);
+    add("catalog",      DUCKDB_TYPE_VARCHAR);
+    add("schema",       DUCKDB_TYPE_VARCHAR);
+    add("table",        DUCKDB_TYPE_VARCHAR);
+    add("table_oid",    DUCKDB_TYPE_BIGINT);
+    add("column",       DUCKDB_TYPE_VARCHAR);
+    add("dtype",        DUCKDB_TYPE_VARCHAR);    // 'I64' | 'F64' | 'STR'
+    add("rows",         DUCKDB_TYPE_BIGINT);
+    add("bytes",        DUCKDB_TYPE_BIGINT);     // backend memory incl. the sort cache
+    add("prepared",     DUCKDB_TYPE_BOOLEAN);
+    add("epoch",        DUCKDB_TYPE_BIGINT);
+    add("uploaded_at",  DUCKDB_TYPE_TIMESTAMP);
+    add("last_used_at", DUCKDB_TYPE_TIMESTAMP);
+}
+
+void store_columns_init(duckdb_init_info info) {
+    auto* init = new StoreColumnsInit();
+    try {
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
+        std::lock_guard<std::mutex> lock(ctx.registry_mu);
+        for (const auto& kv : ctx.stores) {
+            const TableStore& st = *kv.second;
+            for (const auto& ck : st.cols) {
+                const StoreColumn& c = *ck.second;
+                StoreColumnsRow r;
+                r.store = st.key; r.catalog = st.catalog; r.schema = st.schema; r.table = st.table;
+                r.table_oid = st.table_oid; r.column = c.expr;
+                r.dtype = c.is_str ? "STR" : c.col->dtype() == gpudb::Dtype::F64 ? "F64" : "I64";
+                r.rows = static_cast<std::int64_t>(c.col->rows());
+                r.bytes = static_cast<std::int64_t>(c.col->resident_bytes());
+                r.prepared = c.col->prepared();
+                r.epoch = static_cast<std::int64_t>(st.epoch);
+                r.uploaded_at_us = c.uploaded_at_us;
+                r.last_used_at_us = c.last_used_at_us.load();
+                init->rows.push_back(std::move(r));
+            }
+        }
+        std::sort(init->rows.begin(), init->rows.end(),
+                  [](const StoreColumnsRow& a, const StoreColumnsRow& b) {
+                      return a.store != b.store ? a.store < b.store : a.column < b.column; });
+    } catch (const std::exception& e) {
+        delete init;
+        duckdb_init_set_error(info, e.what());
+        return;
+    }
+    duckdb_init_set_init_data(info, init, [](void* p) { delete static_cast<StoreColumnsInit*>(p); });
+}
+
+void store_columns_function(duckdb_function_info info, duckdb_data_chunk output) {
+    auto* init = static_cast<StoreColumnsInit*>(duckdb_function_get_init_data(info));
+    if (!init) return;
+    const std::size_t remaining = init->rows.size() - init->offset;
+    if (remaining == 0) return;
+    const idx_t out_n = static_cast<idx_t>(std::min<std::size_t>(remaining, 2048));
+    auto vec = [&](idx_t c) { return duckdb_data_chunk_get_vector(output, c); };
+    auto set_str = [&](idx_t c, idx_t i, const std::string& v) {
+        duckdb_vector_assign_string_element_len(vec(c), i, v.data(), v.size());
+    };
+    auto set_i64 = [&](idx_t c, idx_t i, std::int64_t x) { static_cast<std::int64_t*>(duckdb_vector_get_data(vec(c)))[i] = x; };
+    auto set_ts = [&](idx_t c, idx_t i, std::int64_t us) {
+        duckdb_vector v = vec(c);
+        if (us == 0) {
+            duckdb_vector_ensure_validity_writable(v);
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(v), i);
+            return;
+        }
+        static_cast<duckdb_timestamp*>(duckdb_vector_get_data(v))[i].micros = us;
+    };
+    for (idx_t i = 0; i < out_n; ++i) {
+        const StoreColumnsRow& r = init->rows[init->offset + i];
+        set_str(0, i, r.store); set_str(1, i, r.catalog); set_str(2, i, r.schema); set_str(3, i, r.table);
+        set_i64(4, i, r.table_oid); set_str(5, i, r.column); set_str(6, i, r.dtype);
+        set_i64(7, i, r.rows); set_i64(8, i, r.bytes);
+        static_cast<bool*>(duckdb_vector_get_data(vec(9)))[i] = r.prepared;
+        set_i64(10, i, r.epoch); set_ts(11, i, r.uploaded_at_us); set_ts(12, i, r.last_used_at_us);
+    }
+    duckdb_data_chunk_set_size(output, out_n);
+    init->offset += static_cast<std::size_t>(out_n);
+}
+
 // gpu_upload_begin(name) -> BOOLEAN: open (or replace) a session; segment
 // statements under this name append to it instead of uploading.
 void upload_begin_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
@@ -1826,7 +2642,9 @@ void upload_finish_exec(duckdb_function_info info, duckdb_data_chunk input, duck
             if (ss->exact) {
                 b.lanes_per_row = ss->lanes_per_row; b.n_pi = ss->n_pi; b.n_pf = ss->n_pf; b.n_ps = ss->n_ps;
                 b.key_str = ss->key_str; b.dicts = std::move(ss->dicts);
+                b.exact = true;
             }
+            if (ss->columns) { b.columns = true; b.chunks = std::move(ss->chunks); b.unordered = ss->unordered; }
             const std::size_t rows = finish_upload(ctx, b, ss->pair, ss->vdt, "gpu_upload_finish");
             pool_release(ss->charged);
             ss->charged = 0;
@@ -2056,6 +2874,7 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     info += ctx_of(info_).aggregator().exact_supported() ? " exact=true" : " exact=false";
     info += ctx_of(info_).aggregator().join_supported() ? " join=true" : " join=false";
     info += " device_memory=" + std::to_string(ctx_of(info_).aggregator().device_memory_bytes());
+    info += " store=true";
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());
@@ -2160,7 +2979,7 @@ JoinLaneRef join_lane_of(const ResidentSet& set, const std::string& c, const cha
     };
     if (c == "k") {
         r.col = set.keys.get();
-        if (set.key_str) { r.kind = 's'; r.dict = &set.key_dict; }
+        if (set.key_str) { r.kind = 's'; r.dict = set.key_dict.get(); }
     } else if (c == "v") {
         r.col = set.vals.get();
     } else if (c.size() > 1 && (c[0] == 'i' || c[0] == 'f' || c[0] == 's')) {
@@ -2174,7 +2993,7 @@ JoinLaneRef join_lane_of(const ResidentSet& set, const std::string& c, const cha
         const std::size_t base = c[0] == 'i' ? 0 : c[0] == 'f' ? set.pred_int : set.pred_int + set.pred_dbl;
         r.col = set.preds[base + idx].get();
         r.kind = c[0];
-        if (c[0] == 's') r.dict = &set.str_dicts[idx];
+        if (c[0] == 's') r.dict = set.str_dicts[idx].get();
     } else {
         throw bad();
     }
@@ -2370,8 +3189,7 @@ void assert_rows_exec(duckdb_function_info info, duckdb_data_chunk input,
             std::shared_ptr<ResidentSet> set;
             {
                 std::lock_guard<std::mutex> lock(ctx.registry_mu);
-                auto it = ctx.registry.find(name);
-                if (it != ctx.registry.end()) set = it->second;
+                set = ctx.find_or_view_locked(name);
             }
             if (!set)
                 throw std::runtime_error("GPUDB_STALE: gpu_assert_rows: no resident set named '" +
@@ -2471,8 +3289,8 @@ void dictionary_init(duckdb_init_info info) {
         if (!set->exact || !set->key_str)
             throw std::runtime_error("gpu_resident_dictionary: '" + bind->name +
                 "' has no string key (upload it with gpu_upload_rows_exact and a VARCHAR key)");
-        init->rows.reserve(set->key_dict.size());
-        for (const auto& kv : set->key_dict) init->rows.emplace_back(kv.first, kv.second);
+        init->rows.reserve(set->key_dict->size());
+        for (const auto& kv : *set->key_dict) init->rows.emplace_back(kv.first, kv.second);
         std::sort(init->rows.begin(), init->rows.end(),
                   [](const auto& a, const auto& b) { return a.first < b.first; });
     } catch (const std::exception& e) {
@@ -2538,8 +3356,8 @@ void dict_component_exec(duckdb_function_info info, duckdb_data_chunk input, duc
             }
             const std::int64_t i = idxs[r];
             if (i < 0 || i >= 8) throw std::runtime_error(std::string(fn) + ": component index must be 0..7");
-            const auto it = set->key_dict.find(static_cast<std::uint64_t>(keys[r]));
-            if (it == set->key_dict.end()) { duckdb_validity_set_row_invalid(ov, r); continue; }
+            const auto it = set->key_dict->find(static_cast<std::uint64_t>(keys[r]));
+            if (it == set->key_dict->end()) { duckdb_validity_set_row_invalid(ov, r); continue; }
             split_tuple(it->second, i + 1, parts);
             if (!parts[static_cast<std::size_t>(i)].first) { duckdb_validity_set_row_invalid(ov, r); continue; }
             const std::string& text = parts[static_cast<std::size_t>(i)].second;
@@ -2643,7 +3461,7 @@ void residents_init(duckdb_init_info info) {
             r.origin = s->managed ? "managed" : "explicit";
             r.catalog = s->catalog; r.schema = s->schema; r.table = s->table;
             r.table_oid = s->table_oid; r.columns = s->columns;
-            r.kind = s->pair ? "pair" : "column";
+            r.kind = s->view ? "view" : s->pair ? "pair" : "column";
             auto dt = [](const gpudb::ResidentColumn* c) {
                 return !c ? "" : c->dtype() == gpudb::Dtype::I64 ? "I64" : "F64";
             };
@@ -2651,7 +3469,7 @@ void residents_init(duckdb_init_info info) {
                               : std::string(dt(s->keys.get()));
             r.rows = static_cast<std::int64_t>(s->rows);
             r.rows_seen = static_cast<std::int64_t>(s->rows_seen);
-            r.bytes = static_cast<std::int64_t>(s->resident_bytes());
+            r.bytes = s->view ? 0 : static_cast<std::int64_t>(s->resident_bytes());   // a view owns nothing: gpu_store_columns() counts
             r.state = to_string(s->state.load());
             r.prepared = s->keys ? s->keys->prepared() : false;
             r.epoch = static_cast<std::int64_t>(s->epoch);
@@ -3071,6 +3889,36 @@ void register_gpu_resident(duckdb_connection con,
                 throw std::runtime_error("gpu_upload_rows_exact registration failed");
             }
         }
+        // gpu_upload_columns(tag, rowid BIGINT, ci BIGINT[], cf DOUBLE[], cs VARCHAR[]) -> BIGINT (stage B)
+        {
+            duckdb_aggregate_function cfn = duckdb_create_aggregate_function();
+            duckdb_aggregate_function_set_name(cfn, "gpu_upload_columns");
+            duckdb_logical_type t_name = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+            duckdb_logical_type t_r    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+            duckdb_logical_type t_i    = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+            duckdb_logical_type t_d    = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+            duckdb_logical_type t_s    = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
+            duckdb_logical_type t_ci   = duckdb_create_list_type(t_i);
+            duckdb_logical_type t_cf   = duckdb_create_list_type(t_d);
+            duckdb_logical_type t_cs   = duckdb_create_list_type(t_s);
+            duckdb_logical_type t_ret  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+            duckdb_aggregate_function_add_parameter(cfn, t_name);
+            duckdb_aggregate_function_add_parameter(cfn, t_r);
+            duckdb_aggregate_function_add_parameter(cfn, t_ci);
+            duckdb_aggregate_function_add_parameter(cfn, t_cf);
+            duckdb_aggregate_function_add_parameter(cfn, t_cs);
+            duckdb_aggregate_function_set_return_type(cfn, t_ret);
+            for (auto* t : { &t_name, &t_r, &t_i, &t_d, &t_s, &t_ci, &t_cf, &t_cs, &t_ret })
+                duckdb_destroy_logical_type(t);
+            duckdb_aggregate_function_set_functions(cfn, upload_state_size, upload_state_init,
+                                                    upload_columns_update, upload_combine, upload_columns_finalize);
+            duckdb_aggregate_function_set_destructor(cfn, upload_state_destroy);
+            duckdb_aggregate_function_set_special_handling(cfn);
+            duckdb_aggregate_function_set_extra_info(cfn, resident_extra_info(ctx), resident_extra_info_destroy);
+            duckdb_state cst = duckdb_register_aggregate_function(con, cfn);
+            duckdb_destroy_aggregate_function(&cfn);
+            if (cst == DuckDBError) throw std::runtime_error("gpu_upload_columns registration failed");
+        }
     }
 
     register_scalar_names(con, "gpu_sum_resident",
@@ -3093,6 +3941,8 @@ void register_gpu_resident(duckdb_connection con,
         join_materialize_exec, DUCKDB_TYPE_BIGINT, 6, ctx);
     register_scalar(con, "gpu_note_rows", note_rows_exec, DUCKDB_TYPE_BOOLEAN,
                     {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT}, ctx);
+    register_scalar(con, "gpu_drop_column", drop_column_exec, DUCKDB_TYPE_BOOLEAN,
+                    {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR}, ctx);
     register_scalar(con, "gpu_resident_dict_component", dict_component_exec, DUCKDB_TYPE_VARCHAR,
                     {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar_names(con, "gpu_upload_begin",
@@ -3142,6 +3992,19 @@ void register_gpu_resident(duckdb_connection con,
         if (duckdb_register_table_function(con, tf) == DuckDBError) {
             duckdb_destroy_table_function(&tf);
             throw std::runtime_error("gpu_residents registration failed");
+        }
+        duckdb_destroy_table_function(&tf);
+    }
+    {
+        duckdb_table_function tf = duckdb_create_table_function();
+        duckdb_table_function_set_name(tf, "gpu_store_columns");
+        duckdb_table_function_set_bind(tf, store_columns_bind);
+        duckdb_table_function_set_init(tf, store_columns_init);
+        duckdb_table_function_set_function(tf, store_columns_function);
+        duckdb_table_function_set_extra_info(tf, resident_extra_info(ctx), resident_extra_info_destroy);
+        if (duckdb_register_table_function(con, tf) == DuckDBError) {
+            duckdb_destroy_table_function(&tf);
+            throw std::runtime_error("gpu_store_columns registration failed");
         }
         duckdb_destroy_table_function(&tf);
     }

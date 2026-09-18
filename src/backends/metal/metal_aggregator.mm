@@ -1577,9 +1577,8 @@ private:
                       const Dtype* dtypes, std::size_t n_lanes) override {
         if (n_lanes == 0) throw std::runtime_error("upload_rows_exact: no lanes");
         if (dtypes[0] != Dtype::I64) throw std::runtime_error("upload_rows_exact: the key lane must be I64");
-        if (n_lanes > 1 && dtypes[1] != Dtype::I64)
-            throw std::runtime_error(
-                "upload_rows_exact: DOUBLE payloads are not on the exact path (docs/TRANSPARENT_DESIGN.md §4.7)");
+        // (lane 1 may be F64: a store upload orders lanes row id, ints, doubles, strings; the
+        // exact operators check the payload's dtype themselves)
         @autoreleasepool {
             std::size_t rows = 0, null_keys = 0;
             auto bit = [](const std::uint64_t* m, std::size_t i) {
@@ -1596,10 +1595,15 @@ private:
                 rows += spans[sidx].rows;
                 const std::uint64_t* kv = lane_valid(spans[sidx], 0);
                 if (!kv) continue;
-                const std::size_t r = spans[sidx].rows, full = r >> 6;
+                const std::size_t r = spans[sidx].rows, b0 = spans[sidx].valid_bit;
                 std::size_t z = 0;
-                for (std::size_t w = 0; w < full; ++w) z += static_cast<std::size_t>(__builtin_popcountll(~kv[w]));
-                if (r & 63) z += static_cast<std::size_t>(__builtin_popcountll(~kv[full] & ((std::uint64_t{1} << (r & 63)) - 1)));
+                if (b0 == 0) {
+                    const std::size_t full = r >> 6;
+                    for (std::size_t w = 0; w < full; ++w) z += static_cast<std::size_t>(__builtin_popcountll(~kv[w]));
+                    if (r & 63) z += static_cast<std::size_t>(__builtin_popcountll(~kv[full] & ((std::uint64_t{1} << (r & 63)) - 1)));
+                } else {
+                    for (std::size_t j = 0; j < r; ++j) z += !bit(kv, b0 + j);
+                }
                 span_null_keys[sidx] = z;
                 null_keys += z;
             }
@@ -1623,7 +1627,11 @@ private:
             std::vector<std::size_t> head0(n_spans, 0);
             {
                 std::size_t h = 0;
-                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) { head0[sidx] = h; h += spans[sidx].rows; }
+                for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+                    const std::size_t d0 = spans[sidx].dst_row == RowSpan::kNext ? h : spans[sidx].dst_row;
+                    if (d0 + spans[sidx].rows > rows) throw std::runtime_error("upload_rows_exact: span destination out of range");
+                    head0[sidx] = d0; h = d0 + spans[sidx].rows;
+                }
             }
             std::vector<std::vector<std::uint64_t>> valid(n_lanes);
             std::vector<std::atomic<bool>> lane_has_null(n_lanes);
@@ -1652,7 +1660,7 @@ private:
                 for (std::size_t j = 0; j < sp.rows; ++j) {
                     const std::size_t d = d0 + j;
                     for (std::size_t l = 0; l < n_lanes; ++l) {
-                        const bool ok = bit(lane_valid(sp, l), j);
+                        const bool ok = bit(lane_valid(sp, l), sp.valid_bit + j);
                         dst[l][d] = ok ? sp.lanes[j * n_lanes + l] : 0;
                         if (!ok) {
                             __atomic_and_fetch(&valid[l][d >> 6], ~(std::uint64_t{1} << (d & 63)), __ATOMIC_SEQ_CST);
@@ -1910,7 +1918,7 @@ private:
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] mask/select: %.3f ms (rows=%zu)\n", ms_, (std::size_t)n_total); }
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] mask/select: %.3f ms (rows=%zu) status=%ld%s\n", ms_, (std::size_t)n_total, (long)[cb status], [cb error] ? " ERROR" : ""); }
             }
 
             // ---- choose the reduce input: the range as is, its compaction (b), or masked (a) ----

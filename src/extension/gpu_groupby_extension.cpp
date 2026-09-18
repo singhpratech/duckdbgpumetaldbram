@@ -496,7 +496,7 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
         bool key_tuple = false;                                                   // k of a string-keyed set
         if (c == "k") {
             p.col = set.keys.get();
-            if (set.key_str) { sdict = &set.key_dict; key_tuple = true; }
+            if (set.key_str) { sdict = set.key_dict.get(); key_tuple = true; }
         }
         else if (c == "v") p.col = set.vals.get();
         else if ((c[0] == 'i' || c[0] == 'f' || c[0] == 's') && c.size() > 1) {
@@ -515,7 +515,7 @@ ResolvedWhere resolve_where(const ResidentSet& set, const std::vector<WhereTerm>
             const std::size_t base = kind == 'i' ? 0 : kind == 'f' ? set.pred_int : set.pred_int + set.pred_dbl;
             p.col = set.preds[base + idx].get();
             is_f64 = kind == 'f';
-            if (kind == 's') sdict = &set.str_dicts[idx];
+            if (kind == 's') sdict = set.str_dicts[idx].get();
         } else {
             throw std::runtime_error(std::string(fn) + ": WHERE program: unknown column '" + c + "'");
         }

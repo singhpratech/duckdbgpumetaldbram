@@ -71,6 +71,7 @@ class BaseSet:
     upload_sql: str
     lanes: Dict[tuple, str] = field(default_factory=dict)   # lane id -> k | v | i<n> | f<n> | s<n>
     sentinel: bool = False            # §4.13: a row-count sentinel (one scalar call, no table scan of its own)
+    store_lanes: List[Tuple[str, str, str]] = field(default_factory=list)   # stage B: (store name, sql, kind) per lane, tag order
 
 
 @dataclass
@@ -413,12 +414,14 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
 
     def layout(ids: List[tuple], first: Optional[tuple] = None, second: Optional[tuple] = None):
         """Order lane ids as (k, v, ints, doubles, strings) and name them."""
-        ints = [i for i in ids if need[i][2] == "i"]
+        # the all-NULL payload stand-in is never a key and always the payload slot: a store view
+        # has no column for it (the key column stands in — nothing reads a NULL payload)
+        ints = [i for i in ids if need[i][2] == "i" and i != ("null",)]
         k = first if first is not None else (ints[0] if ints else None)
         if k is None:
             raise Decline("shape", "no integer lane for a join set")
         rest_ints = [i for i in ints if i != k]
-        v = second if second is not None else (rest_ints[0] if rest_ints else None)
+        v = second if second is not None else (("null",) if ("null",) in ids else (rest_ints[0] if rest_ints else None))
         order = [k, v] + [i for i in rest_ints if i != v] \
             + [i for i in ids if need[i][2] == "f"] + [i for i in ids if need[i][2] == "s" and i != k]
         names: Dict[tuple, str] = {}
@@ -452,22 +455,32 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
         pi = [e for e, kd in list(zip(exprs, kinds))[2:] if kd == "i"]
         pf = [e for e, kd in list(zip(exprs, kinds))[2:] if kd == "f"]
         ps = [e for e, kd in list(zip(exprs, kinds))[2:] if kd == "s"]
-        # lane descriptors for the tag: the real column, or the key field for a computed key
+        # lane descriptors for the tag: the store names of the lanes (stage B: a base set is a
+        # view over its table's store, sharing lanes with every single-table statement — so the
+        # names are the ones _rewrite.store_lanes gives: the key field (role-prefixed when it is a
+        # tuple text), the payload's column, a predicate's virtual column, a join column)
         cols = []
         for lid in order:
             if lid is None:
                 cols.append("-")
             elif lid == ("key",):
-                cols.append("key=" + plan.key_field)
+                # a tuple-text key lives in the store under its role prefix (see _rewrite.store_lanes);
+                # the base set names it so wherever the lane sits
+                cols.append(("k#" + plan.key_field) if plan.dict_key else plan.key_field)
             elif lid == ("val",):
-                cols.append("val=" + plan.val)
+                cols.append(plan.val)
             elif lid == ("null",):
                 cols.append("-")
             elif lid[0] == "pred":
-                cols.append(low.colmap[lid[1]][1])
+                cols.append(lid[1])
             else:
                 cols.append(lid[2])
         tag = t.ident.tag(cols) + ":join"
+        store_lanes = []
+        for nm, lid, e, kd in zip(cols, order, exprs, kinds):
+            if lid is None or lid == ("null",):
+                continue
+            store_lanes.append((nm, e, kd))
         tq = tag.replace("'", "''")
         if kinds[0] == "s" or ps:
             sql = (f"SELECT gpu_upload_rows_exact('{tq}', {exprs[0]}, {exprs[1]}, [{', '.join(pi)}]::BIGINT[], "
@@ -477,7 +490,7 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
                    f"[{', '.join(pf)}]::DOUBLE[]) FROM {t.ident.fqn} AS {OUTER_ALIAS}")
         if first is not None:
             names[first] = "k"
-        base.append(BaseSet(table=ti, tag=tag, fqn=t.ident.fqn, upload_sql=sql, lanes=names))
+        base.append(BaseSet(table=ti, tag=tag, fqn=t.ident.fqn, upload_sql=sql, lanes=names, store_lanes=store_lanes))
 
     # ---- the chain ----
     desc = json.dumps({"tables": [b.tag for b in base],

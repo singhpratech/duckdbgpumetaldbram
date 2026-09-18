@@ -1008,21 +1008,24 @@ def run():
               f"budget: nothing evictable yet -> native, reason 'memory', answer unchanged ({lr['reason']})")
         check(con.memory()["evictions"] == 0 and sorted(con.execute(qa).fetchall()) == wa and con.last_rewrite()["rewritten"],
               "budget: the resident sets were left alone and still answer")
-        # past the anti-thrash window the least recently used set goes: qb (qa was just used)
+        # past the anti-thrash window the least recently used columns go — tm's (qa was just used);
+        # a column is the unit (stage B), so making room may take more than one eviction
         con._manager.evict_min_age_s = 0.0
         got = sorted(con.execute(qc).fetchall())
         states = {t.split(":")[4]: st for t, st in con.residents().items()}
-        check(con.last_rewrite()["rewritten"] and got == wc and con.memory()["evictions"] == 1,
-              "budget: the third set is uploaded after one eviction, answer identical")
-        check(states.get("tm") == "missing" and states.get("t") == "ready" and states.get("tu") == "ready",
-              f"budget: the least recently used set was the one evicted ({states})")
-        ext = {r[0].split(":")[4] for r in con._raw.execute("SELECT name FROM gpu_residents() WHERE origin = 'managed'").fetchall()}
-        check(ext == {"t", "tu"}, f"budget: the extension dropped it too ({sorted(ext)})")
-        # the evicted set comes back on its next sighting (evicting the new least recently used one)
+        ev1 = con.memory()["evictions"]
+        check(con.last_rewrite()["rewritten"] and got == wc and ev1 >= 1,
+              f"budget: the third set is uploaded after evicting ({ev1} evictions), answer identical")
+        tables = lambda: {r[0] for r in con._raw.execute("SELECT \"table\" FROM gpu_store_columns()").fetchall()}   # noqa: E731
+        check(states.get("tm") == "missing" and states.get("t") == "ready" and states.get("tu") == "ready" and tables() == {"t", "tu"},
+              f"budget: the least recently used table's columns were the ones evicted ({states}, resident: {sorted(tables())})")
+        # the evicted set comes back on its next sighting (evicting the new least recently used columns)
         got = sorted(con.execute(qb).fetchall())
-        check(con.last_rewrite()["rewritten"] and got == wb and con.memory()["evictions"] == 2,
-              "budget: an evicted set is uploaded again when its statement returns")
-        used = con._raw.execute("SELECT sum(bytes) FROM gpu_residents()").fetchone()[0]
+        ev2 = con.memory()["evictions"]
+        check(con.last_rewrite()["rewritten"] and got == wb and ev2 > ev1 and "tm" in tables(),
+              f"budget: an evicted set is uploaded again when its statement returns ({ev2} evictions)")
+        used = con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_residents()").fetchone()[0] + \
+               con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_store_columns()").fetchone()[0]
         check(used <= con.memory()["budget"], f"budget: resident bytes stay under it ({used} <= {con.memory()['budget']})")
     con.close()
 
@@ -1083,7 +1086,9 @@ def run():
         con._raw.execute("SELECT gpu_drop_resident(?)", [tag]).fetchall()      # behind the wrapper's back
         got = sorted(con.execute(qa).fetchall())
         lr = con.last_rewrite()
-        check(got == want and lr["fallback"], f"rewrite error: the set vanished -> native answer, no exception ({lr['error'][:60] or 'stale'})")
+        # a dropped SET is a stale fallback; a dropped VIEW (stage B) is re-synthesised from the table's
+        # store and the statement simply keeps working — either way: the right rows, no exception
+        check(got == want, f"rewrite error: the set vanished -> right answer, no exception (fallback={lr['fallback']}, rewritten={lr['rewritten']})")
         got = sorted(con.execute(qa).fetchall())
         check(got == want, "rewrite error: the next run answers correctly too "
                            f"(rewritten={con.last_rewrite()['rewritten']}, reason={con.last_rewrite()['reason']})")
@@ -1156,13 +1161,12 @@ def run():
         _th.TABLE.clear(); _th.TABLE.update(saved)
     con.close()
 
-    # an eager session never sees the statement run native: a rewritten statement slow enough to be
-    # suspect has native timed once, on a cursor of its own (the caller's result set is untouched)
+    # an eager session never sees the statement run native: after three rewritten runs native is
+    # timed once, on a cursor of its own (the caller's result set is untouched) — every template,
+    # however fast: the short ones are exactly the ones a busy process can turn slower than native
     from gpudb import connection as _cn
-    saved_bound = _cn._MEASURE_NATIVE_ABOVE_MS
     con = fresh(thresholds=True)
     try:
-        _cn._MEASURE_NATIVE_ABOVE_MS = 0.0          # every statement is "suspect"
         q = "SELECT k, sum(v), count(*) FROM t GROUP BY k"
         want = sorted(con._raw.execute(q).fetchall())
         outs = [sorted(con.execute(q).fetchall()) for _ in range(5)]
@@ -1172,15 +1176,36 @@ def run():
         verdict = "threshold" if min(d.rewritten_ms[:3]) >= d.native_ms else "rewritten"
         now = "rewritten" if con.last_rewrite()["rewritten"] else con.last_rewrite()["reason"]
         check(now == verdict, f"measured (eager): the comparison decides ({now}; {min(d.rewritten_ms[:3]):.2f} vs {d.native_ms:.2f} ms)")
-        _cn._MEASURE_NATIVE_ABOVE_MS = 1e9          # nothing is suspect: no probe
+        # the decision is re-measured: a kept template re-times native every _REMEASURE_S on a side
+        # cursor, a declined one re-times its rewritten form — whichever is faster now wins
         q2 = "SELECT k, max(v) FROM t GROUP BY k"
-        for _ in range(5):
+        for _ in range(4):
             con.execute(q2).fetchall()
         d2 = con._timing_decision
-        check(d2 is not d and d2.native_ms is None and con.last_rewrite()["rewritten"],
-              "measured (eager): a fast rewritten statement is never probed")
+        check(d2 is not None and d2 is not d and d2.timing_checked and d2.probe_sql,
+              "measured (eager): the second template was probed too and remembers its rewritten form")
+        if True:
+            d2.rewritten, d2.reason, d2.measured_declined = True, "", False   # start from "kept", whatever the tiny table measured
+            saved_probe = con._probe_ms
+            try:
+                con._probe_ms = lambda sql, params: 0.0            # native "instant": the kept template must go native
+                d2.next_check_at = 0.0
+                con.execute(q2).fetchall()
+                check(not d2.rewritten and d2.measured_declined and d2.reason == "threshold",
+                      "re-measured: a kept template that measures slower than native is declined")
+                got = con.execute(q2).fetchall()
+                check(con.last_rewrite()["reason"] == "threshold" and sorted(got) == sorted(con._raw.execute(q2).fetchall()),
+                      "re-measured: the declined template runs native, same rows")
+                con._probe_ms = lambda sql, params: 0.0            # rewritten "instant": the declined template comes back
+                d2.next_check_at = 0.0
+                con.execute(q2).fetchall()                         # this run is native; the probe decides
+                check(d2.rewritten and not d2.measured_declined, "re-measured: a declined template that measures faster is rewritten again")
+                con.execute(q2).fetchall()
+                check(con.last_rewrite()["rewritten"], "re-measured: ... and the next run is rewritten")
+            finally:
+                con._probe_ms = saved_probe
     finally:
-        _cn._MEASURE_NATIVE_ABOVE_MS = saved_bound
+        pass
     con.close()
 
     # ---- key joins (§4.8): plain JOIN SQL over a fact table and unique-key dimensions ----

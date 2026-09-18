@@ -63,12 +63,15 @@ struct ResidentSet {
     bool          pair = false;
     bool          exact = false;     // gpu_upload_pair_exact: NULLs kept (v0.7 §4.1);
                                      // only gpu_groupby_exact_resident reads such a set
-    std::unique_ptr<gpudb::ResidentColumn> keys;   // bare column, or pair.k
-    std::unique_ptr<gpudb::ResidentColumn> vals;   // pair.v (null for a bare column)
+    // Columns are SHARED (docs/RESIDENT_COLUMNS_DESIGN.md, stage B): a view
+    // synthesised from a TableStore references the store's columns, an
+    // uploaded set owns its own.
+    std::shared_ptr<gpudb::ResidentColumn> keys;   // bare column, or pair.k
+    std::shared_ptr<gpudb::ResidentColumn> vals;   // pair.v (null for a bare column)
     // gpu_upload_rows_exact (v0.7 §4.6): row-aligned predicate columns — the
     // BIGINT list's elements first (pred_int of them), then the DOUBLE
     // list's (pred_dbl). Addressed as i<n> / f<n> by the WHERE program.
-    std::vector<std::unique_ptr<gpudb::ResidentColumn>> preds;
+    std::vector<std::shared_ptr<gpudb::ResidentColumn>> preds;
     std::size_t   pred_int = 0, pred_dbl = 0, pred_str = 0;
     // VARCHAR keys / predicate columns (v0.7 §4.5): a string lane holds
     // hash64() of the text; the key lane the hash of the tuple text the
@@ -76,8 +79,14 @@ struct ResidentSet {
     // string lane keeps hash -> text so a WHERE literal can be checked for a
     // collision and gpu_resident_dictionary(tag, n) can map keys back.
     bool          key_str = false;
-    std::unordered_map<std::uint64_t, std::string>              key_dict;      // key lane (when key_str)
-    std::vector<std::unordered_map<std::uint64_t, std::string>> str_dicts;     // one per s<n> lane
+    using Dict = std::unordered_map<std::uint64_t, std::string>;
+    std::shared_ptr<const Dict>              key_dict;      // key lane (when key_str); never null when key_str
+    std::vector<std::shared_ptr<const Dict>> str_dicts;     // one per s<n> lane (shared with a store column)
+    // Stage B: a VIEW is a set whose columns belong to a TableStore (name =
+    // the plain identity tag). It is synthesised on first use and shares the
+    // store's columns, dictionaries and sort caches; it owns nothing.
+    bool          view = false;
+    std::string   store_key;
     // gpu_join_materialize (v0.7 §4.8): the sets this one was derived from.
     // A derived set is stale as soon as a source is stale, dropped or
     // replaced (checked on every acquire, by identity).
@@ -99,6 +108,27 @@ struct ResidentSet {
         for (const auto& p : preds) if (p) b += p->resident_bytes();
         return b;
     }
+};
+
+// ---- Stage B (docs/RESIDENT_COLUMNS_DESIGN.md): one resident copy per table column ----
+// A table's columns, in row-id order, keyed by the lane expression the wrapper
+// names in its tags (a column name, an x_<hash> computed lane, a k1+k2 key
+// tuple). Uploaded by gpu_upload_columns(); read by views (ResidentSet::view).
+struct StoreColumn {
+    std::string  expr;
+    std::shared_ptr<gpudb::ResidentColumn> col;
+    bool         is_str = false;                     // VARCHAR lane: hash64 values + dictionary
+    std::shared_ptr<const ResidentSet::Dict> dict;   // when is_str
+    std::int64_t uploaded_at_us = 0;
+    std::atomic<std::int64_t> last_used_at_us { 0 };
+};
+struct TableStore {
+    std::string   key;                               // gpudb:v1:<catalog>:<schema>:<table>:<oid>
+    std::string   catalog, schema, table;
+    std::int64_t  table_oid = -1;
+    std::size_t   rows_seen = 0;                     // every column has exactly this many rows
+    std::uint64_t epoch = 0;                         // invalidation sequence when the store was created
+    std::unordered_map<std::string, std::shared_ptr<StoreColumn>> cols;
 };
 
 class ResidentContext;

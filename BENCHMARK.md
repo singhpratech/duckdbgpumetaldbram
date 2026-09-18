@@ -3375,3 +3375,63 @@ all correctly: the sweep uploads a new set every few seconds, so nothing residen
 than the 60 s anti-thrash window. SF10 (sweep, 6 pieces): 771 variants, 487 rewritten, none
 below 1.0×, none differing; median 6.0×, range 1.07–85×.
 
+
+## v0.7 resident columns, stage B — device memory of the 22 TPC-H queries, Metal, SF10 (2026-09-18)
+
+What the store changes about memory, measured the same way on `main` (20ca095)
+and on the stage B branch: the 22 TPC-H queries back to back through
+`gpudb.connect(residency="eager", memory_budget="unlimited")` on
+`data/tpch_sf10/tpch.duckdb`, then `gpu_residents()` / `gpu_store_columns()`.
+Both: 16 of 22 on the device (Q1 3 4 5 7 8 9 10 11 12 14 17 18 19 21 22),
+all identical to native. Apple M4 Max, 64 GiB.
+
+| what is resident | main | stage B |
+|---|---|---|
+| single-table sets | 11 sets, 4.76 GiB | — (views, 0 bytes) |
+| join base sets | 8 sets, 7.24 GiB | — (views, 0 bytes) |
+| store columns (shared) | — | 35 columns, 11.43 GiB (`lineitem` 16 = 9.83, `orders` 7 = 1.23, `partsupp` 3 = 0.30) |
+| uploaded join results | 10 sets, 25.58 GiB | 10 sets, 25.58 GiB |
+| device join results | 3 sets, 7.90 GiB | 3 sets, 7.90 GiB |
+| **total** | **45.49 GiB** | **44.91 GiB** |
+
+The store holds every single-table and join-base lane once; on this workload
+those sets barely shared lanes, so the saving is 0.6 GiB. Three quarters of the
+memory is join results (copies in the join's row order) — stage D of
+`docs/RESIDENT_COLUMNS_DESIGN.md`.
+
+Store upload path, `GPUDB_UPLOAD_TRACE=1`: `lineitem`, 5 lanes for Q21 (three
+of them EXISTS / NOT EXISTS subqueries, which DuckDB evaluates through joins so
+the rows arrive in no row-id order): `rows=59986052 chunks=29291 placed=1
+order=172.3 ms upload=265.8 ms` — the placed path ranks the rows by id in
+172 ms of the 266 ms upload; SF1 same shape `order=12.8 ms upload=23.5 ms`.
+Plain scans keep the fast path (`placed=0`, chunks placed at their rank
+without touching the data).
+
+## Two modes of a short kernel — Metal, SF1 (2026-09-18)
+
+`SELECT l_returnflag, count(DISTINCT l_shipmode), sum(l_extendedprice * (1 -
+l_discount)) FROM lineitem WHERE l_discount <= 0.09 GROUP BY l_returnflag`,
+6M rows, exact GROUP BY on the device (mask, run starts, reduce; kernel time
+= `GPUStartTime`→`GPUEndTime`). Native 6.6 ms. Apple M4 Max.
+
+| process state | statement | kernel |
+|---|---|---|
+| `SET threads TO 1` (no DuckDB workers) | 3.4 ms | 2.16 ms |
+| … + 15 threads sleeping 5 ms in a loop | 10.5 ms | 6.78 ms |
+| … + 15 threads sleeping 1 ms in a loop | 8.6 ms | 6.72 ms |
+| … + 4 spinning threads | 330 ms | 6.69 ms |
+| … + threads stopped again | 3.4 ms | 2.14 ms |
+| `threads = 16` (default), fresh process | 3.7 ms | 2.18 ms |
+| `threads = 16`, in the gate's sequence (native runs between) | 8.1 ms | 6.5 ms |
+| bandwidth kernel `gpu_sum_resident` over 48 MB, either state | 0.4 ms | — |
+
+Per stage in the slow mode: mask 0.65 → 2.0 ms, run starts 0.31 → 0.97 ms,
+reduce 1.1 → 3.6 ms — uniform. Same on `main` and on the stage B branch,
+with the store on or off, and in `gpudb-sql` without Python. The wrapper's
+measured rule 1 (continuous, §9.1 of the transparent design) is the answer:
+in the slow mode this statement is declined at run time.
+
+Gate on the stage B branch after the change (`--subqueries --exprs`, SF1):
+772 variants, 485 rewritten rows all faster than native and identical, 48
+declined by the measured check (the process was in the slow mode when they
+ran), 0 slower, 0 differing.

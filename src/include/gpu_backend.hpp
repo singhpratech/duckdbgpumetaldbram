@@ -569,6 +569,14 @@ public:
         std::size_t                rows = 0;
         std::size_t                n_lanes = 0;
         const std::uint64_t* const* valid = nullptr;  // n_lanes entries, or nullptr
+        // Stage B of docs/RESIDENT_COLUMNS_DESIGN.md: a span may say where its rows
+        // land (dst_row; kNext = right after the previous span, the default) and at
+        // which bit of each lane's bitmap its first row sits (valid_bit: a span that
+        // starts mid-segment). Destinations must not overlap and must cover
+        // [0, total rows) exactly; the backend checks nothing beyond bounds.
+        static constexpr std::size_t kNext = ~std::size_t{0};
+        std::size_t                dst_row = kNext;
+        std::size_t                valid_bit = 0;
     };
     virtual std::vector<std::unique_ptr<ResidentColumn>>
         upload_rows_exact(const RowSpan* spans, std::size_t n_spans,

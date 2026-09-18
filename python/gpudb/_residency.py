@@ -68,6 +68,18 @@ class SetState:
     # (before the upload) and what the extension reports it costs (after)
     est_bytes: int = 0
     bytes: int = 0
+    # Stage B (docs/RESIDENT_COLUMNS_DESIGN.md): a set answered by a VIEW over its
+    # table's store. The upload session runs under `upload_name` (a store tag
+    # naming the missing lanes); `store_key` / `store_lanes` say what the view
+    # needs; `post_sql` runs once the upload landed (the key's sort cache).
+    upload_name: str = ""
+    store_key: str = ""
+    store_lanes: List[str] = field(default_factory=list)
+    post_sql: List[str] = field(default_factory=list)
+
+    @property
+    def session_name(self) -> str:
+        return self.upload_name or self.tag
 
     @property
     def derived(self) -> bool:
@@ -103,6 +115,7 @@ class ResidencyManager:
         self.memory_budget = memory_budget      # bytes of device memory for resident sets; None = no cap
         self.evict_min_age_s = evict_min_age_s
         self.evictions = 0
+        self._col_uploaded: Dict[tuple, float] = {}   # (store, lane) -> monotonic time it landed (anti-thrash)
         self._log = log or (lambda m: None)
         self._sets: Dict[str, SetState] = {}
         self._lock = threading.Lock()
@@ -147,7 +160,8 @@ class ResidencyManager:
 
     def note_candidate(self, tag: str, upload_sql: str, fqn: str = "",
                        deps: Optional[List[str]] = None, steps: Optional[List[str]] = None,
-                       est_bytes: int = 0) -> SetState:
+                       est_bytes: int = 0, upload_name: str = "", store_key: str = "",
+                       store_lanes: Optional[List[str]] = None, post_sql: Optional[List[str]] = None) -> SetState:
         """A rewritable shape over a non-resident set was seen. With `steps`
         the set is derived from `deps` (note those first). `est_bytes` is what
         the set is expected to cost on the device (§5.5, the memory budget)."""
@@ -161,6 +175,13 @@ class ResidencyManager:
                 s.fqn = fqn
             if est_bytes:
                 s.est_bytes = int(est_bytes)      # the table may have grown since the last sighting
+            if s.state in ("missing", "stale", "failed"):
+                # what the next upload must fetch may have changed (lanes evicted or landed meanwhile)
+                s.upload_sql = upload_sql or s.upload_sql
+                s.upload_name = upload_name
+                s.store_key = store_key
+                s.store_lanes = list(store_lanes or [])
+                s.post_sql = list(post_sql or [])
             # a set the memory budget refused stays refused until its retry time: re-queueing it on
             # every sighting would hide the reason and make the worker ask again every few ms
             refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
@@ -248,12 +269,20 @@ class ResidencyManager:
         try:
             rows = run("SELECT name, origin, bytes, refs, epoch_ms(last_used_at) AS used_ms "
                        "FROM gpu_residents()")
+            # stage B: the store's columns are what the views cost (a view reports 0)
+            crows = run("SELECT store, \"column\", bytes, epoch_ms(last_used_at) AS used_ms FROM gpu_store_columns()")
         except Exception as e:
             self._log(f"memory budget: gpu_residents() failed ({str(e)[:80]}); uploading without a check")
             return True
         keep = self._protected(s)
         live = {r[0]: r for r in rows}
         used = sum(int(r[2] or 0) for r in rows if r[0] != s.tag)
+        # columns: (store, lane) -> (bytes, last used)
+        cols = {(r[0], r[1]): (int(r[2] or 0), r[3]) for r in crows}
+        used += sum(b for b, _u in cols.values())
+        with self._lock:
+            keep_cols = {(o.store_key, l) for t, o in self._sets.items() if t in keep for l in o.store_lanes}
+            young_cols = {c for c, at in self._col_uploaded.items() if time.monotonic() - at < self.evict_min_age_s}
         while used + s.est_bytes > budget:
             now = time.monotonic()
             with self._lock:
@@ -264,6 +293,29 @@ class ResidencyManager:
             victims = [r for r in live.values()
                        if r[1] == "managed" and r[0] not in keep and r[0] not in is_source
                        and r[0] not in young and int(r[3] or 0) == 0 and int(r[2] or 0) > 0]
+            col_victims = [(c, b, u) for c, (b, u) in cols.items()
+                           if c not in keep_cols and c not in young_cols and b > 0]
+            if col_victims and (not victims or
+                                min(v[4] or 0 for v in victims) > min((u or 0) for _c, _b, u in col_victims)):
+                # the least recently used thing is a column: drop it (and the views on it)
+                c, b, _u = min(col_victims, key=lambda x: (x[2] is not None, x[2] or 0))
+                try:
+                    run("SELECT gpu_drop_column('%s', '%s')" % (c[0].replace("'", "''"), c[1].replace("'", "''")))
+                except Exception as e:
+                    self._log(f"memory budget: could not evict column {c}: {str(e)[:80]}")
+                    cols.pop(c, None)
+                    continue
+                used -= b
+                cols.pop(c, None)
+                with self._lock:
+                    self.evictions += 1
+                    self._col_uploaded.pop(c, None)
+                    for t, o in self._sets.items():
+                        if o.store_key == c[0] and c[1] in o.store_lanes and o.state == "ready":
+                            o.state = "missing"          # its next sighting uploads the missing lane
+                            o.bytes = 0
+                self._log(f"evicted (least recently used): column {c[1]} of {c[0]} ({b / 2**20:.0f} MiB) for {s.tag}")
+                continue
             if not victims:
                 managed = [r for r in live.values() if r[1] == "managed" and int(r[2] or 0) > 0]
                 why = (f"{len(managed)} managed sets: {sum(r[0] in keep for r in managed)} needed by this upload, "
@@ -294,11 +346,26 @@ class ResidencyManager:
             self._log(f"evicted (least recently used): {v[0]} ({int(v[2] or 0) / 2**20:.0f} MiB) for {s.tag}")
         return True
 
+    def _note_columns(self, s: SetState) -> None:
+        if not s.store_key:
+            return
+        with self._lock:
+            now = time.monotonic()
+            for l in s.store_lanes:
+                self._col_uploaded.setdefault((s.store_key, l), now)
+
     def _note_bytes(self, run: Callable[[str], List[tuple]], s: SetState) -> None:
         try:
-            row = run("SELECT bytes FROM gpu_residents() WHERE name = '%s'" % s.tag.replace("'", "''"))
+            if s.store_key:
+                # a view owns nothing: what its lanes cost in the store (shared with other views)
+                rows = run("SELECT \"column\", bytes FROM gpu_store_columns() WHERE store = '%s'" % s.store_key.replace("'", "''"))
+                have = {r[0]: int(r[1]) for r in rows}
+                total = sum(have.get(l, have.get("k#" + l, 0)) for l in s.store_lanes)
+            else:
+                row = run("SELECT bytes FROM gpu_residents() WHERE name = '%s'" % s.tag.replace("'", "''"))
+                total = int(row[0][0]) if row else 0
             with self._lock:
-                s.bytes = int(row[0][0]) if row else 0
+                s.bytes = total
         except Exception:
             pass
 
@@ -340,7 +407,9 @@ class ResidencyManager:
             s.last_upload_start = time.monotonic()
             epoch = s.epoch
         try:
-            for stmt in (s.steps if s.derived else [s.upload_sql]):
+            for stmt in (s.steps if s.derived else ([s.upload_sql] if s.upload_sql else [])):
+                run(stmt)
+            for stmt in s.post_sql:
                 run(stmt)
         except Exception as e:
             with self._lock:
@@ -348,6 +417,7 @@ class ResidencyManager:
                 s.error = str(e)[:200]
             return False
         self._note_bytes(run, s)
+        self._note_columns(s)
         with self._lock:
             if s.epoch == epoch and s.state == "uploading":
                 s.state = "ready"
@@ -422,7 +492,7 @@ class ResidencyManager:
         aimed at the segment statement can still hit it, hence the retries."""
         for _ in range(5):
             try:
-                row = cur.execute("SELECT gpu_upload_status(?)", [s.tag]).fetchall()
+                row = cur.execute("SELECT gpu_upload_status(?)", [s.session_name]).fetchall()
                 return json.loads(row[0][0])
             except Exception as e:
                 if not _is_interrupt(str(e)):
@@ -431,13 +501,20 @@ class ResidencyManager:
 
     def _abort(self, cur, s: SetState) -> None:
         try:
-            cur.execute("SELECT gpu_upload_abort(?)", [s.tag]).fetchall()
+            cur.execute("SELECT gpu_upload_abort(?)", [s.session_name]).fetchall()
         except Exception:
             pass
 
     def _extension_ready(self, cur, s: SetState) -> Optional[int]:
         """rows_seen of the set if the extension holds it ready, else None."""
         try:
+            if s.store_key:
+                rows = cur.execute("SELECT \"column\", rows FROM gpu_store_columns() WHERE store = ?",
+                                   [s.store_key]).fetchall()
+                have = {r[0]: int(r[1]) for r in rows}
+                if all(l in have for l in s.store_lanes) and s.store_lanes:
+                    return have[s.store_lanes[0]]
+                return None
             row = cur.execute("SELECT state, rows_seen FROM gpu_residents() WHERE name = ?",
                               [s.tag]).fetchone()
             return int(row[1]) if row and row[0] == "ready" else None
@@ -450,6 +527,14 @@ class ResidencyManager:
         t_start = time.monotonic()
         if s.derived:
             return self._session_derived(cur, s, epoch, t_start)
+        if not s.upload_sql:
+            # every lane is already in the store: only the view's sort cache is missing
+            try:
+                for stmt in s.post_sql:
+                    self._run(cur, s, stmt)
+            except Exception as e:
+                return "pending" if _is_interrupt(str(e)) else self._fail(s, e)
+            return "ready"
         fqn = s.fqn or s.upload_sql.split(" FROM ", 1)[1]
         seg_rows = self.segment_rows or s.segment_rows_default
         idle_ms = self.idle_ms
@@ -470,7 +555,7 @@ class ResidencyManager:
             s.seg_ms = []
         # 2. begin
         try:
-            self._run(cur, s, "SELECT gpu_upload_begin(?)", [s.tag])
+            self._run(cur, s, "SELECT gpu_upload_begin(?)", [s.session_name])
         except Exception as e:
             return "pending" if _is_interrupt(str(e)) else self._fail(s, e)
         # 3. segments, each only in an idle window
@@ -519,7 +604,7 @@ class ResidencyManager:
             return "closed" if self._closed else "stale"
         t_fin = time.monotonic()
         try:
-            row = self._run(cur, s, "SELECT gpu_upload_finish(?)", [s.tag])
+            row = self._run(cur, s, "SELECT gpu_upload_finish(?)", [s.session_name])
             rows = int(row[0][0])
         except Exception as e:
             err = str(e)
@@ -537,6 +622,12 @@ class ResidencyManager:
                     self._abort(cur, s)
                     return "pending"
             else:
+                return self._fail(s, e)
+        try:
+            for stmt in s.post_sql:                  # the view's sort cache, once the columns are there
+                self._run(cur, s, stmt)
+        except Exception as e:
+            if not _is_interrupt(str(e)):
                 return self._fail(s, e)
         with self._lock:
             s.rows_seen = rows
@@ -606,6 +697,7 @@ class ResidencyManager:
                 outcome = self._session(cur, s, epoch)
                 if outcome == "ready":
                     self._note_bytes(run, s)
+                    self._note_columns(s)
             with self._cv:
                 now = time.monotonic()
                 if outcome == "ready" and s.epoch == epoch and s.state == "uploading":

@@ -1114,6 +1114,104 @@ the tests that compare Metal against it are the proof: 804 unit checks, the
 SQL suite, 897 wrapper checks, then the gate. Nothing above the backend
 interface knew about the block, and nothing above it changed.
 
+## 2026-09-18 — Reinvention, stage B: the store
+
+Stage B is the storage half of `docs/RESIDENT_COLUMNS_DESIGN.md`: a table's
+lanes live once, by name, in row-id order, in a `TableStore`; a statement's
+set — and a device join's base set — is a *view* synthesised from those
+columns when it is first acquired. `gpu_upload_columns(tag, rowid, ints[],
+doubles[], strings[])` uploads any lanes of one table in one scan;
+`gpu_store_columns()` says what a table holds; `gpu_drop_column` is the
+budget's lever; `gpu_residents()` lists views at 0 bytes. The wrapper asks
+the store what is missing and uploads only that, so Q12's `l_orderkey` is
+one column for every single-table statement and for the join.
+
+Three things had to be exactly right and each cost a round:
+
+- **Row-id order without sorting the data.** DuckDB's parallel scan delivers
+  chunks in any order but rows ascending inside a chunk, so the upload records
+  a chunk per (update call, segment) and the backend places each chunk at its
+  row-id rank through the new `RowSpan::dst_row` / `valid_bit` (Metal and the
+  CPU reference; unit test "exact upload from placed spans" shuffles chunks
+  and compares against a one-span upload). Then Q21: a lane that is an EXISTS
+  subquery is evaluated through a join, and the rows come back in *no* order.
+  The placed path ranks every row by its id (a dense position table when the
+  ids are dense, a sort when not) and gathers the rows into fresh segments by
+  destination segment in parallel: 60M lineitem rows, 5 lanes, 29,291 chunks
+  — 172 ms of ranking in a 266 ms upload. The plain scan keeps the fast path.
+- **Names.** A GROUP BY key that is the tuple text of its columns is not the
+  column, so it lives under `k#<field>`; a join base set that carries the key
+  in lane 4 must say so in its tag — the view only guesses the prefix for
+  lane 0. And the all-NULL payload stand-in (`CAST(NULL AS BIGINT)`) is not a
+  column at all: it is never a base set's key and always its payload slot,
+  where the view stands the key column in (nothing reads a NULL payload).
+- **Staleness.** A view whose store went (invalidation, eviction) is only a
+  stale *name*: lookups erase it and re-synthesise once the lanes are back;
+  a store upload that finds another row count replaces the store and marks
+  its views stale; the wrapper's stale handler invalidates the table prefix.
+
+**Measured, SF10, the 22 TPC-H queries back to back, unlimited budget.** 16
+of 22 on the device, all identical (Q1 3 4 5 7 8 9 10 11 12 14 17 18 19 21
+22). Resident memory: store 35 columns = 11.4 GiB (lineitem 16 columns
+9.8 GiB, orders 7 = 1.2 GiB), 11 views at 0 bytes; still uploaded per
+statement: 10 uploaded join results = 25.6 GiB and 3 device-join results =
+7.9 GiB. Total 44.9 GiB, against 45.5 GiB on main with the same script
+(main: 11 single-table sets 4.8 GiB + 8 join base sets 7.2 GiB, now the
+11.4 GiB store; the same 33.5 GiB of join results). The honest reading: the
+saving on this workload is 0.6 GiB, because the 22 queries' single-table and
+base sets barely overlapped in lanes (the store also carries a sort cache
+per key column, as the sets did). What stage B changes is the structure —
+one copy per column, a budget that evicts columns, uploads of only what is
+missing, and rows placed by id whatever order a scan delivers — and it
+leaves three quarters of the memory in join *results*, which are still
+copies. That is stage D, designed in §6 of the
+design doc: a join set is an index vector per joined table plus only the
+cross-table expression lanes, and the kernels gather through the index. Stage
+C (narrow widths) then halves the store.
+
+## 2026-09-18 — Two modes of a short kernel: what the gate's three losing rows were
+
+The stage B gate came back with three `count(DISTINCT)` rows at 0.85–0.91×
+that pass on `main` at 1.6–1.9×. The same statement in isolation on the
+branch: 3.8 ms, identical to main. The whole day went into finding what the
+sequence changes, and the answer is not in the extension.
+
+The facts, in the order they were established: the slowdown is in the
+kernels themselves (`GPUStartTime`→`GPUEndTime`), uniform across the mask,
+run-starts and reduce stages (0.65/0.31/1.1 ms → 2.0/0.97/3.6 ms); an
+unrelated bandwidth kernel over another column runs at 0.4 ms in both
+states; a brand-new set uploaded in the slow state is slow too, so it is not
+the buffers; a fresh process is fast while the slow one idles next to it, so
+it is not the device; `SET threads TO 1` — no DuckDB worker threads —
+restores 2.2 ms instantly and `SET threads TO 16` brings 5–6 ms back; and
+the controlled version: with `threads = 1`, fifteen Python threads that do
+nothing but `sleep(0.005)` in a loop turn 2.16 ms into 6.78 ms, and it is
+2.14 ms again when they stop. Fully busy threads give the same 6.7 ms.
+Idle-but-waking cores are enough. The store had nothing to do with it (the
+one-cell loop degrades the same with the store off, and in the embedded CLI
+without Python), it only changed the timing of when the gate's cells hit the
+mode.
+
+What it means. On Apple silicon a sub-10 ms statement has two speeds, and
+which one a user sees depends on what else their process is doing — DuckDB's
+own worker pool after a parallel native query is the ordinary case. The
+gate's hot-loop minimums are the fast mode. A shape that wins 1.8× there can
+lose in the other, and rule 1 is not a promise about the fast mode.
+
+What changed. The measured check is no longer a one-off for statements over
+20 ms: after a template's first three rewritten runs native is timed once on
+a side cursor whatever the size (the short ones are the exposed ones); a
+template that does not win is declined; and every 60 s the decision is
+re-measured in the process's current state — native for a kept template, the
+rewritten form for a declined one — so a template that lost in the slow mode
+comes back when the mode does. One side-cursor execution per template per
+minute at most; the user's statement is never the experiment. The gate shows
+such a row as "declined after the first run (threshold)".
+
+Left open: whether the wrapper could tell the mode without paying the probe
+(the kernel time itself is visible in `gpu_last_stats`; a template whose
+kernel time doubles could be re-checked at once instead of on the clock).
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1133,6 +1231,10 @@ interface knew about the block, and nothing above it changed.
   interface stays I64; kernels widen on load) halves to quarters memory and the
   bytes every kernel reads. Sharing lanes between sets was measured at 0.0 GiB
   of saving on that workload and dropped.
+- **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
+  while other threads of the process keep waking (DuckDB's idle workers do).
+  The runtime measured check handles rule 1; a cheaper detector (the kernel
+  time in `gpu_last_stats`) could re-check at once instead of on the clock.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client; an Arrow-native
   result path would move the plain-form bounds.

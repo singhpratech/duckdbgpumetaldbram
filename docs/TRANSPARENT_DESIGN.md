@@ -825,10 +825,11 @@ Three fixes this work exposed, all general:
   number at most a quarter of the distinct key tuples; device HAVING and top-k
   always decode per key (§4.15).
 - *Measured rule 1 without a native observation.* A session with eager
-  residency never sees the statement run native, so the measured check (§4.11)
-  had nothing to compare with. When the best of the first three rewritten runs
-  is 20 ms or more — far outside a device answer — native is timed once, on a
-  cursor of its own, and the usual comparison decides.
+  residency never sees the statement run native, so the measured check (§9.1)
+  had nothing to compare with. After the first three rewritten runs native is
+  timed once, on a cursor of its own, for every template — the short ones
+  most of all, see "two modes of a short kernel" in §9.1 — and the usual
+  comparison decides; the decision is re-measured every 60 s.
 
 - *A VARCHAR key with few groups under a WHERE.* With ONE expression payload
   the cell is a coin flip (median 1.07×, below 1.0× in a quarter of process
@@ -1129,7 +1130,10 @@ same database — the extension stays free of threads and hidden connections
     (`bytes` includes derived structures). Sets uploaded by hand count toward
     the total and are never evicted.
   - *Eviction* is least recently used by the extension's own `last_used_at`,
-    through `gpu_drop_resident`. Never evicted: a set an operator is using
+    through `gpu_drop_resident` — and, since the store (§5.10), through
+    `gpu_drop_column` for the columns views share: a view costs nothing, its
+    columns are what the budget counts (`gpu_store_columns()`), and a column
+    goes when none of its views was used recently. Never evicted: a set an operator is using
     (`refs > 0`), a source of the set being uploaded, a source of another
     resident set (the derived set goes first — dropping a base table's set
     from under a join would turn every guard of that join stale), and any set
@@ -1249,14 +1253,23 @@ wrapper's own cursors are seen), and a read-only connection watches nothing
 because nobody can write the file while it is open read-only. A checkpoint
 from another connection looks like a write and costs one rebuild.
 
-### 5.10 Towards resident columns
+### 5.10 Resident columns: the store
 The storage design that replaces per-statement sets with per-table columns —
 one resident copy per column in row-id order, sort caches per key column, joins
 as index vectors, chunks for appends and for tables above the budget — is
 `docs/RESIDENT_COLUMNS_DESIGN.md`. Stage A (2026-09-18) changed the exact
 columns' layout: rows stay in input order and a NULL key is a bit in the key's
-validity bitmap, no longer a trailing block. Nothing above the backend
-interface changed; every suite and the gate are the proof.
+validity bitmap, no longer a trailing block. Stage B (2026-09-18) is the
+store: `gpu_upload_columns` uploads a table's lanes by name in row-id order
+into its `TableStore`; a statement's set — and a device join's base set — is
+a *view* synthesised from the store's columns on first use, sharing the
+columns, the dictionaries and the key's sort cache with every other statement
+on the table. The wrapper asks `gpu_store_columns()` what the table holds and
+uploads only the missing lanes (`_rewrite.store_lanes` / `store_upload_sql`,
+`connection._store_upload`); the budget counts and evicts columns
+(`gpu_drop_column`) and a view whose lane went is re-synthesised once the lane
+is back. Nothing in the rewrite, the guards or the gate changed; every suite
+and the gate are the proof. Join results are still copies — stage D.
 
 ## 6. The rewrite (piece D)
 
@@ -1403,6 +1416,29 @@ review's measurements and are replaced by BENCHMARK.md rows as they land;
 thresholds are measured on both machines and the gate refuses to enable the
 transparent path on a device whose margin at the floor is below 1.2×
 (laptops, T4) rather than assuming the 4090 and M-series numbers transfer.
+
+**Two modes of a short kernel (measured 2026-09-18).** A 2 ms exact GROUP
+BY kernel on the M4 Max runs at 2.0 ms or at 6.5 ms — every stage 3× slower,
+`GPUStartTime`→`GPUEndTime` — depending on what the rest of the *process* is
+doing: with DuckDB's idle worker threads waking every few milliseconds
+(`threads = 16`, the default) the slow mode sets in after native queries and
+stays; `SET threads TO 1` restores the fast mode at once; a fresh process is
+fast while the slow one idles beside it; 15 Python threads that merely sleep
+5 ms in a loop turn the fast mode into the slow one (2.16 → 6.78 ms) and back
+(2.14 ms). A bandwidth-bound kernel is unaffected (0.4 ms either way); the
+device idling a few seconds has the same effect for a few runs. This is the
+SoC's power management, not the extension: it is the same on `main`, with or
+without the store, in the embedded CLI without Python. What it means for rule
+1: the hot-loop minimums the gate reports for statements under ~10 ms are the
+fast mode, and a shape that wins 1.8× there loses (0.85×) in the slow mode.
+So the thresholds are not the last word — the process is: the wrapper times
+native once per template after its first three rewritten runs (a side cursor,
+whatever the statement's size), declines the template when the rewritten
+runs are not faster, and re-measures every 60 s — native for a kept template,
+the rewritten form for a declined one — so the answer follows the process's
+state. The user's own statement is never the experiment. In the gate a row
+that measures slower in the slow mode reads `declined after the first run
+(threshold)`: no ratio, and no statement ran slower for a user.
 
 ### 9.2 Three-way parity
 `groupby_parity_check.sh` runs every scenario native

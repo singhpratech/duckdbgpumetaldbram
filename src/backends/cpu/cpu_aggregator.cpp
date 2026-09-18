@@ -500,9 +500,7 @@ public:
                       const Dtype* dtypes, std::size_t n_lanes) override {
         if (n_lanes == 0) throw std::runtime_error("upload_rows_exact: no lanes");
         if (dtypes[0] != Dtype::I64) throw std::runtime_error("upload_rows_exact: the key lane must be I64");
-        if (n_lanes > 1 && dtypes[1] != Dtype::I64)
-            throw std::runtime_error(
-                "upload_rows_exact: DOUBLE payloads are not on the exact path (docs/TRANSPARENT_DESIGN.md §4.7)");
+        // (lane 1 may be F64: a store upload orders lanes row id, ints, doubles, strings)
         std::size_t rows = 0, null_keys = 0;
         auto bit = [](const std::uint64_t* m, std::size_t i) {
             return !m || ((m[i >> 6] >> (i & 63)) & 1u);
@@ -514,19 +512,23 @@ public:
             if (spans[s].n_lanes != n_lanes) throw std::runtime_error("upload_rows_exact: span lane count differs");
             rows += spans[s].rows;
             const std::uint64_t* kv = lane_valid(spans[s], 0);
-            if (kv) for (std::size_t j = 0; j < spans[s].rows; ++j) null_keys += !bit(kv, j);
+            if (kv) for (std::size_t j = 0; j < spans[s].rows; ++j) null_keys += !bit(kv, spans[s].valid_bit + j);
         }
         const std::size_t words = (rows + 63) / 64;
         std::vector<std::vector<std::int64_t>>  data(n_lanes, std::vector<std::int64_t>(rows));
         std::vector<std::vector<std::uint64_t>> valid(n_lanes, std::vector<std::uint64_t>(words, ~std::uint64_t{0}));
         std::vector<std::size_t> nulls(n_lanes, 0);
         (void)null_keys;
-        std::size_t dst = 0;
+        std::size_t next = 0;
         for (std::size_t s = 0; s < n_spans; ++s) {
             const RowSpan& sp = spans[s];
-            for (std::size_t j = 0; j < sp.rows; ++j, ++dst) {
+            const std::size_t d0 = sp.dst_row == RowSpan::kNext ? next : sp.dst_row;
+            if (d0 + sp.rows > rows) throw std::runtime_error("upload_rows_exact: span destination out of range");
+            next = d0 + sp.rows;
+            for (std::size_t j = 0; j < sp.rows; ++j) {
+                const std::size_t dst = d0 + j;
                 for (std::size_t l = 0; l < n_lanes; ++l) {
-                    const bool ok = bit(lane_valid(sp, l), j);
+                    const bool ok = bit(lane_valid(sp, l), sp.valid_bit + j);
                     data[l][dst] = ok ? sp.lanes[j * n_lanes + l] : 0;
                     if (!ok) { valid[l][dst >> 6] &= ~(std::uint64_t{1} << (dst & 63)); ++nulls[l]; }
                 }

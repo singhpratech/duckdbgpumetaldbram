@@ -985,6 +985,38 @@ def pred_lane_expr(plan: Plan, c: str, q=_q_default) -> str:
     return f"CAST({q(c)} * {10 ** d[1]} AS BIGINT)" if d and d[1] else _int_image(q(c), t)
 
 
+def store_lanes(plan: Plan, q=_q_default) -> List[Tuple[str, str, str]]:
+    """The lanes a plan's set needs from its table's STORE (docs/
+    RESIDENT_COLUMNS_DESIGN.md, stage B): (name, sql expression, kind) with
+    kind 'i' | 'f' | 's', named as the set tag names them so a view over the
+    store resolves them: the key tuple, the payload, the predicate columns."""
+    out: List[Tuple[str, str, str]] = []
+    # a dictionary key is the TUPLE TEXT of its columns, not the columns: it lives in the store
+    # under a role-prefixed name so it never collides with the raw column a WHERE lane holds
+    out.append((("k#" + plan.key_field) if plan.dict_key else plan.key_field,
+                key_lane_expr(plan, q), "s" if plan.dict_key else "i"))
+    if plan.val:
+        out.append((plan.val, val_lane_expr(plan, q), "i"))
+    for c in plan.pred_cols:
+        t = plan.pred_types.get(c, "")
+        kind = "f" if t in ("DOUBLE", "FLOAT", "REAL") else "s" if t in _STRING_TYPES else "i"
+        out.append((c, pred_lane_expr(plan, c, q), kind))
+    return out
+
+
+def store_upload_sql(tag_of, lanes: List[Tuple[str, str, str]], fqn: str) -> Tuple[str, str]:
+    """(store upload tag, statement) uploading `lanes` into the table's store
+    in row-id order. `tag_of(cols)` is Identity.tag; the tag lists the lanes
+    in upload order (ints, doubles, strings) with the extra field 'store'."""
+    ints = [l for l in lanes if l[2] == "i"]
+    dbls = [l for l in lanes if l[2] == "f"]
+    strs = [l for l in lanes if l[2] == "s"]
+    tag = tag_of([l[0] for l in ints + dbls + strs]) + ":store"
+    t = tag.replace("'", "''")
+    return tag, (f"SELECT gpu_upload_columns('{t}', rowid, [{', '.join(l[1] for l in ints)}]::BIGINT[], "
+                 f"[{', '.join(l[1] for l in dbls)}]::DOUBLE[], [{', '.join(l[1] for l in strs)}]::VARCHAR[]) FROM {fqn}")
+
+
 def upload_sql(plan: Plan, fqn: str, q=_q_default) -> str:
     """The upload statement for the plan's resident set (§5.5). `q` renders a
     plan column as SQL over the table: a quoted name, or the expression of a
