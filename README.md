@@ -189,8 +189,9 @@ results, but `gpu_last_stats()` will say `backend=CPU`. For the CUDA backend
 on Linux use the release binary (Option B; statically linked CUDA runtime,
 needs only a driver) or build from source with `nvcc`. Check any binary with
 `SELECT gpu_build_info();`.
-The registry serves the **v0.5.0** build (merged 2026-08-24), including the
-full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
+The registry serves the **v0.6.0** build (merged 2026-08-29), including the
+resident GROUP BY / top-k table functions (`gpu_groupby_*_resident`,
+`gpu_topk_resident`), the full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
 …) and the GPU join functions (`gpu_upload_pair`, `gpu_join_*_resident`,
 `gpu_join_rows_resident`). Installed an earlier version? `UPDATE EXTENSIONS;`
 pulls the latest.
