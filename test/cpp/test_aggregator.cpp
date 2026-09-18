@@ -2119,6 +2119,41 @@ void test_direct_groupby() {
     auto direct_agg = make_metal("direct");
     auto sort_agg   = make_metal("sort");
 
+    // Is the direct path available on this GPU at all? A forced-direct probe
+    // answers: the backend leaves the algorithm it ran in the path note, and
+    // the reason it could not run the other one beside it. A hosted macOS
+    // runner's virtualised Apple GPU compiles the kernel library and then
+    // refuses to lower these functions, and that must cost the suite nothing
+    // but the path assertions.
+    std::string unavailable;
+    {
+        const std::size_t n = 4096, L = 2;
+        std::vector<std::int64_t> flat(n * L);
+        for (std::size_t i = 0; i < n; ++i) {
+            flat[i * L] = static_cast<std::int64_t>(i % 5);
+            flat[i * L + 1] = static_cast<std::int64_t>(i);
+        }
+        const DT dts[2] = {DT::I64, DT::I64};
+        gpudb::Aggregator::RowSpan sp;
+        sp.lanes = flat.data(); sp.rows = n; sp.n_lanes = L; sp.valid = nullptr;
+        try {
+            auto c = direct_agg->upload_rows_exact(&sp, 1, dts, L);
+            gpudb::GroupByFilter f;
+            f.columns = 0x0Fu;
+            gpudb::exact_path_note().clear();
+            gpudb::exact_path_reason().clear();
+            (void)direct_agg->groupby_exact_resident(*c[0], c[1].get(), cap, f);
+            if (gpudb::exact_path_note() != "direct")
+                unavailable = gpudb::exact_path_reason().empty() ? "no reason given"
+                                                                : gpudb::exact_path_reason();
+        } catch (const std::exception& e) {
+            unavailable = std::string("probe threw: ") + e.what();
+        }
+    }
+    if (!unavailable.empty())
+        std::printf("  skipped path assertions (direct path unavailable: %s)\n", unavailable.c_str());
+    const bool have_direct = unavailable.empty();
+
     // Limb-for-limb equality of two results, in order: the group order, the
     // NULL-key group's place and a group the WHERE emptied being absent are
     // all part of the contract.
@@ -2280,7 +2315,7 @@ void test_direct_groupby() {
                         // it (32 slots); above that the slab would have to, and
                         // its min / max are 32-bit.
                         const std::size_t n_groups = c.distinct + (c.nk ? 1 : 0);
-                        const bool direct = c.distinct <= 512 &&
+                        const bool direct = have_direct && c.distinct <= 512 &&
                                             (!(wide && needs_mm[fi]) || n_groups <= 32);
                         EXPECT(same(got, want, what, /*totals*/direct));
                         EXPECT(same(srt, want, what, /*totals*/false));
@@ -2304,7 +2339,7 @@ void test_direct_groupby() {
                                got.sums == want.sums && got.sums_hi == want.sums_hi &&
                                got.counts == want.counts && got.counts_star == want.counts_star);
                         if (!(got.sums == want.sums)) std::printf("    FAIL %s\n", what);
-                        EXPECT_EQ(path == (c.distinct <= 512 ? "direct" : "sort"), true);
+                        EXPECT_EQ(path == (have_direct && c.distinct <= 512 ? "direct" : "sort"), true);
                     }
                 }
             }
@@ -2374,7 +2409,7 @@ void test_direct_groupby() {
                 dc[0]->prepare();
                 sc[0]->prepare();
                 const std::size_t extra = dc[0]->resident_bytes() - sc[0]->resident_bytes();
-                if (c.distinct <= 512) {
+                if (have_direct && c.distinct <= 512) {
                     const std::size_t null_id = c.nk ? c.distinct : c.distinct - 1;
                     const std::size_t gw = null_id <= 255 ? 1 : 2;
                     const std::size_t want_ids = x.rows * gw;
@@ -2426,9 +2461,10 @@ void test_direct_groupby() {
             auto got = auto_agg->groupby_exact_resident(*ac[0], ac[1].get(), cap, f);
             const std::string path = gpudb::exact_path_note();
             auto want = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
-            if (path != sd.want)
-                std::printf("    FAIL %s: path %s, expected %s\n", sd.name, path.c_str(), sd.want);
-            EXPECT_EQ(path == sd.want, true);
+            const char* want_path = have_direct ? sd.want : "sort";
+            if (path != want_path)
+                std::printf("    FAIL %s: path %s, expected %s\n", sd.name, path.c_str(), want_path);
+            EXPECT_EQ(path == want_path, true);
             const bool ok = got.keys == want.keys && got.sums == want.sums &&
                             got.sums_hi == want.sums_hi && got.counts == want.counts &&
                             got.counts_star == want.counts_star;
@@ -2496,6 +2532,75 @@ void test_direct_groupby() {
         std::printf("    FAIL: %s\n", e.what());
     }
 }
+// A GPU whose compiler refuses the direct path's pipelines must cost the
+// operator nothing but the path: no throw out of prepare() or out of any
+// exact call, the sort path answers, the answer is the reference's, and the
+// reason is kept. GPUDB_METAL_DIRECT_DISABLE_PSO makes every direct pipeline
+// refuse, so this runs on a device where the path would otherwise work.
+void test_direct_pso_fallback() {
+    std::printf("\n--- exact GROUP BY: the direct path's pipelines refused ---\n");
+    using DT = gpudb::Dtype;
+    const std::size_t cap = std::size_t(100) * 1000000;
+    auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+
+    const std::size_t N = 3'000'011, L = 3;
+    std::vector<std::int64_t> flat(N * L);
+    std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+    std::mt19937_64 rng(0xF0FAULL);
+    std::uniform_int_distribution<int> pct(0, 99);
+    for (std::size_t i = 0; i < N; ++i) {
+        flat[i * L + 0] = static_cast<std::int64_t>(i % 9);
+        flat[i * L + 1] = (std::int64_t{1} << 61) - static_cast<std::int64_t>(i % 877);
+        flat[i * L + 2] = static_cast<std::int64_t>(i % 1000);
+        if (pct(rng) < 5) valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+        if (pct(rng) < 7) valid[1][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+    }
+    std::vector<const std::uint64_t*> vp{valid[0].data(), valid[1].data(), valid[2].data()};
+    const DT dts[3] = {DT::I64, DT::I64, DT::I64};
+    gpudb::Aggregator::RowSpan sp;
+    sp.lanes = flat.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+
+    auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+    for (const char* mode : {"auto", "direct"}) {
+        setenv("GPUDB_METAL_DIRECT_DISABLE_PSO", "1", 1);
+        if (std::string(mode) == "auto") unsetenv("GPUDB_METAL_GROUPBY_EXACT_PATH");
+        else setenv("GPUDB_METAL_GROUPBY_EXACT_PATH", "direct", 1);
+        try {
+            auto agg = gpudb::make_aggregator(gpudb::Backend::METAL);
+            auto mc = agg->upload_rows_exact(&sp, 1, dts, L);
+            mc[0]->prepare();                       // must not throw either
+            gpudb::Predicate mp, rp;
+            mp.op = rp.op = gpudb::Predicate::Op::LT;
+            mp.value = rp.value = 800;
+            mp.col = mc[2].get(); rp.col = rc[2].get();
+            gpudb::GroupByFilter f;
+            f.columns = 0x0Fu;
+            gpudb::exact_path_note().clear();
+            gpudb::exact_path_reason().clear();
+            auto got = agg->groupby_exact_masked_resident(*mc[0], mc[1].get(), &mp, 1, cap, f);
+            const std::string path = gpudb::exact_path_note(), why = gpudb::exact_path_reason();
+            auto want = ref_agg->groupby_exact_masked_resident(*rc[0], rc[1].get(), &rp, 1, cap, f);
+            if (path != "sort") std::printf("    FAIL %s: path %s, expected sort\n", mode, path.c_str());
+            EXPECT_EQ(path == "sort", true);
+            if (why.empty()) std::printf("    FAIL %s: no reason recorded\n", mode);
+            EXPECT(!why.empty());
+            const bool ok = got.keys == want.keys && got.key_null == want.key_null &&
+                            got.sums == want.sums && got.sums_hi == want.sums_hi &&
+                            got.counts == want.counts && got.counts_star == want.counts_star;
+            if (!ok) std::printf("    FAIL %s: answer differs from the reference\n", mode);
+            EXPECT(ok);
+            // the id lane is never built, so the column costs what it did
+            EXPECT_EQ(mc[0]->resident_bytes() > 0, true);
+            std::printf("  %s: %zu groups through the sort path (%s)\n", mode, got.keys.size(), why.c_str());
+        } catch (const std::exception& e) {
+            ++failures; ++total;
+            std::printf("    FAIL %s: threw %s\n", mode, e.what());
+        }
+        unsetenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
+        unsetenv("GPUDB_METAL_GROUPBY_EXACT_PATH");
+    }
+}
+
 #endif  // GPUDB_HAVE_METAL
 
 // ---------------------------------------------------------------------------
@@ -2646,6 +2751,7 @@ int main(int argc, char** argv) {
     test_hybrid_groupby();
 #if GPUDB_HAVE_METAL
     test_direct_groupby();
+    test_direct_pso_fallback();
 #endif
     test_resident_prepare();
     test_hashjoin();

@@ -305,6 +305,20 @@ shape is left. The exact version wants a second pass — the first gives the hig
 word of the extreme per group, the second the low word among the rows that
 match it — and is worth building when something asks for it.
 
+**Where it does not run at all.** The direct path is five compute pipelines,
+and a GPU may compile the kernel library and then refuse to lower one of them —
+the virtualised Apple device on a hosted macOS runner does. That is not an
+error: the aggregator marks the path unavailable for its lifetime, keeps the
+compiler's own text, says so once on stderr, and every exact call answers
+through the sort path with `path=sort` and the reason in
+`gpudb::exact_path_reason()`. A forced `GPUDB_METAL_GROUPBY_EXACT_PATH=direct`
+answers the same way rather than failing. Nothing on the path throws out of an
+operator or out of `prepare()`. The threadgroup budget and the threads a
+pipeline will take are asked of the device rather than assumed, so a smaller
+GPU narrows the slab instead of overrunning it; `GPUDB_METAL_DIRECT_DISABLE_PSO`
+makes every pipeline refuse, which is how the fallback is tested where it would
+otherwise work.
+
 **Where it stops.** Two of the three limits are memory. The slab is
 `n_groups × (6 × payloads + 1)` 32-bit words and a threadgroup may hold 30 KiB
 of them, so 512 groups fit with one payload, 404 with three and 247 with five;

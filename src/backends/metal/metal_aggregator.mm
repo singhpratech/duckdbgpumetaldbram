@@ -201,6 +201,12 @@ public:
             out_quad_buf_      = [device_ newBufferWithLength:(4 * sizeof(std::int64_t))
                                                       options:MTLResourceStorageModeShared];
 
+            // The direct path's slab is dynamic threadgroup memory: take what
+            // the device says it has, not what an M-series has. On an M4 Max
+            // this is 32768 * 15/16 = 30720, the value it was hard-coded at.
+            const std::size_t tg = static_cast<std::size_t>([device_ maxThreadgroupMemoryLength]);
+            dir_slab_bytes_ = std::min<std::size_t>(kDirSlabBytes, tg - tg / 16);
+
             // What a column's prepare() does beyond its sort cache.
             sort_ctx_->on_prepare = [this](const ResidentColumn& c) { on_column_prepared(c); };
         }
@@ -2231,6 +2237,11 @@ private:
         }
         if (k.dtype() != Dtype::I64 || k.rows() == 0) { k.set_gid_none(); return false; }
         if (k.rows() > 0xFFFFFFFFull - 64) { k.set_gid_none(); return false; }
+        // Both helpers must exist before anything is allocated or sorted; a
+        // refusal here is the path being unavailable, not this column.
+        id<MTLComputePipelineState> ids_ps = dir_ids_pso();
+        id<MTLComputePipelineState> fill_ps = dir_fill_pso();
+        if (!ids_ps || !fill_ps) return false;
         std::lock_guard<std::mutex> lock(k.gid_mutex());
         if (k.gid_state() != MetalResidentColumn::kGidUnknown)
             return k.gid_state() == MetalResidentColumn::kGidReady;
@@ -2292,7 +2303,7 @@ private:
             if (has_null) {
                 const std::uint32_t r32 = static_cast<std::uint32_t>(rows);
                 const std::uint32_t gw32 = gw, null_id = static_cast<std::uint32_t>(groups);
-                [ce setComputePipelineState:dir_fill_pso()];
+                [ce setComputePipelineState:fill_ps];
                 [ce setBuffer:ids offset:0 atIndex:0];
                 [ce setBytes:&r32     length:sizeof(r32)     atIndex:1];
                 [ce setBytes:&gw32    length:sizeof(gw32)    atIndex:2];
@@ -2303,7 +2314,7 @@ private:
             }
             if (n > 0) {
                 const std::uint32_t gw32 = gw;
-                [ce setComputePipelineState:dir_ids_pso()];
+                [ce setComputePipelineState:ids_ps];
                 [ce setBuffer:sorted offset:0 atIndex:0];
                 [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
                 [ce setBuffer:gdir_blk_buf_ offset:0 atIndex:2];
@@ -2351,7 +2362,7 @@ private:
                      const Predicate* preds, std::size_t n_preds,
                      const GroupByFilter& filter,
                      DirectPlan& pl, double* kernel_ms) {
-        if (exact_path_ == ExactPath::Sort) return false;
+        if (exact_path_ == ExactPath::Sort || !direct_available()) return false;
         if (!ensure_gid_lane(k, kernel_ms)) return false;
         const bool has_null = k.null_count() > 0;
         pl.n_groups = k.gid_groups() + (has_null ? 1 : 0);
@@ -2411,7 +2422,7 @@ private:
             std::uint32_t want = 1;
             while (want < kDirMaxCopies && want * pl.n_groups < kBlock) want <<= 1;
             for (std::uint32_t r = want; r >= 1; r >>= 1)
-                if (r * per_copy * sizeof(std::uint32_t) <= kDirSlabBytes) { ncopy = r; break; }
+                if (r * per_copy * sizeof(std::uint32_t) <= dir_slab_bytes_) { ncopy = r; break; }
         }
         const bool slab_ok = !wide_mm && ncopy > 0;
         std::size_t b = 0;
@@ -2449,6 +2460,10 @@ private:
             if (s < 0) return false;
             pl.pay_slot[p] = static_cast<std::uint32_t>(s);
         }
+        // Build the pipelines this call will use now, so direct_impl never has
+        // to deal with a refusal half way through a command buffer.
+        if (!dir_merge_pso()) return false;
+        if (!(pl.slab ? dir_slab_pso() : dir_pso(pl.bucket))) return false;
         pl.prog.resize(n_preds);
         for (std::size_t q = 0; q < n_preds; ++q) {
             const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
@@ -2543,7 +2558,11 @@ private:
 
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-            [ce setComputePipelineState:pl.slab ? dir_slab_pso() : dir_pso(pl.bucket)];
+            id<MTLComputePipelineState> main_ps = pl.slab ? dir_slab_pso() : dir_pso(pl.bucket);
+            id<MTLComputePipelineState> merge_ps = dir_merge_pso();
+            if (!main_ps || !merge_ps)
+                throw std::runtime_error(std::string(op) + ": direct pipeline vanished");
+            [ce setComputePipelineState:main_ps];
             if (pl.slab) [ce setThreadgroupMemoryLength:pl.tg_bytes atIndex:0];
             for (std::size_t i = 0; i < kGaggLanes; ++i) {
                 const bool have = i < pl.lane.size();
@@ -2562,7 +2581,7 @@ private:
             [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
             {
                 const std::size_t threads = n_groups * (1 + n_pays);
-                [ce setComputePipelineState:dir_merge_pso()];
+                [ce setComputePipelineState:merge_ps];
                 [ce setBuffer:gdir_out_ offset:0 atIndex:0];
                 [ce setBytes:&mu length:sizeof(mu) atIndex:1];
                 [ce setBuffer:gdir_res_ offset:0 atIndex:2];
@@ -2724,11 +2743,13 @@ private:
                     if (n_extras && filter.active() && !filter.wants(0))
                         throw std::runtime_error(std::string(op) + ": several payloads under a filter need the keys");
                     exact_path_note() = "direct";
+                    exact_path_reason().clear();
                     return direct_impl(k, v, n_preds, max_groups, filter, op, pl,
                                        extras, n_extras, extra_out, t_wall0, dir_ms);
                 }
             }
             exact_path_note() = "sort";
+            exact_path_reason() = direct_available() ? std::string() : direct_reason();
             adopt_warm_scratch();
 
             const std::size_t n = k.sort_rows();          // valid keys (the sort cache covers them)
@@ -3573,36 +3594,111 @@ private:
     }
 
     // ---- the direct path's pipelines, built on first use ----
-    // Four instantiations of one kernel body, ~20 ms of pipeline build each:
-    // a process that never groups by a few-valued key should not pay for
-    // them at startup.
+    // Two instantiations of one kernel body plus the slab variant and three
+    // small helpers, ~20 ms of pipeline build each: a process that never
+    // groups by a few-valued key should not pay for them at startup.
+    //
+    // A pipeline that will not build is NOT an error. Some GPUs — the
+    // virtualised Apple device on a hosted macOS runner is the one that found
+    // this — compile the library and then refuse to lower one of these
+    // functions. When that happens the direct path is marked unavailable for
+    // the aggregator's lifetime, with the compiler's own text kept, and every
+    // exact call answers through the sort path. Nothing here throws.
+    bool direct_available() const { return direct_ok_.load(std::memory_order_acquire); }
+    std::string direct_reason() {
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        return direct_why_;
+    }
+    // Records the first refusal, asks the rest of the path's functions whether
+    // they would build too, and disables the path. One CI run then names every
+    // function this GPU rejects instead of only the first one asked for.
+    // Called with dir_pso_mu_ held.
+    void direct_unavailable_locked(NSString* name, NSError* err) {
+        if (!direct_why_.empty()) return;
+        std::ostringstream os;
+        os << "pipeline " << [name UTF8String] << " would not build";
+        if (err) os << ": " << [[err localizedDescription] UTF8String];
+        direct_ok_.store(false, std::memory_order_release);
+        @autoreleasepool {
+            NSString* all[5] = {@"gdir_ids_i64", @"gdir_fill_ids", @"gdir_merge_i64",
+                                @"gdir_masked_8_i64", @"gdir_slab_i64"};
+            std::string good, bad;
+            for (NSString* n : all) {
+                if ([n isEqualToString:name]) continue;
+                bool ok = false;
+                if (!dir_disable_pso_) {
+                    if (id<MTLFunction> f = [lib_ newFunctionWithName:n]) {
+                        NSError* e = nil;
+                        ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
+                    }
+                }
+                std::string& into = ok ? good : bad;
+                if (!into.empty()) into.append(", ");
+                into.append([n UTF8String]);
+            }
+            if (!bad.empty())  os << "; also refused: " << bad;
+            if (!good.empty()) os << "; would build: " << good;
+        }
+        direct_why_ = os.str();
+        // Once per process: CI does not set the trace variable, and a red run
+        // that says only "Compilation failed" is what sent us looking.
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] exact GROUP BY direct path unavailable: %s\n",
+                         direct_why_.c_str());
+    }
+    // nil on refusal, never a throw. `pipeline_threads` must be at least kBlock:
+    // the direct kernels reduce over a threadgroup of exactly that size.
+    id<MTLComputePipelineState> dir_make_locked(__strong id<MTLComputePipelineState>& slot, NSString* name) {
+        if (slot) return slot;
+        if (!direct_ok_.load(std::memory_order_relaxed)) return nil;
+        @autoreleasepool {
+            if (dir_disable_pso_) {                       // GPUDB_METAL_DIRECT_DISABLE_PSO
+                direct_unavailable_locked(name, nil);
+                return nil;
+            }
+            id<MTLFunction> fn = [lib_ newFunctionWithName:name];
+            if (!fn) { direct_unavailable_locked(name, nil); return nil; }
+            NSError* err = nil;
+            id<MTLComputePipelineState> pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
+            if (!pso) { direct_unavailable_locked(name, err); return nil; }
+            if ([pso maxTotalThreadsPerThreadgroup] < kBlock) {
+                // the tree reductions are written for a full threadgroup
+                std::ostringstream os;
+                os << "threadgroup of " << (unsigned long)[pso maxTotalThreadsPerThreadgroup]
+                   << " threads, below the " << (unsigned long)kBlock << " the reduce needs";
+                NSError* e2 = [NSError errorWithDomain:@"gpudb"
+                                                  code:1
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                         [NSString stringWithUTF8String:os.str().c_str()]}];
+                direct_unavailable_locked(name, e2);
+                return nil;
+            }
+            slot = pso;
+            return slot;
+        }
+    }
     id<MTLComputePipelineState> dir_pso(std::size_t b) {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
-        if (!ps_gdir_[b]) {
-            NSString* names[2] = {@"gdir_masked_8_i64", @"gdir_masked_32_i64"};
-            ps_gdir_[b] = make_pso(lib_, names[b]);
-        }
-        return ps_gdir_[b];
+        NSString* names[2] = {@"gdir_masked_8_i64", @"gdir_masked_32_i64"};
+        return dir_make_locked(ps_gdir_[b], names[b]);
     }
     id<MTLComputePipelineState> dir_slab_pso() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
-        if (!ps_gdir_slab_) ps_gdir_slab_ = make_pso(lib_, @"gdir_slab_i64");
-        return ps_gdir_slab_;
+        return dir_make_locked(ps_gdir_slab_, @"gdir_slab_i64");
     }
     id<MTLComputePipelineState> dir_ids_pso() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
-        if (!ps_gdir_ids_) ps_gdir_ids_ = make_pso(lib_, @"gdir_ids_i64");
-        return ps_gdir_ids_;
+        return dir_make_locked(ps_gdir_ids_, @"gdir_ids_i64");
     }
     id<MTLComputePipelineState> dir_fill_pso() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
-        if (!ps_gdir_fill_) ps_gdir_fill_ = make_pso(lib_, @"gdir_fill_ids");
-        return ps_gdir_fill_;
+        return dir_make_locked(ps_gdir_fill_, @"gdir_fill_ids");
     }
     id<MTLComputePipelineState> dir_merge_pso() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
-        if (!ps_gdir_merge_) ps_gdir_merge_ = make_pso(lib_, @"gdir_merge_i64");
-        return ps_gdir_merge_;
+        return dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64");
     }
 
     // A freshly allocated shared buffer costs the GPU 0.31 ms per million
@@ -3612,12 +3708,14 @@ private:
     // byte per element, which is the touch.
     void touch_scratch(id<MTLBuffer> b, std::size_t bytes) {
         if (!b || bytes == 0) return;
+        id<MTLComputePipelineState> fill = dir_fill_pso();
+        if (!fill) return;                       // the path is unavailable; nothing to warm
         @autoreleasepool {
             const std::uint32_t n32 = static_cast<std::uint32_t>(std::min<std::size_t>(bytes, 0xFFFFFFFFull));
             const std::uint32_t one = 1, zero = 0;
             id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-            [ce setComputePipelineState:dir_fill_pso()];
+            [ce setComputePipelineState:fill];
             [ce setBuffer:b offset:0 atIndex:0];
             [ce setBytes:&n32  length:sizeof(n32)  atIndex:1];
             [ce setBytes:&one  length:sizeof(one)  atIndex:2];
@@ -4009,6 +4107,14 @@ private:
         return v;
     }();
     std::mutex dir_mu_;                              // guards the id-lane scratch and the warm buffers
+    std::atomic<bool> direct_ok_{true};              // cleared for good when a pipeline will not build
+    std::string direct_why_;                         // ... and why, in the compiler's words (dir_pso_mu_)
+    // GPUDB_METAL_DIRECT_DISABLE_PSO=1: every direct pipeline refuses to
+    // build, so the fallback can be tested on a device where it would work.
+    bool dir_disable_pso_ = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO") != nullptr;
+    // What a threadgroup may hold, asked of the device rather than assumed.
+    // The slab kernel binds this much dynamically and nothing statically.
+    std::size_t dir_slab_bytes_ = kDirSlabBytes;
     id<MTLBuffer> gdir_out_ = nil, gdir_res_ = nil, gdir_blk_buf_ = nil;
     id<MTLBuffer> gdir_meta_ = nil, gdir_prog_ = nil, gdir_list_ = nil, gdir_pay_ = nil;
     id<MTLBuffer> warm_mask_ = nil, warm_mult_ = nil;
