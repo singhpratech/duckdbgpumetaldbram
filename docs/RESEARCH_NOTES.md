@@ -946,6 +946,10 @@ given to the column (the sorter forgets them), large staging released — which
 also ends a hidden cost: after a 300M-row sort the sorter kept ~9.6 GB of
 staging alive outside any budget.
 
+Measured after finding 3 landed: SF50 sort cache 3075 ms → 505 ms, the first
+statement on a 300M-row table 4.7 s → 1.38 s; at SF1 the change is within noise
+(the sort kernel is the cost there). 300M keys in 0.5 s is ~600M keys/s.
+
 **TPC-H at SF50 after findings 1–2 (Metal, 64 GB M4 Max, 40 GB benchmark budget):**
 10 of 22 on the device, all identical — Q22 94×, Q5 53×, Q9 7.3×, Q19 5.7×,
 Q10 4.2×, Q1 3.6×, Q21 3.5×, Q3 2.8×, Q14 2.6×, Q11 1.5×. Six more were refused

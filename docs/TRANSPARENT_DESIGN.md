@@ -1119,6 +1119,8 @@ same database — the extension stays free of threads and hidden connections
   memory) — the general 4 GB cap, a guardrail against window-frame buffering,
   had kept every set above ~250M row-lanes off the device (TPC-H SF50: 0 of 22
   resident before, 10 of 22 after).
+  What the CUDA backend has to implement to join this path, and the tests that
+  prove it, is listed in `docs/CUDA_EXACT_PATH.md`.
 - **When the rewritten statement itself fails.** Staleness was the only
   error the wrapper recovered from. Any other error of the rewritten form — a
   device allocation that fails at query time despite the budget, a set

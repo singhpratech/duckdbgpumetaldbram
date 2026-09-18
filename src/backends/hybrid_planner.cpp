@@ -427,6 +427,9 @@ public:
     bool join_supported() const noexcept override {
         return gpu_ ? gpu_->join_supported() : cpu_->join_supported();
     }
+    std::size_t device_memory_bytes() const noexcept override {
+        return gpu_ ? gpu_->device_memory_bytes() : cpu_->device_memory_bytes();
+    }
     JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
                                            const ResidentColumn& build_key,
                                            const JoinLane* out, std::size_t n_out) override {

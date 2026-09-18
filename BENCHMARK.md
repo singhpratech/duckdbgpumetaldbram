@@ -3361,7 +3361,9 @@ resident is older than the 60 s anti-thrash window.
 10 of 22 queries answered on the device; 0 with rows that differ from native
 
 First statement on a 300M-row set (key + payload, 8.9 GiB resident including the sort cache):
-4.7 s including the upload, then 157 ms against 1478 ms native. Upload phases at SF1 (6M rows,
+4.7 s including the upload, then 157 ms against 1478 ms native; with the sort cache taking the
+sorter's buffers instead of copying them (below) the same first statement is 1.38 s (device copy
+161 ms, sort cache 505 ms — down from 3075 ms — the rest DuckDB's scan). Upload phases at SF1 (6M rows,
 two lanes): copy into device buffers 10–15 ms -> 3.5 ms (parallel, NULL-free fast path); whole
 upload 39 ms -> 26–30 ms; the sort cache is now the largest part (16–18 ms).
 

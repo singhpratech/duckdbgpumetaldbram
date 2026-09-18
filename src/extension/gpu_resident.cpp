@@ -2035,6 +2035,7 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   compiled=cpu,metal     → Metal backend present (macOS build)
 //   join=true|false        → the runtime backend runs join_materialize on its own device (§4.8)
 //   exact=true|false       → the runtime backend runs the v0.7 exact GROUP BY
+//   device_memory=<bytes>  → what the backend reports for the memory budget (0 = unknown, §5.5)
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
 void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
@@ -2054,6 +2055,7 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     }
     info += ctx_of(info_).aggregator().exact_supported() ? " exact=true" : " exact=false";
     info += ctx_of(info_).aggregator().join_supported() ? " join=true" : " join=false";
+    info += " device_memory=" + std::to_string(ctx_of(info_).aggregator().device_memory_bytes());
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());

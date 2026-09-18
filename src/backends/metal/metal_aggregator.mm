@@ -226,7 +226,11 @@ public:
     bool exact_supported() const noexcept override { return true; }
 
     // ---- v0.7 §4.8: the materialised key join ----
-    bool join_supported() const noexcept override { return true; }
+    bool join_supported() const noexcept override { return true; }    std::size_t device_memory_bytes() const noexcept override {
+        // unified memory: what Metal recommends a process keep resident at once
+        return device_ ? static_cast<std::size_t>([device_ recommendedMaxWorkingSetSize]) : 0;
+    }
+
 
     JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
                                            const ResidentColumn& build_key,

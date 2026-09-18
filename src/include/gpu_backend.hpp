@@ -639,6 +639,11 @@ public:
                                                    const ResidentColumn& build_key,
                                                    const JoinLane* out, std::size_t n_out);
     [[nodiscard]] virtual bool join_supported() const noexcept { return false; }
+    // Device memory the wrapper's memory budget (docs/TRANSPARENT_DESIGN.md §5.5) may
+    // plan against, in bytes: the working-set size on unified memory, total device memory
+    // on a discrete GPU; 0 = unknown (the wrapper then uses a conservative default).
+    // Reported by gpu_build_info() as device_memory=<bytes>.
+    [[nodiscard]] virtual std::size_t device_memory_bytes() const noexcept { return 0; }
 
     // ORDER BY col [DESC] LIMIT k over a resident column (I64 or F64).
     // Returns the k smallest (descending=false) or largest values with their

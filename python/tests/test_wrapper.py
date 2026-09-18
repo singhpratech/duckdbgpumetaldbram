@@ -815,6 +815,11 @@ def run():
         check(False, "budget: nonsense raises")
     except ValueError:
         check(True, "budget: nonsense raises")
+    check(_cn2.default_memory_budget("CUDA", 24 * 2**30) == 12 * 2**30
+          and _cn2.default_memory_budget("CUDA", 0) == min(_cn2._host_memory_bytes() // 4, 8 * 2**30)
+          and _cn2.default_memory_budget("METAL", 0) == _cn2._host_memory_bytes() // 4
+          and _cn2.default_memory_budget("METAL", 2**30) == 2**30,
+          "budget defaults: half of a discrete GPU's memory, a conservative fallback without it, a quarter of unified memory capped by what Metal reports")
     one = _cn2.estimate_set_bytes(N, 2)               # a (key, payload) set over an N-row table
     qa = "SELECT k, sum(v) FROM t GROUP BY k"
     qb = "SELECT k, sum(a) FROM tm GROUP BY k"
@@ -822,6 +827,8 @@ def run():
     con = fresh(memory_budget=int(one * 2.5))          # room for two such sets, not three
     if getattr(con, "_exact", False):
         check(con.memory()["budget"] == int(one * 2.5), "budget: the setting reaches the manager")
+        check(con._backend != "METAL" or con._device_bytes > 2**30,
+              f"budget: the backend reports its device memory through gpu_build_info ({con._device_bytes // 2**30} GiB)")
         wa, wb, wc = (sorted(con._raw.execute(q).fetchall()) for q in (qa, qb, qc))
         for q in (qa, qb):
             con.execute(q).fetchall()
