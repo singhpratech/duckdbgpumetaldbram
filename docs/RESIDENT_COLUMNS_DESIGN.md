@@ -315,6 +315,23 @@ through the sort path with `path=sort` and the reason in
 answers the same way rather than failing. Nothing on the path throws out of an
 operator or out of `prepare()`.
 
+**The device is asked what it is before it is asked to compile anything.** On
+the virtualised Apple GPU of a hosted macOS runner, ONE refused pipeline build
+leaves that process's Metal compiler unusable: after `gdir_slab_i64` was
+refused on `macos-15-arm64` ("Apple Paravirtual device", families Apple1–Apple7
+Mac2 Common1–3 Metal3), `sum_i64`, `hashjoin_merge_sorted_i64` and
+`bitonic_step_i64` all failed in the same process — kernels that had built
+minutes earlier. No fallback can repair that, so the slab kernel is never
+offered to a device we are unsure of. The gate, before any direct pipeline is
+requested: the device must report `MTLGPUFamilyApple7` or above (where the slab
+reduce's threadgroup atomics were measured), and a device whose name contains
+`Paravirtual` is refused outright — a deny entry written from this evidence,
+because that compiler's behaviour cannot be queried. A refusal compiles nothing,
+probes nothing and builds no id lane; `GPUDB_METAL_DIRECT_DISABLE_PSO=unsupported`
+simulates it and the unit tests assert that the count of pipelines asked of the
+device is zero. `device_name()` carries the families, so every log says what the
+machine reported.
+
 **Every pipeline names itself when it will not build.** All four Metal
 subsystems — the aggregator, the radix sorter, the v0.6 GROUP BY and the hash
 join — put the function's name and the compiler's own text in the error or the

@@ -98,6 +98,24 @@ inline unsigned width_for(std::int64_t mn, std::int64_t mx) {
     return 8;
 }
 
+// The GPU families a device reports, for the record: a CI log that says which
+// ones the runner has is what turns "Compilation failed" into a decision.
+std::string metal_families(id<MTLDevice> dev) {
+    struct F { MTLGPUFamily f; const char* name; };
+    static const F known[] = {
+        {MTLGPUFamilyApple9, "Apple9"}, {MTLGPUFamilyApple8, "Apple8"},
+        {MTLGPUFamilyApple7, "Apple7"}, {MTLGPUFamilyApple6, "Apple6"},
+        {MTLGPUFamilyApple5, "Apple5"}, {MTLGPUFamilyApple4, "Apple4"},
+        {MTLGPUFamilyApple3, "Apple3"}, {MTLGPUFamilyApple2, "Apple2"},
+        {MTLGPUFamilyApple1, "Apple1"}, {MTLGPUFamilyMac2, "Mac2"},
+        {MTLGPUFamilyCommon3, "Common3"}, {MTLGPUFamilyCommon2, "Common2"},
+        {MTLGPUFamilyCommon1, "Common1"}, {MTLGPUFamilyMetal3, "Metal3"}};
+    std::string out;
+    for (const F& k : known)
+        if ([dev supportsFamily:k.f]) { if (!out.empty()) out += " "; out += k.name; }
+    return out.empty() ? std::string("no known family") : out;
+}
+
 double cb_kernel_ms(id<MTLCommandBuffer> cb) {
     // GPUStart/EndTime are CFAbsoluteTime (seconds). Available after completion.
     const double s = [cb GPUStartTime];
@@ -223,9 +241,8 @@ public:
 
     std::string device_name() const override {
         @autoreleasepool {
-            NSString* name = [device_ name];
             std::ostringstream os;
-            os << [name UTF8String] << " (Metal)";
+            os << [[device_ name] UTF8String] << " (Metal, " << metal_families(device_) << ")";
             return os.str();
         }
     }
@@ -3635,6 +3652,7 @@ private:
             for (NSString* n : all) {
                 if ([n isEqualToString:name]) continue;
                 bool ok = false;
+                metal_direct_pipeline_requests().fetch_add(1, std::memory_order_relaxed);
                 if (id<MTLFunction> f = [lib_ newFunctionWithName:dir_probe_name(n)]) {
                     NSError* e = nil;
                     ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
@@ -3670,6 +3688,7 @@ private:
             // than short-circuiting ahead of it.
             NSError* err = nil;
             id<MTLComputePipelineState> pso = nil;
+            metal_direct_pipeline_requests().fetch_add(1, std::memory_order_relaxed);
             id<MTLFunction> fn = [lib_ newFunctionWithName:dir_probe_name(name)];
             if (!fn) {
                 err = [NSError errorWithDomain:@"gpudb" code:2
@@ -3708,12 +3727,51 @@ private:
     // builds them while refusing the slab, and they only serve a min / max
     // over a payload lane wider than 4 bytes, a shape that measured no better
     // than the sort path on any device we have. So: no slab, no direct path.
+    // Asked BEFORE any direct pipeline is requested, because on the virtualised
+    // Apple device of a hosted macOS runner ONE refused build leaves that
+    // process's compiler unusable: after `gdir_slab_i64` was refused on
+    // macos-15-arm64 ("Apple Paravirtual device"), `sum_i64`,
+    // `hashjoin_merge_sorted_i64` and `bitonic_step_i64` all failed in the
+    // same process, having built moments before. A fallback after the fact
+    // cannot repair that, so such a device is never offered the kernel at all.
+    // Empty means the path may be tried; anything else is the reason it may not.
+    std::string direct_capability_refusal() const {
+        if (dir_disable_pso_ == "unsupported")
+            return "GPUDB_METAL_DIRECT_DISABLE_PSO=unsupported";
+        @autoreleasepool {
+            NSString* nm = [device_ name];
+            if (nm && [nm rangeOfString:@"Paravirtual"].location != NSNotFound)
+                return std::string("device \"") + [nm UTF8String] + "\" is a virtualised Apple GPU, "
+                       "where one refused pipeline build makes every later build in the process fail";
+            if (![device_ supportsFamily:MTLGPUFamilyApple7])
+                return std::string("device \"") + [nm UTF8String] + "\" (" +
+                       metal_families(device_) + ") is below MTLGPUFamilyApple7, the families the "
+                       "slab reduce's threadgroup atomics were measured on";
+        }
+        return {};
+    }
+    // Disables the path without asking Metal for anything at all.
+    void direct_deny_locked(const std::string& why) {
+        if (!direct_why_.empty()) return;
+        direct_why_ = "not offered to this device: " + why;
+        direct_ok_.store(false, std::memory_order_release);
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] exact GROUP BY direct path %s\n", direct_why_.c_str());
+    }
+
     bool direct_ensure_ready() {
         if (!direct_ok_.load(std::memory_order_acquire)) return false;
         if (dir_probed_.load(std::memory_order_acquire)) return true;
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
         if (dir_probed_.load(std::memory_order_relaxed))
             return direct_ok_.load(std::memory_order_relaxed);
+        if (const std::string why = direct_capability_refusal(); !why.empty()) {
+            direct_deny_locked(why);                 // nothing is compiled, nothing is probed
+            dir_probed_.store(true, std::memory_order_release);
+            return false;
+        }
         const bool ok = dir_make_locked(ps_gdir_ids_,   @"gdir_ids_i64")   != nil
                      && dir_make_locked(ps_gdir_fill_,  @"gdir_fill_ids")  != nil
                      && dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64") != nil
