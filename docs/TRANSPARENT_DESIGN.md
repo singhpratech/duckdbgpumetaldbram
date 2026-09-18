@@ -150,7 +150,14 @@ aggregate (`order_bys` on the function node), `TABLESAMPLE` (`sample` on the
 `QUALIFY` (`qualify` non-null), set operations (`SET_OPERATION_NODE`),
 `PARAMETER` nodes, and a non-empty `cte_map.map` at any scope that defines
 the table's name (§5.1). The unit test for the matcher enumerates each of
-these as a serialized tree that must come back unchanged.
+these as a serialized tree that must come back unchanged. This is a list of
+tree shapes the matcher declines, not a list of SQL the device cannot answer:
+the Python wrapper normalises the statement before the decision, so
+`GROUP BY ALL`, group and order ordinals, `ORDER BY ALL` and `SELECT DISTINCT`
+are spelled out into plain keys first (§4.21) and `FILTER (WHERE …)`,
+`count_if` and `bool_and` / `bool_or` are rewritten into their `CASE` /
+`min` / `max` identities (§4.19) — what reaches the matcher no longer carries
+the rejected field.
 
 Everything above the matched subtree (projection, aliases, joins to the
 result, further `ORDER BY`, enclosing CTEs) is untouched; the replacement
@@ -1427,8 +1434,9 @@ and the gate are the proof. Join results are still copies — stage D.
 4. `last_rewrite()` is a **wrapper** method (not a SQL function: the scalar
    is pure and may run in parallel) reporting, for the last statement on
    that connection, whether it was rewritten and if not why (`shape` /
-   `not_resident` / `threshold` / `stale` / `budget` / `backend` /
-   `transaction` / `too_long` / `double`), which is also what the gate
+   `not_resident` / `threshold` / `memory` / `backend` /
+   `transaction` / `too_long` / `double` / … — the full list is `REASONS` in
+   `python/gpudb/connection.py`), which is also what the gate
    parses. `EXPLAIN` of the rewritten statement shows the `gpu_*` table
    function in the plan.
    Two forms the reference renderer and the scalar both produce, settled

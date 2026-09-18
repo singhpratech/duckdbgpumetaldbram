@@ -86,7 +86,7 @@ is being added.
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
 - `scripts/tpch_coverage.py` — the 22 TPC-H queries, SF1: expect 15 of 22 on the
-  device with identical rows (Metal); `--db data/tpch_sf10/tpch.duckdb` 16 of 22.
+  device with identical rows (Metal); `--db data/tpch_sf10/tpch.duckdb` (with `GPUDB_MEMORY_BUDGET_MB=200000`) 17 of 22.
 
 ## 4. Rule 1 on CUDA: measure, then set the thresholds
 
