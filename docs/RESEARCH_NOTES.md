@@ -1069,6 +1069,25 @@ installed unsigned build needs `allow_unsigned_extensions`; the failure is now
 logged with DuckDB's reason instead of swallowed. CI builds and imports the
 wheel on Linux.
 
+## 2026-09-18 — Lane sharing measured before it was built: not worth building
+
+The plan after the SF50 run was to share identical lanes between resident sets
+(`l_quantity` uploaded once, used by every set that reads it). Before writing
+it, the count: the 22 TPC-H queries at SF10 produce 24 sets with 102 lane
+instances of which 87 are distinct — 32.9 GiB of lanes plus sort caches — and
+every one of the 15 duplicates sits in a join-result set (§4.13), whose rows are
+in the join's order, not the table's: not shareable. Saving from sharing
+single-table lanes: 0.0 GiB. The feature is dropped before it cost a line.
+
+Where the memory actually is: 87 distinct lanes × 8 bytes per row. Most of
+them are small integers, dates, flags and two-decimal amounts that fit 32 bits
+or less. Narrower lanes (a backend storing a lane as I32 / I16 when its values
+fit, widening on load; the interface stays I64) would halve to quarter both
+the memory and the bytes every kernel reads — a speed lever as much as a memory
+one. It touches every exact kernel, so it is a designed change, not tonight's;
+noted under open questions. The memory budget stays the right tool for what
+does not fit, and a refused source set now reports `memory` like any other set.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1082,6 +1101,12 @@ wheel on Linux.
   interface and then swept with the same gate.
 - **Other client languages**: the join / expression / split lowering lives in
   the Python wrapper; the pure rewrite function is language-neutral.
+- **Narrow lanes**: every lane is 8 bytes per row; at SF10 the 22 TPC-H
+  queries need 33 GiB of lanes, most of them small integers, dates and
+  two-decimal amounts. Storing a lane as I32 / I16 when its values fit (the
+  interface stays I64; kernels widen on load) halves to quarters memory and the
+  bytes every kernel reads. Sharing lanes between sets was measured at 0.0 GiB
+  of saving on that workload and dropped.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client; an Arrow-native
   result path would move the plain-form bounds.

@@ -318,9 +318,16 @@ class ResidencyManager:
             return False
         for d in s.deps:
             if not self.is_ready(d) and not self.upload_now(d, run):
+                ds = self.get(d)
                 with self._lock:
                     s.state = "failed"
-                    s.error = f"source set {d} is not resident"
+                    # a source refused by the memory budget: this set is refused for the same reason
+                    # (the statement's reason must read 'memory', not 'not_resident')
+                    if ds is not None and ds.error.startswith(MEMORY_ERROR):
+                        s.error = f"{MEMORY_ERROR}source set {d}: {ds.error[len(MEMORY_ERROR):]}"
+                        s.resume_at = ds.resume_at
+                    else:
+                        s.error = f"source set {d} is not resident"
                 return False
         if not self._make_room(run, s):
             with self._lock:
@@ -364,7 +371,12 @@ class ResidencyManager:
                 deps = [self._sets.get(d) for d in s.deps]
                 if any(d is None or d.state == "failed" for d in deps):
                     s.state = "failed"
-                    s.error = "a source set failed to upload"
+                    bad = next((d for d in deps if d is not None and d.state == "failed"), None)
+                    if bad is not None and bad.error.startswith(MEMORY_ERROR):
+                        s.error = f"{MEMORY_ERROR}source set {bad.tag}: {bad.error[len(MEMORY_ERROR):]}"
+                        s.resume_at = bad.resume_at
+                    else:
+                        s.error = "a source set failed to upload"
                     continue
                 if any(d.state != "ready" for d in deps):
                     continue                      # its sources first
