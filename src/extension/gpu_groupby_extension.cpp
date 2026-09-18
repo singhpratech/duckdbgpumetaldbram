@@ -1127,6 +1127,200 @@ void gm_function(duckdb_function_info info, duckdb_data_chunk output) {
 }
 
 // ---------------------------------------------------------------------------
+// gpu_agg_exact_global(name, program, payloads)  (v0.7 §4.12)
+//
+// Aggregates without GROUP BY over an exact set, under a WHERE: TPC-H Q6's
+// shape. One fused device pass over the rows — no key, no sort cache, no
+// permutation — and exactly ONE result row, whatever the WHERE keeps.
+//   program  : the WHERE program ('' = none), as gpu_groupby_exact_resident_where
+//   payloads : 'v, i0, i2' — payload lanes, v or a BIGINT predicate lane; '' = count(*) only
+// Columns: count_star BIGINT, then for payload p:
+//   sum<p> HUGEINT, count<p> BIGINT, min<p> BIGINT, max<p> BIGINT, avg<p> DOUBLE
+// Semantics are one group of gpu_groupby_exact_multi: a row failing the mask
+// takes part in nothing including count(*); a NULL payload cell counts for
+// count(*) only; a payload with count 0 has NULL sum / min / max / avg — which
+// is what native returns over an empty input, so the single row IS native's
+// answer.
+// A set only this function reads carries the tag extra 'global' and no key
+// lane ('-'), so nothing sorts its columns.
+// ---------------------------------------------------------------------------
+struct GgBindData {
+    std::string name;
+    std::vector<WhereTerm> where;
+    std::vector<std::string> lanes;
+};
+
+struct GgInitData {
+    gpudb::GlobalAggResult res;
+    bool done = false;
+    std::vector<idx_t> cols;
+};
+
+void gg_bind(duckdb_bind_info info) {
+    static const char* fn = "gpu_agg_exact_global";
+    std::string a[3];
+    for (idx_t i = 0; i < 3; ++i) {
+        duckdb_value v = duckdb_bind_get_parameter(info, i);
+        const bool null = !v || duckdb_is_null_value(v);
+        if (!null) a[i] = value_to_string(v);
+        if (v) duckdb_destroy_value(&v);
+        if (null) { duckdb_bind_set_error(info, (std::string(fn) + ": arguments may not be NULL").c_str()); return; }
+    }
+    auto bind = std::make_unique<GgBindData>();
+    bind->name = a[0];
+    std::string err = parse_where_program(a[1], bind->where);
+    if (err.empty() && !trim_copy(a[2]).empty()) {
+        std::size_t pos = 0;
+        while (pos <= a[2].size()) {
+            std::size_t comma = a[2].find(',', pos);
+            if (comma == std::string::npos) comma = a[2].size();
+            const std::string tok = lower_copy(trim_copy(a[2].substr(pos, comma - pos)));
+            pos = comma + 1;
+            bool ok = tok == "v" || (tok.size() > 1 && tok.size() < 6 && tok[0] == 'i');
+            for (std::size_t q = 1; ok && tok != "v" && q < tok.size(); ++q) ok = std::isdigit(static_cast<unsigned char>(tok[q])) != 0;
+            if (!ok) { err = "payload lane '" + tok + "' must be v or i<n>"; break; }
+            bind->lanes.push_back(tok);
+            if (comma == a[2].size()) break;
+        }
+        if (err.empty() && bind->lanes.size() > 8) err = "at most 8 payload lanes";
+    }
+    if (!err.empty()) { duckdb_bind_set_error(info, (std::string(fn) + ": " + err).c_str()); return; }
+
+    duckdb_logical_type bigint  = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+    duckdb_logical_type hugeint = duckdb_create_logical_type(DUCKDB_TYPE_HUGEINT);
+    duckdb_logical_type dbl     = duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE);
+    duckdb_bind_add_result_column(info, "count_star", bigint);
+    for (std::size_t p = 0; p < bind->lanes.size(); ++p) {
+        const std::string s = std::to_string(p);
+        duckdb_bind_add_result_column(info, ("sum" + s).c_str(),   hugeint);
+        duckdb_bind_add_result_column(info, ("count" + s).c_str(), bigint);
+        duckdb_bind_add_result_column(info, ("min" + s).c_str(),   bigint);
+        duckdb_bind_add_result_column(info, ("max" + s).c_str(),   bigint);
+        duckdb_bind_add_result_column(info, ("avg" + s).c_str(),   dbl);
+    }
+    duckdb_destroy_logical_type(&bigint);
+    duckdb_destroy_logical_type(&hugeint);
+    duckdb_destroy_logical_type(&dbl);
+    duckdb_bind_set_bind_data(info, bind.release(), [](void* p) { delete static_cast<GgBindData*>(p); });
+}
+
+void gg_init(duckdb_init_info info) {
+    static const char* fn = "gpu_agg_exact_global";
+    auto* bind = static_cast<GgBindData*>(duckdb_init_get_bind_data(info));
+    auto init = std::make_unique<GgInitData>();
+    const std::size_t P = bind->lanes.size();
+    // projection -> per-payload MultiPayload::columns bits (1 sum, 2 count, 4 min, 5 max)
+    std::vector<std::uint32_t> want(P, 0);
+    const idx_t nc = duckdb_init_get_column_count(info);
+    for (idx_t i = 0; i < nc; ++i) {
+        const idx_t c = duckdb_init_get_column_index(info, i);
+        init->cols.push_back(c);
+        if (c == 0) continue;                             // count_star: always computed
+        const std::size_t p = (c - 1) / 5;
+        if (p >= P) continue;
+        switch ((c - 1) % 5) {
+            case 0: want[p] |= (1u << 1) | (1u << 2); break;
+            case 1: want[p] |= 1u << 2; break;
+            case 2: want[p] |= (1u << 4) | (1u << 2); break;
+            case 3: want[p] |= (1u << 5) | (1u << 2); break;
+            default: want[p] |= (1u << 1) | (1u << 2); break;
+        }
+    }
+    try {
+        ResidentContext& ctx = resident_context(duckdb_init_get_extra_info(info));
+        std::shared_ptr<ResidentSet> set = resident_acquire_set(ctx, bind->name, fn);
+        if (!set->pair || !set->exact)
+            throw std::runtime_error(std::string(fn) + ": '" + bind->name + "' is not an exact set");
+        std::vector<gpudb::MultiPayload> mp(P);
+        for (std::size_t p = 0; p < P; ++p) {
+            const std::string& l = bind->lanes[p];
+            const gpudb::ResidentColumn* col = nullptr;
+            if (l == "v") col = set->vals.get();
+            else {
+                const std::size_t idx = static_cast<std::size_t>(std::strtoull(l.c_str() + 1, nullptr, 10));
+                if (idx >= set->pred_int)
+                    throw std::runtime_error(std::string(fn) + ": payload lane '" + l + "' but the set has " +
+                                             std::to_string(set->pred_int) + " BIGINT predicate column(s)");
+                col = set->preds[idx].get();
+            }
+            if (!col || col->dtype() != gpudb::Dtype::I64)
+                throw std::runtime_error(std::string(fn) + ": payload lane '" + l + "' is not a BIGINT lane");
+            mp[p].vals = col;
+            // every payload is reduced in the one pass; `columns` only says what is read back
+            mp[p].columns = want[p] ? want[p] : gpudb::GroupByFilter::kAllColumns;
+        }
+        ResolvedWhere rw = resolve_where(*set, bind->where, fn);
+        auto& agg = resident_aggregator(ctx);
+        {
+            auto dev = resident_device_lock(ctx);
+            init->res = agg.aggregate_exact_masked(mp.data(), P, rw.preds.data(), rw.preds.size());
+        }
+        const auto& d = agg.last_decision();
+        char buf[320];
+        std::snprintf(buf, sizeof(buf),
+            "op=agg_exact_global backend=%s reason=%s rows_in=%zu groups=1 rows_out=1 payloads=%zu "
+            "kept=%lld wall_ms=%.3f kernel_ms=%.3f transfer_ms=0.000",
+            gpudb::to_string(d.chosen), gpudb::to_string(d.reason), init->res.rows_in, P,
+            static_cast<long long>(init->res.count_star), init->res.wall_ms, init->res.kernel_ms);
+        resident_record_stats(ctx, set.get(), buf);
+    } catch (const std::exception& e) {
+        duckdb_init_set_error(info, e.what());
+        return;
+    }
+    duckdb_init_set_init_data(info, init.release(), [](void* p) { delete static_cast<GgInitData*>(p); });
+}
+
+void gg_function(duckdb_function_info info, duckdb_data_chunk output) {
+    auto* init = static_cast<GgInitData*>(duckdb_function_get_init_data(info));
+    if (!init || init->done) return;
+    init->done = true;
+    const auto& r = init->res;
+    auto null_at = [](duckdb_vector vec) {
+        duckdb_vector_ensure_validity_writable(vec);
+        duckdb_validity_set_row_invalid(duckdb_vector_get_validity(vec), 0);
+    };
+    for (idx_t j = 0; j < init->cols.size(); ++j) {
+        duckdb_vector vec = duckdb_data_chunk_get_vector(output, j);
+        const idx_t c = init->cols[j];
+        if (c == 0) {
+            *static_cast<std::int64_t*>(duckdb_vector_get_data(vec)) = r.count_star;
+            continue;
+        }
+        const std::size_t p = (c - 1) / 5;
+        if (p >= r.counts.size()) { null_at(vec); continue; }
+        const std::int64_t cnt = r.counts[p];
+        switch ((c - 1) % 5) {
+            case 0: {
+                auto* sum = static_cast<duckdb_hugeint*>(duckdb_vector_get_data(vec));
+                sum[0].lower = static_cast<std::uint64_t>(r.sums[p]);
+                sum[0].upper = r.sums_hi[p];
+                if (cnt == 0) null_at(vec);
+                break;
+            }
+            case 1:
+                *static_cast<std::int64_t*>(duckdb_vector_get_data(vec)) = cnt;
+                break;
+            case 2: case 3: {
+                auto* v = static_cast<std::int64_t*>(duckdb_vector_get_data(vec));
+                v[0] = ((c - 1) % 5 == 2) ? r.mins[p] : r.maxs[p];
+                if (cnt == 0) null_at(vec);
+                break;
+            }
+            default: {
+                auto* a = static_cast<double*>(duckdb_vector_get_data(vec));
+                if (cnt == 0) { a[0] = 0.0; null_at(vec); }
+                else {
+                    const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[p]), r.sums_hi[p]};
+                    a[0] = sm.to_double() / static_cast<double>(cnt);
+                }
+                break;
+            }
+        }
+    }
+    duckdb_data_chunk_set_size(output, 1);
+}
+
+// ---------------------------------------------------------------------------
 // gpu_topk_resident(name VARCHAR, k BIGINT, order VARCHAR) -> (idx BIGINT, value BIGINT)
 // gpu_topk_resident_f64(...)                                 -> (idx BIGINT, value DOUBLE)
 // ---------------------------------------------------------------------------
@@ -1331,6 +1525,9 @@ void register_gpu_groupby(duckdb_connection con, const std::shared_ptr<ResidentC
     register_table_fn(con, "gpu_groupby_exact_multi",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR},
                       gm_bind, gm_init, gm_function, ctx, /*projection_pushdown*/true);
+    register_table_fn(con, "gpu_agg_exact_global",
+                      {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_VARCHAR},
+                      gg_bind, gg_init, gg_function, ctx, /*projection_pushdown*/true);
     register_table_fn(con, "gpu_topk_resident",
                       {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_VARCHAR},
                       tk_bind<gpudb::Dtype::I64>, tk_init, tk_function, ctx);

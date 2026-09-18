@@ -3508,3 +3508,112 @@ side:
 That is +65% to +85% on the upload. It is paid once per column, in the
 wrapper's idle background segments, and it buys a store that is 2.3× smaller
 and kernels that read fewer bytes on every statement afterwards.
+
+## v0.7 §4.12 — the global masked aggregate, Metal, SF1 + SF10 (2026-09-18)
+
+Aggregates without `GROUP BY` under a `WHERE` as their own operator
+(`Aggregator::aggregate_exact_masked`): one fused pass over the rows in storage
+order, the whole predicate program evaluated per row inside the kernel, no key,
+no sort cache, no permutation gather. Apple M4 Max, `gpudb.connect(...,
+residency="eager", floor_rows=0, memory_budget="unlimited")`, warm, minimum of
+nine, rows identical to native in every row of every table below.
+
+**TPC-H Q6 and two more shapes.** "device" is the whole statement through the
+wrapper; "kernel" is what `gpu_last_stats()` reports for the operator.
+
+| statement | SF | native ms | device ms | ratio | kernel ms |
+|---|---|---|---|---|---|
+| Q6 (5 predicate terms) | 1 | 2.1 | — | — | declined (threshold) |
+| Q6 | 10 | 15.0 | 6.1 | 2.48× | 5.65 |
+| `count(*), sum, max`, no WHERE | 10 | 6.1 | 4.3 | 1.42× | 3.85 |
+| `sum, count(*)`, 3 terms, 1% kept | 10 | 10.8 | 3.8 | 2.81× | 3.43 |
+| `sum, count(*)` over `lineitem ⋈ orders`, date range | 1 | 9.4 | 1.3 | 7.08× | 0.85 |
+| … the same | 10 | 69.2 | 3.9 | 17.74× | 3.34 |
+| `sum, count(*), avg` over `lineitem ⋈ part`, `p_size <= 10` | 1 | 3.7 | 1.7 | 2.15× | 1.19 |
+| … the same | 10 | 61.9 | 5.9 | 10.54× | 5.33 |
+
+Before this operator the same shapes went through the GROUP BY machinery with a
+constant key — a sort cache over 60M rows and a permutation gather for one
+group. TPC-H Q6 measured 2.9 ms against native's 2.0 at SF1 and 25 ms against 17
+at SF10 (kernel 5.8 / 23.2), which is why the wrapper used to leave single-table
+statements without a `GROUP BY` alone.
+
+**Two modes of a short kernel.** Measured in both process states (the default
+one and one that ran `SET threads TO 1` on the raw connection first). At SF10
+the kernel is the same in both — Q6 5.65 ms against 5.65, the one-predicate
+shapes 3.11–3.17 against 3.11–3.17 — so this kernel does not show the 3×
+slow mode of §9.1 at that size. At SF1 it does vary, 1.34 ms to 1.92 for Q6
+(1.4×), which is one more reason the single-table bound sits above SF1.
+
+**Where the device starts winning.** `lineitem` slices of 3M to 30M rows taken
+from SF10, four shapes, thresholds off so every cell runs on the device.
+
+| rows | Q6 (5 terms) | 3 terms, 1% | 1 term, 55% | no WHERE |
+|---|---|---|---|---|
+| 3M | 1.02× | 1.00× | 1.01× | 1.02× |
+| 6M | 0.97× | 1.00× | 0.97× | 0.98× |
+| 10M | 0.97–1.00× | 0.93× | 1.01× | 1.00× |
+| 15M | 1.32–1.51× | 1.06–1.49× | 1.00× | 0.99× |
+| 20M | 1.59–1.65× | 1.35–1.57× | 0.99× | 0.94× |
+| 30M | 1.78–1.93× | 1.71–2.09× | 1.51–1.75× | 0.99× |
+| 60M (SF10) | 2.48× | 2.81× | 2.24–2.50× | 1.42× |
+
+The win appears at `rows × (1 + WHERE terms, counting at most three) ≈ 60M` and
+nowhere below it, which is the bound `_thresholds.py` takes, with a row floor of
+16M under it so the one cell inside the noise (15M × 3 terms, 1.06× on one run
+of three) stays native. With the bound on, every cell the device takes measured
+at least 1.35×. Over a join the comparison is against native's join rather than
+its scan and the device wins from SF1 on, so there is no floor there.
+
+**The pre-upload memory estimate.** `estimate_set_bytes` now sizes each lane
+from its DuckDB type where the build reports `narrow=true` (an upper bound: the
+backend picks the real width from the values, which the wrapper cannot see
+before the upload). Estimate against what `gpu_residents()` +
+`gpu_store_columns()` report afterwards, SF10, one set per process:
+
+| set | estimate MiB | reported MiB | estimate / reported |
+|---|---|---|---|
+| `lineitem`, Q6's global set — 3 narrow lanes, no key | 2088 | 515 | 4.06 |
+| `lineitem` by `l_shipdate`, DATE key + BIGINT payload | 1616 | 686 | 2.35 |
+| `orders` by `o_orderkey`, BIGINT key + DATE predicate | 578 | 257 | 2.24 |
+| `lineitem` by `l_suppkey`, three payloads | 3003 | 1087 | 2.76 |
+
+Per row the estimate went from `8 × lanes + 16` to, for instance, 28 bytes for
+the `l_shipdate` set (4 for the DATE key, 8 for the DECIMAL payload, 8 for the
+cache, 8 of scratch) where it charged 32, and 36 for Q6's keyless set where it
+charged 48. It stays an upper bound everywhere, which is what the admission rule
+needs; what it still cannot see is that a DECIMAL or BIGINT column of small
+values lands at one or two bytes — `l_discount` is 1 byte and the estimate must
+charge 8. Closing that gap means reading the column's min and max before the
+upload, which is stage D's business.
+
+**What the fused predicate evaluation costs.** `gpred_eval` walks the whole
+program per row inside the reduce. SF10 `lineitem` (60M rows),
+`SELECT count(*), sum(l_quantity) FROM lineitem [WHERE …]`, `SET threads TO 1`
+on the raw connection, minimum of 10 kernel times from `gpu_last_stats()`:
+
+| WHERE terms | distinct lanes read | kernel ms |
+|---|---|---|
+| 0 | 1 (the payload) | 2.635 |
+| 1 | 2 | 3.660 |
+| 3 | 3 | 4.650 |
+| 5 | 4 | 5.143 |
+
+So the cost tracks the number of distinct lanes the program touches, not the
+number of terms: the fourth and fifth terms re-read lanes the second and third
+already brought in and add 0.49 ms between them, while the first term costs 1.03.
+For comparison, the GROUP BY's mask stage (`gbx_mask_i64`, one dispatch per term
+plus the selection pass) is 19.7 ms of Q12's ~23 ms kernel at the same scale
+factor.
+
+**TPC-H coverage.** SF1: 15 of 22 on the device, as before — Q6 declines at 6M
+rows by the bound above. SF10 (`GPUDB_MEMORY_BUDGET_MB=200000`): 17 of 22,
+where it was 16 — Q6 joins at 2.24× (13.7 ms native, 6.1 transparent). Rows
+identical to native on every rewritten query at both scale factors.
+
+**The gate.** `PYTHONPATH=python python3 scripts/transparent_gate.py
+--subqueries --exprs` at SF1: 783 rows, 506 PASS, 276 declined, 0 below the
+bound and none differing, exit 0. The `global` form is now swept over single
+tables as well as joins — 74 rows, of which the 8 single-table ones decline on
+the threshold at SF1 and the 66 over joins run 1.02× to 75×.
+

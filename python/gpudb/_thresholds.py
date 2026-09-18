@@ -113,6 +113,22 @@ class Thresholds:
     reagg_max_pairs: int = 100_000
     reagg_max_pairs_where: int = 20_000
     reagg_min_selectivity: float = 0.05
+    # aggregates without GROUP BY (§4.12): one row out, so there is no
+    # output-size bound at all. What decides is how much work native does per
+    # row — a vectorised filter and sum is memory-bandwidth-optimal on the CPU,
+    # and the device only pulls ahead once there are enough rows AND enough
+    # predicate terms to evaluate. Measured on lineitem slices of 3M to 60M
+    # rows (M4 Max, min of 9, warm), the win appears at rows * (1 + terms,
+    # counting at most three) around 60M and nowhere below it: 15M rows x 3
+    # terms 1.18-1.49x, 20M x 3 1.36-1.57x, 30M x 1 1.51-1.75x, 60M x 0 1.42x,
+    # 60M x 5 (TPC-H Q6) 2.48x — while 10M x 3 0.93x, 10M x 5 0.97x,
+    # 20M x 1 0.99x and 30M x 0 0.99x all lose. The row floor sits above the
+    # one cell that is inside the noise (15M x 3 measured 1.06-1.49x over
+    # three runs), so every cell the bound admits measured at least 1.35x. Over a JOIN the comparison is against native's join, not
+    # its scan, and the device wins from SF1 on (7-190x), so no floor there.
+    global_min_rows: int = 16_000_000
+    global_min_row_terms: int = 60_000_000
+    global_join_min_rows: int = 0
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -126,13 +142,29 @@ TABLE = {"METAL": METAL, "CUDA": CUDA}
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
            limited: bool = False, computed_payloads: int = 0,
-           reaggregated: bool = False) -> Tuple[bool, str]:
+           reaggregated: bool = False, global_agg: bool = False, rows: int = 0,
+           where_terms: int = 0) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
     the statement is over a key join (its own table above)."""
     t = TABLE.get((backend or "").upper())
     if t is None:
         return False, f"no thresholds for backend {backend!r}"
+    if global_agg:
+        # §4.12: one group, one row — no output-size risk and no distinct count
+        if join:
+            if rows < t.global_join_min_rows:
+                return False, f"{rows} rows < {t.global_join_min_rows} for an aggregate without GROUP BY over a join"
+            return True, ""
+        if rows < t.global_min_rows:
+            return False, f"{rows} rows < {t.global_min_rows} for an aggregate without GROUP BY"
+        # past three terms native's per-row cost stops growing with the
+        # conjunction (it short-circuits), so the bound stops counting there
+        work = rows * (1 + min(3, max(0, where_terms)))
+        if work < t.global_min_row_terms:
+            return False, (f"{rows} rows x {where_terms} WHERE term(s) = {work} < {t.global_min_row_terms} "
+                           f"for an aggregate without GROUP BY over a single table")
+        return True, ""
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
     if reaggregated:

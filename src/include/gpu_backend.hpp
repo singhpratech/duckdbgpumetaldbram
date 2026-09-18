@@ -149,6 +149,21 @@ struct GroupByResidentResult {
     double wall_ms = 0.0, kernel_ms = 0.0, transfer_ms = 0.0;
 };
 
+// Returned by Aggregator::aggregate_exact_masked (v0.7 §4.12): the one group
+// of an aggregate without GROUP BY. Every per-payload vector holds n_pays
+// entries in the caller's payload order; count_star is the shared count of
+// surviving rows and is filled once.
+struct GlobalAggResult {
+    std::vector<std::int64_t> sums;        // low limb of the 128-bit sum, per payload
+    std::vector<std::int64_t> sums_hi;     // high limb
+    std::vector<std::int64_t> counts;      // count(payload): non-NULL cells among the survivors
+    std::vector<std::int64_t> mins;        // 0 where counts == 0
+    std::vector<std::int64_t> maxs;
+    std::int64_t count_star = 0;           // surviving rows
+    std::size_t  rows_in = 0;
+    double wall_ms = 0.0, kernel_ms = 0.0;
+};
+
 // ---- 128-bit two's-complement sum helpers (§4.2) ----
 // The exact op's sum is {lo = low 64 bits as uint64, hi = high 64 bits
 // signed} — the DuckDB HUGEINT layout. Every backend accumulates with the
@@ -621,6 +636,41 @@ public:
         const ResidentColumn& keys, const MultiPayload* pays, std::size_t n_pays,
         std::size_t filter_payload, const Predicate* preds, std::size_t n_preds,
         std::size_t max_groups, const GroupByFilter& filter = GroupByFilter{});
+
+    // ---- v0.7 §4.12: the global masked aggregate ----
+    // SELECT <aggs of pays[0]>, <aggs of pays[1]>, ..., count(*) FROM set
+    // WHERE <preds> — aggregates with no GROUP BY, TPC-H Q6's shape. It is
+    // groupby_exact_masked_multi with exactly one group, so every semantic
+    // is that operator's: a row failing the conjunction takes part in
+    // nothing INCLUDING count(*); a NULL payload cell is skipped by sum /
+    // count / min / max and counted by count(*); a NULL cell fails every
+    // comparison and In, IsNull / IsNotNull read the validity bit; payload
+    // lanes are I64, predicate lanes I64 or F64. The difference is that
+    // there is no key: no sort cache is read or built, no permutation is
+    // gathered, and the rows are reduced in storage order in ONE pass — the
+    // predicate program is evaluated per row inside the reduce.
+    //   - pays[p].columns asks for the result vectors of payload p (bit 1
+    //     sum + sums_hi, 2 count, 4 min, 5 max); count_star is always filled;
+    //   - a payload with count 0 has unspecified sum / min / max (the SQL
+    //     layer emits NULL), and zero surviving rows gives count_star 0 and
+    //     every count 0 — one result, never no result;
+    //   - n_pays may be 0 (count(*) only), n_preds may be 0 (no WHERE); the
+    //     row count comes from pays[0] when there is a payload and from
+    //     preds[0].col otherwise, and every column must agree on it;
+    //   - bit-identical across backends, as the exact GROUP BY.
+    // Default throws — backends opt in; global_supported() is the rule-1
+    // gate, as exact_supported().
+    virtual GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                                   const Predicate* preds, std::size_t n_preds);
+    [[nodiscard]] virtual bool global_supported() const noexcept { return false; }
+
+    // Does this backend store an exact I64 lane at the narrowest signed width
+    // its values fit (docs/RESIDENT_COLUMNS_DESIGN.md, stage C)? Storage width
+    // is backend-private — the interface keeps saying I64 — but the wrapper's
+    // PRE-upload memory estimate (§5.5) has to know whether to charge 8 bytes
+    // a lane or size each lane from its DuckDB type. Reported by
+    // gpu_build_info() as narrow=true|false.
+    [[nodiscard]] virtual bool narrow_lanes() const noexcept { return false; }
 
     // ---- v0.7 milestone 5: the materialised key join (§4.8) ----
     // Inner equi-join of a PROBE row set against a BUILD row set whose join

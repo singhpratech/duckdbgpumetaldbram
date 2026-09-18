@@ -1685,3 +1685,187 @@ kernel void jm_gather(
         atomic_fetch_and_explicit(&dvalid[d >> 5], ~(1u << (d & 31u)), memory_order_relaxed);
     }
 }
+
+// ===========================================================================
+//  v0.7 §4.12 — the global masked aggregate: aggregates without GROUP BY
+//
+//  ONE pass over the rows in storage order. Each thread walks a grid stride,
+//  evaluates the whole WHERE conjunction for its row (gpred_eval below, not
+//  one kernel pass per predicate), and folds the surviving row into the
+//  payload accumulators it keeps in registers; the threadgroup then reduces
+//  them into one partial block and the host merges the blocks. No key, no
+//  sort cache, no permutation gather.
+//
+//  Accumulators are indexed [group * n_pays + payload] and the partials
+//  buffer holds one block per (threadgroup, group): {count_star, then
+//  n_pays tuples of (lo, hi, cnt, mn, mx)}. n_groups is 1 today (the global
+//  aggregate is one group); a later few-group variant reads a dense group
+//  id per row and only that index changes.
+// ===========================================================================
+
+constant uint GAGG_MAX_LANES = 12u;   // distinct lanes bound (payloads + predicate columns)
+constant uint GAGG_MAX_ACC   = 8u;    // groups * payloads held per thread
+
+// One lane of the row set, as the kernel sees it: its storage, its validity
+// bitmap, its stage-C width and whether its cells are IEEE-754 images.
+struct GLane {
+    device const uchar* data;
+    device const ulong* valid;
+    uint width;
+    uint has_valid;
+    uint is_f64;
+};
+// The per-lane part that travels in a buffer (the pointers are bindings).
+struct GLaneMeta { uint width; uint has_valid; uint is_f64; uint pad; };
+
+// One term of the conjunction. `op` is gbx_mask_i64's encoding (0 EQ, 1 NE,
+// 2 LT, 3 LE, 4 GT, 5 GE, 6 IsNull, 7 IsNotNull, 8 In); an In list is
+// n_list values of `lists` from list_off.
+struct GPred { uint lane; uint op; uint list_off; uint n_list; long value; };
+
+// The reusable single-pass evaluation of a WHERE program: program + lane
+// table + validity in, one bool out. Semantics are gbx_mask_i64's, term for
+// term — a NULL cell fails every comparison and In, IsNull / IsNotNull read
+// the validity bit, F64 lanes compare on the total-order image.
+inline bool gpred_eval(thread const GLane* lanes,
+                       device const GPred* prog, uint n_preds,
+                       device const long* lists, uint row)
+{
+    for (uint t = 0; t < n_preds; ++t) {
+        const GPred pr = prog[t];
+        const GLane ln = lanes[pr.lane];
+        const bool v = gbx_valid(ln.valid, ln.has_valid, (ulong)row);
+        bool pass;
+        if (pr.op == 6u)      pass = !v;
+        else if (pr.op == 7u) pass = v;
+        else if (!v)          pass = false;
+        else {
+            const long raw = ldw(ln.data, ln.width, row);
+            if (ln.is_f64 != 0u) {
+                const ulong a = gbx_f64_key(raw);
+                if (pr.op == 8u) {
+                    pass = false;
+                    for (uint i = 0; i < pr.n_list && !pass; ++i)
+                        pass = (a == gbx_f64_key(lists[pr.list_off + i]));
+                } else {
+                    pass = gbx_cmp_u(pr.op, a, gbx_f64_key(pr.value));
+                }
+            } else {
+                if (pr.op == 8u) {
+                    pass = false;
+                    for (uint i = 0; i < pr.n_list && !pass; ++i)
+                        pass = (raw == lists[pr.list_off + i]);
+                } else {
+                    pass = gbx_cmp_s(pr.op, raw, pr.value);
+                }
+            }
+        }
+        if (!pass) return false;
+    }
+    return true;
+}
+
+struct GAggAcc { ulong lo; long hi; long cnt; long mn; long mx; };
+inline GAggAcc gagg_zero() {
+    GAggAcc a; a.lo = 0ul; a.hi = 0l; a.cnt = 0l; a.mn = GBX_LMAX; a.mx = GBX_LMIN; return a;
+}
+inline void gagg_add(thread GAggAcc& a, long v) {
+    const ulong u = (ulong)v, old = a.lo;
+    a.lo += u;
+    a.hi += (v < 0l ? -1l : 0l) + (a.lo < old ? 1l : 0l);
+    a.cnt += 1l; a.mn = min(a.mn, v); a.mx = max(a.mx, v);
+}
+
+struct GAggU { uint n; uint n_preds; uint n_pays; uint n_groups; };
+
+kernel void gagg_masked_i64(
+    device const uchar*     d0    [[buffer(0)]],  device const ulong* v0  [[buffer(1)]],
+    device const uchar*     d1    [[buffer(2)]],  device const ulong* v1  [[buffer(3)]],
+    device const uchar*     d2    [[buffer(4)]],  device const ulong* v2  [[buffer(5)]],
+    device const uchar*     d3    [[buffer(6)]],  device const ulong* v3  [[buffer(7)]],
+    device const uchar*     d4    [[buffer(8)]],  device const ulong* v4  [[buffer(9)]],
+    device const uchar*     d5    [[buffer(10)]], device const ulong* v5  [[buffer(11)]],
+    device const uchar*     d6    [[buffer(12)]], device const ulong* v6  [[buffer(13)]],
+    device const uchar*     d7    [[buffer(14)]], device const ulong* v7  [[buffer(15)]],
+    device const uchar*     d8    [[buffer(16)]], device const ulong* v8  [[buffer(17)]],
+    device const uchar*     d9    [[buffer(18)]], device const ulong* v9  [[buffer(19)]],
+    device const uchar*     d10   [[buffer(20)]], device const ulong* v10 [[buffer(21)]],
+    device const uchar*     d11   [[buffer(22)]], device const ulong* v11 [[buffer(23)]],
+    device const GLaneMeta* meta  [[buffer(24)]],   // GAGG_MAX_LANES entries
+    device const GPred*     prog  [[buffer(25)]],
+    device const long*      lists [[buffer(26)]],
+    device const uint*      pay   [[buffer(27)]],   // lane index per payload
+    constant GAggU&         u     [[buffer(28)]],
+    device long*            out   [[buffer(29)]],   // per (threadgroup, group) block
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg  [[threadgroups_per_grid]])
+{
+    threadgroup long scr[BLOCK * 5];
+    GLane lanes[GAGG_MAX_LANES];
+    lanes[0].data = d0;  lanes[0].valid = v0;   lanes[1].data = d1;  lanes[1].valid = v1;
+    lanes[2].data = d2;  lanes[2].valid = v2;   lanes[3].data = d3;  lanes[3].valid = v3;
+    lanes[4].data = d4;  lanes[4].valid = v4;   lanes[5].data = d5;  lanes[5].valid = v5;
+    lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
+    lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
+    lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    for (uint l = 0; l < GAGG_MAX_LANES; ++l) {
+        lanes[l].width = meta[l].width;
+        lanes[l].has_valid = meta[l].has_valid;
+        lanes[l].is_f64 = meta[l].is_f64;
+    }
+
+    GAggAcc acc[GAGG_MAX_ACC];
+    long cstar[GAGG_MAX_ACC];
+    for (uint a = 0; a < GAGG_MAX_ACC; ++a) { acc[a] = gagg_zero(); cstar[a] = 0l; }
+
+    const uint gsize = BLOCK * ntg;
+    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {
+        if (!gpred_eval(lanes, prog, u.n_preds, lists, i)) continue;
+        const uint g = 0u;                 // one group; a few-group variant reads its id here
+        cstar[g] += 1l;
+        for (uint p = 0; p < u.n_pays; ++p) {
+            const GLane ln = lanes[pay[p]];
+            if (!gbx_valid(ln.valid, ln.has_valid, (ulong)i)) continue;
+            gagg_add(acc[g * u.n_pays + p], ldw(ln.data, ln.width, i));
+        }
+    }
+
+    // threadgroup reduction, one accumulator at a time through `scr`
+    const uint stride = 1u + 5u * u.n_pays;          // longs per (threadgroup, group) block
+    for (uint g = 0; g < u.n_groups; ++g) {
+        const uint base = (tgid * u.n_groups + g) * stride;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        scr[tid * 5u] = cstar[g];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+            if (tid < s) scr[tid * 5u] += scr[(tid + s) * 5u];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0u) out[base] = scr[0];
+        for (uint p = 0; p < u.n_pays; ++p) {
+            const GAggAcc a = acc[g * u.n_pays + p];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            scr[tid * 5u + 0u] = (long)a.lo; scr[tid * 5u + 1u] = a.hi; scr[tid * 5u + 2u] = a.cnt;
+            scr[tid * 5u + 3u] = a.mn;       scr[tid * 5u + 4u] = a.mx;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint s = BLOCK / 2u; s > 0u; s >>= 1) {
+                if (tid < s) {
+                    const uint x = tid * 5u, y = (tid + s) * 5u;
+                    const ulong old = (ulong)scr[x];
+                    scr[x] = (long)(old + (ulong)scr[y]);
+                    scr[x + 1u] += scr[y + 1u] + (((ulong)scr[x] < old) ? 1l : 0l);
+                    scr[x + 2u] += scr[y + 2u];
+                    scr[x + 3u] = min(scr[x + 3u], scr[y + 3u]);
+                    scr[x + 4u] = max(scr[x + 4u], scr[y + 4u]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (tid == 0u) {
+                const uint o = base + 1u + 5u * p;
+                out[o + 0u] = scr[0]; out[o + 1u] = scr[1]; out[o + 2u] = scr[2];
+                out[o + 3u] = scr[3]; out[o + 4u] = scr[4];
+            }
+        }
+    }
+}

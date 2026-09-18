@@ -211,7 +211,6 @@ def run():
         "double":       ("SELECT k, sum(x) FROM t GROUP BY k", "double"),
         "cte_shadow":   ("WITH t AS (SELECT 1 k, 1 v) SELECT k, sum(v) FROM t GROUP BY k", "shape"),
         "two_tables":   ("SELECT a.k, sum(a.v) FROM t a JOIN t b USING (k) GROUP BY a.k", "threshold"),   # a 90M-row self join: too big to upload
-        "no_group":     ("SELECT sum(v) FROM t", "shape"),
     }
     if not con._exact:
         rej.pop("where_volatile"); rej.pop("where_subquery")
@@ -532,10 +531,52 @@ def run():
             check(got == want, f"global {name}: rows identical to native ({want})")
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"global {name}: names and types identical")
-        sql = "SELECT sum(v), count(*) FROM t WHERE v > 3"
-        got = con.execute(sql).fetchall()
-        check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
-              f"global single table: runs native ({con.last_rewrite()['reason']}) — native's filter + sum wins there")
+        # §4.12 over a SINGLE table: the global masked aggregate, one fused pass
+        sgcases = {
+            "single_plain":     "SELECT sum(v), count(*), count(v), min(v), max(v), avg(v) FROM t",
+            "single_where":     "SELECT sum(v), count(*) FROM t WHERE v > 3",
+            "single_between":   "SELECT sum(v), count(*), min(k) FROM t WHERE v BETWEEN 10 AND 40 AND k < 500",
+            "single_in":        "SELECT count(*), sum(v) FROM t WHERE k IN (1, 2, 3, 400, 999)",
+            "single_dates":     "SELECT count(*), sum(v), max(dt) FROM t WHERE dt >= DATE '1996-01-01' AND dt < DATE '1998-01-01'",
+            "single_decimal":   "SELECT sum(d), avg(d), min(d), max(d), count(d) FROM t WHERE k % 7 < 3",
+            "single_expr":      "SELECT sum(v * (1 - k)) AS e, count(*) FROM t WHERE dt < DATE '1997-06-01'",
+            "single_several":   "SELECT sum(a), max(b), min(c), count(*) FROM tm WHERE z >= 3",
+            "single_isnull":    "SELECT count(*), count(v), sum(v) FROM tn WHERE v IS NULL",
+            "single_isnotnull": "SELECT count(*), count(v), sum(v), avg(v) FROM tn WHERE v IS NOT NULL",
+            "single_empty":     "SELECT sum(v), count(*), count(v), min(v), max(v), avg(v) FROM t WHERE v > 100000",
+            "single_having":    "SELECT sum(v) AS s FROM t HAVING sum(v) > 1",
+            "single_having_no": "SELECT sum(v) AS s FROM t WHERE v > 100000 HAVING sum(v) > 1",
+            "single_ratio":     "SELECT sum(v) / count(*) AS m, count(*) FROM t WHERE k < 300",
+        }
+        for name, sql in sgcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"global {name}: rewritten ({lr['reason']})")
+            check(got == want, f"global {name}: rows identical to native ({want} vs {got})")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"global {name}: names and types identical")
+        # EXCEPT both ways through the rewritten text itself
+        for name in ("single_plain", "single_where", "single_decimal", "single_expr"):
+            sql = sgcases[name]
+            con.execute(sql).fetchall()
+            rw = con.last_rewrite()["sql"]
+            if rw:
+                d1 = con._raw.execute(f"SELECT count(*) FROM (({rw}) EXCEPT ({sql}))").fetchone()[0]
+                d2 = con._raw.execute(f"SELECT count(*) FROM (({sql}) EXCEPT ({rw}))").fetchone()[0]
+                check(d1 == 0 and d2 == 0, f"global {name}: EXCEPT both ways is empty ({d1}, {d2})")
+        # a view holding the global aggregate, and staleness
+        con.execute("CREATE OR REPLACE VIEW gv AS SELECT * FROM t WHERE k < 500")
+        qv = "SELECT sum(v), count(*) FROM gv WHERE v > 3"
+        check(con.execute(qv).fetchall() == con._raw.execute(qv).fetchall(), "global view: answered identically")
+        q_stale = "SELECT count(*), sum(v) FROM tu"
+        before = con.execute(q_stale).fetchall()
+        con.execute("INSERT INTO tu VALUES (7, 1234567)")
+        after = con.execute(q_stale).fetchall()
+        check(after == con._raw.execute(q_stale).fetchall() and after != before,
+              f"global staleness: an INSERT gives a fresh answer ({before} -> {after})")
         # count(DISTINCT x) (§4.17): the device groups by (keys, x), DuckDB counts the pairs per key
         dcases = {
             "distinct_basic":  "SELECT z, count(DISTINCT k) AS dk FROM tm GROUP BY z ORDER BY z",
@@ -867,10 +908,15 @@ def run():
             check(got == want if "ORDER BY" in sql else sorted(map(str, got)) == sorted(map(str, want)),
                   f"distinct/right {name}: rows identical to native ({len(want)} rows)")
             check(got_desc == want_desc, f"distinct/right {name}: names and types identical")
+        # count(DISTINCT) without a GROUP BY: the §4.17 split's inner statement is
+        # itself a global aggregate over (k), so it goes through §4.12 — whichever
+        # path it takes, the answer is native's
+        sql = "SELECT count(DISTINCT k), count(*) FROM tm"
+        check(con.execute(sql).fetchall() == con._raw.execute(sql).fetchall(),
+              f"global count(DISTINCT) over one table: answer unchanged (rewritten={con.last_rewrite()['rewritten']})")
         for name, sql in {
             "distinct_on":         "SELECT DISTINCT ON (z) z, k FROM tm ORDER BY z, k",
             "distinct_eq_key":     "SELECT k, count(DISTINCT k) FROM tm GROUP BY k ORDER BY k",
-            "global_single_table": "SELECT count(DISTINCT k), count(*) FROM tm",
         }.items():
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
@@ -985,7 +1031,7 @@ def run():
           and _cn2.default_memory_budget("METAL", 0) == _cn2._host_memory_bytes() // 4
           and _cn2.default_memory_budget("METAL", 2**30) == 2**30,
           "budget defaults: half of a discrete GPU's memory, a conservative fallback without it, a quarter of unified memory capped by what Metal reports")
-    one = _cn2.estimate_set_bytes(N, 2)               # a (key, payload) set over an N-row table
+    one = _cn2.estimate_set_bytes(N, 2)               # a (key, payload) set over an N-row table, 8 bytes a lane
     qa = "SELECT k, sum(v) FROM t GROUP BY k"
     qb = "SELECT k, sum(a) FROM tm GROUP BY k"
     qc = "SELECT k, sum(v) FROM tu GROUP BY k"
@@ -1001,6 +1047,15 @@ def run():
     if getattr(_probe, "_exact", False):
         _probe.execute(qa).fetchall()
         one_real = _resident(_probe)
+        # since stage C the estimate sizes each lane from its type, so take the figure
+        # the admission rule will actually use rather than the flat 8-bytes-a-lane one
+        one = max([m["est_bytes"] for m in _probe.memory()["sets"].values()] or [one])
+        # ... and it must still bound a NARROW-typed table (INTEGER key, DATE, SMALLINT)
+        _probe.execute("SELECT k, sum(v) FROM tn3 WHERE dt >= DATE '1995-01-10' AND z < 4 GROUP BY k").fetchall()
+        _m = _probe.memory()["sets"]
+        check(all(m["bytes"] == 0 or m["est_bytes"] >= m["bytes"] * 0.9 for m in _m.values()),
+              "budget: the estimate bounds a narrow-typed table too "
+              f"({[round(m['est_bytes'] / max(1, m['bytes']), 2) for m in _m.values()]})")
     _probe.close()
     budget_two = one + one_real
     con = fresh(memory_budget=budget_two)              # room for two such sets, not three

@@ -423,6 +423,49 @@ public:
                                                                   inner.data(), n_preds, max_groups, filter);
     }
 
+    // v0.7 §4.12: the global masked aggregate — one side runs the whole call.
+    bool global_supported() const noexcept override {
+        return gpu_ ? gpu_->global_supported() : cpu_->global_supported();
+    }
+    bool narrow_lanes() const noexcept override {
+        return gpu_ ? gpu_->narrow_lanes() : cpu_->narrow_lanes();
+    }
+
+    GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                           const Predicate* preds, std::size_t n_preds) override {
+        std::vector<MultiPayload> ip(pays, pays + n_pays);
+        std::vector<Predicate> inner(preds, preds + n_preds);
+        bool on_gpu = false, first = true, same = true;
+        std::size_t rows = 0;
+        auto note = [&](const HybridResidentColumn& h) {
+            if (first) { on_gpu = h.on_gpu(); rows = h.rows(); first = false; }
+            else same = same && h.on_gpu() == on_gpu;
+        };
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            if (!pays[p].vals) throw std::runtime_error("aggregate_exact_masked: payload without a column");
+            const auto& h = check_hybrid(*pays[p].vals);
+            note(h);
+            ip[p].vals = &h.inner();
+        }
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            if (!preds[q].col) throw std::runtime_error("aggregate_exact_masked: predicate without a column");
+            const auto& h = check_hybrid(*preds[q].col);
+            note(h);
+            inner[q].col = &h.inner();
+        }
+        if (first) throw std::runtime_error("aggregate_exact_masked: neither a payload nor a predicate");
+        if (!same)
+            throw std::runtime_error(
+                "aggregate_exact_masked: columns are resident on different backends "
+                "(one upload fell back to CPU) — re-upload and retry");
+        const bool run_gpu = gpu_ && on_gpu;
+        last_ = make_decision(run_gpu ? gpu_backend_ : Backend::CPU,
+                              run_gpu ? DispatchReason::Hot_GpuAlwaysWins
+                                      : (gpu_ ? DispatchReason::Resident_OnCpu : DispatchReason::GpuUnavailable),
+                              rows, 0, /*resident*/true, /*borderline*/false);
+        return (run_gpu ? *gpu_ : *cpu_).aggregate_exact_masked(ip.data(), n_pays, inner.data(), n_preds);
+    }
+
     // v0.7 §4.8: the materialised key join runs where its columns live.
     bool join_supported() const noexcept override {
         return gpu_ ? gpu_->join_supported() : cpu_->join_supported();

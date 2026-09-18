@@ -103,6 +103,10 @@ class Plan:
     scales: Dict[str, int] = field(default_factory=dict)
     having_pay: int = 0
     topk_pay: int = 0
+    # §4.12: the statement has no GROUP BY. The split hands the matcher a
+    # constant key so it reads as a GROUP BY; make_global() then strips it —
+    # no key lane, no sort cache, one row out.
+    global_agg: bool = False
 
     def add_payload(self, col: str) -> int:
         if col not in self.vals:
@@ -122,7 +126,16 @@ class Plan:
         return len(self.keys) > 1 and not self.dict_key
 
     @property
+    def no_key(self) -> bool:
+        """§4.12: a global aggregate over a SINGLE table keeps no key lane. Over
+        a join the set is the join's materialised result, whose lane 0 is the
+        row set's own first lane — it stays, and nothing ever sorts it."""
+        return self.global_agg and not self.keys
+
+    @property
     def key_field(self) -> str:
+        if self.no_key:
+            return "-"
         return "+".join(self.keys) if len(self.keys) > 1 else self.key
 
     @property
@@ -604,6 +617,25 @@ def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:
         out.native_type = typ
 
 
+def make_global(plan: Plan, keep_key: bool = False) -> None:
+    """§4.12: turn the split's constant-key GROUP BY plan into a global
+    aggregate. Called once DESCRIBE has typed the outputs (the key is one of
+    them, positionally): the key output goes, and with it the key lane, its
+    sort cache and the dictionary machinery. Everything else — payload lanes,
+    predicate lanes, computed lanes, scales — is what it was."""
+    plan.global_agg = True
+    plan.outputs = [o for o in plan.outputs if o.kind != "key"]
+    if keep_key:
+        return
+    plan.keys = []
+    plan.key = ""
+    plan.key_type = ""
+    plan.key_types = []
+    plan.pack = []
+    plan.dict_key = False
+    plan.decode_per_key = False
+
+
 def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional[int]]:
     """Exact rescale of a HAVING threshold to the payload's integer scale:
     > floors, >= ceils, < ceils, <= floors; = / <> only when representable."""
@@ -624,7 +656,7 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
     """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col == plan.key and len(plan.keys) == 1 and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
+    if col and col == plan.key and len(plan.keys) == 1 and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
         return "k", ("s" if plan.dict_key else "i"), 0
     if col == plan.val:
         return "v", "i", plan.scale
@@ -747,10 +779,13 @@ def _agg_expr(plan: Plan, kind: str, pay: int, native_type: str) -> str:
 
 def _agg_col(plan: Plan, kind: str, pay: int) -> str:
     """The table function's column for an aggregate: the single-payload
-    functions name them sum / count / ..., gpu_groupby_exact_multi sum<p> ..."""
-    if kind in ("key", "count_star") or not plan.multi:
+    functions name them sum / count / ..., gpu_groupby_exact_multi and
+    gpu_agg_exact_global sum<p> ... (the global form always indexes)."""
+    if kind in ("key", "count_star"):
         return kind
-    return f"{kind}{pay}"
+    if plan.global_agg or plan.multi:
+        return f"{kind}{pay}"
+    return kind
 
 
 def _out_expr(plan: Plan, col: str, native_type: str) -> str:
@@ -790,7 +825,32 @@ def _key_component_expr(plan: Plan, i: int, native_type: str) -> str:
     return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type)
 
 
+def _guard_sql(plan: Plan, fqn: str, tag: str) -> str:
+    if plan.guards:
+        # a joined set: one assert per base table, each against that table's own set
+        # (not scalar subqueries of one SELECT: DuckDB's join-order search over N one-row
+        # relations cost 3.8 ms at 8 tables; this form costs 0.27 ms)
+        arms = " UNION ALL ".join("SELECT gpu_assert_rows('%s', count(*)) AS ok FROM %s" % (g.replace("'", "''"), f)
+                                  for g, f in plan.guards)
+        return f"(SELECT bool_and(ok) AS ok FROM ({arms}) gpudb_g) gd"
+    return f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd"
+
+
+def _render_global(plan: Plan, fqn: str) -> str:
+    """§4.12: aggregates without GROUP BY. One table function call, one row —
+    over an empty input too, so the outer statement of the split needs nothing
+    beyond what it already does."""
+    tag = plan.tag.replace("'", "''")
+    prog = _where_program(plan).replace("'", "''")
+    lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
+    src = f"gpu_agg_exact_global('{tag}', '{prog}', '{lanes}') r"
+    cols = [f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS "{out.name}"' for out in plan.outputs]
+    return f"SELECT {', '.join(cols)} FROM {src}, {_guard_sql(plan, fqn, tag)} WHERE gd.ok"
+
+
 def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
+    if plan.global_agg:
+        return _render_global(plan, fqn)
     tag = plan.tag.replace("'", "''")
     fn, args = "gpu_groupby_exact_resident", [f"'{tag}'"]
     prog = _where_program(plan)
@@ -849,15 +909,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key and not dict_per_key:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
-    if plan.guards:
-        # a joined set: one assert per base table, each against that table's own set
-        # (not scalar subqueries of one SELECT: DuckDB's join-order search over N one-row
-        # relations cost 3.8 ms at 8 tables; this form costs 0.27 ms)
-        arms = " UNION ALL ".join("SELECT gpu_assert_rows('%s', count(*)) AS ok FROM %s" % (g.replace("'", "''"), f)
-                                  for g, f in plan.guards)
-        guard = f"(SELECT bool_and(ok) AS ok FROM ({arms}) gpudb_g) gd"
-    else:
-        guard = f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd"
+    guard = _guard_sql(plan, fqn, tag)
     sql = f"SELECT {', '.join(cols)} FROM {src}, {guard} WHERE gd.ok{extra_pred}"
     return sql + _order_limit_sql(plan)
 
@@ -993,8 +1045,9 @@ def store_lanes(plan: Plan, q=_q_default) -> List[Tuple[str, str, str]]:
     out: List[Tuple[str, str, str]] = []
     # a dictionary key is the TUPLE TEXT of its columns, not the columns: it lives in the store
     # under a role-prefixed name so it never collides with the raw column a WHERE lane holds
-    out.append((("k#" + plan.key_field) if plan.dict_key else plan.key_field,
-                key_lane_expr(plan, q), "s" if plan.dict_key else "i"))
+    if not plan.no_key:          # §4.12: a global aggregate over one table has no key lane
+        out.append((("k#" + plan.key_field) if plan.dict_key else plan.key_field,
+                    key_lane_expr(plan, q), "s" if plan.dict_key else "i"))
     if plan.val:
         out.append((plan.val, val_lane_expr(plan, q), "i"))
     for c in plan.pred_cols:
