@@ -110,3 +110,66 @@ SELECT (SELECT count(*) FROM (SELECT key, sum, count, count_star FROM gpu_groupb
        (SELECT count(*) FROM gpu_store_columns()) AS store_cols,
        (SELECT rows FROM gpu_store_columns() WHERE "column" = 's') AS s_rows;
 -- expect: 0  0  4  150000
+
+-- 8. A join materialised over two base VIEWS. A view is not a durable object: it lives
+-- only as long as every lane it names is in the store, so a set built from one is only
+-- as resident as the store behind it. This is what a caller holding the join must
+-- re-derive rather than remember.
+-- setup: CREATE TABLE f AS SELECT (i % 100)::INTEGER AS g, (i % 7)::BIGINT AS v, (i % 50)::INTEGER AS fk FROM range(120000) r(i)
+-- setup: CREATE TABLE d AS SELECT i::INTEGER AS id, (i % 5)::INTEGER AS attr FROM range(50) r(i)
+-- setup: SET VARIABLE fo = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'f')
+-- setup: SET VARIABLE dq = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'd')
+-- setup: SET VARIABLE p = 'gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:join'
+-- setup: SET VARIABLE b = 'gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:join'
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:store', rowid, [g::BIGINT, v, fk::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM f
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:store', rowid, [id::BIGINT, attr::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM d
+-- setup: SET VARIABLE rows = gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k', 'p.k, p.v, b.v')
+SELECT getvariable('rows') AS joined_rows,
+       (SELECT count(*) FROM (SELECT key, sum, count_star FROM gpu_groupby_exact_resident('jv') EXCEPT SELECT g, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id GROUP BY g)) +
+       (SELECT count(*) FROM (SELECT g, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id GROUP BY g EXCEPT SELECT key, sum, count_star FROM gpu_groupby_exact_resident('jv'))) AS mismatch,
+       (SELECT count(*) FROM gpu_residents() WHERE kind = 'view') AS views;
+-- expect: 120000  0  2
+
+-- 8b. A lane the probe view reads is evicted: the view goes with it, so the set built
+-- from it reports the source that changed rather than answering from a dead handle
+-- setup: CREATE TABLE f AS SELECT (i % 100)::INTEGER AS g, (i % 7)::BIGINT AS v, (i % 50)::INTEGER AS fk FROM range(120000) r(i)
+-- setup: CREATE TABLE d AS SELECT i::INTEGER AS id, (i % 5)::INTEGER AS attr FROM range(50) r(i)
+-- setup: SET VARIABLE fo = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'f')
+-- setup: SET VARIABLE dq = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'd')
+-- setup: SET VARIABLE p = 'gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:join'
+-- setup: SET VARIABLE b = 'gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:join'
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:store', rowid, [g::BIGINT, v, fk::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM f
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:store', rowid, [id::BIGINT, attr::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM d
+-- setup: SET VARIABLE rows = gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k', 'p.k, p.v, b.v')
+-- setup: SET VARIABLE dropped = gpu_drop_column('gpudb:v1:memory:main:f:' || getvariable('fo'), 'fk')
+-- expected_fail: was joined from
+SELECT count(*) FROM gpu_groupby_exact_resident('jv');
+
+-- 8c. ... and materialising it again over the same names says there is no such set,
+-- until the lane is uploaded again, when the same call succeeds
+-- setup: CREATE TABLE f AS SELECT (i % 100)::INTEGER AS g, (i % 7)::BIGINT AS v, (i % 50)::INTEGER AS fk FROM range(120000) r(i)
+-- setup: CREATE TABLE d AS SELECT i::INTEGER AS id, (i % 5)::INTEGER AS attr FROM range(50) r(i)
+-- setup: SET VARIABLE fo = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'f')
+-- setup: SET VARIABLE dq = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'd')
+-- setup: SET VARIABLE p = 'gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:join'
+-- setup: SET VARIABLE b = 'gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:join'
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:store', rowid, [g::BIGINT, v, fk::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM f
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:store', rowid, [id::BIGINT, attr::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM d
+-- setup: SET VARIABLE dropped = gpu_drop_column('gpudb:v1:memory:main:f:' || getvariable('fo'), 'fk')
+-- expected_fail: no resident set named
+SELECT gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k', 'p.k, p.v, b.v');
+
+-- 8d. The lane uploaded again: the view is synthesised once more and the join lands
+-- setup: CREATE TABLE f AS SELECT (i % 100)::INTEGER AS g, (i % 7)::BIGINT AS v, (i % 50)::INTEGER AS fk FROM range(120000) r(i)
+-- setup: CREATE TABLE d AS SELECT i::INTEGER AS id, (i % 5)::INTEGER AS attr FROM range(50) r(i)
+-- setup: SET VARIABLE fo = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'f')
+-- setup: SET VARIABLE dq = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 'd')
+-- setup: SET VARIABLE p = 'gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:join'
+-- setup: SET VARIABLE b = 'gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:join'
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:f:' || getvariable('fo') || ':g,v,fk:store', rowid, [g::BIGINT, v, fk::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM f
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:d:' || getvariable('dq') || ':id,attr:store', rowid, [id::BIGINT, attr::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM d
+-- setup: SET VARIABLE dropped = gpu_drop_column('gpudb:v1:memory:main:f:' || getvariable('fo'), 'fk')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:f:' || getvariable('fo') || ':fk:store', rowid, [fk::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM f
+SELECT gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k', 'p.k, p.v, b.v') AS joined_rows,
+       (SELECT count(*) FROM gpu_store_columns() WHERE store = 'gpudb:v1:memory:main:f:' || getvariable('fo')) AS f_cols;
+-- expect: 120000  3

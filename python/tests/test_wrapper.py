@@ -1551,6 +1551,104 @@ def run():
         check(not con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(), "join: native without the operator")
     con.close()
 
+    # ---- a view-backed set is not a stored fact (§5.5) ----
+    # Since stage B a statement's set — and a device join's base set — is a VIEW
+    # synthesised from its table's store, so it exists only while every lane it
+    # names is there. Whatever takes those lanes away (a write, an eviction) must
+    # leave the manager able to derive `ready` again rather than remember it.
+    print("== residency of view-backed sets")
+    from gpudb._residency import ResidencyManager as _RM        # noqa: E402
+    m = _RM(lambda: None, mode="eager")
+    st = m.note_candidate("vset", "UPLOAD", store_key="store", store_lanes=["k", "v"],
+                          upload_name="up", post_sql=["PREPARE"])
+    recipe = (st.upload_name, st.store_key, list(st.store_lanes), list(st.post_sql))
+    m.invalidate("vset")
+    m.requeue("vset")
+    check(st.state == "pending" and (st.upload_name, st.store_key, st.store_lanes, st.post_sql) == recipe,
+          "residency: re-queueing a set keeps the recipe its view is built from")
+    m.note_candidate("vset", "")                       # a sighting carrying no recipe
+    check((st.upload_name, st.store_key, st.store_lanes, st.post_sql) == recipe,
+          "residency: a sighting without a recipe does not erase one")
+    m.note_candidate("vset", "", store_key="store", store_lanes=["k", "v"], post_sql=["PREPARE"])
+    check(st.upload_sql == "" and st.post_sql == ["PREPARE"],
+          "residency: a store-backed sighting replaces the recipe, empty upload statement included")
+    for tag in ("gpudb:v1:d:s:t:1:k,v", "gpudb:v1:d:s:t:10:k,v"):
+        m.note_candidate(tag, "U", store_key=tag.rsplit(":", 1)[0], store_lanes=["k"])
+        m.mark_ready(tag)
+    m.invalidate(prefix="gpudb:v1:d:s:t:1")
+    check(m.get("gpudb:v1:d:s:t:1:k,v").state == "stale" and m.get("gpudb:v1:d:s:t:10:k,v").state == "ready",
+          "residency: gpu_invalidate(<store>) has its match in the manager, matching whole segments")
+    m2 = _RM(lambda: None, mode="eager")
+    m2.note_candidate("base", "U", store_key="st", store_lanes=["k"])
+    m2.note_candidate("derived", "", deps=["base"], steps=["MATERIALIZE"])
+    m2.mark_ready("base"); m2.mark_ready("derived")
+    with m2._lock:
+        m2._sets["base"].state = "missing"
+        m2._demote_dependents_locked({"base"})
+    check(m2.get("derived").state == "missing",
+          "residency: a derived set goes with the source it was materialised from")
+
+    con = fresh()
+    con.execute(JOIN_SETUP_EARLY)
+    if getattr(con, "_join", False) and getattr(con, "_store", False):
+        jq = "SELECT tier, sum(v), count(*) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier"
+        # The crowded state this needs: single-table statements have already put the
+        # base views' lanes in both stores, so each base set's whole recipe is "the
+        # store already holds it" — nothing to upload, only the sort cache to build.
+        con.execute("SELECT did, count(*), sum(v) FROM jf GROUP BY did ORDER BY did").fetchall()
+        con.execute("SELECT did, sum(tier) FROM jd GROUP BY did ORDER BY did").fetchall()
+        con.execute(jq).fetchall()
+        base = sorted(t for t in con.residents() if t.endswith(":join"))
+        derived = [t for t in con.residents() if ":join-" in t]
+        check(con.last_rewrite()["rewritten"] and len(base) == 2 and len(derived) == 1,
+              f"view residency: the device join is resident over two base views ({len(base)} base, {len(derived)} derived)")
+        recipes = {t: (con._manager.get(t).store_key, tuple(con._manager.get(t).store_lanes)) for t in base}
+        check(all(k and l for k, l in recipes.values()) and
+              not any(con._manager.get(t).upload_sql for t in base),
+              f"view residency: each base set is a view with nothing of its own to upload ({recipes})")
+        # a write behind the wrapper's back: the guard fires and the stores are dropped
+        jother = con._raw.cursor()
+        jother.execute("INSERT INTO jd VALUES (94001, 'north', 3, DATE '2021-01-01', 0.5, 7)")
+        want = con._raw.execute(jq).fetchall()
+        got = con.execute(jq).fetchall()
+        check(got == want and con.last_rewrite()["fallback"],
+              "view residency: the foreign write is caught by the guard -> native answer")
+        check(all((con._manager.get(t).store_key, tuple(con._manager.get(t).store_lanes)) == recipes[t] for t in base),
+              "view residency: the base sets kept their recipes across the invalidation")
+        check(not any(con._manager.get(t).state == "ready" for t in base),
+              f"view residency: no base set is ready while its store is gone "
+              f"({[con._manager.get(t).state for t in base]})")
+        for _ in range(3):
+            want = con._raw.execute(jq).fetchall()
+            got = con.execute(jq).fetchall()
+            check(got == want, "view residency: the answer is native's while the sets are rebuilt")
+        lr, states = con.last_rewrite(), con.residents()
+        check(lr["rewritten"] and not lr["fallback"] and got == want,
+              f"view residency: back on the GPU after the write ({lr['reason']}, {lr['error'][:60]})")
+        check(not any(s == "failed" for s in states.values()) and states[derived[0]] == "ready",
+              f"view residency: no set is left failed ({states})")
+        # a column a base view reads is evicted under the budget: the join was
+        # materialised from that view, so it cannot stay ready either
+        used = (con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_store_columns()").fetchone()[0]
+                + con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_residents()").fetchone()[0])
+        con._manager.evict_min_age_s = 0.0
+        con._manager.memory_budget = used                 # the next set has to evict to fit
+        ev0 = con.memory()["evictions"]
+        con.execute("SELECT did, count(*) FROM jm GROUP BY did ORDER BY did").fetchall()
+        check(con.memory()["evictions"] > ev0,
+              f"view residency: the budget evicted to admit another set ({con.memory()['evictions'] - ev0})")
+        check(con._manager.get(derived[0]).state != "ready",
+              f"view residency: the join is not ready once a lane it was built from is evicted "
+              f"({con._manager.get(derived[0]).state})")
+        con._manager.memory_budget = None
+        for _ in range(3):
+            want = con._raw.execute(jq).fetchall()
+            got = con.execute(jq).fetchall()
+            check(got == want, "view residency: the answer is native's after the eviction too")
+        check(con.last_rewrite()["rewritten"] and not any(s == "failed" for s in con.residents().values()),
+              f"view residency: resident again after the eviction ({con.residents()})")
+    con.close()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0

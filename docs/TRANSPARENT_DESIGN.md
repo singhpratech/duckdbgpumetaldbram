@@ -1229,6 +1229,29 @@ same database — the extension stays free of threads and hidden connections
   the shared interface; Metal implements it too) that builds the sort cache
   on the upload stream and records a completion event; the set flips to
   ready after that event completes.
+- **Ready for a VIEW is never a stored fact.** Since the store (§5.10) a
+  single-table set — and a device join's base set — is a view synthesised on
+  lookup from its table's columns, so it exists only while every lane it names
+  is in the store and is gone the moment one of them leaves (a write's
+  `gpu_invalidate`, `gpu_drop_column` under the budget). The manager may
+  remember that such a set was ready, but never rely on that without the
+  extension's word, and three rules keep the two in step. Its own invalidation
+  takes a store PREFIX, as `gpu_invalidate` does, so every set over an
+  invalidated table goes at once, the sources' tables of a join included — the
+  error names the statement's set, not the table that moved. Re-queueing a set
+  never touches its RECIPE (which lanes are missing, the upload statement, the
+  sort cache): what the next upload must fetch depends on what the store holds
+  then, which only the next sighting knows, and a recipe erased to "nothing to
+  upload" would make a set ready for free over columns that are gone. And the
+  one session that would otherwise take readiness on trust — a set whose recipe
+  says every lane is already there — asks `gpu_store_columns()` first, as does a
+  materialise step whose source the extension says is absent; a set the
+  extension does not hold goes back to `missing`, where the next sighting
+  rebuilds it, and a set materialised from it goes with it. None of this is on
+  the warm path: a ready set is answered from the manager's own state, and these
+  questions are asked only by a cold set's session or by a step that has already
+  failed. Meanwhile the statement runs on DuckDB (rule 2) and
+  `last_rewrite()["error"]` says what the set is waiting on.
 - **Memory budget.** Wrapper setting `memory_budget` (bytes, or `'16GB'`;
   `0` / `'unlimited'` removes the cap; `GPUDB_MEMORY_BUDGET_MB` overrides the
   default). Default: 25% of unified memory on Apple silicon — the GPU shares
