@@ -70,6 +70,42 @@ CUDA: the same table until scripts/transparent_gate.py has run on the
 Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
 takes the exact path there today).
 
+The direct grouped reduce (v0.8, `docs/RESIDENT_COLUMNS_DESIGN.md` §7) did not
+move any of these, and the measurement says why. Inside the backend, a key with
+few distinct values now answers in one row-order pass over a group-id lane
+instead of masking, sorting and gathering: at SF10 that is 1.65× to 8.57×
+faster on every shape it serves (BENCHMARK.md), and TPC-H Q1 goes from 37.2 ms
+to 15.2. But the bounds here are group counts, not row counts, and what they
+have to hold at is SF1, where `lineitem` is 6M rows and a few-group statement is
+not bound by the reduce at all. `scripts/transparent_gate.py --subqueries
+--exprs --no-thresholds` on this build, SF1 — the first 56 rows of the sweep,
+which are the ones these bounds decide (the run was stopped there; the machine
+was needed for the gate proper):
+
+  * `l_linenumber` (7 groups, INTEGER key): 0.80-0.94x on plain / HAVING /
+    top-k / projected / nested with no WHERE, 0.52-0.55x under a 9% one.
+    Native answers a 6M-row, 7-group aggregate in 1.5-2.5 ms and the wrapper's
+    own round trip is about 2.5 ms      → min_groups stays at 1000
+  * `l_returnflag` (3 groups, VARCHAR key, already exempt from min_groups with
+    no WHERE): 1.01-1.39x with no WHERE, 0.57-0.62x under the 9% WHERE — which
+    string_key_min_selectivity = 0.5 already declines
+                                        → string_key_min_selectivity and
+                                          string_key_min_computed_payloads stay
+  * the many-group rows (`l_suppkey` 10K, `l_partkey` 200K, `l_orderkey` 1.5M)
+    read the same sort path as before and measure where they measured
+
+The backend has its own rule for the same reason at a smaller scale: the direct
+pass is only taken at 3+ groups and 6M+ rows x (payloads + terms), because below
+that its per-threadgroup setup outweighs what it saves (BENCHMARK.md). That is
+backend-private and invisible here; it changes which algorithm answers, never
+whether the statement is rewritten.
+
+So nothing here is relaxed on this evidence: a bound that admitted the
+few-group shapes at SF1 would admit them at 0.5x, and rule 1 is not a ratio
+averaged over scale factors. What the direct path changes is the SF10 and SF50
+end of every shape that is ALREADY admitted, which is where it shows in the
+TPC-H tables.
+
 The bounds predict the win before a statement runs; the wrapper also MEASURES
 it: every statement runs native while its set is being uploaded, so its own
 native time is known, and when the best of the first three rewritten runs is
