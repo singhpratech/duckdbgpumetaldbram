@@ -204,7 +204,7 @@ def run():
         "rollup":       ("SELECT k, sum(v) FROM t GROUP BY ROLLUP(k)", "shape"),
         # (FILTER on sum / count / min / max / avg is rewritten since §4.19; a DISTINCT aggregate with one is not)
         "filter":       ("SELECT k, count(DISTINCT v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
-        "distinct":     ("SELECT k, sum(DISTINCT v) FROM t GROUP BY k", "shape"),
+        "distinct":     ("SELECT k, count(DISTINCT v) FILTER (WHERE v > 3) FROM t GROUP BY k", "shape"),
         # (OR and function predicates are computed lanes since §4.10 — see "computed lanes")
         "where_volatile": ("SELECT k, sum(v) FROM t WHERE v > random() GROUP BY k", "shape"),
         "where_subquery": ("SELECT k, sum(v) FROM t WHERE v > (SELECT 3) GROUP BY k", "shape"),
@@ -556,9 +556,9 @@ def run():
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"distinct {name}: names and types identical")
         for name, sql in {
-            "distinct_two_columns": "SELECT z, count(DISTINCT k), count(DISTINCT a) FROM tm GROUP BY z ORDER BY z",
+            # (two DISTINCT columns and sum(DISTINCT) are taken since 2026-09-18; avg beside a DISTINCT is not)
             "distinct_with_avg":    "SELECT z, count(DISTINCT k), avg(a) FROM tm GROUP BY z ORDER BY z",
-            "sum_distinct":         "SELECT z, sum(DISTINCT k) FROM tm GROUP BY z ORDER BY z",
+            "distinct_filter":      "SELECT z, count(DISTINCT k) FILTER (WHERE a > 5) FROM tm GROUP BY z ORDER BY z",
         }.items():
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
@@ -566,7 +566,7 @@ def run():
         pdeclines = {
             "double_inside":  "SELECT k, sum(x) / count(*) FROM t GROUP BY k",
             "window_over_agg": "SELECT k, sum(v), rank() OVER (ORDER BY sum(v)) FROM t GROUP BY k",
-            "distinct_agg":   "SELECT k, sum(DISTINCT v) + 1 FROM t GROUP BY k",
+            "distinct_agg":   "SELECT k, count(DISTINCT v) FILTER (WHERE v > 2) + 1 FROM t GROUP BY k",
             "subquery_in_select": "SELECT k, sum(v) / (SELECT count(*) FROM t) FROM t GROUP BY k",
         }
         for name, sql in pdeclines.items():
@@ -835,6 +835,47 @@ def run():
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
             check(got == want, f"shorthand {name}: answer unchanged (rewritten={con.last_rewrite()['rewritten']}, {con.last_rewrite()['reason']})")
+    con.close()
+
+    # ---- SELECT DISTINCT, RIGHT JOIN (§4.21) and DISTINCT aggregates beyond one count (§4.17) ----
+    print("== distinct forms and RIGHT JOIN")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute(JOIN_SETUP_EARLY)
+        con.execute("CREATE TABLE ts AS SELECT k, (a % 97)::BIGINT AS v, z, CASE WHEN a % 11 = 0 THEN NULL ELSE ['alpha','beta','gamma'][1 + a % 3] END AS s, c FROM tm")
+        dcases = {
+            "select_distinct":      "SELECT DISTINCT k, z FROM tm WHERE a < 90000 ORDER BY k, z",
+            "distinct_expr":        "SELECT DISTINCT k % 10 AS b, z FROM tm ORDER BY 1, 2",
+            "distinct_limit":       "SELECT DISTINCT z FROM tm ORDER BY z LIMIT 4",
+            "right_join":           "SELECT tier, count(*), sum(v) FROM jf RIGHT JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier",
+            "right_join_using":     "SELECT tier, count(v) FROM jf RIGHT JOIN jd USING (did) GROUP BY tier ORDER BY tier",
+            "right_join_pred":      "SELECT region, count(*) FROM jf RIGHT OUTER JOIN jd ON jf.did = jd.did AND jf.g < 3 WHERE jd.tier > 2 GROUP BY region ORDER BY region NULLS LAST",
+            "sum_distinct":         "SELECT k, sum(DISTINCT v), count(*) FROM ts GROUP BY k ORDER BY k",
+            "distinct_decimal_avg": "SELECT k, sum(DISTINCT c), min(DISTINCT c), avg(DISTINCT v) FROM ts GROUP BY k ORDER BY k",
+            "two_count_distinct":   "SELECT k, count(DISTINCT z), count(DISTINCT s), sum(v) FROM ts GROUP BY k ORDER BY k",
+            "mixed_distinct_where": "SELECT z, count(DISTINCT s), sum(DISTINCT v), max(v) FROM ts WHERE k < 500 GROUP BY z ORDER BY z",
+            "having_distinct":      "SELECT k, count(DISTINCT z) AS nz FROM ts GROUP BY k HAVING count(DISTINCT z) > 12 ORDER BY k",
+            "global_distinct_join": "SELECT count(DISTINCT tier), count(DISTINCT region), sum(v) FROM jf JOIN jd ON jf.did = jd.did WHERE v > 100",
+        }
+        for name, sql in dcases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + lr["sql"]).fetchall()] if lr["rewritten"] else want_desc
+            check(lr["rewritten"], f"distinct/right {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want if "ORDER BY" in sql else sorted(map(str, got)) == sorted(map(str, want)),
+                  f"distinct/right {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc == want_desc, f"distinct/right {name}: names and types identical")
+        for name, sql in {
+            "distinct_on":         "SELECT DISTINCT ON (z) z, k FROM tm ORDER BY z, k",
+            "distinct_eq_key":     "SELECT k, count(DISTINCT k) FROM tm GROUP BY k ORDER BY k",
+            "global_single_table": "SELECT count(DISTINCT k), count(*) FROM tm",
+        }.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            check(not con.last_rewrite()["rewritten"] and got == want,
+                  f"distinct/right decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
     con.close()
 
     # ---- views (§4.20): a view is its definition spliced in as a derived table ----
@@ -1156,7 +1197,6 @@ def run():
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"join-upload {name}: names and types identical")
         declines = {
-            "right_join":   "SELECT tier, count(*) FROM jf RIGHT JOIN jd ON jf.did = jd.did GROUP BY tier",
             "full_join":    "SELECT tier, count(*) FROM jf FULL JOIN jd ON jf.did = jd.did GROUP BY tier",
             "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did WHERE jf.id < 300 GROUP BY tier",
             "cross_product": "SELECT tier, count(*) FROM jn, jd WHERE jd.tier = 1 GROUP BY tier",

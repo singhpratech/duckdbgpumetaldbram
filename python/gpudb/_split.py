@@ -224,7 +224,14 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
     that result — count(__d) skips the NULL x exactly as count(DISTINCT x)
     does. The other aggregates re-aggregate exactly: sum of sums, sum of
     counts (cast back to BIGINT), min of mins, max of maxs; avg does not
-    decompose and declines. One DISTINCT column per statement."""
+    decompose and declines.
+
+    Also: sum / avg / min / max (DISTINCT x) — over rows unique per (keys, x)
+    the plain aggregate of __d IS the DISTINCT aggregate; several DISTINCT
+    columns — the device groups by (keys, x1, x2, ...) and DuckDB keeps the
+    DISTINCT on each (count(DISTINCT __d0) over the far smaller result); and no
+    GROUP BY at all (the outer is a global aggregate over the device's groups,
+    one row even over no input, as native)."""
     j = json.loads(tree_json)
     stmts = j.get("statements") or []
     if len(stmts) != 1:
@@ -233,7 +240,7 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
     if node.get("type") != "SELECT_NODE" or (node.get("cte_map") or {}).get("map"):
         return None
     groups = node.get("group_expressions") or []
-    if not groups or node.get("group_sets") != [list(range(len(groups)))] or len(groups) > 7:
+    if groups and (node.get("group_sets") != [list(range(len(groups)))] or len(groups) > 7):
         return None
     if node.get("aggregate_handling") != "STANDARD_HANDLING" or node.get("qualify") or node.get("sample"):
         return None
@@ -249,8 +256,9 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
     if any(g.get("class") == "CONSTANT" for g in groups):
         return None
 
-    distinct_arg: List[dict] = []
+    distinct_args: List[dict] = []
     aggs: List[dict] = []
+    _DISTINCT_OUTER = {"count": "count", "sum": "sum", "avg": "avg", "min": "min", "max": "max"}
     ok = [True]
     select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
 
@@ -286,15 +294,18 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
                     ok[0] = False
                     return e
                 if e.get("distinct"):
-                    if name != "count" or len(ch) != 1:
+                    if name not in _DISTINCT_OUTER or len(ch) != 1:
                         ok[0] = False
                         return e
-                    if not distinct_arg:
-                        distinct_arg.append(ch[0])
-                    elif not _same(distinct_arg[0], ch[0]):
-                        ok[0] = False              # two different DISTINCT columns
-                        return e
-                    return fn("count", _ref("__d"), alias)
+                    di = next((i for i, d in enumerate(distinct_args) if _same(d, ch[0])), None)
+                    if di is None:
+                        distinct_args.append(ch[0])
+                        di = len(distinct_args) - 1
+                    # over rows unique per (keys, x) the plain aggregate of __d is the DISTINCT one;
+                    # with several DISTINCT columns the rows are unique per the tuple, so each keeps its DISTINCT
+                    out = fn(_DISTINCT_OUTER[name], _ref(f"__d{di}"), alias)
+                    out["distinct"] = True         # harmless with one column, required with several
+                    return out
                 if name == "avg":
                     ok[0] = False
                     return e
@@ -328,18 +339,21 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
             for o in m2.get("orders") or []:
                 o["expression"] = sub(o.get("expression"), top_level_order=True)
         outer_mods.append(m2)
-    if not ok[0] or not distinct_arg:
+    if not ok[0] or not distinct_args:
         return None
-    if any(_same(distinct_arg[0], g) for g in groups):
+    if any(_same(d, g) for d in distinct_args for g in groups):
         return None                                   # count(DISTINCT k) GROUP BY k: leave it to native
+    if len(groups) + len(distinct_args) > 8:
+        return None
 
     inner = json.loads(json.dumps(j))
     inode = inner["statements"][0]["node"]
-    d_expr = dict(json.loads(json.dumps(distinct_arg[0])), alias="")
-    inode["group_expressions"] = [json.loads(json.dumps(g)) for g in groups] + [d_expr]
-    inode["group_sets"] = [list(range(len(groups) + 1))]
+    d_exprs = [dict(json.loads(json.dumps(d)), alias="") for d in distinct_args]
+    inode["group_expressions"] = [json.loads(json.dumps(g)) for g in groups] + d_exprs
+    inode["group_sets"] = [list(range(len(groups) + len(d_exprs)))]
+    inode["aggregate_handling"] = "STANDARD_HANDLING"
     inode["select_list"] = [dict(json.loads(json.dumps(g)), alias=f"__k{i}") for i, g in enumerate(groups)] + \
-                           [dict(json.loads(json.dumps(d_expr)), alias="__d")] + \
+                           [dict(json.loads(json.dumps(d)), alias=f"__d{i}") for i, d in enumerate(d_exprs)] + \
                            [dict(json.loads(json.dumps(a)), alias=f"__g{i}") for i, a in enumerate(aggs)]
     if not aggs:
         # the device set needs something to aggregate: count(*) is free

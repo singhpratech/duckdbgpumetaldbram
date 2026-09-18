@@ -761,9 +761,14 @@ No kernel: `SELECT k, count(DISTINCT x), sum(v) … GROUP BY k` becomes an inner
 device GROUP BY over (k, x) and an outer statement in which DuckDB counts the
 pairs per key — `count(x)` over the inner rows skips a NULL x exactly as
 `count(DISTINCT x)` does — and re-aggregates the rest exactly: sum of sums,
-sum of counts cast back to BIGINT, min of mins, max of maxs. `avg` does not
-decompose and declines; one DISTINCT column per statement; `sum(DISTINCT)`
-declines. Every (key, x) pair travels back through DuckDB, ~0.25 ms per 1K
+sum of counts cast back to BIGINT, min of mins, max of maxs. `avg` over a plain payload does not
+decompose and declines. Since 2026-09-18 the pass also takes `sum` / `avg` /
+`min` / `max` (DISTINCT x) — over rows unique per (keys, x) the plain
+aggregate of the pair column is the DISTINCT one — several DISTINCT columns
+(the device groups by the tuple, DuckDB keeps a DISTINCT per column over the
+far smaller result) and, over a join, no GROUP BY at all. A single-table
+`count(DISTINCT x)` without GROUP BY stays native: DuckDB does it in 4–13 ms
+at SF1 and the device would first return every distinct value. Every (key, x) pair travels back through DuckDB, ~0.25 ms per 1K
 pairs, so the form has its own bound (`_thresholds.py`): up to 17K pairs
 1.3–7.1×, 70K pairs 2.1–2.5× without a WHERE but 0.82–1.13× under a 9–10% one,
 700K pairs 0.39–0.51× — declined above 100K pairs, above 20K under a WHERE,
@@ -881,9 +886,11 @@ noticed on the next statement, which is rebuilt from the new definition.
 DuckDB's shorthand is spelled out before the decision (`_syntax.normalise`), by
 DuckDB's own definitions: `GROUP BY ALL` becomes every select item that holds no
 aggregate; `GROUP BY 1, 2` and `ORDER BY 3 DESC` become the select items they
-stand for; `ORDER BY ALL` becomes every select item in order. ROLLUP / CUBE /
-GROUPING SETS, `SELECT *` and an ordinal past the select list are left as
-written. Names pinned and verified with DESCRIBE, as §4.19.
+stand for; `ORDER BY ALL` becomes every select item in order. Two more identities in the same pass: `SELECT DISTINCT a, b` (no aggregate,
+no GROUP BY) is `GROUP BY a, b`, and `A RIGHT JOIN B ON c` is `B LEFT JOIN A ON
+c` (column order is not observable: `SELECT *` is never rewritten). ROLLUP / CUBE /
+GROUPING SETS, `DISTINCT ON`, `SELECT *` and an ordinal past the select list are
+left as written. Names pinned and verified with DESCRIBE, as §4.19.
 
 ## 5. Automatic residency (piece C)
 
