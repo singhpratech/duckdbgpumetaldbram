@@ -1026,6 +1026,33 @@ while the device would first return every distinct value (200K rows for
 `l_partkey`); the rule that keeps single-table global aggregates native holds
 for it too.
 
+## 2026-09-18 — The write the guard could not see
+
+Before sharing lanes between sets I asked what the staleness guard actually
+sees. It compares row counts. So: `UPDATE t SET v = v + 1 WHERE k = 5` from a
+second connection, then the resident statement — same row count, guard
+passes, the device answers from the old values. A wrong answer with no error,
+on a path documented nowhere. That is a rule-2 hole and it went to the front
+of the queue.
+
+DuckDB offers no table version. Its storage metadata does tell
+(`pragma_storage_info` has `has_updates` and block positions), but reading it
+costs 2.8 ms at SF1 and 175 ms at SF50 — it enumerates every column of every
+row group whatever the WHERE says — so it cannot run per statement. The file
+can. Every committed write appends to the WAL or, at a checkpoint, rewrites the
+database file; a read touches neither, a rollback touches neither; and a DuckDB
+file that is open can only be written by connections of the same process,
+which share that WAL. Two `stat` calls, 2.6 µs, before every rewritten
+statement: a change means a write happened somewhere, drop every set, run
+native, rebuild on the next statement. The wrapper's own writes re-take the
+snapshot after they run so they do not invalidate twice.
+
+What it does not cover is honest to state: an in-memory database has no file,
+so a write made there through a raw `duckdb` cursor (not the wrapper's) stays
+invisible — the row-count guard is all there is. The fix for that is the same
+ask already on the list for the DuckDB team: a table version, or a change
+notification, in the C API.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
