@@ -2103,8 +2103,22 @@ void test_cuda_device_fault_is_an_error() {
 // =sort and compared limb for limb against the CPU reference.
 // ---------------------------------------------------------------------------
 #if GPUDB_HAVE_METAL
+void test_direct_groupby_body();
+
+// Nothing in this block may take the binary down: a GPU that cannot build one
+// of the pipelines the exact path needs — including the radix sorter the SORT
+// path uses — is a skip, not a crash, and the rest of the suite still has to
+// run and report.
 void test_direct_groupby() {
     std::printf("\n--- exact GROUP BY: the direct path vs the sort path ---\n");
+    try {
+        test_direct_groupby_body();
+    } catch (const std::exception& e) {
+        std::printf("  skipped (%s)\n", e.what());
+    }
+}
+
+void test_direct_groupby_body() {
     using DT = gpudb::Dtype;
     using Op = gpudb::Predicate::Op;
     const std::size_t cap = std::size_t(100) * 1000000;
@@ -2427,6 +2441,59 @@ void test_direct_groupby() {
         }
     }
 
+    // An OPTIONAL pipeline's refusal must cost one shape, not the path. A
+    // min / max over a payload lane wider than 4 bytes cannot use the slab's
+    // 32-bit atomics, so it takes the thread-private kernel; at 9 to 32
+    // accumulator slots that is gdir_masked_32_i64. If only that one will not
+    // build, this call takes the sort path and every other shape still goes
+    // direct. GPUDB_METAL_DIRECT_DISABLE_PSO=masked32 is that device.
+    std::printf("  an optional pipeline refused (wide min/max, 9..32 slots):\n");
+    try {
+        const char* knob = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
+        const std::string mode = knob ? knob : "";
+        const std::size_t N = 2'000'003, L = 3;
+        std::vector<std::int64_t> flat(N * L);
+        std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+        for (std::size_t i = 0; i < N; ++i) {
+            flat[i * L + 0] = static_cast<std::int64_t>(i % 20) * 7 - 3;     // 20 distinct + NULLs = 21 groups
+            flat[i * L + 1] = (std::int64_t{1} << 62) - static_cast<std::int64_t>(i % 991);  // 8-byte lane
+            flat[i * L + 2] = static_cast<std::int64_t>(i % 127) - 63;       // narrow lane
+            if (i % 37 == 0) valid[0][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+        }
+        std::vector<const std::uint64_t*> vp{valid[0].data(), valid[1].data(), valid[2].data()};
+        const DT dts[3] = {DT::I64, DT::I64, DT::I64};
+        gpudb::Aggregator::RowSpan sp;
+        sp.lanes = flat.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+        auto dc = direct_agg->upload_rows_exact(&sp, 1, dts, L);
+        auto rc = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+        gpudb::GroupByFilter f;            // kAllColumns: min / max are read
+        auto call = [&](std::size_t pay) {
+            gpudb::exact_path_note().clear();
+            auto got = direct_agg->groupby_exact_resident(*dc[0], dc[pay].get(), cap, f);
+            return std::make_pair(got, gpudb::exact_path_note());
+        };
+        auto wide = call(1), narrow = call(2);
+        auto want_wide = ref_agg->groupby_exact_resident(*rc[0], rc[1].get(), cap, f);
+        auto want_narrow = ref_agg->groupby_exact_resident(*rc[0], rc[2].get(), cap, f);
+        EXPECT(same(wide.first, want_wide, "wide min/max", /*totals*/wide.second == "direct"));
+        EXPECT(same(narrow.first, want_narrow, "narrow min/max", /*totals*/narrow.second == "direct"));
+        if (have_direct) {
+            // the narrow payload never needs the thread kernel, so it is the
+            // witness that the path itself is still alive
+            if (narrow.second != "direct")
+                std::printf("    FAIL narrow min/max took %s, expected direct\n", narrow.second.c_str());
+            EXPECT_EQ(narrow.second == "direct", true);
+            const char* want_path = (mode == "masked32") ? "sort" : "direct";
+            if (wide.second != want_path)
+                std::printf("    FAIL wide min/max took %s, expected %s\n",
+                            wide.second.c_str(), want_path);
+            EXPECT_EQ(wide.second == want_path, true);
+        }
+    } catch (const std::exception& e) {
+        ++failures; ++total;
+        std::printf("    FAIL: %s\n", e.what());
+    }
+
     // The admission rule, on both sides of it. `auto` must send a call the
     // sort path's way when there is not enough work per row to pay the
     // group-id lane back, and take the direct path once there is — with the
@@ -2537,8 +2604,18 @@ void test_direct_groupby() {
 // exact call, the sort path answers, the answer is the reference's, and the
 // reason is kept. GPUDB_METAL_DIRECT_DISABLE_PSO makes every direct pipeline
 // refuse, so this runs on a device where the path would otherwise work.
+void test_direct_pso_fallback_body();
+
 void test_direct_pso_fallback() {
     std::printf("\n--- exact GROUP BY: the direct path's pipelines refused ---\n");
+    try {
+        test_direct_pso_fallback_body();
+    } catch (const std::exception& e) {
+        std::printf("  skipped (%s)\n", e.what());
+    }
+}
+
+void test_direct_pso_fallback_body() {
     using DT = gpudb::Dtype;
     const std::size_t cap = std::size_t(100) * 1000000;
     auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
@@ -2722,6 +2799,11 @@ void test_resident_prepare() {
 }
 
 int main(int argc, char** argv) {
+    // CI reads this through a pipe, where stdout is block-buffered: a crash
+    // then loses every line since the last flush and the log points at the
+    // wrong place. Line buffering costs nothing here and makes the last line
+    // printed the last line that ran.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
 #if GPUDB_HAVE_CUDA && defined(__linux__)
     if (argc > 1 && std::string(argv[1]) == "--cuda-fault-child") return cuda_fault_child();
 #else

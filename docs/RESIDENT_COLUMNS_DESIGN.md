@@ -315,6 +315,13 @@ through the sort path with `path=sort` and the reason in
 answers the same way rather than failing. Nothing on the path throws out of an
 operator or out of `prepare()`.
 
+**Every pipeline names itself when it will not build.** All four Metal
+subsystems — the aggregator, the radix sorter, the v0.6 GROUP BY and the hash
+join — put the function's name and the compiler's own text in the error or the
+reason. A message that says only `Compilation failed` cost two round trips to
+narrow down and cannot be produced any more. The unit binary line-buffers
+stdout too, so a crash cannot swallow the lines that say where it was.
+
 **The decision is made once, before anything is built for it.** The path needs
 four pipelines — the id-lane pair, the merge and the slab reduce — and the
 first time anything wants the path they are all asked for together. A device
@@ -326,7 +333,11 @@ so the ordering matters in practice and not just in principle. The
 thread-private kernels are deliberately NOT in the required set: they serve
 only a `min` / `max` over a payload lane wider than 4 bytes, they measured no
 better than the sort path on any device here, and a slab-less mode built out of
-them would be a shape nobody has numbers for. The threadgroup budget and the threads a
+them would be a shape nobody has numbers for. An optional pipeline that refuses
+costs that one shape and nothing else — the call takes the sort path and every
+other shape still goes direct, which `GPUDB_METAL_DIRECT_DISABLE_PSO=masked32`
+and a 21-group wide-`min`/`max` case in the unit tests pin down.
+The threadgroup budget and the threads a
 pipeline will take are asked of the device rather than assumed, so a smaller
 GPU narrows the slab instead of overrunning it; `GPUDB_METAL_DIRECT_DISABLE_PSO`
 makes every pipeline refuse, which is how the fallback is tested where it would
