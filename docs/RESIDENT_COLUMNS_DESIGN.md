@@ -313,7 +313,20 @@ compiler's own text, says so once on stderr, and every exact call answers
 through the sort path with `path=sort` and the reason in
 `gpudb::exact_path_reason()`. A forced `GPUDB_METAL_GROUPBY_EXACT_PATH=direct`
 answers the same way rather than failing. Nothing on the path throws out of an
-operator or out of `prepare()`. The threadgroup budget and the threads a
+operator or out of `prepare()`.
+
+**The decision is made once, before anything is built for it.** The path needs
+four pipelines — the id-lane pair, the merge and the slab reduce — and the
+first time anything wants the path they are all asked for together. A device
+that refuses any of them is latched unavailable before a single group-id lane
+exists, which is what makes the fallback free rather than merely safe: an id
+lane costs a byte or two per row and there is nothing to read it with. The
+runner that found this refuses `gdir_slab_i64` alone and builds the other four,
+so the ordering matters in practice and not just in principle. The
+thread-private kernels are deliberately NOT in the required set: they serve
+only a `min` / `max` over a payload lane wider than 4 bytes, they measured no
+better than the sort path on any device here, and a slab-less mode built out of
+them would be a shape nobody has numbers for. The threadgroup budget and the threads a
 pipeline will take are asked of the device rather than assumed, so a smaller
 GPU narrows the slab instead of overrunning it; `GPUDB_METAL_DIRECT_DISABLE_PSO`
 makes every pipeline refuse, which is how the fallback is tested where it would

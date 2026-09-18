@@ -2237,8 +2237,10 @@ private:
         }
         if (k.dtype() != Dtype::I64 || k.rows() == 0) { k.set_gid_none(); return false; }
         if (k.rows() > 0xFFFFFFFFull - 64) { k.set_gid_none(); return false; }
-        // Both helpers must exist before anything is allocated or sorted; a
-        // refusal here is the path being unavailable, not this column.
+        // Before the sort cache and before a byte is allocated: can this
+        // device run the path at all? A lane built for a path that turns out
+        // to be unavailable is memory nothing will ever read.
+        if (!direct_ensure_ready()) return false;
         id<MTLComputePipelineState> ids_ps = dir_ids_pso();
         id<MTLComputePipelineState> fill_ps = dir_fill_pso();
         if (!ids_ps || !fill_ps) return false;
@@ -2362,7 +2364,7 @@ private:
                      const Predicate* preds, std::size_t n_preds,
                      const GroupByFilter& filter,
                      DirectPlan& pl, double* kernel_ms) {
-        if (exact_path_ == ExactPath::Sort || !direct_available()) return false;
+        if (exact_path_ == ExactPath::Sort || !direct_ensure_ready()) return false;
         if (!ensure_gid_lane(k, kernel_ms)) return false;
         const bool has_null = k.null_count() > 0;
         pl.n_groups = k.gid_groups() + (has_null ? 1 : 0);
@@ -2460,10 +2462,10 @@ private:
             if (s < 0) return false;
             pl.pay_slot[p] = static_cast<std::uint32_t>(s);
         }
-        // Build the pipelines this call will use now, so direct_impl never has
-        // to deal with a refusal half way through a command buffer.
-        if (!dir_merge_pso()) return false;
-        if (!(pl.slab ? dir_slab_pso() : dir_pso(pl.bucket))) return false;
+        // The slab and the merge are in the required set, so they exist by now;
+        // the thread-private kernel is optional and may not, in which case
+        // this call takes the sort path like any other it cannot express.
+        if (!pl.slab && !dir_pso(pl.bucket)) return false;
         pl.prog.resize(n_preds);
         for (std::size_t q = 0; q < n_preds; ++q) {
             const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
@@ -3604,6 +3606,13 @@ private:
     // functions. When that happens the direct path is marked unavailable for
     // the aggregator's lifetime, with the compiler's own text kept, and every
     // exact call answers through the sort path. Nothing here throws.
+    // Why no group-id lane can outlive the decision: direct_unavailable_locked
+    // is reachable only from a REQUIRED build, every required build happens
+    // inside direct_ensure_ready(), and every caller that could leave a lane
+    // or a touched buffer behind — ensure_gid_lane, touch_scratch,
+    // direct_plan — calls it before it allocates anything. Once dir_probed_ is
+    // set no required build runs again, so direct_ok_ cannot flip after a lane
+    // exists and there is nothing to release.
     bool direct_available() const { return direct_ok_.load(std::memory_order_acquire); }
     std::string direct_reason() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
@@ -3626,7 +3635,7 @@ private:
             for (NSString* n : all) {
                 if ([n isEqualToString:name]) continue;
                 bool ok = false;
-                if (!dir_disable_pso_) {
+                if (!dir_refuses(n)) {
                     if (id<MTLFunction> f = [lib_ newFunctionWithName:n]) {
                         NSError* e = nil;
                         ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
@@ -3648,21 +3657,24 @@ private:
             std::fprintf(stderr, "[gpudb metal] exact GROUP BY direct path unavailable: %s\n",
                          direct_why_.c_str());
     }
-    // nil on refusal, never a throw. `pipeline_threads` must be at least kBlock:
-    // the direct kernels reduce over a threadgroup of exactly that size.
-    id<MTLComputePipelineState> dir_make_locked(__strong id<MTLComputePipelineState>& slot, NSString* name) {
+    // nil on refusal, never a throw. A REQUIRED pipeline's refusal disables the
+    // path; an optional one's does not — the thread-private kernel is only the
+    // fallback for a min / max the slab cannot hold exactly, and a device
+    // without it still runs every other shape.
+    id<MTLComputePipelineState> dir_make_locked(__strong id<MTLComputePipelineState>& slot, NSString* name,
+                                                bool required = true) {
         if (slot) return slot;
         if (!direct_ok_.load(std::memory_order_relaxed)) return nil;
         @autoreleasepool {
-            if (dir_disable_pso_) {                       // GPUDB_METAL_DIRECT_DISABLE_PSO
-                direct_unavailable_locked(name, nil);
+            if (dir_refuses(name)) {                      // GPUDB_METAL_DIRECT_DISABLE_PSO
+                if (required) direct_unavailable_locked(name, nil);
                 return nil;
             }
             id<MTLFunction> fn = [lib_ newFunctionWithName:name];
-            if (!fn) { direct_unavailable_locked(name, nil); return nil; }
+            if (!fn) { if (required) direct_unavailable_locked(name, nil); return nil; }
             NSError* err = nil;
             id<MTLComputePipelineState> pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
-            if (!pso) { direct_unavailable_locked(name, err); return nil; }
+            if (!pso) { if (required) direct_unavailable_locked(name, err); return nil; }
             if ([pso maxTotalThreadsPerThreadgroup] < kBlock) {
                 // the tree reductions are written for a full threadgroup
                 std::ostringstream os;
@@ -3672,17 +3684,38 @@ private:
                                                   code:1
                                               userInfo:@{NSLocalizedDescriptionKey:
                                                          [NSString stringWithUTF8String:os.str().c_str()]}];
-                direct_unavailable_locked(name, e2);
+                if (required) direct_unavailable_locked(name, e2);
                 return nil;
             }
             slot = pso;
             return slot;
         }
     }
+    // Availability is decided ONCE, before anything the path would leave behind
+    // exists. The four pipelines below are what it needs to run at all:
+    // without the slab there is no general reduce, and a device that cannot
+    // build it must not pay for group-id lanes it will never read. The
+    // thread-private kernels are NOT required — the runner that found this
+    // builds them while refusing the slab, and they only serve a min / max
+    // over a payload lane wider than 4 bytes, a shape that measured no better
+    // than the sort path on any device we have. So: no slab, no direct path.
+    bool direct_ensure_ready() {
+        if (!direct_ok_.load(std::memory_order_acquire)) return false;
+        if (dir_probed_.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(dir_pso_mu_);
+        if (dir_probed_.load(std::memory_order_relaxed))
+            return direct_ok_.load(std::memory_order_relaxed);
+        const bool ok = dir_make_locked(ps_gdir_ids_,   @"gdir_ids_i64")   != nil
+                     && dir_make_locked(ps_gdir_fill_,  @"gdir_fill_ids")  != nil
+                     && dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64") != nil
+                     && dir_make_locked(ps_gdir_slab_,  @"gdir_slab_i64")  != nil;
+        dir_probed_.store(true, std::memory_order_release);
+        return ok;
+    }
     id<MTLComputePipelineState> dir_pso(std::size_t b) {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
         NSString* names[2] = {@"gdir_masked_8_i64", @"gdir_masked_32_i64"};
-        return dir_make_locked(ps_gdir_[b], names[b]);
+        return dir_make_locked(ps_gdir_[b], names[b], /*required*/false);
     }
     id<MTLComputePipelineState> dir_slab_pso() {
         std::lock_guard<std::mutex> lock(dir_pso_mu_);
@@ -3708,8 +3741,9 @@ private:
     // byte per element, which is the touch.
     void touch_scratch(id<MTLBuffer> b, std::size_t bytes) {
         if (!b || bytes == 0) return;
+        if (!direct_ensure_ready()) return;      // the path is unavailable; nothing to warm
         id<MTLComputePipelineState> fill = dir_fill_pso();
-        if (!fill) return;                       // the path is unavailable; nothing to warm
+        if (!fill) return;
         @autoreleasepool {
             const std::uint32_t n32 = static_cast<std::uint32_t>(std::min<std::size_t>(bytes, 0xFFFFFFFFull));
             const std::uint32_t one = 1, zero = 0;
@@ -4107,11 +4141,23 @@ private:
         return v;
     }();
     std::mutex dir_mu_;                              // guards the id-lane scratch and the warm buffers
-    std::atomic<bool> direct_ok_{true};              // cleared for good when a pipeline will not build
+    std::atomic<bool> direct_ok_{true};              // cleared for good when a required pipeline refuses
+    std::atomic<bool> dir_probed_{false};            // the required set has been asked for once
     std::string direct_why_;                         // ... and why, in the compiler's words (dir_pso_mu_)
-    // GPUDB_METAL_DIRECT_DISABLE_PSO=1: every direct pipeline refuses to
-    // build, so the fallback can be tested on a device where it would work.
-    bool dir_disable_pso_ = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO") != nullptr;
+    // GPUDB_METAL_DIRECT_DISABLE_PSO: `1` makes every direct pipeline refuse
+    // to build, `slab` only the slab kernel — which is what a hosted macOS
+    // runner's virtualised GPU does, and the harder case, because the id-lane
+    // helpers do build there. Both are for testing the fallback on a device
+    // where the path would otherwise work.
+    std::string dir_disable_pso_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
+        return e ? std::string(e) : std::string();
+    }();
+    bool dir_refuses(NSString* name) const {
+        if (dir_disable_pso_.empty()) return false;
+        if (dir_disable_pso_ == "slab") return [name isEqualToString:@"gdir_slab_i64"];
+        return true;
+    }
     // What a threadgroup may hold, asked of the device rather than assumed.
     // The slab kernel binds this much dynamically and nothing statically.
     std::size_t dir_slab_bytes_ = kDirSlabBytes;
