@@ -822,6 +822,150 @@ it measured 1.25–1.84× with no process start below 1.0×. Method worth keepin
 gate cell fails on a path the change cannot reach, alternate old and new code
 on one binary across many process starts before believing either story.
 
+## 2026-09-17 (night) — The memory budget that was only on paper
+
+**How it surfaced.** Asked whether big tables spill over, I went to quote the
+design (§5.5: budget, LRU eviction, "a set that does not fit is not uploaded")
+and grepped the wrapper for it first. Nothing. The design had been written,
+reviewed and never built: the only thing standing between a too-large table
+and the device was an allocation failing somewhere inside an upload. A design
+document is a claim about intent; only the code is a claim about behaviour.
+
+**What the extension already knew.** `gpu_residents()` reports per set the
+bytes the backend holds (derived structures included), `refs` (operators
+using it right now), `uploaded_at` and `last_used_at`; `gpu_drop_resident`
+drops one. So the budget needed no C++ at all: the wrapper estimates before
+the upload, asks the extension what is resident, evicts through the
+extension, and reads the real size back afterwards.
+
+**The estimate.** `rows × (8 × lanes + 16) + rows × lanes / 8`. Against the
+extension's figure on four shapes (two to four lanes, a VARCHAR key, NULLs):
+12.36 vs 12.21 MiB, 18.56 vs 18.36, 15.46 vs 15.26, 12.36 vs 12.25 — all
+within 1%. At SF50 one lane is 2.4 GB, so a four-lane set is ~13 GB with
+scratch: it fits the 16 GiB default of a 64 GB machine, two of them do not.
+
+**Three rules that are easy to get wrong.**
+- *Evict the derived set before its sources.* A device join's guards assert
+  against the base tables' sets. Dropping a base set from under a live joined
+  set turns the join stale on its next statement, which then re-uploads
+  everything: the eviction would have cost more memory traffic than it freed.
+- *Anti-thrash.* Two sets that do not fit together, used alternately, would
+  evict each other on every statement — seconds of upload to save
+  milliseconds. Nothing younger than 60 s is evicted; the newcomer runs
+  native meanwhile. The age comes from the manager's own monotonic clock, not
+  from subtracting the extension's wall-clock timestamps in SQL (time zones).
+- *A refusal must stay visible.* First version: the background worker refused
+  the set, the next statement re-queued it at once, and the reason read
+  `not_resident` — indistinguishable from "still uploading", while the worker
+  asked the same question every few milliseconds. A refused set now stays
+  refused until its retry time, and the reason is `memory`.
+
+**The neighbouring hole.** Looking at what happens if an allocation fails at
+QUERY time, despite the budget: the wrapper recovered from exactly one error,
+staleness. Anything else raised to the user — for a statement DuckDB alone
+would have answered. That is a rule-2 violation waiting for its first
+out-of-memory. Now any error of the rewritten form (interrupts excepted) is
+answered by running the original statement natively; if that raises too, it
+is DuckDB's own error for the user's own statement, which is exactly what
+"never a different answer" means for errors. Tested with a simulated device
+allocation failure and with a set dropped behind the wrapper's back.
+
+**Not built:** spilling, or splitting one statement's data across device and
+host. A table that does not fit runs on DuckDB, which spills by itself.
+
+## 2026-09-17 (night, later) — Aggregates in disguise
+
+Counting the aggregate functions the device answers (6 of DuckDB's 80) made
+the next step obvious: several of the other 74 are not other aggregates at
+all. `sum(x) FILTER (WHERE c)` is `sum(CASE WHEN c THEN x END)`; `count_if(c)`
+is a count of the same CASE; `bool_and` is a `min` over 0 / 1. The CASE is a
+row-local expression, the machinery for which exists since §4.10 — so the whole
+feature is a tree rewrite of ~100 lines before the decision, no kernel, no
+operator change. Eleven shapes (FILTER on every supported aggregate, in the
+select list, HAVING and ORDER BY; count_if; bool_and / bool_or with NULLs; an
+empty filter) ran identical to native on the first try, names and types
+included; `count(DISTINCT x) FILTER`, ordered aggregates and a volatile filter
+stay native.
+
+Two details worth keeping. Type: `count_if` returns HUGEINT where `count`
+returns BIGINT, and `bool_and` returns BOOLEAN — hence the outer CAST, which
+turns those statements into the projected form; plain `FILTER` keeps its type
+and its form, so HAVING / top-k on the device still apply. Names: the rewrite
+changes an unnamed item's auto-name, so, as with folded derived tables, every
+select item is aliased with the original name and DESCRIBE has the last word.
+
+## 2026-09-17 (night, last) — Raw performance first: where a statement's time goes, and why SF50 had nothing on the device
+
+**The question.** Is the stable C API costing us raw performance — should the
+extension move to the C++ API before anything else? Measured instead of
+argued. One rewritten statement, taken apart (SF1, machine shared with a
+running sweep, so proportions rather than absolutes):
+
+| part | cost |
+|---|---|
+| DuckDB's fixed cost per statement (`SELECT 1`) | 0.1 ms |
+| wrapper (routing, caches) | ≈ 0 — the same SQL run directly is as fast |
+| staleness guard (`count(*)` + assert) | 0.2–0.5 ms |
+| the table function alone | ≈ the whole statement |
+| of which the device kernel | the largest part |
+| rows through the table-function interface | ~0.4 ms per 1K rows |
+
+The query path is kernel-bound; an API change buys nothing there. The UPLOAD
+path is another story: DuckDB scans and casts the two lanes in 2 ms and
+materialises them into a temp table in 5–8 ms; our upload took 30–58 ms.
+`GPUDB_UPLOAD_TRACE=1` split it: ~10 ms scan + callbacks, 10–15 ms copying the
+staged rows into device buffers, ~17 ms building the sort cache.
+
+**Finding 1: the device copy was one thread testing one bit per value.**
+`upload_rows_exact` (Metal) walked every row of every span serially,
+de-interleaving lanes and consulting a validity bit per value. Each span's
+output ranges follow from prefix sums of its valid-key and NULL-key counts, so
+spans copy independently: now in parallel, with a strided copy for spans
+without NULLs. Layout is byte-identical to the serial loop (a unit test uploads
+2.6M rows from nine uneven spans — NULL-free, 60% NULL keys, empty, and one
+whose bitmap carries stale zero bits past its rows — against the CPU reference
+fed ONE span). Two spans can share a validity word at a range boundary, hence
+an atomic AND. 10–15 ms → 3.5 ms at SF1; 223 ms for 300M rows.
+
+**Finding 2: SF50 had 0 of 22 queries on the device because of a guardrail.**
+The sweep showed every SF50 statement `not_resident`. The error, once printed:
+the host staging pool is capped at 4 GB — a guardrail against `gpu_upload`
+inside a window frame buffering quadratically. 300M rows × 2 lanes × 8 bytes is
+4.8 GB. So no set above ~250M row-lanes could ever upload, whatever the device
+had free. The exact uploads are the wrapper's, sized against the memory budget
+before they start; they now have their own cap (half of physical memory,
+`GPUDB_EXACT_UPLOAD_POOL_MAX_MB`), the 4 GB wall stays for everything else.
+First SF50 statement after the fix: upload 4.7 s, then 1478 ms native vs 157 ms.
+
+**Finding 3: the sort cache build was five serial passes around the sort.** A
+host index array filled by one thread, two `memcpy`s into the sorter's staging,
+the sort, two `memcpy`s out — at SF50, 2.4 GB each. The keys already live in a
+shared buffer and the sorter's output buffers can simply be handed over. New
+`sort_iota_take`: parallel staging, index generated in place, result buffers
+given to the column (the sorter forgets them), large staging released — which
+also ends a hidden cost: after a 300M-row sort the sorter kept ~9.6 GB of
+staging alive outside any budget.
+
+**TPC-H at SF50 after findings 1–2 (Metal, 64 GB M4 Max, 40 GB benchmark budget):**
+10 of 22 on the device, all identical — Q22 94×, Q5 53×, Q9 7.3×, Q19 5.7×,
+Q10 4.2×, Q1 3.6×, Q21 3.5×, Q3 2.8×, Q14 2.6×, Q11 1.5×. Six more were refused
+for `memory` — the budget doing its job: back-to-back 12 GB sets cannot evict
+each other inside the 60 s anti-thrash window. Against SF1 and SF10 the pattern
+is plain: native time grows linearly with the data, the device's much more
+slowly for joins and selective shapes (Q5: 4.7× → 25.7× → 52.7×).
+
+**What this says about the API question.** None of the three findings is the C
+API. They are our own ingestion and cache-build code. The callback interface
+may still be a wall further down (the remaining ~10 ms of scan + callbacks at
+SF1 against DuckDB's own 5–8 ms), but it is not the wall we were standing in
+front of. Stay on the stable ABI; measure again after these land.
+
+**Still open on this path:** every resident set holds its own copy of each
+lane, so two statements over `lineitem` that both read `l_quantity` store it
+twice — at SF50 that is what turns six queries into `memory` refusals. Sharing
+lanes between sets (a set as a list of lane references) is the next structural
+step, and it is the same object the chunked design needs.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

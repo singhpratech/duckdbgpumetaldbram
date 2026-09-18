@@ -13,8 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds
-from ._residency import ResidencyManager
+from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _thresholds
+from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
@@ -37,7 +37,66 @@ STALE_MARKER = "GPUDB_STALE"
 _MEASURE_NATIVE_ABOVE_MS = 20.0
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
-           "not_found", "manual", "error", "off", "params", "multi")
+           "not_found", "manual", "error", "off", "params", "multi", "memory")
+
+
+def _host_memory_bytes() -> int:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (ValueError, OSError, AttributeError):
+        return 0
+
+
+def parse_memory_budget(value) -> Optional[int]:
+    """None -> the default for the backend; 0 / 'unlimited' -> no cap; an int is
+    bytes; a string takes a unit: '512MB', '16GB', '1.5 GiB'."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if value < 0:
+            raise ValueError("memory_budget must be >= 0")
+        return int(value)
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([KMGT]?)I?B?\s*", str(value).upper())
+    if str(value).strip().lower() in ("unlimited", "none", "off"):
+        return 0
+    if not m:
+        raise ValueError(f"memory_budget: cannot read {value!r} (examples: 8589934592, '512MB', '16GB', 'unlimited')")
+    return int(float(m.group(1)) * 1024 ** " KMGT".index(m.group(2) or " "))
+
+
+def default_memory_budget(backend: str, device_bytes: int = 0) -> int:
+    """§5.5: a quarter of unified memory on Apple silicon (the GPU shares it
+    with DuckDB and everything else), half of device memory on a discrete GPU.
+    When the extension does not report the device's memory, a discrete GPU gets
+    the smaller of a quarter of host memory and 8 GiB — conservative on purpose.
+    GPUDB_MEMORY_BUDGET_MB overrides the default."""
+    env = os.environ.get("GPUDB_MEMORY_BUDGET_MB")
+    if env:
+        try:
+            return max(0, int(float(env) * 2 ** 20))
+        except ValueError:
+            pass
+    host = _host_memory_bytes()
+    if backend == "CUDA":
+        if device_bytes > 0:
+            return device_bytes // 2
+        return min(host // 4, 8 * 2 ** 30) if host else 8 * 2 ** 30
+    return host // 4 if host else 8 * 2 ** 30
+
+
+def estimate_set_bytes(rows: int, lanes: int) -> int:
+    """What a resident set costs on the device: 8 bytes per row and lane, a
+    validity bit per row and lane, and two row-sized scratch lanes the exact
+    operators keep beside it (selection and run starts / sort permutation)."""
+    rows, lanes = max(0, int(rows)), max(1, int(lanes))
+    return rows * (8 * lanes + 16) + (rows * lanes) // 8 + (64 << 10)
+
+
+def _tag_lanes(tag: str) -> int:
+    """Lanes of a set from its identity tag (…:oid:<k>,<v>,<pred>,…[:suffix]); a
+    several-column key (a+b+c) is one lane."""
+    parts = tag.split(":")
+    return parts[6].count(",") + 1 if len(parts) > 6 and parts[6] else 1
 
 
 @dataclass
@@ -62,6 +121,8 @@ class Decision:
     wrap: Optional[Tuple[str, str]] = None
     is_join: bool = False              # the statement's FROM is a join (decides the §4.13 fallback)
     sentinels: List[Any] = field(default_factory=list)   # §4.18: row-count sentinels of tables read by subquery lanes
+    set_rows: int = 0                                     # §5.5: rows the resident set will hold (the memory budget's estimate)
+    base_rows: Dict[str, int] = field(default_factory=dict)   # ... and of each base set of a device join, by tag
     # measured rule 1 (§9.1): this statement's own native time, seen while it
     # was not resident yet, against its first rewritten runs
     native_ms: Optional[float] = None
@@ -78,7 +139,8 @@ class LastRewrite:
     form: str = ""
     tag: str = ""
     sql: str = ""
-    fallback: bool = False       # rewritten statement raised GPUDB_STALE, native re-run
+    fallback: bool = False       # the rewritten statement raised (GPUDB_STALE or any other error), native re-run
+    error: str = ""              # ... the error text, when it was not staleness
     round_trip_ms: float = 0.0
     engine: str = ""             # 'scalar' (gpu_rewrite_ast) | 'python' (reference renderer)
 
@@ -121,7 +183,8 @@ class Connection:
 
     def __init__(self, raw: duckdb.DuckDBPyConnection, *, transparent: bool = True,
                  residency: str = "background", floor_rows: int = 1_000_000,
-                 idle_ms: float = 20.0, log=None, _parent: Optional["Connection"] = None):
+                 idle_ms: float = 20.0, log=None, memory_budget=None,
+                 _parent: Optional["Connection"] = None):
         self._raw = raw
         self._transparent = transparent
         self._residency_mode = residency
@@ -149,6 +212,10 @@ class Connection:
                                              idle_ms=idle_ms, log=self._log)
             self._refresh_settings()
             self._probe_extension()
+            budget = parse_memory_budget(memory_budget)
+            if budget is None:
+                budget = default_memory_budget(self._backend, getattr(self, "_device_bytes", 0))
+            self._manager.memory_budget = budget or None       # 0 = no cap
         else:
             self._manager = _parent._manager
             self._settings = dict(_parent._settings)
@@ -171,6 +238,11 @@ class Connection:
 
     def last_rewrite(self) -> Dict[str, Any]:
         return self._last.as_dict()
+
+    def memory(self) -> Dict[str, Any]:
+        """The memory budget (§5.5) and, per resident set, the size the wrapper
+        expected and the size the extension reports."""
+        return self._manager.memory()
 
     def residents(self) -> Dict[str, str]:
         return self._manager.snapshot()
@@ -315,12 +387,33 @@ class Connection:
                 if self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
                     self._raw.execute(query, parameters)
+                elif self._last.rewritten and "INTERRUPT" not in str(e).upper():
+                    # Rule 2: the user's statement is the ORIGINAL one. Whatever went wrong in the
+                    # rewritten form (a device allocation that failed, a set dropped behind the
+                    # wrapper's back, a bug), DuckDB answers the original — and if that raises too,
+                    # it is DuckDB's own error for the user's own statement.
+                    self._on_rewrite_error(e)
+                    self._raw.execute(query, parameters)
                 else:
                     raise
         finally:
             self._manager.statement_end()
             self._after()
         return self
+
+    def _on_rewrite_error(self, e: Exception) -> None:
+        """The rewritten statement failed for a reason that is not staleness:
+        answer natively now, and keep this template native from here on (its
+        sets are re-noted as stale so a healthy upload can replace them)."""
+        self._last.fallback = True
+        self._last.error = str(e)[:300]
+        self._log(f"rewritten statement failed, answered natively: {str(e)[:160]}")
+        d = getattr(self, "_last_decision", None)
+        if d is not None:
+            d.rewritten = False
+            d.reason = "error"
+        for tag in [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]:
+            self._manager.invalidate(tag)
 
     def _check_output_size(self) -> None:
         """Once per template, after its first rewritten run: the shape's
@@ -677,10 +770,33 @@ class Connection:
                             self._log(f"fold: names / types changed ({want} -> {have}); not folded")
                 except Exception as e:
                     self._log(f"fold failed: {str(e)[:120]}")
+            flat = self._normalise_aggs(flat)
             if len(self._flat_cache) > 1024:
                 self._flat_cache.clear()
             self._flat_cache[sql] = flat
         return flat
+
+    _AGG_SPELLING_RE = re.compile(r"\bFILTER\s*\(|\bcount_if\s*\(|\bbool_(?:and|or)\s*\(", re.IGNORECASE)
+
+    def _normalise_aggs(self, sql: str) -> str:
+        """§4.19: FILTER aggregates, count_if and bool_and / bool_or as the
+        plain aggregates over a CASE / cast they are equal to. Names are pinned
+        and names + types verified with DESCRIBE; anything else keeps the text."""
+        if not self._AGG_SPELLING_RE.search(sql):
+            return sql
+        try:
+            want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+            out = _aggs.normalise(self._serialize(sql), [w[0] for w in want])
+            if out is None:
+                return sql
+            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
+            if want == have:
+                return cand
+            self._log(f"aggregate spelling: names / types changed ({want} -> {have}); left as written")
+        except Exception as e:
+            self._log(f"aggregate spelling failed: {str(e)[:120]}")
+        return sql
 
     def _rewrite_text(self, sql: str) -> Optional[str]:
         """The rewritten SQL of ONE statement, or None with _last.reason set."""
@@ -725,17 +841,21 @@ class Connection:
                     if b.sentinel:
                         self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
                     else:
-                        self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn)
+                        self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn,
+                                                     est_bytes=estimate_set_bytes(d.base_rows.get(b.tag, d.set_rows),
+                                                                                  _tag_lanes(b.tag)))
             for b in d.sentinels:
                 self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
             st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
                                               deps=([b.tag for b in d.join.base] if d.join is not None
                                                     else [b.tag for b in d.sentinels] or None),
-                                              steps=d.join.steps_sql if d.join is not None else None)
+                                              steps=d.join.steps_sql if d.join is not None else None,
+                                              est_bytes=estimate_set_bytes(d.set_rows, _tag_lanes(d.tag)))
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
             if not self._manager.is_ready(d.tag):
-                self._last.reason = "not_resident"
+                self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
+                                     else "not_resident")
                 return None
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql
@@ -1004,6 +1124,11 @@ class Connection:
             inner_sql, outer_sql = (self._raw.execute("SELECT json_deserialize_sql(?)", [x]).fetchone()[0]
                                     for x in parts[:2])
             is_global = parts[2]
+        except duckdb.BinderException as e:
+            # a subquery the nested pass lifted out of its statement can be correlated (TPC-H Q2:
+            # `p_partkey` belongs to the outer query): it does not bind on its own, by design
+            self._log(f"split: the statement does not bind on its own (correlated): {str(e).splitlines()[0][:120]}")
+            return None
         except Exception as e:
             self._log(f"split failed: {e}")
             return None
@@ -1263,6 +1388,11 @@ class Connection:
             d = Decision(True, "", plan=plan, fqn=jr.root_fqn or ident.fqn, tag=plan.tag,
                          upload_sql=jr.upload_sql, form=plan.form, join=jr)
         d.literal_sensitive = any(c.has_constant for c in computed.values())
+        # §5.5: what the set(s) will hold — an uploaded join its result, a device join at most its
+        # largest (probe) table, each base set its own table
+        d.set_rows = int(join_rows) if upload_mode else int(nrows)
+        if d.join is not None and not upload_mode:
+            d.base_rows = {b.tag: int(low.tables[b.table].rows) for b in d.join.base if not b.sentinel}
         # §4.18: tables read only inside subquery lanes get a row-count sentinel and a guard
         covered = {(i.catalog, i.oid) for i in idents}
         extra: List[_resolve.Identity] = []
@@ -1344,7 +1474,8 @@ class Connection:
 def connect(database: str = ":memory:", read_only: bool = False, config: Optional[dict] = None,
             *, extension: Optional[str] = None, transparent: bool = True,
             residency: str = "background", floor_rows: int = 1_000_000,
-            idle_ms: float = 20.0, thresholds: bool = True, log=None) -> Connection:
+            idle_ms: float = 20.0, thresholds: bool = True, log=None,
+            memory_budget=None) -> Connection:
     """duckdb.connect with the gpudb extension loaded and the transparent path
     on. `residency`: 'background' (upload in short row-id segments, each only
     while the connection is idle for `idle_ms`; §5.5), 'eager' (upload on first
@@ -1352,7 +1483,13 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     under an identity tag are used). `floor_rows`: tables smaller than this
     are never parsed (§0). `thresholds`: apply the per-backend shape thresholds
     (§9.1, gpudb/_thresholds.py); False rewrites every exact shape regardless
-    of the predicted win — for parity testing, never for production."""
+    of the predicted win — for parity testing, never for production.
+    `memory_budget`: device memory the resident sets may use — bytes, or a string
+    such as '16GB'; 0 or 'unlimited' removes the cap. Default: a quarter of
+    unified memory on Apple silicon, half of device memory on a discrete GPU
+    (§5.5). Least recently used sets are evicted to make room; a set that cannot
+    fit is not uploaded and its statements keep running on DuckDB
+    (`last_rewrite()["reason"] == "memory"`)."""
     if residency not in ("background", "eager", "manual"):
         raise ValueError("residency must be 'background', 'eager' or 'manual'")
     cfg = dict(config or {})
@@ -1363,6 +1500,6 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     if ext:
         raw.execute(f"LOAD '{ext}'")
     con = Connection(raw, transparent=transparent, residency=residency,
-                     floor_rows=floor_rows, idle_ms=idle_ms, log=log)
+                     floor_rows=floor_rows, idle_ms=idle_ms, log=log, memory_budget=memory_budget)
     con._thresholds = thresholds
     return con

@@ -838,6 +838,25 @@ over a join 2.6–36×, IN over a join 1.15–6.4×; 185 rewritten cells, none b
 1.0×, 31 declined by the bounds. TPC-H: Q4, Q17, Q21 move to the device and
 Q18 becomes one statement — 15 of 22.
 
+### 4.19 Aggregate spellings: FILTER, count_if, bool_and / bool_or
+Some aggregates are another aggregate in disguise, and the identity is SQL's own:
+
+    agg(x) FILTER (WHERE c)      =  agg(CASE WHEN c THEN x END)        agg in sum count min max avg
+    count(*) FILTER (WHERE c)    =  count(CASE WHEN c THEN 1 END)
+    count_if(c)                  =  CAST(count(CASE WHEN c THEN 1 END) AS HUGEINT)
+    bool_and(b) / bool_or(b)     =  CAST(min / max (CAST(b AS TINYINT)) AS BOOLEAN)
+
+An aggregate skips NULL inputs and a CASE without ELSE is NULL for the rows the
+filter rejects; over no qualifying row sum / min / max / avg / bool_* are NULL
+and the counts 0 on both sides (a fixture pins that). `_aggs.normalise` rewrites
+the top-level SELECT (select list, HAVING, ORDER BY) before the decision, in
+the stage that folds derived tables (§4.16): output names are pinned as
+aliases and names + types verified with DESCRIBE, otherwise the text is left
+as written. The CASE / cast is a computed lane (§4.10), so no operator changed;
+a CAST around the aggregate makes the statement the projected form (§4.11).
+Left alone: DISTINCT or ordered aggregates with a FILTER, and anything the
+lane rules refuse (a volatile function in the filter).
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -1057,14 +1076,57 @@ same database — the extension stays free of threads and hidden connections
   the shared interface; Metal implements it too) that builds the sort cache
   on the upload stream and records a completion event; the set flips to
   ready after that event completes.
-- **Memory budget.** Wrapper setting `memory_budget` (default: 50% of device
-  memory on a discrete GPU, 25% of unified memory on Apple silicon), passed
-  to the upload as the cap. The budget counts key, payload, validity, sort
-  cache and scratch, not just the columns. Sets are evicted LRU by last use;
-  a set that does not fit is not uploaded; a set is never evicted within 60 s
-  of being uploaded (anti-thrash). `GPUDB_UPLOAD_POOL_MAX_MB` stays what it
-  is — the extension-side cap on **host** upload buffering — and is
-  documented as such.
+- **Memory budget.** Wrapper setting `memory_budget` (bytes, or `'16GB'`;
+  `0` / `'unlimited'` removes the cap; `GPUDB_MEMORY_BUDGET_MB` overrides the
+  default). Default: 25% of unified memory on Apple silicon — the GPU shares
+  it with DuckDB and everything else on the machine — and 50% of device
+  memory on a discrete GPU (until the backend reports its device memory
+  through `gpu_build_info()`, a discrete GPU gets the smaller of 25% of host
+  memory and 8 GiB). Implemented in the wrapper (`_residency._make_room`),
+  with the extension as the source of truth:
+  - *Before an upload* the set's cost is estimated as `rows × (8 × lanes +
+    16) + rows × lanes / 8`: 8 bytes per row and lane, a validity bit, and the
+    two row-sized scratch lanes the exact operators keep. Measured against
+    `gpu_residents().bytes`: within 1% on four shapes. An uploaded join counts
+    its result rows, a device join at most its probe table's.
+  - *What is resident and what it costs* comes from `gpu_residents()`
+    (`bytes` includes derived structures). Sets uploaded by hand count toward
+    the total and are never evicted.
+  - *Eviction* is least recently used by the extension's own `last_used_at`,
+    through `gpu_drop_resident`. Never evicted: a set an operator is using
+    (`refs > 0`), a source of the set being uploaded, a source of another
+    resident set (the derived set goes first — dropping a base table's set
+    from under a join would turn every guard of that join stale), and any set
+    uploaded less than 60 s ago (anti-thrash: two sets that do not fit
+    together must not evict each other on alternate statements).
+  - *A set that does not fit* — larger than the budget, or nothing evictable
+    yet — is not uploaded. Its statements keep running on DuckDB with
+    `last_rewrite()["reason"] == "memory"`; a refused set is asked about again
+    no sooner than the failed-upload retry time (30 s), not on every sighting.
+  `GPUDB_UPLOAD_POOL_MAX_MB` stays what it is — the extension-side cap on
+  **host** upload buffering — and is documented as such.
+- **Upload cost (measured 2026-09-17).** A statement's time on the device is
+  kernel-bound (wrapper ≈ 0, guard 0.2–0.5 ms, table function ≈ the whole
+  statement); the upload was not: 30–58 ms for two 6M-row lanes that DuckDB
+  itself materialises in 5–8 ms. Three changes, none of them the C API:
+  the Metal copy from staged rows into device buffers runs per span in
+  parallel with a NULL-free fast path (prefix sums give every span its output
+  ranges, so the layout is byte-identical); the sort cache takes the sorter's
+  output buffers instead of copying them and stages in parallel
+  (`MetalRadixSort::sort_iota_take`), and the sorter no longer keeps gigabytes
+  of staging alive after a large sort; and the host staging of an EXACT upload
+  has its own cap (`GPUDB_EXACT_UPLOAD_POOL_MAX_MB`, default half of physical
+  memory) — the general 4 GB cap, a guardrail against window-frame buffering,
+  had kept every set above ~250M row-lanes off the device (TPC-H SF50: 0 of 22
+  resident before, 10 of 22 after).
+- **When the rewritten statement itself fails.** Staleness was the only
+  error the wrapper recovered from. Any other error of the rewritten form — a
+  device allocation that fails at query time despite the budget, a set
+  dropped behind the wrapper's back, a defect — is now answered by running
+  the user's ORIGINAL statement on DuckDB (rule 2: if that raises too, it is
+  DuckDB's own error for the user's own statement), the template stays native
+  afterwards (`reason == "error"`), and the text is kept in
+  `last_rewrite()["error"]`. A user interrupt is not retried.
 - `residency = 'manual' | 'eager' | 'background'` is a wrapper setting:
   `'eager'` uploads on first sight (for scripts that know their workload),
   `'manual'` restores v0.6 behaviour (`gpu_upload_pair` only, no managed

@@ -1,5 +1,7 @@
 // metal_radix_sort.mm — LSD radix sort for (int64, int64) pairs on Apple Silicon.
 
+#include <vector>
+#include <thread>
 #include "metal_radix_sort.hpp"
 #include "metal_kernel_sources.hpp"
 
@@ -259,6 +261,57 @@ MetalRadixSort::DeviceView MetalRadixSort::sort_device(const std::int64_t* keys,
         view.kernel_ms = run_sort_on_staged(n, in_keys, in_vals);
         view.keys = in_keys;
         view.payloads = in_vals;
+    }
+    return view;
+}
+
+MetalRadixSort::DeviceView MetalRadixSort::sort_iota_take(const std::int64_t* keys, std::uint32_t n,
+                                                          std::size_t keep_bytes) {
+    DeviceView view;
+    if (n == 0) return view;
+    constexpr std::uint32_t RADIX_WORK_PER_BLOCK = 1024;
+    const std::uint32_t num_blocks = (n + RADIX_WORK_PER_BLOCK - 1) / RADIX_WORK_PER_BLOCK;
+    @autoreleasepool {
+        // exact-size buffers: they become the column's cache, a larger leftover would be kept for life
+        if (b_keys_a_ && [b_keys_a_ length] != static_cast<std::size_t>(n) * sizeof(std::int64_t)) {
+            b_keys_a_ = nil; b_vals_a_ = nil; b_keys_b_ = nil; b_vals_b_ = nil;
+        }
+        ensure_sort_buffers(n, num_blocks);
+        if (!b_keys_a_ || !b_keys_b_ || !b_vals_a_ || !b_vals_b_)
+            throw std::runtime_error("radix sort: device allocation failed (Metal)");
+        auto* dk = static_cast<std::int64_t*>([b_keys_a_ contents]);
+        auto* dv = static_cast<std::int64_t*>([b_vals_a_ contents]);
+        // stage in parallel: one serial memcpy + one serial index fill were ~2 of the 5 host
+        // passes that made a 300M-row cache build take 3 s around a much shorter sort
+        const std::size_t hw = std::max<unsigned>(1u, std::thread::hardware_concurrency());
+        const std::size_t n_threads = (n < (1u << 20)) ? 1 : std::min<std::size_t>(hw, 8);
+        auto stage = [&](std::size_t lo, std::size_t hi) {
+            std::memcpy(dk + lo, keys + lo, (hi - lo) * sizeof(std::int64_t));
+            for (std::size_t i = lo; i < hi; ++i) dv[i] = static_cast<std::int64_t>(i);
+        };
+        if (n_threads <= 1) {
+            stage(0, n);
+        } else {
+            std::vector<std::thread> pool;
+            pool.reserve(n_threads);
+            const std::size_t step = (static_cast<std::size_t>(n) + n_threads - 1) / n_threads;
+            for (std::size_t t = 0; t < n_threads; ++t) {
+                const std::size_t lo = std::min<std::size_t>(n, t * step), hi = std::min<std::size_t>(n, lo + step);
+                if (lo < hi) pool.emplace_back(stage, lo, hi);
+            }
+            for (auto& th : pool) th.join();
+        }
+        id<MTLBuffer> in_keys = b_keys_a_;
+        id<MTLBuffer> in_vals = b_vals_a_;
+        view.kernel_ms = run_sort_on_staged(n, in_keys, in_vals);
+        view.keys = in_keys;
+        view.payloads = in_vals;
+        // The result pair now belongs to the caller. The other pair goes too: keeping half a
+        // staging set would need ensure_sort_buffers() to track the halves, and a shared buffer
+        // costs nothing to allocate next to a sort.
+        b_keys_a_ = nil; b_vals_a_ = nil; b_keys_b_ = nil; b_vals_b_ = nil;
+        const bool big = static_cast<std::size_t>(n) * sizeof(std::int64_t) > keep_bytes;
+        if (big) { b_hist_ = nil; b_scan_ = nil; }
     }
     return view;
 }

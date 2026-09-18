@@ -1137,6 +1137,79 @@ void test_backend(gpudb::Backend b) {
     // an unselective mask), a key-range predicate, HAVING and top-k on a
     // payload other than the first, the NULL-key group among the survivors.
     {
+        // upload_rows_exact from SEVERAL spans (what an upload session hands over): a backend may
+        // copy spans in parallel, so the layout must not depend on it — same groups, sums, counts,
+        // mins, maxs and NULL-key group as ONE span of the same rows on the CPU reference. Spans:
+        // NULL-free ones (the fast path), ones with NULL keys and NULL payloads, an empty one, and a
+        // bitmap that carries stale zero bits past the span's rows (a shared segment does).
+        std::printf("  exact upload from many spans:\n");
+        try {
+            std::mt19937_64 rng(0x5EA9ULL);
+            const std::size_t N = 2'600'037, L = 3;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t> kd(-4000, 4000), vd(-1000000, 1000000), sel(0, 999);
+            std::vector<std::int64_t> lanes(N * L);
+            for (std::size_t i = 0; i < N; ++i) { lanes[i * L] = kd(rng); lanes[i * L + 1] = vd(rng); lanes[i * L + 2] = sel(rng); }
+            const std::size_t cuts[] = {0, 300'001, 300'001, 911'000, 1'048'576, 1'500'003, 1'500'067, 2'200'000, 2'599'999, N};
+            const std::size_t n_spans = sizeof(cuts) / sizeof(cuts[0]) - 1;
+            std::vector<gpudb::Aggregator::RowSpan> spans(n_spans);
+            std::vector<std::vector<std::vector<std::uint64_t>>> sv(n_spans);      // [span][lane] bitmap, row-local
+            std::vector<std::vector<const std::uint64_t*>> svp(n_spans, std::vector<const std::uint64_t*>(L, nullptr));
+            std::vector<std::vector<std::uint64_t>> whole(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            for (std::size_t sidx = 0; sidx < n_spans; ++sidx) {
+                const std::size_t a = cuts[sidx], b = cuts[sidx + 1], r = b - a;
+                spans[sidx].lanes = lanes.data() + a * L; spans[sidx].rows = r; spans[sidx].n_lanes = L;
+                const bool with_nulls = (sidx % 2 == 1) || sidx == 6;           // the others stay NULL-free
+                if (with_nulls) {
+                    sv[sidx].assign(L, std::vector<std::uint64_t>((r + 63) / 64 + 1, ~std::uint64_t{0}));
+                    const int nullp[3] = {sidx == 6 ? 60 : 3, 9, 0};
+                    for (std::size_t j = 0; j < r; ++j)
+                        for (std::size_t l = 0; l < 2; ++l)
+                            if (pct(rng) < nullp[l]) {
+                                sv[sidx][l][j >> 6] &= ~(std::uint64_t{1} << (j & 63));
+                                whole[l][(a + j) >> 6] &= ~(std::uint64_t{1} << ((a + j) & 63));
+                            }
+                    // stale zero bits past the span's rows must not be counted as NULL keys
+                    for (std::size_t j = r; j < ((r + 63) / 64 + 1) * 64; ++j) sv[sidx][0][j >> 6] &= ~(std::uint64_t{1} << (j & 63));
+                    svp[sidx][0] = sv[sidx][0].data(); svp[sidx][1] = sv[sidx][1].data();
+                    spans[sidx].valid = svp[sidx].data();
+                } else {
+                    spans[sidx].valid = (sidx % 4 == 0) ? nullptr : svp[sidx].data();   // no array / an array of null pointers
+                }
+            }
+            const gpudb::Dtype dts[3] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64};
+            auto cols = agg->upload_rows_exact(spans.data(), n_spans, dts, L);
+            auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+            std::vector<const std::uint64_t*> wp(L);
+            for (std::size_t l = 0; l < L; ++l) wp[l] = whole[l].data();
+            gpudb::Aggregator::RowSpan one; one.lanes = lanes.data(); one.rows = N; one.n_lanes = L; one.valid = wp.data();
+            auto ref_cols = ref_agg->upload_rows_exact(&one, 1, dts, L);
+            EXPECT(cols.size() == L && cols[0]->rows() == N && cols[1]->null_count() == ref_cols[1]->null_count());
+            for (int with_pred = 0; with_pred < 2; ++with_pred) {
+                gpudb::Predicate p, rp;
+                p.col = cols[2].get(); p.op = gpudb::Predicate::Op::LT; p.value = 250;
+                rp = p; rp.col = ref_cols[2].get();
+                auto got = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), with_pred ? &p : nullptr, with_pred, cap);
+                auto want = ref_agg->groupby_exact_masked_resident(*ref_cols[0], ref_cols[1].get(), with_pred ? &rp : nullptr, with_pred, cap);
+                using Row = std::tuple<int, std::int64_t, std::uint64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t>;
+                auto rows_of = [](const decltype(got)& g) {
+                    std::vector<Row> out;
+                    for (std::size_t i = 0; i < g.keys.size(); ++i)
+                        out.emplace_back(g.key_null[i], g.key_null[i] ? 0 : g.keys[i], static_cast<std::uint64_t>(g.sums[i]), g.sums_hi[i],
+                                         g.counts[i], g.counts_star[i], g.counts[i] ? g.mins[i] : 0, g.counts[i] ? g.maxs[i] : 0);
+                    std::sort(out.begin(), out.end());
+                    return out;
+                };
+                const bool ok = rows_of(got) == rows_of(want) && got.keys.size() > 7000;
+                if (!ok) std::printf("    FAIL many spans (%s): %zu groups vs %zu\n", with_pred ? "WHERE" : "plain", got.keys.size(), want.keys.size());
+                EXPECT(ok);
+            }
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) std::printf("    SKIP (%s)\n", e.what());
+            else { ++failures; ++total; std::printf("    FAIL: %s\n", e.what()); }
+        }
+
         std::printf("  several payloads in one group by:\n");
         using Op = gpudb::Predicate::Op;
         using Cmp = gpudb::GroupByFilter::Cmp;

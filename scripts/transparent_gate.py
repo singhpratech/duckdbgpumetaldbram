@@ -138,6 +138,9 @@ def main() -> int:
     ap.add_argument("--subqueries", action="store_true",
                     help="add EXISTS / IN / correlated scalar subquery predicates (BOOLEAN lanes, §4.18)")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
+    ap.add_argument("--memory-budget", default="unlimited",
+                    help="device memory budget for the run (§5.5); the gate sweeps more distinct sets than a "
+                         "session ever holds, so the default lifts the cap — pass e.g. 16GB to test the budget")
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")
@@ -162,7 +165,7 @@ def main() -> int:
         return 2
 
     con = gpudb.connect(args.db, read_only=True, residency="eager", floor_rows=0,
-                        thresholds=not args.no_thresholds)
+                        thresholds=not args.no_thresholds, memory_budget=args.memory_budget)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
     print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}, "

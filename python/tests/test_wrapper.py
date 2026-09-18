@@ -202,7 +202,8 @@ def run():
         "group_by_all": ("SELECT k, sum(v) FROM t GROUP BY ALL", "shape"),
         "ordinal":      ("SELECT k, sum(v) FROM t GROUP BY 1", "shape"),
         "rollup":       ("SELECT k, sum(v) FROM t GROUP BY ROLLUP(k)", "shape"),
-        "filter":       ("SELECT k, sum(v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
+        # (FILTER on sum / count / min / max / avg is rewritten since §4.19; a DISTINCT aggregate with one is not)
+        "filter":       ("SELECT k, count(DISTINCT v) FILTER (WHERE v > 1) FROM t GROUP BY k", "shape"),
         "distinct":     ("SELECT k, sum(DISTINCT v) FROM t GROUP BY k", "shape"),
         # (OR and function predicates are computed lanes since §4.10 — see "computed lanes")
         "where_volatile": ("SELECT k, sum(v) FROM t WHERE v > random() GROUP BY k", "shape"),
@@ -753,6 +754,193 @@ def run():
         got = con.execute(sql).fetchall()
         check(con.last_rewrite()["fallback"] and got == con._raw.execute(sql).fetchall(),
               "nested: foreign write -> GPUDB_STALE fallback, native answer")
+    con.close()
+
+    # ---- aggregate spellings (§4.19): FILTER, count_if, bool_and / bool_or as plain aggregates over a CASE / cast ----
+    print("== aggregate spellings")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute("""CREATE TABLE tf AS SELECT (i % 1000)::INTEGER AS k, (i % 97)::BIGINT AS v, (i % 13)::SMALLINT AS z,
+                       CASE WHEN i % 11 = 0 THEN NULL ELSE i % 3 = 0 END AS b, ((i % 977) / 100.0)::DECIMAL(15,2) AS d,
+                       CASE WHEN i % 7 = 0 THEN NULL ELSE i END::BIGINT AS n FROM range(__N__) r(i)""".replace("__N__", str(N)))
+        acases = {
+            "sum_filter":        "SELECT k, sum(v) FILTER (WHERE z = 1), count(*) FROM tf GROUP BY k",
+            "count_star_filter": "SELECT k, count(*) FILTER (WHERE z > 5) AS big, count(*) AS n_all FROM tf GROUP BY k",
+            "several":           "SELECT k, sum(d) FILTER (WHERE z < 4), max(n) FILTER (WHERE b), min(v) FILTER (WHERE z = 12 AND n IS NOT NULL), count(n) FILTER (WHERE z = 2) FROM tf GROUP BY k",
+            "avg_filter":        "SELECT k, avg(v) FILTER (WHERE z = 3), avg(d) FILTER (WHERE b) FROM tf GROUP BY k",
+            "count_if":          "SELECT k, count_if(z = 3), count_if(b) FROM tf GROUP BY k",
+            "bool_and_or":       "SELECT k, bool_and(b), bool_or(b), bool_or(z > 11) FROM tf GROUP BY k",
+            "bool_filter":       "SELECT k, bool_and(b) FILTER (WHERE z < 3), count_if(b) FILTER (WHERE z = 1) FROM tf GROUP BY k",
+            "having_filter":     "SELECT k, sum(v) FROM tf GROUP BY k HAVING count(*) FILTER (WHERE z = 1) > 20",
+            "order_filter":      "SELECT k, sum(v) FILTER (WHERE z = 1) AS s FROM tf GROUP BY k ORDER BY s DESC NULLS LAST, k LIMIT 7",
+            # no row qualifies: sum / min / max / bool are NULL, count is 0 — on both sides
+            "empty_filter":      "SELECT k, sum(v) FILTER (WHERE z > 99), count(*) FILTER (WHERE z > 99), bool_and(b) FILTER (WHERE z > 99), count_if(z > 99) FROM tf GROUP BY k",
+            "with_where":        "SELECT z, sum(v) FILTER (WHERE b), count_if(n > 1000) FROM tf WHERE k < 500 GROUP BY z",
+            "over_join":         None,
+        }
+        acases.pop("over_join")
+        for name, sql in acases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + lr["sql"]).fetchall()] if lr["rewritten"] else want_desc
+            ordered = "ORDER BY" in sql
+            check(lr["rewritten"], f"spelling {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want if ordered else sorted(map(str, got)) == sorted(map(str, want)),
+                  f"spelling {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc == want_desc, f"spelling {name}: names and types identical")
+        check(any(r[1] is None and r[2] == 0 for r in con._raw.execute(acases["empty_filter"]).fetchall()),
+              "spelling fixtures: an empty FILTER gives NULL sums beside zero counts")
+        for name, sql in {
+            "distinct_filter": "SELECT k, count(DISTINCT v) FILTER (WHERE z = 1) FROM tf GROUP BY k",
+            "ordered_agg":     "SELECT k, sum(v ORDER BY n) FILTER (WHERE z = 1) FROM tf GROUP BY k",
+            "volatile_filter": "SELECT k, count(*) FILTER (WHERE random() < 2) FROM tf GROUP BY k",
+        }.items():
+            want = sorted(map(str, con._raw.execute(sql).fetchall()))
+            got = sorted(map(str, con.execute(sql).fetchall()))
+            check(not con.last_rewrite()["rewritten"] and got == want,
+                  f"spelling decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
+    con.close()
+
+    # ---- memory budget (§5.5): estimate, least-recently-used eviction, anti-thrash, "does not fit" ----
+    print("== memory budget")
+    from gpudb import connection as _cn2
+    check(_cn2.parse_memory_budget("512MB") == 512 * 2**20 and _cn2.parse_memory_budget("1.5 GiB") == int(1.5 * 2**30)
+          and _cn2.parse_memory_budget(12345) == 12345 and _cn2.parse_memory_budget("unlimited") == 0
+          and _cn2.parse_memory_budget(None) is None,
+          "budget: bytes, '512MB', '1.5 GiB', 'unlimited' and None are read")
+    try:
+        _cn2.parse_memory_budget("lots")
+        check(False, "budget: nonsense raises")
+    except ValueError:
+        check(True, "budget: nonsense raises")
+    one = _cn2.estimate_set_bytes(N, 2)               # a (key, payload) set over an N-row table
+    qa = "SELECT k, sum(v) FROM t GROUP BY k"
+    qb = "SELECT k, sum(a) FROM tm GROUP BY k"
+    qc = "SELECT k, sum(v) FROM tu GROUP BY k"
+    con = fresh(memory_budget=int(one * 2.5))          # room for two such sets, not three
+    if getattr(con, "_exact", False):
+        check(con.memory()["budget"] == int(one * 2.5), "budget: the setting reaches the manager")
+        wa, wb, wc = (sorted(con._raw.execute(q).fetchall()) for q in (qa, qb, qc))
+        for q in (qa, qb):
+            con.execute(q).fetchall()
+        mem = con.memory()["sets"]
+        check(all(m["bytes"] > 0 and 0.9 <= m["est_bytes"] / m["bytes"] <= 1.25 for m in mem.values()),
+              "budget: the estimate is within -10% / +25% of what the extension reports "
+              f"({[round(m['est_bytes'] / max(1, m['bytes']), 2) for m in mem.values()]})")
+        # anti-thrash: both sets are seconds old, so the third is refused rather than evicting them
+        got = sorted(con.execute(qc).fetchall())
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "memory" and got == wc,
+              f"budget: nothing evictable yet -> native, reason 'memory', answer unchanged ({lr['reason']})")
+        check(con.memory()["evictions"] == 0 and sorted(con.execute(qa).fetchall()) == wa and con.last_rewrite()["rewritten"],
+              "budget: the resident sets were left alone and still answer")
+        # past the anti-thrash window the least recently used set goes: qb (qa was just used)
+        con._manager.evict_min_age_s = 0.0
+        got = sorted(con.execute(qc).fetchall())
+        states = {t.split(":")[4]: st for t, st in con.residents().items()}
+        check(con.last_rewrite()["rewritten"] and got == wc and con.memory()["evictions"] == 1,
+              "budget: the third set is uploaded after one eviction, answer identical")
+        check(states.get("tm") == "missing" and states.get("t") == "ready" and states.get("tu") == "ready",
+              f"budget: the least recently used set was the one evicted ({states})")
+        ext = {r[0].split(":")[4] for r in con._raw.execute("SELECT name FROM gpu_residents() WHERE origin = 'managed'").fetchall()}
+        check(ext == {"t", "tu"}, f"budget: the extension dropped it too ({sorted(ext)})")
+        # the evicted set comes back on its next sighting (evicting the new least recently used one)
+        got = sorted(con.execute(qb).fetchall())
+        check(con.last_rewrite()["rewritten"] and got == wb and con.memory()["evictions"] == 2,
+              "budget: an evicted set is uploaded again when its statement returns")
+        used = con._raw.execute("SELECT sum(bytes) FROM gpu_residents()").fetchone()[0]
+        check(used <= con.memory()["budget"], f"budget: resident bytes stay under it ({used} <= {con.memory()['budget']})")
+    con.close()
+
+    # a set larger than the whole budget is never uploaded; a join under pressure keeps its sources
+    con = fresh(memory_budget=int(one * 0.5))
+    if getattr(con, "_exact", False):
+        con._manager.evict_min_age_s = 0.0
+        want = sorted(con._raw.execute(qa).fetchall())
+        for _ in range(3):
+            got = sorted(con.execute(qa).fetchall())
+        check(not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "memory" and got == want,
+              "budget: a set larger than the budget is never uploaded -> native every time")
+        check(con._raw.execute("SELECT count(*) FROM gpu_residents()").fetchone()[0] == 0,
+              "budget: nothing reached the device")
+    con.close()
+
+    con = fresh(memory_budget="unlimited")
+    check(con.memory()["budget"] is None, "budget: 'unlimited' removes the cap")
+    con.close()
+
+    con = fresh()
+    if getattr(con, "_join", False):
+        con.execute(JOIN_SETUP_EARLY)
+        qj = "SELECT tier, count(*), sum(v) FROM jf JOIN jd ON jf.did = jd.did GROUP BY tier ORDER BY tier"
+        wj = con._raw.execute(qj).fetchall()
+        con.execute(qj).fetchall()
+        check(con.last_rewrite()["rewritten"], "budget (join): resident under the default budget")
+        joined = sum(m["bytes"] for m in con.memory()["sets"].values())
+        # now only the join's sets plus half of another fit: a new big set must evict the DERIVED set first,
+        # never a source from under it
+        con._manager.memory_budget = joined + one // 2
+        con._manager.evict_min_age_s = 0.0
+        got = sorted(con.execute(qa).fetchall())
+        check(got == sorted(con._raw.execute(qa).fetchall()), "budget (join): the new statement's answer is right either way")
+        got = con.execute(qj).fetchall()
+        check(got == wj, f"budget (join): the join still answers correctly after eviction pressure "
+                         f"(rewritten={con.last_rewrite()['rewritten']}, fallback={con.last_rewrite()['fallback']})")
+        got = con.execute(qj).fetchall()
+        check(got == wj and not con.last_rewrite()["fallback"], "budget (join): and again, without a fallback")
+    con.close()
+
+    # rule 2 when the rewritten form itself fails (not staleness): DuckDB answers the original statement
+    con = fresh()
+    if getattr(con, "_exact", False):
+        want = sorted(con._raw.execute(qa).fetchall())
+        con.execute(qa).fetchall()
+        tag = con.last_rewrite()["tag"]
+        con._raw.execute("SELECT gpu_drop_resident(?)", [tag]).fetchall()      # behind the wrapper's back
+        got = sorted(con.execute(qa).fetchall())
+        lr = con.last_rewrite()
+        check(got == want and lr["fallback"], f"rewrite error: the set vanished -> native answer, no exception ({lr['error'][:60] or 'stale'})")
+        got = sorted(con.execute(qa).fetchall())
+        check(got == want, "rewrite error: the next run answers correctly too "
+                           f"(rewritten={con.last_rewrite()['rewritten']}, reason={con.last_rewrite()['reason']})")
+        # any other failure of the rewritten form (here: a simulated device allocation error)
+        qe = "SELECT k, max(v) FROM t GROUP BY k"
+        wante = sorted(con._raw.execute(qe).fetchall())
+        con.execute(qe).fetchall()
+        route = con._route
+        def broken(q, p=None, _route=route):
+            out = _route(q, p)
+            return "SELECT error('device allocation failed (simulated)')" if con.last_rewrite()["rewritten"] else out
+        con._route = broken
+        try:
+            got = sorted(con.execute(qe).fetchall())
+        finally:
+            con._route = route
+        lr = con.last_rewrite()
+        check(got == wante and lr["fallback"] and "device allocation failed" in lr["error"],
+              "rewrite error: a failing rewritten statement is answered natively, the error kept for diagnostics")
+        got = sorted(con.execute(qe).fetchall())
+        check(got == wante and not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "error",
+              f"rewrite error: that template stays native afterwards ({con.last_rewrite()['reason']})")
+        # a genuine user error is still the user's error, with DuckDB's own message
+        try:
+            con.execute("SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > 'x'").fetchall()
+            check(False, "rewrite error: a statement DuckDB rejects still raises")
+        except duckdb.Error:
+            check(True, "rewrite error: a statement DuckDB rejects still raises")
+    con.close()
+
+    # background residency: the worker applies the same budget
+    con = fresh(residency="background", idle_ms=5.0, memory_budget=int(one * 0.5))
+    if getattr(con, "_exact", False):
+        want = sorted(con._raw.execute(qa).fetchall())
+        con.execute(qa).fetchall()
+        con._manager.wait_idle(30)
+        got = sorted(con.execute(qa).fetchall())
+        check(not con.last_rewrite()["rewritten"] and con.last_rewrite()["reason"] == "memory" and got == want,
+              f"budget (background): the worker refuses the upload -> native, reason 'memory' ({con.last_rewrite()['reason']})")
     con.close()
 
     # ---- measured rule 1: a template whose rewritten runs are not faster than its own native runs is declined ----

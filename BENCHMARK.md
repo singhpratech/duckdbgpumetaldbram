@@ -3324,3 +3324,52 @@ branch over 12 alternating process starts it has the same 1.07× median on both 
 falls below 1.0× in a quarter of process starts on either, so the bound was tightened: that
 exemption now needs two expression payloads (1.08–1.59× on 27 cells).
 
+## v0.7 TPC-H at scale factor 50 — Metal, 300M lineitem rows (2026-09-17)
+
+Apple M4 Max, 64 GB unified memory; `GPUDB_MEMORY_BUDGET_MB=40000` for the run (the default
+budget is a quarter of unified memory; a benchmark that uploads a new 9–15 GB set every few
+seconds needs more room than a session does). Before this change: 0 of 22 — every upload above
+4 GB was stopped by the host staging cap (see docs/RESEARCH_NOTES.md). Queries marked
+`native (memory)` were refused by the budget: their sets arrive back-to-back and nothing
+resident is older than the 60 s anti-thrash window.
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 760.2 | 211.5 | 3.59× | True | |
+| Q2 | native (shape) | 52.7 | — | — | — | split failed: Binder Error: Referenced column "p_partkey" not found in FROM clause!
+| Q3 | GPU (plain) | 287.8 | 103.5 | 2.78× | True | |
+| Q4 | native (memory) | 230.8 | — | — | — |  |
+| Q5 | GPU (plain) | 262.7 | 5.0 | 52.70× | True | |
+| Q6 | native (shape) | 82.7 | — | — | — |  |
+| Q7 | native (memory) | 291.9 | — | — | — | declined (shape, device): self join |
+| Q8 | native (memory) | 314.4 | — | — | — | declined (shape, device): self join |
+| Q9 | GPU (plain) | 756.3 | 103.5 | 7.30× | True | |
+| Q10 | GPU (topk) | 428.8 | 101.1 | 4.24× | True | |
+| Q11 | GPU (nested) | 44.2 | 29.3 | 1.51× | True | |
+| Q12 | native (memory) | 232.0 | — | — | — |  |
+| Q13 | native (shape) | 1206.7 | — | — | — | threshold: 7500000 groups returned over a join > 1000000 (output-bound) |
+| Q14 | GPU (projected) | 199.0 | 77.2 | 2.58× | True | |
+| Q15 | native (shape) | 151.1 | — | — | — | declined (not_found, device): table |
+| Q16 | native (threshold) | 218.6 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | native (memory) | 633.0 | — | — | — | declined (shape, device): expression over columns of several tables |
+| Q18 | native (memory) | 974.0 | — | — | — | declined (shape): GROUP BY key components from different tables |
+| Q19 | GPU (projected) | 536.1 | 93.7 | 5.72× | True | |
+| Q20 | native (shape) | 360.5 | — | — | — |  |
+| Q21 | GPU (plain) | 1253.4 | 361.1 | 3.47× | True | |
+| Q22 | GPU (plain) | 517.9 | 5.5 | 94.38× | True | |
+
+10 of 22 queries answered on the device; 0 with rows that differ from native
+
+First statement on a 300M-row set (key + payload, 8.9 GiB resident including the sort cache):
+4.7 s including the upload, then 157 ms against 1478 ms native. Upload phases at SF1 (6M rows,
+two lanes): copy into device buffers 10–15 ms -> 3.5 ms (parallel, NULL-free fast path); whole
+upload 39 ms -> 26–30 ms; the sort cache is now the largest part (16–18 ms).
+
+Gate for this build at SF1 (`transparent_gate.py --subqueries --exprs`, unlimited budget — the gate
+sweeps more distinct sets than a session ever holds): 771 variants, 526 rewritten, none below 1.0×,
+identical rows, 245 declined by the bounds — the same as before these changes. With the wrapper's
+default budget (16 GiB here) the same run evicts 164 sets and refuses 70 uploads for `memory`,
+all correctly: the sweep uploads a new set every few seconds, so nothing resident is ever older
+than the 60 s anti-thrash window. SF10 (sweep, 6 pieces): 771 variants, 487 rewritten, none
+below 1.0×, none differing; median 6.0×, range 1.07–85×.
+
