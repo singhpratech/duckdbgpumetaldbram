@@ -41,7 +41,7 @@ jobs:
         run: |
           python3 -m pip install --quiet --upgrade pip wheel
           python3 -m pip wheel ./python -w /tmp/gpudb-wheel --no-deps --quiet
-          python3 -m pip install --quiet /tmp/gpudb-wheel/gpudb-*.whl
+          python3 -m pip install --quiet /tmp/gpudb-wheel/*.whl
           cd /tmp && python3 -c "import gpudb; con = gpudb.connect(); con.execute('SELECT 1').fetchall(); print('gpudb', gpudb.__version__, 'without an extension:', con.last_rewrite()['reason'])"
 
   macos-cpu-metal:
