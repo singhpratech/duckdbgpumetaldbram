@@ -35,9 +35,9 @@ _MAX_STATEMENT_BYTES = 16 * 1024
 _LITERAL_RE = re.compile(r"""('(?:[^']|'')*')|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)""")
 _WS_RE = re.compile(r"\s+")
 STALE_MARKER = "GPUDB_STALE"
-# a rewritten statement this slow is far outside a device answer (1-5 ms): when the session
-# never saw it run native (eager residency), native is timed once to compare
-_MEASURE_NATIVE_ABOVE_MS = 20.0
+# measured rule 1 (§9.1): a template is re-measured against native at most this often — one
+# side-cursor probe per template per interval, the user's own statement never the experiment
+_REMEASURE_S = 60.0
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
            "not_found", "manual", "error", "off", "params", "multi", "memory")
@@ -128,12 +128,18 @@ class Decision:
     is_join: bool = False              # the statement's FROM is a join (decides the §4.13 fallback)
     sentinels: List[Any] = field(default_factory=list)   # §4.18: row-count sentinels of tables read by subquery lanes
     set_rows: int = 0                                     # §5.5: rows the resident set will hold (the memory budget's estimate)
+    store_key: str = ""                                   # stage B: the table store a single-table set is a view over
+    store_lanes: List[str] = field(default_factory=list)  # ... and the lanes it reads there
+    store_all: List[tuple] = field(default_factory=list)  # (name, sql, kind) of every lane, for the upload of missing ones
     base_rows: Dict[str, int] = field(default_factory=dict)   # ... and of each base set of a device join, by tag
     # measured rule 1 (§9.1): this statement's own native time, seen while it
     # was not resident yet, against its first rewritten runs
     native_ms: Optional[float] = None
     rewritten_ms: List[float] = field(default_factory=list)
     timing_checked: bool = False
+    measured_declined: bool = False      # sent native by a measurement, not by the thresholds
+    next_check_at: float = 0.0           # when the next side-cursor probe may run
+    probe_sql: str = ""                  # the rewritten statement, for the probe of a declined template
     variants: Dict[Tuple[str, ...], "Decision"] = field(default_factory=dict)
 
 
@@ -282,6 +288,7 @@ class Connection:
         self._backend = (m.group(1) if m else "").upper()   # CPU | METAL | CUDA
         self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
         self._join = self._exact and "join=true" in info     # ... and so does the materialised key join (§4.8)
+        self._store = self._exact and "store=true" in info   # stage B: per-table column store (docs/RESIDENT_COLUMNS_DESIGN.md)
         dm = re.search(r"device_memory=(\d+)", info)
         self._device_bytes = int(dm.group(1)) if dm else 0   # 0 = the backend does not report it (§5.5)
         try:
@@ -351,43 +358,80 @@ class Connection:
         return self
 
     def _note_timing(self, ms: float, query=None, parameters=None) -> None:
-        """Rule 1, measured: the thresholds PREDICT the win. When this
-        session has also seen the statement run native (it did, every time
-        before its set became resident), compare: if the best of the first
-        three rewritten runs is not faster than the best native run, the
-        template runs native from now on (reason 'threshold'). A session
-        that never saw it native (eager residency) times native ONCE, on its
-        own cursor, when the rewritten runs are slow enough to be suspect."""
+        """Rule 1, measured: the thresholds PREDICT the win; the process is the
+        judge. After a template's first three rewritten runs its native time is
+        known — seen while the set was not resident yet, or timed once on a side
+        cursor — and if the best rewritten run is not faster, the template runs
+        native from then on (reason 'threshold'). The decision is not final:
+        a short kernel runs up to 3x slower on Apple silicon while other threads
+        of the process keep waking (DuckDB's idle workers do) or after the device
+        idled, and that state comes and goes. So at most once per _REMEASURE_S a
+        kept template re-times native, and a declined one re-times its rewritten
+        form, on a side cursor; whichever is faster in the process's current
+        state wins. The user's own statement is never the experiment."""
         d = getattr(self, "_timing_decision", None)
-        if d is None or d.timing_checked or not getattr(self, "_thresholds", True) or self._last.fallback:
+        if d is None or not getattr(self, "_thresholds", True) or self._last.fallback:
             return
+        now = time.monotonic()
         if not self._last.rewritten:
-            if self._last.reason == "not_resident":
+            if self._last.reason in ("not_resident", "threshold"):
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
+            if d.measured_declined and now >= d.next_check_at and d.probe_sql and isinstance(query, str):
+                d.next_check_at = now + _REMEASURE_S
+                probe = self._probe_ms(d.probe_sql, None)
+                if probe is not None and probe < ms:
+                    self._log(f"threshold: measured {probe:.2f} ms rewritten vs {ms:.2f} ms native — "
+                              f"template rewritten again")
+                    d.rewritten, d.reason, d.measured_declined = True, "", False
+                    d.rewritten_ms = [probe]
+                    d.native_ms = ms
             return
         d.rewritten_ms.append(ms)
-        if len(d.rewritten_ms) < 3:
+        del d.rewritten_ms[:-5]
+        if not d.probe_sql:
+            d.probe_sql = self._last.sql or ""
+        if not d.timing_checked:
+            if len(d.rewritten_ms) < 3:
+                return
+            if d.native_ms is None:
+                if not isinstance(query, str):
+                    return
+                d.native_ms = self._probe_ms(query, parameters)
+                if d.native_ms is None:
+                    d.timing_checked = True
+                    return
+            d.timing_checked = True
+            d.next_check_at = now + _REMEASURE_S
+            native = d.native_ms
+        elif now >= d.next_check_at and isinstance(query, str):
+            d.next_check_at = now + _REMEASURE_S
+            native = self._probe_ms(query, parameters)
+            if native is None:
+                return
+            d.native_ms = native
+        else:
             return
-        if d.native_ms is None:
-            if min(d.rewritten_ms) < _MEASURE_NATIVE_ABOVE_MS or not isinstance(query, str):
-                return
-            try:
-                cur = self._raw.cursor()       # the caller still fetches from self._raw
-                t0 = time.perf_counter()
-                cur.execute(query, parameters)
-                d.native_ms = (time.perf_counter() - t0) * 1000.0
-                cur.close()
-            except duckdb.Error as e:
-                self._log(f"native timing probe failed: {e}")
-                d.timing_checked = True
-                return
-        d.timing_checked = True
-        best = min(d.rewritten_ms)
-        if best >= d.native_ms:
-            self._log(f"threshold: measured {best:.2f} ms rewritten vs {d.native_ms:.2f} ms native — "
-                      f"template declined from now on")
+        best = min(d.rewritten_ms[-3:])
+        if best >= native:
+            self._log(f"threshold: measured {best:.2f} ms rewritten vs {native:.2f} ms native — "
+                      f"template declined (re-measured in {_REMEASURE_S:.0f} s)")
             d.rewritten = False
             d.reason = "threshold"
+            d.measured_declined = True
+
+    def _probe_ms(self, sql: str, parameters) -> Optional[float]:
+        """Time one execution of `sql` on a side cursor (the caller still
+        fetches from self._raw); None when it fails."""
+        try:
+            cur = self._raw.cursor()
+            t0 = time.perf_counter()
+            cur.execute(sql, parameters)
+            out = (time.perf_counter() - t0) * 1000.0
+            cur.close()
+            return out
+        except duckdb.Error as e:
+            self._log(f"timing probe failed: {e}")
+            return None
 
     def execute(self, query, parameters=None):
         sql = self._route(query, parameters)
@@ -555,6 +599,13 @@ class Connection:
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        # stage B: the table's STORE holds the stale columns — drop it (and every view on it)
+        # in the extension, or the next upload would find its lanes "already there"
+        for prefix in {":".join(t.split(":")[:6]) for t in tags if t.startswith("gpudb:v1:")}:
+            try:
+                self._raw.execute("SELECT gpu_invalidate(?)", [prefix]).fetchall()
+            except Exception:
+                pass
         for tag in tags:
             st = self._manager.get(tag)
             # a joined set: the error does not say which table moved
@@ -984,6 +1035,8 @@ class Connection:
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if not d.rewritten:
             self._last.reason = d.reason
+            if d.measured_declined:
+                self._timing_decision = d        # its native runs keep its native time; it may be re-measured
             return None
         self._timing_decision = d
         self._last.form = d.form
@@ -999,17 +1052,43 @@ class Connection:
                 for b in d.join.base:
                     if b.sentinel:
                         self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
+                    elif getattr(self, "_store", False) and b.store_lanes:
+                        # stage B: a base set is a view over its table's store
+                        parts = b.tag.split(":")
+                        skey = ":".join(parts[:6])
+                        try:
+                            have = {r[0] for r in self._raw.execute(
+                                "SELECT \"column\" FROM gpu_store_columns() WHERE store = ?", [skey]).fetchall()}
+                        except Exception:
+                            have = set()
+                        missing = [l for l in b.store_lanes if l[0] not in have]
+                        bident = _resolve.Identity(parts[2], parts[3], parts[4], int(parts[5]), {})
+                        up_name, up_sql = _rewrite.store_upload_sql(bident.tag, missing, f"{b.fqn} AS {_join.OUTER_ALIAS}") if missing else ("", "")
+                        self._manager.note_candidate(b.tag, up_sql, fqn=b.fqn,
+                                                     est_bytes=estimate_set_bytes(d.base_rows.get(b.tag, d.set_rows), max(1, len(missing))),
+                                                     upload_name=up_name, store_key=skey,
+                                                     store_lanes=[l[0] for l in b.store_lanes],
+                                                     post_sql=["SELECT gpu_prepare_resident('%s')" % b.tag.replace("'", "''")])
                     else:
                         self._manager.note_candidate(b.tag, b.upload_sql, fqn=b.fqn,
                                                      est_bytes=estimate_set_bytes(d.base_rows.get(b.tag, d.set_rows),
                                                                                   _tag_lanes(b.tag)))
             for b in d.sentinels:
                 self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
-            st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
-                                              deps=([b.tag for b in d.join.base] if d.join is not None
-                                                    else [b.tag for b in d.sentinels] or None),
-                                              steps=d.join.steps_sql if d.join is not None else None,
-                                              est_bytes=estimate_set_bytes(d.set_rows, _tag_lanes(d.tag)))
+            if d.store_key and d.join is None:
+                up_name, up_sql, missing = self._store_upload(d)
+                st = self._manager.note_candidate(d.tag, up_sql, fqn=d.fqn,
+                                                  deps=[b.tag for b in d.sentinels] or None,
+                                                  est_bytes=estimate_set_bytes(d.set_rows, max(1, len(missing))),
+                                                  upload_name=up_name, store_key=d.store_key,
+                                                  store_lanes=list(d.store_lanes),
+                                                  post_sql=["SELECT gpu_prepare_resident('%s')" % d.tag.replace("'", "''")])
+            else:
+                st = self._manager.note_candidate(d.tag, d.upload_sql, fqn=d.fqn,
+                                                  deps=([b.tag for b in d.join.base] if d.join is not None
+                                                        else [b.tag for b in d.sentinels] or None),
+                                                  steps=d.join.steps_sql if d.join is not None else None,
+                                                  est_bytes=estimate_set_bytes(d.set_rows, _tag_lanes(d.tag)))
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
             if not self._manager.is_ready(d.tag):
@@ -1044,6 +1123,27 @@ class Connection:
         self._last.rewritten = True
         self._last.sql = out
         return out
+
+    def _store_upload(self, d: "Decision"):
+        """(session name, upload statement, missing lanes) for a store-backed set:
+        what the table's store lacks of the lanes the set reads (stage B). An
+        empty statement means every lane is there and only the view's sort cache
+        may be missing."""
+        try:
+            have = {r[0] for r in self._raw.execute(
+                "SELECT \"column\" FROM gpu_store_columns() WHERE store = ?", [d.store_key]).fetchall()}
+        except Exception:
+            have = set()
+        missing = [l for l in d.store_all if l[0] not in have]
+        if not missing:
+            return "", "", []
+        ident = self._identity_of(d)
+        tag, sql = _rewrite.store_upload_sql(ident.tag, missing, f"{d.fqn} AS {_join.OUTER_ALIAS}")
+        return tag, sql, [l[0] for l in missing]
+
+    def _identity_of(self, d: "Decision"):
+        parts = d.store_key.split(":")
+        return _resolve.Identity(parts[2], parts[3], parts[4], int(parts[5]), {})
 
     def _extension_has_ready_set(self, tag: str) -> bool:
         try:
@@ -1541,6 +1641,12 @@ class Connection:
             d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
                          upload_sql=_rewrite.upload_sql(plan, f"{ident.fqn} AS {_join.OUTER_ALIAS}", q),
                          form=plan.form)
+            if getattr(self, "_store", False):
+                # stage B: the set is a view over the table's store; only lanes the store lacks are uploaded
+                lanes = _rewrite.store_lanes(plan, q)
+                d.store_key = f"gpudb:v1:{ident.catalog}:{ident.schema}:{ident.table}:{ident.oid}"
+                d.store_lanes = [l[0] for l in lanes]
+                d.store_all = lanes
         else:
             try:
                 jr = (_join.plan_upload_residency(low, plan, computed) if isinstance(low, _join.LoweredUpload)

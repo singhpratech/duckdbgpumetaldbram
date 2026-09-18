@@ -1,0 +1,112 @@
+# gpu_store SQL test — resident table columns (docs/RESIDENT_COLUMNS_DESIGN.md, stage B):
+# gpu_upload_columns(tag, rowid, BIGINT[] cols, DOUBLE[] cols, VARCHAR[] cols) uploads columns
+# of a table into its STORE in row-id order; a plain identity tag whose lanes are all in the
+# store is answered by a VIEW that shares them; gpu_store_columns() lists them and
+# gpu_drop_column() frees one. Parity is checked in-process against native SQL.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_store
+
+-- 1. Two statements over one table share the store's columns: k,v and k,v,z are views, three columns resident, views own nothing
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, (i % 7)::BIGINT AS v, (i % 5)::INTEGER AS z FROM range(300000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE st = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v,z:store'
+-- setup: SET VARIABLE s1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v'
+-- setup: SET VARIABLE s2 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v,z'
+-- setup: SELECT gpu_upload_columns(getvariable('st'), rowid, [k::BIGINT, v, z::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM t
+-- setup: SELECT count(*) FROM gpu_groupby_exact_resident(getvariable('s1'))
+-- setup: SELECT count(*) FROM gpu_groupby_exact_resident_where(getvariable('s2'), 'i0 = 2')
+SELECT (SELECT count(*) FROM (SELECT key, sum FROM gpu_groupby_exact_resident(getvariable('s1')) EXCEPT SELECT k, sum(v) FROM t GROUP BY k)) + (SELECT count(*) FROM (SELECT k, sum(v) FROM t GROUP BY k EXCEPT SELECT key, sum FROM gpu_groupby_exact_resident(getvariable('s1')))) AS mismatch1,
+       (SELECT count(*) FROM (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where(getvariable('s2'), 'i0 = 2') EXCEPT SELECT k, sum(v), count(*) FROM t WHERE z = 2 GROUP BY k)) AS mismatch2,
+       (SELECT count(*) FROM gpu_store_columns() WHERE store = 'gpudb:v1:memory:main:t:' || getvariable('oid')) AS store_cols,
+       (SELECT count(*) FROM gpu_residents() WHERE kind = 'view') AS views,
+       (SELECT sum(bytes) FROM gpu_residents() WHERE kind = 'view') AS view_bytes,
+       (SELECT bool_and(bytes > 0) FROM gpu_store_columns()) AS columns_cost;
+-- expect: 0  0  3  2  0  true
+
+-- 2. A VARCHAR column as the key (its dictionary shared with every view; a NULL s is the tuple text 'N', decoded back to NULL), a DOUBLE predicate lane
+-- setup: CREATE TABLE t AS SELECT CASE WHEN i % 9 = 0 THEN NULL ELSE ['a','bb','ccc'][1 + i % 3] END AS s, (i % 11)::BIGINT AS v, (i % 3) / 2.0 AS d, CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 4)::INTEGER END AS z FROM range(200000) r(i)
+-- setup: CREATE MACRO tup(x) AS CASE WHEN x IS NULL THEN 'N' ELSE strlen(CAST(x AS VARCHAR))::VARCHAR || ':' || CAST(x AS VARCHAR) END
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE st = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':v,z,d,s:store'
+-- setup: SET VARIABLE s1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':s,v,z,d'
+-- setup: SELECT gpu_upload_columns(getvariable('st'), rowid, [v, z::BIGINT], [d], [tup(s)]) FROM t
+SELECT (SELECT count(*) FROM (SELECT d.c0, r.sum, r.count, r.count_star FROM gpu_groupby_exact_resident_where(getvariable('s1'), 'i0 = 1; f0 > 0.4') r LEFT JOIN gpu_resident_dictionary(getvariable('s1'), 1) d ON d.id = r.key EXCEPT SELECT s, sum(v), count(v), count(*) FROM t WHERE z = 1 AND d > 0.4 GROUP BY s)) +
+       (SELECT count(*) FROM (SELECT s, sum(v), count(v), count(*) FROM t WHERE z = 1 AND d > 0.4 GROUP BY s EXCEPT SELECT d.c0, r.sum, r.count, r.count_star FROM gpu_groupby_exact_resident_where(getvariable('s1'), 'i0 = 1; f0 > 0.4') r LEFT JOIN gpu_resident_dictionary(getvariable('s1'), 1) d ON d.id = r.key)) AS mismatch,
+       (SELECT count(*) FROM gpu_groupby_exact_resident(getvariable('s1')) WHERE key IS NULL) AS null_key_groups,
+       (SELECT dtype FROM gpu_store_columns() WHERE "column" = 's') AS s_dtype;
+-- expect: 0  0  STR
+
+-- 3. Segmented upload in REVERSE row-id order lands in row-id order: the store is row-aligned across scans (a second lane uploaded separately joins the first)
+-- setup: CREATE TABLE t AS SELECT (i % 50)::INTEGER AS k, i::BIGINT AS v, (i * 3)::BIGINT AS w FROM range(120000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE st1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store'
+-- setup: SET VARIABLE st2 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':w:store'
+-- setup: SET VARIABLE s1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,w,v'
+-- setup: SELECT gpu_upload_begin(getvariable('st1'))
+-- setup: SELECT gpu_upload_columns(getvariable('st1'), rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t WHERE rowid >= 80000
+-- setup: SELECT gpu_upload_columns(getvariable('st1'), rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t WHERE rowid >= 40000 AND rowid < 80000
+-- setup: SELECT gpu_upload_columns(getvariable('st1'), rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t WHERE rowid < 40000
+-- setup: SELECT gpu_upload_finish(getvariable('st1'))
+-- setup: SELECT gpu_upload_columns(getvariable('st2'), rowid, [w], []::DOUBLE[], []::VARCHAR[]) FROM t
+SELECT (SELECT count(*) FROM (SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where(getvariable('s1'), 'i0 < 30000') EXCEPT SELECT k, sum(w), count(*) FROM t WHERE v < 30000 GROUP BY k)) +
+       (SELECT count(*) FROM (SELECT k, sum(w), count(*) FROM t WHERE v < 30000 GROUP BY k EXCEPT SELECT key, sum, count_star FROM gpu_groupby_exact_resident_where(getvariable('s1'), 'i0 < 30000'))) AS mismatch,
+       (SELECT count(*) FROM gpu_store_columns()) AS store_cols,
+       (SELECT rows FROM gpu_store_columns() WHERE "column" = 'w') AS w_rows;
+-- expect: 0  3  120000
+
+-- 4. Guards and lifetime: gpu_assert_rows sees a view; gpu_drop_column frees a lane and every view on it
+-- setup: CREATE TABLE t AS SELECT (i % 10)::INTEGER AS k, i::BIGINT AS v FROM range(100000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE st = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store'
+-- setup: SET VARIABLE s1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v'
+-- setup: SELECT gpu_upload_columns(getvariable('st'), rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+-- setup: SELECT count(*) FROM gpu_groupby_exact_resident(getvariable('s1'))
+-- setup: SET VARIABLE guard = gpu_assert_rows(getvariable('s1'), 100000)
+-- setup: SET VARIABLE ready_views = (SELECT count(*) FROM gpu_residents() WHERE kind = 'view' AND state = 'ready')
+-- setup: SET VARIABLE dropped = gpu_drop_column('gpudb:v1:memory:main:t:' || getvariable('oid'), 'v')
+SELECT getvariable('guard') AS guard_ok, getvariable('ready_views') AS ready_views, getvariable('dropped') AS dropped,
+       (SELECT count(*) FROM gpu_residents() WHERE kind = 'view') AS views_after_drop,
+       (SELECT count(*) FROM gpu_store_columns()) AS cols_after_drop;
+-- expect: true  1  true  0  1
+
+-- 4b. A write invalidates the store (its prefix) and every view on it
+-- setup: CREATE TABLE t AS SELECT (i % 10)::INTEGER AS k, i::BIGINT AS v FROM range(100000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+-- setup: SELECT count(*) FROM gpu_groupby_exact_resident('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v')
+-- setup: SET VARIABLE n = gpu_invalidate('gpudb:v1:memory:main:t:' || getvariable('oid'))
+SELECT getvariable('n') >= 2 AS invalidated_store_and_view,
+       (SELECT count(*) FROM gpu_store_columns()) AS cols_after,
+       (SELECT count(*) FROM gpu_residents() WHERE kind = 'view' AND state = 'stale') AS stale_views;
+-- expect: true  0  1
+
+-- 5. A view without a payload (count(*) only, the tag's '-' lane) over the store
+-- setup: CREATE TABLE t AS SELECT (i % 10)::INTEGER AS k, CASE WHEN i % 3 = 0 THEN NULL ELSE i END::BIGINT AS n FROM range(60000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,n:store', rowid, [k::BIGINT, n], []::DOUBLE[], []::VARCHAR[]) FROM t
+SELECT (SELECT count(*) FROM (SELECT key, count_star FROM gpu_groupby_exact_resident_where('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,-,n', 'i0 is not null') EXCEPT SELECT k, count(*) FROM t WHERE n IS NOT NULL GROUP BY k)) +
+       (SELECT count(*) FROM (SELECT k, count(*) FROM t WHERE n IS NOT NULL GROUP BY k EXCEPT SELECT key, count_star FROM gpu_groupby_exact_resident_where('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,-,n', 'i0 is not null'))) AS mismatch;
+-- expect: 0
+
+-- 6. A view over a store that lacks a lane is no set: the operator says so (the wrapper uploads the missing lane)
+-- setup: CREATE TABLE t AS SELECT (i % 10)::INTEGER AS k, i::BIGINT AS v, (i % 3)::INTEGER AS z FROM range(1000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+-- expected_fail: no resident set named
+SELECT count(*) FROM gpu_groupby_exact_resident('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v,z');
+
+-- 7. A scrambled scan (what a lane behind a correlated subquery looks like: the join hands its rows back in another order) is placed by row-id rank at finish — the placed lanes stay row-aligned with an ordered upload, NULL cells and a VARCHAR lane included
+-- setup: CREATE TABLE t AS SELECT (i % 40)::INTEGER AS k, i::BIGINT AS v, CASE WHEN i % 7 = 0 THEN NULL ELSE (i % 9)::BIGINT END AS n, ['a','bb','ccc','dddd'][1 + i % 4] AS s FROM range(150000) r(i)
+-- setup: CREATE MACRO tup(x) AS CASE WHEN x IS NULL THEN 'N' ELSE strlen(CAST(x AS VARCHAR))::VARCHAR || ':' || CAST(x AS VARCHAR) END
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE s1 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,n'
+-- setup: SET VARIABLE s2 = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':s,v,n'
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k:store', rowid, [k::BIGINT], []::DOUBLE[], []::VARCHAR[]) FROM t
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':v,n,s:store', rid, [v, n], []::DOUBLE[], [tup(s)]) FROM (SELECT rowid AS rid, v, n, s FROM t ORDER BY hash(rowid))
+SELECT (SELECT count(*) FROM (SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident(getvariable('s1')) EXCEPT SELECT k, sum(n), count(n), count(*) FROM t GROUP BY k)) +
+       (SELECT count(*) FROM (SELECT k, sum(n), count(n), count(*) FROM t GROUP BY k EXCEPT SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident(getvariable('s1')))) AS mismatch_placed_nulls,
+       (SELECT count(*) FROM (SELECT d.c0, r.sum, r.count_star FROM gpu_groupby_exact_resident_where(getvariable('s2'), 'i0 = 3') r LEFT JOIN gpu_resident_dictionary(getvariable('s2'), 1) d ON d.id = r.key EXCEPT SELECT s, sum(v), count(*) FROM t WHERE n = 3 GROUP BY s)) +
+       (SELECT count(*) FROM (SELECT s, sum(v), count(*) FROM t WHERE n = 3 GROUP BY s EXCEPT SELECT d.c0, r.sum, r.count_star FROM gpu_groupby_exact_resident_where(getvariable('s2'), 'i0 = 3') r LEFT JOIN gpu_resident_dictionary(getvariable('s2'), 1) d ON d.id = r.key)) AS mismatch_placed_str,
+       (SELECT count(*) FROM gpu_store_columns()) AS store_cols,
+       (SELECT rows FROM gpu_store_columns() WHERE "column" = 's') AS s_rows;
+-- expect: 0  0  4  150000

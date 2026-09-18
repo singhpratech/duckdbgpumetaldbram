@@ -1210,6 +1210,93 @@ void test_backend(gpudb::Backend b) {
             else { ++failures; ++total; std::printf("    FAIL: %s\n", e.what()); }
         }
 
+        // Stage B primitive: spans that name their destination row and their bitmap bit offset
+        // (chunks scanned in any order land at their row-id rank; a chunk that starts mid-segment
+        // reads its bitmap from that bit). Placed in shuffled order + offsets == one span.
+        std::printf("  exact upload from placed spans:\n");
+        try {
+            std::mt19937_64 rng(0x9E1ACEULL);
+            const std::size_t N = 1'300'011, L = 3;
+            const std::size_t cap = std::size_t(100) * 1000000;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t> kd(-3000, 3000), vd(-500000, 500000), sel(0, 99);
+            // the "segment": rows in SCAN order, with a bitmap per lane over the whole segment
+            std::vector<std::int64_t> lanes(N * L);
+            std::vector<std::vector<std::uint64_t>> seg_valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            for (std::size_t i = 0; i < N; ++i) {
+                lanes[i * L] = kd(rng); lanes[i * L + 1] = vd(rng); lanes[i * L + 2] = sel(rng);
+                const int nullp[3] = {4, 10, 0};
+                for (std::size_t l = 0; l < L; ++l)
+                    if (pct(rng) < nullp[l]) seg_valid[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+            }
+            // chunks of odd sizes, each with a destination = its rank in row-id order, presented shuffled
+            std::vector<std::size_t> cuts{0};
+            std::uniform_int_distribution<std::size_t> csz(1, 5000);
+            while (cuts.back() < N) cuts.push_back(std::min(N, cuts.back() + csz(rng)));
+            const std::size_t n_chunks = cuts.size() - 1;
+            std::vector<std::size_t> order(n_chunks);
+            for (std::size_t c = 0; c < n_chunks; ++c) order[c] = c;
+            std::shuffle(order.begin(), order.end(), rng);
+            std::vector<gpudb::Aggregator::RowSpan> spans(n_chunks);
+            std::vector<std::vector<const std::uint64_t*>> vps(n_chunks, std::vector<const std::uint64_t*>(L));
+            for (std::size_t x = 0; x < n_chunks; ++x) {
+                const std::size_t c = order[x], a = cuts[c], b = cuts[c + 1];
+                spans[x].lanes = lanes.data() + a * L; spans[x].rows = b - a; spans[x].n_lanes = L;
+                for (std::size_t l = 0; l < L; ++l) vps[x][l] = seg_valid[l].data();
+                spans[x].valid = vps[x].data();
+                spans[x].dst_row = a;                 // its rank in row-id order
+                spans[x].valid_bit = a;               // its bitmap starts at bit a of the segment's bitmap
+            }
+            const gpudb::Dtype dts[3] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64};
+            auto cols = agg->upload_rows_exact(spans.data(), n_chunks, dts, L);
+            auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+            std::vector<const std::uint64_t*> wp(L);
+            for (std::size_t l = 0; l < L; ++l) wp[l] = seg_valid[l].data();
+            gpudb::Aggregator::RowSpan one; one.lanes = lanes.data(); one.rows = N; one.n_lanes = L; one.valid = wp.data();
+            auto ref_cols = ref_agg->upload_rows_exact(&one, 1, dts, L);
+            EXPECT(cols.size() == L && cols[0]->rows() == N && cols[0]->null_count() == ref_cols[0]->null_count()
+                   && cols[1]->null_count() == ref_cols[1]->null_count());
+            gpudb::Predicate p, rp;
+            p.col = cols[2].get(); p.op = gpudb::Predicate::Op::GE; p.value = 30;
+            rp = p; rp.col = ref_cols[2].get();
+            auto got = agg->groupby_exact_masked_resident(*cols[0], cols[1].get(), &p, 1, cap);
+            auto want = ref_agg->groupby_exact_masked_resident(*ref_cols[0], ref_cols[1].get(), &rp, 1, cap);
+            using Row = std::tuple<int, std::int64_t, std::uint64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t, std::int64_t>;
+            auto rows_of = [](const decltype(got)& g) {
+                std::vector<Row> out;
+                for (std::size_t i = 0; i < g.keys.size(); ++i)
+                    out.emplace_back(g.key_null[i], g.key_null[i] ? 0 : g.keys[i], static_cast<std::uint64_t>(g.sums[i]), g.sums_hi[i],
+                                     g.counts[i], g.counts_star[i], g.counts[i] ? g.mins[i] : 0, g.counts[i] ? g.maxs[i] : 0);
+                std::sort(out.begin(), out.end());
+                return out;
+            };
+            const bool ok = rows_of(got) == rows_of(want) && got.keys.size() > 5000;
+            if (!ok) std::printf("    FAIL placed spans: %zu groups vs %zu\n", got.keys.size(), want.keys.size());
+            EXPECT(ok);
+            // the join sees row-aligned lanes too: a self join on the key lane against a unique build
+            std::vector<std::int64_t> bk(6001), bv(6001);
+            for (std::size_t i = 0; i < 6001; ++i) { bk[i] = static_cast<std::int64_t>(i) - 3000; bv[i] = static_cast<std::int64_t>(i) * 7; }
+            gpudb::Aggregator::RowSpan bs; bs.lanes = nullptr;
+            std::vector<std::int64_t> bl(6001 * 2);
+            for (std::size_t i = 0; i < 6001; ++i) { bl[2 * i] = bk[i]; bl[2 * i + 1] = bv[i]; }
+            bs.lanes = bl.data(); bs.rows = 6001; bs.n_lanes = 2;
+            const gpudb::Dtype d2[2] = {gpudb::Dtype::I64, gpudb::Dtype::I64};
+            auto bcols = agg->upload_rows_exact(&bs, 1, d2, 2);
+            auto rbcols = ref_agg->upload_rows_exact(&bs, 1, d2, 2);
+            gpudb::JoinLane jl[2]; jl[0].col = cols[1].get(); jl[0].from_build = false; jl[1].col = bcols[1].get(); jl[1].from_build = true;
+            gpudb::JoinLane rjl[2]; rjl[0].col = ref_cols[1].get(); rjl[0].from_build = false; rjl[1].col = rbcols[1].get(); rjl[1].from_build = true;
+            auto jr = agg->join_materialize(*cols[0], *bcols[0], jl, 2);
+            auto rjr = ref_agg->join_materialize(*ref_cols[0], *rbcols[0], rjl, 2);
+            auto jgot = agg->groupby_exact_resident(*jr.lanes[1], jr.lanes[0].get(), cap);
+            auto jwant = ref_agg->groupby_exact_resident(*rjr.lanes[1], rjr.lanes[0].get(), cap);
+            const bool jok = jr.rows_out == rjr.rows_out && rows_of(jgot) == rows_of(jwant) && jgot.keys.size() > 5000;
+            if (!jok) std::printf("    FAIL placed spans join: %zu vs %zu rows out\n", jr.rows_out, rjr.rows_out);
+            EXPECT(jok);
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) std::printf("    SKIP (%s)\n", e.what());
+            else { ++failures; ++total; std::printf("    FAIL: %s\n", e.what()); }
+        }
+
         std::printf("  several payloads in one group by:\n");
         using Op = gpudb::Predicate::Op;
         using Cmp = gpudb::GroupByFilter::Cmp;
