@@ -857,6 +857,26 @@ a CAST around the aggregate makes the statement the projected form (§4.11).
 Left alone: DISTINCT or ordered aggregates with a FILTER, and anything the
 lane rules refuse (a volatile function in the filter).
 
+### 4.20 Views
+`FROM revenue0` means `FROM (SELECT …) AS revenue0` — that is what a view is —
+so a statement over a view is a statement over a derived table once the
+definition is spliced in, and §4.14 / §4.16 apply unchanged. `_views.inline`
+replaces every `BASE_TABLE` node that names a view of the CURRENT catalog and
+schema with a `SUBQUERY` node holding the view's SELECT (the view's column list
+becomes the column aliases, the reference's alias or the view name the alias),
+views over views up to four deep. Left as written: a view in another schema (its
+unqualified names bind in the schema it was created in), a name that is both a
+table and a view, a view whose body is not one SELECT (a set operation), and
+anything the DESCRIBE check (names and types) rejects. The fast path treats a
+view that names a big table as naming it, and a statement that names a view as
+possibly aggregating.
+
+A view is the one object whose text can change under a session without any
+table changing, so a statement built on views remembers their definitions and
+re-reads `duckdb_views()` for those names on every run (~0.2 ms): a view
+redefined from any connection — or replaced by a table of the same name — is
+noticed on the next statement, which is rebuilt from the new definition.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -879,7 +899,8 @@ connection:
    rule is conservative: the statement is rewritten only when exactly
    **one** object of that name exists across all of those, and it is a base
    table. Two candidates (a temp table shadowing a base table, a view beside
-   a table in another catalog), a view, or no hit at all: native. This
+   a table in another catalog), a view outside the current schema, or no hit
+   at all: native (a view of the current schema is inlined first, §4.20). This
    avoids reproducing the binder's precedence rules.
 3. A qualified name is checked the same way against its catalog and schema.
 4. The result is `(catalog, schema, table, table oid, column names)` — the

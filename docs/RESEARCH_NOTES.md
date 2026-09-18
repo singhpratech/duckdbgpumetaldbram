@@ -970,6 +970,33 @@ twice — at SF50 that is what turns six queries into `memory` refusals. Sharing
 lanes between sets (a set as a list of lane references) is the next structural
 step, and it is the same object the chunked design needs.
 
+## 2026-09-18 — Views are derived tables with a name
+
+After the merges, the next coverage gap by real-world weight was views: every
+statement over one ran on DuckDB, by a rule written before derived tables and
+CTEs were handled. But a view IS a derived table — DuckDB binds `FROM v` as
+`FROM (definition) AS v` — so the whole feature is a tree splice before the
+decision, and the fold (§4.16) and nested (§4.14) passes do the rest. Seven
+shapes on the first try: a filtered SELECT over an aggregating view, the TPC-H
+Q15 shape (the view twice, once in a scalar subquery), an aggregate over a view,
+a view over a view, a view with a column list, a view joined to a table, an
+aliased reference. The two places the fast path needed to learn: a view that
+names a big table counts as naming it, and a statement over a view may
+aggregate even if its text does not.
+
+The interesting part is rule 2. Tables show their changes through row
+counts; a view's text can change with no table changing — `CREATE OR REPLACE
+VIEW` from another connection would leave a cached statement computing the old
+definition, silently. So a statement built on views keeps the definitions it
+used and re-reads `duckdb_views()` for those names before every run (0.2 ms; a
+cost only view statements pay). The test redefines the view from a second
+connection and then replaces it with a table of the same name; both are
+answered from the new object on the next statement.
+
+Q15 in DuckDB's TPC-H module is a CTE, not a view, and it stays native for a
+measured reason: its GROUP BY keeps 4% of the rows and returns all 10K groups,
+which the gate showed the device loses. The rule held; nothing to fix.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
