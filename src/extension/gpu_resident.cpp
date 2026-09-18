@@ -573,7 +573,9 @@ public:
         if (!starts_with(name, kTagPrefix)) return nullptr;
         TagFields t;
         if (!parse_tag(name, t).empty()) return nullptr;
-        if (!t.extra.empty() && t.extra != "join") return nullptr;   // a plain set, or a join's base set
+        // a plain set, a join's base set, or a set only global aggregates read (§4.12)
+        const bool global = t.extra == "global";
+        if (!t.extra.empty() && t.extra != "join" && !global) return nullptr;
         const std::string key = std::string("gpudb:v1:") + t.catalog + ":" + t.schema + ":" + t.table + ":" + std::to_string(t.table_oid);
         auto st = stores.find(key);
         if (st == stores.end()) return nullptr;
@@ -590,10 +592,22 @@ public:
             return it == store.cols.end() ? nullptr : it->second;
         };
         auto set = std::make_shared<ResidentSet>();
-        auto k = lane("k#" + lanes[0]);          // a tuple-text key lives under its role prefix
-        if (!k) k = lane(lanes[0]);
+        std::shared_ptr<StoreColumn> k;
+        if (global && lanes[0] == "-") {
+            // §4.12: no GROUP BY key. The first real lane (the payload, else the
+            // first predicate lane) stands in so the set's invariants hold; the
+            // global operator never reads it as a key and nothing sorts it.
+            set->no_key = true;
+            for (std::size_t l = 1; l < lanes.size() && !k; ++l)
+                if (lanes[l] != "-") k = lane(lanes[l]);
+            if (!k || k->is_str) return nullptr;
+        } else {
+            k = lane("k#" + lanes[0]);           // a tuple-text key lives under its role prefix
+            if (!k) k = lane(lanes[0]);
+        }
         if (!k) return nullptr;
         set->keys = k->col; set->key_str = k->is_str; set->key_dict = k->dict;
+        if (set->no_key) { set->key_str = false; set->key_dict = nullptr; }
         if (lanes[1] != "-") {
             auto v = lane(lanes[1]);
             if (!v || v->is_str) return nullptr;
@@ -663,7 +677,8 @@ public:
         }
         if (fresh_view && s->keys) {
             // the sort cache belongs to the (shared) key column: built once, used by every view on it
-            s->keys->prepare();
+            // (§4.12: a global set has no key — sorting its lanes would buy nothing)
+            if (!s->no_key) s->keys->prepare();
             s->state.store(SetState::Ready);
         }
         if (!s) {
@@ -2853,6 +2868,9 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   compiled=cpu,metal     → Metal backend present (macOS build)
 //   join=true|false        → the runtime backend runs join_materialize on its own device (§4.8)
 //   exact=true|false       → the runtime backend runs the v0.7 exact GROUP BY
+//   global=true|false      → ... and the global masked aggregate (§4.12) on its own device
+//   narrow=true|false      → lanes are stored at their narrowest width (docs/RESIDENT_COLUMNS_DESIGN.md
+//                            stage C); the wrapper's memory estimate sizes lanes from their type then
 //   device_memory=<bytes>  → what the backend reports for the memory budget (0 = unknown, §5.5)
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
@@ -2873,6 +2891,8 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     }
     info += ctx_of(info_).aggregator().exact_supported() ? " exact=true" : " exact=false";
     info += ctx_of(info_).aggregator().join_supported() ? " join=true" : " join=false";
+    info += ctx_of(info_).aggregator().global_supported() ? " global=true" : " global=false";
+    info += ctx_of(info_).aggregator().narrow_lanes() ? " narrow=true" : " narrow=false";
     info += " device_memory=" + std::to_string(ctx_of(info_).aggregator().device_memory_bytes());
     info += " store=true";
     const idx_t n = duckdb_data_chunk_get_size(input);
@@ -2941,6 +2961,13 @@ void prepare_resident_exec(duckdb_function_info info, duckdb_data_chunk input,
         }
         try {
             ResidentRef ref = ctx.acquire_column(read_name(names, i), "gpu_prepare_resident");
+            if (ref.set->no_key && ref.set->keys.get() == ref.col) {
+                // §4.12: a global set has no key; there is nothing to derive
+                SetState expect = SetState::Uploaded;
+                ref.set->state.compare_exchange_strong(expect, SetState::Ready);
+                out[i] = true;
+                continue;
+            }
             ref.col->prepare();   // no device lock: runs on the column's own stream
             if (ref.set->keys.get() == ref.col && ref.set->keys->prepared()) {
                 SetState expect = SetState::Uploaded;

@@ -21,6 +21,8 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 | `groupby_exact_resident(keys, vals, cap, filter)` | one row per distinct key ascending, NULL-key group last; exact 128-bit sums (`sums`/`sums_hi`), counts, count(*), min, max; `filter` = device HAVING / top-k | same | sort-based: run starts over the sorted prefix |
 | `groupby_exact_masked_resident(keys, vals, preds, n_preds, cap, filter)` | the same under a WHERE program: conjunction of `Predicate`s over predicate lanes (EQ NE LT LE GT GE IsNull IsNotNull In) | same | mask → selection → reduce |
 | `groupby_exact_masked_multi(keys, pays, n_pays, filter_payload, preds, n_preds, cap, filter)` | several payloads in ONE pass; `MultiPayload::columns` bits select what to produce per payload | default = one pass per payload (fine to start with) | fused: mask / selection / run starts once, reduce per payload |
+| `aggregate_exact_masked(pays, n_pays, preds, n_preds)` | **optional, added 2026-09-18 (§4.12)**: aggregates without GROUP BY under a WHERE — one fused pass over the rows in storage order, no key, no sort cache, no permutation. Returns `GlobalAggResult`: per payload the exact 128-bit sum, `count(payload)`, min and max, plus one `count_star` of the surviving rows. Semantics are one group of `groupby_exact_masked_multi`; `n_pays` may be 0 (`count(*)` only) and `n_preds` may be 0. `global_supported()` is its rule-1 gate, defaulting to false — the CUDA backend builds and answers unchanged until it overrides both | `cpu_aggregator.cpp` (the reference) | `metal_aggregator.mm` + `gagg_masked_i64` in `kernels/sum.metal`: one lane table bound per distinct lane (payloads and predicate columns share slots, 12 of them), per-thread accumulators indexed `[group * n_pays + payload]`, threadgroup tree reduce, host merge |
+| `narrow_lanes()` | **optional**: does this backend store an exact I64 lane at the narrowest signed width its values fit (`docs/RESIDENT_COLUMNS_DESIGN.md` §6)? Storage width stays backend-private; the flag exists because the wrapper's PRE-upload memory estimate sizes lanes from their DuckDB type when it is true and charges 8 bytes a lane when it is false. Defaults to false, which is correct for a CUDA backend that stores 8-byte lanes | false | true |
 | `join_materialize(probe_key, build_key, lanes, n)` | inner join onto a UNIQUE build key; returns row-aligned lanes (probe or build side), NULL-key rows dropped; `join_supported()` gates it | `cpu_aggregator.cpp` | sort-merge (Metal has no 64-bit atomic CAS); CUDA should use open-addressing with `atomicCAS` as `join_kernel.cu` already does for the v0.6 join |
 | `device_memory_bytes()` | total device memory in bytes (`cudaMemGetInfo` total); reported by `gpu_build_info()`, sets the wrapper's default budget to half of it | 0 | `recommendedMaxWorkingSetSize` |
 | `exact_supported()`, `join_supported()` | return true only when the above are complete — these are rule-1 gates: a backend that claims support and throws makes statements fall back at run time | — | — |
@@ -40,6 +42,11 @@ Not needed: anything in `GroupByAggregator`, `WindowAggregator`, `HashJoinProbe`
   backends; DuckDB's `sum(BIGINT)` is HUGEINT.
 - **Predicates on F64 lanes** compare doubles; on I64 lanes integers; `In`
   takes a list. NULL never satisfies a predicate except `IsNull`.
+- **The global aggregate returns one result, always** — over an empty column,
+  over a mask that keeps nothing, over a payload whose every cell is NULL.
+  `count_star` is then 0, every `counts[p]` is 0 and the sums / mins / maxs of
+  those payloads are unspecified (the extension emits SQL NULL). Returning
+  "no result" would be a different answer from native's.
 - **HAVING / top-k on the device** (`GroupByFilter`): `cmp` + `threshold` on
   `agg` (Sum / Count / CountStar / Min / Max), or `topk` with `topk_desc`;
   `columns` bits select the output columns.
@@ -56,7 +63,14 @@ Not needed: anything in `GroupByAggregator`, `WindowAggregator`, `HashJoinProbe`
   uneven spans, NULL-free / 60% NULL keys / empty / stale bitmap bits, compared
   with the CPU reference fed one span). 804 checks on Metal; the CUDA count will
   differ only by the SKIP lines that become real checks.
-- `./scripts/run_sql_tests.sh` — `test/sql/gpu_groupby_exact*.test`,
+- `test/cpp/test_aggregator.cpp`, block `global masked aggregate`: six payloads
+  with NULL cells, every predicate op including `In` and `IsNull` / `IsNotNull`,
+  an F64 predicate lane, lanes sitting on each narrow-width boundary, a mask
+  that keeps nothing, an empty column, a 128-bit sum that leaves 64 bits, and
+  2.6M rows so the parallel reduction runs many threadgroups — every case
+  compared limb for limb against the CPU reference.
+- `./scripts/run_sql_tests.sh` — `test/sql/gpu_agg_exact_global.test` (the
+  table function, including its guardrails), `test/sql/gpu_groupby_exact*.test`,
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
 - `python/tests/test_wrapper.py` — 808 checks through `gpudb.connect()`: parity

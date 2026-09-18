@@ -899,6 +899,183 @@ void test_backend(gpudb::Backend b) {
         if (implemented) std::printf("    ok\n");
     }
 
+    // ---- Global masked aggregate (v0.7 §4.12) vs the CPU reference ----
+    // Aggregates without GROUP BY under a WHERE, one fused pass: several
+    // payloads, NULL payload cells and NULL predicate cells, every predicate
+    // op including In and IsNull / IsNotNull, an F64 predicate lane, lanes at
+    // every narrow-width boundary, a mask that keeps nothing, an empty column,
+    // a 128-bit sum that overflows 64 bits, and 2.6M+ rows so the parallel
+    // reduction runs many threadgroups. Every case is compared against the
+    // CPU reference, limb for limb.
+    {
+        std::printf("  global masked aggregate:\n");
+        using Op = gpudb::Predicate::Op;
+        bool implemented = true;
+        try {
+            std::mt19937_64 rng(0xA11CEULL);
+            // lanes: 0 stand-in key (unused), 1 payload i64-wide, 2 i8-wide,
+            // 3 i16-wide, 4 i32-wide, 5 one past i32, 6 all NULL, 7 F64
+            const std::size_t N = 2'600'011, L = 8;
+            std::uniform_int_distribution<int> pct(0, 99);
+            std::uniform_int_distribution<std::int64_t>
+                wide(std::numeric_limits<std::int64_t>::min() / 64, std::numeric_limits<std::int64_t>::max() / 64),
+                d8(-128, 127), d16(-32768, 32767), d32(-2147483648LL, 2147483647LL),
+                d33(-2147483649LL, 2147483648LL);
+            std::uniform_real_distribution<double> ud(-1.0, 2.0);
+            std::vector<std::int64_t> lanes(N * L);
+            std::vector<std::vector<std::uint64_t>> vb(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+            auto clr = [&](std::size_t l, std::size_t i) { vb[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+            for (std::size_t i = 0; i < N; ++i) {
+                lanes[i * L + 0] = static_cast<std::int64_t>(i % 97);
+                lanes[i * L + 1] = wide(rng);
+                lanes[i * L + 2] = d8(rng);
+                lanes[i * L + 3] = d16(rng);
+                lanes[i * L + 4] = d32(rng);
+                lanes[i * L + 5] = d33(rng);
+                lanes[i * L + 6] = 0;
+                const double x = ud(rng);
+                std::memcpy(&lanes[i * L + 7], &x, sizeof(x));
+                if (pct(rng) < 7)  clr(1, i);
+                if (pct(rng) < 3)  clr(2, i);
+                if (pct(rng) < 11) clr(3, i);
+                if (pct(rng) < 2)  clr(7, i);
+                clr(6, i);
+            }
+            // the width boundaries themselves, in rows that stay valid
+            const std::int64_t ends[L][2] = {
+                {0, 96}, {0, 0}, {-128, 127}, {-32768, 32767},
+                {-2147483648LL, 2147483647LL}, {-2147483649LL, 2147483648LL}, {0, 0}, {0, 0} };
+            for (std::size_t l = 0; l < L; ++l)
+                for (int e = 0; e < 2; ++e) {
+                    const std::size_t row = 5 + static_cast<std::size_t>(e);
+                    if (l != 6 && l != 7) { lanes[row * L + l] = ends[l][e]; vb[l][row >> 6] |= std::uint64_t{1} << (row & 63); }
+                }
+            const gpudb::Dtype dts[L] = {gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64,
+                                         gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::I64, gpudb::Dtype::F64};
+            std::vector<const std::uint64_t*> vp(L);
+            for (std::size_t l = 0; l < L; ++l) vp[l] = vb[l].data();
+            gpudb::Aggregator::RowSpan sp;
+            sp.lanes = lanes.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+            auto cols = agg->upload_rows_exact(&sp, 1, dts, L);
+            auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+            auto ref_cols = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+
+            using Tup = std::tuple<std::int64_t, std::vector<std::int64_t>>;
+            auto tuple_of = [](const gpudb::GlobalAggResult& r) {
+                std::vector<std::int64_t> v;
+                for (std::size_t p = 0; p < r.counts.size(); ++p) {
+                    v.push_back(r.sums[p]); v.push_back(r.sums_hi[p]); v.push_back(r.counts[p]);
+                    v.push_back(r.counts[p] ? r.mins[p] : 0); v.push_back(r.counts[p] ? r.maxs[p] : 0);
+                }
+                return Tup{r.count_star, v};
+            };
+            // one case: payload lane indices + a predicate program, both sides
+            auto run_case = [&](const char* what, const std::vector<std::size_t>& pay,
+                                const std::vector<std::tuple<std::size_t, Op, std::int64_t>>& terms,
+                                const std::vector<std::int64_t>& list) {
+                std::vector<gpudb::MultiPayload> mp(pay.size()), rmp(pay.size());
+                for (std::size_t p = 0; p < pay.size(); ++p) {
+                    mp[p].vals = cols[pay[p]].get();
+                    rmp[p].vals = ref_cols[pay[p]].get();
+                }
+                std::vector<gpudb::Predicate> ps(terms.size()), rps(terms.size());
+                for (std::size_t q = 0; q < terms.size(); ++q) {
+                    ps[q].col = cols[std::get<0>(terms[q])].get();
+                    ps[q].op = std::get<1>(terms[q]);
+                    ps[q].value = std::get<2>(terms[q]);
+                    if (ps[q].op == Op::In) { ps[q].list = list.data(); ps[q].n_list = list.size(); }
+                    rps[q] = ps[q];
+                    rps[q].col = ref_cols[std::get<0>(terms[q])].get();
+                }
+                auto got = agg->aggregate_exact_masked(mp.data(), mp.size(), ps.data(), ps.size());
+                auto want = ref_agg->aggregate_exact_masked(rmp.data(), rmp.size(), rps.data(), rps.size());
+                const bool ok = tuple_of(got) == tuple_of(want) && got.rows_in == N;
+                if (!ok) std::printf("    FAIL %s: count_star %lld vs %lld\n", what,
+                                     static_cast<long long>(got.count_star), static_cast<long long>(want.count_star));
+                EXPECT(ok);
+                return got;
+            };
+            const std::int64_t f_half = [] {
+                const double d = 0.5; std::int64_t b; std::memcpy(&b, &d, sizeof(b)); return b;
+            }();
+            const std::vector<std::int64_t> in_list = {-128, 0, 1, 127, 42};
+            run_case("no WHERE, six payloads", {1, 2, 3, 4, 5, 6}, {}, {});
+            run_case("count(*) only, no WHERE", {}, {{2, Op::GE, -10}}, {});
+            run_case("EQ / NE", {1, 2}, {{2, Op::EQ, 7}}, {});
+            run_case("NE", {1, 3}, {{2, Op::NE, 7}}, {});
+            run_case("LT / LE / GT / GE", {1, 4}, {{3, Op::LT, 1000}, {3, Op::GE, -1000}, {4, Op::GT, -5}, {2, Op::LE, 100}}, {});
+            run_case("In", {1, 2}, {{2, Op::In, 0}}, in_list);
+            run_case("IsNull", {1, 3}, {{3, Op::IsNull, 0}}, {});
+            run_case("IsNotNull", {1, 3}, {{1, Op::IsNotNull, 0}, {3, Op::IsNotNull, 0}}, {});
+            run_case("all NULL lane IsNull", {1}, {{6, Op::IsNull, 0}}, {});
+            run_case("F64 lane", {1, 2}, {{7, Op::LT, f_half}}, {});
+            run_case("F64 lane IsNull", {1}, {{7, Op::IsNull, 0}}, {});
+            run_case("narrow boundaries", {2, 3, 4, 5}, {{5, Op::GE, -2147483649LL}}, {});
+            {
+                auto none = run_case("mask keeps nothing", {1, 2}, {{2, Op::GT, 1000}}, {});
+                EXPECT_EQ(none.count_star, 0);
+                EXPECT_EQ(none.counts[0], 0);
+            }
+            // 128-bit sum: a payload whose total overflows 64 bits
+            {
+                const std::size_t M = 300'000;
+                std::vector<std::int64_t> big(M * 2);
+                for (std::size_t i = 0; i < M; ++i) {
+                    big[i * 2] = static_cast<std::int64_t>(i);
+                    big[i * 2 + 1] = (i % 2) ? std::numeric_limits<std::int64_t>::max() / 2
+                                             : std::numeric_limits<std::int64_t>::min() / 2;
+                }
+                const gpudb::Dtype d2[2] = {gpudb::Dtype::I64, gpudb::Dtype::I64};
+                gpudb::Aggregator::RowSpan bs; bs.lanes = big.data(); bs.rows = M; bs.n_lanes = 2;
+                auto bc = agg->upload_rows_exact(&bs, 1, d2, 2);
+                auto rbc = ref_agg->upload_rows_exact(&bs, 1, d2, 2);
+                gpudb::MultiPayload mp{bc[1].get(), gpudb::GroupByFilter::kAllColumns};
+                gpudb::MultiPayload rmp{rbc[1].get(), gpudb::GroupByFilter::kAllColumns};
+                gpudb::Predicate p; p.col = bc[1].get(); p.op = Op::GT; p.value = 0;
+                gpudb::Predicate rp = p; rp.col = rbc[1].get();
+                auto got = agg->aggregate_exact_masked(&mp, 1, &p, 1);
+                auto want = ref_agg->aggregate_exact_masked(&rmp, 1, &rp, 1);
+                EXPECT(tuple_of(got) == tuple_of(want));
+                EXPECT(got.sums_hi[0] != 0);           // the sum really left 64 bits
+            }
+            // an empty column: one result, zeros
+            {
+                const gpudb::Dtype d2[2] = {gpudb::Dtype::I64, gpudb::Dtype::I64};
+                gpudb::Aggregator::RowSpan es; es.lanes = nullptr; es.rows = 0; es.n_lanes = 2;
+                auto ec = agg->upload_rows_exact(&es, 1, d2, 2);
+                gpudb::MultiPayload mp{ec[1].get(), gpudb::GroupByFilter::kAllColumns};
+                auto got = agg->aggregate_exact_masked(&mp, 1, nullptr, 0);
+                EXPECT_EQ(got.count_star, 0);
+                EXPECT_EQ(got.counts[0], 0);
+                EXPECT_EQ(got.rows_in, 0u);
+            }
+            // row counts must agree, and neither a payload nor a predicate is an error
+            {
+                std::vector<std::int64_t> other(N + 1, 0);
+                auto oc = agg->upload_i64(other.data(), N + 1);
+                gpudb::Predicate bad; bad.col = oc.get(); bad.op = Op::GT; bad.value = 0;
+                gpudb::MultiPayload mp{cols[1].get(), gpudb::GroupByFilter::kAllColumns};
+                bool threw = false;
+                try { (void)agg->aggregate_exact_masked(&mp, 1, &bad, 1); }
+                catch (const std::runtime_error&) { threw = true; }
+                EXPECT(threw);
+                threw = false;
+                try { (void)agg->aggregate_exact_masked(nullptr, 0, nullptr, 0); }
+                catch (const std::runtime_error&) { threw = true; }
+                EXPECT(threw);
+            }
+        } catch (const std::runtime_error& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("    SKIP (%s)\n", e.what());
+            } else {
+                ++failures; ++total;
+                std::printf("    FAIL: %s\n", e.what());
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
+
     // ---- Materialised key join (v0.7 §4.8) vs a host reference ----
     // The join output is an ordinary exact row set, so it is checked through
     // groupby_exact_[masked_]resident over its lanes: key from the probe or

@@ -554,6 +554,110 @@ public:
         return exact_impl(keys, vals, preds, n_preds, max_groups, filter, "groupby_exact_masked_resident");
     }
 
+    // ---- v0.7 §4.12: the global masked aggregate — reference implementation ----
+    // One pass over the rows in storage order: evaluate the whole predicate
+    // conjunction for the row, then fold every payload of the surviving row.
+    // No key, no sort, no permutation — this is the shape the operator exists
+    // for. The accumulator array is indexed [group * n_pays + payload] with
+    // one group today, so a later few-group variant reuses the fold unchanged.
+    bool global_supported() const noexcept override { return true; }   // the reference
+
+    GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                           const Predicate* preds, std::size_t n_preds) override {
+        static const char* op = "aggregate_exact_masked";
+        const auto t0 = std::chrono::steady_clock::now();
+        if (n_pays == 0 && n_preds == 0)
+            throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
+        std::vector<const CpuResidentColumn*> pc(n_pays, nullptr);
+        std::size_t n = 0;
+        bool have_n = false;
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
+            pc[p] = &check_i64_nullable(*pays[p].vals);
+            if (!have_n) { n = pc[p]->rows(); have_n = true; }
+            else if (pc[p]->rows() != n)
+                throw std::runtime_error(std::string(op) + ": payload row counts differ");
+        }
+        std::vector<const CpuResidentColumn*> prc(n_preds, nullptr);
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            if (!preds[q].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
+            if (preds[q].col->backend_tag() != Backend::CPU)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            prc[q] = static_cast<const CpuResidentColumn*>(preds[q].col);
+            if (!have_n) { n = prc[q]->rows(); have_n = true; }
+            else if (prc[q]->rows() != n)
+                throw std::runtime_error(std::string(op) + ": predicate column row count differs from the payloads");
+        }
+
+        GlobalAggResult r{};
+        r.rows_in = n;
+        r.sums.assign(n_pays, 0); r.sums_hi.assign(n_pays, 0); r.counts.assign(n_pays, 0);
+        r.mins.assign(n_pays, 0); r.maxs.assign(n_pays, 0);
+        if (n == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        struct Acc {
+            Sum128 s;
+            std::int64_t cnt = 0;
+            std::int64_t mn = std::numeric_limits<std::int64_t>::max();
+            std::int64_t mx = std::numeric_limits<std::int64_t>::min();
+        };
+        struct Part {
+            std::vector<Acc> acc;        // [group * n_pays + payload]; one group today
+            std::int64_t cstar = 0;
+        };
+        auto chunk = [&](std::size_t b, std::size_t e) {
+            Part part;
+            part.acc.assign(n_pays, Acc{});
+            for (std::size_t i = b; i < e; ++i) {
+                bool keep = true;
+                for (std::size_t q = 0; keep && q < n_preds; ++q) {
+                    const CpuResidentColumn& c = *prc[q];
+                    const std::int64_t* d = c.as_i64();
+                    keep = predicate_row(preds[q], c.dtype(), i,
+                                         [d](std::size_t row) { return d[row]; },
+                                         [&c](std::size_t row) { return c.valid(row); });
+                }
+                if (!keep) continue;
+                ++part.cstar;
+                for (std::size_t p = 0; p < n_pays; ++p) {
+                    if (!pc[p]->valid(i)) continue;
+                    const std::int64_t x = pc[p]->as_i64()[i];
+                    Acc& a = part.acc[p];
+                    a.s.add(x); ++a.cnt;
+                    if (x < a.mn) a.mn = x;
+                    if (x > a.mx) a.mx = x;
+                }
+            }
+            return part;
+        };
+        auto combine = [&](Part a, const Part& b) {
+            a.cstar += b.cstar;
+            for (std::size_t p = 0; p < a.acc.size(); ++p) {
+                Acc& x = a.acc[p];
+                const Acc& y = b.acc[p];
+                const std::uint64_t old = x.s.lo;
+                x.s.lo += y.s.lo;
+                x.s.hi += y.s.hi + (x.s.lo < old ? 1 : 0);
+                x.cnt += y.cnt;
+                if (y.mn < x.mn) x.mn = y.mn;
+                if (y.mx > x.mx) x.mx = y.mx;
+            }
+            return a;
+        };
+        const Part total = parallel_chunks<Part>(n, chunk, combine);
+        r.count_star = total.cstar;
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            const Acc& a = total.acc[p];
+            r.sums[p]    = static_cast<std::int64_t>(a.s.lo);
+            r.sums_hi[p] = a.s.hi;
+            r.counts[p]  = a.cnt;
+            r.mins[p]    = a.cnt ? a.mn : 0;
+            r.maxs[p]    = a.cnt ? a.mx : 0;
+        }
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
     // ---- v0.7 §4.8: the materialised key join — reference implementation ----
     bool join_supported() const noexcept override { return true; }
 

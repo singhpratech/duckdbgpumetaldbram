@@ -150,6 +150,7 @@ public:
             ps_gbx_topk_counts_       = make_pso(lib, @"gbx_topk_counts_i64");
             ps_gbx_topk_compact_      = make_pso(lib, @"gbx_topk_compact_i64");
             ps_gbx_mask_              = make_pso(lib, @"gbx_mask_i64");
+            ps_gagg_masked_           = make_pso(lib, @"gagg_masked_i64");
             ps_gbxm_chunk_            = make_pso(lib, @"gbxm_chunk_i64");
             ps_gbxm_finalize_         = make_pso(lib, @"gbxm_finalize_i64");
             ps_gbx_sel_counts_        = make_pso(lib, @"gbx_sel_counts_i64");
@@ -1883,6 +1884,177 @@ private:
         return 0u;
     }
 
+    // ---- v0.7 §4.12: the global masked aggregate ----
+    // One fused kernel pass: every thread evaluates the whole WHERE program
+    // for its row (gpred_eval in sum.metal) and folds the surviving row into
+    // its payload accumulators, the threadgroup reduces them into one partial
+    // block, the host merges the blocks. Nothing here reads or builds a sort
+    // cache. The lanes are bound one buffer pair each (data, validity), so
+    // the distinct lanes a statement reads are capped at kGaggLanes; above
+    // that the operator throws and the SQL layer runs native.
+    static constexpr std::size_t kGaggLanes = 12;   // must match GAGG_MAX_LANES in sum.metal
+    static constexpr std::size_t kGaggAcc   = 8;    // must match GAGG_MAX_ACC
+
+    bool global_supported() const noexcept override { return true; }
+    // stage C: every exact I64 lane is stored at the narrowest width its values fit
+    bool narrow_lanes() const noexcept override { return true; }
+
+    GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                           const Predicate* preds, std::size_t n_preds) override {
+        @autoreleasepool {
+            static const char* op = "aggregate_exact_masked";
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            if (n_pays == 0 && n_preds == 0)
+                throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
+            if (n_pays * 1 > kGaggAcc)      // one group today: the accumulators are the payloads
+                throw std::runtime_error(std::string(op) + ": more than " + std::to_string(kGaggAcc) +
+                                         " payload columns");
+
+            // ---- the lane table: distinct columns, payloads and predicates share slots ----
+            std::vector<const MetalResidentColumn*> lane;
+            auto slot_of = [&](const MetalResidentColumn* c) {
+                for (std::size_t i = 0; i < lane.size(); ++i) if (lane[i] == c) return i;
+                if (lane.size() >= kGaggLanes)
+                    throw std::runtime_error(std::string(op) + ": more than " + std::to_string(kGaggLanes) +
+                                             " distinct lanes in one statement");
+                lane.push_back(c);
+                return lane.size() - 1;
+            };
+            std::size_t n = 0;
+            bool have_n = false;
+            auto note_rows = [&](const MetalResidentColumn& c, const char* what) {
+                if (!have_n) { n = c.rows(); have_n = true; }
+                else if (c.rows() != n)
+                    throw std::runtime_error(std::string(op) + ": " + what + " row count differs");
+            };
+            std::vector<std::uint32_t> pay_slot(n_pays, 0);
+            for (std::size_t p = 0; p < n_pays; ++p) {
+                if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
+                const auto& c = check_i64_nullable(*pays[p].vals);
+                note_rows(c, "payload");
+                pay_slot[p] = static_cast<std::uint32_t>(slot_of(&c));
+            }
+            struct GPredHost { std::uint32_t lane, op, list_off, n_list; std::int64_t value; };
+            std::vector<GPredHost> prog(n_preds);
+            std::vector<std::int64_t> lists;
+            for (std::size_t q = 0; q < n_preds; ++q) {
+                if (!preds[q].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
+                if (preds[q].col->backend_tag() != Backend::METAL)
+                    throw std::runtime_error("ResidentColumn mismatch (Metal predicate column)");
+                const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
+                note_rows(c, "predicate column");
+                prog[q].lane = static_cast<std::uint32_t>(slot_of(&c));
+                prog[q].op = pred_op_code(preds[q].op);
+                prog[q].value = preds[q].value;
+                prog[q].list_off = static_cast<std::uint32_t>(lists.size());
+                prog[q].n_list = 0;
+                if (preds[q].op == Predicate::Op::In) {
+                    prog[q].n_list = static_cast<std::uint32_t>(preds[q].n_list);
+                    lists.insert(lists.end(), preds[q].list, preds[q].list + preds[q].n_list);
+                }
+            }
+
+            GlobalAggResult r{};
+            r.rows_in = n;
+            r.sums.assign(n_pays, 0); r.sums_hi.assign(n_pays, 0); r.counts.assign(n_pays, 0);
+            r.mins.assign(n_pays, 0); r.maxs.assign(n_pays, 0);
+            if (n == 0) {
+                r.wall_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t_wall0).count();
+                return r;
+            }
+            if (n > 0xFFFFFFFFull - 64)
+                throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
+
+            struct GLaneMetaHost { std::uint32_t width, has_valid, is_f64, pad; };
+            std::vector<GLaneMetaHost> meta(kGaggLanes, GLaneMetaHost{8u, 0u, 0u, 0u});
+            for (std::size_t i = 0; i < lane.size(); ++i)
+                meta[i] = GLaneMetaHost{lane[i]->width(), lane[i]->valid_buffer() ? 1u : 0u,
+                                        lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+
+            if (!gbx_dummy_valid_)
+                gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+            const std::uint32_t n_groups = 1;                 // §4.12: one group
+            const std::size_t stride = 1 + 5 * n_pays;        // longs per (threadgroup, group) block
+            const NSUInteger ntg = pick_grid(n);
+            grow(gagg_out_, static_cast<std::size_t>(ntg) * n_groups * stride * sizeof(std::int64_t),
+                 "global aggregate partials");
+            id<MTLBuffer> meta_b = [device_ newBufferWithBytes:meta.data()
+                                                        length:meta.size() * sizeof(GLaneMetaHost)
+                                                       options:MTLResourceStorageModeShared];
+            id<MTLBuffer> prog_b = n_preds ? [device_ newBufferWithBytes:prog.data()
+                                                                  length:prog.size() * sizeof(GPredHost)
+                                                                 options:MTLResourceStorageModeShared]
+                                           : gbx_dummy_valid_;
+            id<MTLBuffer> list_b = lists.empty() ? gbx_dummy_valid_
+                                                 : [device_ newBufferWithBytes:lists.data()
+                                                                        length:lists.size() * sizeof(std::int64_t)
+                                                                       options:MTLResourceStorageModeShared];
+            id<MTLBuffer> pay_b = n_pays ? [device_ newBufferWithBytes:pay_slot.data()
+                                                                length:pay_slot.size() * sizeof(std::uint32_t)
+                                                               options:MTLResourceStorageModeShared]
+                                         : gbx_dummy_valid_;
+            if (!meta_b || !prog_b || !list_b || !pay_b)
+                throw std::runtime_error(std::string(op) + ": device allocation failed (Metal)");
+
+            struct { std::uint32_t n, n_preds, n_pays, n_groups; } u{
+                static_cast<std::uint32_t>(n), static_cast<std::uint32_t>(n_preds),
+                static_cast<std::uint32_t>(n_pays), n_groups};
+
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            [ce setComputePipelineState:ps_gagg_masked_];
+            for (std::size_t i = 0; i < kGaggLanes; ++i) {
+                const bool have = i < lane.size();
+                [ce setBuffer:(have ? lane[i]->buffer() : gbx_dummy_valid_) offset:0 atIndex:2 * i];
+                id<MTLBuffer> vb = (have && lane[i]->valid_buffer()) ? lane[i]->valid_buffer() : gbx_dummy_valid_;
+                [ce setBuffer:vb offset:0 atIndex:2 * i + 1];
+            }
+            [ce setBuffer:meta_b offset:0 atIndex:24];
+            [ce setBuffer:prog_b offset:0 atIndex:25];
+            [ce setBuffer:list_b offset:0 atIndex:26];
+            [ce setBuffer:pay_b  offset:0 atIndex:27];
+            [ce setBytes:&u length:sizeof(u) atIndex:28];
+            [ce setBuffer:gagg_out_ offset:0 atIndex:29];
+            [ce dispatchThreadgroups:MTLSizeMake(ntg, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            r.kernel_ms = cb_kernel_ms(cb);
+            if (trace_exact_)
+                std::fprintf(stderr, "[gpudb metal exact] global agg: %.3f ms (rows=%zu preds=%zu pays=%zu lanes=%zu)\n",
+                             r.kernel_ms, n, n_preds, n_pays, lane.size());
+
+            // ---- merge the per-(threadgroup, group) blocks; one group today ----
+            const auto* out = static_cast<const std::int64_t*>([gagg_out_ contents]);
+            std::vector<Sum128> s(n_pays);
+            std::vector<std::int64_t> mn(n_pays, std::numeric_limits<std::int64_t>::max());
+            std::vector<std::int64_t> mx(n_pays, std::numeric_limits<std::int64_t>::min());
+            for (NSUInteger b = 0; b < ntg; ++b) {
+                const std::int64_t* blk = out + static_cast<std::size_t>(b) * n_groups * stride;
+                r.count_star += blk[0];
+                for (std::size_t p = 0; p < n_pays; ++p) {
+                    const std::int64_t* t = blk + 1 + 5 * p;
+                    const std::uint64_t old = s[p].lo;
+                    s[p].lo += static_cast<std::uint64_t>(t[0]);
+                    s[p].hi += t[1] + (s[p].lo < old ? 1 : 0);
+                    r.counts[p] += t[2];
+                    if (t[3] < mn[p]) mn[p] = t[3];
+                    if (t[4] > mx[p]) mx[p] = t[4];
+                }
+            }
+            for (std::size_t p = 0; p < n_pays; ++p) {
+                r.sums[p] = static_cast<std::int64_t>(s[p].lo);
+                r.sums_hi[p] = s[p].hi;
+                r.mins[p] = r.counts[p] ? mn[p] : 0;
+                r.maxs[p] = r.counts[p] ? mx[p] : 0;
+            }
+            r.wall_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_wall0).count();
+            return r;
+        }
+    }
+
     // The exact GROUP BY, plain or masked (§4.1, §4.2, §4.6).
     // The NULL-key group: rows [from, to) of the key-partitioned set, under the
     // mask. Folded on the host (unified memory). A LEFT JOIN can put most of a
@@ -3077,6 +3249,7 @@ private:
     id<MTLComputePipelineState> ps_gbx_topk_counts_       = nil;
     id<MTLComputePipelineState> ps_gbx_topk_compact_      = nil;
     id<MTLComputePipelineState> ps_gbx_mask_              = nil;
+    id<MTLComputePipelineState> ps_gagg_masked_           = nil;
     id<MTLComputePipelineState> ps_gbxm_chunk_            = nil;
     id<MTLComputePipelineState> ps_gbxm_finalize_         = nil;
     id<MTLComputePipelineState> ps_gbx_sel_counts_        = nil;
@@ -3099,6 +3272,7 @@ private:
     // lists, 6-long masked partials, and the compacted sorted keys /
     // permutation of variant (b).
     id<MTLBuffer> gbx_mask_buf_ = nil, gbx_list_buf_ = nil;
+    id<MTLBuffer> gagg_out_ = nil;          // §4.12 global aggregate partials
     // join_materialize scratch (match row, class, destination per probe row; the uniqueness flag)
     id<MTLBuffer> jm_match_ = nil, jm_cls_ = nil, jm_pos_buf_ = nil, jm_flag_ = nil;
     std::vector<std::vector<id<MTLBuffer>>> gbx_e_;   // §4.9: per extra payload, lo hi cnt cstar mn mx keys

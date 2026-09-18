@@ -212,12 +212,21 @@ built. The numbers are in BENCHMARK.md.
   — a gather cannot widen a lane's range, so each output lane keeps its
   source's width. The result is still a copy; that is stage D.
 
-**The wrapper's estimate is now an over-estimate.** `estimate_set_bytes` still
-charges 8 bytes per row and lane, so the budget admits a set on a figure that
-can be three times what the set costs. Nothing is wrong — the budget is
-conservative, never optimistic — but a table that would now fit can still be
-refused. Sizing the estimate from the column's type (what the store knows
-before the upload) belongs with stage D, where a set stops being a copy at all.
+**The wrapper's estimate sizes lanes from their type (2026-09-18).** The
+backend chooses a lane's width from the values, which the wrapper cannot know
+before the upload; the column's DuckDB type bounds it, and that is what
+`estimate_set_bytes` now charges where the build reports `narrow=true`
+(`gpu_build_info()`, from `Aggregator::narrow_lanes()`): BOOLEAN / TINYINT 1,
+SMALLINT 2, INTEGER / DATE 4, everything else — BIGINT, DECIMAL images, computed
+lanes, string hashes — 8, plus the validity bit per row and lane, plus the key
+lane's sort cache (the key's width and a u32 row id per row) when that lane is
+the one being uploaded, plus one row-sized scratch lane. It stays an UPPER bound,
+which is what the admission rule needs, and the wrapper test that asserts the
+estimate never falls below what `gpu_residents()` / `gpu_store_columns()` report
+covers a narrow-typed table (INTEGER key, DATE, SMALLINT) as well as a BIGINT
+one. On a backend without narrow lanes — CUDA, the CPU reference — every lane is
+charged 8 as before. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
+§4.12) is charged no sort cache.
 
 ## 7. Stage D — joins as index vectors
 

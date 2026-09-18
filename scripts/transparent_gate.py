@@ -88,7 +88,7 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     if form == "nested":
         return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({PAYLOAD}) AS q{more} "
                 f"FROM {source}{w} GROUP BY {key} HAVING sum({PAYLOAD}) > {having_thr}) gpudb_x")
-    if form == "global":          # no GROUP BY (§4.12); only swept over joins
+    if form == "global":          # no GROUP BY (§4.12): the global masked aggregate
         return f"SELECT sum({PAYLOAD}) AS q, count(*){more} FROM {source}{w}"
     if form == "projected":
         return (f"SELECT {key}, sum({PAYLOAD}) / count(*) AS mean{more} FROM {source}{w} GROUP BY {key} "
@@ -204,7 +204,9 @@ def main() -> int:
         ).fetchone()[0]
         thr_s = f"{thr:.2f}" if thr is not None else "0"
         if True:
-            for form in FORMS + (("global",) if label else ()):
+            # the global form (§4.12) reads no key, so over a single table one
+            # cell per (source, WHERE) is the whole sweep — it rides on the first key
+            for form in FORMS + (("global",) if (label or key == keys[0]) else ()):
                 sql = build(key, where, form, thr_s, source, args.payloads)
                 # native
                 con.transparent = False

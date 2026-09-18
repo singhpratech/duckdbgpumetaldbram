@@ -98,9 +98,10 @@ GROUP BY k1 [, k2, k3]
   wrapper). RIGHT / FULL / semi / anti joins, cross products, subqueries as
   join inputs and joins whose result is more than four times the largest
   table run native.
-- No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is accepted
-  over a join (§4.12); on a single table native's filter-and-sum wins and the
-  statement is left alone.
+- No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is its own
+  device operator, a single fused pass with no key (§4.12): accepted over a
+  join at any size, and over a single table above a measured row and
+  predicate-term bound.
 - Payloads: integer family, DECIMAL (§4.3); DATE / TIMESTAMP for `min`, `max`
   and `count` (days / microseconds on the device, typed on the way out).
   `count(DISTINCT x)`, one DISTINCT column per statement (§4.17).
@@ -621,20 +622,60 @@ DISTINCT / FILTER aggregates, windows, subqueries, a bare column that is not
 a group key.
 
 ### 4.12 Aggregates without GROUP BY
-`SELECT sum(x), count(*) FROM a JOIN b … WHERE …` has one group. The split of
-§4.11 handles it: the inner statement groups by a constant computed key (`(c
-IS NULL AND c IS NOT NULL)` over any column of the statement — FALSE on every
-row, never NULL), the outer statement selects the aggregates. One difference
-from a GROUP BY matters: over an empty input native returns ONE row (NULL
-sums, zero counts), a GROUP BY returns none. The outer statement is therefore
-`FROM (SELECT 1) LEFT JOIN (<inner>) ON true` with `coalesce(count, 0)`, and
-a HAVING always filters in the outer statement (no row in, no row out).
-Measured before building it: on a single table native wins this shape (TPC-H
-Q6: 2.0 ms native vs 2.9 ms at SF1, 17 vs 25 ms at SF10 — a vectorised filter
-and sum is memory-bandwidth-optimal on the CPU, while the device evaluates
-five predicate passes), so the wrapper's fast path only parses a GROUP-BY-less
-aggregate when the statement joins, and the single-table case stays native by
-the `min_groups` bound. Over a join: 1.3–3.4× at SF1.
+`SELECT sum(x), count(*) FROM a [JOIN b …] WHERE …` has one group — TPC-H Q6's
+shape. It is not a GROUP BY with a constant key: there is no key at all, so
+there is nothing to sort, nothing to permute and no sort cache to build. The
+operator is `Aggregator::aggregate_exact_masked(pays, n_pays, preds, n_preds)`,
+ONE pass over the rows in storage order: each thread evaluates the whole `WHERE`
+program for its row on the (narrow) predicate lanes, folds the surviving row
+into its payload accumulators — 128-bit sum, count, min, max per payload, plus
+the shared `count(*)` — and the threadgroup reduces them into one partial block
+that the host merges. `global_supported()` is its rule-1 gate, as
+`exact_supported()` is the exact GROUP BY's. Semantics are exactly one group of
+`groupby_exact_masked_multi`: a row failing the mask takes part in nothing
+including `count(*)`, a NULL payload cell is skipped by the aggregates and
+counted by `count(*)`, a payload with count 0 gives NULL sum / min / max / avg —
+which is what native returns over an empty input, so the operator's single row
+IS native's answer however selective the `WHERE` is.
+
+SQL: `gpu_agg_exact_global(name, program, payloads)` → `count_star`, then per
+payload `sum<p> HUGEINT, count<p>, min<p>, max<p>, avg<p> DOUBLE`; `payloads` is
+`'v, i0, i2'` as §4.9 spells it, or `''` for `count(*)` alone; the `program` is
+the WHERE program of §4.6. Projection pushdown skips the payload columns the
+statement does not read. A set only global statements use carries the tag extra
+`global` and writes lane 0 as `-`: the store view synthesised for it has no key
+column, so neither `acquire()` nor the wrapper's `gpu_prepare_resident` post-step
+sorts a 60M-row lane for nothing. Over a join the set is the join's materialised
+result, whose lane 0 is an ordinary lane — it stays, and no operator reads it as
+a key.
+
+The statement still goes through the split of §4.11: the inner statement is the
+aggregate, the outer selects it, and because a global aggregate's HAVING filters
+one row it always sits in the outer statement (no row in, no row out). The outer
+form is `FROM (SELECT 1) LEFT JOIN (<inner>) ON true` with `coalesce(count, 0)`,
+which is now belt and braces — the operator returns its row whatever happens —
+and costs nothing. The C++ statement rewriter has no global form (it matches a
+GROUP BY), so a global plan is rendered by the reference renderer alone.
+
+Thresholds. One row out means no output-size risk at all; what decides is how
+much work native does per row, because a vectorised filter-and-sum is
+memory-bandwidth-optimal on the CPU. Measured on `lineitem` slices of 3M to 60M
+rows (M4 Max, warm, minimum of nine): the device wins from about
+`rows × (1 + WHERE terms, counting at most three) = 60M` and nowhere below it —
+20M × 3 terms 1.39×, 30M × 1 term 1.66×, 60M × 0 terms 1.42×, 60M × 5 terms
+(Q6) 2.48× — while 10M × 3 terms 0.93×, 10M × 5 terms 0.97×, 20M × 1 term 0.99×
+and 30M × 0 terms 0.99× all lose. `_thresholds.py` takes that bound with a row
+floor of 16M under it, so TPC-H Q6 runs on the device at SF10 (15.0 ms native,
+6.1 ms transparent, kernel 5.6 ms) and stays native at SF1, where `lineitem` is
+6M rows and the two sides measure within noise of each other. Over a join the
+comparison is against native's join rather than its scan and the device wins
+from SF1 on — 3.9–7.1× at SF1, 10.5–17.7× at SF10 — so there is no floor there.
+
+History: before this operator the shape was forced through the GROUP BY
+machinery as a constant key, which built a sort cache and gathered a permutation
+for one group and measured 2.9 ms against native's 2.0 at SF1 and 25 against 17
+at SF10 — which is why the wrapper's fast path used to skip single-table
+statements without a GROUP BY altogether.
 
 ### 4.13 Joins the device operator cannot express: upload the join's result
 §4.8 covers joins that are "fact rows with dimension columns attached". A
@@ -1121,10 +1162,20 @@ same database — the extension stays free of threads and hidden connections
   through `gpu_build_info()`, a discrete GPU gets the smaller of 25% of host
   memory and 8 GiB). Implemented in the wrapper (`_residency._make_room`),
   with the extension as the source of truth:
-  - *Before an upload* the set's cost is estimated as `rows × (8 × lanes +
-    16) + rows × lanes / 8`: 8 bytes per row and lane, a validity bit, and the
-    two row-sized scratch lanes the exact operators keep. Measured against
-    `gpu_residents().bytes`: within 1% on four shapes. An uploaded join counts
+  - *Before an upload* the set's cost is estimated as `rows × (Σ lane widths +
+    key width + 4 + 8) + rows × lanes / 8`: an upper bound on each lane from
+    the DuckDB type of the column it holds (BOOLEAN / TINYINT 1, SMALLINT 2,
+    INTEGER / DATE 4, everything else 8 — a backend stores a lane at the
+    narrowest width its values fit and the wrapper cannot know that before the
+    upload, `docs/RESIDENT_COLUMNS_DESIGN.md` §6), a validity bit per row and
+    lane, the key lane's sort cache (its width plus a u32 row id) when that
+    lane is the one being uploaded, and one row-sized scratch lane. On a
+    backend that does not store lanes narrow (`gpu_build_info()` says
+    `narrow=false`) every lane is charged 8; a set with no key (§4.12) is
+    charged no sort cache. It is an UPPER bound by construction — that is what
+    the admission rule needs — and a wrapper test pins it against what
+    `gpu_residents()` / `gpu_store_columns()` report afterwards, on a BIGINT
+    table and on a narrow-typed one. An uploaded join counts
     its result rows, a device join at most its probe table's.
   - *What is resident and what it costs* comes from `gpu_residents()`
     (`bytes` includes derived structures). Sets uploaded by hand count toward

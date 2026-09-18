@@ -1,0 +1,79 @@
+# gpu_agg_exact_global SQL test — aggregates without GROUP BY under a WHERE,
+# one fused device pass (v0.7, docs/TRANSPARENT_DESIGN.md §4.12):
+#   gpu_agg_exact_global(name, program, payloads)
+#     -> count_star, then per payload p: sum<p> HUGEINT, count<p>, min<p>, max<p>, avg<p> DOUBLE
+#   payloads: 'v, i0, ...' (v or a BIGINT predicate lane); '' = count(*) only
+# It returns exactly ONE row whatever the WHERE keeps — an empty input gives
+# count_star 0, counts 0 and NULL sums / min / max / avg, which is native's
+# answer for an aggregate without GROUP BY.
+# Parity is checked IN-PROCESS against native, both EXCEPT directions.
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_agg_exact_global
+
+-- 1. Hand fixture: NULL payload cells, an all-NULL payload, count(*) over every row
+-- setup: CREATE TABLE g AS SELECT * FROM (VALUES (1,10,100,5),(1,NULL,200,NULL),(2,NULL,NULL,7),(2,NULL,50,8),(3,3,NULL,1),(3,4,9,NULL)) t(k,a,b,c)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [b, c], []) FROM g
+SELECT count_star, sum0, count0, min0, max0, sum1, count1, avg2 FROM gpu_agg_exact_global('g', '', 'v, i0, i1');
+-- expect: 6  17  3  3  10  359  4  5.25
+
+-- 2. The WHERE keeps nothing: one row, zero counts, NULL sums (native's empty-input answer)
+-- setup: CREATE TABLE g AS SELECT * FROM (VALUES (1,10,100,5),(1,NULL,200,NULL),(2,NULL,NULL,7)) t(k,a,b,c)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [b, c], []) FROM g
+SELECT count_star, sum0, count0, min0, max0, avg0 FROM gpu_agg_exact_global('g', 'i0 > 100000', 'v');
+-- expect: 0  NULL  0  NULL  NULL  NULL
+
+-- 3. Every payload cell NULL: count(*) counts the rows, the payload aggregates are NULL
+-- setup: CREATE TABLE g AS SELECT CAST(i AS BIGINT) AS k, CAST(NULL AS BIGINT) AS a FROM range(50) t(i)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [], []) FROM g
+SELECT count_star, sum0, count0, min0, avg0 FROM gpu_agg_exact_global('g', '', 'v');
+-- expect: 50  NULL  0  NULL  NULL
+
+-- 4. Random parity against native, 300k rows, 3 payloads, NULLs everywhere:
+--    no WHERE, a conjunction over an I64 and an F64 lane, IN, IS NULL / IS NOT NULL,
+--    every comparison operator, and count(*) with no payload at all
+-- setup: SELECT setseed(0.31)
+-- setup: CREATE TABLE r AS SELECT CASE WHEN random() < 0.02 THEN NULL ELSE CAST(floor(random()*4000) AS BIGINT) END AS k, CASE WHEN random() < 0.05 THEN NULL ELSE CAST(floor((random()-0.5)*9e18) AS BIGINT) END AS a, CASE WHEN random() < 0.30 THEN NULL ELSE CAST(floor(random()*1000) AS BIGINT) END AS b, CASE WHEN random() < 0.01 THEN NULL ELSE CAST(floor((random()-0.5)*2e6) AS BIGINT) END AS c, random() AS x FROM range(300000)
+-- setup: SELECT gpu_upload_rows_exact('r', k, a, [b, c], [x]) FROM r
+SELECT (SELECT count(*) FROM ((SELECT count_star, sum0, count0, min0, max0, avg0, sum1, count1, min1, max1, avg1, sum2, count2, min2, max2, avg2 FROM gpu_agg_exact_global('r', '', 'v,i0,i1')) EXCEPT (SELECT count(*), sum(a), count(a), min(a), max(a), avg(a), sum(b), count(b), min(b), max(b), avg(b), sum(c), count(c), min(c), max(c), avg(c) FROM r))) AS plain, (SELECT count(*) FROM ((SELECT count_star, sum0, sum2, count1 FROM gpu_agg_exact_global('r', 'f0 < 0.3; i0 >= 100', 'v,i0,i1')) EXCEPT (SELECT count(*), sum(a), sum(c), count(b) FROM r WHERE x < 0.3 AND b >= 100))) AS conj, (SELECT count(*) FROM ((SELECT count_star, sum0 FROM gpu_agg_exact_global('r', 'i0 in (1, 2, 500, 999)', 'v')) EXCEPT (SELECT count(*), sum(a) FROM r WHERE b IN (1, 2, 500, 999)))) AS in_list, (SELECT count(*) FROM ((SELECT count_star, sum0, count0 FROM gpu_agg_exact_global('r', 'i0 is null', 'v')) EXCEPT (SELECT count(*), sum(a), count(a) FROM r WHERE b IS NULL))) AS is_null, (SELECT count(*) FROM ((SELECT count_star, sum0 FROM gpu_agg_exact_global('r', 'i0 is not null; k > 2000; i1 <= 0; f0 != 2.0; i0 < 900', 'v')) EXCEPT (SELECT count(*), sum(a) FROM r WHERE b IS NOT NULL AND k > 2000 AND c <= 0 AND x <> 2.0 AND b < 900))) AS mixed, (SELECT count_star FROM gpu_agg_exact_global('r', 'f0 >= 0.5', '')) - (SELECT count(*) FROM r WHERE x >= 0.5) AS count_only;
+-- expect: 0  0  0  0  0  0
+
+-- 5. 128-bit sums: the total overflows 64 bits, both limbs must be native's
+-- setup: CREATE TABLE h AS SELECT CAST(i AS BIGINT) AS k, CAST(4611686018427387904 AS BIGINT) AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('h', k, a, [], []) FROM h
+SELECT (SELECT count(*) FROM ((SELECT sum0, count0 FROM gpu_agg_exact_global('h', '', 'v')) EXCEPT (SELECT sum(a), count(a) FROM h))) AS diff, (SELECT sum0 FROM gpu_agg_exact_global('h', '', 'v')) AS total;
+-- expect: 0  461168601842738790400
+
+-- 6. Projection pushdown: reading only count_star still answers, and only the
+--    payload columns asked for come back
+-- setup: CREATE TABLE g AS SELECT CAST(i AS BIGINT) AS k, CAST(i AS BIGINT) AS a, CAST(i % 7 AS BIGINT) AS b FROM range(1000) t(i)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [b], []) FROM g
+SELECT (SELECT count_star FROM gpu_agg_exact_global('g', 'i0 = 3', 'v, i0')) AS kept, (SELECT max1 FROM gpu_agg_exact_global('g', 'i0 = 3', 'v, i0')) AS only_max;
+-- expect: 143  3
+
+-- 7. A DOUBLE lane is not a payload
+-- setup: CREATE TABLE g AS SELECT i % 5 AS k, i AS a, i / 3.0 AS x FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [], [x]) FROM g
+-- expected_fail: must be v or i<n>
+SELECT * FROM gpu_agg_exact_global('g', '', 'v, f0');
+
+-- 8. A payload lane the set does not have
+-- setup: CREATE TABLE g AS SELECT i % 5 AS k, i AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [], []) FROM g
+-- expected_fail: BIGINT predicate column
+SELECT * FROM gpu_agg_exact_global('g', '', 'v, i0');
+
+-- 9. A malformed WHERE program names the grammar
+-- setup: CREATE TABLE g AS SELECT i % 5 AS k, i AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_rows_exact('g', k, a, [], []) FROM g
+-- expected_fail: WHERE program
+SELECT * FROM gpu_agg_exact_global('g', 'v ?? 3', 'v');
+
+-- 10. A set that is not exact
+-- setup: CREATE TABLE g AS SELECT i % 5 AS k, i AS a FROM range(100) t(i)
+-- setup: SELECT gpu_upload_pair('g', k, a) FROM g
+-- expected_fail: is not an exact set
+SELECT * FROM gpu_agg_exact_global('g', '', 'v');
+
+-- 11. The build reports the capability
+SELECT gpu_build_info() LIKE '%global=true%' AS has_global;
+-- expect: true

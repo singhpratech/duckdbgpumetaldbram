@@ -87,6 +87,11 @@ struct ResidentSet {
     // store's columns, dictionaries and sort caches; it owns nothing.
     bool          view = false;
     std::string   store_key;
+    // v0.7 §4.12: a set only global aggregates read (tag extra 'global', lane
+    // 0 written '-'). It has no GROUP BY key, so no sort cache is built for it
+    // — `keys` points at the first real lane purely so the set's invariants
+    // hold, and nothing reads it as a key.
+    bool          no_key = false;
     // gpu_join_materialize (v0.7 §4.8): the sets this one was derived from.
     // A derived set is stale as soon as a source is stale, dropped or
     // replaced (checked on every acquire, by identity).

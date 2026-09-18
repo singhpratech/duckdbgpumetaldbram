@@ -18,17 +18,22 @@ from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
-# an aggregate without GROUP BY is only worth parsing over a join (§4.12): on a
-# single table native's filter + sum wins (measured), so the fast path keeps it
+# an aggregate without GROUP BY (§4.12). Over a join it was always worth
+# parsing; over a SINGLE table it is worth parsing since the global masked
+# aggregate exists (one fused pass, no key, no sort cache) — on a build whose
+# backend reports that operator, which is what the wider regex is gated on.
 _GLOBAL_AGG_JOIN_RE = re.compile(
     r"\b(?:sum|count|min|max|avg)\s*\(.*\bFROM\b.*(?:\bJOIN\b|,)", re.IGNORECASE | re.DOTALL)
+_GLOBAL_AGG_RE = re.compile(
+    r"\b(?:sum|count|min|max|avg)\s*\(.*\bFROM\b", re.IGNORECASE | re.DOTALL)
 
 
 _SELECT_DISTINCT_RE = re.compile(r"\bSELECT\s+DISTINCT\b(?!\s+ON\b)", re.IGNORECASE)   # a GROUP BY in disguise (§4.21)
 
 
-def _maybe_aggregate(sql: str) -> bool:
-    return bool(_GROUP_BY_RE.search(sql) or _GLOBAL_AGG_JOIN_RE.search(sql) or _SELECT_DISTINCT_RE.search(sql))
+def _maybe_aggregate(sql: str, single_global: bool = False) -> bool:
+    glob = _GLOBAL_AGG_RE if single_global else _GLOBAL_AGG_JOIN_RE
+    return bool(_GROUP_BY_RE.search(sql) or glob.search(sql) or _SELECT_DISTINCT_RE.search(sql))
 _SELECT_START_RE = re.compile(r"^\s*(SELECT|FROM|VALUES)\b", re.IGNORECASE)
 _TABLE_REF_RE = re.compile(r'\bFROM\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)){0,2})', re.IGNORECASE)
 _MAX_STATEMENT_BYTES = 16 * 1024
@@ -90,12 +95,36 @@ def default_memory_budget(backend: str, device_bytes: int = 0) -> int:
     return min(quarter, device_bytes) if device_bytes > 0 else quarter
 
 
-def estimate_set_bytes(rows: int, lanes: int) -> int:
-    """What a resident set costs on the device: 8 bytes per row and lane, a
-    validity bit per row and lane, and two row-sized scratch lanes the exact
-    operators keep beside it (selection and run starts / sort permutation)."""
+# An UPPER bound on a lane's storage width, from the DuckDB type of the column
+# it holds (docs/RESIDENT_COLUMNS_DESIGN.md §6: since stage C a lane is stored
+# at the narrowest signed width its values fit, which the wrapper cannot know
+# before the upload — the type is what bounds it). A computed lane, a DECIMAL
+# image and a string hash fill the range and take 8.
+_LANE_WIDTH = {"BOOLEAN": 1, "TINYINT": 1, "UTINYINT": 1,
+               "SMALLINT": 2, "USMALLINT": 2,
+               "INTEGER": 4, "UINTEGER": 4, "DATE": 4}
+
+
+def lane_width(col_type: str) -> int:
+    return _LANE_WIDTH.get((col_type or "").upper(), 8)
+
+
+def estimate_set_bytes(rows: int, lanes: int, widths=None, key_width: int = 8) -> int:
+    """What a resident set costs on the device: the lanes, a validity bit per
+    row and lane, the key's sort cache (the sorted key plus a u32 row id per
+    row) and one row-sized scratch lane the exact operators keep beside it.
+    `widths` is the per-lane upper bound in bytes (see lane_width) and is only
+    passed on a backend that stores lanes narrow; without it every lane is
+    charged 8. `key_width` 0 = the set has no key (§4.12): no sort cache.
+    It must stay an UPPER bound — it is the budget's admission rule."""
     rows, lanes = max(0, int(rows)), max(1, int(lanes))
-    return rows * (8 * lanes + 16) + (rows * lanes) // 8 + (64 << 10)
+    if widths:
+        lanes = max(lanes, len(widths))
+        per = sum(max(1, int(w)) for w in widths)
+    else:
+        per = 8 * lanes
+    cache = (max(1, int(key_width)) + 4) if key_width else 0
+    return rows * (per + cache + 8) + (rows * lanes) // 8 + (64 << 10)
 
 
 def _tag_lanes(tag: str) -> int:
@@ -131,6 +160,11 @@ class Decision:
     store_key: str = ""                                   # stage B: the table store a single-table set is a view over
     store_lanes: List[str] = field(default_factory=list)  # ... and the lanes it reads there
     store_all: List[tuple] = field(default_factory=list)  # (name, sql, kind) of every lane, for the upload of missing ones
+    # §5.5 + docs/RESIDENT_COLUMNS_DESIGN.md §6: an upper bound on each store
+    # lane's storage width, from its DuckDB type, and which lane carries the
+    # sort cache ("" = none, §4.12). Only used where the backend stores narrow.
+    lane_widths: Dict[str, int] = field(default_factory=dict)
+    key_lane: str = ""
     base_rows: Dict[str, int] = field(default_factory=dict)   # ... and of each base set of a device join, by tag
     # measured rule 1 (§9.1): this statement's own native time, seen while it
     # was not resident yet, against its first rewritten runs
@@ -289,6 +323,11 @@ class Connection:
         self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
         self._join = self._exact and "join=true" in info     # ... and so does the materialised key join (§4.8)
         self._store = self._exact and "store=true" in info   # stage B: per-table column store (docs/RESIDENT_COLUMNS_DESIGN.md)
+        # §4.12: the global masked aggregate on the GPU side; it answers over a
+        # store view, so it needs the store too
+        self._global = self._exact and self._store and "global=true" in info
+        # stage C: lanes stored at their narrowest width — the memory estimate sizes them by type
+        self._narrow = "narrow=true" in info
         dm = re.search(r"device_memory=(\d+)", info)
         self._device_bytes = int(dm.group(1)) if dm else 0   # 0 = the backend does not report it (§5.5)
         try:
@@ -692,8 +731,9 @@ class Connection:
         if ";" not in query and _SELECT_START_RE.match(query):
             big = self._names_big_table(query)
             # a view stands for its definition: the aggregate may be inside it (§4.20)
-            if not big or (not _maybe_aggregate(query) and not self._names_view(query)):
-                self._last.reason = "threshold" if _maybe_aggregate(query) else "shape"
+            sg = getattr(self, "_global", False)
+            if not big or (not _maybe_aggregate(query, sg) and not self._names_view(query)):
+                self._last.reason = "threshold" if _maybe_aggregate(query, sg) else "shape"
                 return query
         stmts = _classify.split(self._raw, query)
         if stmts is None:
@@ -740,7 +780,7 @@ class Connection:
         if len(sql) > _MAX_STATEMENT_BYTES:
             self._last.reason = "too_long"
             return None
-        if not _maybe_aggregate(sql) and not self._names_view(sql):     # a view may hold the aggregate (§4.20)
+        if not _maybe_aggregate(sql, getattr(self, "_global", False)) and not self._names_view(sql):   # a view may hold the aggregate (§4.20)
             self._last.reason = "shape"
             return None
         out = self._rewrite_text(sql)
@@ -1077,9 +1117,15 @@ class Connection:
                 self._manager.note_candidate(b.tag, "", steps=[b.upload_sql])
             if d.store_key and d.join is None:
                 up_name, up_sql, missing = self._store_upload(d)
+                # the sort cache is charged only when the key lane itself is being
+                # uploaded: a lane already in the store carries its cache with it
+                narrow = getattr(self, "_narrow", False)
+                widths = [d.lane_widths.get(n, 8) for n in missing] if narrow and missing else None
+                kw = (d.lane_widths.get(d.key_lane, 8) if narrow else 8) if d.key_lane in missing else 0
                 st = self._manager.note_candidate(d.tag, up_sql, fqn=d.fqn,
                                                   deps=[b.tag for b in d.sentinels] or None,
-                                                  est_bytes=estimate_set_bytes(d.set_rows, max(1, len(missing))),
+                                                  est_bytes=estimate_set_bytes(d.set_rows, max(1, len(missing)),
+                                                                               widths, kw),
                                                   upload_name=up_name, store_key=d.store_key,
                                                   store_lanes=list(d.store_lanes),
                                                   post_sql=["SELECT gpu_prepare_resident('%s')" % d.tag.replace("'", "''")])
@@ -1401,7 +1447,7 @@ class Connection:
             return None
         if outer_sql.count(_split.PLACEHOLDER) != 1:
             return None
-        d = self._decide(inner_sql, allow_split=False, reagg=reagg)
+        d = self._decide(inner_sql, allow_split=False, reagg=reagg, global_agg=is_global)
         if not d.rewritten:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
             return Decision(False, d.reason)
@@ -1416,15 +1462,16 @@ class Connection:
             d.form = "projected"
         return d
 
-    def _decide(self, sql: str, allow_split: bool = True, reagg: bool = False) -> Decision:
+    def _decide(self, sql: str, allow_split: bool = True, reagg: bool = False,
+                global_agg: bool = False) -> Decision:
         """Device path first; a join it cannot express falls back to uploading
         the join's result (§4.13); expressions over aggregates fall back to the
         split (§4.11), whose inner statement comes back through here."""
-        d = self._decide_once(sql, "device", reagg)
+        d = self._decide_once(sql, "device", reagg, global_agg)
         if d.rewritten or d.reason != "shape" or not getattr(self, "_exact", False):
             return d
         if d.is_join and getattr(self, "_join", False):
-            du = self._decide_once(sql, "upload", reagg)
+            du = self._decide_once(sql, "upload", reagg, global_agg)
             if du.rewritten or du.reason != "shape":
                 return du
         if allow_split:
@@ -1433,15 +1480,19 @@ class Connection:
                 return ds
         return d
 
-    def _decide_once(self, sql: str, mode: str, reagg: bool = False) -> Decision:
-        d = self._decide_body(sql, mode, reagg)
+    def _decide_once(self, sql: str, mode: str, reagg: bool = False,
+                     global_agg: bool = False) -> Decision:
+        d = self._decide_body(sql, mode, reagg, global_agg)
         try:
             d.is_join = _join.is_join_statement(self._serialize(sql))
         except Exception:
             pass
         return d
 
-    def _decide_body(self, sql: str, mode: str, reagg: bool = False) -> Decision:
+    def _decide_body(self, sql: str, mode: str, reagg: bool = False,
+                     global_agg: bool = False) -> Decision:
+        if global_agg and not getattr(self, "_global", False):
+            return Decision(False, "backend")
         try:
             plan, low, computed = self._match(sql, mode)
         except _rewrite.Decline as e:
@@ -1576,15 +1627,18 @@ class Connection:
         # under a WHERE, the selectivity of THIS statement's literals (one
         # count(*) scan at decision time, cached with the template)
         if plan.exact and getattr(self, "_thresholds", True):
-            est = (stats.get(plan.key) or {}).get("approx_unique")
-            if len(plan.keys) > 1:
+            # §4.12: an aggregate without GROUP BY has exactly one group and no
+            # output-size risk, so neither the zone map nor the distinct-count
+            # scan says anything about it
+            est = 1 if global_agg else (stats.get(plan.key) or {}).get("approx_unique")
+            if not global_agg and len(plan.keys) > 1:
                 est = 1
                 for kc in plan.keys:
                     u = (stats.get(kc) or {}).get("approx_unique")
                     est = None if (u is None or est is None) else est * u
                 if est is not None:
                     est = min(est, nrows)
-            if est is None:
+            if est is None and not global_agg:
                 # no zone-map estimate (VARCHAR columns carry none): count the key's distinct
                 # values once — one scan per statement template
                 try:
@@ -1620,7 +1674,8 @@ class Connection:
                                          string_key=bool(plan.dict_key),
                                          limited=plan.limit is not None and plan.limit <= 10_000,
                                          computed_payloads=sum(1 for v in set(plan.vals) if v in computed),
-                                         reaggregated=reagg)
+                                         reaggregated=reagg, global_agg=global_agg, rows=nrows,
+                                         where_terms=len(plan.where))
             if not ok:
                 self._log(f"threshold: {why}")
                 return Decision(False, "threshold")
@@ -1632,10 +1687,16 @@ class Connection:
         except Exception as e:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
+        if global_agg:
+            # §4.12: from here the plan has no GROUP BY. Over a single table the
+            # key lane goes with it (nothing uploads or sorts it); over a join the
+            # set is the join's materialised result, whose lane 0 stays — no
+            # operator ever reads it as a key.
+            _rewrite.make_global(plan, keep_key=low is not None)
         q = (lambda c: computed[c].sql if c in computed else f'"{c}"')   # noqa: E731
         if low is None:
             try:
-                plan.tag = ident.tag(plan.upload_columns)
+                plan.tag = ident.tag(plan.upload_columns) + (":global" if plan.no_key else "")
             except ValueError:
                 return Decision(False, "shape")
             d = Decision(True, "", plan=plan, fqn=ident.fqn, tag=plan.tag,
@@ -1644,6 +1705,16 @@ class Connection:
             if getattr(self, "_store", False):
                 # stage B: the set is a view over the table's store; only lanes the store lacks are uploaded
                 lanes = _rewrite.store_lanes(plan, q)
+                # a lane that is a plain column is stored at most as wide as its type;
+                # a computed lane, a packed or dictionary key and a DECIMAL image take 8
+                if len(plan.keys) == 1 and plan.keys[0] not in computed and plan.key_types:
+                    d.lane_widths[plan.key_field] = lane_width(plan.key_types[0])
+                if plan.val and plan.val not in computed:
+                    d.lane_widths[plan.val] = lane_width(plan.val_types.get(plan.val, plan.val_type))
+                for c in plan.pred_cols:
+                    if c not in computed:
+                        d.lane_widths[c] = lane_width(plan.pred_types.get(c, ""))
+                d.key_lane = "" if plan.no_key else (("k#" + plan.key_field) if plan.dict_key else plan.key_field)
                 d.store_key = f"gpudb:v1:{ident.catalog}:{ident.schema}:{ident.table}:{ident.oid}"
                 d.store_lanes = [l[0] for l in lanes]
                 d.store_all = lanes
@@ -1689,7 +1760,10 @@ class Connection:
             else:
                 d.sentinels = sent
                 plan.guards = [(plan.tag, ident.fqn)] + [(b.tag, b.fqn) for b in sent]
-        if self._has_rewrite_scalar:
+        # §4.12: the C++ statement rewriter has no global form — it matches a
+        # GROUP BY and nothing else — so a global plan is rendered by the
+        # reference renderer alone, as the split's outer statement already is.
+        if self._has_rewrite_scalar and not plan.global_agg:
             # The extension's pure scalar is the authority on the decision and
             # renders the statement for these literals; `ready` is passed as
             # true because residency is enforced here, not in the scalar, and

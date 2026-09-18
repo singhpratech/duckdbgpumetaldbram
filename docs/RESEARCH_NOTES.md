@@ -1272,6 +1272,92 @@ fill the 64-bit range and land at 8 by the same rule that narrows everything
 else. Join results are narrow but only as narrow as the lanes they gather from
 — they are still copies, 17.8 GiB of the 22.7, and that is stage D.
 
+## 2026-09-18 — One group is not a GROUP BY
+
+TPC-H Q6 is a sum and a count over `lineitem` under four predicates, and it was
+one of the queries the transparent path would not touch. Not because anything
+about it is hard — because the only operator that could answer it was the
+GROUP BY, and to use a GROUP BY you need a key. The split (§4.11/§4.12) supplied
+one: `(c IS NULL AND c IS NOT NULL)`, false on every row, never NULL. Correct,
+and expensive in a way that has nothing to do with the query. The key is a lane
+of 60M zeros; the operator sorts it, builds a permutation, gathers the payload
+through the permutation, finds one run start and reduces one segment. At SF10
+that measured 25 ms against native's 17, kernel 23.2. Which is why the wrapper's
+fast path did not even parse a single-table statement without a `GROUP BY`: the
+machinery it would have been handed to was the wrong machinery.
+
+The operator this shape wants has no key in it anywhere. Per row: evaluate the
+whole `WHERE` program, and if the row survives, fold it into the accumulators.
+That is one pass, sequential over the lanes, and at SF10 it reads about 0.5 GB.
+`aggregate_exact_masked(pays, n_pays, preds, n_preds)` — a new optional method
+with a default that throws and a `global_supported()` gate beside
+`exact_supported()`, so the CUDA backend keeps building and answering unchanged
+until it opts in. Q6 at SF10: 15.0 ms native, 6.1 through the wrapper, kernel
+5.6. The two other shapes I measured came out at 1.42× (no `WHERE` at all) and
+2.81× (three terms, 1% kept); over a join, where native pays for the join too,
+10.5× and 17.7×.
+
+Two things in the kernel were worth being deliberate about, both because
+something else will want them.
+
+The predicate program is evaluated inside the reduce, once per row, as ONE
+reusable MSL function — `gpred_eval(lanes, prog, n_preds, lists, row)`, with the
+lane table (storage pointer, validity pointer, stage-C width, is-it-an-F64-image)
+built from the kernel's bindings and passed in `thread` space. The existing
+GROUP BY mask does the opposite: one kernel dispatch per predicate, each writing
+a byte per row into a mask buffer the next pass reads back. At SF10 that mask
+stage is 19.7 ms of Q12's ~23 ms kernel. Nothing in this PR touches it, but the
+function it would need now exists and is pinned by tests.
+
+The accumulators are indexed `[group * n_pays + payload]` and the partials
+buffer holds one block per `(threadgroup, group)` — `{count_star, then n_pays
+tuples of (lo, hi, cnt, mn, mx)}` — with `n_groups` a uniform that is 1 today.
+Writing it that way cost nothing and means a later few-group variant (a direct,
+row-order reduce over a narrow group-id lane, no sort cache) changes one index
+and the host merge loop, not the kernel's shape.
+
+The lanes are bound one buffer pair each — data and validity — which caps a
+statement at 12 distinct lanes; payloads and predicate columns share slots, so
+Q6 uses four. Above that the operator throws and the SQL layer runs native. The
+alternative was an argument buffer holding GPU addresses; twelve slots covers
+every shape in the suite and the gate, so the simpler thing won again.
+
+What took the longest was not the kernel. It was making a set that has no key.
+`view_from_store_locked` synthesises a `ResidentSet` from the table's store, and
+a `ResidentSet` has a key column — the operators want one, the sort cache hangs
+off it, `acquire()` prepares it on first use. A global statement's tag now writes
+lane 0 as `-` and carries the extra `global`; the view marks itself `no_key`,
+points `keys` at the first real lane so the invariants hold, and neither
+`acquire()` nor `gpu_prepare_resident` sorts anything. Over a join the set is the
+join's materialised result, whose lane 0 is an ordinary lane — it stays, and
+nothing reads it as a key. That asymmetry is honest: the join result is a copy
+either way (stage D), and removing its first lane would have bought nothing.
+
+The threshold is the part I would have got wrong by guessing. A vectorised
+filter-and-sum is memory-bandwidth-optimal on the CPU, and there is no output to
+be bound by — one row. So the device's margin is entirely "how much work does
+native do per row", and the sweep says so plainly: on `lineitem` slices, no
+`WHERE` at all loses until 60M rows, one predicate until 30M, three predicates
+until 15M, and below 10M nothing wins at any predicate count. The rule that fits
+every measured cell is `rows × (1 + terms, counting at most three) ≥ 60M`, with a
+16M row floor under it so the one cell inside the noise stays native. TPC-H Q6
+therefore runs on the device at SF10 and stays native at SF1, where `lineitem` is
+6M rows and the two sides measure within noise of each other. I would rather lose
+that 1.1× than claim it.
+
+A second, smaller thing rode along. Since stage C a lane is stored at the
+narrowest width its values fit, and the wrapper's pre-upload estimate still
+charged 8 bytes a row and lane — an over-estimate by up to 3×, listed as an open
+question two entries ago. The wrapper cannot know the width before the upload,
+but the column's DuckDB type bounds it: 1 byte for BOOLEAN and TINYINT, 2 for
+SMALLINT, 4 for INTEGER and DATE, 8 for everything else including computed
+lanes, DECIMAL images and string hashes. Plus the validity bit, plus the key
+lane's sort cache when that lane is the one being uploaded, plus one scratch
+lane. It stays an upper bound, which is the only property the admission rule
+needs, and the backend says whether it applies at all (`narrow=true` in
+`gpu_build_info()`, from `Aggregator::narrow_lanes()`; CUDA and the CPU reference
+keep 8).
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1286,14 +1372,22 @@ else. Join results are narrow but only as narrow as the lanes they gather from
 - **Other client languages**: the join / expression / split lowering lives in
   the Python wrapper; the pure rewrite function is language-neutral.
 - **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
-  TPC-H queries at SF10 became 22.7. What is left open is CUDA (the same choice
-  as a template parameter, `docs/CUDA_EXACT_PATH.md` §6) and the wrapper's
-  pre-upload estimate, which still charges 8 bytes a row and lane and is now an
-  over-estimate by up to 3×.
+  TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
+  each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
+  same choice as a template parameter, `docs/CUDA_EXACT_PATH.md` §6).
 - **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel
   time in `gpu_last_stats`) could re-check at once instead of on the clock.
+- **The GROUP BY mask stage**: `gbx_mask_i64` runs one kernel dispatch per
+  predicate and writes a byte a row that the next pass reads back — 19.7 ms of
+  Q12's ~23 ms kernel at SF10. The global aggregate (§4.12) evaluates the whole
+  program per row in one pass through `gpred_eval`, a function written to be
+  called from anywhere; switching the mask stage to it is the obvious next move.
+- **Few-group keys without a sort cache**: a direct row-order reduce over a
+  narrow group-id lane would reuse the global aggregate's predicate evaluation,
+  128-bit partials and merge unchanged — the accumulators are already indexed
+  `[group × payloads + payload]` with one group.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client; an Arrow-native
   result path would move the plain-form bounds.

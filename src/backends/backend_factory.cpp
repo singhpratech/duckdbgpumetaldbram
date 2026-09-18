@@ -84,6 +84,12 @@ GroupByResidentResult Aggregator::groupby_exact_masked_resident(const ResidentCo
     throw std::runtime_error("groupby_exact_masked_resident: not implemented on this backend");
 }
 
+// v0.7 §4.12: the global masked aggregate — same opt-in rule.
+GlobalAggResult Aggregator::aggregate_exact_masked(const MultiPayload*, std::size_t,
+                                                   const Predicate*, std::size_t) {
+    throw std::runtime_error("aggregate_exact_masked: not implemented on this backend");
+}
+
 std::vector<GroupByResidentResult> Aggregator::groupby_exact_masked_multi(
     const ResidentColumn& keys, const MultiPayload* pays, std::size_t n_pays, std::size_t filter_payload,
     const Predicate* preds, std::size_t n_preds, std::size_t max_groups, const GroupByFilter& filter) {
