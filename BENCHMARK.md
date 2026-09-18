@@ -4152,6 +4152,66 @@ are and the run-time measured rule 1 keeps deciding these shapes. The only
 rows below 1.0× in that sweep are the global-aggregate form at SF1, which its
 own rule (`rows × (1 + terms) ≥ 60M`) already declines.
 
+## v0.8 — shedding what the direct reduce made unnecessary, Metal, SF10 (2026-09-18)
+
+A key column with a group-id lane releases its sort cache, and a lane that is a
+GROUP BY key and nothing else releases the lane too (`key[row] =
+dkeys[gid[row]]` rebuilds it); a set only global aggregates read carries no key
+at all, over a join as well as over one table
+(`docs/RESIDENT_COLUMNS_DESIGN.md` §9). Apple M4 Max, the same script as the
+stage B and stage C sections (`residency="eager"`, `memory_budget="unlimited"`,
+the 22 TPC-H queries back to back on `data/tpch_sf10/tpch.duckdb`), `main` at
+b742f5d against the branch. 17 of 22 on the device on both, every answer
+identical to native on both.
+
+**Device memory after the 22 queries.**
+
+| | main | branch |
+|---|---:|---:|
+| store, 35–36 columns | 5.319 GiB | 4.042 GiB |
+| uploaded join results, 10 sets | 14.268 GiB | 11.531 GiB |
+| device join results, 3 sets | 3.885 GiB | 3.162 GiB |
+| views, sentinels | 0 | 0 |
+| **total resident** | **23.472 GiB** | **18.735 GiB** |
+
+−4.737 GiB, 20.2%. Per join-result set, bytes per row (rows out are 59,986,052
+except Q11's 8,000,000 and Q5's 2,398,579):
+
+| Q | set | main | branch | what left |
+|---|---|---:|---:|---|
+| 9 | `joinu-04b669f1…` | 26 | 6 | the 8-byte key lane and its 12-byte cache; the id lane costs 1 back |
+| 12 | `join-174ae33c…` | 27 | 15 | the cache only — the statement's WHERE reads `l_shipmode` as a value |
+| 8 | `joinu-242fbba5…` | 35 | 27 | the 2-byte year key and its 6-byte cache |
+| 17, 19 | `joinu-…` | 28 | 21 | the constant key (1) and its cache (5) — a global aggregate over a join |
+| 14 | `joinu-…` | 17 | 10 | as Q17 |
+| 11 | `join-…` | 19 | 12 | as Q17, on a device join |
+| 3, 10, 18, 21 | | 36, 34, 23, 40 | unchanged | 100k to 15M distinct keys: no id lane |
+| 7 | `joinu-5a0fc172…` | 27 | unchanged | 1250 distinct key tuples before the WHERE (4 groups come OUT) |
+| 5 | `joinu-d6c5cefa…` | 35 | unchanged | 2.4M rows, below the work rule |
+
+The store's 1.277 GiB is the sort caches of the `k#…` tuple-key columns, which
+the direct path stopped reading.
+
+**Time.** `scripts/tpch_coverage.py`, medians of two runs of 5, SF10 with
+`GPUDB_MEMORY_BUDGET_MB=200000`. No query is slower beyond the sub-5 ms noise
+band this file documents elsewhere: at SF10 the largest branch/main ratio is
+Q4 at 1.058× (2.6 → 2.8 ms) and every query above 10 ms is inside ±1%
+(Q3 21.2 → 21.4, Q7 19.1 → 19.7, Q10 21.5 → 21.4, Q12 10.4 → 10.4,
+Q18 11.1 → 11.1, Q21 32.5 → 32.5, Q1 14.4 → 14.3). At SF1 the largest is
+Q5 at 1.091× (1.1 → 1.2 ms) and the largest queries move the other way
+(Q21 5.4 → 4.8, Q13 2.3 → 1.8, Q18 1.9 → 1.7). 15 of 22 on the device at SF1,
+17 of 22 at SF10, every answer identical, on both sides.
+
+**Rebuilds.** `gpu_build_info()` reports `rebuilds=<caches>/<lanes>`, and
+`GPUDB_METAL_TRACE_EXACT=1` prints a line per rebuild. After the 22 queries at
+SF10 it is `0/0`, and after the SF1 and SF10 coverage runs `0/0` — no call
+wanted back anything that was shed. The shape sweep does find some: the gate
+with `--subqueries` rebuilds 3 key lanes and 4 sort caches over its 782 cells
+(6,001,215-row columns of 3, 21, 49 and 7 groups, 5.7 to 18.4 ms each), one per
+column per structure and never twice, and `--joins none`, `--no-single` and
+`--exprs` alone find none. The gate is still exit 0 with every rewritten cell at
+or above the bound.
+
 ## Probation — a soft threshold measured per process, Metal, SF1 (2026-09-18)
 
 **Hardware / build:** Apple M4 Max, macOS 26.6.2, `build-macos`

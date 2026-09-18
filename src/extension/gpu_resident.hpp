@@ -115,9 +115,13 @@ struct ResidentSet {
     std::mutex                 stats_mu;
     std::string                last_stats;   // per-set copy of gpu_last_stats()
 
+    // What the set's columns hold. A lane that stands in for another (a
+    // no-key set's `keys`, a count(*)-only set's `vals`) is the SAME column
+    // and is counted once.
     std::size_t resident_bytes() const noexcept {
-        std::size_t b = (keys ? keys->resident_bytes() : 0) + (vals ? vals->resident_bytes() : 0);
-        for (const auto& p : preds) if (p) b += p->resident_bytes();
+        std::size_t b = keys ? keys->resident_bytes() : 0;
+        if (vals && vals != keys) b += vals->resident_bytes();
+        for (const auto& p : preds) if (p && p != keys && p != vals) b += p->resident_bytes();
         return b;
     }
 };

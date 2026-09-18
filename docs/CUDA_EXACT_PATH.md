@@ -86,7 +86,7 @@ is being added.
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
 - `scripts/tpch_coverage.py` — the 22 TPC-H queries, SF1: expect 15 of 22 on the
-  device with identical rows (Metal); `--db data/tpch_sf10/tpch.duckdb` 16 of 22.
+  device with identical rows (Metal); `--db data/tpch_sf10/tpch.duckdb` (with `GPUDB_MEMORY_BUDGET_MB=200000`) 17 of 22.
 
 ## 4. Rule 1 on CUDA: measure, then set the thresholds
 
@@ -152,3 +152,23 @@ The proof is the same as for everything else here: the CPU reference stores I64,
 against it bit for bit over lanes that sit exactly on the I8 / I16 / I32
 boundaries and one past each, an all-NULL lane and a 64-bit hash lane, and reads
 the widths back through `resident_bytes()`.
+
+## 7. Shedding a derived structure is backend-private too (§9)
+
+A backend that keeps a group-id lane (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) may
+release the structures that lane makes unnecessary — the key's sort cache, and,
+for a lane the extension marks as a key and nothing else, the key lane itself,
+since `key[row] = dkeys[gid[row]]` rebuilds it. `gpu_backend.hpp` says nothing
+about any of this; what crosses the boundary is one note each way in
+`src/include/resident_shed_note.hpp`: the extension sets a bit mask of key-only
+lanes immediately before the upload call that creates them, and the backend
+counts the rebuilds it was forced into. CUDA is free to implement none of it —
+an unmarked lane and an empty counter are exactly today's behaviour — and if it
+does implement it, the rules it must keep are: never shed where the direct path
+is unavailable or where the dispatch rule would send this column's calls to the
+sort path at this row count; rebuild on demand behind the single accessor that
+returns the lane; pin what was rebuilt so a column pays at most one rebuild per
+structure; and let `resident_bytes()` follow, since that is what the budget
+reads. The parity proof is the ordinary one: `test/cpp/test_aggregator.cpp`'s
+shedding block runs every exact form over a shed column against the CPU
+reference, forces the sort path back onto it and compares again.

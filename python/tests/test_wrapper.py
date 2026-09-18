@@ -1681,6 +1681,52 @@ def run():
             check(got == want, f"join-upload {name}: rows identical to native ({len(want)} rows)")
             check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
                   f"join-upload {name}: names and types identical")
+        # §4.12 over a join (docs/RESIDENT_COLUMNS_DESIGN.md §9): an aggregate
+        # without GROUP BY keeps NO key lane over a join either — the tag
+        # writes lane 0 as '-', the set drops the key slot at publish and
+        # nothing sorts it. Same answer, fewer bytes per row than the same
+        # statement with a GROUP BY key, and the staleness guards unchanged.
+        # On a connection of its own: what this measures is two sets and the
+        # guards, not how the sixty sets above share a memory budget.
+        if getattr(con, "_global", False):
+            gcon = fresh()
+            gcon.execute(JOIN_SETUP)
+            gcases = {
+                "device join":   ("SELECT sum(v), count(*), min(amt), max(amt) FROM jf JOIN jd ON jf.did = jd.did WHERE tier > 1",
+                                  "SELECT tier, sum(v), count(*), min(amt), max(amt) FROM jf JOIN jd ON jf.did = jd.did WHERE tier > 1 GROUP BY tier ORDER BY tier"),
+                "uploaded join": ("SELECT sum(v * jd.nid), count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE score < 0.9",
+                                  "SELECT tier, sum(v * jd.nid), count(*) FROM jf JOIN jd ON jf.did = jd.did WHERE score < 0.9 GROUP BY tier ORDER BY tier"),
+            }
+            for name, (gsql, ksql) in gcases.items():
+                want = gcon._raw.execute(gsql).fetchall()
+                got = gcon.execute(gsql).fetchall()
+                lr = gcon.last_rewrite()
+                gtag = lr["tag"] or ""
+                check(lr["rewritten"] and got == want, f"join global {name}: rewritten, rows identical to native")
+                check(":-," in gtag, f"join global {name}: the set names no key lane ({gtag[-44:]})")
+                gcon.execute(ksql).fetchall()
+                ktag = gcon.last_rewrite()["tag"] or ""
+                rows = gcon._raw.execute(
+                    "SELECT name, rows, bytes FROM gpu_residents() WHERE name IN (?, ?)", [gtag, ktag]).fetchall()
+                b = {r[0]: (r[1], r[2]) for r in rows}
+                if gtag in b and ktag in b and b[gtag][0] and b[ktag][0]:
+                    gper = b[gtag][1] / b[gtag][0]
+                    kper = b[ktag][1] / b[ktag][0]
+                    check(gper < kper, f"join global {name}: the keyless set is smaller ({gper:.1f} vs {kper:.1f} B/row)")
+                else:
+                    check(False, f"join global {name}: both sets resident ({sorted(b)})")
+            # the guards still fire for a keyless set: a foreign write to a
+            # joined table falls back to native, and the set comes back
+            gsql = gcases["device join"][0]
+            gother = gcon._raw.cursor()
+            gother.execute("INSERT INTO jd VALUES (4997, 'west', 3, DATE '2020-03-03', 0.35, 2)")
+            got = gcon.execute(gsql).fetchall()
+            check(gcon.last_rewrite()["fallback"] and got == gcon._raw.execute(gsql).fetchall(),
+                  "join global: foreign write -> GPUDB_STALE fallback, native answer")
+            got = gcon.execute(gsql).fetchall()
+            check(gcon.last_rewrite()["rewritten"] and got == gcon._raw.execute(gsql).fetchall(),
+                  f"join global: resident again after the foreign write ({gcon.last_rewrite()['reason']})")
+            gcon.close()
         declines = {
             "full_join":    "SELECT tier, count(*) FROM jf FULL JOIN jd ON jf.did = jd.did GROUP BY tier",
             "non_equi":     "SELECT tier, count(*) FROM jf JOIN jd ON jf.did < jd.did WHERE jf.id < 300 GROUP BY tier",
