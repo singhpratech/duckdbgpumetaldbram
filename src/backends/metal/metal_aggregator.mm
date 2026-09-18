@@ -3629,18 +3629,17 @@ private:
         if (err) os << ": " << [[err localizedDescription] UTF8String];
         direct_ok_.store(false, std::memory_order_release);
         @autoreleasepool {
-            NSString* all[5] = {@"gdir_ids_i64", @"gdir_fill_ids", @"gdir_merge_i64",
-                                @"gdir_masked_8_i64", @"gdir_slab_i64"};
+            NSString* all[6] = {@"gdir_ids_i64", @"gdir_fill_ids", @"gdir_merge_i64",
+                                @"gdir_slab_i64", @"gdir_masked_8_i64", @"gdir_masked_32_i64"};
             std::string good, bad;
             for (NSString* n : all) {
                 if ([n isEqualToString:name]) continue;
                 bool ok = false;
-                if (!dir_refuses(n)) {
-                    if (id<MTLFunction> f = [lib_ newFunctionWithName:n]) {
-                        NSError* e = nil;
-                        ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
-                    }
+                if (id<MTLFunction> f = [lib_ newFunctionWithName:dir_probe_name(n)]) {
+                    NSError* e = nil;
+                    ok = [device_ newComputePipelineStateWithFunction:f error:&e] != nil;
                 }
+                if (ok && dir_refuses(n)) ok = false;
                 std::string& into = ok ? good : bad;
                 if (!into.empty()) into.append(", ");
                 into.append([n UTF8String]);
@@ -3666,14 +3665,24 @@ private:
         if (slot) return slot;
         if (!direct_ok_.load(std::memory_order_relaxed)) return nil;
         @autoreleasepool {
-            if (dir_refuses(name)) {                      // GPUDB_METAL_DIRECT_DISABLE_PSO
-                if (required) direct_unavailable_locked(name, nil);
-                return nil;
-            }
-            id<MTLFunction> fn = [lib_ newFunctionWithName:name];
-            if (!fn) { if (required) direct_unavailable_locked(name, nil); return nil; }
+            // Metal is always asked, so the failure handling below is the same
+            // code a real refusal runs; the knob discards the answer rather
+            // than short-circuiting ahead of it.
             NSError* err = nil;
-            id<MTLComputePipelineState> pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
+            id<MTLComputePipelineState> pso = nil;
+            id<MTLFunction> fn = [lib_ newFunctionWithName:dir_probe_name(name)];
+            if (!fn) {
+                err = [NSError errorWithDomain:@"gpudb" code:2
+                                      userInfo:@{NSLocalizedDescriptionKey: @"no such function"}];
+            } else {
+                pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
+            }
+            if (pso && dir_refuses(name)) {               // GPUDB_METAL_DIRECT_DISABLE_PSO
+                pso = nil;
+                err = [NSError errorWithDomain:@"gpudb" code:3
+                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                 @"refused by GPUDB_METAL_DIRECT_DISABLE_PSO"}];
+            }
             if (!pso) { if (required) direct_unavailable_locked(name, err); return nil; }
             if ([pso maxTotalThreadsPerThreadgroup] < kBlock) {
                 // the tree reductions are written for a full threadgroup
@@ -3805,17 +3814,26 @@ private:
         }
     }
 
+    // Every pipeline this backend builds names itself and quotes the compiler
+    // when it fails. A CI log that says only "Compilation failed" cost two
+    // round trips to narrow down; it must not be possible any more.
     id<MTLComputePipelineState> make_pso(id<MTLLibrary> lib, NSString* name) {
         @autoreleasepool {
             id<MTLFunction> fn = [lib newFunctionWithName:name];
             if (!fn) {
-                std::ostringstream os; os << "no function " << [name UTF8String];
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (aggregator): no such function";
                 throw std::runtime_error(os.str());
             }
             NSError* err = nil;
             id<MTLComputePipelineState> pso =
                 [device_ newComputePipelineStateWithFunction:fn error:&err];
-            if (!pso) metal_throw("newComputePipelineState", err);
+            if (!pso) {
+                std::ostringstream os;
+                os << "Metal pipeline " << [name UTF8String] << " (aggregator) would not build";
+                if (err) os << ": " << [[err localizedDescription] UTF8String];
+                throw std::runtime_error(os.str());
+            }
             return pso;
         }
     }
@@ -4153,10 +4171,27 @@ private:
         const char* e = std::getenv("GPUDB_METAL_DIRECT_DISABLE_PSO");
         return e ? std::string(e) : std::string();
     }();
+    // Which function the knob refuses. `1` / `all` every one of them, `slab`
+    // / `masked32` / `masked8` / `ids` / `fill` / `merge` that one, `missing`
+    // none of them by name but every request asks Metal for a function that
+    // does not exist (so the genuine nil-from-Metal branch runs), anything
+    // else is taken as a function name.
     bool dir_refuses(NSString* name) const {
-        if (dir_disable_pso_.empty()) return false;
-        if (dir_disable_pso_ == "slab") return [name isEqualToString:@"gdir_slab_i64"];
-        return true;
+        if (dir_disable_pso_.empty() || dir_disable_pso_ == "missing") return false;
+        if (dir_disable_pso_ == "1" || dir_disable_pso_ == "all") return true;
+        static const struct { const char* key; const char* fn; } alias[] = {
+            {"slab", "gdir_slab_i64"},       {"masked32", "gdir_masked_32_i64"},
+            {"masked8", "gdir_masked_8_i64"}, {"ids", "gdir_ids_i64"},
+            {"fill", "gdir_fill_ids"},        {"merge", "gdir_merge_i64"}};
+        for (const auto& a : alias)
+            if (dir_disable_pso_ == a.key) return [name isEqualToString:[NSString stringWithUTF8String:a.fn]];
+        return dir_disable_pso_ == [name UTF8String];
+    }
+    // The name to ask Metal for. `missing` sends a name nothing defines, which
+    // is the one way to make a real device return nil on a build we control.
+    NSString* dir_probe_name(NSString* name) const {
+        return dir_disable_pso_ == "missing"
+            ? [name stringByAppendingString:@"__no_such_function"] : name;
     }
     // What a threadgroup may hold, asked of the device rather than assumed.
     // The slab kernel binds this much dynamically and nothing statically.

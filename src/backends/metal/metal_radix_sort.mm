@@ -63,15 +63,23 @@ void MetalRadixSort::ensure_library() {
 
 id<MTLComputePipelineState> MetalRadixSort::make_pso(NSString* name) {
     @autoreleasepool {
+        // A build error names the function and quotes the compiler. A message
+        // that says only "Compilation failed" tells whoever reads a CI log
+        // nothing, which is how this rule came to be written down.
         id<MTLFunction> fn = [lib_ newFunctionWithName:name];
         if (!fn) {
             std::ostringstream os;
-            os << "no function " << [name UTF8String];
+            os << "Metal pipeline " << [name UTF8String] << " (radix sort): no such function";
             throw std::runtime_error(os.str());
         }
         NSError* err = nil;
         id<MTLComputePipelineState> pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
-        if (!pso) metal_throw("newComputePipelineState", err);
+        if (!pso) {
+            std::ostringstream os;
+            os << "Metal pipeline " << [name UTF8String] << " (radix sort) would not build";
+            if (err) os << ": " << [[err localizedDescription] UTF8String];
+            throw std::runtime_error(os.str());
+        }
         return pso;
     }
 }

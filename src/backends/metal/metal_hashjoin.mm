@@ -201,11 +201,16 @@ private:
         id<MTLFunction> fn = [lib newFunctionWithName:name];
         if (!fn) {
             std::ostringstream os;
-            os << "no function " << [name UTF8String];
+            os << "Metal pipeline " << [name UTF8String] << " (hash join): no such function";
             throw std::runtime_error(os.str());
         }
         id<MTLComputePipelineState> ps = [device newComputePipelineStateWithFunction:fn error:&err];
-        if (!ps) metal_throw("newComputePipelineState", err);
+        if (!ps) {
+            std::ostringstream os;
+            os << "Metal pipeline " << [name UTF8String] << " (hash join) would not build";
+            if (err) os << ": " << [[err localizedDescription] UTF8String];
+            throw std::runtime_error(os.str());
+        }
         return ps;
     }
 
