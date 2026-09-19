@@ -1,0 +1,28 @@
+name: probe (ctrl-d diagnosis, throwaway)
+
+on:
+  push:
+    branches: ['ci/shell-ctrl-d-diagnosis']
+
+jobs:
+  probe:
+    name: shell ctrl-d loop
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: |
+          python3 -m pip install --quiet --upgrade pip
+          python3 -m pip install --quiet duckdb py-spy
+          python3 -c "import readline; print(readline.__doc__, getattr(readline, '_READLINE_LIBRARY_VERSION', '?'))"
+          python3 -c "import sys; print(sys.version)"
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+      - name: loop the interactive sequence
+        run: |
+          python3 python/tests/probe_ctrl_d.py ${PROBE_N:-60}
+        env:
+          PROBE_N: 60
