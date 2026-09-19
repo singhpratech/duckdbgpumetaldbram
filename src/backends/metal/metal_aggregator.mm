@@ -233,6 +233,13 @@ public:
             ps_jm_counts_             = make_pso(lib, @"jm_counts");
             ps_jm_pos_                = make_pso(lib, @"jm_pos");
             ps_jm_gather_             = make_pso(lib, @"jm_gather");
+            // stage D1: the two row vectors join_index returns, and the
+            // stand-alone gather that materialises one indexed lane. Both are
+            // plain row-order kernels of the same shape as jm_gather, built in
+            // the same eager block, so they add no build that could fail where
+            // the join already builds.
+            ps_jm_rows_               = make_pso(lib, @"jm_rows");
+            ps_ix_gather_             = make_pso(lib, @"ix_gather");
 
             partials_buf_ = [device_ newBufferWithLength:(kMaxGrid * sizeof(std::int64_t))
                                                  options:MTLResourceStorageModeShared];
@@ -372,88 +379,15 @@ public:
             if (!gbx_dummy_valid_)
                 gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
 
-            // ---- build side: sorted valid keys + permutation to build rows ----
-            // the column's own sort cache: valid keys sorted, permutation = row ids (shared
-            // by every statement that joins on this key)
-            id<MTLBuffer> sorted = nil, perm = nil;
-            const std::size_t nb = bk.sort_rows();
-            if (nb) { auto sv = bk.ensure_sort_view(&kernel_ms); sorted = sv.keys; perm = sv.perm; }
-
-            const std::size_t n = pk.rows();
-            std::size_t n1 = 0, n2 = 0;
-            const std::size_t nblocks = (n + kBlock - 1) / kBlock;
-            const std::uint32_t n32  = static_cast<std::uint32_t>(n);
-            const std::uint32_t nb32 = static_cast<std::uint32_t>(nb);
+            // ---- probe: the stage join_index shares, term for term ----
+            // (build-key uniqueness, the binary-search probe, the class counts)
+            const auto& kc0 = static_cast<const MetalResidentColumn&>(*out[0].col);
+            const ProbeStage st = join_probe_stage(pk, bk, kc0, out[0].from_build,
+                                                   nullptr, nullptr, pk.rows(), "join_materialize");
+            kernel_ms += st.kernel_ms;
+            const std::size_t n = st.n, n1 = st.n1, n2 = st.n2, nblocks = st.nblocks;
+            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
             auto null_from = [](const MetalResidentColumn&) { return 0xFFFFFFFFu; };   // NULLs: the bitmap
-            if (n > 0 && nb > 0) {
-                grow(jm_flag_, sizeof(std::uint32_t), "join flag");
-                grow(jm_match_, n * sizeof(std::uint32_t), "join match");
-                grow(jm_cls_, n, "join class");
-                grow(gb_block_buf_,  nblocks * sizeof(std::uint32_t), "join block counts");
-                grow(gb_block2_buf_, nblocks * sizeof(std::uint32_t), "join block counts");
-                *static_cast<std::uint32_t*>([jm_flag_ contents]) = 0u;
-                const auto& kc = static_cast<const MetalResidentColumn&>(*out[0].col);
-                const std::uint32_t p_has = pk.valid_buffer() != nil ? 1u : 0u;
-                const std::uint32_t p_from = null_from(pk);
-                const std::uint32_t k_has = kc.valid_buffer() != nil ? 1u : 0u;
-                const std::uint32_t k_from = null_from(kc);
-                const std::uint32_t k_build = out[0].from_build ? 1u : 0u;
-                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                const std::uint32_t bs_w = bk.sort_width();
-                const std::uint32_t pk_w = pk.width();
-                if (nb > 1) {
-                    [ce setComputePipelineState:ps_jm_unique_];
-                    [ce setBuffer:sorted offset:0 atIndex:0];
-                    [ce setBytes:&nb32 length:sizeof(nb32) atIndex:1];
-                    [ce setBuffer:jm_flag_ offset:0 atIndex:2];
-                    [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:3];
-                    [ce dispatchThreadgroups:MTLSizeMake((nb + kBlock - 1) / kBlock, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                }
-                [ce setComputePipelineState:ps_jm_probe_];
-                [ce setBuffer:pk.buffer() offset:0 atIndex:0];
-                [ce setBuffer:(p_has ? pk.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
-                [ce setBytes:&p_has  length:sizeof(p_has)  atIndex:2];
-                [ce setBytes:&p_from length:sizeof(p_from) atIndex:3];
-                [ce setBytes:&n32    length:sizeof(n32)    atIndex:4];
-                [ce setBuffer:sorted offset:0 atIndex:5];
-                [ce setBuffer:perm   offset:0 atIndex:6];
-                [ce setBytes:&nb32   length:sizeof(nb32)   atIndex:7];
-                [ce setBuffer:(k_has ? kc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:8];
-                [ce setBytes:&k_has   length:sizeof(k_has)   atIndex:9];
-                [ce setBytes:&k_from  length:sizeof(k_from)  atIndex:10];
-                [ce setBytes:&k_build length:sizeof(k_build) atIndex:11];
-                [ce setBuffer:jm_match_ offset:0 atIndex:12];
-                [ce setBuffer:jm_cls_   offset:0 atIndex:13];
-                [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:14];
-                [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:15];
-                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                [ce setComputePipelineState:ps_jm_counts_];
-                [ce setBuffer:jm_cls_ offset:0 atIndex:0];
-                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
-                [ce setBuffer:gb_block_buf_  offset:0 atIndex:2];
-                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:3];
-                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                [ce endEncoding];
-                [cb commit];
-                [cb waitUntilCompleted];
-                if ([cb status] == MTLCommandBufferStatusError)
-                    throw std::runtime_error("join_materialize: probe command buffer failed (Metal)");
-                kernel_ms += cb_kernel_ms(cb);
-                if (*static_cast<std::uint32_t*>([jm_flag_ contents]) != 0u)
-                    throw std::runtime_error("join_materialize: build key not unique");
-                n1 = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]),  nblocks);
-                n2 = host_scan_u32(static_cast<std::uint32_t*>([gb_block2_buf_ contents]), nblocks);
-            } else if (nb > 1) {
-                // No probe rows: uniqueness is still the contract.
-                const void* sk = [sorted contents];
-                const unsigned sw = bk.sort_width();
-                for (std::size_t i = 0; i + 1 < nb; ++i)
-                    if (load_w(sk, sw, i) == load_w(sk, sw, i + 1))
-                        throw std::runtime_error("join_materialize: build key not unique");
-            }
             const std::size_t rows_out = n1 + n2;
             const std::size_t words = (rows_out + 63) / 64;
 
@@ -504,6 +438,7 @@ public:
                     [ce setBuffer:vbits[l] offset:0 atIndex:10];
                     const std::uint32_t lw = out_w[l];
                     [ce setBytes:&lw length:sizeof(lw) atIndex:11];
+                    bind_index(ce, nullptr, 12);          // stage D1: read at the row itself
                     [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
                 [ce endEncoding];
@@ -1101,6 +1036,33 @@ private:
         // Rows the sort cache covers: the valid ones.
         std::size_t sort_rows()   const noexcept { return rows_ - nulls_; }
 
+        // ---- stage D1: is this column usable as an index into `bound` rows? ----
+        // The kernels use an index cell as a row with no bound of their own, so
+        // the bound is proved here. It depends only on the column's min and max
+        // over its VALID cells, so it is computed once, on first use, and kept:
+        // an index vector is read by every statement over its join set, and the
+        // scan is one sequential pass over unified memory at the lane's stage-C
+        // width (4 bytes for a 60M-row vector).
+        bool index_within(std::size_t bound) const {
+            std::lock_guard<std::mutex> lock(ix_mu_);
+            if (!ix_done_) {
+                ix_min_ = 0; ix_max_ = -1;
+                const void* p = [ensure_lane() contents];
+                const auto* vb = valid_ ? static_cast<const std::uint64_t*>([valid_ contents]) : nullptr;
+                bool any = false;
+                for (std::size_t i = 0; i < rows_; ++i) {
+                    if (vb && !((vb[i >> 6] >> (i & 63)) & 1u)) continue;
+                    const std::int64_t v = load_w(p, width_, i);
+                    if (!any) { ix_min_ = ix_max_ = v; any = true; }
+                    else { if (v < ix_min_) ix_min_ = v; if (v > ix_max_) ix_max_ = v; }
+                }
+                if (!any) { ix_min_ = 0; ix_max_ = -1; }      // no valid cell: vacuously in range
+                ix_done_ = true;
+            }
+            if (ix_max_ < ix_min_) return true;               // no valid cell
+            return ix_min_ >= 0 && static_cast<std::size_t>(ix_max_) < bound;
+        }
+
         // ---- v0.7 milestone 0b: readiness (gpu_backend.hpp contract) ----
         // The derived structure is the radix-sorted copy of the column's VALID
         // rows (compacted through the validity bitmap) at the key's storage
@@ -1353,6 +1315,12 @@ private:
         id<MTLBuffer> valid_ = nil;               // validity bitmap (nil = no NULLs)
         std::size_t   nulls_ = 0;                 // NULL rows (bitmap zeros)
         unsigned      width_ = 8;                 // storage width in bytes (stage C)
+        // stage D1: the value range over the valid cells, computed on first
+        // use by index_within() and then kept (ix_max_ < ix_min_ = no valid
+        // cell, which is vacuously in range).
+        mutable std::mutex   ix_mu_;
+        mutable bool         ix_done_ = false;
+        mutable std::int64_t ix_min_ = 0, ix_max_ = -1;
         mutable std::mutex       gid_mu_;         // guards the group-id lane build
         mutable std::atomic<int> gid_state_{0};   // release after gid_/dkeys_ are set
         mutable id<MTLBuffer>    gid_   = nil;
@@ -1368,6 +1336,360 @@ private:
         mutable std::atomic<bool> cache_shed_{false};
         mutable std::atomic<bool> cache_pinned_{false};
     };
+
+    // ---- stage D1: bind one index vector into four consecutive slots -------
+    // (data, validity, mode, storage width), where mode 0 = no index — the
+    // kernel then reads at the row itself and the whole thing costs one
+    // comparison of a register. A null index still needs the two buffer slots
+    // filled, so they take the dummy buffer every kernel here already has.
+    void bind_index(id<MTLComputeCommandEncoder> ce, const MetalResidentColumn* ix, NSUInteger b0) {
+        if (!gbx_dummy_valid_)
+            gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        const std::uint32_t mode = !ix ? 0u : (ix->valid_buffer() != nil ? 2u : 1u);
+        const std::uint32_t w    = ix ? ix->width() : 8u;
+        [ce setBuffer:(ix ? ix->buffer() : gbx_dummy_valid_) offset:0 atIndex:b0];
+        [ce setBuffer:((ix && ix->valid_buffer()) ? ix->valid_buffer() : gbx_dummy_valid_)
+               offset:0 atIndex:b0 + 1];
+        [ce setBytes:&mode length:sizeof(mode) atIndex:b0 + 2];
+        [ce setBytes:&w    length:sizeof(w)    atIndex:b0 + 3];
+    }
+
+    // ---- the probe stage both join forms share -----------------------------
+    // Uniqueness of the build key, the binary-search probe and the class
+    // counts: everything up to the point where join_materialize gathers lanes
+    // and join_index writes row vectors instead. It leaves jm_match_ and
+    // jm_cls_ filled and returns the two class sizes, so the two forms agree
+    // term for term by construction rather than by inspection.
+    struct ProbeStage { std::size_t n = 0, nb = 0, n1 = 0, n2 = 0, nblocks = 0; double kernel_ms = 0.0; };
+    ProbeStage join_probe_stage(const MetalResidentColumn& pk, const MetalResidentColumn& bk,
+                                const MetalResidentColumn& kc, bool k_from_build,
+                                const MetalResidentColumn* probe_index,
+                                const MetalResidentColumn* key_index,
+                                std::size_t n_rows, const char* op) {
+        ProbeStage st;
+        st.n = n_rows;
+        if (!gbx_dummy_valid_)
+            gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> sorted = nil, perm = nil;
+        st.nb = bk.sort_rows();
+        if (st.nb) { auto sv = bk.ensure_sort_view(&st.kernel_ms); sorted = sv.keys; perm = sv.perm; }
+        const std::size_t n = st.n, nb = st.nb;
+        st.nblocks = (n + kBlock - 1) / kBlock;
+        const std::uint32_t n32  = static_cast<std::uint32_t>(n);
+        const std::uint32_t nb32 = static_cast<std::uint32_t>(nb);
+        const std::uint32_t null_from = 0xFFFFFFFFu;        // NULLs: the bitmap
+        if (n > 0 && nb > 0) {
+            grow(jm_flag_, sizeof(std::uint32_t), "join flag");
+            grow(jm_match_, n * sizeof(std::uint32_t), "join match");
+            grow(jm_cls_, n, "join class");
+            grow(gb_block_buf_,  st.nblocks * sizeof(std::uint32_t), "join block counts");
+            grow(gb_block2_buf_, st.nblocks * sizeof(std::uint32_t), "join block counts");
+            *static_cast<std::uint32_t*>([jm_flag_ contents]) = 0u;
+            const std::uint32_t p_has = pk.valid_buffer() != nil ? 1u : 0u;
+            const std::uint32_t k_has = kc.valid_buffer() != nil ? 1u : 0u;
+            const std::uint32_t k_build = k_from_build ? 1u : 0u;
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            const std::uint32_t bs_w = bk.sort_width();
+            const std::uint32_t pk_w = pk.width();
+            if (nb > 1) {
+                [ce setComputePipelineState:ps_jm_unique_];
+                [ce setBuffer:sorted offset:0 atIndex:0];
+                [ce setBytes:&nb32 length:sizeof(nb32) atIndex:1];
+                [ce setBuffer:jm_flag_ offset:0 atIndex:2];
+                [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:3];
+                [ce dispatchThreadgroups:MTLSizeMake((nb + kBlock - 1) / kBlock, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            }
+            [ce setComputePipelineState:ps_jm_probe_];
+            [ce setBuffer:pk.buffer() offset:0 atIndex:0];
+            [ce setBuffer:(p_has ? pk.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+            [ce setBytes:&p_has     length:sizeof(p_has)     atIndex:2];
+            [ce setBytes:&null_from length:sizeof(null_from) atIndex:3];
+            [ce setBytes:&n32       length:sizeof(n32)       atIndex:4];
+            [ce setBuffer:sorted offset:0 atIndex:5];
+            [ce setBuffer:perm   offset:0 atIndex:6];
+            [ce setBytes:&nb32   length:sizeof(nb32)   atIndex:7];
+            [ce setBuffer:(k_has ? kc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:8];
+            [ce setBytes:&k_has     length:sizeof(k_has)     atIndex:9];
+            [ce setBytes:&null_from length:sizeof(null_from) atIndex:10];
+            [ce setBytes:&k_build   length:sizeof(k_build)   atIndex:11];
+            [ce setBuffer:jm_match_ offset:0 atIndex:12];
+            [ce setBuffer:jm_cls_   offset:0 atIndex:13];
+            [ce setBytes:&pk_w length:sizeof(pk_w) atIndex:14];
+            [ce setBytes:&bs_w length:sizeof(bs_w) atIndex:15];
+            bind_index(ce, probe_index, 16);
+            bind_index(ce, key_index, 20);
+            [ce dispatchThreadgroups:MTLSizeMake(st.nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [ce setComputePipelineState:ps_jm_counts_];
+            [ce setBuffer:jm_cls_ offset:0 atIndex:0];
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+            [ce setBuffer:gb_block_buf_  offset:0 atIndex:2];
+            [ce setBuffer:gb_block2_buf_ offset:0 atIndex:3];
+            [ce dispatchThreadgroups:MTLSizeMake(st.nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError)
+                throw std::runtime_error(std::string(op) + ": probe command buffer failed (Metal)");
+            st.kernel_ms += cb_kernel_ms(cb);
+            if (*static_cast<std::uint32_t*>([jm_flag_ contents]) != 0u)
+                throw std::runtime_error(std::string(op) + ": build key not unique");
+            st.n1 = host_scan_u32(static_cast<std::uint32_t*>([gb_block_buf_ contents]),  st.nblocks);
+            st.n2 = host_scan_u32(static_cast<std::uint32_t*>([gb_block2_buf_ contents]), st.nblocks);
+        } else if (nb > 1) {
+            // No probe rows: uniqueness is still the contract.
+            const void* sk = [sorted contents];
+            const unsigned sw = bk.sort_width();
+            for (std::size_t i = 0; i + 1 < nb; ++i)
+                if (load_w(sk, sw, i) == load_w(sk, sw, i + 1))
+                    throw std::runtime_error(std::string(op) + ": build key not unique");
+        }
+        return st;
+    }
+
+    // ---- stage D1: materialise one lane through an index -------------------
+    // `dst[i] = col[index[i]]`, the gather the join used to do per output
+    // lane, at the source lane's storage width (a gather cannot widen a
+    // lane's range). A NULL index cell, or a NULL source cell, makes the
+    // output cell NULL. This is what the paths that still want a lane in
+    // result order use, and it is measured against the indexed read in
+    // BENCHMARK.md rather than assumed better or worse.
+    std::unique_ptr<MetalResidentColumn> materialise_indexed(const MetalResidentColumn& col,
+                                                             const MetalResidentColumn& ix,
+                                                             const char* op, double* kernel_ms) {
+        const std::size_t n = ix.rows();
+        const std::size_t words = (n + 63) / 64;
+        const unsigned w = col.width();
+        id<MTLBuffer> data = [device_ newBufferWithLength:std::max<std::size_t>(16, n * w)
+                                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> vb = [device_ newBufferWithLength:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
+                                                options:MTLResourceStorageModeShared];
+        if (!data || !vb) throw std::runtime_error(std::string(op) + ": device allocation failed (Metal)");
+        std::memset([vb contents], 0xFF, [vb length]);
+        if (n > 0) {
+            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+            const std::uint32_t s_has = col.valid_buffer() != nil ? 1u : 0u;
+            const std::uint32_t w32 = w;
+            id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+            if (!gbx_dummy_valid_)
+                gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+            [ce setComputePipelineState:ps_ix_gather_];
+            [ce setBuffer:col.buffer() offset:0 atIndex:0];
+            [ce setBuffer:(s_has ? col.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+            [ce setBytes:&s_has length:sizeof(s_has) atIndex:2];
+            bind_index(ce, &ix, 3);
+            [ce setBytes:&n32 length:sizeof(n32) atIndex:7];
+            [ce setBuffer:data offset:0 atIndex:8];
+            [ce setBuffer:vb   offset:0 atIndex:9];
+            [ce setBytes:&w32 length:sizeof(w32) atIndex:10];
+            [ce dispatchThreadgroups:MTLSizeMake((n + kBlock - 1) / kBlock, 1, 1)
+               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+            [ce endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+            if ([cb status] == MTLCommandBufferStatusError)
+                throw std::runtime_error(std::string(op) + ": gather command buffer failed (Metal)");
+            if (kernel_ms) *kernel_ms += cb_kernel_ms(cb);
+        }
+        const auto* wp = static_cast<const std::uint64_t*>([vb contents]);
+        std::size_t set = 0;
+        for (std::size_t i = 0; i < words; ++i) {
+            std::uint64_t x = wp[i];
+            if (i + 1 == words && (n & 63)) x &= (std::uint64_t{1} << (n & 63)) - 1;
+            set += static_cast<std::size_t>(__builtin_popcountll(x));
+        }
+        const std::size_t nulls = n - set;
+        return std::make_unique<MetalResidentColumn>(data, n, col.dtype(), sort_ctx_,
+                                                     nulls == 0 ? nil : vb, nulls, w, false);
+    }
+
+    // ---- stage D1: the same join, returning row positions ------------------
+    // Everything up to jm_pos is join_materialize's, by construction: the two
+    // share join_probe_stage. What differs is the last dispatch — jm_rows
+    // writes the probe and build row of every kept output row at the narrowest
+    // width each side's row count fits in, instead of one gather per output
+    // lane. `mat` is whatever the caller still wants in result order, gathered
+    // exactly as join_materialize gathers it.
+    JoinIndexResult join_index(const ResidentColumn& probe_key, const ResidentColumn& build_key,
+                               const JoinLane& key_lane, const JoinLane* mat, std::size_t n_mat,
+                               const ResidentColumn* probe_index) override {
+        @autoreleasepool {
+            static const char* op = "join_index";
+            const auto t_wall0 = std::chrono::steady_clock::now();
+            const auto& pk = check_i64_nullable(probe_key);
+            const auto& bk = check_i64_nullable(build_key);
+            if (!key_lane.col) throw std::runtime_error(std::string(op) + ": no key lane");
+            if (key_lane.col->dtype() != Dtype::I64)
+                throw std::runtime_error(std::string(op) + ": the key lane must be I64");
+            if (key_lane.col->backend_tag() != Backend::METAL)
+                throw std::runtime_error("ResidentColumn mismatch (Metal join lane)");
+            const auto& kc = static_cast<const MetalResidentColumn&>(*key_lane.col);
+            const MetalResidentColumn* pix =
+                probe_index ? &check_index(*probe_index, pk, op, "the probe key") : nullptr;
+            const std::size_t n = pix ? pix->rows() : pk.rows();
+            if (n > 0xFFFFFFFFull - 64 || bk.rows() > 0xFFFFFFFFull - 64)
+                throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
+            const MetalResidentColumn* kix = nullptr;
+            if (key_lane.index)
+                kix = &check_index(*key_lane.index, kc, op, "the key lane");
+            const std::size_t key_rows = kix ? kix->rows() : kc.rows();
+            if (!key_lane.from_build && key_rows != n)
+                throw std::runtime_error(std::string(op) + ": the key lane's row count differs from the probe side");
+            if (key_lane.from_build && key_rows != bk.rows())
+                throw std::runtime_error(std::string(op) + ": the key lane's row count differs from the build side");
+            std::vector<const MetalResidentColumn*> mix(n_mat, nullptr);
+            for (std::size_t l = 0; l < n_mat; ++l) {
+                if (!mat[l].col) throw std::runtime_error(std::string(op) + ": output lane without a column");
+                if (mat[l].col->backend_tag() != Backend::METAL)
+                    throw std::runtime_error("ResidentColumn mismatch (Metal join lane)");
+                const auto& lc = static_cast<const MetalResidentColumn&>(*mat[l].col);
+                std::size_t lane_rows = lc.rows();
+                if (mat[l].index) {
+                    mix[l] = &check_index(*mat[l].index, lc, op, "an output lane");
+                    lane_rows = mix[l]->rows();
+                }
+                if (lane_rows != (mat[l].from_build ? bk.rows() : n))
+                    throw std::runtime_error(std::string(op) + ": lane " + std::to_string(l) +
+                                             " row count differs from its side of the join");
+            }
+
+            JoinIndexResult r;
+            r.rows_probe = n;
+            r.rows_build = bk.rows();
+            double kernel_ms = 0.0;
+            if (!gbx_dummy_valid_)
+                gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
+
+            const ProbeStage st = join_probe_stage(pk, bk, kc, key_lane.from_build, pix, kix, n, op);
+            kernel_ms += st.kernel_ms;
+            const std::size_t n1 = st.n1, n2 = st.n2, nblocks = st.nblocks;
+            const std::size_t rows_out = n1 + n2;
+            const std::size_t words = (rows_out + 63) / 64;
+            const std::uint32_t n32 = static_cast<std::uint32_t>(n);
+
+            // The two row vectors, each as narrow as its side's row count
+            // allows (`width_for` over [0, rows) — stage C's own rule), and
+            // the lanes the caller still wants in result order.
+            const unsigned pw = width_for(0, static_cast<std::int64_t>(n ? n - 1 : 0));
+            const unsigned bw = width_for(0, static_cast<std::int64_t>(bk.rows() ? bk.rows() - 1 : 0));
+            id<MTLBuffer> prow = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * pw)
+                                                      options:MTLResourceStorageModeShared];
+            id<MTLBuffer> brow = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * bw)
+                                                      options:MTLResourceStorageModeShared];
+            if (!prow || !brow) throw std::runtime_error(std::string(op) + ": device allocation failed (Metal)");
+            std::vector<id<MTLBuffer>> data(n_mat, nil), vbits(n_mat, nil);
+            std::vector<unsigned> out_w(n_mat, 8);
+            for (std::size_t l = 0; l < n_mat; ++l) {
+                out_w[l] = static_cast<const MetalResidentColumn&>(*mat[l].col).width();
+                data[l]  = [device_ newBufferWithLength:std::max<std::size_t>(16, rows_out * out_w[l])
+                                                options:MTLResourceStorageModeShared];
+                vbits[l] = [device_ newBufferWithLength:std::max<std::size_t>(8, words * sizeof(std::uint64_t))
+                                                options:MTLResourceStorageModeShared];
+                if (!data[l] || !vbits[l]) throw std::runtime_error(std::string(op) + ": device allocation failed (Metal)");
+                std::memset([vbits[l] contents], 0xFF, [vbits[l] length]);
+            }
+            if (rows_out > 0) {
+                grow(jm_pos_buf_, n * sizeof(std::uint32_t), "join positions");
+                const std::uint32_t n1_32 = static_cast<std::uint32_t>(n1);
+                id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps_jm_pos_];
+                [ce setBuffer:jm_cls_ offset:0 atIndex:0];
+                [ce setBytes:&n32 length:sizeof(n32) atIndex:1];
+                [ce setBuffer:gb_block_buf_  offset:0 atIndex:2];
+                [ce setBuffer:gb_block2_buf_ offset:0 atIndex:3];
+                [ce setBytes:&n1_32 length:sizeof(n1_32) atIndex:4];
+                [ce setBuffer:jm_pos_buf_ offset:0 atIndex:5];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                const std::uint32_t pw32 = pw, bw32 = bw;
+                [ce setComputePipelineState:ps_jm_rows_];
+                [ce setBuffer:jm_match_   offset:0 atIndex:0];
+                [ce setBuffer:jm_cls_     offset:0 atIndex:1];
+                [ce setBuffer:jm_pos_buf_ offset:0 atIndex:2];
+                [ce setBytes:&n32   length:sizeof(n32)   atIndex:3];
+                [ce setBuffer:prow offset:0 atIndex:4];
+                [ce setBytes:&pw32 length:sizeof(pw32) atIndex:5];
+                [ce setBuffer:brow offset:0 atIndex:6];
+                [ce setBytes:&bw32 length:sizeof(bw32) atIndex:7];
+                [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                for (std::size_t l = 0; l < n_mat; ++l) {
+                    const auto& sc = static_cast<const MetalResidentColumn&>(*mat[l].col);
+                    const std::uint32_t s_has = sc.valid_buffer() != nil ? 1u : 0u;
+                    const std::uint32_t s_from = 0xFFFFFFFFu;        // NULLs: the bitmap
+                    const std::uint32_t fb = mat[l].from_build ? 1u : 0u;
+                    [ce setComputePipelineState:ps_jm_gather_];
+                    [ce setBuffer:sc.buffer() offset:0 atIndex:0];
+                    [ce setBuffer:(s_has ? sc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+                    [ce setBytes:&s_has  length:sizeof(s_has)  atIndex:2];
+                    [ce setBytes:&s_from length:sizeof(s_from) atIndex:3];
+                    [ce setBytes:&fb     length:sizeof(fb)     atIndex:4];
+                    [ce setBuffer:jm_match_   offset:0 atIndex:5];
+                    [ce setBuffer:jm_cls_     offset:0 atIndex:6];
+                    [ce setBuffer:jm_pos_buf_ offset:0 atIndex:7];
+                    [ce setBytes:&n32 length:sizeof(n32) atIndex:8];
+                    [ce setBuffer:data[l]  offset:0 atIndex:9];
+                    [ce setBuffer:vbits[l] offset:0 atIndex:10];
+                    const std::uint32_t lw = out_w[l];
+                    [ce setBytes:&lw length:sizeof(lw) atIndex:11];
+                    bind_index(ce, mix[l], 12);
+                    [ce dispatchThreadgroups:MTLSizeMake(nblocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                }
+                [ce endEncoding];
+                [cb commit];
+                [cb waitUntilCompleted];
+                if ([cb status] == MTLCommandBufferStatusError)
+                    throw std::runtime_error(std::string(op) + ": row-vector command buffer failed (Metal)");
+                kernel_ms += cb_kernel_ms(cb);
+            }
+            // probe_rows is strictly increasing inside each class and every
+            // kept row matched, so neither vector carries a NULL: they are
+            // built with no bitmap, exactly as the reference builds them.
+            r.probe_rows = std::make_unique<MetalResidentColumn>(prow, rows_out, Dtype::I64, sort_ctx_,
+                                                                 nil, 0, pw, false);
+            r.build_rows = std::make_unique<MetalResidentColumn>(brow, rows_out, Dtype::I64, sort_ctx_,
+                                                                 nil, 0, bw, false);
+            r.lanes.reserve(n_mat);
+            for (std::size_t l = 0; l < n_mat; ++l) {
+                const auto* w = static_cast<const std::uint64_t*>([vbits[l] contents]);
+                std::size_t set = 0;
+                for (std::size_t i = 0; i < words; ++i) {
+                    std::uint64_t x = w[i];
+                    if (i + 1 == words && (rows_out & 63)) x &= (std::uint64_t{1} << (rows_out & 63)) - 1;
+                    set += static_cast<std::size_t>(__builtin_popcountll(x));
+                }
+                const std::size_t nulls = rows_out - set;
+                r.lanes.push_back(std::make_unique<MetalResidentColumn>(
+                    data[l], rows_out, mat[l].col->dtype(), sort_ctx_,
+                    nulls == 0 ? nil : vbits[l], nulls, out_w[l], false));
+            }
+            r.rows_out = rows_out;
+            r.null_key_rows = n2;
+            // `probe_identity` is the reference's, term for term: every probe
+            // row kept AND every one of them at its own position. Nothing was
+            // dropped exactly when rows_out == n, and then, if every kept row
+            // is class 1, the class fills [0, n) in probe order and the vector
+            // IS the identity — no scan. Only a statement that kept every row
+            // AND put some of them in the NULL-key suffix has to be looked at,
+            // and then the scan stops at the first row out of place.
+            r.probe_identity = rows_out == n && n2 == 0;
+            if (rows_out == n && n2 > 0) {
+                const void* pr = [prow contents];
+                bool id_ok = true;
+                for (std::size_t d = 0; id_ok && d < rows_out; ++d)
+                    id_ok = load_w(pr, pw, d) == static_cast<std::int64_t>(d);
+                r.probe_identity = id_ok;
+            }
+            r.kernel_ms = kernel_ms;
+            r.wall_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t_wall0).count();
+            return r;
+        }
+    }
+
 
     // backend_notes.hpp reporter: the storage width of one of OUR columns
     // (stage C), 0 for a column this backend did not create. A plain function
@@ -2169,11 +2491,23 @@ private:
     // One WHERE term as gpred_eval reads it (GPred in sum.metal).
     struct GaggPred { std::uint32_t lane, op, list_off, n_list; std::int64_t value; };
     // The per-lane part that travels in a buffer (GLaneMeta in sum.metal).
-    struct GaggLaneMeta { std::uint32_t width, has_valid, is_f64, pad; };
+    // stage D1: the last word is the slot of this lane's index vector, or
+    // kNoIdx to read at the row itself. An index vector is bound as an
+    // ordinary lane, so stage D costs no new argument table slot — the direct
+    // reduce already binds all 31 of them.
+    static constexpr std::uint32_t kNoIdx = 0xFFFFFFFFu;
+    struct GaggLaneMeta { std::uint32_t width, has_valid, is_f64, idx_slot; };
 
     bool global_supported() const noexcept override { return true; }
     // stage C: every exact I64 lane is stored at the narrowest width its values fit
     bool narrow_lanes() const noexcept override { return true; }
+    // stage D1: the row-order operators read a lane through an index vector.
+    // The index rides in an ordinary lane slot (GLane::idx_slot in sum.metal),
+    // so no pipeline had to change shape and nothing new is compiled — there
+    // is no capability gate to pass and no fallback to arrange, because the
+    // kernels that gained the indirection are the ones this backend already
+    // builds and already falls back from.
+    bool indexed_supported() const noexcept override { return true; }
 
     GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
                                            const Predicate* preds, std::size_t n_preds) override {
@@ -2187,28 +2521,47 @@ private:
                                          " payload columns");
 
             // ---- the lane table: distinct columns, payloads and predicates share slots ----
+            // stage D1: an index vector is bound as an ordinary lane and the
+            // lane that reads through it names its slot, so a statement's
+            // budget of kGaggLanes now covers payloads, predicate columns AND
+            // index vectors. The pair (column, index) is what identifies a
+            // slot: one store column read through two different indexes is two
+            // lanes, because it holds two different values per row.
             std::vector<const MetalResidentColumn*> lane;
-            auto slot_of = [&](const MetalResidentColumn* c) {
-                for (std::size_t i = 0; i < lane.size(); ++i) if (lane[i] == c) return i;
+            std::vector<std::uint32_t> idx_slot;
+            auto add_slot = [&](const MetalResidentColumn* c, std::uint32_t is) {
+                for (std::size_t i = 0; i < lane.size(); ++i)
+                    if (lane[i] == c && idx_slot[i] == is) return i;
                 if (lane.size() >= kGaggLanes)
                     throw std::runtime_error(std::string(op) + ": more than " + std::to_string(kGaggLanes) +
                                              " distinct lanes in one statement");
                 lane.push_back(c);
+                idx_slot.push_back(is);
                 return lane.size() - 1;
             };
             std::size_t n = 0;
             bool have_n = false;
+            // Without an index a lane spans its own rows; with one it spans the
+            // index's, and the column's row count is only the bound its cells
+            // must respect.
             auto note_rows = [&](const MetalResidentColumn& c, const char* what) {
                 if (!have_n) { n = c.rows(); have_n = true; }
                 else if (c.rows() != n)
                     throw std::runtime_error(std::string(op) + ": " + what + " row count differs");
             };
+            auto slot_of = [&](const MetalResidentColumn& c, const ResidentColumn* index,
+                               const char* what) {
+                if (!index) { note_rows(c, what); return add_slot(&c, kNoIdx); }
+                const auto& ix = check_index(*index, c, op, what);
+                note_rows(ix, what);
+                const std::uint32_t is = static_cast<std::uint32_t>(add_slot(&ix, kNoIdx));
+                return add_slot(&c, is);
+            };
             std::vector<std::uint32_t> pay_slot(n_pays, 0);
             for (std::size_t p = 0; p < n_pays; ++p) {
                 if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
                 const auto& c = check_i64_nullable(*pays[p].vals);
-                note_rows(c, "payload");
-                pay_slot[p] = static_cast<std::uint32_t>(slot_of(&c));
+                pay_slot[p] = static_cast<std::uint32_t>(slot_of(c, pays[p].index, "payload"));
             }
             using GPredHost = GaggPred;
             std::vector<GPredHost> prog(n_preds);
@@ -2218,8 +2571,7 @@ private:
                 if (preds[q].col->backend_tag() != Backend::METAL)
                     throw std::runtime_error("ResidentColumn mismatch (Metal predicate column)");
                 const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
-                note_rows(c, "predicate column");
-                prog[q].lane = static_cast<std::uint32_t>(slot_of(&c));
+                prog[q].lane = static_cast<std::uint32_t>(slot_of(c, preds[q].index, "predicate column"));
                 prog[q].op = pred_op_code(preds[q].op);
                 prog[q].value = preds[q].value;
                 prog[q].list_off = static_cast<std::uint32_t>(lists.size());
@@ -2243,10 +2595,10 @@ private:
                 throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
 
             using GLaneMetaHost = GaggLaneMeta;
-            std::vector<GLaneMetaHost> meta(kGaggLanes, GLaneMetaHost{8u, 0u, 0u, 0u});
+            std::vector<GLaneMetaHost> meta(kGaggLanes, GLaneMetaHost{8u, 0u, 0u, kNoIdx});
             for (std::size_t i = 0; i < lane.size(); ++i)
                 meta[i] = GLaneMetaHost{lane[i]->width(), lane[i]->valid_buffer() ? 1u : 0u,
-                                        lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+                                        lane[i]->dtype() == Dtype::F64 ? 1u : 0u, idx_slot[i]};
 
             if (!gbx_dummy_valid_)
                 gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
@@ -2544,6 +2896,7 @@ private:
         std::size_t tg_bytes = 0;
         std::size_t ntg      = 1;      // threadgroups, sized to the row work
         std::vector<const MetalResidentColumn*> lane;
+        std::vector<std::uint32_t> idx_slot;              // stage D1, parallel to `lane`
         std::vector<const MetalResidentColumn*> pay;      // payload columns, in output order
         std::vector<std::uint32_t> pay_slot;
         std::vector<GaggPred>      prog;
@@ -2552,9 +2905,18 @@ private:
 
     // Can the direct path answer this call? Everything it refuses the sort
     // path answers identically, so a refusal is never an error.
+    // stage D1: `v_ix` / `ex_ix` / `pred_ix` are the index vector each lane is
+    // read through, or null for the row itself. They are bound as ordinary
+    // lanes and named in GLaneMeta::idx_slot, so an indexed call costs the
+    // same pipelines, the same dispatch and one extra load per indexed read —
+    // but it does spend the statement's lane budget on the index vectors too,
+    // and this plan declines, as it always has, when the budget runs out.
     bool direct_plan(const MetalResidentColumn& k, const MetalResidentColumn* v,
-                     const MultiPayload* extras, std::size_t n_extras,
-                     const Predicate* preds, std::size_t n_preds,
+                     const MetalResidentColumn* v_ix,
+                     const MultiPayload* extras, const MetalResidentColumn* const* ex_ix,
+                     std::size_t n_extras,
+                     const Predicate* preds, const MetalResidentColumn* const* pred_ix,
+                     std::size_t n_preds,
                      const GroupByFilter& filter,
                      DirectPlan& pl, double* kernel_ms) {
         if (exact_path_ == ExactPath::Sort || !direct_ensure_ready()) return false;
@@ -2563,12 +2925,25 @@ private:
         pl.n_groups = k.gid_groups() + (has_null ? 1 : 0);
         if (exact_path_ != ExactPath::Direct && pl.n_groups > direct_max_groups_) return false;
 
-        auto slot_of = [&](const MetalResidentColumn* c) -> long {
-            for (std::size_t i = 0; i < pl.lane.size(); ++i) if (pl.lane[i] == c) return static_cast<long>(i);
+        // stage D1: a slot is the pair (column, index vector) — one column
+        // read through two indexes holds two different values per row and so
+        // needs two slots. `is` is the slot of the index, or kNoIdx.
+        auto slot_with = [&](const MetalResidentColumn* c, std::uint32_t is) -> long {
+            for (std::size_t i = 0; i < pl.lane.size(); ++i)
+                if (pl.lane[i] == c && pl.idx_slot[i] == is) return static_cast<long>(i);
             if (pl.lane.size() >= kGaggLanes) return -1;
             pl.lane.push_back(c);
+            pl.idx_slot.push_back(is);
             return static_cast<long>(pl.lane.size() - 1);
         };
+        auto slot_of = [&](const MetalResidentColumn* c) -> long { return slot_with(c, kNoIdx); };
+        auto slot_indexed = [&](const MetalResidentColumn* c, const MetalResidentColumn* ix) -> long {
+            if (!ix) return slot_with(c, kNoIdx);
+            const long is = slot_with(ix, kNoIdx);
+            if (is < 0) return -1;
+            return slot_with(c, static_cast<std::uint32_t>(is));
+        };
+        (void)slot_of;
         // min / max: wanted when a caller reads those columns, or when the
         // filter ranks on them. The slab keeps them as 32-bit atomics, which
         // is exact for a lane stored at 4 bytes or narrower; a wider lane
@@ -2581,10 +2956,12 @@ private:
             pl.want_mm = true;
             if (c->width() > 4) wide_mm = true;
         };
-        if (v) { pl.pay.push_back(v); note_mm(v, filter.columns, true); }
+        std::vector<const MetalResidentColumn*> pay_ix;
+        if (v) { pl.pay.push_back(v); pay_ix.push_back(v_ix); note_mm(v, filter.columns, true); }
         for (std::size_t e = 0; e < n_extras; ++e) {
             const auto& c = check_i64_nullable(*extras[e].vals);
             pl.pay.push_back(&c);
+            pay_ix.push_back(ex_ix ? ex_ix[e] : nullptr);
             note_mm(&c, extras[e].columns, false);
         }
         pl.n_pays = pl.pay.size();
@@ -2651,7 +3028,7 @@ private:
 
         pl.pay_slot.resize(pl.n_pays);
         for (std::size_t p = 0; p < pl.n_pays; ++p) {
-            const long s = slot_of(pl.pay[p]);
+            const long s = slot_indexed(pl.pay[p], pay_ix[p]);
             if (s < 0) return false;
             pl.pay_slot[p] = static_cast<std::uint32_t>(s);
         }
@@ -2662,7 +3039,7 @@ private:
         pl.prog.resize(n_preds);
         for (std::size_t q = 0; q < n_preds; ++q) {
             const auto& c = static_cast<const MetalResidentColumn&>(*preds[q].col);
-            const long s = slot_of(&c);
+            const long s = slot_indexed(&c, pred_ix ? pred_ix[q] : nullptr);
             if (s < 0) return false;
             pl.prog[q].lane = static_cast<std::uint32_t>(s);
             pl.prog[q].op = pred_op_code(preds[q].op);
@@ -2750,10 +3127,11 @@ private:
             const std::size_t n_groups = pl.n_groups, n_pays = pl.n_pays;
             const std::size_t stride = 1 + 5 * n_pays;
 
-            std::vector<GaggLaneMeta> meta(kGaggLanes, GaggLaneMeta{8u, 0u, 0u, 0u});
+            std::vector<GaggLaneMeta> meta(kGaggLanes, GaggLaneMeta{8u, 0u, 0u, kNoIdx});
             for (std::size_t i = 0; i < pl.lane.size(); ++i)
                 meta[i] = GaggLaneMeta{pl.lane[i]->width(), pl.lane[i]->valid_buffer() ? 1u : 0u,
-                                       pl.lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+                                       pl.lane[i]->dtype() == Dtype::F64 ? 1u : 0u,
+                                       i < pl.idx_slot.size() ? pl.idx_slot[i] : kNoIdx};
             if (!gbx_dummy_valid_)
                 gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
             const NSUInteger ntg = static_cast<NSUInteger>(pl.ntg);
@@ -2934,20 +3312,48 @@ private:
                                      std::size_t max_groups, const GroupByFilter& filter,
                                      const char* op,
                                      const MultiPayload* extras = nullptr, std::size_t n_extras = 0,
-                                     std::vector<GroupByResidentResult>* extra_out = nullptr) {
+                                     std::vector<GroupByResidentResult>* extra_out = nullptr,
+                                     // ---- stage D1 ----
+                                     // The key's index, and the primary payload's (every other
+                                     // lane carries its own on MultiPayload / Predicate). All
+                                     // null is the call this operator always took.
+                                     const ResidentColumn* key_index = nullptr,
+                                     const ResidentColumn* val_index = nullptr) {
         @autoreleasepool {
             const auto t_wall0 = std::chrono::steady_clock::now();
             if (extra_out) extra_out->assign(n_extras, GroupByResidentResult{});
+            double mat_ms = 0.0;         // stage D1: gathers this call had to do itself
+            // The KEY through an index is materialised here, once, before
+            // either path runs. Both paths read a key through structures
+            // DERIVED from the key column and shared by every statement over
+            // it — the sort cache, the group-id lane and its distinct keys —
+            // and an index would make those per statement rather than per
+            // column. So the key of a join set is a lane in result order, as
+            // §8 says, and an indexed key reaching here is gathered into one.
+            const auto& key_src = check_i64_nullable(keys);
+            std::unique_ptr<MetalResidentColumn> owned_key;
+            if (key_index) {
+                const auto& kix = check_index(*key_index, key_src, op, "the keys");
+                owned_key = materialise_indexed(key_src, kix, op, &mat_ms);
+            }
+            const MetalResidentColumn& k = owned_key ? *owned_key : key_src;
+            const std::size_t stmt_rows = k.rows();
+            // Payload and predicate lanes keep their index: the direct path
+            // reads through it, and only if this call takes the sort path are
+            // they gathered too (see below).
             std::vector<const MetalResidentColumn*> ex(n_extras, nullptr);
+            std::vector<const MetalResidentColumn*> ex_ix(n_extras, nullptr);
             for (std::size_t e = 0; e < n_extras; ++e) {
                 if (!extras[e].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
                 ex[e] = &check_i64_nullable(*extras[e].vals);
-                if (ex[e]->rows() != keys.rows())
+                if (extras[e].index) ex_ix[e] = &check_index(*extras[e].index, *ex[e], op, "a payload");
+                if ((ex_ix[e] ? ex_ix[e]->rows() : ex[e]->rows()) != stmt_rows)
                     throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
             }
-            const auto& k = check_i64_nullable(keys);
             const MetalResidentColumn* v = vals ? &check_i64_nullable(*vals) : nullptr;
-            if (v && v->rows() != k.rows())
+            const MetalResidentColumn* v_ix = nullptr;
+            if (v && val_index) v_ix = &check_index(*val_index, *v, op, "the payload");
+            if (v && (v_ix ? v_ix->rows() : v->rows()) != stmt_rows)
                 throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
             GroupByResidentResult r{};
             r.rows_in = k.rows();
@@ -2960,28 +3366,39 @@ private:
             if (n_total > 0xFFFFFFFFull - 64)
                 throw std::runtime_error(std::string(op) + ": > 2^32-64 rows unsupported");
             if (filter.active()) (void)agg_code(filter.agg);   // reject avg early
+            std::vector<const MetalResidentColumn*> pred_ix(n_preds, nullptr);
             for (std::size_t p = 0; p < n_preds; ++p) {
                 if (!preds[p].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
                 if (preds[p].col->backend_tag() != Backend::METAL)
                     throw std::runtime_error("ResidentColumn mismatch (Metal predicate column)");
-                if (preds[p].col->rows() != n_total)
+                const auto& pc = static_cast<const MetalResidentColumn&>(*preds[p].col);
+                if (preds[p].index) pred_ix[p] = &check_index(*preds[p].index, pc, op, "a predicate column");
+                if ((pred_ix[p] ? pred_ix[p]->rows() : pc.rows()) != n_total)
                     throw std::runtime_error(std::string(op) + ": predicate column row count differs from the keys");
             }
+            bool any_lane_index = v_ix != nullptr;
+            for (std::size_t e = 0; e < n_extras; ++e) any_lane_index = any_lane_index || ex_ix[e];
+            for (std::size_t p = 0; p < n_preds; ++p) any_lane_index = any_lane_index || pred_ix[p];
 
             // ---- the direct path: one row-order pass over a group-id lane ----
             // Chosen here, inside the backend. It answers exactly what the
             // sort path below answers; what it cannot express it declines.
+            // Stage D1: this is the path that reads a lane THROUGH its index,
+            // because it reads every lane at the row and an index is one more
+            // load of a lane already bound.
             {
                 DirectPlan pl;
                 double dir_ms = 0.0;
-                if (direct_plan(k, v, extras, n_extras, preds, n_preds, filter, pl, &dir_ms)) {
+                if (direct_plan(k, v, v_ix, extras, ex_ix.data(), n_extras,
+                                preds, pred_ix.data(), n_preds, filter, pl, &dir_ms)) {
                     if (n_extras && filter.active() && !filter.wants(0))
                         throw std::runtime_error(std::string(op) + ": several payloads under a filter need the keys");
                     exact_path_note() = "direct";
                     exact_path_reason().clear();
                     exact_mask_note().clear();      // no mask stage on this path at all
                     GroupByResidentResult r2 = direct_impl(k, v, n_preds, max_groups, filter, op, pl,
-                                                           extras, n_extras, extra_out, t_wall0, dir_ms);
+                                                           extras, n_extras, extra_out, t_wall0,
+                                                           dir_ms + mat_ms);
                     maybe_shed(k, pl);
                     return r2;
                 }
@@ -2991,8 +3408,41 @@ private:
             exact_mask_note().clear();          // set below when there is a mask stage
             adopt_warm_scratch();
 
+            // ---- stage D1 on the sort path: the lane is gathered, not indexed ----
+            // The sort path does not read a lane at the row: it reads it at
+            // perm[i], the permutation that sorted the key. A lane with an
+            // index there would be a DOUBLE gather — perm, then the index —
+            // on a path whose reduce is already gather-bound, and the reduce
+            // is where its time goes. So this path takes the other half of
+            // the rule in §5.3: gather each indexed lane ONCE, here, and then
+            // run exactly the operator that ran before stage D, bit for bit.
+            // The gather is the one join_materialize would have done at
+            // residency build, so nothing is paid twice — it is paid later.
+            // The indexed read on this path is not built, and so is not
+            // claimed either way; what is measured is the direct path, where
+            // the index is free (BENCHMARK.md, 2026-09-19).
+            std::vector<std::unique_ptr<MetalResidentColumn>> owned_lanes;
+            std::vector<Predicate> preds_mat;
+            if (any_lane_index) {
+                auto take = [&](const MetalResidentColumn* c, const MetalResidentColumn* ix) {
+                    owned_lanes.push_back(materialise_indexed(*c, *ix, op, &mat_ms));
+                    return owned_lanes.back().get();
+                };
+                if (v_ix) v = take(v, v_ix);
+                for (std::size_t e = 0; e < n_extras; ++e) if (ex_ix[e]) ex[e] = take(ex[e], ex_ix[e]);
+                if (n_preds) {
+                    preds_mat.assign(preds, preds + n_preds);
+                    for (std::size_t p = 0; p < n_preds; ++p) {
+                        if (!pred_ix[p]) continue;
+                        preds_mat[p].col = take(static_cast<const MetalResidentColumn*>(preds[p].col), pred_ix[p]);
+                        preds_mat[p].index = nullptr;
+                    }
+                    preds = preds_mat.data();
+                }
+            }
+
             const std::size_t n = k.sort_rows();          // valid keys (the sort cache covers them)
-            double kernel_ms = 0.0;
+            double kernel_ms = mat_ms;    // stage D1: the gathers above, counted as this call's
             id<MTLBuffer> sorted = nil, perm = nil;
             if (n > 0) {
                 auto kv = k.ensure_sort_view(&kernel_ms);
@@ -3628,6 +4078,38 @@ private:
         return out;
     }
 
+    // ---- stage D1: the same operator, with an index on any input ----------
+    // The fan-out over payloads, the filter, the cap and the output contract
+    // are groupby_exact_masked_multi's; the only difference is that the key,
+    // the payloads and the predicate columns may each name an index vector,
+    // and with every index null the two calls are the same call.
+    std::vector<GroupByResidentResult> groupby_exact_masked_multi_indexed(
+        const IndexedColumn& keys, const MultiPayload* pays, std::size_t n_pays,
+        std::size_t filter_payload, const Predicate* preds, std::size_t n_preds,
+        std::size_t max_groups, const GroupByFilter& filter) override {
+        static const char* op = "groupby_exact_masked_multi_indexed";
+        if (!keys.col) throw std::runtime_error(std::string(op) + ": no key column");
+        if (n_pays == 0 || !pays) throw std::runtime_error(std::string(op) + ": no payload columns");
+        const std::size_t fp = filter.active() ? filter_payload : 0;
+        if (fp >= n_pays) throw std::runtime_error(std::string(op) + ": filter payload out of range");
+        std::vector<MultiPayload> extras;
+        std::vector<std::size_t> which;
+        for (std::size_t p = 0; p < n_pays; ++p)
+            if (p != fp && (pays[p].columns & ~std::uint32_t{0x9})) { extras.push_back(pays[p]); which.push_back(p); }
+        GroupByFilter f = filter;
+        f.columns = (pays[fp].columns & ~std::uint32_t{0x9}) | (filter.columns & 0x9u) | (extras.empty() ? 0u : 1u);
+        if (f.columns == 0) f.columns = 1u << 3;
+        std::vector<GroupByResidentResult> eout;
+        GroupByResidentResult prim = exact_impl(*keys.col, pays[fp].vals, preds, n_preds, max_groups, f, op,
+                                                extras.data(), extras.size(), &eout,
+                                                keys.index, pays[fp].index);
+        if (!(filter.columns & 1u)) { prim.keys.clear(); prim.key_null.clear(); }
+        std::vector<GroupByResidentResult> out(n_pays);
+        for (std::size_t j = 0; j < which.size(); ++j) out[which[j]] = std::move(eout[j]);
+        out[fp] = std::move(prim);
+        return out;
+    }
+
     // HAVING / top-k over the finalized exact tuple, on the device. `b` is
     // lo hi cnt cstar mn mx keys key_null(uchar), each `total` long.
     void device_filter_exact(GroupByResidentResult& r, const std::vector<id<MTLBuffer>>& b,
@@ -3899,6 +4381,31 @@ private:
         if (c.backend_tag() != Backend::METAL || c.dtype() != Dtype::F64)
             throw std::runtime_error("ResidentColumn mismatch (Metal/f64)");
         return static_cast<const MetalResidentColumn&>(c);
+    }
+
+    // ---- stage D1: what an index vector has to be before a kernel reads it ----
+    // The kernels read an index cell and use it as a row of `target` with no
+    // bound of their own, so the bound is checked here, once per call, on the
+    // host: an index whose cells could leave the column is a planner bug and
+    // must never reach the device. The scan is over the index's own min/max,
+    // which the column already tracks from its upload (stage C's narrow
+    // widths are derived from exactly that), so this costs no pass over the
+    // data.
+    static const MetalResidentColumn& check_index(const ResidentColumn& index,
+                                                  const MetalResidentColumn& target,
+                                                  const char* op, const char* what) {
+        if (index.backend_tag() != Backend::METAL)
+            throw std::runtime_error("ResidentColumn mismatch (Metal index vector)");
+        if (index.dtype() != Dtype::I64)
+            throw std::runtime_error(std::string(op) + ": the index of " + what + " must be I64");
+        const auto& ix = static_cast<const MetalResidentColumn&>(index);
+        if (target.rows() > 0xFFFFFFFFull)
+            throw std::runtime_error(std::string(op) + ": an indexed column of more than 2^32 rows");
+        if (!ix.index_within(target.rows()))
+            throw std::runtime_error(std::string(op) + ": an index cell of " + what +
+                                     " addresses a row outside a column with " +
+                                     std::to_string(target.rows()) + " rows");
+        return ix;
     }
 
     // ---- the direct path's pipelines, built on first use ----
@@ -4242,12 +4749,14 @@ private:
     void bind_mask_program(id<MTLComputeCommandEncoder> ce,
                            const std::vector<const MetalResidentColumn*>& lane,
                            const std::vector<GaggPred>& prog,
-                           const std::vector<std::int64_t>& lists) {
+                           const std::vector<std::int64_t>& lists,
+                           const std::vector<std::uint32_t>& idx_slot = {}) {
         GaggLaneMeta meta[kGaggLanes];
-        for (std::size_t i = 0; i < kGaggLanes; ++i) meta[i] = GaggLaneMeta{8u, 0u, 0u, 0u};
+        for (std::size_t i = 0; i < kGaggLanes; ++i) meta[i] = GaggLaneMeta{8u, 0u, 0u, kNoIdx};
         for (std::size_t i = 0; i < lane.size(); ++i)
             meta[i] = GaggLaneMeta{lane[i]->width(), lane[i]->valid_buffer() ? 1u : 0u,
-                                   lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+                                   lane[i]->dtype() == Dtype::F64 ? 1u : 0u,
+                                   i < idx_slot.size() ? idx_slot[i] : kNoIdx};
         grow(gbx_mmeta_, sizeof(meta), "where lane table");
         std::memcpy([gbx_mmeta_ contents], meta, sizeof(meta));
         grow(gbx_mprog_, std::max<std::size_t>(1, prog.size() * sizeof(GaggPred)), "where program");
@@ -4605,6 +5114,8 @@ private:
     id<MTLComputePipelineState> ps_jm_counts_             = nil;
     id<MTLComputePipelineState> ps_jm_pos_                = nil;
     id<MTLComputePipelineState> ps_jm_gather_             = nil;
+    id<MTLComputePipelineState> ps_jm_rows_               = nil;   // stage D1
+    id<MTLComputePipelineState> ps_ix_gather_             = nil;   // stage D1
 
     // Exact GROUP BY scratch: 5-long chunk partials, the finalized tuple
     // arrays (lo, hi, cnt, cstar, mn, mx, keys, key_null) kept on the device

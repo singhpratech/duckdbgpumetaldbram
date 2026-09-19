@@ -4352,3 +4352,93 @@ They are printed as measured.
 the machine, on the final code: 782 cells, 509 rewritten and at or above the
 bound, 273 declined by a threshold, 0 slower, 0 differing, exit 0. No threshold
 changed.
+
+## v0.8 stage D1 — a lane read through an index vector, Metal, SF1 + SF10 (2026-09-19)
+
+**Hardware / build:** Apple M4 Max (unified memory), macOS 25.6, `./scripts/build.sh`
+(`build-macos`, CPU + Metal), DuckDB via `gpudb.connect()` with `threads = 1`.
+`main` is `3c32d5a`; the branch is the same tree plus stage D1. Every A/B below
+interleaves the two sides — main, branch, main, branch — and reports the minimum
+AND the median of 7 timed iterations after the warm loop. Losing cells included.
+
+### 1. What the indexed read cost before it was used at all
+
+Stage D1 adds an indirection to every kernel that reads a lane. No SQL takes
+the indexed path yet, so any difference against `main` is pure overhead. The
+first shape put the test inside the row loop:
+
+| SF10 | Q1 | Q6 | Q12 | Q14 | Q17 | Q19 | Q22 | worst |
+|---|---|---|---|---|---|---|---|---|
+| branch / main, test in the loop | 1.082× | 1.116× | 1.110× | 1.118× | 1.085× | 1.148× | 1.055× | **1.148×** |
+| branch / main, compiled twice | 1.006× | 0.982× | 1.003× | 1.012× | 1.046× | 1.015× | 0.982× | 1.046× |
+| branch / main, final (lane table untouched when nothing is indexed) | 0.979× | 0.985× | 0.983× | 0.995× | 1.003× | 1.000× | 0.966× | 1.012× (Q3) |
+
+The cost was not the branch. `row` is the row loop's induction variable, so the
+address of `lane[row]` and the word of its validity bitmap strength-reduce
+across the loop; a row that comes back from a function does not. `gl_row` and
+`gpred_eval` are now templated on whether any lane of the dispatch is indexed,
+every kernel that reads a lane is built twice, and the dispatch picks its
+instance from a flag uniform over the grid.
+
+Full sweep, final code, two interleaved runs of the 22 TPC-H queries:
+
+| | queries on the device | worst branch/main (min) | at or below main | rows identical |
+|---|---|---|---|---|
+| SF10 | 17 | 1.012× (Q3, 13.59 → 13.75 ms) | 14 of 17 | 17 of 17 |
+| SF1 | 15 | 1.082× (Q4, 0.49 → 0.53 ms) | 11 of 15 | 15 of 15 |
+
+SF1 Q4, Q10 and Q21 were re-run three more interleaved times at N=15, because
+all three are under 3 ms and that is where a short kernel has two modes: Q4
+alternates between 0.49 and 0.59 ms on BOTH sides, and over the longer run the
+branch is 0.961× (Q4), 1.011× (Q10) and 0.996× (Q21) — spread, not a
+regression.
+
+### 2. What the index costs when it IS used
+
+The same lane read through an index vector against the same lane gathered into
+result order, on the exact grouped reduce: 16,000,000 probe rows joined to a
+200,000-row dimension on a unique key, one join per row, min / median of 7.
+"join build" is the residency-build call itself — `join_materialize` with five
+output lanes against `join_index` with the key lane materialised and two row
+vectors written at their narrow widths.
+
+| groups | payloads | WHERE | join build ms (materialise / index) | reduce ms materialised (min/med) | reduce ms indexed (min/med) | indexed / materialised |
+|---|---|---|---|---|---|---|
+| 4 | 1 | no | 13.8 / 9.4 | 1.78 / 1.80 | 2.10 / 2.11 | 1.180× |
+| 4 | 3 | no | 12.5 / 8.7 | 3.18 / 3.21 | 3.70 / 3.74 | 1.161× |
+| 4 | 1 | yes | 11.7 / 8.6 | 1.96 / 2.00 | 2.40 / 2.42 | 1.224× |
+| 64 | 1 | no | 11.9 / 8.6 | 1.77 / 1.84 | 2.06 / 2.12 | 1.163× |
+| 64 | 3 | no | 11.9 / 8.7 | 2.88 / 2.90 | 3.57 / 3.63 | 1.240× |
+| 64 | 1 | yes | 11.9 / 8.7 | 2.03 / 2.05 | 2.42 / 2.44 | 1.193× |
+| 1000 | 1 | no | 12.2 / 8.9 | 3.74 / 3.83 | 5.65 / 5.86 | 1.512× |
+| 1000 | 3 | no | 12.3 / 9.2 | 5.81 / 5.95 | 11.13 / 11.41 | 1.917× |
+| 1000 | 1 | yes | 12.8 / 9.5 | 5.21 / 5.36 | 8.89 / 9.06 | 1.706× |
+
+The indexed read loses on every shape tried — 1.16× at the smallest, 1.92× at
+the largest — and the loss grows with the groups and the payloads, because the
+gather is random where the materialised read is sequential and the more work a
+row brings the more of it is gather. The join that returns row vectors is
+1.3–1.4× faster to build than the one that gathers lanes.
+
+So stage D1's win is the residency build and the bytes, not the query, and the
+admission rule has to be written from that: a lane a hot statement reads per
+row keeps its materialised copy. That is the opposite of what the plan assumed
+and it is why nothing in SQL was switched over in this step.
+
+One host-side cost found by this sweep and removed: `join_index` proved
+`probe_identity` by scanning the whole probe-row vector whenever nothing was
+dropped, which is single-threaded and cost 4–5 ms at 16M rows. When every kept
+row is class 1 the vector is the identity by construction, so the scan now runs
+only for a join that kept every row AND put some of them in the NULL-key
+suffix.
+
+### 3. Correctness alongside
+
+`test/cpp/test_aggregator.cpp` 3023 / 3023 checks; under
+`GPUDB_METAL_MASK_DISABLE_PSO=1` 3023 / 3023 and `=unsupported` 3023 / 3023;
+under `GPUDB_METAL_DIRECT_DISABLE_PSO=1` 3017 / 3017 and `=unsupported`
+3025 / 3025 (the counts differ because the path a check runs on decides whether
+it applies). `scripts/run_sql_tests.sh`: 224 pass, 0 fail, 45 expected fails, 0
+unexpected. Join, GROUP BY and rewrite parity checks: 12 / 12, 12 / 12 and 8
+scenarios, 0 failed. Every rewritten TPC-H query above returned rows identical
+to native.

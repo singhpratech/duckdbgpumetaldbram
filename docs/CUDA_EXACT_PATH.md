@@ -205,3 +205,76 @@ structure; and let `resident_bytes()` follow, since that is what the budget
 reads. The parity proof is the ordinary one: `test/cpp/test_aggregator.cpp`'s
 shedding block runs every exact form over a shed column against the CPU
 reference, forces the sort path back onto it and compares again.
+
+## Stage D1 — lanes read through an index (2026-09-19)
+
+`gpu_backend.hpp` gained five additive things and changed nothing that exists.
+CUDA builds and runs unchanged without implementing any of them: the defaults
+refuse an index rather than ignore one, and `indexed_supported()` returns false,
+which is the gate the SQL layer reads before it plans an indexed set.
+
+What the CUDA side owes, when it comes to it:
+
+- **`IndexedColumn`** — a lane plus the index vector it is read through. An
+  index is an ordinary `Dtype::I64` resident column with one cell per row of the
+  statement; the cell is the row POSITION in the lane's column, not a DuckDB
+  rowid. `nullptr` is the identity and must cost exactly what a direct read
+  costs today. A NULL index cell makes every lane read through it NULL — that is
+  the unmatched side of an outer join, and it is the whole NULL story.
+- **The `index` fields** on `Predicate`, `MultiPayload` and `JoinLane`, honoured
+  in the mask kernels and the reduce kernels. The statement's row count is the
+  index's when a lane has one, and the column's own row count is then only the
+  bound its cells must respect. That bound is the implementor's to prove: the
+  kernels use a cell as a row with no check, so an out-of-range cell is a
+  planner bug that must be caught before a kernel sees it. Metal proves it on
+  the host from the index column's min and max over its valid cells, computed
+  once and cached on the column; the CPU reference checks every cell.
+- **`join_index`** — the same probe, uniqueness check and class-1/class-2 split
+  as `join_materialize`, stopping one kernel earlier: instead of one gather per
+  output lane it returns `probe_rows` and `build_rows`, plus whatever lanes the
+  caller still asked to materialise. `rows_out`, `null_key_rows` and the order
+  within each class must agree with `join_materialize` exactly. `probe_index`
+  is for a chained join, whose probe key is itself read through the previous
+  step's vector; composing the earlier vectors needs no new operator, because
+  gathering the old index at the new probe rows is an ordinary materialised
+  lane.
+- **`groupby_exact_masked_multi_indexed`** — exists only for an indexed KEY;
+  payload and predicate indexes travel on their own structs. With every index
+  null it must be `groupby_exact_masked_multi`, call for call.
+- **`indexed_supported()`** — true only once the above are real on the device.
+
+A note on where the index vectors are bound, because it cost a design revision
+on Metal: they are bound as ordinary lanes, sharing the per-statement lane
+budget, because the direct reduce had already used every argument-table slot the
+API offers. CUDA has no such limit and can bind them separately; the interface
+does not care either way.
+
+The parity proof is `test/cpp/test_aggregator.cpp`'s stage-D1 block. It runs on
+every backend that reports `indexed_supported()`, compares `join_index` plus
+indexed reads against `join_materialize` plus direct reads lane for lane where
+`join_index` exists, and otherwise holds the backend to the indexed read alone
+against host-built index vectors — the width boundaries, an F64 lane with NaN /
+±inf / -0.0, NULL cells in the lane, NULL cells in the index, and a refusal on
+an out-of-range cell. One allowance the block makes: a backend may refuse a KEY
+whose dtype it does not group on (Metal refuses an F64 key), and the block then
+requires BOTH forms to refuse — a refusal is an answer only if the index did not
+change it.
+
+Two findings from building it on Metal that a CUDA implementor should have
+before starting, because they are about shape rather than about Metal:
+
+- **Do not put the index test inside the row loop.** Reading a lane through a
+  runtime test cost the masked kernels 8–15% at SF10 with no statement indexed,
+  because a row returned from a function is not the loop's induction variable
+  and the address arithmetic for `lane[row]` and its validity word stops
+  strength-reducing. Metal templates the read and every kernel that uses it on
+  a compile-time flag, builds both, and picks one per dispatch from a value
+  uniform over the grid. CUDA has the same property and the same fix available.
+- **The indexed read is slower than the gathered lane, everywhere measured.**
+  On an M4 Max, 16M probe rows against a 200k dimension: 1.16–1.24× slower at
+  4–64 groups and 1.51–1.92× at 1000, growing with groups and payloads
+  (docs/RESIDENT_COLUMNS_DESIGN.md §8.2 has the table). What the index buys is
+  the residency build — the join that returns row vectors is 1.3–1.4× faster
+  than the one that gathers lanes — and the bytes. So rule 1 for stage D is a
+  memory rule, not a speed rule, and a backend that implements the mechanism
+  has not thereby made anything faster.
