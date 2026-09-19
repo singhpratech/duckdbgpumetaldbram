@@ -1723,26 +1723,41 @@ def run():
               f"view residency: back on the GPU after the write ({lr['reason']}, {lr['error'][:60]})")
         check(not any(s == "failed" for s in states.values()) and states[derived[0]] == "ready",
               f"view residency: no set is left failed ({states})")
-        # a column a base view reads is evicted under the budget: the join was
-        # materialised from that view, so it cannot stay ready either
+        # the budget shrinks to exactly what is resident, and a small, cheap
+        # statement wants the device. Value decides (§5.5): the only thing it
+        # could displace is the join materialised from the base views — a
+        # dependent, which is what would go first — and that join is worth more
+        # per byte than the newcomer, so the newcomer keeps running on DuckDB
+        # and says so. The sources' own lanes are never offered: dropping one
+        # from under the join would turn every guard of that join stale.
         used = (con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_store_columns()").fetchone()[0]
                 + con._raw.execute("SELECT coalesce(sum(bytes), 0) FROM gpu_residents()").fetchone()[0])
         con._manager.evict_min_age_s = 0.0
         con._manager.memory_budget = used                 # the next set has to evict to fit
         ev0 = con.memory()["evictions"]
-        con.execute("SELECT did, count(*) FROM jm GROUP BY did ORDER BY did").fetchall()
-        check(con.memory()["evictions"] > ev0,
-              f"view residency: the budget evicted to admit another set ({con.memory()['evictions'] - ev0})")
-        check(con._manager.get(derived[0]).state != "ready",
-              f"view residency: the join is not ready once a lane it was built from is evicted "
-              f"({con._manager.get(derived[0]).state})")
+        qm = "SELECT did, count(*) FROM jm GROUP BY did ORDER BY did"
+        wm = con._raw.execute(qm).fetchall()
+        same_m = True
+        for _ in range(3):
+            same_m = same_m and con.execute(qm).fetchall() == wm
+        lr = con.last_rewrite()
+        check(same_m and lr["reason"] == "memory",
+              f"view residency: the cheaper statement stays native, answer unchanged ({lr['reason']})")
+        check("ms/s" in (lr["detail"] or "") and "what making room would cost" in (lr["detail"] or "")
+              and "Nothing was evicted" in (lr["detail"] or ""),
+              f"view residency: the refusal names what making room would have cost, and that "
+              f"nothing was given up for it ({(lr['detail'] or '')[-120:]!r})")
+        check(con.memory()["evictions"] == ev0 and con._manager.get(derived[0]).state == "ready",
+              f"view residency: nothing more valuable was given up for it "
+              f"({con.memory()['evictions'] - ev0} evictions, join {con._manager.get(derived[0]).state})")
         con._manager.memory_budget = None
         for _ in range(3):
             want = con._raw.execute(jq).fetchall()
             got = con.execute(jq).fetchall()
-            check(got == want, "view residency: the answer is native's after the eviction too")
+            check(got == want, "view residency: the answer is right once the budget is lifted too")
+        con.execute(qm).fetchall()
         check(con.last_rewrite()["rewritten"] and not any(s == "failed" for s in con.residents().values()),
-              f"view residency: resident again after the eviction ({con.residents()})")
+              f"view residency: the refused set is resident once there is room ({con.residents()})")
     con.close()
 
     # ---- last_rewrite()['detail']: one sentence explaining the decision ----
@@ -1899,6 +1914,70 @@ def run():
     check(sorted(rel.fetchall()) ==
           sorted(con._raw.execute("SELECT k, sum(v) FROM t WHERE v > 5 GROUP BY k").fetchall()),
           "sql(): ... and still answers it")
+    con.close()
+
+    # ---- §4.23: an inner statement's groups are DuckDB's, not the client's ----
+    print("== inner-statement bounds")
+    con = fresh(thresholds=True, floor_rows=0)
+    if con._backend not in ("", "CPU"):
+        # 1000 groups under a WHERE that keeps ~10%: the client-facing plain form is
+        # declined by plain_min_selectivity, and the SAME GROUP BY consumed inside
+        # DuckDB is admitted — 30 rows read per group returned, well past the bound
+        plain = "SELECT k, sum(v) AS s FROM t WHERE v < 10 GROUP BY k"
+        con.execute(plain).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "threshold"
+              and "selectivity" in (lr["detail"] or ""),
+              f"inner: the client-facing form is still declined by the selectivity bound ({lr['detail']!r})")
+        reduced = f"SELECT count(*) AS n, max(s) AS top FROM ({plain}) gpudb_x"
+        want = con._raw.execute(reduced).fetchall()
+        got = con.execute(reduced).fetchall()
+        lr = con.last_rewrite()
+        check(got == want, "inner: an outer aggregate over it gets native's rows")
+        check(lr["rewritten"] and "inner-statement bounds" in (lr["detail"] or ""),
+              f"inner: ... and the detail names the rule that admitted it ({lr['detail']!r})")
+        # a consumer that does NOT reduce keeps the client-facing bounds
+        passthru = f"SELECT k, s FROM ({plain}) gpudb_x WHERE s IS NOT NULL"
+        want = sorted(con._raw.execute(passthru).fetchall())
+        got = sorted(con.execute(passthru).fetchall())
+        lr = con.last_rewrite()
+        check(got == want, "inner: a consumer that returns every group gets native's rows")
+        check(not lr["rewritten"], f"inner: ... and is still declined ({lr['reason']}, {lr['detail']!r})")
+        # ... and so does an inner statement that is not reducing enough: a WHERE
+        # keeping 1% leaves ~3 rows per group returned, below the measured bound
+        thin = "SELECT k, sum(v) AS s FROM t WHERE v = 3 GROUP BY k"
+        thin_in = f"SELECT count(*) AS n, max(s) AS top FROM ({thin}) gpudb_x"
+        want = con._raw.execute(thin_in).fetchall()
+        got = con.execute(thin_in).fetchall()
+        lr = con.last_rewrite()
+        check(got == want, "inner: a thin inner statement gets native's rows")
+        check(not lr["rewritten"] and lr["reason"] == "threshold"
+              and "rows read per group returned" in (lr["detail"] or ""),
+              f"inner: ... and the detail says the inner bounds do not apply either "
+              f"({lr['reason']}, {lr['detail']!r})")
+    con.close()
+
+    # ---- §4.23: the row floor counts the table a subquery lane reads ----
+    print("== the row floor and a subquery lane")
+    con = fresh(thresholds=True, floor_rows=200_000)
+    con.execute("CREATE TABLE tsmall AS SELECT (i % 40)::INTEGER AS k2, i::BIGINT AS w "
+                f"FROM range({N // 100}) r(i)")
+    con._big_tables = None                     # tsmall is new: re-read what is above the floor
+    if con._backend not in ("", "CPU"):
+        lane = ("SELECT k2, sum(w), count(*) FROM tsmall "
+                "WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = tsmall.k2) GROUP BY k2")
+        want = sorted(con._raw.execute(lane).fetchall())
+        for _ in range(3):
+            got = sorted(con.execute(lane).fetchall())
+        lr = con.last_rewrite()
+        check(got == want, "floor: a lane over a big table gets native's rows")
+        check(lr["rewritten"] and "subquery lane reads" in (lr["detail"] or ""),
+              f"floor: ... and the detail says which table the floor counted ({lr['detail']!r})")
+        # without the lane the same small table is still below the floor
+        con.execute("SELECT k2, sum(w) FROM tsmall GROUP BY k2").fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and "floor" in (lr["detail"] or ""),
+              f"floor: a small table on its own is still declined ({lr['detail']!r})")
     con.close()
 
     # store_columns(): what .residents prints per column, and it leaves last_rewrite() alone

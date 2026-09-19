@@ -1137,6 +1137,77 @@ One name-resolution fix came with this. `_views.inline` replaced any
 after a view would have been replaced by the view's body. It now skips names a
 `cte_map` in scope defines, which is what SQL does.
 
+### 4.23 An inner statement is not the statement the bounds were swept on
+Every output-size bound in `python/gpudb/_thresholds.py` — the plain form's
+group caps, its selectivity bound, the join form's two — was measured on a
+statement whose groups the CLIENT fetches. At large outputs that fetch is what
+the statement is bound by (§9.1, "Output cost"), which is why those bounds
+exist at all.
+
+When the nested pass (§4.14) lifts a `GROUP BY` out of a bigger statement, the
+groups are not fetched. DuckDB reads them out of the table function inside the
+same process, joins or re-aggregates or compares them, and one row — or a few —
+leaves. TPC-H Q13 is a derived table feeding an outer `GROUP BY`; Q15's CTE
+feeds a join and a scalar subquery and the statement returns one row. Applying
+a fetch-bound number to those is applying a measurement of one thing to
+another.
+
+**What decides instead.** The same quantity §4.22 found for the join bound:
+rows read per row returned, counted after the `WHERE`. The device wins by
+reducing; when it hands back nearly as many rows as survive the filter there is
+nothing left to win, whoever reads them. The sweep is
+`scripts/transparent_gate.py --inner`, which wraps every cell four ways — an
+outer aggregate, an outer `GROUP BY` over the inner aggregate (Q13's shape), a
+CTE against a scalar subquery over itself (Q15's shape), and a join back to the
+key's own table, which returns every group to the client after all. The numbers
+and the losing cells are in `_thresholds.py` and BENCHMARK.md; the bound is
+**7 rows read per group returned**.
+
+Three conditions, and only inside all three do the output bounds step aside:
+
+- the consumer **reduces**: the whole statement returns at least four times
+  fewer rows than the inner one produces. The join-back form is the measured
+  extreme — it reduces nothing — and it behaves exactly like the client-facing
+  plain form, winning and losing where that form does, so anything that
+  reducing is decided by the ordinary bounds;
+- the device is **reducing**: at least 7 rows kept per group returned;
+- the statement is inside the **measured envelope**: at most 2,000,000 groups,
+  which is just above the largest inner statement the sweep saw (Q13 at SF10,
+  1,488,128).
+
+Everything else is unchanged. `min_groups`, the VARCHAR-key rules, HAVING and
+top-k, the several-payload bounds and the `count(DISTINCT)` pair bounds all
+decide an inner statement as they decide any other, and the continuous measured
+rule 1 (§9.1) is the backstop for all of them.
+
+**How the wrapper knows.** It measures, once per statement text, and only when
+it would change the answer. The nested pass walks the statement offering each
+aggregate `SELECT` to the ordinary path; when one is declined by a bound,
+`decide()` is asked the same question a second time with the statement marked
+inner (a pure call, no probe) and records `inner_relaxable` if the answer would
+flip. Only then does `_consumer_rows` run one native `SELECT count(*) FROM
+(<the whole statement>)` and the walk repeat with that number. A statement
+whose sub-`SELECT` declines for any other reason — too few groups, too thin a
+reduction — never pays the probe. The number is part of the cached decision's
+key, because the same text decides differently where its groups go somewhere
+else.
+
+`last_rewrite()["detail"]` says which rule spoke: *the inner-statement bounds:
+1488128 groups reduced to 45 row(s) inside DuckDB, 10.1 rows read per group
+returned* when they admit, and when they decline it names both the bound that
+fired and the reason the inner bounds did not apply either.
+
+**The row floor is the same mistake, one level down.** The floor asks whether
+there is enough work to be worth a device at all, and it counted the rows of
+the statement's own `FROM`. A statement over a small table whose `WHERE` holds
+`NOT EXISTS (SELECT … FROM <big>)` makes native read `<big>` on every run; the
+device reads it once, during the upload, into a §4.18 lane. The join bounds
+already make that argument — native runs a join whatever the `FROM` says — and
+the floor did not. It now counts the largest table the answer depends on, the
+tables a subquery lane reads included, and says so in the detail. TPC-H Q22 is
+the case: 150,000 `customer` rows at SF1 over a `NOT EXISTS` on 1,500,000
+`orders` rows.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -1408,20 +1479,117 @@ same database — the extension stays free of threads and hidden connections
   - *What is resident and what it costs* comes from `gpu_residents()`
     (`bytes` includes derived structures). Sets uploaded by hand count toward
     the total and are never evicted.
-  - *Eviction* is least recently used by the extension's own `last_used_at`,
-    through `gpu_drop_resident` — and, since the store (§5.10), through
-    `gpu_drop_column` for the columns views share: a view costs nothing, its
-    columns are what the budget counts (`gpu_store_columns()`), and a column
-    goes when none of its views was used recently. Never evicted: a set an operator is using
-    (`refs > 0`), a source of the set being uploaded, a source of another
-    resident set (the derived set goes first — dropping a base table's set
-    from under a join would turn every guard of that join stale), and any set
-    uploaded less than 60 s ago (anti-thrash: two sets that do not fit
-    together must not evict each other on alternate statements).
-  - *A set that does not fit* — larger than the budget, or nothing evictable
-    yet — is not uploaded. Its statements keep running on DuckDB with
-    `last_rewrite()["reason"] == "memory"`; a refused set is asked about again
-    no sooner than the failed-upload retry time (30 s), not on every sighting.
+  - *Eviction* goes by what a set is WORTH (see "Value-aware residency"
+    below), through `gpu_drop_resident` — and, since the store (§5.10),
+    through `gpu_drop_column` for the columns views share: a view costs
+    nothing, its columns are what the budget counts (`gpu_store_columns()`),
+    and a column's worth is what the views over it are worth. Never evicted: a
+    set an operator is using (`refs > 0`), a source of the set being uploaded,
+    a source of another resident set and its store columns (the derived set
+    goes first — dropping a base table's lane from under a join would turn
+    every guard of that join stale).
+  - *A set that does not fit* — larger than the budget, or not worth more than
+    what it would have to displace — is not uploaded. Its statements keep
+    running on DuckDB with `last_rewrite()["reason"] == "memory"`, and
+    `detail` carries the arithmetic; a refused set is asked about again no
+    sooner than the failed-upload retry time (30 s), not on every sighting.
+- **Value-aware residency (2026-09-19).** Least recently used says nothing
+  about what a set is FOR. Under a budget smaller than the working set it lets
+  a set that saves 25 ms a run hold memory a set saving 250 ms a run needs,
+  and it lets a looping workload cycle evictions, each re-upload costing
+  seconds in the background while its statements run native. The quantities,
+  all in `python/gpudb/_residency.py`, all O(1) per statement:
+  - *The value of a set* is a decaying rate — the milliseconds of DuckDB time
+    it saves per second of wall time:
+    `Σ_uses saved_ms · e^(−age/τ) / τ`, τ = 300 s. It is one float per set,
+    updated on each use as `value ← value·e^(−Δt/τ) + saved_ms/τ`
+    (`note_use`, one dict lookup and one `exp()` under the manager's lock), so
+    a set that goes quiet stops holding memory a few minutes later without
+    anybody sweeping anything. `saved_ms` comes from the statement that just
+    ran (`Connection._note_value`): measured as `native − rewritten` where the
+    template's native time is known, and otherwise estimated from this
+    connection's own measured speedup S — the median of the templates that
+    have both times, clamped to [1.2, 20] and 2.0 until three have been
+    measured. A use of a set that is NOT resident (the statement ran native)
+    is an estimate, not a measurement, and counts for half a resident use;
+    that is what makes residency sticky, because at equal true value a
+    resident set's accumulator then grows twice as fast as its challenger's
+    and the two cannot trade places.
+  - *Value per byte* is what admission compares, because bytes are what
+    eviction frees. A set's value is spread over the store columns it reads in
+    proportion to what each one costs, and a column read by several sets
+    carries the sum of their shares — so evicting one reader of a shared
+    column, which frees nothing, is never mistaken for a saving.
+  - *The value of a candidate* that has never been resident: its native time
+    and its sighting rate are known, its speedup is not, so its saving is
+    estimated through S and credited on every sighting exactly like a use. A
+    candidate nobody has measured at all — the first sighting of a template on
+    a connection whose budget is already full — is priced at the MEDIAN value
+    density of what is resident: absent evidence, a set is worth what this
+    connection's sets are typically worth, which lets it displace the cheapest
+    thing there is and nothing better. Being wrong is self-correcting, because
+    one statement later the measurement replaces the guess in the same
+    accumulator.
+  - *Admission vs eviction: snapshot, plan, then execute.* `_make_room` takes
+    a snapshot of what is resident, builds the WHOLE eviction plan over it
+    without dropping anything (`_plan`), and only then executes it
+    (`_evict`). A plan that cannot reach the budget, or is not worth
+    executing, refuses with everything still resident. The earlier shape
+    dropped one unit at a time inside the loop that was still deciding, so it
+    could run out of acceptable victims *after* destroying several for a
+    candidate it then declined anyway — measured at SF10/12 GiB: ~1.9 GiB of
+    resident sets torn down in one loop by two candidates that both ended up
+    native, and a third query pushed off the device as a result.
+    `memory()["evictions_wasted"]` counts evictions that bought nothing and is
+    0 by construction now except when a drop itself fails; a failed drop makes
+    the caller re-plan against a fresh snapshot rather than carry on against a
+    picture that is no longer true (three plans, then a refusal).
+  - *Two quantities, two jobs.* **Value per byte decides WHO goes** — units
+    are taken cheapest first, because a byte freed from a low-density unit
+    costs the least value; ties break to least recently used, and a unit the
+    minimum age protects sorts last whatever its value. **Total value decides
+    WHETHER** — the plan runs only if the candidate is worth more than
+    everything in it put together, by a hysteresis margin of 1.25. A candidate
+    that needs three victims must beat the three together, not merely be
+    denser than each; that is the exchange that makes the resident population
+    better rather than only differently arranged, and it is why a small cheap
+    set never displaces a large valuable one. The margin is also the whole
+    anti-ping-pong argument: A displaces B only if v(A) > 1.25·v(B), and B
+    cannot displace A back without v(B) > 1.25·v(A). When the candidate is
+    refused, `detail` names the plan and what it would have cost.
+  - *The minimum age* (60 s) is what it always was — anti-thrash — but stated
+    as what it is for: a set gets the chance to pay back its upload, and
+    paying back means answering a statement. So a unit is protected while it
+    is younger than 60 s AND has not yet saved anybody anything; after that it
+    competes on value, however young. This was decided by measurement: the
+    22-query TPC-H run fills the budget inside 60 s and every set in it has
+    already answered by the time the next statement arrives, so a wall-clock
+    minute was refusing Q18 (15×) and Q19 (14.5×) the device that Q13 and Q15
+    had just taken. A still-unproven unit can be interrupted only by a
+    candidate worth twice the typical resident set, and a set that an override
+    took off the device may not override its way back for 60 s — so two sets
+    cannot ping-pong through a third.
+  - *Where it runs, and what it costs.* `_make_room` is called from the
+    background worker's thread in the default residency mode, and inline only
+    under `residency='eager'`, which uploads synchronously by design. The
+    policy's own arithmetic (`_plan`: densities, the median, the victim order,
+    the two rules) measured 0.104 ms median and 0.115 ms maximum over 36 calls
+    under real contention at SF10; the rest of `_make_room`'s wall time is the
+    `gpu_drop_*` calls it executes, which is device work and only happens when
+    a candidate has been accepted.
+  - *Explainability.* `Connection.memory()` reports `value` (ms saved per
+    second), `density` (the same per GiB) and `evictions_wasted`; the shell's
+    `.residents` prints the density as `worth`; every eviction log line says
+    what went and what it was worth against the set that displaced it, and
+    every refusal ends "Nothing was evicted".
+  - *Where index vectors plug in.* PR #142 (a join set held as row-index
+    vectors: 1.2–1.9× slower to read, much smaller) is the other lever on this
+    same pressure. In these terms it is a second FORM of a set with a
+    different point on the value/bytes curve — lower value, far fewer bytes,
+    so usually a higher density. The place it attaches is admission: when a
+    candidate is refused, or when it would have to evict something denser,
+    re-price it in its index-vector form and compare that density instead of
+    declining. Nothing else in the policy changes; it is out of scope here.
   `GPUDB_UPLOAD_POOL_MAX_MB` stays what it is — the extension-side cap on
   **host** upload buffering — and is documented as such.
 - **Upload cost (measured 2026-09-17).** A statement's time on the device is
@@ -1758,6 +1926,24 @@ state. The user's own statement is never the experiment. In the gate a row
 that measures slower in the slow mode reads `declined after the first run
 (threshold)`: no ratio, and no statement ran slower for a user.
 
+**Inner bounds and client-facing bounds (measured 2026-09-19).** A threshold is
+a measurement of a particular situation, and the situation every output-size
+bound here was measured in is *the client fetches the groups*. Three TPC-H
+declines turned out to be that measurement applied to a different situation —
+a statement whose groups DuckDB reads out of the table function and consumes
+itself — and a fourth, the row floor, was counting the wrong table. §4.23 has
+the rule and the sweep; what belongs here is the shape of the argument. A bound
+does not move because a query would be faster past it: `--no-thresholds` said
+Q13 was worth 10.91×, but `--no-thresholds` is not the shipping plan forced
+(for Q18 it picks a path that is 0.03× of native), so each of the three was
+re-measured with **one bound overridden and everything else shipping**, which
+is the path the code would actually take. Then the rule itself came from a
+sweep of its own — the same cells as the plain and join forms, wrapped in four
+different consumers — and it was placed where every admitted cell measured at
+least 1.29× and every cell below 1.0× stayed declined, not where TPC-H wanted
+it. Two cells that measure 1.05× are declined by it; that is the direction a
+bound is allowed to be wrong in.
+
 **A faster kernel is not a looser threshold (2026-09-18).** The direct grouped
 reduce (§4.1, `docs/RESIDENT_COLUMNS_DESIGN.md` §7) makes a few-group exact
 GROUP BY 1.65× to 8.57× faster at SF10, which is the obvious moment to ask
@@ -1794,6 +1980,15 @@ shadowing / `ATTACH` + `USE` / a second connection writing / a write inside
 an open transaction with the query before and after `COMMIT`.
 
 ### 9.3 `scripts/transparent_gate.sh` (rule 1)
+Form groups the script adds on request, each the same grid of keys,
+selectivities and joins seen through a different surface: `--exprs` (computed
+lanes, §4.10), `--subqueries` (§4.18 lanes), `--ctes` (§4.22), `--inner` (the
+same `GROUP BY` consumed inside DuckDB by four different consumers, §4.23) and
+`--lane-floor` (a small table whose work is a lane over a large one — what the
+row floor should count). `--forms` restricts a run to named forms and
+`--no-thresholds` turns every bound off, which is how the tables those bounds
+are read off are collected; neither is the shipping configuration.
+
 Every rewritable shape and every §9.1 sweep point, transparent vs native,
 same process, warm, min-of-N with N ≥ 5 and the GPU clock printed beside
 each row (the 4090's boost clock is bimodal, 1665–2400 MHz, and a 1.0× row

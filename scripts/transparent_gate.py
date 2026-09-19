@@ -50,10 +50,32 @@ FORMS = ("plain", "having", "topk", "projected", "nested", "distinct")
 # FROM, `cte_arm` is one arm of a join — the shape a project-and-join CTE folds
 # into. Both are measured against the same statement written without the CTE.
 CTE_FORMS = ("cte", "cte_arm")
+# --inner: the SAME GROUP BY, but its result is consumed inside DuckDB instead
+# of by the client (§4.23). The plain and join forms' output bounds were swept
+# on statements whose groups the client materialises; these four say what the
+# same groups cost when DuckDB reads them out of the table function. Three
+# consumers REDUCE the result (one row, or far fewer rows, leave), one does not.
+#   inner_agg    an outer aggregate over the derived table
+#   inner_group  an outer GROUP BY over the inner aggregate (TPC-H Q13's shape)
+#   inner_scalar a CTE compared against a scalar subquery over itself (Q15's shape)
+#   inner_join   a join back to the key's own table — every inner group still
+#                reaches the client, so this is the consumer that does NOT reduce
+INNER_FORMS = ("inner_agg", "inner_group", "inner_scalar", "inner_join")
+# key column -> (table, its key column, a payload column) for the join-back consumer
+BACK_JOIN = {
+    "l_orderkey": ("orders", "o_orderkey", "o_orderstatus"),
+    "l_partkey":  ("part", "p_partkey", "p_brand"),
+    "l_suppkey":  ("supplier", "s_suppkey", "s_nationkey"),
+    "o_custkey":  ("customer", "c_custkey", "c_nationkey"),
+    "c_custkey":  ("customer", "c_custkey", "c_nationkey"),
+}
 # key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
 # applies where its table is part of the join
 JOINS = {
-    "li x orders":            ("lineitem JOIN orders ON l_orderkey = o_orderkey", ["o_custkey", "o_orderdate", "l_suppkey"]),
+    # `l_orderkey` is the high-cardinality key over a join (1.5M groups at SF1): the shape
+    # the join output bounds and the inner-statement bounds (§4.23) both decide
+    "li x orders":            ("lineitem JOIN orders ON l_orderkey = o_orderkey",
+                               ["o_custkey", "o_orderdate", "l_suppkey", "l_orderkey"]),
     "li x orders x customer": ("lineitem JOIN orders ON l_orderkey = o_orderkey JOIN customer ON o_custkey = c_custkey",
                                ["c_nationkey", "c_custkey"]),
     "li x part":              ("lineitem JOIN part ON l_partkey = p_partkey", ["p_brand", "p_size"]),
@@ -74,8 +96,27 @@ JOIN_WHERES = {          # predicate -> the table it needs in the join ('' = any
 
 EXTRA_PAYLOADS = ["sum(l_extendedprice)", "max(l_tax)", "sum(l_discount)", "min(l_partkey)"]
 
+# --lane-floor (§4.23): what the row floor should count. Each cell reads a
+# SMALL table and carries a subquery lane (§4.18) over a much larger one, so
+# native's work is the lane and the statement's own FROM says nothing about it.
+# (table, its rows at SF1, key column, payload column, its own key, the table
+#  the lane reads, that table's join column, and a filter for the IN form)
+LANE_SOURCES = [
+    ("supplier", "s_nationkey",      "s_acctbal",      "s_suppkey", "lineitem", "l_suppkey",
+     "l_discount > 0.09 AND l_quantity > 49 AND l_shipdate > DATE '1998-10-01'"),
+    ("customer", "c_nationkey",      "c_acctbal",      "c_custkey", "orders",   "o_custkey",  "o_totalprice > 100000"),
+    ("customer", "c_mktsegment",     "c_acctbal",      "c_custkey", "orders",   "o_custkey",  "o_totalprice > 100000"),
+    ("part",     "p_brand",          "p_retailprice",  "p_partkey", "lineitem", "l_partkey",  "l_quantity > 45"),
+    ("part",     "p_size",           "p_retailprice",  "p_partkey", "lineitem", "l_partkey",  "l_quantity > 45"),
+    ("partsupp", "ps_availqty",      "ps_supplycost",  "ps_partkey", "lineitem", "l_partkey", "l_quantity > 45"),
+    ("orders",   "o_orderpriority",  "o_totalprice",   "o_orderkey", "lineitem", "l_orderkey", "l_discount > 0.09"),
+    ("orders",   "o_custkey",        "o_totalprice",   "o_orderkey", "lineitem", "l_orderkey", "l_discount > 0.09"),
+]
+LANE_KINDS = ("not exists", "in", "scalar")
+
 
 PAYLOAD = "l_quantity"            # --exprs swaps it for REVENUE (a computed lane, §4.10)
+SOURCE_PAYLOAD = {}               # --lane-floor: a FROM table that is not lineitem has its own
 REVENUE = "l_extendedprice * (1 - l_discount)"
 
 
@@ -83,33 +124,59 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     """`payloads` > 1 adds aggregates over further columns (§4.9: one device
     pass per payload column)."""
     w = f" WHERE {where}" if where else ""
+    pay = SOURCE_PAYLOAD.get(source, PAYLOAD)
     more = "".join(", " + e for e in EXTRA_PAYLOADS[:payloads - 1])
     if form == "plain":
-        return f"SELECT {key}, sum({PAYLOAD}){more}, count(*) FROM {source}{w} GROUP BY {key}"
+        return f"SELECT {key}, sum({pay}){more}, count(*) FROM {source}{w} GROUP BY {key}"
     if form == "distinct":
-        return (f"SELECT {key}, count(DISTINCT l_shipmode) AS modes, sum({PAYLOAD}) AS q{more} "
+        return (f"SELECT {key}, count(DISTINCT l_shipmode) AS modes, sum({pay}) AS q{more} "
                 f"FROM {source}{w} GROUP BY {key}")
     if form == "nested":
-        return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({PAYLOAD}) AS q{more} "
-                f"FROM {source}{w} GROUP BY {key} HAVING sum({PAYLOAD}) > {having_thr}) gpudb_x")
+        return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({pay}) AS q{more} "
+                f"FROM {source}{w} GROUP BY {key} HAVING sum({pay}) > {having_thr}) gpudb_x")
+    if form == "inner_agg":       # §4.23: the groups are reduced again, inside DuckDB
+        return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low "
+                f"FROM (SELECT {key} AS kk, sum({pay}) AS q{more} FROM {source}{w} GROUP BY {key}) gpudb_i")
+    if form == "inner_group":     # §4.23: an outer GROUP BY over the inner aggregate (Q13's shape)
+        return (f"SELECT c, count(*) AS n FROM (SELECT {key} AS kk, count(*) AS c{more} "
+                f"FROM {source}{w} GROUP BY {key}) gpudb_i GROUP BY c ORDER BY n DESC, c DESC")
+    if form == "inner_scalar":    # §4.23: a CTE against a scalar subquery over itself (Q15's shape)
+        return (f"WITH gpudb_i AS (SELECT {key} AS kk, sum({pay}) AS q{more} FROM {source}{w} GROUP BY {key}) "
+                f"SELECT kk, q FROM gpudb_i WHERE q = (SELECT max(q) FROM gpudb_i)")
+    if form == "inner_join":      # §4.23: the consumer that does NOT reduce — every group reaches the client
+        tbl, pk, col = BACK_JOIN[key]
+        return (f"SELECT gpudb_i.kk, gpudb_i.q, {tbl}.{col} "
+                f"FROM (SELECT {key} AS kk, sum({pay}) AS q{more} FROM {source}{w} GROUP BY {key}) gpudb_i "
+                f"JOIN {tbl} ON gpudb_i.kk = {tbl}.{pk}")
     if form == "cte":             # §4.22: a project-and-join CTE that is the whole FROM
-        return (f"WITH gpudb_src AS (SELECT {key} AS gpudb_k, {PAYLOAD} AS gpudb_v FROM {source}{w}) "
+        return (f"WITH gpudb_src AS (SELECT {key} AS gpudb_k, {pay} AS gpudb_v FROM {source}{w}) "
                 f"SELECT gpudb_k, sum(gpudb_v), count(*) FROM gpudb_src GROUP BY gpudb_k")
     if form == "cte_arm":         # §4.22: the same CTE as one ARM of a join
-        return (f"WITH gpudb_src AS (SELECT l_orderkey AS gpudb_ok, {key} AS gpudb_k, {PAYLOAD} AS gpudb_v "
+        return (f"WITH gpudb_src AS (SELECT l_orderkey AS gpudb_ok, {key} AS gpudb_k, {pay} AS gpudb_v "
                 f"FROM lineitem{w}) "
                 f"SELECT gpudb_k, sum(gpudb_v), count(*) FROM gpudb_src, orders "
                 f"WHERE gpudb_ok = o_orderkey AND o_orderstatus = 'F' GROUP BY gpudb_k")
     if form == "global":          # no GROUP BY (§4.12): the global masked aggregate
-        return f"SELECT sum({PAYLOAD}) AS q, count(*){more} FROM {source}{w}"
+        return f"SELECT sum({pay}) AS q, count(*){more} FROM {source}{w}"
     if form == "projected":
-        return (f"SELECT {key}, sum({PAYLOAD}) / count(*) AS mean{more} FROM {source}{w} GROUP BY {key} "
-                f"HAVING sum({PAYLOAD}) > {having_thr} AND count(*) > 1")
+        return (f"SELECT {key}, sum({pay}) / count(*) AS mean{more} FROM {source}{w} GROUP BY {key} "
+                f"HAVING sum({pay}) > {having_thr} AND count(*) > 1")
     if form == "having":
-        return (f"SELECT {key}, sum({PAYLOAD}) AS q{more} FROM {source}{w} GROUP BY {key} "
-                f"HAVING sum({PAYLOAD}) > {having_thr}")
-    return (f"SELECT {key}, sum({PAYLOAD}) AS q{more} FROM {source}{w} GROUP BY {key} "
+        return (f"SELECT {key}, sum({pay}) AS q{more} FROM {source}{w} GROUP BY {key} "
+                f"HAVING sum({pay}) > {having_thr}")
+    return (f"SELECT {key}, sum({pay}) AS q{more} FROM {source}{w} GROUP BY {key} "
             f"ORDER BY q DESC LIMIT 10")
+
+
+def lane_where(kind: str, own_key: str, big: str, big_key: str, filt: str, payload: str) -> str:
+    """The §4.18 subquery predicate of a --lane-floor cell."""
+    if kind == "not exists":
+        return f"NOT EXISTS (SELECT 1 FROM {big} WHERE {big_key} = {own_key} AND {filt})"
+    if kind == "in":
+        return f"{own_key} IN (SELECT {big_key} FROM {big} WHERE {filt})"
+    # a correlated scalar: the lane DuckDB evaluates once, during the upload
+    col = {"lineitem": "l_extendedprice", "orders": "o_totalprice"}[big]
+    return f"{payload} < (SELECT 0.5 * avg(gpudb_b.{col}) FROM {big} gpudb_b WHERE gpudb_b.{big_key} = {own_key})"
 
 
 PACE_S = 0.0     # --pace-ms: idle gap before EVERY timed statement
@@ -149,8 +216,15 @@ def main() -> int:
                     help="aggregate l_extendedprice * (1 - l_discount) and add an expression WHERE (computed lanes)")
     ap.add_argument("--ctes", action="store_true",
                     help="add the WITH forms: a project-and-join CTE as the FROM and as a join arm (§4.22)")
+    ap.add_argument("--inner", action="store_true",
+                    help="add the inner-statement forms: the same GROUP BY consumed inside DuckDB (§4.23)")
+    ap.add_argument("--lane-floor", action="store_true",
+                    help="sweep small tables carrying a subquery lane over a large one — what the row floor "
+                         "should count (§4.23); replaces the lineitem sweep unless --no-single is absent")
     ap.add_argument("--subqueries", action="store_true",
                     help="add EXISTS / IN / correlated scalar subquery predicates (BOOLEAN lanes, §4.18)")
+    ap.add_argument("--forms", default="all",
+                    help="'all' or a ','-separated list of form names to restrict the sweep to")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
     ap.add_argument("--memory-budget", default="unlimited",
                     help="device memory budget for the run (§5.5); the gate sweeps more distinct sets than a "
@@ -192,9 +266,9 @@ def main() -> int:
     keys = [k for k in args.keys.split(",") if k]
     wheres = list(WHERES) if args.wheres == "all" else args.wheres.split(";")
     fails = []
-    cells = []          # (source label, FROM clause, key, where)
+    cells = []          # (source label, FROM clause, key, where, forms or None)
     if not args.no_single:
-        cells += [("", "lineitem", key, where) for where in wheres for key in keys]
+        cells += [("", "lineitem", key, where, None) for where in wheres for key in keys]
     if args.joins != "none":
         labels = list(JOINS) if args.joins == "all" else args.joins.split(";")
         for label in labels:
@@ -202,9 +276,15 @@ def main() -> int:
             for where, table in JOIN_WHERES.items():
                 if table and not re.search(rf"\b{table}\b", source):
                     continue
-                cells += [(label, source, key, where) for key in jkeys]
+                cells += [(label, source, key, where, None) for key in jkeys]
+    if args.lane_floor:
+        for src, key, pay, own, big, bkey, filt in LANE_SOURCES:
+            for kind in LANE_KINDS:
+                SOURCE_PAYLOAD[src] = pay
+                cells.append((f"{src} + a {kind} lane over {big}", src, key,
+                              lane_where(kind, own, big, bkey, filt, pay), ("plain", "having")))
     sel_cache = {}
-    for label, source, key, where in cells:
+    for label, source, key, where, only_forms in cells:
         w = f" WHERE {where}" if where else ""
         if (source, where) not in sel_cache:
             kept, total = con._raw.execute(
@@ -212,9 +292,10 @@ def main() -> int:
             sel_cache[(source, where)] = f"{100.0 * kept / total:.0f}%" if total else "—"
         sel = sel_cache[(source, where)]
         key_label = f"{label}: {key}" if label else key
+        pay = SOURCE_PAYLOAD.get(source, PAYLOAD)
         # a HAVING threshold that keeps roughly 1% of the groups
         thr = con._raw.execute(
-            f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum({PAYLOAD}) q FROM {source}{w} GROUP BY {key})"
+            f"SELECT quantile_cont(q, 0.99) FROM (SELECT sum({pay}) q FROM {source}{w} GROUP BY {key})"
         ).fetchone()[0]
         thr_s = f"{thr:.2f}" if thr is not None else "0"
         if True:
@@ -225,6 +306,14 @@ def main() -> int:
                 # `cte_arm` joins lineitem to orders itself, so it is only run over
                 # the single-table sweep (where the WHERE names lineitem alone)
                 forms += CTE_FORMS if not label else ("cte",)
+            if args.inner:
+                # the join-back consumer needs a table the key is a key OF
+                forms += tuple(f for f in INNER_FORMS if f != "inner_join" or key in BACK_JOIN)
+            if only_forms is not None:
+                forms = only_forms
+            if args.forms != "all":
+                want = args.forms.split(",")
+                forms = tuple(f for f in forms if f in want)
             for form in forms:
                 sql = build(key, where, form, thr_s, source, args.payloads)
                 # native

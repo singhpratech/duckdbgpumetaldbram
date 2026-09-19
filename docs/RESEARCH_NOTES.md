@@ -2317,6 +2317,243 @@ Final: 956 cells, 628 rewritten, 328 declined, 0 below 1.0×, 0 differing. The
 CTE forms carry no bound of their own — after the splice they ARE the plain and
 join forms.
 
+## 2026-09-19 — A bound is a measurement of a situation, and three of ours were in the wrong one
+
+The §4.22 work ended by writing down that three TPC-H declines are
+conservative, with the rule that declines each one named, "which is what the
+next sweep needs". This is that sweep, and the first thing it had to do was not
+believe the numbers that motivated it. `--no-thresholds` said Q13 at SF10 was
+worth 10.91x, but `--no-thresholds` drops every bound and the row floor at
+once, and for Q18 it picks a path that is 0.03x of native. So each of the three
+was re-run with ONE bound overridden and everything else shipping, which is the
+path the code would take once that bound moves. Q13 at SF10: 10.64x and 17.07x
+over two rounds. Q15: 1.72-1.95x at SF1 and 1.63-2.05x at SF10. Q22 at SF1:
+10.17-10.62x, better than the 7.71x the forced run had reported. Two
+corrections came out of that alone. Q13 declines on BOTH join output bounds,
+not the group cap only — with just that one lifted it still reads `10.1 rows
+per group over a join with 1488128 groups < 16.0`. And Q15 at SF10 declines on
+two as well, neither of which its log tail names; that tail says `declined
+(not_found, device): table`, which is the same trap that cost an hour last
+time.
+
+**What the three have in common.** Every output-size bound in `_thresholds.py`
+was swept on a statement whose groups the CLIENT fetches, where Python
+materialisation is what a large result is bound by. Q13's and Q15's groups are
+not fetched: the nested pass lifted their GROUP BY out of a bigger statement,
+DuckDB reads the groups out of the table function inside the same process, and
+one row — or forty-five — leaves. Q22's is the row floor, which counted
+`customer`'s 150,000 rows while the work is a `NOT EXISTS` over 1,500,000
+`orders` rows that §4.18 turns into a lane. Three applications of a measurement
+of one situation to a different one.
+
+**The sweep, and the thing it refused to be.** `transparent_gate.py --inner`
+runs the same cells wrapped four ways: an outer aggregate, an outer GROUP BY
+over the inner aggregate (Q13's shape), a CTE against a scalar subquery over
+itself (Q15's shape), and — the control — a join back to the key's own table,
+which returns every group to the client after all. The tempting conclusion was
+"output bounds do not apply to an inner statement", and the sweep says that is
+false twice over. At 1.5M groups over `lineitem` with no WHERE the reducing
+consumers measure **0.44x, 0.97x and 0.44x**: native answers `SELECT count(*),
+max(q) FROM (a 1.5M-group GROUP BY)` in 9.4 ms, and moving 1.5M rows through
+the table function for DuckDB to reduce costs 21 ms. And at 187K groups under a
+9% WHERE they measure 0.71-0.73x. An inner statement is cheaper at the client
+end and not at the other one.
+
+What separates the winners from the losers is not the group count — 150K groups
+lose under a 9% WHERE and win 1.47x under a 25% one — and not the selectivity —
+9% wins at 50K groups and loses at 150K. It is **rows kept per row returned**,
+which is the quantity §4.22 already found for the join bound, now counted after
+the WHERE instead of before it. Every losing inner cell sits at 2.9 to 4.0
+rows per group; the band at 5.4 measures 1.05-1.34x; every cell at 7.5 or more
+measures 1.29x or better. The bound went at 7, between the last loser and the
+first clear winner, which declines two cells that measured 1.05x. TPC-H sits
+well inside it: Q13 reads 10.1 rows per group at SF10, Q15 24.5.
+
+The join-back control earned its place. It behaves like the client-facing plain
+form — 1.24-1.35x at 200K groups, 0.93x at 1.5M, 0.97x at 187K under the 9%
+WHERE — because the client does materialise its groups. So "inner" is not a
+property of where the SELECT sits in the syntax; it is a property of what the
+consumer does with the rows, and the wrapper has to measure that. It does, once
+per statement text and only when it would change the answer: when a bound
+declines a sub-SELECT, `decide()` is asked the same question a second time with
+the statement marked inner (a pure call, no I/O), and only if the answer flips
+does one native `SELECT count(*) FROM (<the whole statement>)` run and the walk
+repeat. A sub-SELECT declined for too few groups, or too thin a reduction,
+never pays for the probe.
+
+**The floor was the easy one and the most satisfying.** 48 cells: five outer
+tables from 10K to 1.5M rows, each with a `NOT EXISTS` / `IN` / correlated-avg
+lane over a table ten times its size. 1.22x to 31.44x, none below 1.0x. Four of
+the five are under the million-row floor and every one of them wins, for the
+reason the join bounds already state out loud — native runs the subquery on
+every statement, the device runs it once during the upload. The floor now
+counts the largest table the answer depends on, lanes included, and
+`last_rewrite()['detail']` says which table that was.
+
+One diagnostic came along for free. When the nested pass found a rewritable
+SELECT and a BOUND declined it, the statement used to report `shape` — "not a
+shape the rewrite expresses" — which is the log-tail-as-diagnosis problem
+again, this time inside the wrapper. It now reports `threshold` and the bound's
+own words, and when the inner bounds would not have helped either it says so:
+`selectivity 0.01 < 0.5 for the plain form; 2.5 rows read per group returned <
+7.0, so the inner-statement bounds do not apply either`.
+
+Nothing about which SQL is produced changed. The rewritten statements are the
+ones the wrapper already wrote; what moved is which of them are admitted.
+
+## 2026-09-19 — Least recently used knows when, not what for
+
+The previous entry ends on a regression it measured honestly and left standing:
+with the inner-statement bounds in, TPC-H Q13 and Q15 join the device at SF10,
+their sets fill the default 16 GiB budget first, and Q18 (15x) and Q19 (14.5x)
+then report `native (memory)` where main answers them on the device. The note
+said it was the budget and not a threshold, which was true and not the whole
+truth. The budget was fine. The policy was the problem: eviction was least
+recently used with a 60 s minimum age, admission was first come first served,
+and nothing anywhere knew what a set was FOR. A set saving 25 ms a run could
+hold the memory a set saving 250 ms a run needed, and whichever statement
+happened to arrive last was the one refused.
+
+**What a set is worth turns out to be one float.** The milliseconds of DuckDB
+time it saves per second of wall time, as a decaying sum:
+`sum over uses of saved_ms * e^(-age/tau) / tau`, tau five minutes. Written that
+way it updates in O(1) on each use - `value = value*e^(-dt/tau) + saved_ms/tau`
+- so there is no sweep, no list of past uses, and a set that goes quiet stops
+holding memory a few minutes later on its own. Divided by the bytes it costs it
+becomes a density, and density is what admission compares, because bytes are
+what eviction frees.
+
+The saving itself the wrapper already measures for rule 1. Where a template has
+both times it is `native - rewritten`; where it has one it is estimated through
+this connection's own median speedup, the median of the templates that have
+both, clamped and 2.0 until three exist. A use of a set that is NOT resident -
+the statement ran native - is an estimate and counts for half a resident use,
+which is the whole anti-ping-pong story: at equal true value a resident set's
+accumulator grows twice as fast as its challenger's, so the two cannot trade
+places.
+
+**Three things the first measurement made me change, each of which I had got
+wrong on paper.**
+
+The first was where value lives. A view over a table store costs nothing; its
+COLUMNS cost, and two views share one column. Attributing value to sets and
+bytes to columns compares nothing to nothing. A set's value is now spread over
+the columns it reads in proportion to what each costs, and a column carries the
+sum of its readers' shares - so evicting one reader of a shared column, which
+frees no bytes at all, can never look like a saving. The same argument reached
+further than I expected: a set is credited together with everything it is built
+FROM, because a materialised join's base sets are not optional. Value is
+deliberately not additive down that chain. Each member gets the whole saving and
+is then divided by its own bytes, so the small source a join cannot do without
+is dense and safe and a large one is judged on its size. Before that, base sets
+had a value of exactly zero, were the cheapest thing in the registry, and Q21
+lost its source to whatever came next.
+
+The second was the minimum age. Sixty wall-clock seconds of anti-thrash reads
+like a safety net until you notice that the 22-query run fills the budget inside
+60 s and every set in it has already answered a statement by the time the next
+one arrives. The net was catching the wrong fish. What the minimum age is FOR is
+that a set gets the chance to pay back its upload - and paying back means
+answering a statement. So a unit is protected while it is young AND has saved
+nobody anything; after that it competes on value, however young it is. A set
+that is still unproven can be interrupted only by a candidate worth twice the
+typical resident set, and a set an override took off the device may not override
+its way back for the same window, so two sets cannot swap through a third. That
+one change is what puts Q18 and Q19 back on the device.
+
+The third was the first sighting. A candidate nobody has measured has no value,
+and comparing zero against anything refuses everything. The honest guess is the
+median density of what is resident: absent evidence a set is worth what this
+connection's sets are typically worth, which lets it displace the cheapest thing
+there is and nothing better. Being wrong is self-correcting, since one statement
+later the measurement replaces the guess in the same accumulator. Getting the
+victim ORDER right mattered as much as the price: the cheapest unit by density
+is almost always an unproven one at value zero, so protected units now sort
+last whatever their value - there is no sense interrupting a set nobody has read
+while a proven worthless one is standing right there.
+
+**The instrument kept being the lesson.** My first probe ran each of the 22
+queries once per loop and reported that nothing ever had any value; the coverage
+script that the acceptance criterion names runs each rewritten query twenty more
+times, which is where the measurements come from. Neither is wrong, they are
+different workloads, and a policy that learns behaves differently under them. I
+also had to stop reading the statement that performs an eager upload as a
+measurement of its set: that time is the upload's, the saving looks negative,
+and the set is then valued at nothing for the rest of its life. It records the
+use and no value, which is also what keeps the minimum age over it until
+something has actually been answered from it.
+
+**What it measures.** At the default budget, SF10, two interleaved rounds: main
+15 of 22 on the device, branch 19 - Q13 and Q15 join, Q19 and Q21 come back, and
+no query main answers on the device is answered natively by the branch. The
+22-query wrapper total goes from 602/614 ms to 256/255 ms. At SF1, 15 against
+17, 67/72 ms against 58/60. Under a budget deliberately below the working set -
+8 and 12 GiB against a ~14 GiB working set, 14 loops - loops 1 to 3 pay for the
+re-arrangement the first real measurements ask for, and from loop 4 nothing
+moves and nothing is evicted again: 0.57-0.81 s a loop against
+least-recently-used's 0.84-0.90 s at 12 GiB, with two more queries on the
+device at both budgets. Least recently used shows zero evictions in that
+experiment for a reason worth saying out loud - its 60 s window never expires
+inside a 14-loop run, so it never re-arranges anything at all.
+
+The bookkeeping costs nothing I can measure: against a no-op, alternating rounds
+in one process, the four sub-millisecond statements move by at most 0.03 ms and
+half of those deltas are negative.
+
+**One flaw survived the first round of this, and it was in the shape of the
+code rather than the arithmetic.** `_make_room` had always been a loop that
+dropped a victim and then looked again, and I kept that shape while changing
+what it compared. Under the new rules a pass can run OUT of acceptable victims
+- the next one costs more than the candidate is worth - and by then it has
+already destroyed the ones before it. My own thrash log had it in plain sight:
+at 12 GiB, loop 3, Q18 and Q21 between them tore down about 1.9 GiB and were
+both answered natively anyway, and Q3 left the device for nothing. It also
+explains the residual I had written up as harmless - one eviction per loop at
+steady state - which was not a small set churning but this, every loop.
+
+The fix is to separate deciding from doing: snapshot what is resident, build
+the WHOLE plan over that snapshot without touching anything, and execute only
+a plan that has been accepted. It made room for a better rule at the same
+time. Density is the right currency for choosing WHO goes, because a byte
+freed from a low-density unit costs the least value - but it is the wrong one
+for deciding WHETHER, and comparing the candidate against each victim in turn
+was quietly assuming the freed bytes were fungible. With a plan in hand the
+honest question is available: is this candidate worth more than everything the
+plan would take, together? A candidate that needs three victims must beat the
+three of them. That also settles the caveat I had left open, where a small
+cheap set could out-rank a large valuable one on density alone.
+
+`evictions_wasted` counts what a refused candidate destroyed on its way to
+being refused. It is 0 in every run now, which it should be by construction -
+the only way it can move is a `gpu_drop_*` that itself fails, and then the
+caller re-plans against a fresh snapshot rather than carrying on against a
+picture that is no longer true. With the residual gone the steady loop at
+12 GiB is 0.57-0.81 s against least-recently-used's 0.84-0.90 s, the
+re-arrangement finishes a loop earlier, and loops 4 to 13 evict nothing at all.
+
+**Two things I had to stop reporting as cleaner than they were.** Main's SF10
+baseline is not one number: 17 of 22 in four runs, 15 in five, the same script
+at the same budget, and only Q19 and Q21 ever move. It is not the commit - I
+probed main at two commits back to back and both put those two on DuckDB - and
+beyond that it is not established. What I can say is the mechanism that lets
+it happen: first come first served with a minimum age that never expires
+inside a 30 s run means the last two large candidates fit or not depending on
+what the queries before them happened to leave behind, and nothing can be
+given up to change that. And the harness that produced every thrash number
+runs `residency="eager"`, which uploads and evicts inside the statement - that
+is why single statements in the early loops read in seconds. The default mode
+does none of that inline, and measured over 45 loops its slowest statement is
+a query DuckDB answers on both sides.
+
+**What it does not do.** The whole policy is still one form of a set against
+another; PR #142's index
+vectors, a join set held as row indices at 1.2-1.9x the read cost and a fraction
+of the bytes, are a second point on the value-per-byte curve for the same set.
+The place they attach is admission: when a candidate is refused, re-price it in
+its index-vector form and compare THAT density before declining. Nothing else in
+the policy would have to change, which is the part that makes me think the
+quantity is the right one.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -2327,9 +2564,12 @@ join forms.
   What would change that is a cheaper way to return a million-group result, not
   a rewrite.
 - **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
-  HAVING; subqueries over other subqueries (Q2, Q20, Q22 — Q22 also sits below
-  the row floor); Q16 combines `count(DISTINCT)` with a `NOT IN` subquery over
-  tables below the row floor. WHERE-term subqueries are done (§4.18).
+  HAVING; subqueries over other subqueries (Q2, Q20). Q22 is answered: the row
+  floor now counts the table its lane reads (2026-09-19 entry, §4.23). Q16
+  combines `count(DISTINCT)` with a `NOT IN` subquery over tables below the row
+  floor, and the forced run measures 0.08x at SF1 and 0.02x at SF10, so the
+  pair bounds that decline it are right. WHERE-term subqueries are done
+  (§4.18).
 - **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
   and as the CPU reference; the CUDA side is to be written against the same
   interface and then swept with the same gate.
@@ -2357,5 +2597,10 @@ join forms.
   could be evaluated per GROUP (at most 512 of them) instead of per row, which
   would let Q12's key lane go too.
 - **Output cost**: for large results the statement is bound by moving rows
-  through the table-function interface and into the client; an Arrow-native
-  result path would move the plain-form bounds.
+  through the table-function interface and into the client, and the sweep of
+  2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
+  is worth a lot up to about 200K groups and nothing at all at 1.5M, where
+  moving the rows through the table function alone costs more than native's
+  whole aggregate. So an Arrow-native result path would move the plain-form
+  bounds, and a cheaper table-function hand-off would move the inner ones —
+  they are different problems.

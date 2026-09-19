@@ -4294,7 +4294,9 @@ mask it shares with the fused pass is what carries it (up to 1.73×). A lane
 gather costs what a payload gather costs, and a term buys one of those instead
 of one sequential read. It stays behind `GPUDB_METAL_MASK_PATH=permeval`.
 
-**What it does to whole queries.** `scripts/tpch_coverage.py`, threads = 1,
+**What it does to whole queries.** `scripts/tpch_coverage.py`, DuckDB's default
+thread count (an earlier revision of this entry said `threads = 1`; the driver
+never set it — the kernel sweep above was single-threaded, these runs were not),
 resident, the same build with `GPUDB_METAL_MASK_PATH=legacy` and with the
 default, two runs of each, interleaved (rewritten statement ms, run 1 / run 2;
 the ratio is min over min):
@@ -4567,3 +4569,412 @@ CTE forms themselves: `cte` 75 rewritten at 1.17–67.0× with 43 declined,
 `cte_arm` 30 rewritten at 1.05–13.68× with 25 declined. Neither form carries a
 bound of its own — after the splice they ARE the plain and join forms, and the
 bounds that decide them are those.
+
+## v0.7 §4.23 — inner statements, and what a row floor should count — Metal, SF1 + SF10 (2026-09-19)
+
+`gpudb.connect()`, Apple M4 Max, statement vs statement through the wrapper,
+warm, minimum of 5, nothing else on the machine. The §4.22 section recorded
+that three TPC-H declines — Q13 at SF10, Q15 at both scale factors, Q22 at SF1
+— are conservative, and named the rule that declines each. This section is the
+sweep that revisits them.
+
+### The three declines, re-measured on the path the shipping code would take
+
+`--no-thresholds` is not "the shipping plan, forced" (for Q18 it picks a path
+that is 0.03× of native), so each query was run with **one bound overridden and
+everything else shipping**. Two interleaved rounds, minimum and median of 5.
+
+| query | SF | bound lifted | path | native ms (min / med) | device ms (min / med) | ratio, round 1 / 2 |
+|---|---|---|---|---|---|---|
+| Q13 | 1  | the two join output bounds (neither fires at SF1) | nested | 18.1 / 19.2 · 38.6 / 42.5 | 2.8 / 2.9 · 3.6 / 3.6 | 6.40× / 10.69× |
+| Q13 | 10 | `join_plain_max_groups` **and** `join_plain_min_rows_per_group` | nested | 161.8 / 174.2 · 296.4 / 319.4 | 15.2 / 15.3 · 17.4 / 17.5 | 10.64× / 17.07× |
+| Q15 | 1  | `plain_min_selectivity` | nested | 3.7 / 3.9 · 4.4 / 5.0 | 2.2 / 2.2 · 2.3 / 2.3 | 1.72× / 1.95× |
+| Q15 | 10 | `plain_min_selectivity` **and** `plain_max_groups_where` | nested | 26.5 / 27.5 · 33.6 / 34.1 | 16.3 / 16.6 · 16.4 / 16.6 | 1.63× / 2.05× |
+| Q22 | 1  | the row floor | plain | 12.8 / 13.1 · 12.7 / 12.8 | 1.3 / 1.3 · 1.2 / 1.2 | 10.17× / 10.62× |
+| Q22 | 10 | none — already on the device | plain | 77.0 / 87.5 | 1.8 / 1.9 | 43.63× |
+
+Two things the earlier `--no-thresholds` numbers did not show. Q13 at SF10
+declines on **both** join output bounds, not just the group cap: with only
+`join_plain_max_groups` lifted it still reads `10.1 rows per group over a join
+with 1488128 groups < 16.0`. Q15 at SF10 declines on two as well, and its log
+tail (`declined (not_found, device): table`) names neither.
+
+### The sweep: the same GROUP BY, consumed four ways
+
+`scripts/transparent_gate.py --inner` adds four forms to every cell. Three
+consumers reduce the inner result — an outer aggregate, an outer `GROUP BY`
+over the inner aggregate (Q13's shape), a CTE compared against a scalar
+subquery over itself (Q15's shape) — and one does not: a join back to the key's
+own table, which returns every group to the client after all. `--no-thresholds`
+so every cell reports a ratio; SF1, plain `l_quantity` payload.
+
+| key | groups | WHERE | rows kept per group | inner_agg | inner_group | inner_scalar | join-back | client-facing plain |
+|---|---|---|---|---|---|---|---|---|
+| l_linenumber | 7 | — | 857K | 1.04× | 1.20× | 1.73× | — | 1.04× |
+| l_returnflag | 3 | — | 2.0M | 2.46× | 1.90× | 2.28× | — | 3.48× |
+| l_suppkey | 10K | — | 600 | 1.33× | 2.77× | 2.22× | 1.35× | 1.49× |
+| l_partkey | 200K | — | 30 | 3.76× | 5.14× | 3.53× | 1.24× | 1.15× |
+| l_orderkey | 1.5M | — | 4.0 | **0.44×** | **0.97×** | **0.44×** | **0.93×** | **0.97×** |
+| l_linenumber | 7 | 9 % | 77K | 1.73× | 1.32× | 1.61× | — | 1.76× |
+| l_returnflag | 3 | 9 % | 180K | 1.18× | **0.86×** | **0.84×** | — | 1.21× |
+| l_suppkey | 10K | 9 % | 54 | 1.24× | 1.23× | 1.22× | 1.05× | 1.04× |
+| l_partkey % 25000 | 25K | 9 % | 21.6 | 1.34× | 1.39× | 1.41× | — | **0.87×** |
+| l_partkey % 50000 | 50K | 9 % | 10.8 | 1.39× | 1.52× | 1.10× | — | **0.91×** |
+| l_partkey % 100000 | 99,550 | 9 % | 5.4 | 1.05× | 1.34× | 1.11× | — | **0.93×** |
+| l_partkey % 150000 | 143,339 | 9 % | 3.8 | **0.93×** | 1.27× | **0.83×** | — | **0.95×** |
+| l_partkey | 186,984 | 9 % | 2.9 | **0.73×** | 1.15× | **0.71×** | **0.97×** | **0.94×** |
+| l_partkey % 25000 | 25K | 25 % | 60 | 2.09× | 2.11× | 2.00× | — | 1.14× |
+| l_partkey % 50000 | 50K | 25 % | 30 | 2.51× | 2.22× | 2.36× | — | 1.03× |
+| l_partkey % 100000 | 100K | 25 % | 15 | 1.29× | 2.48× | 1.96× | — | 1.01× |
+| l_partkey % 150000 | 149,955 | 25 % | 10.0 | 1.55× | 2.37× | 1.47× | — | 1.00× |
+| l_partkey | 199,893 | 25 % | 7.5 | 1.35× | 1.86× | 1.38× | — | 1.00× |
+| l_partkey % 25000 | 25K | 91 % | 218 | 3.91× | 3.93× | 3.80× | — | 1.58× |
+| l_partkey % 50000 | 50K | 91 % | 109 | 5.20× | 5.52× | 4.95× | — | 1.32× |
+| l_partkey % 100000 | 100K | 91 % | 55 | 4.35× | 5.16× | 3.80× | — | 1.21× |
+| l_partkey % 150000 | 149,955 | 91 % | 36 | 3.40× | 4.71× | 3.18× | — | 1.13× |
+| l_partkey | 199,893 | 91 % | 27 | 2.96× | — | — | — | 1.11× |
+
+Every cell in bold is below 1.0×. The group count does not separate them (150K
+groups lose under a 9 % `WHERE` and win 1.47× under a 25 % one), and neither
+does selectivity (9 % wins at 50K groups and loses at 150K). **Rows kept per
+group returned** does: every losing inner cell is at 2.9 to 4.0, the band at
+5.4 measures 1.05–1.34×, and every cell at 7.5 or more measures 1.29× or
+better. The two few-group rows that lose (`l_returnflag` under the 9 % `WHERE`)
+are declined by `min_groups` and the VARCHAR-key rules whatever happens here.
+
+So the bound is **7 rows read per group returned**, placed between the last
+cell that loses (4.0, at 0.44×) and the first that wins clearly (7.5, at
+1.35×), above the thin band. It admits Q13 (10.1 rows per group at SF10, 10.3
+at SF1) and Q15 (24.5 at SF10, 26.4 at SF1) with room, and declines two cells
+that measured 1.05×, which is the direction a bound is allowed to be wrong in.
+
+The join-back column is why the relaxation asks for a reducing consumer. That
+form returns every inner group to the client, and it wins and loses exactly
+where the client-facing plain form does — 1.24–1.35× at 200K groups with no
+`WHERE`, 0.93× at 1.5M, 0.97× at 187K under the 9 % one. A consumer that
+reduces nothing is not an inner statement in the sense that matters, so
+anything returning less than 4× fewer rows keeps the bounds above.
+
+Checked after the fact, `decide()` against all 26 measured cells plus the six
+TPC-H rows: **0 admitted below 1.0×**.
+
+### The row floor, and the table it was not counting
+
+`scripts/transparent_gate.py --lane-floor`: a small table whose `WHERE` holds a
+§4.18 subquery lane over a much larger one, which is TPC-H Q22's shape. Five
+outer tables, three lane kinds, plain and HAVING forms, SF1.
+
+| outer table (rows at SF1) | lane | over | plain | HAVING |
+|---|---|---|---|---|
+| supplier (10K) | `NOT EXISTS` | lineitem (6M) | 1.65× | 1.64× |
+| supplier | `IN` | lineitem | 1.82× | 1.27× |
+| supplier | correlated `avg` | lineitem | 3.75× | 3.95× |
+| customer (150K), by c_nationkey | `NOT EXISTS` | orders (1.5M) | 10.64× | 8.60× |
+| customer, by c_nationkey | `IN` | orders | 2.27× | 2.26× |
+| customer, by c_nationkey | correlated `avg` | orders | 4.09× | 4.58× |
+| customer, by c_mktsegment | `NOT EXISTS` / `IN` / `avg` | orders | 10.42× / 2.79× / 3.91× | 6.98× / 2.62× / 4.14× |
+| part (200K), by p_brand | `NOT EXISTS` / `IN` / `avg` | lineitem | 8.97× / 4.47× / 12.15× | 7.47× / 4.14× / 13.15× |
+| part, by p_size | `NOT EXISTS` / `IN` / `avg` | lineitem | 10.49× / 3.90× / 14.45× | 8.75× / 3.96× / 17.12× |
+| partsupp (800K) | `NOT EXISTS` / `IN` / `avg` | lineitem | 2.77× / 2.49× / 3.39× | 8.33× / 6.50× / 13.58× |
+| orders (1.5M), by o_orderpriority | `NOT EXISTS` / `IN` / `avg` | lineitem | 14.82× / 4.78× / 29.02× | 10.12× / 4.18× / 31.44× |
+| orders, by o_custkey | `NOT EXISTS` / `IN` / `avg` | lineitem | 1.59× / 1.22× / 21.95× | 6.49× / 3.04× / 23.05× |
+
+**48 cells, 1.22× to 31.44×, none below 1.0×.** Four of the five outer tables
+are below the 1,000,000-row floor and every one of them wins, because what
+native runs on every statement is the lane, and the device runs it once, during
+the upload. The floor now counts the largest table the statement's answer
+depends on, the tables a lane reads included.
+
+### TPC-H coverage, `main` against this branch
+
+`scripts/tpch_coverage.py`, two interleaved rounds per scale factor (main,
+branch, main, branch), nothing else on the machine, the wrapper's default
+device-memory budget.
+
+| | SF1 round 1 | SF1 round 2 | SF10 round 1 | SF10 round 2 |
+|---|---|---|---|---|
+| main | 15 / 22 | 15 / 22 | 17 / 22 | 17 / 22 |
+| branch | **17 / 22** | **17 / 22** | 17 / 22 | 17 / 22 |
+
+Every query's rows are identical to native on both sides, at both scale
+factors, in both rounds.
+
+**SF1: two queries move onto the device and none moves off.**
+
+| query | native ms (r1 / r2) | rewritten ms (r1 / r2) | ratio | the bound that used to decline it |
+|---|---|---|---|---|
+| Q15 | 4.2 / 4.6 | 2.3 / 2.7 | 1.85× / 1.72× | `selectivity 0.04 < 0.5 for the plain form` |
+| Q22 | 14.1 / 13.7 | 1.2 / 1.2 | 11.28× / 11.66× | `150000 rows < the 1000000-row floor` |
+
+Q13 was already on the device at SF1 (146K groups is under the join bound's
+300K) and stays there, 9.07× and 8.78× against main's 9.34× and 11.55×. The
+other 13 device queries take the same path with the same ratios inside
+run-to-run spread; where a gap looks wide it is native's time that moved (Q14
+at SF10 reads 8.04× against main's 14.28× on a native time of 37.0 ms against
+64.7, with the device at 4.7 ms against 4.6).
+
+**SF10: two move on, two are pushed off by the memory budget.**
+
+| query | native ms (r1 / r2) | rewritten ms (r1 / r2) | ratio |
+|---|---|---|---|
+| Q13 | 201.0 / 199.3 | 17.5 / 18.0 | 11.51× / 11.04× |
+| Q15 | 41.2 / 47.4 | 17.0 / 17.0 | 2.42× / 2.79× |
+
+and, in both rounds, Q18 and Q19 report `native (memory)` on the branch where
+main answers them on the device (15.34× / 16.06× and 14.53× / 14.78×). This is
+the device-memory budget, not a threshold: the 22 queries back to back already
+hold more at SF10 than the wrapper's default budget (a quarter of unified
+memory, 16 GiB on this machine), the sets Q13 and Q15 upload are two more, and
+a set younger than the eviction floor cannot be evicted to make room. Nothing
+runs slower than native — a set the budget refuses makes the statement native,
+which is what `reason == "memory"` means. The same comparison with a budget
+that holds the working set is below.
+
+**With a budget that holds the working set, SF10 is 17 / 22 against 19 / 22.**
+`scripts/tpch_coverage.py --memory-budget 40GB`, one round each:
+
+| query | main | branch |
+|---|---|---|
+| Q13 | native (shape) 201.1 ms | **GPU (nested)** 17.6 ms — 11.31× |
+| Q15 | native (shape) 27.4 ms | **GPU (nested)** 17.0 ms — 2.17× |
+| Q18 | GPU (plain) 15.15× | GPU (plain) 15.66× |
+| Q19 | GPU (projected) 14.20× | GPU (projected) 14.51× |
+| the other 18 | — | same path, same ratios inside spread |
+
+So the two `native (memory)` rows at the default budget are the budget and
+nothing else. The 22 queries at SF10 leave **14.49 GiB** resident on main (33
+sets of 11.28 GiB plus 30 store columns of 3.20 GiB) and **14.10 GiB** on the
+branch (35 sets of 10.23 GiB plus 31 store columns of 3.87 GiB) — the branch
+holds a little less because the two sets it could not admit are larger than the
+two it did. Both sit just under the wrapper's default 16 GiB on this machine
+(a quarter of unified memory, §5.5), which is why two more sets tip it: a set
+younger than the eviction floor cannot be evicted to make room, so whichever
+statements arrive last are the ones refused.
+
+### The gate, on the shipped code
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor`,
+SF1, last and alone on the machine, on the final code: **1506 cells, 914
+rewritten, 591 declined, 0 below 1.0×, 0 differing, exit 0.**
+
+| form group | cells | rewritten | declined | ratio range |
+|---|---|---|---|---|
+| `inner_agg` | 125 | 69 | 56 | |
+| `inner_group` | 125 | 70 | 55 | 1.01× – 66.03× |
+| `inner_scalar` | 125 | 69 | 56 | (the four groups together) |
+| `inner_join` | 71 | 31 | 40 | |
+| `--lane-floor` | 48 | 46 | 2 | 1.64× – 28.25× |
+| `cte` / `cte_arm` | 125 / 55 | 73 / 30 | 52 / 25 | unchanged from §4.22 |
+
+The four thinnest rewritten inner cells are `l_suppkey` (10K groups) under the
+9 % and 25 % `WHERE`s at 1.01–1.10×: 54 and 150 rows kept per group, far past
+the bound, but 2 ms statements where the wrapper's own round trip is most of
+the difference — exactly the shapes the measured rule 1
+(`connection._note_timing`) decides at run time rather than a static bound. The
+two declined `--lane-floor` cells are the `o_custkey` plain form over `orders`
+(97–100K groups returned to the client from a 1.5M-row table), declined after
+their first run by the operator's output-size check; their HAVING forms are
+rewritten at 3.12× and 6.68×.
+
+## v0.7 §5.5 — residency that knows what a set is worth — Metal, SF1 + SF10 (2026-09-19)
+
+`gpudb.connect()`, Apple M4 Max (64 GiB unified, wrapper default budget
+16 GiB), nothing else on the machine, **DuckDB's default thread count**
+throughout (`SET threads TO 1` appears nowhere in this section). "main" is the
+merge base `0aeb6ab` — the branch without the inner-statement bounds and
+without this policy — run from its own `python/` and `scripts/` against the
+same built extension, so only the wrapper differs.
+
+The section above ends on a measured regression: at the default budget the
+inner-statement bounds admit Q13 and Q15 at SF10, their sets fill the budget
+first, and Q18 (15×) and Q19 (14.5×) then report `native (memory)` where main
+answers them on the device. The cause was the policy, not the budget: eviction
+was least recently used with a 60 s minimum age, admission was first come first
+served, and nothing knew what a set was worth. §5.5 now measures that.
+
+### TPC-H coverage at the DEFAULT budget, main against the branch
+
+`scripts/tpch_coverage.py`, two interleaved rounds per scale factor (main,
+branch, main, branch). Every query's rows are identical to native on both
+sides, at both scale factors, in both rounds. "wrapper total" is the sum over
+the 22 queries of the transparent time where the query is rewritten and the
+native time where it is not — the 22-query loop as the wrapper answers it.
+
+| | SF1 r1 | SF1 r2 | SF10 r1 | SF10 r2 |
+|---|---|---|---|---|
+| main, on the device | 15 / 22 | 15 / 22 | 15 / 22 | 15 / 22 |
+| branch, on the device | **17 / 22** | **17 / 22** | **19 / 22** | **19 / 22** |
+| main, native total | 202.7 ms | 209.0 ms | 1352.8 ms | 1370.8 ms |
+| main, wrapper total | 66.6 ms | 71.7 ms | 601.6 ms | 613.8 ms |
+| branch, wrapper total | **58.4 ms** | **60.4 ms** | **255.8 ms** | **254.9 ms** |
+
+Per query, the difference is the same set in both SF10 rounds and in both SF1
+rounds — and it is only ever in one direction:
+
+| query | SF | main | branch |
+|---|---|---|---|
+| Q13 | 10 | native (shape) | **GPU (nested)**, ~11.7× |
+| Q15 | 10 | native (shape) | **GPU (nested)**, ~2.3× |
+| Q19 | 10 | native (memory) | **GPU (projected)**, ~15× |
+| Q21 | 10 | native (memory) | **GPU (plain)**, ~12.5× |
+| Q15 | 1 | native (shape) | **GPU (nested)**, ~1.8× |
+| Q22 | 1 | native (threshold) | **GPU (plain)**, ~11.3× |
+
+**No query that main answers on the device is answered natively by the
+branch**, at either scale factor, in either round.
+
+#### Main's SF10 baseline is not stable, and that is the point
+
+Main at SF10 and the default budget measured **17 / 22 in four runs and 15 / 22
+in five**, across this session and the reviewer's:
+
+| main's SF10 result | runs | which queries |
+|---|---|---|
+| 17 / 22 | 4 (2 here, 2 the reviewer's earlier pair) | Q19 and Q21 on the device |
+| 15 / 22 | 5 (2 here, 3 the reviewer's re-runs) | Q19 and Q21 `native (memory)` |
+
+Both outcomes come from the same script at the same budget, and the only
+queries that move are Q19 and Q21 — every other row is identical. **What
+differs was not established.** It is not the commit: a direct probe of main at
+`df33fdd` and at the merge base `0aeb6ab`, back to back on this machine, put
+Q19 and Q21 on DuckDB in both. The mechanism that makes it possible is main's
+policy itself — first come first served, with a 60 s minimum age that never
+expires inside a 25–35 s run, so whether the last two large candidates fit
+depends entirely on how much the preceding queries happened to leave resident,
+and nothing can be given up to change that. That is the variance value-aware
+admission removes: the branch measured **19 / 22 in every run of it**, here and
+the reviewer's.
+
+### The thrash experiment: a budget deliberately below the working set
+
+The 22 queries in a loop, one run each, SF10, at 8 GiB and 12 GiB — both below
+the ~14 GiB the 22 queries want. 14 loops, main and branch, same machine, same
+extension. **`residency="eager"`**, which is what `tpch_coverage.py` and this
+probe use: it uploads *and* evicts synchronously inside the statement that
+asked for the set, which is why single statements in loops 0–3 read in
+seconds (Q18 8.3 s, Q10 6.7 s, Q21 1.9 s — those are uploads, not queries).
+The default mode never does that; it is measured separately below.
+
+| | main 8 GiB | branch 8 GiB | main 12 GiB | branch 12 GiB |
+|---|---|---|---|---|
+| loop 0 (cold) | 14.60 s | 15.57 s | 22.15 s | 23.29 s |
+| loop 1 | 1.01 s | 10.19 s | 0.90 s | 8.94 s |
+| loop 2 | 1.47 s | 8.12 s | 1.58 s | 3.23 s |
+| loop 3 | 0.98 s | 2.62 s | 0.90 s | 3.34 s |
+| loops 4–13 | 0.95–0.96 s | **0.78–1.00 s** | 0.84–0.90 s | **0.57–0.81 s** |
+| evictions, loops 4–13 | 0 | **0** | 0 | **0** |
+| evictions by refused candidates, all loops | 0 | **0** | 0 | **0** |
+| on the device at steady state | 9 / 22 | **11 / 22** | 12 / 22 | **14 / 22** |
+
+Loops 1–3 are where the policy pays for what it learns: the measured rule
+probes a template's native time after its third rewritten run, so only then
+are both sides of every saving known, and the re-arrangement that follows
+costs the uploads of the sets it admits (the losing loops are printed above).
+From loop 4 the resident population does not change again and **nothing is
+evicted at all**: the steady-state loop is **0.57–0.81 s against main's
+0.84–0.90 s at 12 GiB** and **0.78–1.00 s against main's 0.95–0.96 s at
+8 GiB**, with two more of the 22 queries on the device at both budgets.
+
+Main shows zero evictions throughout for a reason worth stating plainly: its
+60 s wall-clock minimum age never expires inside a 14-loop run, so it never
+re-arranges anything at all.
+
+**The residual is gone.** An earlier revision of this policy showed one
+eviction per loop at steady state and a slower steady loop (0.80 s at 12 GiB,
+1.00 s at 8 GiB). That was not a quirk of a small set: it was the eviction
+loop deciding and dropping in the same pass. A candidate would drop one unit,
+fail to find an acceptable second, and be refused — having destroyed the
+first. In `thrash_branch_12GB.log` loop 3 of that revision, two candidates
+that both ended up `native (memory)` tore down ~1.9 GiB between them and Q3
+left the device for it. `_make_room` now takes a snapshot, builds the entire
+plan over it, and executes only a plan it has accepted; `evictions_wasted`
+counts evictions made for a candidate that was then refused and is **0 in
+every run above**.
+
+### The default residency mode: no statement waits for residency work
+
+The same loop with `residency="background"` (the shipping default), 12 GiB,
+45 loops, main and branch. The background uploader only moves in idle windows
+and a back-to-back loop leaves few, so it reaches 4 sets on main and 5 on the
+branch in 45 loops and never contends for the budget at all — 0 evictions on
+both sides. That is itself rule 1 holding: the uploader yields to every
+statement rather than taking the device.
+
+| | main | branch |
+|---|---|---|
+| slowest single statement after loop 0 | 172.8 ms (Q13) | 177.1 ms (Q13) |
+| steady loop | 1.20–1.29 s | 1.23–1.26 s |
+| `_make_room` calls / median / max | 11 / 0.003 ms / 0.527 ms | 12 / 0.117 ms / 0.559 ms |
+| evictions, wasted | 0, 0 | 0, 0 |
+
+The slowest statement on either side is a query that runs on DuckDB on both
+sides; nothing is slower than native because of residency work. In this mode
+`_make_room` is called from the manager's worker thread and never from the
+statement's, so its wall time cannot reach a statement even in principle.
+
+**What the policy's own arithmetic costs**, measured where it is actually
+contended (branch, eager, 12 GiB, 6 loops): `_plan` — the densities, the
+median, the victim order and the two rules, with no device work in it —
+**36 calls, median 0.104 ms, maximum 0.115 ms**. The rest of `_make_room`'s
+wall time in that mode (median 0.372 ms, maximum 231 ms) is the `gpu_drop_*`
+calls of an accepted plan, which is device work that only happens when
+something is being admitted.
+
+### What the bookkeeping costs per statement
+
+`Connection._note_value` against a no-op, alternating rounds inside one
+process (the instrument of "The millisecond that was not there"), SF1, 61
+rounds, minimum and median:
+
+| statement | threads = 1, without → with | default threads, without → with |
+|---|---|---|
+| varchar-key, 3 groups | 0.717 → 0.722 ms (median 0.822 → 0.806) | 0.792 → 0.785 ms (0.883 → 0.863) |
+| int-key, 7 groups | 0.666 → 0.663 ms (0.741 → 0.775) | 0.684 → 0.687 ms (0.955 → 0.891) |
+| int-key, 7 groups, `WHERE` | 0.774 → 0.767 ms (0.850 → 0.858) | 1.029 → 1.018 ms (1.232 → 1.262) |
+| global aggregate | 1.016 → 1.027 ms (1.089 → 1.091) | 1.265 → 1.241 ms (1.390 → 1.410) |
+| join, 10K groups | 5.888 → 6.051 ms (6.633 → 6.740) | 5.761 → 5.945 ms (6.707 → 6.679) |
+| int-key, 10K groups | 5.735 → 6.001 ms (6.667 → 6.633) | 6.024 → 5.993 ms (7.300 → 6.579) |
+
+On the four sub-millisecond statements — the ones where a fixed cost would show
+— every delta is within ±0.03 ms of zero and half of them are negative, so the
+bookkeeping is below this instrument's resolution against a 0.7–1.3 ms
+statement. The two 6 ms rows disagree between minimum and median in both
+directions (+0.27 min / −0.03 median, +0.18 min / −0.03 median), which is what
+noise looks like; there is one dict lookup, one `exp()` and a lock acquire per
+set per statement behind them.
+
+### The rest of the acceptance run
+
+`python3 python/tests/test_wrapper.py` 1093 checks, 0 failures ·
+`python3 python/tests/test_residency_policy.py` 58 checks, 0 failures ·
+`python3 python/tests/test_shell.py` pass · `./build-macos/test/test_gpudb`
+3023 / 3023 · `./scripts/run_sql_tests.sh` 224 pass / 0 fail / 45 expected
+fails · `rewrite_parity_check.sh`, `join_parity_check.sh`,
+`groupby_parity_check.sh` all pass.
+
+`scripts/wrapper_residency_gate.py`, run last and alone on the final code:
+**0 failing rows** — `q18_native` 0.99×, `small_scan` 1.00×, `point_lookup`
+1.18×; and the same three cadences earlier in the session at 0.98× / 1.00× /
+1.10×. Run instead inside a batch that interleaved it with another process, it
+is flaky on BOTH sides: three
+interleaved rounds gave main 1 failing row of 3 rounds (`q18_native` 0.71×)
+and the branch 2 of 3 (`point_lookup` 0.88×, `q18_native` 0.89×), on a
+different row each time, with the branch ahead of main on `q18_native` in the
+two rounds where both were measured (0.97× against 0.91×, 0.91× against
+0.71×). That is the machine state §9.1 calls "two modes of a short kernel",
+not a change in what the wrapper does inline: in the default residency mode
+`_make_room` runs on the worker thread and measured at most 0.56 ms, and no
+background run evicted anything at all. Recorded here rather than explained
+away.
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor`,
+SF1, last and alone on the machine, on this code: **1506 cells, 904 rewritten,
+602 declined, 0 below 1.0×, 0 differing, exit 0.** The same run on the code
+before this change measured 914 rewritten and 591 declined; the ten cells that
+moved are `declined after the first run (threshold)` — the operator's
+output-size check, which reads the run's own `rows_out` and is therefore
+process-state dependent, and which declines in the safe direction. SF1 sets are
+far below the budget, so no cell in this gate reaches the admission rule at
+all; it is here to show that nothing else moved. The plan-then-execute change
+that followed touches only `_make_room`'s contended path, which that gate
+never reaches, so it was not re-run for it.

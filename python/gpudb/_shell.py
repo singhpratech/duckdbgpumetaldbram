@@ -511,12 +511,17 @@ class Shell:
                 parts = tag.split(":")
                 table = ".".join(parts[3:5]) if len(parts) > 6 and parts[0] == "gpudb" else tag
                 names = parts[6] if len(parts) > 6 and parts[0] == "gpudb" else ""
+                dens = s.get("density") or 0.0
                 rows.append((table, names, s.get("state", ""), self._bytes(s.get("bytes") or 0),
-                             self._bytes(s.get("est_bytes") or 0), s.get("error") or ""))
-            self._table(("table", "columns", "state", "bytes", "estimated"), rows, note=5)
+                             self._bytes(s.get("est_bytes") or 0),
+                             f"{dens:.2f}" if dens else "-", s.get("error") or ""))
+            # `worth`: ms of DuckDB time the set saves per second of wall time, per
+            # GiB it holds — what the budget compares when it has to choose (§5.5)
+            self._table(("table", "columns", "state", "bytes", "estimated", "worth"), rows, note=6)
             held = sum((s.get("bytes") or 0) for s in sets.values())
             self.say(self.paint(f"{len(sets)} set{'s' if len(sets) > 1 else ''} {self._sep} "
-                                f"{self._bytes(held)} held {self._sep} `.memory` for the budget"))
+                                f"{self._bytes(held)} held {self._sep} worth is ms saved per second "
+                                f"per GiB {self._sep} `.memory` for the budget"))
         if cols:
             self.say()
             rows = [(c["table"], c["column"], c["dtype"] or "",

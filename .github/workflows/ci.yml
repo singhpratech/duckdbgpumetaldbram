@@ -48,6 +48,10 @@ jobs:
         run: |
           python3 python/tests/test_shell.py
 
+      - name: python residency policy tests (no extension, no DuckDB needed)
+        run: |
+          python3 python/tests/test_residency_policy.py
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2

@@ -186,6 +186,11 @@ class Decision:
     lazy_sightings: int = 0
     timing_checked: bool = False
     measured_declined: bool = False      # sent native by a measurement, not by the thresholds
+    # §4.23: an output-size bound declined it, and the SAME bounds would admit
+    # it if its groups were consumed inside DuckDB instead of by the client —
+    # so it is worth measuring what the statement around it returns
+    inner_relaxable: bool = False
+    inner_out: Optional[int] = None      # ... and, once measured, what that statement returns
     next_check_at: float = 0.0           # when the next side-cursor probe may run
     probe_sql: str = ""                  # the rewritten statement, for the probe of a declined template
     variants: Dict[Tuple[str, ...], "Decision"] = field(default_factory=dict)
@@ -274,6 +279,8 @@ class Connection:
         self._watch_files: List[str] = []
         self._write_snapshot: tuple = ()
         self._last_tags: List[str] = []
+        self._last_inner_note = ""        # §4.23: the inner-statement rule that admitted the last nested rewrite
+        self._inner_admit = ""
         self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
         self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
         self._select_template: Optional[dict] = None
@@ -283,6 +290,7 @@ class Connection:
         self._has_rewrite_scalar = False
         self._refresh_after = False
         self._big_tables: Optional[set] = None    # names of tables above the floor (§0)
+        self._speedups: List[float] = []          # §5.5: measured native/rewritten ratios, newest last
         self._parent = _parent
         if _parent is None:
             self._manager = ResidencyManager(lambda: self._raw.cursor(), mode=residency,
@@ -321,7 +329,10 @@ class Connection:
 
     def memory(self) -> Dict[str, Any]:
         """The memory budget (§5.5) and, per resident set, the size the wrapper
-        expected and the size the extension reports."""
+        expected, the size the extension reports, and what the set is worth:
+        `value`, the milliseconds it saves per second of wall time, and
+        `density`, the same per GiB it holds — the quantity admission and
+        eviction compare."""
         return self._manager.memory()
 
     def residents(self) -> Dict[str, str]:
@@ -461,7 +472,10 @@ class Connection:
             return
         now = time.monotonic()
         if not self._last.rewritten:
-            if self._last.reason in ("not_resident", "threshold"):
+            # 'memory' belongs here with the other two: the budget refused the
+            # set, so this run IS the template's native time — and it is what
+            # the set's value as a candidate is estimated from (§5.5)
+            if self._last.reason in ("not_resident", "threshold", "memory"):
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
             if d.measured_declined and now >= d.next_check_at and d.probe_sql and isinstance(query, str):
                 d.next_check_at = now + _REMEASURE_S
@@ -572,6 +586,69 @@ class Connection:
                       f"template rewritten again")
             d.rewritten, d.reason, d.measured_declined, d.why = True, "", False, ""
 
+    # ---- what a resident set is worth (§5.5) ----
+    def _speedup(self) -> float:
+        """This connection's measured speedup: the median of the templates that
+        have both a native and a rewritten time. It is what the value of a set
+        nobody has measured yet is estimated from — a distribution the
+        connection collected itself rather than a constant picked here. 2.0
+        until three templates have been measured, and clamped either side, so
+        that one 40x template cannot make every unmeasured candidate look
+        golden and one barely-winning one cannot make them all look worthless."""
+        root = self._parent or self
+        got = sorted(root._speedups)
+        s = got[len(got) // 2] if len(got) >= 3 else 2.0
+        return min(20.0, max(1.2, s))
+
+    def _note_value(self, ms: Optional[float] = None) -> None:
+        """After a statement: credit the sets it read with what they saved.
+
+        This is the whole of the residency policy's bookkeeping on the
+        statement path, and it is O(1) per set (`ResidencyManager.note_use`).
+        Three cases, all one function of the connection's measured speedup S:
+
+          * the set answered and its template's native time is known — the
+            saving is measured, native - rewritten;
+          * it answered and no native time is known yet — estimate
+            rewritten * (S - 1);
+          * it did NOT answer (not resident, or the budget refused it) and the
+            statement ran native — estimate native * (1 - 1/S).
+
+        The estimate is what a candidate is admitted on. Being wrong is
+        self-correcting: the first time the set is resident and used, the
+        measurement replaces the estimate in the same accumulator."""
+        d = getattr(self, "_detail_decision", None)
+        if d is None or self._last.fallback:
+            return
+        tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        if not tags:
+            return
+        if ms is None:
+            ms = (d.rewritten_ms[-1] if (self._last.rewritten and d.rewritten_ms) else d.native_ms)
+            if ms is None:
+                return
+        if self._last.rewritten:
+            native = d.native_ms
+            if getattr(self, "_uploaded_now", False):
+                # the upload ran inside this statement (residency='eager'): this
+                # time is the upload's, not the set's, and there is nothing
+                # honest to read as a saving. The use is recorded and the set
+                # stays worth nothing — which is also what keeps the minimum age
+                # over it until a statement has actually been answered from it.
+                saved, measured = 0.0, False
+            elif native is not None and native > 0.0 and ms > 0.0:
+                root = self._parent or self
+                root._speedups.append(native / ms)
+                del root._speedups[:-16]
+                saved, measured = max(0.0, native - ms), True
+            else:
+                saved, measured = ms * (self._speedup() - 1.0), False
+        elif self._last.reason in ("not_resident", "memory"):
+            saved, measured = ms * (1.0 - 1.0 / self._speedup()), False
+        else:
+            return          # native for a reason no amount of residency changes
+        self._manager.note_use(tags, saved, measured=measured)
+
     def _probe_ms(self, sql: str, parameters) -> Optional[float]:
         """Time one execution of `sql` on a side cursor (the caller still
         fetches from self._raw); None when it fails."""
@@ -599,7 +676,9 @@ class Connection:
                 run = self._planned(sql) if (self._last.rewritten and not parameters
                                              and sql == self._last.sql) else sql
                 self._raw.execute(run, parameters)
-                self._note_timing((time.perf_counter() - t0) * 1000.0, query, parameters)
+                _ms = (time.perf_counter() - t0) * 1000.0
+                self._note_timing(_ms, query, parameters)
+                self._note_value(_ms)
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
@@ -697,8 +776,14 @@ class Connection:
             return
         rows_out = int(m.group(1))
         has_where = bool(d.plan is not None and d.plan.where)
+        # §4.23: an inner statement's rows are read by DuckDB, not materialised
+        # by the client, so it is measured against the inner bounds
+        inner = d.inner_out is not None
         if d.join is not None:
-            bound = t.join_plain_max_groups          # a key join has its own measured bound (§4.8)
+            bound = (t.inner_join_plain_max_groups if inner   # a key join has its own measured bound (§4.8)
+                     else t.join_plain_max_groups)
+        elif inner:
+            bound = t.inner_plain_max_groups_where if has_where else t.inner_plain_max_groups
         else:
             bound = t.plain_max_groups_where if has_where else t.plain_max_groups
         if rows_out > bound:
@@ -745,6 +830,7 @@ class Connection:
                 if self._last.rewritten:
                     _ = rel.columns
                 self._note_timing_lazy(query)
+                self._note_value()
                 return rel
             except duckdb.Error as e:
                 if self._last.rewritten and STALE_MARKER in str(e):
@@ -1046,8 +1132,10 @@ class Connection:
         """Which path a rewritten statement took."""
         if self._last.engine == "nested":
             n = len([t for t in self._last_tags if t])
+            note = getattr(self, "_last_inner_note", "")
             return (f"a rewritable SELECT inside the statement runs on the device "
-                    f"({n} resident set{'' if n == 1 else 's'}); the rest stays DuckDB's")
+                    f"({n} resident set{'' if n == 1 else 's'}); the rest stays DuckDB's"
+                    + (f" — {note}" if note else ""))
         if d is None:
             return "the resident exact path"
         if d.join is not None:
@@ -1059,6 +1147,8 @@ class Connection:
             path = "the resident GROUP BY"
         if d.wrap is not None:
             path += ", with DuckDB evaluating the expressions over its aggregates"
+        if d.why:
+            path += f" — {d.why}"
         return path
 
     def _route_body(self, query: Any, parameters) -> Any:
@@ -1066,6 +1156,8 @@ class Connection:
         self._timing_decision = None
         self._detail_decision = None
         self._last_tags = []
+        self._last_inner_note = ""
+        self._uploaded_now = False
         if not isinstance(query, str):
             self._last.reason = "shape"
             return query
@@ -1175,6 +1267,20 @@ class Connection:
             return False
         return has_agg(node.get("select_list") or [])
 
+    def _consumer_rows(self, sql: str) -> Optional[int]:
+        """§4.23: how many rows the whole statement returns — what an inner
+        GROUP BY's groups are reduced to before anything reaches the client.
+        One native count over the statement, once per statement text, and only
+        when an output-size bound declined an inner statement that the inner
+        bounds could admit."""
+        try:
+            n = int(self._raw.execute("SELECT count(*) FROM (" + sql + ")").fetchone()[0])
+        except Exception as e:
+            self._log(f"consumer row count failed: {str(e).splitlines()[0][:120]}")
+            return None
+        self._log(f"the statement around the declined GROUP BY returns {n} row(s)")
+        return n
+
     def _rewrite_nested(self, sql: str) -> Optional[str]:
         """The statement as a whole is not a transparent shape, but a SELECT
         inside it may be: `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP
@@ -1185,6 +1291,9 @@ class Connection:
         its own and declines by itself."""
         key = (sql, self._settings_key)
         entry = self._nested_cache.get(key)
+        if isinstance(entry, tuple):            # declined, and the bound that did it is worth saying
+            self._last.reason, self._last.detail = entry
+            return None
         if entry is False:
             self._last.reason = "shape"
             return None
@@ -1200,9 +1309,8 @@ class Connection:
                 self._nested_cache[key] = False
                 self._last.reason = "shape"
                 return None
-            subs: List[Tuple[list, str]] = []
 
-            def walk(e, path, top):
+            def walk(e, path, top, inner_out, subs, relaxable, bounded):
                 if isinstance(e, dict):
                     if not top and self._is_aggregate_select(e):
                         try:
@@ -1211,36 +1319,74 @@ class Connection:
                         except Exception:
                             sub_sql = None
                         if sub_sql:
-                            self._rewrite_text(sub_sql)
+                            self._rewrite_text(sub_sql, inner_out=inner_out)
                             if self._last.rewritten or self._last.reason == "not_resident":
                                 subs.append((list(path), sub_sql))
                                 return                      # rewritten as a whole: do not descend
+                            sd = getattr(self, "_detail_decision", None)
+                            if self._last.reason == "threshold" and sd is not None:
+                                # the log tail is not the reason: a SELECT inside the
+                                # statement was rewritable and a BOUND declined it
+                                bounded.append(sd.why or "")
+                                if sd.inner_relaxable:
+                                    relaxable.append(sub_sql)
                     for k, v in e.items():
-                        walk(v, path + [k], False)
+                        walk(v, path + [k], False, inner_out, subs, relaxable, bounded)
                 elif isinstance(e, list):
                     for i, v in enumerate(e):
-                        walk(v, path + [i], False)
+                        walk(v, path + [i], False, inner_out, subs, relaxable, bounded)
 
-            walk(stmts[0].get("node"), ["statements", 0, "node"], True)
+            subs: List[Tuple[list, str]] = []
+            relaxable: List[str] = []
+            bounded: List[str] = []
+            root, path0 = stmts[0].get("node"), ["statements", 0, "node"]
+            walk(root, path0, True, None, subs, relaxable, bounded)
+            inner_out = None
+            if relaxable:
+                # §4.23: an aggregate inside this statement was declined by an
+                # output-size bound that was swept on statements whose groups
+                # the CLIENT materialises. These groups do not go to the
+                # client — DuckDB reads them out of the table function and
+                # consumes them. How much is left when it has? One native
+                # count over the whole statement, once per statement text.
+                inner_out = self._consumer_rows(sql)
+                if inner_out is not None:
+                    subs2: List[Tuple[list, str]] = []
+                    walk(root, path0, True, inner_out, subs2, [], [])
+                    if len(subs2) > len(subs):
+                        subs = subs2
+                    else:
+                        inner_out = None
             if not subs or len(self._nested_cache) > 512:
-                self._nested_cache[key] = False
                 self._last = LastRewrite(statement=sql, reason="shape")
+                if bounded:
+                    self._last.reason = "threshold"
+                    self._last.detail = (bounded[0] or
+                                         "a rewritable SELECT inside the statement was declined by a bound")
+                    self._nested_cache[key] = (self._last.reason, self._last.detail)
+                else:
+                    self._nested_cache[key] = False
                 return None
-            entry = {"tree": tree, "subs": subs, "final": {}, "decision": Decision(True, form="nested")}
+            entry = {"tree": tree, "subs": subs, "final": {}, "inner_out": inner_out,
+                     "decision": Decision(True, form="nested")}
             self._nested_cache[key] = entry
         d = entry["decision"]
         if not d.rewritten:
             self._last = LastRewrite(statement=sql, reason=d.reason or "threshold")
             return None
-        outs, tags, pending = [], [], False
+        outs, tags, pending, notes = [], [], False, []
         for _path, sub_sql in entry["subs"]:
-            o = self._rewrite_text(sub_sql)
+            o = self._rewrite_text(sub_sql, inner_out=entry.get("inner_out"))
             if o is None:
                 pending = pending or self._last.reason == "not_resident"
                 outs.append(None)
             else:
                 outs.append(o)
                 tags.append(self._last.tag)
+                sd = getattr(self, "_detail_decision", None)
+                if sd is not None and sd.why:
+                    notes.append(sd.why)
+        self._last_inner_note = notes[0] if notes else ""
         self._last = LastRewrite(statement=sql)
         self._timing_decision = None
         self._last_decision = None
@@ -1435,16 +1581,19 @@ class Connection:
             self._log(f"aggregate spelling failed: {str(e)[:120]}")
         return sql
 
-    def _rewrite_text(self, sql: str) -> Optional[str]:
-        """The rewritten SQL of ONE statement, or None with _last.reason set."""
+    def _rewrite_text(self, sql: str, inner_out: Optional[int] = None) -> Optional[str]:
+        """The rewritten SQL of ONE statement, or None with _last.reason set.
+        `inner_out` (§4.23): this statement is an inner one and the statement
+        around it returns that many rows — part of the cache key, because the
+        same text decides differently where its groups go somewhere else."""
         self._last = LastRewrite(statement=sql)
         sql = self._folded(sql)
         t0 = time.perf_counter()
         template, literals = self._normalise(sql)
-        key = (template, self._settings_key)
+        key = (template, self._settings_key + ("" if inner_out is None else f"|inner:{inner_out}"))
         d = self._cache.get(key)
         if d is None:
-            d = self._decide(sql)
+            d = self._decide(sql, inner_out=inner_out)
             d.literals = literals
             self._cache[key] = d
         elif d.literal_sensitive and literals != d.literals:
@@ -1456,7 +1605,7 @@ class Connection:
                     self._last.reason = "threshold"
                     self._last.detail = "16 literal variants of one template already decided"
                     return None
-                v = self._decide(sql)
+                v = self._decide(sql, inner_out=inner_out)
                 v.literals = literals
                 d.variants[literals] = v
             d = v
@@ -1531,6 +1680,9 @@ class Connection:
                                                                                key_width=0 if (d.plan is not None and d.plan.no_key) else 8))
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
+                # this statement paid for the upload, so its time is not what the
+                # set will cost from now on and must not be read as its saving (§5.5)
+                self._uploaded_now = self._manager.is_ready(d.tag)
             if not self._manager.is_ready(d.tag):
                 self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
                                      else "not_resident")
@@ -1818,7 +1970,7 @@ class Connection:
             plan.form = cached.form
         return plan
 
-    def _decide_split(self, sql: str) -> Optional[Decision]:
+    def _decide_split(self, sql: str, inner_out: Optional[int] = None) -> Optional[Decision]:
         """§4.11: answer the GROUP BY on the device and let DuckDB evaluate
         the expressions over its aggregates (and a compound HAVING) on top."""
         try:
@@ -1844,10 +1996,14 @@ class Connection:
             return None
         if outer_sql.count(_split.PLACEHOLDER) != 1:
             return None
-        d = self._decide(inner_sql, allow_split=False, reagg=reagg, global_agg=is_global)
+        # the split's outer statement returns one row per group of the inner
+        # one, so the consumer of §4.23 is whatever consumes THIS statement
+        d = self._decide(inner_sql, allow_split=False, reagg=reagg, global_agg=is_global,
+                         inner_out=inner_out)
         if not d.rewritten:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
-            return Decision(False, d.reason, why=d.why or "the GROUP BY under the expressions declined")
+            return Decision(False, d.reason, why=d.why or "the GROUP BY under the expressions declined",
+                            inner_relaxable=d.inner_relaxable)
         head, tail = outer_sql.split(_split.PLACEHOLDER)
         if is_global:
             # no GROUP BY: one row even when nothing qualifies, as native
@@ -1860,26 +2016,32 @@ class Connection:
         return d
 
     def _decide(self, sql: str, allow_split: bool = True, reagg: bool = False,
-                global_agg: bool = False) -> Decision:
+                global_agg: bool = False, inner_out: Optional[int] = None) -> Decision:
         """Device path first; a join it cannot express falls back to uploading
         the join's result (§4.13); expressions over aggregates fall back to the
-        split (§4.11), whose inner statement comes back through here."""
-        d = self._decide_once(sql, "device", reagg, global_agg)
+        split (§4.11), whose inner statement comes back through here.
+        `inner_out`: §4.23 — this statement's groups are consumed inside DuckDB
+        by a statement that returns that many rows."""
+        d = self._decide_once(sql, "device", reagg, global_agg, inner_out)
         if d.rewritten or d.reason != "shape" or not getattr(self, "_exact", False):
             return d
         if d.is_join and getattr(self, "_join", False):
-            du = self._decide_once(sql, "upload", reagg, global_agg)
+            du = self._decide_once(sql, "upload", reagg, global_agg, inner_out)
             if du.rewritten or du.reason != "shape":
                 return du
         if allow_split:
-            ds = self._decide_split(sql)
+            ds = self._decide_split(sql, inner_out)
             if ds is not None:
                 return ds
         return d
 
     def _decide_once(self, sql: str, mode: str, reagg: bool = False,
-                     global_agg: bool = False) -> Decision:
-        d = self._decide_body(sql, mode, reagg, global_agg)
+                     global_agg: bool = False, inner_out: Optional[int] = None) -> Decision:
+        self._inner_admit = ""
+        d = self._decide_body(sql, mode, reagg, global_agg, inner_out)
+        d.inner_out = inner_out
+        if d.rewritten and self._inner_admit and not d.why:
+            d.why = self._inner_admit
         try:
             d.is_join = _join.is_join_statement(self._serialize(sql))
         except Exception:
@@ -1887,7 +2049,7 @@ class Connection:
         return d
 
     def _decide_body(self, sql: str, mode: str, reagg: bool = False,
-                     global_agg: bool = False) -> Decision:
+                     global_agg: bool = False, inner_out: Optional[int] = None) -> Decision:
         if global_agg and not getattr(self, "_global", False):
             return Decision(False, "backend", why="this backend has no global masked aggregate")
         try:
@@ -1954,9 +2116,30 @@ class Connection:
         # the resident set once it exists
         nrows = (max(t.rows for t in low.tables) if low is not None     # the largest joined table decides
                  else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
-        if nrows < self._floor_rows:
+        # §4.23: the floor asks whether there is enough work to be worth a
+        # device at all, so it counts the rows the statement's answer depends
+        # on — including the ones a subquery lane (§4.18) reads. A statement
+        # over a small table whose WHERE holds `NOT EXISTS (SELECT … FROM
+        # <big>)` makes native read <big> on every run; the device reads it
+        # once, into the lane. The join bounds already make that argument
+        # ("native runs a join whatever the FROM says"); the floor did not.
+        floor_rows_seen, floor_from = nrows, ""
+        for c in computed.values():
+            for dep in c.dep_tables:
+                try:
+                    dr = int(self._raw.execute(f"SELECT count(*) FROM {dep.fqn}").fetchone()[0])
+                except Exception as e:
+                    self._log(f"lane table row count failed: {e}")
+                    continue
+                if dr > floor_rows_seen:
+                    floor_rows_seen, floor_from = dr, dep.table
+        if floor_rows_seen < self._floor_rows:
             return Decision(False, "threshold",
                             why=f"{nrows} rows < the {self._floor_rows}-row floor")
+        if floor_rows_seen > nrows:
+            self._inner_admit = (f"the row floor counted the {floor_rows_seen} rows of {floor_from}, which a "
+                                 f"subquery lane reads, beside the {nrows} of the statement's own FROM")
+            self._log("floor: " + self._inner_admit)
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
         stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
@@ -2078,10 +2261,26 @@ class Connection:
                                          limited=plan.limit is not None and plan.limit <= 10_000,
                                          computed_payloads=sum(1 for v in set(plan.vals) if v in computed),
                                          reaggregated=reagg, global_agg=global_agg, rows=nrows,
-                                         where_terms=len(plan.where))
+                                         where_terms=len(plan.where), inner_out=inner_out)
             if not ok:
                 self._log(f"threshold: {why}")
-                return Decision(False, "threshold", why=why)
+                # §4.23: would the same bounds admit it if DuckDB consumed its
+                # groups instead of the client? (the same pure call, no probe)
+                relax = inner_out is None and _thresholds.decide(
+                    self._backend, plan.form, est, sel, bool(plan.where),
+                    join=low is not None or any(c.dep_tables for c in computed.values()),
+                    payloads=max(1, len(plan.vals)), string_key=bool(plan.dict_key),
+                    limited=plan.limit is not None and plan.limit <= 10_000,
+                    computed_payloads=sum(1 for v in set(plan.vals) if v in computed),
+                    reaggregated=reagg, global_agg=global_agg, rows=nrows,
+                    where_terms=len(plan.where), inner_out=0)[0]
+                if inner_out is None and not relax:
+                    blocked = _thresholds.inner_blocked(self._backend, est, sel, bool(plan.where), nrows)
+                    if blocked:
+                        why = f"{why}; {blocked}"
+                return Decision(False, "threshold", why=why, inner_relaxable=bool(relax))
+            if why:                          # §4.23: names the rule that admitted it
+                self._inner_admit = (self._inner_admit + "; " + why) if self._inner_admit else why
         try:
             described = self._raw.execute("DESCRIBE " + sql).fetchall()
             _rewrite.apply_describe(plan, [(r[0], r[1]) for r in described])
@@ -2240,9 +2439,11 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     `memory_budget`: device memory the resident sets may use — bytes, or a string
     such as '16GB'; 0 or 'unlimited' removes the cap. Default: a quarter of
     unified memory on Apple silicon, half of device memory on a discrete GPU
-    (§5.5). Least recently used sets are evicted to make room; a set that cannot
-    fit is not uploaded and its statements keep running on DuckDB
-    (`last_rewrite()["reason"] == "memory"`)."""
+    (§5.5). Under pressure the sets that save the most time per byte are the
+    ones that stay: a candidate evicts the least valuable resident thing only
+    when it is worth more per byte than that, and otherwise it is not uploaded
+    and its statements keep running on DuckDB
+    (`last_rewrite()["reason"] == "memory"`, with the arithmetic in `detail`)."""
     if residency not in ("background", "eager", "manual"):
         raise ValueError("residency must be 'background', 'eager' or 'manual'")
     cfg = dict(config or {})

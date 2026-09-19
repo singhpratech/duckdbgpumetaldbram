@@ -158,6 +158,58 @@ rules stay as they are; the continuous measured rule 1
 (connection._note_timing) keeps deciding these shapes at run time. The only
 rows below 1.0x in that sweep are the global-aggregate form at SF1, which its
 own rule (rows x (1 + terms) >= 60M) already declines.
+
+An INNER statement is not the statement these bounds were swept on
+(2026-09-19, §4.23). Every output-size bound above was measured on a statement
+whose groups the CLIENT fetches, where Python materialisation dominates at
+large outputs. When the nested pass (§4.14) lifts a GROUP BY out of a bigger
+statement, DuckDB reads those groups out of the table function and consumes
+them itself, and none of them reaches the client. `transparent_gate.py --inner`
+runs the same cells wrapped four ways — an outer aggregate, an outer GROUP BY
+over the inner aggregate (Q13's shape), a CTE against a scalar subquery over
+itself (Q15's shape), and a join back to the key's own table, which returns
+every group to the client after all. SF1, min of 5, plain `l_quantity` payload,
+`--no-thresholds` so every cell reports a ratio:
+
+  * no WHERE: 10K groups 1.11-2.91x, 25K-100K 2.16-5.36x, 200K 3.53-5.14x,
+    1.5M **0.44-0.97x**
+  * 9% kept: 10K 1.22-1.24x, 25K 1.34-1.41x, 50K 1.10-1.52x, 100K 1.05-1.34x,
+    150K **0.83-1.27x**, 187K **0.71-1.15x**
+  * 25% kept: 25K 2.00-2.11x, 50K 2.22-2.51x, 100K 1.29-2.48x, 150K 1.47-2.37x,
+    200K 1.35-1.86x
+  * the join-back consumer, which reduces nothing: 10K 1.32-1.37x, 200K
+    1.06-1.35x, 1.5M **0.93x**, 10K under 9% 1.05x, 187K under 9% **0.97x**
+
+A group count does not separate those, and neither does selectivity: 150K
+groups lose under a 9% WHERE and win 1.47x under a 25% one. What separates them
+is the same quantity the join bound found in §4.22 — **rows read per row
+returned**, counted after the WHERE. Every losing cell is at 2.9 to 4.0 rows
+per group; the thin band at 5.4 measures 1.05-1.34x; every cell at 7.5 or more
+measures 1.29x or better (166 cells, 0 below 1.0x above the bound). So an inner
+statement is admitted past the output bounds while it reduces at least 7 rows
+into each row it returns. TPC-H sits well inside that: Q13's inner reads 10.1
+rows per group at SF10 (10.6-17.1x) and 10.3 at SF1, Q15's 24.5 at SF10
+(1.63-2.05x) and 26.4 at SF1 (1.72-1.95x).
+                                    → inner_min_rows_per_group
+The relaxation needs the consumer to actually reduce. The join-back form is the
+measured extreme (it returns every group to the client) and it behaves like the
+client-facing plain form: it wins where that form wins and loses where it
+loses. So a statement whose consumer returns nearly as many rows as the inner
+one produced is decided by the bounds above, unchanged; only one that returns
+at least four times fewer takes the inner bounds. And the relaxation stops at
+the largest inner statement the sweep saw — Q13's 1,488,128 groups — because
+above it nothing has been measured
+                                    → inner_min_reduction, inner_max_groups
+
+The row floor is the third bound of that kind, and it is not in this file: it
+counts the rows of the statement's own FROM (connection._decide_body). TPC-H
+Q22 at SF1 reads 150,000 `customer` rows and its work is a `NOT EXISTS` over
+1,500,000 `orders` rows that §4.18 turns into a lane; the floor declined it at
+SF1 while the identical shape ran 43.6x at SF10, where `customer` alone clears
+the floor. Lifting only the floor, everything else shipping, it measures
+10.17-10.62x at SF1. The floor now counts the largest table the statement's
+answer depends on, lanes included — which is the argument the join bounds
+already make ("native runs a join whatever the FROM says").
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -209,6 +261,14 @@ class Thresholds:
     global_min_rows: int = 16_000_000
     global_min_row_terms: int = 60_000_000
     global_join_min_rows: int = 0
+    # an INNER statement (§4.23): a GROUP BY the nested pass lifted out of a
+    # bigger statement, whose groups DuckDB reads out of the table function and
+    # consumes itself. Three conditions, all measured (the paragraph below the
+    # table); inside them the output-size bounds above do not apply, outside
+    # them they decide as they do for any other statement.
+    inner_min_reduction: float = 4.0        # the consumer has to return this many times fewer rows
+    inner_min_rows_per_group: float = 7.0   # ... and the device has to be reducing this much
+    inner_max_groups: int = 2_000_000       # ... within the envelope the sweep covered
 
 
 METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_where=50_000,
@@ -219,14 +279,36 @@ CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
+def inner_blocked(backend: str, est_groups: Optional[int], selectivity: Optional[float],
+                  has_where: bool, rows: int) -> str:
+    """Why the inner-statement bounds (§4.23) would not apply to this statement
+    even if DuckDB consumed its groups — '' when they would. Said out loud so a
+    decline names the rule that refused to relax, not only the one that fired."""
+    t = TABLE.get((backend or "").upper())
+    if t is None or not est_groups:
+        return ""
+    if est_groups > t.inner_max_groups:
+        return (f"{est_groups} groups is past the {t.inner_max_groups} the inner-statement bounds "
+                f"were measured over")
+    kept = rows * (selectivity if (has_where and selectivity is not None) else 1.0)
+    per_group = kept / est_groups
+    if per_group < t.inner_min_rows_per_group:
+        return (f"{per_group:.1f} rows read per group returned < {t.inner_min_rows_per_group}, so the "
+                f"inner-statement bounds do not apply either")
+    return ""
+
+
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
            limited: bool = False, computed_payloads: int = 0,
            reaggregated: bool = False, global_agg: bool = False, rows: int = 0,
-           where_terms: int = 0) -> Tuple[bool, str]:
+           where_terms: int = 0, inner_out: Optional[int] = None) -> Tuple[bool, str]:
     """(ok, detail). form: plain | having | topk. est_groups None = unknown
     (declines: a miss never rewrites). selectivity None = no WHERE. join:
-    the statement is over a key join (its own table above)."""
+    the statement is over a key join (its own table above). inner_out: this is
+    an INNER statement (§4.23) and its consumer returns that many rows — None
+    when the statement's groups go to the client, which is what the
+    output-size bounds above were measured on."""
     t = TABLE.get((backend or "").upper())
     if t is None:
         return False, f"no thresholds for backend {backend!r}"
@@ -247,6 +329,22 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         return True, ""
     if est_groups is None:
         return False, "no distinct-count estimate for the key"
+    # §4.23: the nested pass lifted this GROUP BY out of a larger statement, so
+    # DuckDB reads its groups out of the table function and consumes them
+    # itself. `inner_out` is what the WHOLE statement returns. When the
+    # consumer reduces the result, the client never materialises these groups,
+    # and the output-size bounds above — every one of them swept on statements
+    # whose groups the client DOES materialise — are the wrong bounds. What
+    # decides instead is how much the device reduces: the rows its WHERE keeps
+    # per row it returns. Outside these three conditions nothing is relaxed and
+    # the bounds above decide as they do for any other statement.
+    kept = rows * (selectivity if (has_where and selectivity is not None) else 1.0)
+    inner = (inner_out is not None and est_groups > 0
+             and est_groups >= inner_out * t.inner_min_reduction
+             and est_groups <= t.inner_max_groups
+             and kept >= est_groups * t.inner_min_rows_per_group)
+    admit = (f"the inner-statement bounds: {est_groups} groups reduced to {inner_out} row(s) inside "
+             f"DuckDB, {kept / est_groups:.1f} rows read per group returned") if inner else ""
     if reaggregated:
         # est_groups counts (key, x) pairs: every one of them goes back through DuckDB
         if est_groups > t.reagg_max_pairs:
@@ -269,6 +367,8 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         # several terms): every group still leaves the operator, but only LIMIT rows reach
         # the client, so the fetch-bound reasoning behind the plain-form bounds does not
         # apply (TPC-H Q3: 11K groups under a 1% WHERE, LIMIT 10 — 1.5-1.7x)
+        if inner:
+            return True, admit
         if form != "plain" or limited:
             return True, ""
         if est_groups > t.join_plain_max_groups:
@@ -301,6 +401,8 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
     if sel is None:
         return False, "selectivity unknown"
     if form == "plain":
+        if inner:
+            return True, admit
         if est_groups > t.plain_max_groups:
             return False, f"{est_groups} groups returned > {t.plain_max_groups} (output-bound)"
         if has_where and est_groups > t.plain_max_groups_where:
