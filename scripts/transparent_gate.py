@@ -46,6 +46,10 @@ WHERES = {
 # projected: expressions over aggregates (§4.11); nested: a rewritable GROUP BY inside a statement DuckDB keeps (§4.14)
 # distinct: count(DISTINCT x) beside a sum (§4.17: the device groups by (key, x))
 FORMS = ("plain", "having", "topk", "projected", "nested", "distinct")
+# --ctes: the same aggregate read through a WITH (§4.22). `cte` names the whole
+# FROM, `cte_arm` is one arm of a join — the shape a project-and-join CTE folds
+# into. Both are measured against the same statement written without the CTE.
+CTE_FORMS = ("cte", "cte_arm")
 # key joins (§4.8): label -> (FROM clause, key column); the WHERE list below
 # applies where its table is part of the join
 JOINS = {
@@ -88,6 +92,14 @@ def build(key: str, where: str, form: str, having_thr: str, source: str = "linei
     if form == "nested":
         return (f"SELECT count(*) AS groups, max(q) AS top, min(q) AS low FROM (SELECT {key} AS kk, sum({PAYLOAD}) AS q{more} "
                 f"FROM {source}{w} GROUP BY {key} HAVING sum({PAYLOAD}) > {having_thr}) gpudb_x")
+    if form == "cte":             # §4.22: a project-and-join CTE that is the whole FROM
+        return (f"WITH gpudb_src AS (SELECT {key} AS gpudb_k, {PAYLOAD} AS gpudb_v FROM {source}{w}) "
+                f"SELECT gpudb_k, sum(gpudb_v), count(*) FROM gpudb_src GROUP BY gpudb_k")
+    if form == "cte_arm":         # §4.22: the same CTE as one ARM of a join
+        return (f"WITH gpudb_src AS (SELECT l_orderkey AS gpudb_ok, {key} AS gpudb_k, {PAYLOAD} AS gpudb_v "
+                f"FROM lineitem{w}) "
+                f"SELECT gpudb_k, sum(gpudb_v), count(*) FROM gpudb_src, orders "
+                f"WHERE gpudb_ok = o_orderkey AND o_orderstatus = 'F' GROUP BY gpudb_k")
     if form == "global":          # no GROUP BY (§4.12): the global masked aggregate
         return f"SELECT sum({PAYLOAD}) AS q, count(*){more} FROM {source}{w}"
     if form == "projected":
@@ -135,6 +147,8 @@ def main() -> int:
                     help="idle gap before every timed statement; reports medians (an interactive cadence)")
     ap.add_argument("--exprs", action="store_true",
                     help="aggregate l_extendedprice * (1 - l_discount) and add an expression WHERE (computed lanes)")
+    ap.add_argument("--ctes", action="store_true",
+                    help="add the WITH forms: a project-and-join CTE as the FROM and as a join arm (§4.22)")
     ap.add_argument("--subqueries", action="store_true",
                     help="add EXISTS / IN / correlated scalar subquery predicates (BOOLEAN lanes, §4.18)")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
@@ -206,7 +220,12 @@ def main() -> int:
         if True:
             # the global form (§4.12) reads no key, so over a single table one
             # cell per (source, WHERE) is the whole sweep — it rides on the first key
-            for form in FORMS + (("global",) if (label or key == keys[0]) else ()):
+            forms = FORMS + (("global",) if (label or key == keys[0]) else ())
+            if args.ctes:
+                # `cte_arm` joins lineitem to orders itself, so it is only run over
+                # the single-table sweep (where the WHERE names lineitem alone)
+                forms += CTE_FORMS if not label else ("cte",)
+            for form in forms:
                 sql = build(key, where, form, thr_s, source, args.payloads)
                 # native
                 con.transparent = False

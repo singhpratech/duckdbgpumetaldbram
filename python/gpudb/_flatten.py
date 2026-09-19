@@ -56,6 +56,34 @@ def _is_spj(node: dict) -> bool:
     return not _has(node.get("select_list") or [], bad)
 
 
+def _plain_inner_join(j: dict) -> bool:
+    """An INNER / CROSS join written without USING or NATURAL: the only join a
+    derived table's WHERE may be hoisted above."""
+    return (j.get("join_type") == "INNER" and not j.get("using_columns")
+            and j.get("ref_type") not in ("NATURAL",))
+
+
+def _all_inner(ft) -> bool:
+    if not isinstance(ft, dict) or ft.get("type") != "JOIN":
+        return True
+    return _plain_inner_join(ft) and _all_inner(ft.get("left")) and _all_inner(ft.get("right"))
+
+
+def _find_arm(ft: dict):
+    """(parent, side, arm) for the first derived-table arm of a join tree."""
+    for side in ("left", "right"):
+        ch = ft.get(side)
+        if not isinstance(ch, dict):
+            continue
+        if ch.get("type") == "SUBQUERY":
+            return ft, side, ch
+        if ch.get("type") == "JOIN":
+            r = _find_arm(ch)
+            if r is not None:
+                return r
+    return None
+
+
 def _colname(e) -> Optional[str]:
     if isinstance(e, dict) and e.get("class") == "COLUMN_REF":
         names = e.get("column_names") or []
@@ -74,7 +102,24 @@ def fold_once(tree: dict) -> bool:
     ft = node.get("from_table") or {}
     ctes = (node.get("cte_map") or {}).get("map") or []
     inner, alias, col_aliases = None, "", []
-    if ft.get("type") == "SUBQUERY" and not ctes:
+    arm_slot = None
+    if ft.get("type") == "JOIN" and not ctes:
+        # §4.22: a derived table that is an ARM of a join (what a project-and-join
+        # CTE or a view becomes there). Its WHERE is hoisted above the join, so
+        # every join in sight has to be an inner one, and the substitution must
+        # not reach into a subquery, where a bare name could bind elsewhere.
+        hit = _find_arm(ft)
+        if hit is None or not _all_inner(ft):
+            return False
+        parent, side, armnode = hit
+        inner = (armnode.get("subquery") or {}).get("node")
+        alias, col_aliases = armnode.get("alias") or "", list(armnode.get("column_name_alias") or [])
+        if armnode.get("sample") or not alias:
+            return False
+        if not _all_inner((inner or {}).get("from_table")):
+            return False
+        arm_slot = (parent, side)
+    elif ft.get("type") == "SUBQUERY" and not ctes:
         inner = (ft.get("subquery") or {}).get("node")
         alias, col_aliases = ft.get("alias") or "", list(ft.get("column_name_alias") or [])
         if ft.get("sample"):
@@ -128,6 +173,34 @@ def fold_once(tree: dict) -> bool:
         if name.casefold() in mapping:
             return False
         mapping[name.casefold()] = it
+    if arm_slot is not None:
+        if star:
+            return False                       # `arm.col` over SELECT * would lose its qualifier
+        # substituting a bare name inside a subquery could bind it to the
+        # subquery's own relation instead of this one (§4.18's scoping trap):
+        # an arm beside a subquery predicate is left as written
+        if _has([node.get("select_list"), node.get("where_clause"), node.get("having"),
+                 node.get("modifiers")], lambda e: e.get("class") == "SUBQUERY"):
+            return False
+
+    # An arm's columns lose their qualifier when the arm is spliced into the
+    # join, and a bare name that also exists on the other side would stop
+    # binding. Over a single base table the qualifier is known, so it is kept.
+    inner_ft = (inner.get("from_table") or {}) if arm_slot is not None else {}
+    qual = ((inner_ft.get("alias") or inner_ft.get("table_name") or "")
+            if inner_ft.get("type") == "BASE_TABLE" else "")
+
+    def requalify(e):
+        if isinstance(e, list):
+            return [requalify(x) for x in e]
+        if not isinstance(e, dict):
+            return e
+        if e.get("class") == "COLUMN_REF":
+            names = e.get("column_names") or []
+            if len(names) <= 2:
+                return dict(e, column_names=[qual, names[-1]])
+            return e
+        return {k: (v if k in ("value", "cast_type", "type_info") else requalify(v)) for k, v in e.items()}
 
     def expr_for(names) -> Optional[dict]:
         if not names or len(names) > 2:
@@ -140,7 +213,8 @@ def fold_once(tree: dict) -> bool:
                 return {"class": "COLUMN_REF", "type": "COLUMN_REF", "alias": "", "query_location": _NO_LOC,
                         "column_names": [names[-1]]}
             return None
-        return dict(json.loads(json.dumps(it)), alias="")
+        out = dict(json.loads(json.dumps(it)), alias="")
+        return requalify(out) if qual else out
 
     select_aliases = {(s.get("alias") or "").casefold() for s in (node.get("select_list") or []) if s.get("alias")}
 
@@ -162,6 +236,15 @@ def fold_once(tree: dict) -> bool:
             return r
         return {k: (v if k in ("value", "cast_type", "type_info") else sub(v, False, in_order)) for k, v in e.items()}
 
+    if arm_slot is not None:
+        # the arm's columns are named in the join's own ON conditions too
+        def sub_conditions(j):
+            if isinstance(j, dict) and j.get("type") == "JOIN":
+                if j.get("condition") is not None:
+                    j["condition"] = sub(j["condition"])
+                sub_conditions(j.get("left"))
+                sub_conditions(j.get("right"))
+        sub_conditions(ft)
     node["select_list"] = [sub(it, top_select=True) for it in (node.get("select_list") or [])]
     node["group_expressions"] = sub(node.get("group_expressions") or [])
     node["having"] = sub(node.get("having")) if node.get("having") is not None else None
@@ -171,12 +254,18 @@ def fold_once(tree: dict) -> bool:
             for o in m.get("orders") or []:
                 o["expression"] = sub(o.get("expression"), in_order=True)
     inner_where = inner.get("where_clause")
+    if inner_where is not None and qual:
+        inner_where = requalify(json.loads(json.dumps(inner_where)))
     if inner_where is not None and outer_where is not None:
         node["where_clause"] = {"class": "CONJUNCTION", "type": "CONJUNCTION_AND", "alias": "",
                                 "query_location": _NO_LOC, "children": [inner_where, outer_where]}
     else:
         node["where_clause"] = inner_where if inner_where is not None else outer_where
-    node["from_table"] = inner.get("from_table")
+    if arm_slot is not None:
+        parent, side = arm_slot
+        parent[side] = inner.get("from_table")
+    else:
+        node["from_table"] = inner.get("from_table")
     if ctes:
         node["cte_map"] = {"map": []}
     return True
@@ -192,7 +281,7 @@ def fold(tree_json: str, names: Optional[list] = None) -> Optional[str]:
     except ValueError:
         return None
     changed = False
-    for _ in range(4):
+    for _ in range(8):                          # several derived tables, one per pass
         if not fold_once(tree):
             break
         changed = True
