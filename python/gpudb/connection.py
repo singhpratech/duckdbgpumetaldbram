@@ -290,6 +290,7 @@ class Connection:
         self._has_rewrite_scalar = False
         self._refresh_after = False
         self._big_tables: Optional[set] = None    # names of tables above the floor (§0)
+        self._speedups: List[float] = []          # §5.5: measured native/rewritten ratios, newest last
         self._parent = _parent
         if _parent is None:
             self._manager = ResidencyManager(lambda: self._raw.cursor(), mode=residency,
@@ -328,7 +329,10 @@ class Connection:
 
     def memory(self) -> Dict[str, Any]:
         """The memory budget (§5.5) and, per resident set, the size the wrapper
-        expected and the size the extension reports."""
+        expected, the size the extension reports, and what the set is worth:
+        `value`, the milliseconds it saves per second of wall time, and
+        `density`, the same per GiB it holds — the quantity admission and
+        eviction compare."""
         return self._manager.memory()
 
     def residents(self) -> Dict[str, str]:
@@ -468,7 +472,10 @@ class Connection:
             return
         now = time.monotonic()
         if not self._last.rewritten:
-            if self._last.reason in ("not_resident", "threshold"):
+            # 'memory' belongs here with the other two: the budget refused the
+            # set, so this run IS the template's native time — and it is what
+            # the set's value as a candidate is estimated from (§5.5)
+            if self._last.reason in ("not_resident", "threshold", "memory"):
                 d.native_ms = ms if d.native_ms is None else min(d.native_ms, ms)
             if d.measured_declined and now >= d.next_check_at and d.probe_sql and isinstance(query, str):
                 d.next_check_at = now + _REMEASURE_S
@@ -579,6 +586,69 @@ class Connection:
                       f"template rewritten again")
             d.rewritten, d.reason, d.measured_declined, d.why = True, "", False, ""
 
+    # ---- what a resident set is worth (§5.5) ----
+    def _speedup(self) -> float:
+        """This connection's measured speedup: the median of the templates that
+        have both a native and a rewritten time. It is what the value of a set
+        nobody has measured yet is estimated from — a distribution the
+        connection collected itself rather than a constant picked here. 2.0
+        until three templates have been measured, and clamped either side, so
+        that one 40x template cannot make every unmeasured candidate look
+        golden and one barely-winning one cannot make them all look worthless."""
+        root = self._parent or self
+        got = sorted(root._speedups)
+        s = got[len(got) // 2] if len(got) >= 3 else 2.0
+        return min(20.0, max(1.2, s))
+
+    def _note_value(self, ms: Optional[float] = None) -> None:
+        """After a statement: credit the sets it read with what they saved.
+
+        This is the whole of the residency policy's bookkeeping on the
+        statement path, and it is O(1) per set (`ResidencyManager.note_use`).
+        Three cases, all one function of the connection's measured speedup S:
+
+          * the set answered and its template's native time is known — the
+            saving is measured, native - rewritten;
+          * it answered and no native time is known yet — estimate
+            rewritten * (S - 1);
+          * it did NOT answer (not resident, or the budget refused it) and the
+            statement ran native — estimate native * (1 - 1/S).
+
+        The estimate is what a candidate is admitted on. Being wrong is
+        self-correcting: the first time the set is resident and used, the
+        measurement replaces the estimate in the same accumulator."""
+        d = getattr(self, "_detail_decision", None)
+        if d is None or self._last.fallback:
+            return
+        tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        if not tags:
+            return
+        if ms is None:
+            ms = (d.rewritten_ms[-1] if (self._last.rewritten and d.rewritten_ms) else d.native_ms)
+            if ms is None:
+                return
+        if self._last.rewritten:
+            native = d.native_ms
+            if getattr(self, "_uploaded_now", False):
+                # the upload ran inside this statement (residency='eager'): this
+                # time is the upload's, not the set's, and there is nothing
+                # honest to read as a saving. The use is recorded and the set
+                # stays worth nothing — which is also what keeps the minimum age
+                # over it until a statement has actually been answered from it.
+                saved, measured = 0.0, False
+            elif native is not None and native > 0.0 and ms > 0.0:
+                root = self._parent or self
+                root._speedups.append(native / ms)
+                del root._speedups[:-16]
+                saved, measured = max(0.0, native - ms), True
+            else:
+                saved, measured = ms * (self._speedup() - 1.0), False
+        elif self._last.reason in ("not_resident", "memory"):
+            saved, measured = ms * (1.0 - 1.0 / self._speedup()), False
+        else:
+            return          # native for a reason no amount of residency changes
+        self._manager.note_use(tags, saved, measured=measured)
+
     def _probe_ms(self, sql: str, parameters) -> Optional[float]:
         """Time one execution of `sql` on a side cursor (the caller still
         fetches from self._raw); None when it fails."""
@@ -606,7 +676,9 @@ class Connection:
                 run = self._planned(sql) if (self._last.rewritten and not parameters
                                              and sql == self._last.sql) else sql
                 self._raw.execute(run, parameters)
-                self._note_timing((time.perf_counter() - t0) * 1000.0, query, parameters)
+                _ms = (time.perf_counter() - t0) * 1000.0
+                self._note_timing(_ms, query, parameters)
+                self._note_value(_ms)
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
@@ -758,6 +830,7 @@ class Connection:
                 if self._last.rewritten:
                     _ = rel.columns
                 self._note_timing_lazy(query)
+                self._note_value()
                 return rel
             except duckdb.Error as e:
                 if self._last.rewritten and STALE_MARKER in str(e):
@@ -1084,6 +1157,7 @@ class Connection:
         self._detail_decision = None
         self._last_tags = []
         self._last_inner_note = ""
+        self._uploaded_now = False
         if not isinstance(query, str):
             self._last.reason = "shape"
             return query
@@ -1606,6 +1680,9 @@ class Connection:
                                                                                key_width=0 if (d.plan is not None and d.plan.no_key) else 8))
             if self._residency_mode == "eager" and st.state == "pending":
                 self._manager.upload_now(d.tag, lambda s: self._raw.execute(s).fetchall())
+                # this statement paid for the upload, so its time is not what the
+                # set will cost from now on and must not be read as its saving (§5.5)
+                self._uploaded_now = self._manager.is_ready(d.tag)
             if not self._manager.is_ready(d.tag):
                 self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
                                      else "not_resident")
@@ -2362,9 +2439,11 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
     `memory_budget`: device memory the resident sets may use — bytes, or a string
     such as '16GB'; 0 or 'unlimited' removes the cap. Default: a quarter of
     unified memory on Apple silicon, half of device memory on a discrete GPU
-    (§5.5). Least recently used sets are evicted to make room; a set that cannot
-    fit is not uploaded and its statements keep running on DuckDB
-    (`last_rewrite()["reason"] == "memory"`)."""
+    (§5.5). Under pressure the sets that save the most time per byte are the
+    ones that stay: a candidate evicts the least valuable resident thing only
+    when it is worth more per byte than that, and otherwise it is not uploaded
+    and its statements keep running on DuckDB
+    (`last_rewrite()["reason"] == "memory"`, with the arithmetic in `detail`)."""
     if residency not in ("background", "eager", "manual"):
         raise ValueError("residency must be 'background', 'eager' or 'manual'")
     cfg = dict(config or {})

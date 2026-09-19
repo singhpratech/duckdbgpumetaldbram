@@ -1479,20 +1479,87 @@ same database — the extension stays free of threads and hidden connections
   - *What is resident and what it costs* comes from `gpu_residents()`
     (`bytes` includes derived structures). Sets uploaded by hand count toward
     the total and are never evicted.
-  - *Eviction* is least recently used by the extension's own `last_used_at`,
-    through `gpu_drop_resident` — and, since the store (§5.10), through
-    `gpu_drop_column` for the columns views share: a view costs nothing, its
-    columns are what the budget counts (`gpu_store_columns()`), and a column
-    goes when none of its views was used recently. Never evicted: a set an operator is using
-    (`refs > 0`), a source of the set being uploaded, a source of another
-    resident set (the derived set goes first — dropping a base table's set
-    from under a join would turn every guard of that join stale), and any set
-    uploaded less than 60 s ago (anti-thrash: two sets that do not fit
-    together must not evict each other on alternate statements).
-  - *A set that does not fit* — larger than the budget, or nothing evictable
-    yet — is not uploaded. Its statements keep running on DuckDB with
-    `last_rewrite()["reason"] == "memory"`; a refused set is asked about again
-    no sooner than the failed-upload retry time (30 s), not on every sighting.
+  - *Eviction* goes by what a set is WORTH (see "Value-aware residency"
+    below), through `gpu_drop_resident` — and, since the store (§5.10),
+    through `gpu_drop_column` for the columns views share: a view costs
+    nothing, its columns are what the budget counts (`gpu_store_columns()`),
+    and a column's worth is what the views over it are worth. Never evicted: a
+    set an operator is using (`refs > 0`), a source of the set being uploaded,
+    a source of another resident set and its store columns (the derived set
+    goes first — dropping a base table's lane from under a join would turn
+    every guard of that join stale).
+  - *A set that does not fit* — larger than the budget, or not worth more than
+    what it would have to displace — is not uploaded. Its statements keep
+    running on DuckDB with `last_rewrite()["reason"] == "memory"`, and
+    `detail` carries the arithmetic; a refused set is asked about again no
+    sooner than the failed-upload retry time (30 s), not on every sighting.
+- **Value-aware residency (2026-09-19).** Least recently used says nothing
+  about what a set is FOR. Under a budget smaller than the working set it lets
+  a set that saves 25 ms a run hold memory a set saving 250 ms a run needs,
+  and it lets a looping workload cycle evictions, each re-upload costing
+  seconds in the background while its statements run native. The quantities,
+  all in `python/gpudb/_residency.py`, all O(1) per statement:
+  - *The value of a set* is a decaying rate — the milliseconds of DuckDB time
+    it saves per second of wall time:
+    `Σ_uses saved_ms · e^(−age/τ) / τ`, τ = 300 s. It is one float per set,
+    updated on each use as `value ← value·e^(−Δt/τ) + saved_ms/τ`
+    (`note_use`, one dict lookup and one `exp()` under the manager's lock), so
+    a set that goes quiet stops holding memory a few minutes later without
+    anybody sweeping anything. `saved_ms` comes from the statement that just
+    ran (`Connection._note_value`): measured as `native − rewritten` where the
+    template's native time is known, and otherwise estimated from this
+    connection's own measured speedup S — the median of the templates that
+    have both times, clamped to [1.2, 20] and 2.0 until three have been
+    measured. A use of a set that is NOT resident (the statement ran native)
+    is an estimate, not a measurement, and counts for half a resident use;
+    that is what makes residency sticky, because at equal true value a
+    resident set's accumulator then grows twice as fast as its challenger's
+    and the two cannot trade places.
+  - *Value per byte* is what admission compares, because bytes are what
+    eviction frees. A set's value is spread over the store columns it reads in
+    proportion to what each one costs, and a column read by several sets
+    carries the sum of their shares — so evicting one reader of a shared
+    column, which frees nothing, is never mistaken for a saving.
+  - *The value of a candidate* that has never been resident: its native time
+    and its sighting rate are known, its speedup is not, so its saving is
+    estimated through S and credited on every sighting exactly like a use. A
+    candidate nobody has measured at all — the first sighting of a template on
+    a connection whose budget is already full — is priced at the MEDIAN value
+    density of what is resident: absent evidence, a set is worth what this
+    connection's sets are typically worth, which lets it displace the cheapest
+    thing there is and nothing better. Being wrong is self-correcting, because
+    one statement later the measurement replaces the guess in the same
+    accumulator.
+  - *Admission vs eviction.* The least valuable evictable unit — a store
+    column or a set of its own — goes only if the candidate is worth more per
+    byte than it is by a hysteresis margin of 1.25; otherwise the candidate
+    stays native and `detail` says whose value it did not beat. The margin is
+    the whole anti-ping-pong argument: A displaces B only if
+    d(A) > 1.25·d(B), and B cannot displace A back without d(B) > 1.25·d(A).
+  - *The minimum age* (60 s) is what it always was — anti-thrash — but stated
+    as what it is for: a set gets the chance to pay back its upload, and
+    paying back means answering a statement. So a unit is protected while it
+    is younger than 60 s AND has not yet saved anybody anything; after that it
+    competes on value, however young. This was decided by measurement: the
+    22-query TPC-H run fills the budget inside 60 s and every set in it has
+    already answered by the time the next statement arrives, so a wall-clock
+    minute was refusing Q18 (15×) and Q19 (14.5×) the device that Q13 and Q15
+    had just taken. A still-unproven unit can be interrupted only by a
+    candidate worth twice the typical resident set, and a set that an override
+    took off the device may not override its way back for 60 s — so two sets
+    cannot ping-pong through a third.
+  - *Explainability.* `Connection.memory()` reports `value` (ms saved per
+    second) and `density` (the same per GiB) per set; the shell's
+    `.residents` prints the latter as `worth`; every eviction log line says
+    what went and what it was worth against the set that displaced it.
+  - *Where index vectors plug in.* PR #142 (a join set held as row-index
+    vectors: 1.2–1.9× slower to read, much smaller) is the other lever on this
+    same pressure. In these terms it is a second FORM of a set with a
+    different point on the value/bytes curve — lower value, far fewer bytes,
+    so usually a higher density. The place it attaches is admission: when a
+    candidate is refused, or when it would have to evict something denser,
+    re-price it in its index-vector form and compare that density instead of
+    declining. Nothing else in the policy changes; it is out of scope here.
   `GPUDB_UPLOAD_POOL_MAX_MB` stays what it is — the extension-side cap on
   **host** upload buffering — and is documented as such.
 - **Upload cost (measured 2026-09-17).** A statement's time on the device is
