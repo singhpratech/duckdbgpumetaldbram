@@ -4211,3 +4211,144 @@ with `--subqueries` rebuilds 3 key lanes and 4 sort caches over its 782 cells
 column per structure and never twice, and `--joins none`, `--no-single` and
 `--exprs` alone find none. The gate is still exit 0 with every rewritten cell at
 or above the bound.
+
+## v0.8 — the WHERE stage of the sort path in one pass, Metal, SF10 (2026-09-18)
+
+`gbx_mask_i64` was one kernel dispatch per predicate over the rows, each of them
+reading a byte of the mask and writing one back in order to look at a single
+lane; the sort path then gathered `mask[perm[i]]` once to count the survivors of
+the key range and again for every payload it reduced. The branch replaces both:
+one `gbx_fused_mask_i64` pass evaluates the whole conjunction per row through
+`gpred_eval`, and the counting pass (`gbx_sel_smask_i64`) keeps its gather as a
+mask in SORTED order that the masked reduce and the compaction read straight
+(`docs/TRANSPARENT_DESIGN.md` §4.6).
+
+Apple M4 Max, `data/tpch_sf10/tpch.duckdb` (59,986,052 lineitem rows),
+`gpudb.connect(residency="eager", thresholds=False, floor_rows=0,
+memory_budget="200GB")`, `SET threads TO 1`, alone on the machine. The three
+shapes run in ONE process, interleaved with the order rotated per round (§9.1),
+10 rounds, min and median of `kernel_ms` from `gpu_last_stats()`. Cells: WHERE
+terms 1–5 × selectivity 1 / 10 / 50 / 90 % × payloads 1 / 3 / 5 × groups 10k
+(`l_partkey % 10000`) / 100k (`l_suppkey`) / 2M (`l_partkey`). The selectivity
+term is a cut point of `l_extendedprice` read from the data, so it is
+decorrelated from the key; the other terms are always true and each reads a
+different lane, so `n` terms read `n` distinct lanes. Every shape returned the
+same rows in every cell. **98 of the 180 cells were measured** — terms 1 and 2
+complete, terms 3 partial — before the run was stopped; the trend across terms
+is monotonic and the table says so.
+
+| region | cells | legacy/fused, kernel min | median | statement min | range |
+|---|---:|---:|---:|---:|---|
+| all | 98 | 1.43× | 1.44× | 1.35× | 1.06–2.38× |
+| 1 term | 36 | 1.26× | 1.26× | 1.21× | 1.06–1.90× |
+| 2 terms | 36 | 1.41× | 1.42× | 1.33× | 1.20–1.92× |
+| 3 terms | 26 | 1.61× | 1.59× | 1.54× | 1.29–2.38× |
+| 1 % survive | 27 | 1.36× | 1.37× | 1.32× | 1.06–1.68× |
+| 10 % | 27 | 1.26× | 1.27× | 1.24× | 1.09–1.50× |
+| 50 % | 26 | 1.71× | 1.70× | 1.54× | 1.33–2.38× |
+| 90 % | 18 | 1.59× | 1.54× | 1.42× | 1.32–1.71× |
+| 1 payload | 33 | 1.39× | 1.39× | 1.36× | 1.06–1.68× |
+| 3 payloads | 33 | 1.55× | 1.51× | 1.32× | 1.07–1.83× |
+| 5 payloads | 32 | 1.61× | 1.54× | 1.34× | 1.09–2.38× |
+| 10k groups | 33 | 1.45× | 1.45× | 1.43× | 1.06–2.38× |
+| 100k groups | 33 | 1.45× | 1.45× | 1.41× | 1.09–2.19× |
+| 2M groups | 32 | 1.41× | 1.42× | 1.28× | 1.09–1.77× |
+
+**The two halves, separated.** Terms cost the legacy stage a pass each and the
+fused stage almost nothing (1 payload, 100k groups, whole-kernel ms, min of 10):
+
+| | 1 term | 2 terms | 3 terms | per term |
+|---|---:|---:|---:|---|
+| 1 % survive, legacy | 11.97 | 15.16 | 18.93 | +3.5 ms |
+| 1 % survive, fused | 10.72 | 10.99 | 11.35 | +0.3 ms |
+| 10 %, legacy | 14.93 | 17.49 | 21.21 | +3.1 ms |
+| 10 %, fused | 12.48 | 13.10 | 14.14 | +0.8 ms |
+| 50 %, legacy | 26.54 | 30.65 | 33.11 | +3.3 ms |
+| 50 %, fused | 19.13 | 20.40 | 20.93 | +0.9 ms |
+
+Payloads cost the legacy stage one gather of the mask each, and the sorted-order
+mask removes it (50 % survive, 100k groups, whole-kernel ms):
+
+| | 1 payload | 3 | 5 |
+|---|---:|---:|---:|
+| 1 term, legacy | 26.5 | 52.2 | 79.6 |
+| 1 term, fused | 19.1 | 30.5 | 42.0 |
+| 3 terms, legacy | 33.1 | 59.0 | 120.6 |
+| 3 terms, fused | 20.9 | 32.3 | 55.0 |
+
+**The rule: fused whenever it can express the WHERE.** Not one of the 98 cells
+is slower than legacy — the worst is 1.06× (one term, 1 % survive, one payload,
+where the legacy stage is one pass too) — so there is no region to split and no
+threshold to fit. The only declines are structural: a WHERE that reads more than
+12 distinct columns (the kernel binds one buffer pair per lane) and a device
+that will not build the pipelines both keep the per-term loop.
+
+**permeval, the third shape.** Evaluating the WHERE at `row = perm[i]` and
+writing only the sorted-order mask removes the 60 MB write, the 60 MB read and
+the byte gather, and costs one RANDOM gather per distinct predicate lane
+instead of one sequential read. It is slower than fused in **98 of 98 cells**
+(fused takes 0.48–0.93× of its kernel, median 0.75×), and slower than legacy
+wherever little survives (0.71× at 1 % with one payload and one term); it beats
+legacy only at 50–90 % survival with several payloads, where the sorted-order
+mask it shares with the fused pass is what carries it (up to 1.73×). A lane
+gather costs what a payload gather costs, and a term buys one of those instead
+of one sequential read. It stays behind `GPUDB_METAL_MASK_PATH=permeval`.
+
+**What it does to whole queries.** `scripts/tpch_coverage.py`, threads = 1,
+resident, the same build with `GPUDB_METAL_MASK_PATH=legacy` and with the
+default, two runs of each, interleaved (rewritten statement ms, run 1 / run 2;
+the ratio is min over min):
+
+| SF10 | legacy | fused | legacy ÷ fused | native |
+|---|---:|---:|---:|---:|
+| Q3 | 21.1 / 21.8 | 13.4 / 13.4 | 1.57× | 45.3 |
+| Q7 | 20.6 / 22.3 | 11.5 / 11.0 | 1.87× | 48.6 |
+| Q10 | 21.6 / 21.5 | 13.9 / 14.2 | 1.55× | 79.3 |
+| Q18 | 11.2 / 11.5 | 8.9 / 8.9 | 1.26× | 101.6 |
+| Q21 | 33.2 / 34.7 | 21.8 / 21.5 | 1.54× | 162.0 |
+| Q22 | 1.5 / 1.5 | 0.7 / 1.5 | 2.14× | 26.3 |
+| Q1 | 14.4 / 14.4 | 14.8 / 14.3 | 1.01× | 107.6 |
+| Q4 | 2.6 / 2.6 | 2.6 / 2.8 | 1.00× | 45.1 |
+| Q5 | 1.7 / 1.0 | 1.0 / 0.9 | 1.11× | 47.6 |
+| Q6 | 6.0 / 6.2 | 6.2 / 6.1 | 0.98× | 13.4 |
+| Q8 | 7.9 / 7.9 | 7.9 / 7.9 | 1.00× | 68.4 |
+| Q9 | 5.6 / 5.8 | 5.6 / 5.5 | 1.02× | 146.4 |
+| Q11 | 6.9 / 7.1 | 7.4 / 6.8 | 1.01× | 10.4 |
+| Q12 | 10.5 / 10.5 | 10.7 / 10.5 | 1.00× | 39.0 |
+| Q14 | 4.4 / 4.4 | 4.5 / 4.4 | 1.00× | 29.5 |
+| Q17 | 3.3 / 3.1 | 3.5 / 3.2 | 0.97× | 49.9 |
+| Q19 | 4.2 / 4.3 | 4.2 / 4.2 | 1.00× | 64.9 |
+
+The first six are the queries whose sort-path GROUP BY carries a WHERE; the
+stage trace (`GPUDB_METAL_TRACE_EXACT=1`) shows their mask stage going from
+13.2–14.2 ms to 5.8–6.7 ms over 60M rows with three terms. The other eleven do
+not run that stage — the direct reduce, the global aggregate or an unmasked
+GROUP BY answers them — and they sit within ±3 %, which is the run-to-run
+spread of this harness (Q5's own legacy pair reads 1.7 and 1.0). 17 of 22 on
+the device either way, every result identical.
+
+At SF1 the same comparison, 15 of 22 on the device either way:
+
+| SF1 | legacy | fused | legacy ÷ fused | native |
+|---|---:|---:|---:|---:|
+| Q3 | 2.7 / 2.9 | 2.8 / 2.2 | 1.23× | 6.4 |
+| Q4 | 1.3 / 0.7 | 0.5 / 1.3 | 1.40× | 7.3 |
+| Q7 | 3.6 / 3.6 | 2.4 / 2.4 | 1.50× | 7.4 |
+| Q10 | 4.5 / 3.6 | 3.1 / 3.2 | 1.16× | 17.4 |
+| Q21 | 6.1 / 4.9 | 4.9 / 4.2 | 1.17× | 22.1 |
+| Q17, Q18 | 1.2–1.7 | 1.1–1.5 | 1.07–1.09× | 6.0, 13.3 |
+| Q1, Q12, Q13, Q14, Q19 | — | — | 1.00× | — |
+| Q5 | 1.1 / 1.2 | 1.2 / 1.2 | 0.92× | 6.9 |
+| Q8 | 1.3 / 1.4 | 2.7 / 1.4 | 0.93× | 7.5 |
+| Q9 | 1.3 / 1.2 | 1.4 / 1.4 | 0.86× | 18.7 |
+
+Q5, Q8 and Q9 read below 1.0× and none of them runs the mask stage: their
+statements are 1.2–1.4 ms, where a tenth of a millisecond is 8 %, and single
+runs at that size land in either of the two modes a short kernel has on this
+machine (Q8's fused pair is 2.7 and 1.4; Q14's legacy pair is 1.4 and 5.3).
+They are printed as measured.
+
+**The gate.** `scripts/transparent_gate.py --subqueries --exprs`, SF1, alone on
+the machine, on the final code: 782 cells, 509 rewritten and at or above the
+bound, 273 declined by a threshold, 0 slower, 0 differing, exit 0. No threshold
+changed.

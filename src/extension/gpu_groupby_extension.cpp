@@ -746,6 +746,7 @@ void gx_init(duckdb_init_info info) {
         {
             auto dev = resident_device_lock(ctx);
             gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
+            gpudb::exact_mask_note().clear();   // ... and, when there was one, its WHERE stage
             if (where)
                 init->res = agg.groupby_exact_masked_resident(*set->keys, set->vals.get(),
                                                               rw.preds.data(), rw.preds.size(), cap, filt);
@@ -753,6 +754,7 @@ void gx_init(duckdb_init_info info) {
                 init->res = agg.groupby_exact_resident(*set->keys, set->vals.get(), cap, filt);
             d = agg.last_decision();
             path = gpudb::exact_path_note();
+            if (!gpudb::exact_mask_note().empty()) path += "/" + gpudb::exact_mask_note();
         }
         {
             const auto& rr = init->res;
@@ -1049,10 +1051,12 @@ void gm_init(duckdb_init_info info) {
         {
             auto dev = resident_device_lock(ctx);
             gpudb::exact_path_note().clear();   // the backend names the algorithm it ran
+            gpudb::exact_mask_note().clear();   // ... and, when there was one, its WHERE stage
             init->pay = agg.groupby_exact_masked_multi(*set->keys, mp.data(), P, fp, rw.preds.data(), rw.preds.size(), cap, f0);
             // process-wide state: copied out under the lock that wrote it
             d = agg.last_decision();
             path = gpudb::exact_path_note();
+            if (!gpudb::exact_mask_note().empty()) path += "/" + gpudb::exact_mask_note();
         }
         {
             auto& prim = init->pay[fp];

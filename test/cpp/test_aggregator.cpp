@@ -3172,6 +3172,256 @@ void test_shed_derived_body() {
         std::printf("  the direct path is unavailable: %zu bytes kept\n", before);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The WHERE stage of the sort path, fused and legacy (docs/TRANSPARENT_DESIGN.md
+// §4.6). One pass that evaluates the whole conjunction per row must answer what
+// the one-pass-per-term loop answers, limb for limb, on every shape the mask
+// stage serves: each operator, IN lists, F64 lanes under DuckDB's total order,
+// IsNull / IsNotNull, NULL cells in a predicate lane, narrow lanes at their
+// width boundaries, nothing surviving and everything surviving, the compaction
+// variant and the masked reduce, several payloads, HAVING and top-k, and a
+// NULL-key group. A WHERE over more distinct columns than the fused kernel
+// binds must fall back to the legacy pass rather than throw, and the note says
+// which ran so a silent fallback fails the check.
+// ---------------------------------------------------------------------------
+void test_fused_mask_body();
+
+void test_fused_mask() {
+    std::printf("\n--- exact GROUP BY: the fused WHERE pass vs the legacy one ---\n");
+    try {
+        test_fused_mask_body();
+    } catch (const std::exception& e) {
+        std::printf("  skipped (%s)\n", e.what());
+    }
+}
+
+void test_fused_mask_body() {
+    using DT = gpudb::Dtype;
+    using Op = gpudb::Predicate::Op;
+    const std::size_t cap = std::size_t(100) * 1000000;
+    auto ref_agg = gpudb::make_aggregator(gpudb::Backend::CPU);
+    // Many-group keys only, so every call takes the sort path and therefore
+    // the mask stage; `sort` is forced as well so nothing here depends on the
+    // direct path's dispatch rule.
+    auto metal = [] {
+        setenv("GPUDB_METAL_GROUPBY_EXACT_PATH", "sort", 1);
+        auto a = gpudb::make_aggregator(gpudb::Backend::METAL);
+        unsetenv("GPUDB_METAL_GROUPBY_EXACT_PATH");
+        return a;
+    }();
+
+    // Is the fused pass available on this GPU? A device that will not build
+    // its pipelines answers everything through the legacy pass, which costs
+    // the suite the path assertions and nothing else.
+    // The device is read from its name, not from the note under test, so the
+    // assertions stay independent of the code they check: the fused pass is
+    // offered to Apple7 and later, and never to a virtualised Apple GPU.
+    const char* knob = std::getenv("GPUDB_METAL_MASK_DISABLE_PSO");
+    const std::string dev = metal->device_name();
+    const bool offered = dev.find("Apple7") != std::string::npos &&
+                         dev.find("Paravirtual") == std::string::npos;
+    if (!offered)
+        std::printf("  the fused pass is not offered to this device: every shape must answer "
+                    "through the legacy pass (%s)\n", dev.c_str());
+    const bool refused = (knob && *knob) || !offered;
+
+    const std::size_t N = 2'600'003, L = 16;
+    // Lanes: 0 key (10k distinct, NULLs), 1 key (120k distinct), 2 wide
+    // payload, 3 narrow payload, 4..7 the width boundaries 1 / 2 / 4 / 8
+    // bytes, 8 an F64 lane (NaN, +-inf, -0.0, NULLs), 9 all NULL, 10 an IN
+    // list's lane, 11..15 four more distinct lanes so a WHERE can ask for more
+    // than the kernel binds.
+    std::vector<std::int64_t> flat(N * L);
+    std::vector<std::vector<std::uint64_t>> valid(L, std::vector<std::uint64_t>((N + 63) / 64, ~std::uint64_t{0}));
+    const double specials[5] = {std::numeric_limits<double>::quiet_NaN(),
+                                std::numeric_limits<double>::infinity(),
+                                -std::numeric_limits<double>::infinity(), -0.0, 0.0};
+    for (std::size_t i = 0; i < N; ++i) {
+        auto clear = [&](std::size_t l) { valid[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+        flat[i * L + 0] = static_cast<std::int64_t>((i * 2654435761ull) % 10'000) * 3 - 7;
+        flat[i * L + 1] = static_cast<std::int64_t>((i * 40503ull) % 120'011);
+        flat[i * L + 2] = (std::int64_t{1} << 62) - static_cast<std::int64_t>(i % 1013) * 7;
+        flat[i * L + 3] = static_cast<std::int64_t>(i % 251) - 125;
+        flat[i * L + 4] = static_cast<std::int64_t>(i % 256) - 128;            // width 1
+        flat[i * L + 5] = static_cast<std::int64_t>(i % 65536) - 32768;        // width 2
+        flat[i * L + 6] = static_cast<std::int64_t>(i % 4001) * 1'000'000 - 2'000'000'000LL;  // width 4
+        flat[i * L + 7] = (std::int64_t{1} << 40) + static_cast<std::int64_t>(i % 7919);      // width 8
+        double d = (i % 211 < 5) ? specials[i % 5]
+                                 : static_cast<double>(static_cast<std::int64_t>(i % 997)) / 997.0;
+        std::memcpy(&flat[i * L + 8], &d, sizeof(double));
+        flat[i * L + 9] = 0;
+        flat[i * L + 10] = static_cast<std::int64_t>(i % 17) - 8;
+        for (std::size_t l = 11; l < L; ++l)
+            flat[i * L + l] = static_cast<std::int64_t>((i + l * 13) % 97) - 48;
+        if (i % 23 == 0) clear(0);        // a NULL-key group
+        if (i % 31 == 0) clear(3);        // NULL payload cells
+        if (i % 29 == 0) clear(5);        // NULL cells in a predicate lane
+        if (i % 41 == 0) clear(8);
+        clear(9);                         // a lane that is NULL everywhere
+    }
+    std::vector<const std::uint64_t*> vp(L);
+    for (std::size_t l = 0; l < L; ++l) vp[l] = valid[l].data();
+    DT dts[L];
+    for (std::size_t l = 0; l < L; ++l) dts[l] = (l == 8) ? DT::F64 : DT::I64;
+    gpudb::Aggregator::RowSpan sp;
+    sp.lanes = flat.data(); sp.rows = N; sp.n_lanes = L; sp.valid = vp.data();
+    auto mcols = metal->upload_rows_exact(&sp, 1, dts, L);
+    auto rcols = ref_agg->upload_rows_exact(&sp, 1, dts, L);
+
+    auto bits = [](double d) { std::int64_t b = 0; std::memcpy(&b, &d, sizeof(b)); return b; };
+    const std::vector<std::int64_t> in_list = {-8, 0, 3, 7, 1234};
+    const std::vector<std::int64_t> in_f64  = {bits(0.5), bits(std::numeric_limits<double>::infinity()),
+                                               bits(-0.0)};
+
+    // Every group's tuple, limb for limb, in order — the group order, the
+    // NULL-key group's place and a group the WHERE emptied being absent are
+    // all part of the contract.
+    auto same = [&](const gpudb::GroupByResidentResult& a, const gpudb::GroupByResidentResult& b,
+                    const char* what, std::uint32_t cols = gpudb::GroupByFilter::kAllColumns) {
+        bool ok = a.keys == b.keys && a.key_null == b.key_null;
+        if (cols & (1u << 1)) ok = ok && a.sums == b.sums && a.sums_hi == b.sums_hi;
+        if (cols & (1u << 2)) ok = ok && a.counts == b.counts;
+        if (cols & (1u << 3)) ok = ok && a.counts_star == b.counts_star;
+        if (cols & (1u << 4)) ok = ok && a.mins == b.mins;
+        if (cols & (1u << 5)) ok = ok && a.maxs == b.maxs;
+        if (!ok) std::printf("    FAIL %s (%zu vs %zu groups)\n", what, a.keys.size(), b.keys.size());
+        return ok;
+    };
+
+    // `heavy`: also run HAVING, both top-k directions and the multi-payload
+    // call. Every case runs the plain form; the forms differ in what they do
+    // with the finished tuple, not in how the mask is built, so four of them
+    // carry the whole filter matrix and the rest pin the mask itself.
+    struct Term { std::size_t lane; Op op; std::int64_t value; const std::vector<std::int64_t>* list; };
+    struct Case { const char* name; bool heavy; std::vector<Term> terms; };
+    const std::vector<Case> cases = {
+        {"every operator", true, {{4, Op::GE, -120, nullptr}, {4, Op::NE, 0, nullptr},
+                            {5, Op::LT, 30000, nullptr}, {5, Op::LE, 29999, nullptr},
+                            {6, Op::GT, -2'000'000'000LL, nullptr}, {10, Op::EQ, 3, nullptr}}},
+        {"in list",        false, {{10, Op::In, 0, &in_list}}},
+        {"in list + term", false, {{10, Op::In, 0, &in_list}, {3, Op::LT, 100, nullptr}}},
+        {"f64 total order",false, {{8, Op::GT, bits(0.4), nullptr}}},
+        {"f64 in list",    false, {{8, Op::In, 0, &in_f64}}},
+        {"f64 vs nan",     false, {{8, Op::LE, bits(std::numeric_limits<double>::quiet_NaN()), nullptr}}},
+        {"is null",        false, {{5, Op::IsNull, 0, nullptr}}},
+        {"is not null",    false, {{5, Op::IsNotNull, 0, nullptr}, {8, Op::IsNotNull, 0, nullptr}}},
+        {"all-null lane",  false, {{9, Op::IsNotNull, 0, nullptr}}},          // 0 survivors
+        {"everything",     false, {{7, Op::GE, 0, nullptr}}},                 // 100 % survivors
+        {"nothing",        true,  {{6, Op::GT, 1LL << 40, nullptr}}},         // 0 survivors
+        {"width 1 edge",   false, {{4, Op::GE, -128, nullptr}, {4, Op::LE, 127, nullptr}}},
+        {"width 2 edge",   false, {{5, Op::GE, -32768, nullptr}, {5, Op::LE, 32767, nullptr}}},
+        {"width 4 edge",   false, {{6, Op::GE, -2147483648LL, nullptr}, {6, Op::LE, 2147483647LL, nullptr}}},
+        {"width 8 lane",   false, {{7, Op::LT, (1LL << 40) + 4000, nullptr}}},
+        {"selective (5 %)",true,  {{3, Op::LT, -112, nullptr}}},              // below the compaction bound
+        {"half",           true,  {{3, Op::LT, 0, nullptr}}},                 // the masked reduce
+        {"key range",      false, {{0, Op::GE, 0, nullptr}, {3, Op::LT, 50, nullptr}}},
+        {"key + null",     false, {{0, Op::NE, -7, nullptr}}},
+        {"12 lanes",       false, {{3, Op::GE, -125, nullptr}, {4, Op::GE, -128, nullptr},
+                            {5, Op::GE, -32768, nullptr}, {6, Op::GE, -2147483648LL, nullptr},
+                            {7, Op::GE, 0, nullptr}, {8, Op::IsNotNull, 0, nullptr},
+                            {10, Op::GE, -8, nullptr}, {11, Op::GE, -48, nullptr},
+                            {12, Op::GE, -48, nullptr}, {13, Op::GE, -48, nullptr},
+                            {14, Op::GE, -48, nullptr}, {15, Op::GE, -48, nullptr}}},
+        {"13 lanes",       true,  {{2, Op::GE, 0, nullptr}, {3, Op::GE, -125, nullptr},
+                            {4, Op::GE, -128, nullptr}, {5, Op::GE, -32768, nullptr},
+                            {6, Op::GE, -2147483648LL, nullptr}, {7, Op::GE, 0, nullptr},
+                            {8, Op::IsNotNull, 0, nullptr}, {9, Op::IsNull, 0, nullptr},
+                            {10, Op::GE, -8, nullptr}, {11, Op::GE, -48, nullptr},
+                            {12, Op::GE, -48, nullptr}, {13, Op::GE, -48, nullptr},
+                            {14, Op::GE, -48, nullptr}}},
+    };
+
+    const char* shapes[2] = {"fused", "legacy"};
+    int fused_seen = 0, legacy_seen = 0;
+    for (std::size_t key = 0; key < 2; ++key) {     // 10k groups + NULLs, then 120k
+        for (const Case& c : cases) {
+            auto build = [&](const std::vector<std::unique_ptr<gpudb::ResidentColumn>>& col) {
+                std::vector<gpudb::Predicate> ps(c.terms.size());
+                for (std::size_t q = 0; q < c.terms.size(); ++q) {
+                    ps[q].col = col[c.terms[q].lane].get();
+                    ps[q].op = c.terms[q].op;
+                    ps[q].value = c.terms[q].value;
+                    if (c.terms[q].list) { ps[q].list = c.terms[q].list->data(); ps[q].n_list = c.terms[q].list->size(); }
+                }
+                return ps;
+            };
+            auto rp = build(rcols);
+            auto mp = build(mcols);
+            // The distinct columns the WHERE reads; above what the fused
+            // kernel binds it has to fall back rather than throw.
+            std::vector<std::size_t> distinct;
+            for (const Term& t : c.terms)
+                if (std::find(distinct.begin(), distinct.end(), t.lane) == distinct.end())
+                    distinct.push_back(t.lane);
+            const bool expect_fused = !refused && distinct.size() <= 12;
+
+            gpudb::GroupByFilter forms[4];
+            forms[1].agg = gpudb::GroupByFilter::Agg::CountStar;
+            forms[1].cmp = gpudb::GroupByFilter::Cmp::GT;
+            forms[1].threshold_i64 = 40;
+            forms[2].agg = gpudb::GroupByFilter::Agg::Sum; forms[2].topk = 5; forms[2].topk_desc = true;
+            forms[3].agg = gpudb::GroupByFilter::Agg::Min; forms[3].topk = 3; forms[3].topk_desc = false;
+            const char* fname[4] = {"plain", "having", "topk desc", "topk asc"};
+            for (int fi = 0; fi < (c.heavy ? 4 : 1); ++fi) {
+                auto want = ref_agg->groupby_exact_masked_resident(
+                    *rcols[key], rcols[3].get(), rp.data(), rp.size(), cap, forms[fi]);
+                for (const char* sh : shapes) {
+                    setenv("GPUDB_METAL_MASK_PATH", sh, 1);
+                    gpudb::exact_path_note().clear();
+                    gpudb::exact_mask_note().clear();
+                    auto got = metal->groupby_exact_masked_resident(
+                        *mcols[key], mcols[3].get(), mp.data(), mp.size(), cap, forms[fi]);
+                    const std::string note = gpudb::exact_mask_note();
+                    char what[200];
+                    std::snprintf(what, sizeof(what), "key%zu / %s / %s / %s [%s]", key, c.name,
+                                  fname[fi], sh, note.c_str());
+                    EXPECT(same(got, want, what));
+                    const char* wanted = (std::string(sh) == "fused" && expect_fused) ? "fused" : "legacy";
+                    if (note != wanted)
+                        std::printf("    FAIL %s: mask stage %s, expected %s\n", what,
+                                    note.c_str(), wanted);
+                    EXPECT_EQ(note == wanted, true);
+                    if (note == "fused") ++fused_seen; else ++legacy_seen;
+                }
+            }
+            // several payloads over one mask (§4.9): the wide lane without
+            // min / max, the narrow one with
+            for (int fi = 0; c.heavy && fi < 2; ++fi) {
+                gpudb::GroupByFilter f;
+                if (fi) { f.agg = gpudb::GroupByFilter::Agg::CountStar;
+                          f.cmp = gpudb::GroupByFilter::Cmp::GE; f.threshold_i64 = 30; }
+                auto multi = [&](const std::unique_ptr<gpudb::Aggregator>& a,
+                                 const std::vector<std::unique_ptr<gpudb::ResidentColumn>>& col,
+                                 std::vector<gpudb::Predicate>& p) {
+                    gpudb::MultiPayload m[3];
+                    m[0].vals = col[2].get(); m[0].columns = 0x0Fu;
+                    m[1].vals = col[3].get(); m[1].columns = gpudb::GroupByFilter::kAllColumns;
+                    m[2].vals = col[6].get(); m[2].columns = gpudb::GroupByFilter::kAllColumns;
+                    return a->groupby_exact_masked_multi(*col[key], m, 3, 1, p.data(), p.size(), cap, f);
+                };
+                auto want = multi(ref_agg, rcols, rp);
+                for (const char* sh : shapes) {
+                    setenv("GPUDB_METAL_MASK_PATH", sh, 1);
+                    gpudb::exact_mask_note().clear();
+                    auto got = multi(metal, mcols, mp);
+                    const std::string note = gpudb::exact_mask_note();
+                    char what[200];
+                    std::snprintf(what, sizeof(what), "key%zu / %s / multi%s / %s [%s]", key, c.name,
+                                  fi ? " having" : "", sh, note.c_str());
+                    EXPECT_EQ(got.size(), want.size());
+                    for (std::size_t p = 0; p < got.size() && p < want.size(); ++p)
+                        EXPECT(same(got[p], want[p], what, p == 0 ? 0x0Fu : gpudb::GroupByFilter::kAllColumns));
+                    const char* wanted = (std::string(sh) == "fused" && expect_fused) ? "fused" : "legacy";
+                    EXPECT_EQ(note == wanted, true);
+                }
+            }
+        }
+    }
+    unsetenv("GPUDB_METAL_MASK_PATH");
+    std::printf("  %d calls through the fused pass, %d through the legacy one (rows=%zu)\n",
+                fused_seen, legacy_seen, N);
+}
 #endif  // GPUDB_HAVE_METAL
 
 // ---------------------------------------------------------------------------
@@ -3330,6 +3580,7 @@ int main(int argc, char** argv) {
     // before test_direct_pso_fallback: that block ends by unsetting
     // GPUDB_METAL_DIRECT_DISABLE_PSO, and this one reads it
     test_shed_derived();
+    test_fused_mask();
     test_direct_pso_fallback();
 #endif
     test_resident_prepare();

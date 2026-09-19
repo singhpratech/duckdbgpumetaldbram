@@ -31,6 +31,16 @@ inline std::string& exact_path_reason() {
     return s;
 }
 
+// Which WHERE stage the sort path ran: `fused` (one pass evaluates the whole
+// conjunction), `legacy` (one pass per term) or `permeval` (the conjunction
+// evaluated through the permutation). Empty when the statement had no WHERE,
+// or when the direct path answered it and there was no mask stage at all.
+// Same note discipline as above: cleared by the caller before the call.
+inline std::string& exact_mask_note() {
+    static thread_local std::string s;
+    return s;
+}
+
 // How many compute pipelines the exact path's own kernels have been asked of
 // the GPU, process-wide. It exists so a test can assert ZERO: a device whose
 // compiler is left unusable by one failed build must never be asked in the

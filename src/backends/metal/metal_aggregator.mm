@@ -2979,6 +2979,7 @@ private:
                         throw std::runtime_error(std::string(op) + ": several payloads under a filter need the keys");
                     exact_path_note() = "direct";
                     exact_path_reason().clear();
+                    exact_mask_note().clear();      // no mask stage on this path at all
                     GroupByResidentResult r2 = direct_impl(k, v, n_preds, max_groups, filter, op, pl,
                                                            extras, n_extras, extra_out, t_wall0, dir_ms);
                     maybe_shed(k, pl);
@@ -2987,6 +2988,7 @@ private:
             }
             exact_path_note() = "sort";
             exact_path_reason() = direct_available() ? std::string() : direct_reason();
+            exact_mask_note().clear();          // set below when there is a mask stage
             adopt_warm_scratch();
 
             const std::size_t n = k.sort_rows();          // valid keys (the sort cache covers them)
@@ -3040,18 +3042,48 @@ private:
             const std::size_t range_n = hi - lo;
             const bool masked = !maskp.empty();
 
-            // ---- mask over the ORIGINAL rows (one kernel pass per predicate) and
-            //      the survivor count over the key range, in ONE command buffer ----
+            // ---- the WHERE, and the survivor count over the key range, in ONE
+            //      command buffer ----
+            // Fused (§4.6): one pass evaluates the whole conjunction per row
+            // through gpred_eval and writes the mask once, and the counting
+            // pass keeps its gather as a mask in SORTED order that every
+            // payload then reads straight. Legacy: one pass per term, and the
+            // mask gathered again per payload — what a device that will not
+            // build the fused pipelines, or a WHERE over more distinct columns
+            // than the kernel binds, answers through.
             const std::size_t sel_nb = (range_n + kBlock - 1) / kBlock;
+            bool have_smask = false;          // the mask also exists in sorted order
+            bool have_row_mask = false;       // ... and in row order (the NULL-key fold reads it)
             if (masked) {
-                grow(gbx_mask_buf_, std::max<std::size_t>(1, n_total), "where mask");
+                std::vector<const MetalResidentColumn*> mlane;
+                std::vector<GaggPred> mprog;
+                std::vector<std::int64_t> mlists;
+                MaskShape shape = MaskShape::Legacy;
+                const MaskPath want = mask_path();
+                if (want != MaskPath::Legacy &&
+                    mask_program(maskp, mlane, mprog, mlists) && mask_ensure_ready()) {
+                    shape = MaskShape::Fused;
+                    // permeval writes no row-order mask, and the NULL-key
+                    // group's rows are not in the permutation, so a statement
+                    // that folds one keeps the fused pass.
+                    if (want == MaskPath::PermEval && range_n > 0 &&
+                        !(null_ok && k.null_count() > 0) && mask_permeval_pso())
+                        shape = MaskShape::PermEval;
+                }
+                exact_mask_note() = mask_shape_name(shape);
+                if (shape != MaskShape::PermEval) {
+                    grow(gbx_mask_buf_, std::max<std::size_t>(1, n_total), "where mask");
+                    have_row_mask = true;
+                }
                 if (!gbx_dummy_valid_)
                     gbx_dummy_valid_ = [device_ newBufferWithLength:8 options:MTLResourceStorageModeShared];
                 if (range_n > 0) grow(gb_block_buf_, sel_nb * sizeof(std::uint32_t), "select block counts");
+                if (shape != MaskShape::Legacy && range_n > 0)
+                    grow(gbx_smask_buf_, range_n, "sorted where mask");
                 const std::uint32_t nt32 = static_cast<std::uint32_t>(n_total);
                 const std::uint32_t rn32 = static_cast<std::uint32_t>(range_n);
-                std::vector<id<MTLBuffer>> lists(maskp.size(), nil);
-                for (std::size_t p = 0; p < maskp.size(); ++p) {
+                std::vector<id<MTLBuffer>> lists(shape == MaskShape::Legacy ? maskp.size() : 0, nil);
+                for (std::size_t p = 0; p < lists.size(); ++p) {
                     const Predicate& pr = *maskp[p];
                     if (pr.op == Predicate::Op::In && pr.n_list) {
                         lists[p] = [device_ newBufferWithBytes:pr.list length:pr.n_list * sizeof(std::int64_t)
@@ -3061,49 +3093,85 @@ private:
                 }
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                for (std::size_t p = 0; p < maskp.size(); ++p) {
-                    const Predicate& pr = *maskp[p];
-                    const auto& pc = static_cast<const MetalResidentColumn&>(*pr.col);
-                    const bool has_bitmap = pc.valid_buffer() != nil;
-                    const std::uint32_t has_valid = has_bitmap ? 1u : 0u;
-                    const std::uint32_t null_from = 0xFFFFFFFFu;         // NULLs: the bitmap
-                    const std::uint32_t is_f64 = pc.dtype() == Dtype::F64 ? 1u : 0u;
-                    const std::uint32_t opc = pred_op_code(pr.op);
-                    const std::int64_t  value = pr.value;
-                    const std::uint32_t n_list = static_cast<std::uint32_t>(pr.op == Predicate::Op::In ? pr.n_list : 0);
-                    const std::uint32_t first = p == 0 ? 1u : 0u;
-                    id<MTLBuffer> list = lists[p] ? lists[p] : gbx_dummy_valid_;
-                    [ce setComputePipelineState:ps_gbx_mask_];
-                    [ce setBuffer:pc.buffer() offset:0 atIndex:0];
-                    [ce setBuffer:(has_bitmap ? pc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
-                    [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:2];
-                    [ce setBytes:&null_from length:sizeof(null_from) atIndex:3];
-                    [ce setBytes:&nt32      length:sizeof(nt32)      atIndex:4];
-                    [ce setBytes:&is_f64    length:sizeof(is_f64)    atIndex:5];
-                    [ce setBytes:&opc       length:sizeof(opc)       atIndex:6];
-                    [ce setBytes:&value     length:sizeof(value)     atIndex:7];
-                    [ce setBuffer:list offset:0 atIndex:8];
-                    [ce setBytes:&n_list    length:sizeof(n_list)    atIndex:9];
-                    [ce setBytes:&first     length:sizeof(first)     atIndex:10];
-                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:11];
-                    const std::uint32_t cw = pc.width();
-                    [ce setBytes:&cw        length:sizeof(cw)        atIndex:12];
-                    [ce dispatchThreadgroups:MTLSizeMake((n_total + kBlock - 1) / kBlock, 1, 1)
-                       threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
-                    [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
-                if (range_n > 0) {
-                    [ce setComputePipelineState:ps_gbx_sel_counts_];
-                    [ce setBuffer:perm offset:lo * sizeof(std::uint32_t) atIndex:0];
-                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:1];
-                    [ce setBytes:&rn32 length:sizeof(rn32) atIndex:2];
-                    [ce setBuffer:gb_block_buf_ offset:0 atIndex:3];
-                    [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                if (shape == MaskShape::Legacy) {
+                    for (std::size_t p = 0; p < maskp.size(); ++p) {
+                        const Predicate& pr = *maskp[p];
+                        const auto& pc = static_cast<const MetalResidentColumn&>(*pr.col);
+                        const bool has_bitmap = pc.valid_buffer() != nil;
+                        const std::uint32_t has_valid = has_bitmap ? 1u : 0u;
+                        const std::uint32_t null_from = 0xFFFFFFFFu;         // NULLs: the bitmap
+                        const std::uint32_t is_f64 = pc.dtype() == Dtype::F64 ? 1u : 0u;
+                        const std::uint32_t opc = pred_op_code(pr.op);
+                        const std::int64_t  value = pr.value;
+                        const std::uint32_t n_list = static_cast<std::uint32_t>(pr.op == Predicate::Op::In ? pr.n_list : 0);
+                        const std::uint32_t first = p == 0 ? 1u : 0u;
+                        id<MTLBuffer> list = lists[p] ? lists[p] : gbx_dummy_valid_;
+                        [ce setComputePipelineState:ps_gbx_mask_];
+                        [ce setBuffer:pc.buffer() offset:0 atIndex:0];
+                        [ce setBuffer:(has_bitmap ? pc.valid_buffer() : gbx_dummy_valid_) offset:0 atIndex:1];
+                        [ce setBytes:&has_valid length:sizeof(has_valid) atIndex:2];
+                        [ce setBytes:&null_from length:sizeof(null_from) atIndex:3];
+                        [ce setBytes:&nt32      length:sizeof(nt32)      atIndex:4];
+                        [ce setBytes:&is_f64    length:sizeof(is_f64)    atIndex:5];
+                        [ce setBytes:&opc       length:sizeof(opc)       atIndex:6];
+                        [ce setBytes:&value     length:sizeof(value)     atIndex:7];
+                        [ce setBuffer:list offset:0 atIndex:8];
+                        [ce setBytes:&n_list    length:sizeof(n_list)    atIndex:9];
+                        [ce setBytes:&first     length:sizeof(first)     atIndex:10];
+                        [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:11];
+                        const std::uint32_t cw = pc.width();
+                        [ce setBytes:&cw        length:sizeof(cw)        atIndex:12];
+                        [ce dispatchThreadgroups:MTLSizeMake((n_total + kBlock - 1) / kBlock, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    }
+                    if (range_n > 0) {
+                        [ce setComputePipelineState:ps_gbx_sel_counts_];
+                        [ce setBuffer:perm offset:lo * sizeof(std::uint32_t) atIndex:0];
+                        [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:1];
+                        [ce setBytes:&rn32 length:sizeof(rn32) atIndex:2];
+                        [ce setBuffer:gb_block_buf_ offset:0 atIndex:3];
+                        [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                    }
+                } else {
+                    struct { std::uint32_t n, n_preds, n_lanes, pad; } mu{
+                        0, static_cast<std::uint32_t>(mprog.size()),
+                        static_cast<std::uint32_t>(mlane.size()), 0};
+                    bind_mask_program(ce, mlane, mprog, mlists);
+                    if (shape == MaskShape::Fused) {
+                        mu.n = nt32;
+                        [ce setComputePipelineState:ps_gbx_fused_mask_];
+                        [ce setBytes:&mu length:sizeof(mu) atIndex:27];
+                        [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:28];
+                        [ce dispatchThreadgroups:MTLSizeMake(pick_grid(n_total), 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        if (range_n > 0) {
+                            [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                            [ce setComputePipelineState:ps_gbx_sel_smask_];
+                            [ce setBuffer:perm offset:lo * sizeof(std::uint32_t) atIndex:0];
+                            [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:1];
+                            [ce setBytes:&rn32 length:sizeof(rn32) atIndex:2];
+                            [ce setBuffer:gb_block_buf_ offset:0 atIndex:3];
+                            [ce setBuffer:gbx_smask_buf_ offset:0 atIndex:4];
+                            [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1)
+                               threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                        }
+                    } else {
+                        mu.n = rn32;
+                        [ce setComputePipelineState:ps_gbx_smask_eval_];
+                        [ce setBytes:&mu length:sizeof(mu) atIndex:27];
+                        [ce setBuffer:perm offset:lo * sizeof(std::uint32_t) atIndex:28];
+                        [ce setBuffer:gb_block_buf_   offset:0 atIndex:29];
+                        [ce setBuffer:gbx_smask_buf_  offset:0 atIndex:30];
+                        [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
+                    }
+                    have_smask = range_n > 0;
                 }
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] mask/select: %.3f ms (rows=%zu) status=%ld%s\n", ms_, (std::size_t)n_total, (long)[cb status], [cb error] ? " ERROR" : ""); }
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] mask/select (%s): %.3f ms (rows=%zu terms=%zu lanes=%zu) status=%ld%s\n", mask_shape_name(shape), ms_, (std::size_t)n_total, maskp.size(), mlane.size(), (long)[cb status], [cb error] ? " ERROR" : ""); }
             }
 
             // ---- choose the reduce input: the range as is, its compaction (b), or masked (a) ----
@@ -3154,13 +3222,15 @@ private:
                     [ce setComputePipelineState:ps_gbx_sel_compact_];
                     [ce setBuffer:sorted offset:0 atIndex:0];
                     [ce setBuffer:perm   offset:lo * sizeof(std::uint32_t) atIndex:1];
-                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:2];
+                    [ce setBuffer:(have_smask ? gbx_smask_buf_ : gbx_mask_buf_) offset:0 atIndex:2];
                     [ce setBytes:&rn32 length:sizeof(rn32) atIndex:3];
                     [ce setBuffer:gb_block_buf_ offset:0 atIndex:4];
                     [ce setBuffer:run_sorted offset:0 atIndex:5];
                     [ce setBuffer:run_perm   offset:0 atIndex:6];
                     [ce setBytes:&kw   length:sizeof(kw)   atIndex:7];
                     [ce setBytes:&lo32 length:sizeof(lo32) atIndex:8];
+                    const std::uint32_t sm = have_smask ? 1u : 0u;
+                    [ce setBytes:&sm   length:sizeof(sm)   atIndex:9];
                     [ce dispatchThreadgroups:MTLSizeMake(sel_nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
@@ -3193,7 +3263,7 @@ private:
             std::int64_t nmn = std::numeric_limits<std::int64_t>::max();
             std::int64_t nmx = std::numeric_limits<std::int64_t>::min();
             if (null_ok && k.null_count() > 0) {
-                const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
+                const std::uint8_t* mk = have_row_mask ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
                 const NullFold f = fold_null_keys(k, v, mk);
                 ns = f.s; ncnt = f.cnt; ncstar = f.cstar; nmn = f.mn; nmx = f.mx;
                 if (!v) ncnt = ncstar;
@@ -3256,7 +3326,10 @@ private:
                     [ce setBuffer:mult_buf_     offset:0 atIndex:4];
                     [ce setBytes:&n32  length:sizeof(n32)  atIndex:5];
                     [ce setBytes:&ns32 length:sizeof(ns32) atIndex:6];
-                    [ce setBuffer:gbx_mask_buf_ offset:0 atIndex:7];
+                    // The mask in sorted order where the counting pass kept it
+                    // (read straight, per position of the run), else in row
+                    // order (gathered through the permutation, per payload).
+                    [ce setBuffer:(have_smask ? gbx_smask_buf_ : gbx_mask_buf_) offset:0 atIndex:7];
                     [ce setBytes:&with_vals length:sizeof(with_vals) atIndex:8];
                     [ce setBuffer:bb[0] offset:0 atIndex:9];    // lo
                     [ce setBuffer:bb[1] offset:0 atIndex:10];   // hi
@@ -3268,6 +3341,8 @@ private:
                     [ce setBuffer:gbxm_tail_buf_ offset:0 atIndex:16];
                     const std::uint32_t vw = vc ? vc->width() : 8u;
                     [ce setBytes:&vw length:sizeof(vw) atIndex:17];
+                    const std::uint32_t sm = have_smask ? 1u : 0u;
+                    [ce setBytes:&sm length:sizeof(sm) atIndex:18];
                     [ce dispatchThreadgroups:MTLSizeMake((nchunks + kBlock - 1) / kBlock, 1, 1)
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                     [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -3360,6 +3435,19 @@ private:
                        threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 }
             };
+            // ---- §4.9 scratch for the other payloads, sized before Stage B so
+            //      every payload's reduce is encoded into ONE command buffer ----
+            std::vector<std::vector<id<MTLBuffer>>> eb(n_extras);
+            if (n_extras) {
+                const std::size_t bytes = std::max<std::size_t>(1, total) * sizeof(std::int64_t);
+                if (gbx_e_.size() < n_extras) gbx_e_.resize(n_extras);
+                for (std::size_t e = 0; e < n_extras; ++e) {
+                    eb[e].assign(7, nil);
+                    if (gbx_e_[e].size() < 7) gbx_e_[e].resize(7, nil);
+                    for (std::size_t i = 0; i < 7; ++i) eb[e][i] = grow_slot(gbx_e_[e], i, bytes, "multi payload scratch");
+                }
+            }
+
             if (run_n > 0) {
                 id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
                 id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -3374,10 +3462,14 @@ private:
                    threadsPerThreadgroup:MTLSizeMake(kBlock, 1, 1)];
                 [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode_reduce(ce, v, b);
+                for (std::size_t e = 0; e < n_extras; ++e) {
+                    [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];   // the partial scratch is shared
+                    encode_reduce(ce, ex[e], eb[e]);
+                }
                 [ce endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
-                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] stage B (reduce): %.3f ms (n=%zu segs=%zu)\n", ms_, (std::size_t)run_n, (std::size_t)num_segs); }
+                { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] stage B (reduce): %.3f ms (n=%zu segs=%zu payloads=%zu)\n", ms_, (std::size_t)run_n, (std::size_t)num_segs, n_extras + 1); }
             }
 
             if (null_group) {
@@ -3393,30 +3485,11 @@ private:
                 static_cast<std::int64_t*>([b[6] contents])[num_segs] = 0;
             }
 
-            // ---- §4.9: the other payloads, over the same selection and run starts ----
-            std::vector<std::vector<id<MTLBuffer>>> eb(n_extras);
+            // ---- §4.9: the other payloads' NULL-key group (their reduce ran in
+            //      Stage B's command buffer, over the same selection and starts) ----
             if (n_extras) {
-                const std::size_t bytes = std::max<std::size_t>(1, total) * sizeof(std::int64_t);
-                if (gbx_e_.size() < n_extras) gbx_e_.resize(n_extras);
-                for (std::size_t e = 0; e < n_extras; ++e) {
-                    eb[e].assign(7, nil);
-                    if (gbx_e_[e].size() < 7) gbx_e_[e].resize(7, nil);
-                    for (std::size_t i = 0; i < 7; ++i) eb[e][i] = grow_slot(gbx_e_[e], i, bytes, "multi payload scratch");
-                }
-                if (run_n > 0) {
-                    id<MTLCommandBuffer>         cb = [queue_ commandBuffer];
-                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-                    for (std::size_t e = 0; e < n_extras; ++e) {
-                        encode_reduce(ce, ex[e], eb[e]);
-                        [ce memoryBarrierWithScope:MTLBarrierScopeBuffers];   // the partial scratch is shared
-                    }
-                    [ce endEncoding];
-                    [cb commit];
-                    [cb waitUntilCompleted];
-                    { const double ms_ = cb_kernel_ms(cb); kernel_ms += ms_; if (trace_exact_) std::fprintf(stderr, "[gpudb metal exact] extra payloads: %.3f ms (n=%zu segs=%zu)\n", ms_, (std::size_t)run_n, (std::size_t)num_segs); }
-                }
                 if (null_group) {
-                    const std::uint8_t* mk = masked ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
+                    const std::uint8_t* mk = have_row_mask ? static_cast<const std::uint8_t*>([gbx_mask_buf_ contents]) : nullptr;
                     for (std::size_t e = 0; e < n_extras; ++e) {
                         const NullFold f = fold_null_keys(k, ex[e], mk);
                         const Sum128 es = f.s; const std::int64_t ecnt = f.cnt, emn = f.mn, emx = f.mx;
@@ -4017,6 +4090,181 @@ private:
         return dir_make_locked(ps_gdir_merge_, @"gdir_merge_i64");
     }
 
+    // ---- the fused WHERE pass: built on first use, and never a throw ----
+    // The capability lesson of the direct path applies here unchanged. A
+    // device whose compiler ONE refused build would leave unusable is never
+    // asked at all (the virtualised Apple GPU of a hosted macOS runner), and a
+    // refusal anywhere else marks the fused pass unavailable for the
+    // aggregator's lifetime — every masked statement then answers through the
+    // legacy per-term pass, with the same result. The MTLGPUFamilyApple7 floor
+    // the direct path asks for is NOT asked here: the fused pass uses no
+    // threadgroup atomics, only what gagg_masked_i64 (built with the library
+    // on every device) already uses.
+    std::string mask_capability_refusal() const {
+        if (mask_disable_pso_ == "unsupported")
+            return "GPUDB_METAL_MASK_DISABLE_PSO=unsupported";
+        @autoreleasepool {
+            NSString* nm = [device_ name];
+            if (nm && [nm rangeOfString:@"Paravirtual"].location != NSNotFound)
+                return std::string("device \"") + [nm UTF8String] + "\" is a virtualised Apple GPU, "
+                       "where one refused pipeline build makes every later build in the process fail";
+        }
+        return {};
+    }
+    // Which function the knob refuses: `1` / `all` both of them, `permeval`
+    // that one, `missing` none by name but every request asks for a function
+    // nothing defines (so the genuine nil-from-Metal branch runs), anything
+    // else is taken as a function name.
+    bool mask_refuses(NSString* name) const {
+        if (mask_disable_pso_.empty() || mask_disable_pso_ == "missing") return false;
+        if (mask_disable_pso_ == "1" || mask_disable_pso_ == "all") return true;
+        if (mask_disable_pso_ == "permeval") return [name isEqualToString:@"gbx_smask_eval_i64"];
+        return mask_disable_pso_ == [name UTF8String];
+    }
+    NSString* mask_probe_name(NSString* name) const {
+        return mask_disable_pso_ == "missing"
+            ? [name stringByAppendingString:@"__no_such_function"] : name;
+    }
+    void mask_unavailable_locked(NSString* name, NSError* err) {   // mask_pso_mu_ held
+        if (!mask_why_.empty()) return;
+        std::ostringstream os;
+        os << "pipeline " << [name UTF8String] << " would not build";
+        if (err) os << ": " << [[err localizedDescription] UTF8String];
+        mask_why_ = os.str();
+        mask_ok_.store(false, std::memory_order_release);
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] fused WHERE pass unavailable: %s\n", mask_why_.c_str());
+    }
+    void mask_deny_locked(const std::string& why) {                // mask_pso_mu_ held
+        if (!mask_why_.empty()) return;
+        mask_why_ = "not offered to this device: " + why;
+        mask_ok_.store(false, std::memory_order_release);
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true) || trace_exact_)
+            std::fprintf(stderr, "[gpudb metal] fused WHERE pass %s\n", mask_why_.c_str());
+    }
+    // nil on refusal, never a throw. Both fused pipelines are required: with
+    // the row-order pass and without the sorted-order one the reduce would
+    // gather the mask per payload again, which is half of what this is for.
+    id<MTLComputePipelineState> mask_make_locked(__strong id<MTLComputePipelineState>& slot, NSString* name,
+                                                 bool required = true) {
+        if (slot) return slot;
+        if (!mask_ok_.load(std::memory_order_relaxed)) return nil;
+        @autoreleasepool {
+            NSError* err = nil;
+            id<MTLComputePipelineState> pso = nil;
+            id<MTLFunction> fn = [lib_ newFunctionWithName:mask_probe_name(name)];
+            if (!fn) {
+                err = [NSError errorWithDomain:@"gpudb" code:2
+                                      userInfo:@{NSLocalizedDescriptionKey: @"no such function"}];
+            } else {
+                pso = [device_ newComputePipelineStateWithFunction:fn error:&err];
+            }
+            if (pso && mask_refuses(name)) {
+                pso = nil;
+                err = [NSError errorWithDomain:@"gpudb" code:3
+                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                 @"refused by GPUDB_METAL_MASK_DISABLE_PSO"}];
+            }
+            if (pso && [pso maxTotalThreadsPerThreadgroup] < kBlock) {
+                std::ostringstream os;
+                os << "threadgroup of " << (unsigned long)[pso maxTotalThreadsPerThreadgroup]
+                   << " threads, below the " << (unsigned long)kBlock << " the block count needs";
+                pso = nil;
+                err = [NSError errorWithDomain:@"gpudb" code:1
+                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                 [NSString stringWithUTF8String:os.str().c_str()]}];
+            }
+            if (!pso) { if (required) mask_unavailable_locked(name, err); return nil; }
+            slot = pso;
+            return slot;
+        }
+    }
+    // Decided once, before the first masked statement encodes anything.
+    bool mask_ensure_ready() {
+        if (!mask_ok_.load(std::memory_order_acquire)) return false;
+        if (mask_probed_.load(std::memory_order_acquire)) return true;
+        std::lock_guard<std::mutex> lock(mask_pso_mu_);
+        if (mask_probed_.load(std::memory_order_relaxed))
+            return mask_ok_.load(std::memory_order_relaxed);
+        if (const std::string why = mask_capability_refusal(); !why.empty()) {
+            mask_deny_locked(why);                  // nothing is compiled
+            mask_probed_.store(true, std::memory_order_release);
+            return false;
+        }
+        const bool ok = mask_make_locked(ps_gbx_fused_mask_, @"gbx_fused_mask_i64") != nil
+                     && mask_make_locked(ps_gbx_sel_smask_,  @"gbx_sel_smask_i64")  != nil;
+        mask_probed_.store(true, std::memory_order_release);
+        return ok;
+    }
+    // Optional: only GPUDB_METAL_MASK_PATH=permeval asks for it, and a refusal
+    // leaves the fused pass in place rather than disabling anything.
+    id<MTLComputePipelineState> mask_permeval_pso() {
+        std::lock_guard<std::mutex> lock(mask_pso_mu_);
+        return mask_make_locked(ps_gbx_smask_eval_, @"gbx_smask_eval_i64", /*required*/false);
+    }
+
+    // The WHERE as gpred_eval reads it: the distinct lanes it touches, one
+    // GPred per term, the IN lists behind them. False when the statement reads
+    // more distinct columns than the kernel binds — the legacy pass, which
+    // binds one column at a time, answers those.
+    bool mask_program(const std::vector<const Predicate*>& maskp,
+                      std::vector<const MetalResidentColumn*>& lane,
+                      std::vector<GaggPred>& prog,
+                      std::vector<std::int64_t>& lists) const {
+        for (const Predicate* p : maskp) {
+            const auto& c = static_cast<const MetalResidentColumn&>(*p->col);
+            std::size_t slot = lane.size();
+            for (std::size_t i = 0; i < lane.size(); ++i) if (lane[i] == &c) { slot = i; break; }
+            if (slot == lane.size()) {
+                if (lane.size() >= kGaggLanes) return false;
+                lane.push_back(&c);
+            }
+            GaggPred g{};
+            g.lane     = static_cast<std::uint32_t>(slot);
+            g.op       = pred_op_code(p->op);
+            g.list_off = static_cast<std::uint32_t>(lists.size());
+            g.n_list   = 0;
+            g.value    = p->value;
+            if (p->op == Predicate::Op::In) {
+                g.n_list = static_cast<std::uint32_t>(p->n_list);
+                lists.insert(lists.end(), p->list, p->list + p->n_list);
+            }
+            prog.push_back(g);
+        }
+        return true;
+    }
+    // The lane table, the program and the lists, bound at the indices every
+    // gpred_eval kernel shares (0..26). The kept buffers are refilled here.
+    void bind_mask_program(id<MTLComputeCommandEncoder> ce,
+                           const std::vector<const MetalResidentColumn*>& lane,
+                           const std::vector<GaggPred>& prog,
+                           const std::vector<std::int64_t>& lists) {
+        GaggLaneMeta meta[kGaggLanes];
+        for (std::size_t i = 0; i < kGaggLanes; ++i) meta[i] = GaggLaneMeta{8u, 0u, 0u, 0u};
+        for (std::size_t i = 0; i < lane.size(); ++i)
+            meta[i] = GaggLaneMeta{lane[i]->width(), lane[i]->valid_buffer() ? 1u : 0u,
+                                   lane[i]->dtype() == Dtype::F64 ? 1u : 0u, 0u};
+        grow(gbx_mmeta_, sizeof(meta), "where lane table");
+        std::memcpy([gbx_mmeta_ contents], meta, sizeof(meta));
+        grow(gbx_mprog_, std::max<std::size_t>(1, prog.size() * sizeof(GaggPred)), "where program");
+        if (!prog.empty()) std::memcpy([gbx_mprog_ contents], prog.data(), prog.size() * sizeof(GaggPred));
+        grow(gbx_mlist_, std::max<std::size_t>(8, lists.size() * sizeof(std::int64_t)), "where IN lists");
+        if (!lists.empty()) std::memcpy([gbx_mlist_ contents], lists.data(), lists.size() * sizeof(std::int64_t));
+        for (std::size_t i = 0; i < kGaggLanes; ++i) {
+            const bool have = i < lane.size();
+            [ce setBuffer:(have ? lane[i]->buffer() : gbx_dummy_valid_) offset:0 atIndex:2 * i];
+            id<MTLBuffer> vb = (have && lane[i]->valid_buffer()) ? lane[i]->valid_buffer() : gbx_dummy_valid_;
+            [ce setBuffer:vb offset:0 atIndex:2 * i + 1];
+        }
+        [ce setBuffer:gbx_mmeta_ offset:0 atIndex:24];
+        [ce setBuffer:gbx_mprog_ offset:0 atIndex:25];
+        [ce setBuffer:gbx_mlist_ offset:0 atIndex:26];
+    }
+
     // A freshly allocated shared buffer costs the GPU 0.31 ms per million
     // rows the first time it reads or writes it — once per buffer, at that
     // size. Paid here, where prepare() already spends the upload's time,
@@ -4370,6 +4618,12 @@ private:
     // masked partials, and the compacted sorted keys / permutation of
     // variant (b).
     id<MTLBuffer> gbx_mask_buf_ = nil;
+    // The same mask in SORTED order over the key range, written by the pass
+    // that counts the survivors, so the reduce reads it without a gather.
+    id<MTLBuffer> gbx_smask_buf_ = nil;
+    // The fused WHERE pass's program: lane table, terms, IN lists. Kept rather
+    // than allocated per call.
+    id<MTLBuffer> gbx_mmeta_ = nil, gbx_mprog_ = nil, gbx_mlist_ = nil;
     id<MTLBuffer> gagg_out_ = nil;          // §4.12 global aggregate partials
     // join_materialize scratch (match row, class, destination per probe row; the uniqueness flag)
     id<MTLBuffer> jm_match_ = nil, jm_cls_ = nil, jm_pos_buf_ = nil, jm_flag_ = nil;
@@ -4394,6 +4648,48 @@ private:
     // the tuples sit in shared memory and the device radix select has a
     // fixed cost. HAVING stays on the device at every size.
     bool trace_exact_ = std::getenv("GPUDB_METAL_TRACE_EXACT") != nullptr;   // per-stage GPU times on stderr
+
+    // ---- the fused WHERE pass (§4.6) ----
+    // GPUDB_METAL_MASK_PATH = fused | legacy | permeval | auto (default auto,
+    // which is fused wherever the kernel can express the WHERE). `legacy` is
+    // the one-dispatch-per-term pass, which also answers on a device that will
+    // not build the fused pipelines; `permeval` evaluates the WHERE through
+    // the permutation and is there for the comparison in BENCHMARK.md.
+    enum class MaskPath { Auto, Fused, Legacy, PermEval };
+    // Which of them a call actually ran.
+    enum class MaskShape { Legacy, Fused, PermEval };
+    static const char* mask_shape_name(MaskShape s) {
+        switch (s) {
+            case MaskShape::Fused:    return "fused";
+            case MaskShape::PermEval: return "permeval";
+            default:                  return "legacy";
+        }
+    }
+    // Read per call, not once: §9.1's way of comparing two kernels is to
+    // interleave them and rotate the order, which needs both shapes reachable
+    // from one process. One getenv beside a GPU pass costs nothing.
+    MaskPath mask_path() const {
+        const char* e = std::getenv("GPUDB_METAL_MASK_PATH");
+        if (!e) return MaskPath::Auto;
+        if (std::strcmp(e, "fused") == 0)    return MaskPath::Fused;
+        if (std::strcmp(e, "legacy") == 0)   return MaskPath::Legacy;
+        if (std::strcmp(e, "permeval") == 0) return MaskPath::PermEval;
+        return MaskPath::Auto;
+    }
+    // GPUDB_METAL_MASK_DISABLE_PSO: `1` makes the fused pipelines refuse to
+    // build, `permeval` only that one — for testing, on a device where they
+    // would build, that a refusal falls back to the legacy pass and throws
+    // nothing.
+    std::string mask_disable_pso_ = [] {
+        const char* e = std::getenv("GPUDB_METAL_MASK_DISABLE_PSO");
+        return e ? std::string(e) : std::string();
+    }();
+    std::mutex mask_pso_mu_;
+    id<MTLComputePipelineState> ps_gbx_fused_mask_ = nil, ps_gbx_sel_smask_ = nil;
+    id<MTLComputePipelineState> ps_gbx_smask_eval_ = nil;
+    std::atomic<bool> mask_ok_{true};        // cleared for good when a fused pipeline refuses
+    std::atomic<bool> mask_probed_{false};
+    std::string mask_why_;                   // ... and why (mask_pso_mu_)
 
     // ---- the direct grouped reduce ----
     id<MTLLibrary> lib_ = nil;                       // for the pipelines built on first use
