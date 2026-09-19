@@ -4750,3 +4750,28 @@ two it did. Both sit just under the wrapper's default 16 GiB on this machine
 (a quarter of unified memory, §5.5), which is why two more sets tip it: a set
 younger than the eviction floor cannot be evicted to make room, so whichever
 statements arrive last are the ones refused.
+
+### The gate, on the shipped code
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor`,
+SF1, last and alone on the machine, on the final code: **1506 cells, 914
+rewritten, 591 declined, 0 below 1.0×, 0 differing, exit 0.**
+
+| form group | cells | rewritten | declined | ratio range |
+|---|---|---|---|---|
+| `inner_agg` | 125 | 69 | 56 | |
+| `inner_group` | 125 | 70 | 55 | 1.01× – 66.03× |
+| `inner_scalar` | 125 | 69 | 56 | (the four groups together) |
+| `inner_join` | 71 | 31 | 40 | |
+| `--lane-floor` | 48 | 46 | 2 | 1.64× – 28.25× |
+| `cte` / `cte_arm` | 125 / 55 | 73 / 30 | 52 / 25 | unchanged from §4.22 |
+
+The four thinnest rewritten inner cells are `l_suppkey` (10K groups) under the
+9 % and 25 % `WHERE`s at 1.01–1.10×: 54 and 150 rows kept per group, far past
+the bound, but 2 ms statements where the wrapper's own round trip is most of
+the difference — exactly the shapes the measured rule 1
+(`connection._note_timing`) decides at run time rather than a static bound. The
+two declined `--lane-floor` cells are the `o_custkey` plain form over `orders`
+(97–100K groups returned to the client from a 1.5M-row table), declined after
+their first run by the operator's output-size check; their HAVING forms are
+rewritten at 3.12× and 6.68×.
