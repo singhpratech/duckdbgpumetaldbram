@@ -2823,57 +2823,6 @@ still only on its branch, so a hand-built Linux asset still carries the build
 box's `GLIBCXX_3.4.32` floor; the registry's own Linux build is made in an older
 container and does not.
 
-## Open questions
-
-- **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
-  need kernels or a different decomposition.
-- **Correlated aggregate subqueries outside a §4.18 WHERE term** (Q2, Q20):
-  the decorrelation is expressible, but the GROUP BY it produces is
-  output-bound and the bounds decline it (2026-09-19 entry, with the numbers).
-  What would change that is a cheaper way to return a million-group result, not
-  a rewrite.
-- **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
-  HAVING; subqueries over other subqueries (Q2, Q20). Q22 is answered: the row
-  floor now counts the table its lane reads (2026-09-19 entry, §4.23). Q16
-  combines `count(DISTINCT)` with a `NOT IN` subquery over tables below the row
-  floor, and the forced run measures 0.08x at SF1 and 0.02x at SF10, so the
-  pair bounds that decline it are right. WHERE-term subqueries are done
-  (§4.18).
-- **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
-  and as the CPU reference; the CUDA side is to be written against the same
-  interface and then swept with the same gate.
-- **Other client languages**: the join / expression / split lowering lives in
-  the Python wrapper; the pure rewrite function is language-neutral.
-- **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
-  TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
-  each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
-  same choice as a template parameter, `docs/CUDA_EXACT_PATH.md` §6).
-- **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
-  while other threads of the process keep waking (DuckDB's idle workers do).
-  The runtime measured check handles rule 1; a cheaper detector (the kernel
-  time in `gpu_last_stats`) could re-check at once instead of on the clock.
-- **The GROUP BY mask stage**: done on Metal (2026-09-18) — one fused
-  `gpred_eval` pass per statement instead of one per term, and the counting
-  pass's gather kept as a mask in sorted order so the reduce stops re-gathering
-  it per payload. 1.06× to 2.38× on the sort path's kernel over 98 measured
-  cells at SF10, nothing slower. What is open is CUDA
-  (`docs/CUDA_EXACT_PATH.md` §1.1) and the one round trip that stays: the
-  compaction-versus-masked-reduce choice still needs the survivor count on the
-  host.
-- **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
-  shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
-  they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
-  could be evaluated per GROUP (at most 512 of them) instead of per row, which
-  would let Q12's key lane go too.
-- **Output cost**: for large results the statement is bound by moving rows
-  through the table-function interface and into the client, and the sweep of
-  2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
-  is worth a lot up to about 200K groups and nothing at all at 1.5M, where
-  moving the rows through the table function alone costs more than native's
-  whole aggregate. So an Arrow-native result path would move the plain-form
-  bounds, and a cheaper table-function hand-off would move the inner ones —
-  they are different problems.
-
 ## 2026-09-19 — A formula verified bit-exact on one architecture and wrong on the other
 
 The CUDA port began with a baseline run of the whole suite on the RTX 4090
@@ -2960,3 +2909,136 @@ helper already has `native_avg_decimal` for it) or declining `avg(DECIMAL)` on
 platforms where `long double` is wider than `double`. Left for a decision
 rather than fixed silently.
 
+## 2026-09-19 — A capability flag that was really a placement decision
+
+The CUDA exact GROUP BY landed: `upload_pair_exact`, `upload_rows_exact`, the
+validity bitmap and null count on the resident column, the sort cache over the
+valid rows, and `groupby_exact_[masked_]resident`. Unit tests went 569/569 with
+nine exact blocks skipped to 652/652 with four, and the four that remain are
+`aggregate_exact_masked` and `join_materialize` — operators this milestone never
+claimed.
+
+Then `exact_supported()` was turned on, and the SQL suite went from 1 failure to
+19.
+
+None of the nineteen were the operator just written. Every one of them was
+`aggregate_exact_masked` or `join_materialize`, both of which had been passing
+five minutes earlier. Nothing about them had changed. What changed was where
+their columns lived.
+
+`exact_supported()` reads like a capability flag — "can this backend group
+exactly?" — and it is documented as the rule-1 gate for the transparent
+rewrite. But `HybridAggregator::upload_rows_exact` is what actually decides
+which device a set is uploaded to, and a resident column is single-homed: there
+is one copy of it, on one device, and the CPU reference cannot read device
+memory. So the moment the GPU accepts the upload, every other exact operator
+over that set must also run on the GPU. There is no per-operator fallback left
+to take — the fallback would have to move the data.
+
+That makes `exact_supported()` a placement decision wearing a capability
+flag's clothes. Its real meaning is not "I can do the exact GROUP BY" but "I
+can do the whole exact path, so it is safe to hand me the columns." A backend
+that implements two thirds of the path and says true does not degrade to the
+reference for the last third; it captures the set and converts a correct answer
+into a thrown error. Which is exactly what the nineteen failures were.
+
+The flag is therefore off by default behind `GPUDB_CUDA_EXACT=1` until the last
+stub lands, and the nineteen are the measurement that fixed the default rather
+than an argument about it.
+
+### The bug underneath
+
+The hybrid was not consulting the flag at all. Placement was decided by whether
+the GPU's upload threw:
+
+    if (gpu_) {
+        try { return wrap(gpu_->upload_rows_exact(...), /*on_gpu=*/true); }
+        catch (const std::exception&) { /* fall through to the CPU upload */ }
+    }
+
+That worked for as long as "not implemented" and "cannot do the rest of the
+path" were the same condition, which they were while every backend either had
+the whole exact path or none of it. Implementing one operator separated them,
+and the rule silently started making the wrong choice. It now asks
+`exact_supported()`, which is what the interface always said the flag was for.
+
+Worth noting what kind of bug this was: it had been latent in shared code since
+the exact path was introduced, it was invisible to both backends by
+construction, and the only way to surface it was for a backend to be
+*partially* done. Metal was never partially done, and neither was the CPU.
+
+### Why HAVING by avg cannot move to the device
+
+The exact GROUP BY runs its comparison and top-k on the host, deliberately. The
+average of a 128-bit sum is finalised as a `long double` quotient, and there is
+no 80-bit float on a GPU; computing the comparison in `double` on the device
+would keep a different set of groups than the values the same query then
+returns — the divergence fixed a day earlier, reappearing one layer up.
+
+The integer comparisons are a different case and can move later: `sum <cmp> t`
+is decidable in 128-bit integer arithmetic, and so is `avg <cmp> t` when
+rewritten as `sum <cmp> t * count`, which is exact whenever the product does not
+overflow. The quotient form is the only one that needs the 80-bit type, and it
+is the only one that can never be a device kernel.
+
+### The 128-bit sum does not care about order
+
+Nothing about the reduction had to be made deterministic. A 128-bit
+two's-complement add is arithmetic mod 2^128: associative and commutative,
+carry included. So CUB may pick any block count, any tile size and any
+partitioning, and the limbs come out bit-identical to the CPU reference's
+`Sum128`. The exactness is a property of the arithmetic, not of the schedule —
+which is the reason the exact path chose 128-bit integers over compensated
+floating point in the first place, and the first time that choice paid for
+itself on a device with a non-deterministic reduction order.
+
+## Open questions
+
+- **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
+  need kernels or a different decomposition.
+- **Correlated aggregate subqueries outside a §4.18 WHERE term** (Q2, Q20):
+  the decorrelation is expressible, but the GROUP BY it produces is
+  output-bound and the bounds decline it (2026-09-19 entry, with the numbers).
+  What would change that is a cheaper way to return a million-group result, not
+  a rewrite.
+- **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
+  HAVING; subqueries over other subqueries (Q2, Q20). Q22 is answered: the row
+  floor now counts the table its lane reads (2026-09-19 entry, §4.23). Q16
+  combines `count(DISTINCT)` with a `NOT IN` subquery over tables below the row
+  floor, and the forced run measures 0.08x at SF1 and 0.02x at SF10, so the
+  pair bounds that decline it are right. WHERE-term subqueries are done
+  (§4.18).
+- **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
+  and as the CPU reference; the CUDA side is to be written against the same
+  interface and then swept with the same gate.
+- **Other client languages**: the join / expression / split lowering lives in
+  the Python wrapper; the pure rewrite function is language-neutral.
+- **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
+  TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
+  each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
+  same choice as a template parameter, `docs/CUDA_EXACT_PATH.md` §6).
+- **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
+  while other threads of the process keep waking (DuckDB's idle workers do).
+  The runtime measured check handles rule 1; a cheaper detector (the kernel
+  time in `gpu_last_stats`) could re-check at once instead of on the clock.
+- **The GROUP BY mask stage**: done on Metal (2026-09-18) — one fused
+  `gpred_eval` pass per statement instead of one per term, and the counting
+  pass's gather kept as a mask in sorted order so the reduce stops re-gathering
+  it per payload. 1.06× to 2.38× on the sort path's kernel over 98 measured
+  cells at SF10, nothing slower. What is open is CUDA
+  (`docs/CUDA_EXACT_PATH.md` §1.1) and the one round trip that stays: the
+  compaction-versus-masked-reduce choice still needs the survivor count on the
+  host.
+- **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
+  shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
+  they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
+  could be evaluated per GROUP (at most 512 of them) instead of per row, which
+  would let Q12's key lane go too.
+- **Output cost**: for large results the statement is bound by moving rows
+  through the table-function interface and into the client, and the sweep of
+  2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
+  is worth a lot up to about 200K groups and nothing at all at 1.5M, where
+  moving the rows through the table function alone costs more than native's
+  whole aggregate. So an Arrow-native result path would move the plain-form
+  bounds, and a cheaper table-function hand-off would move the inner ones —
+  they are different problems.
