@@ -924,6 +924,114 @@ public:
                             max_groups, filter);
     }
 
+    // ---- v0.7 §4.12: the global masked aggregate ----
+    // No key, no sort, no permutation: one pass over the rows, the mask
+    // evaluated once and shared by every payload. Gated as exact_supported()
+    // is, and for the same reason — it reads columns this backend placed.
+    bool global_supported() const noexcept override { return exact_supported(); }
+
+    GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                           const Predicate* preds, std::size_t n_preds) override {
+        static const char* op = "aggregate_exact_masked";
+        const auto t0 = std::chrono::steady_clock::now();
+        if (n_pays == 0 && n_preds == 0)
+            throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
+
+        std::vector<const std::int64_t*>       pay_data(n_pays, nullptr);
+        std::vector<const unsigned long long*> pay_valid(n_pays, nullptr);
+        std::size_t rows = 0;
+        bool        have_rows = false;
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
+            if (pays[p].index)
+                throw std::runtime_error(std::string(op) +
+                                         ": indexed payloads are not on this backend");
+            const auto& c = check_i64_nullable(*pays[p].vals);
+            if (!have_rows) { rows = c.rows(); have_rows = true; }
+            else if (c.rows() != rows)
+                throw std::runtime_error(std::string(op) + ": payload row counts differ");
+            pay_data[p]  = static_cast<const std::int64_t*>(c.device_ptr());
+            pay_valid[p] = c.valid_bits();
+        }
+
+        GlobalAggResult r{};
+        r.sums.assign(n_pays, 0); r.sums_hi.assign(n_pays, 0); r.counts.assign(n_pays, 0);
+        r.mins.assign(n_pays, 0); r.maxs.assign(n_pays, 0);
+
+        DeviceOut<std::int64_t>               d_lists(0, "");
+        DeviceOut<gpudb::cuda_exact::DevPred> d_preds(0, "");
+        std::vector<gpudb::cuda_exact::DevPred> h_preds;
+        std::vector<std::int64_t>               h_lists;
+        std::vector<std::size_t>                off(n_preds, 0);
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            if (!preds[q].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
+            if (preds[q].index)
+                throw std::runtime_error(std::string(op) +
+                                         ": indexed predicate columns are not on this backend");
+            if (preds[q].col->backend_tag() != Backend::CUDA)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            const auto& pc = static_cast<const CudaResidentColumn&>(*preds[q].col);
+            if (!have_rows) { rows = pc.rows(); have_rows = true; }
+            else if (pc.rows() != rows)
+                throw std::runtime_error(
+                    std::string(op) + ": predicate column row count differs from the payloads");
+        }
+        r.rows_in = rows;
+        if (rows == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        if (n_preds) {
+            h_preds.resize(n_preds);
+            for (std::size_t q = 0; q < n_preds; ++q) {
+                off[q] = h_lists.size();
+                if (preds[q].op == Predicate::Op::In)
+                    h_lists.insert(h_lists.end(), preds[q].list, preds[q].list + preds[q].n_list);
+            }
+            d_lists.reset(h_lists.size(), "global IN lists");
+            if (!h_lists.empty())
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_lists.p, h_lists.data(),
+                                                 h_lists.size() * sizeof(std::int64_t),
+                                                 cudaMemcpyHostToDevice, stream_),
+                                 "global IN lists H2D");
+            for (std::size_t q = 0; q < n_preds; ++q) {
+                const auto& pc = static_cast<const CudaResidentColumn&>(*preds[q].col);
+                auto& d  = h_preds[q];
+                d.data   = static_cast<const std::int64_t*>(pc.device_ptr());
+                d.valid  = pc.valid_bits();
+                d.list   = d_lists.p ? d_lists.p + off[q] : nullptr;
+                d.value  = preds[q].value;
+                d.n_list = static_cast<int>(preds[q].n_list);
+                d.op     = static_cast<int>(preds[q].op);
+                d.is_f64 = (pc.dtype() == Dtype::F64) ? 1 : 0;
+            }
+            d_preds.reset(n_preds, "global predicates");
+            GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_preds.p, h_preds.data(),
+                                             n_preds * sizeof(gpudb::cuda_exact::DevPred),
+                                             cudaMemcpyHostToDevice, stream_),
+                             "global predicates H2D");
+        }
+
+        std::vector<gpudb::cuda_exact::ExactTuple> tup(n_pays ? n_pays : 1);
+        std::int64_t count_star = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_global(d_preds.p, static_cast<int>(n_preds), rows,
+                                                 pay_data.data(), pay_valid.data(),
+                                                 static_cast<int>(n_pays), tup.data(),
+                                                 &count_star, stream_),
+                         "global masked aggregate");
+        r.kernel_ms = stop_kernel_timer();
+
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            r.sums[p]    = static_cast<std::int64_t>(tup[p].lo);
+            r.sums_hi[p] = tup[p].hi;
+            r.counts[p]  = tup[p].cnt_v;
+            r.mins[p]    = tup[p].mn;
+            r.maxs[p]    = tup[p].mx;
+        }
+        r.count_star = count_star;
+        r.wall_ms    = elapsed_ms(t0);
+        return r;
+    }
+
     // top-k = a slice of the cached sort. kernel_ms covers the sort on the
     // first call for a column and is ~0 on later calls (cache hit); the
     // descending order is the tail of the ascending run, reversed on the host.
