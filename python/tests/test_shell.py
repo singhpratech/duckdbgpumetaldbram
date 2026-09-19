@@ -358,7 +358,10 @@ def interactive():
         while data:
             data = data[os.write(primary, data):]
 
-    def read_until(text, timeout=60.0):
+    def read_until(text, timeout=60.0, after=None):
+        """Wait for `text` in what the terminal has sent. `after` waits for it
+        BEYOND an earlier marker — which clearing the buffer cannot do, because
+        one read can already hold the marker and everything that follows it."""
         import select
         end = time.time() + timeout
         while time.time() < end:
@@ -371,8 +374,14 @@ def interactive():
                 if not chunk:
                     break
                 out.append(chunk.decode("utf-8", "replace"))
-            if text in "".join(out):
-                return True
+            seen = "".join(out)
+            if after is None:
+                if text in seen:
+                    return True
+            else:
+                head = seen.find(after)
+                if head >= 0 and text in seen[head + len(after):]:
+                    return True
         return False
 
     try:
@@ -395,8 +404,8 @@ def interactive():
         send(b"       2 AS b;\n")
         check(read_until("│"), "the finished statement renders its box")
         check(read_until(" ms"), "the timer footer is on by default at a terminal")
-        del out[:]                                       # so the next wait is for a NEW prompt
-        check(read_until("gpudb> "), "the prompt comes back after a statement")
+        # the NEW prompt: the one after the footer, not the one already read
+        check(read_until("gpudb> ", after=" ms"), "the prompt comes back after a statement")
 
         del out[:]
         send(b"SELECT 1 AS thrown_away")
@@ -405,13 +414,13 @@ def interactive():
         read_until("gpudb> ")
         del out[:]
         send(b"SELECT 2 AS after_ctrl_c;\n")
-        check(read_until("after_ctrl_c") and "thrown_away" not in "".join(out),
+        check(read_until("│") and "after_ctrl_c" in "".join(out)
+              and "thrown_away" not in "".join(out),
               "^C throws away the half-typed line, the next statement runs on its own")
 
         # ^C flushes the terminal's queues, so the long statement has to be read
         # by the shell (prompt seen, line echoed) before the signal is sent
-        del out[:]
-        read_until("gpudb> ")
+        read_until("gpudb> ", after="│")
         del out[:]
         send(b"SELECT count(*) FROM range(100000000000) r(i) WHERE i % 7 = 3;\n")
         read_until("\x00", timeout=2.0)                  # never matches: reads for 2 s
@@ -419,12 +428,22 @@ def interactive():
         send(b"\x03")                       # ^C with a statement running
         check(read_until("INTERRUPT", timeout=60),
               f"^C interrupts the running statement (saw {''.join(out)[-160:]!r})")
+        # the terminal echoes what is typed at it, so the statement's own text
+        # would match the echo and say nothing about the shell: wait for the
+        # ANSWER, which only the shell can print
         del out[:]
         send(b"SELECT 3 AS still_here;\n")
-        check(read_until("still_here", timeout=60), "the shell is still there after the interrupt")
+        check(read_until("│", timeout=60) and "still_here" in "".join(out),
+              "the shell is still there after the interrupt")
 
-        del out[:]
-        check(read_until("gpudb> "), "the prompt is back")
+        # and then for the prompt that follows the answer. readline prints its
+        # prompt the moment it takes the terminal, before it has read the line
+        # already waiting in the terminal's queue, so an earlier `gpudb> ` does
+        # not mean the shell is idle — and a ^D typed while a statement is
+        # still running reaches a terminal that readline has put back in
+        # canonical mode, where Linux records it as an end-of-file mark and
+        # then drops that mark when readline switches the mode again.
+        check(read_until("gpudb> ", after="│"), "the prompt is back")
         send(b"\x04")                       # Ctrl-D on an empty line
         read_until("\x00", timeout=30)     # never matches: reads until the shell closes the tty
         try:

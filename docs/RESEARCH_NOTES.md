@@ -2554,6 +2554,107 @@ its index-vector form and compare THAT density before declining. Nothing else in
 the policy would have to change, which is the part that makes me think the
 quantity is the right one.
 
+## 2026-09-19 — The end-of-file that arrived while nobody was reading
+
+`Ctrl-D leaves the shell`, the last check of the shell suite's interactive
+section, had been failing on the Linux runner now and then and never on macOS.
+`rc=None` says the child was still there sixty seconds after the test wrote
+`\x04` into the pseudo-terminal, so `input()` in `repl()` had never raised
+`EOFError` — and the way out is bounded (`close()` joins for `CLOSE_S` and then
+`os._exit`), so the hang could not be in the leaving. The shell was sitting at a
+prompt ignoring a key.
+
+**CI was the Linux machine.** A throwaway branch ran the interactive sequence in
+a loop — a round takes 2.1 s — and, on a round that did not leave, printed the
+child's `/proc` state, the pseudo-terminal's termios, `py-spy dump --pid`, and
+three recovery attempts in order (a second `^D`, a newline then `^D`, a whole
+`.quit`), which separate *the byte was lost* from *the line was not empty* from
+*it is not reading at all*. **6 hangs in 480 rounds, 1.25%** — and none at all in
+the 360 rounds of a first version whose bookkeeping sat between the read and the
+write that bound the window: the window is microseconds wide and measuring it
+moved it.
+
+A caught round says all of it at once. `py-spy`: the main thread is at
+`repl (_shell.py:239)`, which is the `input()` call. `/proc/<pid>/syscall`: 270,
+`pselect6` — readline's own wait for a key. `stty`: `-icanon -echo min = 1`,
+`eof = ^D` — readline has the terminal, armed, with the end-of-file character
+still bound. And then `after second ^D: alive=False`: a second `\x04` leaves
+immediately. Reading, empty line, key bound, works on the second press. The
+first byte had simply been thrown away.
+
+**Where it went.** A control with no gpudb in it — eight lines of stock Python
+looping over `input()`, sleeping a second when told to `work` — puts it beyond
+argument. Three cases, five times each, on the same runner:
+
+| what is written | the terminal when it arrives | what happens |
+|---|---|---|
+| `^D` at a prompt that is waiting | `raw -echo` | leaves, 5/5 |
+| `^D` while the program is working | `canonical +echo` | **stays, 5/5** |
+| `work\n` and `^D` in ONE write at the prompt | `raw -echo` | leaves, 5/5 |
+
+Same byte, same order, same program: only the mode of the terminal when it
+arrives differs. `input()` hands the terminal to readline and hands it back when
+it returns, so a key typed while a statement runs reaches a canonical terminal —
+and there Linux's line discipline does not queue `^D` as a byte at all, it
+records an end-of-file mark beside the input queue, and it clears those marks on
+any change of `ICANON`, which is precisely what the next `input()` does. The
+mark is gone before anyone reads it. On macOS all three cases leave, because
+libedit never puts the terminal back: it reads `raw -echo` there even while the
+program is working, so the byte stays a byte. That is the whole of the
+platform difference, and it is why the check never failed on this machine.
+
+**So the shell was not ignoring the user — the test was typing into that
+window.** `read_until("still_here")` matches the terminal's ECHO of the line the
+test has just typed, never the answer; and the `gpudb> ` after it can be the
+prompt readline prints the *moment* it takes the terminal, before it has read the
+line still sitting in the queue. A caught round's transcript shows the line
+twice, the canonical echo and then readline's, with the prompt between them. The
+test read that as "idle" and sent `^D` into a shell that was about to run a
+statement. 13 to 36 rounds in 80 sent it before the answer was rendered; most of
+those still leave, because the byte usually arrives while readline still holds
+the terminal, and the losing tail is the millisecond in which the statement runs.
+
+The loop found a second bug of the same family before it found this one: 13 of
+360 rounds took 62 seconds instead of 2.1, and 60 s is exactly a `read_until`
+timeout. The test cleared its buffer between waiting for a statement and waiting
+for the prompt, and one 64 KB read can already hold both — a prompt that had
+arrived was thrown away and then waited for.
+
+**The fix is in the test, because the shell behaves as every readline client on
+the platform does** — the control is that behaviour with nothing of ours in it.
+It now waits for the box DuckDB renders — the one thing only the shell can
+print — and then for the prompt *after* that box, with a `read_until(..., after=)`
+that looks past a marker instead of clearing the buffer. Both halves of the
+family go with it: the ^D is only ever sent at a prompt with an empty queue
+behind it, and no prompt can be discarded before it is waited for. The same two
+shapes elsewhere in the section were corrected the same way. `KNOWN_ISSUES.md`
+records the platform behaviour, since a user who types `Ctrl-D` during a long
+statement on Linux will see it ignored.
+
+Measured on the same runner: **7 hangs in 640 rounds** of the sequence as it was,
+**0 in 160 rounds** of the corrected one — and in all 160 the ^D went to a prompt
+that came after the answer, where before it did so in barely half of them — plus
+**0 failures in 160 runs** of the suite's interactive section itself. Locally,
+ten runs of the whole shell suite with the Metal extension and five without it,
+all passing.
+
+The same loops with eight busy processes beside them, which finished after the
+lines above were written: the sequence as it was, **1 hang in 160 rounds** (so
+8 in 800 in all, and 48 of every 80 rounds sent the ^D before the answer); the
+corrected one, **0 in 80** (0 in 240 in all), every round of it at a prompt that
+followed the answer. Three more loaded jobs were still running when this was
+merged and are not counted. The zero is not the argument on its own — 240 rounds
+at a 1 % rate would miss it one time in eleven; the argument is that the window
+the byte was lost in opened in half the old rounds and in none of the new ones.
+
+**Ruled out.** The exit path (bounded, and `py-spy` puts the thread in `input()`,
+not in `close()`). `_restore_terminal()` (it runs before the prompt is printed
+and writes canonical settings over canonical ones, which is not a change of
+`ICANON` and clears nothing). A non-empty readline line buffer (a bare second
+`^D` freed the shell; a newline would have been needed first). readline not
+reading (`pselect6`, and the second `^D` was answered at once). And anything
+gpudb-specific: the control has no gpudb in it.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
