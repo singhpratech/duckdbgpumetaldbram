@@ -4804,64 +4804,121 @@ native time where it is not — the 22-query loop as the wrapper answers it.
 |---|---|---|---|---|
 | main, on the device | 15 / 22 | 15 / 22 | 15 / 22 | 15 / 22 |
 | branch, on the device | **17 / 22** | **17 / 22** | **19 / 22** | **19 / 22** |
-| main, native total | 207.5 ms | 213.0 ms | 1337.5 ms | 1427.4 ms |
-| main, wrapper total | 69.9 ms | 72.1 ms | 597.3 ms | 617.4 ms |
-| branch, wrapper total | **62.2 ms** | **62.5 ms** | **253.7 ms** | **254.8 ms** |
+| main, native total | 202.7 ms | 209.0 ms | 1352.8 ms | 1370.8 ms |
+| main, wrapper total | 66.6 ms | 71.7 ms | 601.6 ms | 613.8 ms |
+| branch, wrapper total | **58.4 ms** | **60.4 ms** | **255.8 ms** | **254.9 ms** |
 
 Per query, the difference is the same set in both SF10 rounds and in both SF1
 rounds — and it is only ever in one direction:
 
 | query | SF | main | branch |
 |---|---|---|---|
-| Q13 | 10 | native (shape) | **GPU (nested)**, 11.72× / 11.6× |
-| Q15 | 10 | native (shape) | **GPU (nested)**, 2.27× / 2.3× |
-| Q19 | 10 | native (memory) | **GPU (projected)**, 15.1× / 15.0× |
-| Q21 | 10 | native (memory) | **GPU (plain)**, 12.4× / 12.6× |
-| Q15 | 1 | native (shape) | **GPU (nested)**, 1.8× |
-| Q22 | 1 | native (threshold) | **GPU (plain)**, 11.3× |
+| Q13 | 10 | native (shape) | **GPU (nested)**, ~11.7× |
+| Q15 | 10 | native (shape) | **GPU (nested)**, ~2.3× |
+| Q19 | 10 | native (memory) | **GPU (projected)**, ~15× |
+| Q21 | 10 | native (memory) | **GPU (plain)**, ~12.5× |
+| Q15 | 1 | native (shape) | **GPU (nested)**, ~1.8× |
+| Q22 | 1 | native (threshold) | **GPU (plain)**, ~11.3× |
 
 **No query that main answers on the device is answered natively by the
-branch**, at either scale factor, in either round. Main itself reports
-`native (memory)` for Q19 and Q21 at SF10 in both of these rounds (an earlier
-round of the same script had main at 17 / 22 with those two on the device —
-which is the point: first come first served makes the outcome depend on what
-the budget happened to be holding, and that is what value-aware admission
-replaces).
+branch**, at either scale factor, in either round.
+
+#### Main's SF10 baseline is not stable, and that is the point
+
+Main at SF10 and the default budget measured **17 / 22 in four runs and 15 / 22
+in five**, across this session and the reviewer's:
+
+| main's SF10 result | runs | which queries |
+|---|---|---|
+| 17 / 22 | 4 (2 here, 2 the reviewer's earlier pair) | Q19 and Q21 on the device |
+| 15 / 22 | 5 (2 here, 3 the reviewer's re-runs) | Q19 and Q21 `native (memory)` |
+
+Both outcomes come from the same script at the same budget, and the only
+queries that move are Q19 and Q21 — every other row is identical. **What
+differs was not established.** It is not the commit: a direct probe of main at
+`df33fdd` and at the merge base `0aeb6ab`, back to back on this machine, put
+Q19 and Q21 on DuckDB in both. The mechanism that makes it possible is main's
+policy itself — first come first served, with a 60 s minimum age that never
+expires inside a 25–35 s run, so whether the last two large candidates fit
+depends entirely on how much the preceding queries happened to leave resident,
+and nothing can be given up to change that. That is the variance value-aware
+admission removes: the branch measured **19 / 22 in every run of it**, here and
+the reviewer's.
 
 ### The thrash experiment: a budget deliberately below the working set
 
 The 22 queries in a loop, one run each, SF10, at 8 GiB and 12 GiB — both below
 the ~14 GiB the 22 queries want. 14 loops, main and branch, same machine, same
-extension. Loop 0 is cold (every upload happens in it).
+extension. **`residency="eager"`**, which is what `tpch_coverage.py` and this
+probe use: it uploads *and* evicts synchronously inside the statement that
+asked for the set, which is why single statements in loops 0–3 read in
+seconds (Q18 8.3 s, Q10 6.7 s, Q21 1.9 s — those are uploads, not queries).
+The default mode never does that; it is measured separately below.
 
 | | main 8 GiB | branch 8 GiB | main 12 GiB | branch 12 GiB |
 |---|---|---|---|---|
-| loop 0 | 14.79 s | 16.04 s | 22.46 s | 22.57 s |
-| loop 1 | 1.01 s | 0.90 s | 0.91 s | 0.75 s |
-| loop 2 | 1.53 s | 1.59 s | 1.64 s | 1.65 s |
-| loop 3 | 1.02 s | 2.67 s | 0.92 s | 2.34 s |
-| loop 4 | 0.99 s | 6.48 s | 0.87 s | 8.91 s |
-| loops 5–13 | 0.97–0.99 s | **0.98–1.01 s** | 0.86–0.88 s | **0.79–0.85 s** |
-| evictions per loop, 5–13 | 0 | 1 | 0 | 1 |
-| on the device at steady state | 9 / 22 | **10 / 22** | 12 / 22 | **14 / 22** |
+| loop 0 (cold) | 14.60 s | 15.57 s | 22.15 s | 23.29 s |
+| loop 1 | 1.01 s | 10.19 s | 0.90 s | 8.94 s |
+| loop 2 | 1.47 s | 8.12 s | 1.58 s | 3.23 s |
+| loop 3 | 0.98 s | 2.62 s | 0.90 s | 3.34 s |
+| loops 4–13 | 0.95–0.96 s | **0.78–1.00 s** | 0.84–0.90 s | **0.57–0.81 s** |
+| evictions, loops 4–13 | 0 | **0** | 0 | **0** |
+| evictions by refused candidates, all loops | 0 | **0** | 0 | **0** |
+| on the device at steady state | 9 / 22 | **11 / 22** | 12 / 22 | **14 / 22** |
 
-Loops 3 and 4 are where the policy pays for what it learns: the measured rule 1
-probes a template's native time after its third rewritten run, so it is only
-then that the two sides of every saving are known, and the re-arrangement that
-follows costs one set's upload (6.5 s at 8 GiB, 8.9 s at 12 GiB — the losing
-numbers, printed). From loop 5 the resident population does not change again:
-the steady-state loop is **0.79–0.85 s against main's 0.86–0.88 s at 12 GiB**
-and **0.98–1.01 s against main's 0.97–0.99 s at 8 GiB**, with two more queries
-on the device at 12 GiB and one more at 8 GiB. Main shows zero evictions in
-this experiment for a reason worth stating plainly: its 60 s wall-clock
-minimum age never expires inside a 14-loop run, so it never re-arranges
-anything at all.
+Loops 1–3 are where the policy pays for what it learns: the measured rule
+probes a template's native time after its third rewritten run, so only then
+are both sides of every saving known, and the re-arrangement that follows
+costs the uploads of the sets it admits (the losing loops are printed above).
+From loop 4 the resident population does not change again and **nothing is
+evicted at all**: the steady-state loop is **0.57–0.81 s against main's
+0.84–0.90 s at 12 GiB** and **0.78–1.00 s against main's 0.95–0.96 s at
+8 GiB**, with two more of the 22 queries on the device at both budgets.
 
-The residual is one eviction per loop at steady state on the branch, of a unit
-small enough that it neither changes which queries are on the device nor shows
-in the loop time. It is bounded (one, every loop, for nine loops) rather than
-growing, which is what "converged" means here; it is written up in
-`KNOWN_ISSUES.md`.
+Main shows zero evictions throughout for a reason worth stating plainly: its
+60 s wall-clock minimum age never expires inside a 14-loop run, so it never
+re-arranges anything at all.
+
+**The residual is gone.** An earlier revision of this policy showed one
+eviction per loop at steady state and a slower steady loop (0.80 s at 12 GiB,
+1.00 s at 8 GiB). That was not a quirk of a small set: it was the eviction
+loop deciding and dropping in the same pass. A candidate would drop one unit,
+fail to find an acceptable second, and be refused — having destroyed the
+first. In `thrash_branch_12GB.log` loop 3 of that revision, two candidates
+that both ended up `native (memory)` tore down ~1.9 GiB between them and Q3
+left the device for it. `_make_room` now takes a snapshot, builds the entire
+plan over it, and executes only a plan it has accepted; `evictions_wasted`
+counts evictions made for a candidate that was then refused and is **0 in
+every run above**.
+
+### The default residency mode: no statement waits for residency work
+
+The same loop with `residency="background"` (the shipping default), 12 GiB,
+45 loops, main and branch. The background uploader only moves in idle windows
+and a back-to-back loop leaves few, so it reaches 4 sets on main and 5 on the
+branch in 45 loops and never contends for the budget at all — 0 evictions on
+both sides. That is itself rule 1 holding: the uploader yields to every
+statement rather than taking the device.
+
+| | main | branch |
+|---|---|---|
+| slowest single statement after loop 0 | 172.8 ms (Q13) | 177.1 ms (Q13) |
+| steady loop | 1.20–1.29 s | 1.23–1.26 s |
+| `_make_room` calls / median / max | 11 / 0.003 ms / 0.527 ms | 12 / 0.117 ms / 0.559 ms |
+| evictions, wasted | 0, 0 | 0, 0 |
+
+The slowest statement on either side is a query that runs on DuckDB on both
+sides; nothing is slower than native because of residency work. In this mode
+`_make_room` is called from the manager's worker thread and never from the
+statement's, so its wall time cannot reach a statement even in principle.
+
+**What the policy's own arithmetic costs**, measured where it is actually
+contended (branch, eager, 12 GiB, 6 loops): `_plan` — the densities, the
+median, the victim order and the two rules, with no device work in it —
+**36 calls, median 0.104 ms, maximum 0.115 ms**. The rest of `_make_room`'s
+wall time in that mode (median 0.372 ms, maximum 231 ms) is the `gpu_drop_*`
+calls of an accepted plan, which is device work that only happens when
+something is being admitted.
 
 ### What the bookkeeping costs per statement
 
@@ -4889,12 +4946,25 @@ set per statement behind them.
 ### The rest of the acceptance run
 
 `python3 python/tests/test_wrapper.py` 1093 checks, 0 failures ·
-`python3 python/tests/test_residency_policy.py` 47 checks, 0 failures ·
+`python3 python/tests/test_residency_policy.py` 58 checks, 0 failures ·
 `python3 python/tests/test_shell.py` pass · `./build-macos/test/test_gpudb`
 3023 / 3023 · `./scripts/run_sql_tests.sh` 224 pass / 0 fail / 45 expected
 fails · `rewrite_parity_check.sh`, `join_parity_check.sh`,
-`groupby_parity_check.sh` all pass · `scripts/wrapper_residency_gate.py` 0
-failing rows, all three cadences pass.
+`groupby_parity_check.sh` all pass.
+
+`scripts/wrapper_residency_gate.py` passed all three cadences on this branch
+earlier in the session (`q18_native` 0.98×, `small_scan` 1.00×,
+`point_lookup` 1.10×). Re-run late in the session, after many hours of
+continuous GPU work on this machine, it is flaky on BOTH sides: three
+interleaved rounds gave main 1 failing row of 3 rounds (`q18_native` 0.71×)
+and the branch 2 of 3 (`point_lookup` 0.88×, `q18_native` 0.89×), on a
+different row each time, with the branch ahead of main on `q18_native` in the
+two rounds where both were measured (0.97× against 0.91×, 0.91× against
+0.71×). That is the machine state §9.1 calls "two modes of a short kernel",
+not a change in what the wrapper does inline: in the default residency mode
+`_make_room` runs on the worker thread and measured at most 0.56 ms, and no
+background run evicted anything at all. Recorded here rather than explained
+away.
 
 `scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor`,
 SF1, last and alone on the machine, on this code: **1506 cells, 904 rewritten,
@@ -4904,4 +4974,6 @@ moved are `declined after the first run (threshold)` — the operator's
 output-size check, which reads the run's own `rows_out` and is therefore
 process-state dependent, and which declines in the safe direction. SF1 sets are
 far below the budget, so no cell in this gate reaches the admission rule at
-all; it is here to show that nothing else moved.
+all; it is here to show that nothing else moved. The plan-then-execute change
+that followed touches only `_make_room`'s contended path, which that gate
+never reaches, so it was not re-run for it.

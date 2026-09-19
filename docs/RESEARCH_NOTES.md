@@ -2486,24 +2486,67 @@ something has actually been answered from it.
 **What it measures.** At the default budget, SF10, two interleaved rounds: main
 15 of 22 on the device, branch 19 - Q13 and Q15 join, Q19 and Q21 come back, and
 no query main answers on the device is answered natively by the branch. The
-22-query wrapper total goes from 597/617 ms to 254/255 ms. At SF1, 15 against
-17, 70/72 ms against 62/63. Under a budget deliberately below the working set -
-8 and 12 GiB against a ~14 GiB working set, 14 loops - loops 3 and 4 pay one
-set's upload each (6.5 s and 8.9 s, printed) for the re-arrangement the first
-real measurements ask for, and from loop 5 nothing moves again: 0.79-0.85 s a
-loop against least-recently-used's 0.86-0.88 s at 12 GiB, with two more queries
-on the device. Least recently used shows zero evictions in that experiment for a
-reason worth saying out loud - its 60 s window never expires inside a 14-loop
-run, so it never re-arranges anything at all.
+22-query wrapper total goes from 602/614 ms to 256/255 ms. At SF1, 15 against
+17, 67/72 ms against 58/60. Under a budget deliberately below the working set -
+8 and 12 GiB against a ~14 GiB working set, 14 loops - loops 1 to 3 pay for the
+re-arrangement the first real measurements ask for, and from loop 4 nothing
+moves and nothing is evicted again: 0.57-0.81 s a loop against
+least-recently-used's 0.84-0.90 s at 12 GiB, with two more queries on the
+device at both budgets. Least recently used shows zero evictions in that
+experiment for a reason worth saying out loud - its 60 s window never expires
+inside a 14-loop run, so it never re-arranges anything at all.
 
 The bookkeeping costs nothing I can measure: against a no-op, alternating rounds
 in one process, the four sub-millisecond statements move by at most 0.03 ms and
 half of those deltas are negative.
 
-**What it does not do.** One eviction per loop survives at steady state, of a
-unit small enough that it changes neither the resident population nor the loop
-time - bounded, not growing, and written down rather than explained away. And
-the whole policy is still one form of a set against another; PR #142's index
+**One flaw survived the first round of this, and it was in the shape of the
+code rather than the arithmetic.** `_make_room` had always been a loop that
+dropped a victim and then looked again, and I kept that shape while changing
+what it compared. Under the new rules a pass can run OUT of acceptable victims
+- the next one costs more than the candidate is worth - and by then it has
+already destroyed the ones before it. My own thrash log had it in plain sight:
+at 12 GiB, loop 3, Q18 and Q21 between them tore down about 1.9 GiB and were
+both answered natively anyway, and Q3 left the device for nothing. It also
+explains the residual I had written up as harmless - one eviction per loop at
+steady state - which was not a small set churning but this, every loop.
+
+The fix is to separate deciding from doing: snapshot what is resident, build
+the WHOLE plan over that snapshot without touching anything, and execute only
+a plan that has been accepted. It made room for a better rule at the same
+time. Density is the right currency for choosing WHO goes, because a byte
+freed from a low-density unit costs the least value - but it is the wrong one
+for deciding WHETHER, and comparing the candidate against each victim in turn
+was quietly assuming the freed bytes were fungible. With a plan in hand the
+honest question is available: is this candidate worth more than everything the
+plan would take, together? A candidate that needs three victims must beat the
+three of them. That also settles the caveat I had left open, where a small
+cheap set could out-rank a large valuable one on density alone.
+
+`evictions_wasted` counts what a refused candidate destroyed on its way to
+being refused. It is 0 in every run now, which it should be by construction -
+the only way it can move is a `gpu_drop_*` that itself fails, and then the
+caller re-plans against a fresh snapshot rather than carrying on against a
+picture that is no longer true. With the residual gone the steady loop at
+12 GiB is 0.57-0.81 s against least-recently-used's 0.84-0.90 s, the
+re-arrangement finishes a loop earlier, and loops 4 to 13 evict nothing at all.
+
+**Two things I had to stop reporting as cleaner than they were.** Main's SF10
+baseline is not one number: 17 of 22 in four runs, 15 in five, the same script
+at the same budget, and only Q19 and Q21 ever move. It is not the commit - I
+probed main at two commits back to back and both put those two on DuckDB - and
+beyond that it is not established. What I can say is the mechanism that lets
+it happen: first come first served with a minimum age that never expires
+inside a 30 s run means the last two large candidates fit or not depending on
+what the queries before them happened to leave behind, and nothing can be
+given up to change that. And the harness that produced every thrash number
+runs `residency="eager"`, which uploads and evicts inside the statement - that
+is why single statements in the early loops read in seconds. The default mode
+does none of that inline, and measured over 45 loops its slowest statement is
+a query DuckDB answers on both sides.
+
+**What it does not do.** The whole policy is still one form of a set against
+another; PR #142's index
 vectors, a join set held as row indices at 1.2-1.9x the read cost and a fraction
 of the bytes, are a second point on the value-per-byte curve for the same set.
 The place they attach is admission: when a candidate is refused, re-price it in

@@ -1530,12 +1530,33 @@ same database — the extension stays free of threads and hidden connections
     thing there is and nothing better. Being wrong is self-correcting, because
     one statement later the measurement replaces the guess in the same
     accumulator.
-  - *Admission vs eviction.* The least valuable evictable unit — a store
-    column or a set of its own — goes only if the candidate is worth more per
-    byte than it is by a hysteresis margin of 1.25; otherwise the candidate
-    stays native and `detail` says whose value it did not beat. The margin is
-    the whole anti-ping-pong argument: A displaces B only if
-    d(A) > 1.25·d(B), and B cannot displace A back without d(B) > 1.25·d(A).
+  - *Admission vs eviction: snapshot, plan, then execute.* `_make_room` takes
+    a snapshot of what is resident, builds the WHOLE eviction plan over it
+    without dropping anything (`_plan`), and only then executes it
+    (`_evict`). A plan that cannot reach the budget, or is not worth
+    executing, refuses with everything still resident. The earlier shape
+    dropped one unit at a time inside the loop that was still deciding, so it
+    could run out of acceptable victims *after* destroying several for a
+    candidate it then declined anyway — measured at SF10/12 GiB: ~1.9 GiB of
+    resident sets torn down in one loop by two candidates that both ended up
+    native, and a third query pushed off the device as a result.
+    `memory()["evictions_wasted"]` counts evictions that bought nothing and is
+    0 by construction now except when a drop itself fails; a failed drop makes
+    the caller re-plan against a fresh snapshot rather than carry on against a
+    picture that is no longer true (three plans, then a refusal).
+  - *Two quantities, two jobs.* **Value per byte decides WHO goes** — units
+    are taken cheapest first, because a byte freed from a low-density unit
+    costs the least value; ties break to least recently used, and a unit the
+    minimum age protects sorts last whatever its value. **Total value decides
+    WHETHER** — the plan runs only if the candidate is worth more than
+    everything in it put together, by a hysteresis margin of 1.25. A candidate
+    that needs three victims must beat the three together, not merely be
+    denser than each; that is the exchange that makes the resident population
+    better rather than only differently arranged, and it is why a small cheap
+    set never displaces a large valuable one. The margin is also the whole
+    anti-ping-pong argument: A displaces B only if v(A) > 1.25·v(B), and B
+    cannot displace A back without v(B) > 1.25·v(A). When the candidate is
+    refused, `detail` names the plan and what it would have cost.
   - *The minimum age* (60 s) is what it always was — anti-thrash — but stated
     as what it is for: a set gets the chance to pay back its upload, and
     paying back means answering a statement. So a unit is protected while it
@@ -1548,10 +1569,19 @@ same database — the extension stays free of threads and hidden connections
     candidate worth twice the typical resident set, and a set that an override
     took off the device may not override its way back for 60 s — so two sets
     cannot ping-pong through a third.
+  - *Where it runs, and what it costs.* `_make_room` is called from the
+    background worker's thread in the default residency mode, and inline only
+    under `residency='eager'`, which uploads synchronously by design. The
+    policy's own arithmetic (`_plan`: densities, the median, the victim order,
+    the two rules) measured 0.104 ms median and 0.115 ms maximum over 36 calls
+    under real contention at SF10; the rest of `_make_room`'s wall time is the
+    `gpu_drop_*` calls it executes, which is device work and only happens when
+    a candidate has been accepted.
   - *Explainability.* `Connection.memory()` reports `value` (ms saved per
-    second) and `density` (the same per GiB) per set; the shell's
-    `.residents` prints the latter as `worth`; every eviction log line says
-    what went and what it was worth against the set that displaced it.
+    second), `density` (the same per GiB) and `evictions_wasted`; the shell's
+    `.residents` prints the density as `worth`; every eviction log line says
+    what went and what it was worth against the set that displaced it, and
+    every refusal ends "Nothing was evicted".
   - *Where index vectors plug in.* PR #142 (a join set held as row-index
     vectors: 1.2–1.9× slower to read, much smaller) is the other lever on this
     same pressure. In these terms it is a second FORM of a set with a

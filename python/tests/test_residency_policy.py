@@ -49,6 +49,8 @@ class Device:
         self.sets = {}                  # name -> [bytes, refs, used_at, origin]
         self.cols = {}                  # (store, lane) -> [bytes, used_at]
         self.dropped = []
+        self.fail_drop = set()          # names whose drop always raises
+        self.fail_once = set()          # ... and names whose NEXT drop raises, once
 
     # -- what the test drives it with --
     def touch(self, name):
@@ -71,6 +73,11 @@ class Device:
             return [(s, c, v[0], v[1]) for (s, c), v in self.cols.items()]
         if sql.startswith("SELECT gpu_drop_resident"):
             name = sql.split("'")[1]
+            if name in self.fail_once:
+                self.fail_once.discard(name)
+                raise RuntimeError("the extension would not drop " + name)
+            if name in self.fail_drop:
+                raise RuntimeError("the extension will never drop " + name)
             self.dropped.append(name)
             self.sets.pop(name, None)
             return [(1,)]
@@ -191,13 +198,114 @@ def run():  # noqa: C901
     check(not upload(mgr, dev, "poor"), "refusal: the cheap candidate is not uploaded")
     err = mgr.get("poor").error
     check(err.startswith(MEMORY_ERROR), f"refusal: the reason is the memory budget ({err[:40]})")
-    check("worth" in err and "ms/s per GiB" in err and "cheapest thing that could go" in err,
+    check("worth" in err and "ms/s" in err and "what making room would cost" in err,
           f"refusal: it names the value it did not beat ({err})")
-    check("MiB resident" in err and "MiB needed" in err,
-          "refusal: and what it needed against what was resident")
+    check("MiB resident" in err and "MiB needed" in err and "Nothing was evicted" in err,
+          "refusal: and what it needed against what was resident, and that nothing went")
     check(not dev.dropped, "refusal: nothing was evicted for it")
     check(mgr.get("rich1").state == "ready" and mgr.get("rich2").state == "ready",
           "refusal: the resident sets were left alone")
+
+    print("== the plan is made before anything is dropped")
+    # The bug this replaces: the old loop dropped one unit at a time and could
+    # run out of acceptable victims AFTER it had destroyed several, for a
+    # candidate it then declined anyway. Here the candidate needs two units and
+    # the only second one left is an unused young set it may not interrupt.
+    clock, dev = Clock(), None
+    dev = Device(clock)
+    mgr = manager(clock, dev, 3 * MiB)
+    offer(mgr, "cheap", 1 * MiB)
+    upload(mgr, dev, "cheap")
+    mgr.note_use(["cheap"], 20.0)
+    offer(mgr, "scale", 1 * MiB)                # ... sets the median
+    upload(mgr, dev, "scale")
+    mgr.note_use(["scale"], 100.0)
+    dev.sets["scale"][1] = 1                    # held by an operator: never a victim
+    offer(mgr, "fresh", 1 * MiB)
+    upload(mgr, dev, "fresh")                   # young, never read: protected
+    offer(mgr, "want", 2 * MiB)                 # needs BOTH cheap and fresh
+    mgr.note_use(["want"], 120.0)               # worth more than cheap, nowhere near 2x the median
+    check(not upload(mgr, dev, "want"),
+          "plan: the candidate that cannot complete a plan is refused")
+    check(dev.dropped == [] and mgr.get("cheap").state == "ready",
+          f"plan: and NOTHING was evicted on the way to that refusal ({dev.dropped})")
+    check("2 units, the cheapest of them cheap" in mgr.get("want").error
+          and "Nothing was evicted" in mgr.get("want").error,
+          f"plan: the refusal names the plan it could not run ({mgr.get('want').error[-150:]})")
+
+    print("== total value decides whether, density decides who")
+    for worth, expect in ((150.0, False), (900.0, True)):
+        clock, dev = Clock(), None
+        dev = Device(clock)
+        mgr = manager(clock, dev, 2 * MiB)
+        offer(mgr, "a", 1 * MiB)
+        upload(mgr, dev, "a")
+        mgr.note_use(["a"], 100.0)              # A is the cheaper of the two
+        offer(mgr, "b", 1 * MiB)
+        upload(mgr, dev, "b")
+        mgr.note_use(["b"], 400.0)
+        clock.advance(120.0)
+        offer(mgr, "two", 2 * MiB)              # needs both A and B
+        mgr.note_use(["two"], worth)
+        got = upload(mgr, dev, "two")
+        check(got is expect,
+              f"sum rule: a candidate worth {worth:.0f} ms against A+B (100+400) is "
+              f"{'admitted' if expect else 'refused'} (got {got})")
+        if expect:
+            check(sorted(dev.dropped) == ["a", "b"],
+                  f"sum rule: and both went, cheapest first ({dev.dropped})")
+        else:
+            check(dev.dropped == [], f"sum rule: and nothing went ({dev.dropped})")
+    # ... worth more than A alone but less than A+B: still refused, nothing dropped
+    clock, dev = Clock(), None
+    dev = Device(clock)
+    mgr = manager(clock, dev, 2 * MiB)
+    for t, ms in (("a", 100.0), ("b", 400.0)):
+        offer(mgr, t, 1 * MiB)
+        upload(mgr, dev, t)
+        mgr.note_use([t], ms)
+    clock.advance(120.0)
+    offer(mgr, "mid", 2 * MiB)
+    mgr.note_use(["mid"], 300.0)                # beats A (100), loses to A+B (500)
+    check(not upload(mgr, dev, "mid") and dev.dropped == [],
+          f"sum rule: worth more than the cheapest victim but less than the plan -> refused, "
+          f"nothing dropped ({dev.dropped})")
+
+    print("== a drop that fails is re-planned, not carried on from")
+    clock, dev = Clock(), None
+    dev = Device(clock)
+    mgr = manager(clock, dev, 2 * MiB)
+    for t, ms in (("bad", 20.0), ("good", 30.0)):
+        offer(mgr, t, 1 * MiB)
+        upload(mgr, dev, t)
+        mgr.note_use([t], ms)
+    clock.advance(120.0)
+    dev.fail_once.add("bad")                    # the extension refuses this drop once
+    offer(mgr, "new", 1 * MiB)
+    mgr.note_use(["new"], 800.0)
+    check(upload(mgr, dev, "new"),
+          "re-plan: the candidate still got in after a drop failed under it")
+    check(dev.dropped == ["bad"] and "good" in dev.sets,
+          f"re-plan: the second plan was made from a fresh picture and took one unit, "
+          f"not two ({dev.dropped})")
+    # a drop that never succeeds: three plans, then a refusal — and nothing else
+    # is torn down on the way
+    clock, dev = Clock(), None
+    dev = Device(clock)
+    mgr = manager(clock, dev, 2 * MiB)
+    for t, ms in (("stuck", 20.0), ("fine", 30.0)):
+        offer(mgr, t, 1 * MiB)
+        upload(mgr, dev, t)
+        mgr.note_use([t], ms)
+    clock.advance(120.0)
+    dev.fail_drop.add("stuck")
+    offer(mgr, "new2", 1 * MiB)
+    mgr.note_use(["new2"], 800.0)
+    check(not upload(mgr, dev, "new2") and dev.dropped == [] and "fine" in dev.sets,
+          f"re-plan: a drop that never succeeds refuses without tearing anything else down "
+          f"({dev.dropped})")
+    check("three eviction plans" in mgr.get("new2").error,
+          f"re-plan: and the refusal says why ({mgr.get('new2').error[-90:]})")
 
     print("== the minimum age protects a set until it has answered something")
     clock, dev = Clock(), None
@@ -268,16 +376,22 @@ def run():  # noqa: C901
     mgr = manager(clock, dev, 1 * MiB, evict_min_age_s=0.0)   # no anti-thrash at all: the margin alone
     offer(mgr, "x", 1 * MiB)
     upload(mgr, dev, "x")
+    refused_cost = 0
     for i in range(200):
         # the two statements alternate, each saving the same 100 ms
         for t in ("x", "y"):
             if not mgr.is_ready(t):
                 offer(mgr, t, 1 * MiB)
-                upload(mgr, dev, t)
+                before = mgr.evictions
+                if not upload(mgr, dev, t):
+                    refused_cost += mgr.evictions - before
             mgr.note_use([t], 100.0)
         clock.advance(1.0)
     check(mgr.evictions <= 2,
           f"hysteresis: {mgr.evictions} evictions over 200 alternating rounds (bounded)")
+    check(refused_cost == 0 and mgr.memory()["evictions_wasted"] == 0,
+          f"hysteresis: and a refused round evicted nothing at all ({refused_cost}, "
+          f"{mgr.memory()['evictions_wasted']} wasted)")
     check(dev.total() <= 1 * MiB, "hysteresis: and the budget still holds")
     # the set that holds the memory is the one being used on the device; the other
     # one keeps running native, which is exactly rule 1 under a budget too small

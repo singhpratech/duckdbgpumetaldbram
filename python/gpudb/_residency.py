@@ -166,6 +166,11 @@ class ResidencyManager:
         self.memory_budget = memory_budget      # bytes of device memory for resident sets; None = no cap
         self.evict_min_age_s = evict_min_age_s
         self.evictions = 0
+        # evictions that bought nothing: a candidate that was refused AFTER
+        # something had already been dropped for it. Plan-then-execute makes
+        # this structurally unreachable except when a drop itself fails, and it
+        # is counted rather than assumed (§5.5).
+        self.evictions_wasted = 0
         self._col_uploaded: Dict[tuple, float] = {}   # (store, lane) -> monotonic time it landed (anti-thrash)
         self._log = log or (lambda m: None)
         self._sets: Dict[str, SetState] = {}
@@ -437,24 +442,26 @@ class ResidencyManager:
         return keep
 
     def _make_room(self, run: Callable[[str], List[tuple]], s: SetState) -> bool:
-        """Before an upload: does the set fit the budget, evicting less
-        valuable sets if it has to? False (and s.error says why) when it does
-        not — the statement then keeps running native, which is what rule 1
-        asks for when the device cannot hold the data.
+        """Before an upload: does the set fit the budget, and if not, is it
+        worth more than what it would take to make it fit? False (and s.error
+        says why) when it is not — the statement then keeps running native,
+        which is what rule 1 asks for when the device cannot hold the data.
 
-        The extension is the source of truth for what is resident and what it
-        costs (`gpu_residents().bytes` counts lanes, validity and derived
-        structures); sets uploaded by hand count toward the total and are
-        never evicted. Not evictable: a set in use by a running operator, a
-        source of `s`, a source of another resident set (its dependents go
-        first).
+        Three steps, in this order, and the order is the point. A SNAPSHOT of
+        what is resident and what it costs (the extension is the source of
+        truth: `gpu_residents().bytes` counts lanes, validity and derived
+        structures; sets uploaded by hand count toward the total and are never
+        evicted). Then a PLAN over that snapshot, which drops nothing: the
+        whole set of units that would have to go, and the decision whether
+        they should. Only then the drops. A plan that cannot reach the budget,
+        or is not worth executing, refuses with everything still resident —
+        the earlier shape evicted one unit at a time and could run out of
+        acceptable victims after it had already destroyed several for a
+        candidate it then declined anyway.
 
-        What goes is the least VALUABLE evictable unit — a store column or a
-        set of its own — and it goes only if this candidate is worth more per
-        byte than it is, by EVICT_HYSTERESIS (or YOUNG_OVERRIDE_RATIO where the
-        victim is younger than evict_min_age_s). A candidate nothing is known
-        about yet has no value to compare, and then this is what it always was:
-        least recently used, among units past the minimum age."""
+        Not evictable at all: a set an operator is using, a source of `s`, a
+        source of another resident set (its dependents go first), and that
+        source's store columns."""
         budget = self.memory_budget
         if not budget or s.est_bytes <= 0:
             return True
@@ -464,6 +471,38 @@ class ResidencyManager:
                            f"the budget is {budget / 2**20:.0f} MiB")
             self._log(f"not uploaded: {s.tag}: {s.error}")
             return False
+        with self._lock:
+            before = self.evictions
+        for _attempt in range(3):
+            snap = self._snapshot(run, s)
+            if snap is None:
+                return True                      # cannot ask; upload without a check
+            live, cols, used = snap
+            if used + s.est_bytes <= budget:
+                return True
+            plan = self._plan(s, budget, used, live, cols)
+            if plan is None:
+                self._note_wasted(before)        # nothing was evicted; this records that
+                return False
+            if self._evict(run, s, plan, live, cols):
+                return True
+            self._log(f"memory budget: a drop failed for {s.tag} — re-planning "
+                      f"against what is resident now")
+        with self._lock:
+            s.error = (f"{MEMORY_ERROR}the room could not be freed: three eviction plans "
+                       f"in a row had a drop fail under them")
+        self._log(f"not uploaded: {s.tag}: {s.error}")
+        self._note_wasted(before)
+        return False
+
+    def _note_wasted(self, before: int) -> None:
+        """This call is refusing. Anything it dropped on the way bought nothing."""
+        with self._lock:
+            self.evictions_wasted += self.evictions - before
+
+    def _snapshot(self, run: Callable[[str], List[tuple]], s: SetState):
+        """What the extension holds right now: (sets by name, columns by
+        (store, lane), bytes in use). None when it cannot be asked."""
         try:
             rows = run("SELECT name, origin, bytes, refs, epoch_ms(last_used_at) AS used_ms "
                        "FROM gpu_residents()")
@@ -471,109 +510,141 @@ class ResidencyManager:
             crows = run("SELECT store, \"column\", bytes, epoch_ms(last_used_at) AS used_ms FROM gpu_store_columns()")
         except Exception as e:
             self._log(f"memory budget: gpu_residents() failed ({str(e)[:80]}); uploading without a check")
-            return True
-        keep = self._protected(s)
+            return None
         live = {r[0]: r for r in rows}
-        used = sum(int(r[2] or 0) for r in rows if r[0] != s.tag)
-        # columns: (store, lane) -> (bytes, last used)
         cols = {(r[0], r[1]): (int(r[2] or 0), r[3]) for r in crows}
-        used += sum(b for b, _u in cols.values())
-        now0 = self._now()
+        used = (sum(int(r[2] or 0) for r in rows if r[0] != s.tag)
+                + sum(b for b, _u in cols.values()))
+        return live, cols, used
+
+    def _plan(self, s: SetState, budget: int, used: int, live: dict, cols: dict):
+        """The whole eviction plan for `s`, or None with `s.error` saying why
+        there is none. Drops nothing.
+
+        Two different quantities do two different jobs, and conflating them was
+        the earlier mistake:
+
+          * **value per byte decides WHO goes** — the units are taken cheapest
+            first, because a byte freed from a low-density unit costs the least
+            value; between two of equal density the one used longest ago, and a
+            unit the minimum age still protects comes last whatever its value.
+          * **total value decides WHETHER** — the plan runs only if the
+            candidate is worth more than everything in it put together, by
+            EVICT_HYSTERESIS. A candidate that needs three victims must be
+            worth more than the three of them, not merely denser than each.
+            That is the exchange that makes the resident population better
+            rather than only differently arranged.
+
+        A plan containing a unit the minimum age protects has one more
+        condition, because such a unit has never been read and its value says
+        nothing: the candidate must be worth YOUNG_OVERRIDE_RATIO times the
+        typical resident density."""
+        now = self._now()
+        keep = self._protected(s)
+        col_value = self._column_values(cols, now)
         with self._lock:
-            young_cols = {c for c, at in self._col_uploaded.items() if now0 - at < self.evict_min_age_s}
-            cand_value = self._value_locked(s, now0)
+            is_source = {d for t, o in self._sets.items() if t in live and t not in keep for d in o.deps}
+            # age by this manager's own clock (a set it did not upload is old by definition)
+            young = {t for t, o in self._sets.items()
+                     if o.last_upload_start and now - o.last_upload_start < self.evict_min_age_s}
+            young_cols = {c for c, at in self._col_uploaded.items()
+                          if now - at < self.evict_min_age_s}
+            set_value = {t: self._value_locked(o, now) for t, o in self._sets.items()}
+            # a set that must stay takes its store columns with it: this upload's
+            # own sources, and the sources of every resident derived set (their
+            # dependents go first — dropping a lane under one would un-ready the
+            # join built from it)
+            keep_cols = {(o.store_key, l) for t, o in self._sets.items()
+                         if t in keep or t in is_source for l in o.store_lanes}
+            cand_value = self._value_locked(s, now)
             # a set an override took off the device may not take one back
             # immediately: the margin already rules out a straight swap, this
             # rules out a swap through a third set whose value moved meanwhile
-            cooling = bool(s.override_evicted_at) and now0 - s.override_evicted_at < self.evict_min_age_s
+            cooling = bool(s.override_evicted_at) and now - s.override_evicted_at < self.evict_min_age_s
+        # every evictable unit: (value per byte, least-recently-used key, kind, key, bytes, protected, value)
+        units: List[tuple] = []
+        for r in live.values():
+            if (r[1] != "managed" or r[0] in keep or r[0] in is_source
+                    or int(r[3] or 0) != 0 or int(r[2] or 0) <= 0):
+                continue
+            b, v = int(r[2]), set_value.get(r[0], 0.0)
+            # protected while young AND worth nothing yet: it has not had the
+            # chance to pay back its upload (see YOUNG_OVERRIDE_RATIO)
+            units.append((v / b, (r[4] is not None, r[4] or 0),
+                          "set", r[0], b, r[0] in young and v <= 0.0, v))
+        for c, (b, u) in cols.items():
+            if c in keep_cols or b <= 0:
+                continue
+            v = col_value.get(c, 0.0)
+            units.append((v / b, (u is not None, u or 0),
+                          "col", c, b, c in young_cols and v <= 0.0, v))
+        # the typical worth of what is resident, over everything measured
+        known = sorted(d for d in
+                       ([set_value.get(r[0], 0.0) / int(r[2]) for r in live.values()
+                         if r[1] == "managed" and int(r[2] or 0) > 0]
+                        + [col_value.get(c, 0.0) / b for c, (b, _u) in cols.items() if b > 0])
+                       if d > 0.0)
+        median = known[len(known) // 2] if known else 0.0
+        # a candidate nobody has measured is priced at that median: absent
+        # evidence, a set is worth what this connection's sets are typically
+        # worth, which lets it displace the cheapest thing there is and nothing
+        # better. One statement later the measurement replaces the guess.
+        priced = False
+        if cand_value <= 0.0 and median > 0.0:
+            cand_value, priced = median * s.est_bytes, True
         cand_density = cand_value / s.est_bytes
         allow_young = cand_density > 0.0 and not cooling
-        priced = False              # ... its density is the median guess, not its own
-        while used + s.est_bytes > budget:
-            now = self._now()
-            col_value = self._column_values(cols, now)
-            with self._lock:
-                is_source = {d for t, o in self._sets.items() if t in live and t not in keep for d in o.deps}
-                # age by this manager's own clock (a set it did not upload is old by definition)
-                young = {t for t, o in self._sets.items()
-                         if o.last_upload_start and now - o.last_upload_start < self.evict_min_age_s}
-                set_value = {t: self._value_locked(o, now) for t, o in self._sets.items()}
-                # a set that must stay takes its store columns with it: this
-                # upload's own sources, and the sources of every resident
-                # derived set (their dependents go first — dropping a lane
-                # under one would un-ready the join built from it)
-                keep_cols = {(o.store_key, l) for t, o in self._sets.items()
-                             if t in keep or t in is_source for l in o.store_lanes}
-            # every evictable unit: (value per byte, least-recently-used key, kind, key, bytes, young)
-            units: List[tuple] = []
-            for r in live.values():
-                if (r[1] != "managed" or r[0] in keep or r[0] in is_source
-                        or int(r[3] or 0) != 0 or int(r[2] or 0) <= 0):
-                    continue
-                b, v = int(r[2]), set_value.get(r[0], 0.0)
-                # protected while young AND worth nothing yet: it has not had
-                # the chance to pay back its upload (see YOUNG_OVERRIDE_RATIO)
-                units.append((v / b, (r[4] is not None, r[4] or 0),
-                              "set", r[0], b, r[0] in young and v <= 0.0))
-            for c, (b, u) in cols.items():
-                if c in keep_cols or b <= 0:
-                    continue
-                v = col_value.get(c, 0.0)
-                units.append((v / b, (u is not None, u or 0),
-                              "col", c, b, c in young_cols and v <= 0.0))
-            # the typical worth of what is resident, over everything measured
-            known = sorted(d for d in
-                           ([set_value.get(r[0], 0.0) / int(r[2]) for r in live.values()
-                             if r[1] == "managed" and int(r[2] or 0) > 0]
-                            + [col_value.get(c, 0.0) / b for c, (b, _u) in cols.items() if b > 0])
-                           if d > 0.0)
-            median = known[len(known) // 2] if known else 0.0
-            # a candidate nobody has measured is priced at that median: absent
-            # evidence, a set is worth what this connection's sets are typically
-            # worth, which lets it displace the cheapest thing there is and
-            # nothing better. One statement later the measurement replaces the
-            # guess, in the same accumulator.
-            if cand_density <= 0.0 and median > 0.0:
-                cand_density, priced = median, True
-                allow_young = not cooling
-            if not allow_young:
-                units = [u for u in units if not u[5]]
-            if not units:
-                self._refuse(s, used, budget, live, cols, keep, is_source, young,
-                             keep_cols, young_cols, allow_young, cand_density, priced, None)
-                return False
-            # the least valuable thing there is; between two of equal value, the
-            # one used longest ago (which is where this started, §5.5). A unit
-            # the minimum age still protects comes last whatever its value:
-            # nothing has read it, so its value says nothing, and there is no
-            # sense in interrupting an unproven set while a proven worthless
-            # one is standing there.
-            density, _lru, kind, key, nbytes, is_young = min(units, key=lambda u: (u[5], u[0], u[1]))
-            # a unit still under the minimum age has not been used, so it has no
-            # value of its own to be compared against: what a candidate has to
-            # beat there is the typical set, by the override ratio
-            floor = median * YOUNG_OVERRIDE_RATIO if is_young else density * (1.0 + EVICT_HYSTERESIS)
-            if floor > 0.0 and cand_density < floor:
-                self._refuse(s, used, budget, live, cols, keep, is_source, young,
-                             keep_cols, young_cols, allow_young, cand_density, priced,
-                             (key, density, is_young, floor))
-                return False
+        pool = sorted(units, key=lambda u: (u[5], u[0], u[1]))
+        if not allow_young:
+            pool = [u for u in pool if not u[5]]
+        need = used + s.est_bytes - budget
+        chosen: List[tuple] = []
+        freed, lost, takes_young = 0, 0.0, False
+        for u in pool:
+            if freed >= need:
+                break
+            chosen.append(u)
+            freed += u[4]
+            lost += u[6]
+            takes_young = takes_young or u[5]
+        ctx = (s, used, budget, live, cols, keep, is_source, young, young_cols,
+               allow_young, cand_density, cand_value, priced)
+        if freed < need:
+            self._refuse(ctx, None)
+            return None
+        if takes_young and cand_density < median * YOUNG_OVERRIDE_RATIO:
+            self._refuse(ctx, ("young", chosen, lost, median * YOUNG_OVERRIDE_RATIO))
+            return None
+        if lost > 0.0 and cand_value < lost * (1.0 + EVICT_HYSTERESIS):
+            self._refuse(ctx, ("value", chosen, lost, lost * (1.0 + EVICT_HYSTERESIS)))
+            return None
+        return chosen, cand_density, lost, priced
+
+    def _evict(self, run: Callable[[str], List[tuple]], s: SetState, plan, live: dict,
+               cols: dict) -> bool:
+        """Execute a plan the budget has already accepted. False when a drop
+        failed — the caller re-plans against what is resident then, rather than
+        carrying on against a picture that is no longer true."""
+        chosen, cand_density, lost, priced = plan
+        now = self._now()
+        for density, _lru, kind, key, nbytes, is_young, value in chosen:
             worth = (f"worth {self._per_gib(density):.2f} ms/s per GiB, this set "
                      f"{self._per_gib(cand_density):.2f}"
                      + (" as an unmeasured set is priced" if priced else "")
                      if (density or cand_density)
                      else "nothing measured either way, least recently used")
+            if len(chosen) > 1:
+                worth += (f"; {len(chosen)} units worth {self._per_gib(lost / max(1, s.est_bytes)):.2f} "
+                          f"together over this set's bytes")
             if is_young:
-                worth += (f"; younger than {self.evict_min_age_s:.0f} s and not used yet, "
-                          f"overridden")
+                worth += f"; younger than {self.evict_min_age_s:.0f} s and not used yet, overridden"
             if kind == "col":
                 try:
-                    run("SELECT gpu_drop_column('%s', '%s')" % (key[0].replace("'", "''"), key[1].replace("'", "''")))
+                    run("SELECT gpu_drop_column('%s', '%s')" % (key[0].replace("'", "''"),
+                                                                key[1].replace("'", "''")))
                 except Exception as e:
                     self._log(f"memory budget: could not evict column {key}: {str(e)[:80]}")
-                    cols.pop(key, None)
-                    continue
-                used -= nbytes
+                    return False
                 cols.pop(key, None)
                 with self._lock:
                     self.evictions += 1
@@ -581,7 +652,7 @@ class ResidencyManager:
                     gone = set()
                     for t, o in self._sets.items():
                         if o.store_key == key[0] and key[1] in o.store_lanes and o.state == "ready":
-                            o.state = "missing"          # its next sighting uploads the missing lane
+                            o.state = "missing"      # its next sighting uploads the missing lane
                             o.bytes = 0
                             if is_young:
                                 o.override_evicted_at = now
@@ -594,15 +665,13 @@ class ResidencyManager:
                 run("SELECT gpu_drop_resident('%s')" % key.replace("'", "''"))
             except Exception as e:
                 self._log(f"memory budget: could not evict {key}: {str(e)[:80]}")
-                live.pop(key, None)
-                continue
-            used -= nbytes
+                return False
             live.pop(key, None)
             with self._lock:
                 self.evictions += 1
                 o = self._sets.get(key)
                 if o is not None and o.state == "ready":
-                    o.state = "missing"            # a later sighting uploads it again
+                    o.state = "missing"              # a later sighting uploads it again
                     o.bytes = 0
                     if is_young:
                         o.override_evicted_at = now
@@ -610,41 +679,47 @@ class ResidencyManager:
             self._log(f"evicted ({worth}): {key} ({nbytes / 2**20:.0f} MiB) for {s.tag}")
         return True
 
-    def _refuse(self, s: SetState, used: int, budget: int, live: dict, cols: dict,
-                keep: set, is_source: set, young: set, keep_cols: set, young_cols: set,
-                allow_young: bool, cand_density: float, priced: bool,
-                beat: Optional[tuple]) -> None:
+    def _refuse(self, ctx: tuple, beat: Optional[tuple]) -> None:
         """Why this set stays off the device, with the numbers: what it needed,
-        what is resident, and either whose value it did not beat or what stood
-        in the way of evicting anything at all. One sentence — it is what
-        `last_rewrite()['detail']` shows a person."""
+        what is resident, and either what the plan would have cost against what
+        the set is worth, or what stood in the way of a plan at all. One
+        sentence — it is what `last_rewrite()['detail']` shows a person.
+        Nothing has been evicted when this is called."""
+        (s, used, budget, live, cols, keep, is_source, young, young_cols,
+         allow_young, cand_density, cand_value, priced) = ctx
         managed = [r for r in live.values() if r[1] == "managed" and int(r[2] or 0) > 0]
         head = (f"{MEMORY_ERROR}{used / 2**20:.0f} MiB resident + about "
                 f"{s.est_bytes / 2**20:.0f} MiB needed > {budget / 2**20:.0f} MiB")
+        mine = (f"is worth {cand_value:.3f} ms/s ({self._per_gib(cand_density):.2f} per GiB)"
+                if not priced else
+                f"has nothing measured yet and is priced at the median, "
+                f"{cand_value:.3f} ms/s ({self._per_gib(cand_density):.2f} per GiB)")
         if beat is not None:
-            key, density, is_young, floor = beat
-            name = key[1] + " of " + key[0] if isinstance(key, tuple) else key
-            mine = (f"is worth {self._per_gib(cand_density):.2f} ms/s per GiB" if not priced
-                    else f"has nothing measured yet and is priced at the median "
-                         f"{self._per_gib(cand_density):.2f} ms/s per GiB")
-            why = (f"{head}, and this set {mine}, "
-                   + (f"under the {self._per_gib(floor):.2f} it would take to interrupt {name}, "
-                      f"the cheapest thing that could go — younger than {self.evict_min_age_s:.0f} s "
-                      f"and not used yet, so it would take {YOUNG_OVERRIDE_RATIO:.0f}x the typical set"
-                      if is_young else
-                      f"against {self._per_gib(density):.2f} for {name}, the cheapest thing that "
-                      f"could go (a swap takes {1.0 + EVICT_HYSTERESIS:.2f}x)"))
+            kind, chosen, lost, floor = beat
+            first = chosen[0]
+            name = (first[3][1] + " of " + first[3][0]) if first[2] == "col" else first[3]
+            what = (f"{len(chosen)} units, the cheapest of them {name}" if len(chosen) > 1
+                    else name)
+            if kind == "young":
+                why = (f"{head}, and this set {mine}, under the "
+                       f"{self._per_gib(floor):.2f} per GiB it would take to interrupt {what} — "
+                       f"younger than {self.evict_min_age_s:.0f} s and not used yet, so it would "
+                       f"take {YOUNG_OVERRIDE_RATIO:.0f}x the typical set. Nothing was evicted")
+            else:
+                why = (f"{head}, and this set {mine} against {lost:.3f} ms/s for {what}, "
+                       f"which is what making room would cost (a swap takes "
+                       f"{1.0 + EVICT_HYSTERESIS:.2f}x). Nothing was evicted")
         else:
             n_cols = sum(1 for c, (b, _u) in cols.items() if b > 0)
-            why = (f"{head}, and nothing can be evicted yet ({len(managed)} managed sets, "
+            why = (f"{head}, and no plan reaches the budget ({len(managed)} managed sets, "
                    f"{n_cols} resident columns: "
                    f"{sum(r[0] in keep for r in managed)} sets needed by this upload, "
                    f"{sum(r[0] in is_source for r in managed)} sources of resident sets, "
                    f"{sum(int(r[3] or 0) > 0 for r in managed)} in use, "
                    f"{sum(r[0] in young for r in managed) + sum(1 for c in cols if c in young_cols)} "
                    f"younger than {self.evict_min_age_s:.0f} s"
-                   + ("" if allow_young else
-                      " and this set may not override that") + ")")
+                   + ("" if allow_young else " and this set may not override that")
+                   + "). Nothing was evicted")
         with self._lock:
             s.error = why
         self._log(f"not uploaded: {s.tag}: {why}")
@@ -730,7 +805,8 @@ class ResidencyManager:
                 out[t] = {"state": s.state, "est_bytes": s.est_bytes, "bytes": s.bytes,
                           "error": s.error, "value": v, "uses": s.uses,
                           "density": self._per_gib(v / size) if size else 0.0}
-            return {"budget": self.memory_budget, "evictions": self.evictions, "sets": out}
+            return {"budget": self.memory_budget, "evictions": self.evictions,
+                    "evictions_wasted": self.evictions_wasted, "sets": out}
 
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:

@@ -1743,8 +1743,10 @@ def run():
         lr = con.last_rewrite()
         check(same_m and lr["reason"] == "memory",
               f"view residency: the cheaper statement stays native, answer unchanged ({lr['reason']})")
-        check("ms/s per GiB" in (lr["detail"] or "") and "cheapest thing that could go" in (lr["detail"] or ""),
-              f"view residency: the refusal names the value it did not beat ({(lr['detail'] or '')[-110:]!r})")
+        check("ms/s" in (lr["detail"] or "") and "what making room would cost" in (lr["detail"] or "")
+              and "Nothing was evicted" in (lr["detail"] or ""),
+              f"view residency: the refusal names what making room would have cost, and that "
+              f"nothing was given up for it ({(lr['detail'] or '')[-120:]!r})")
         check(con.memory()["evictions"] == ev0 and con._manager.get(derived[0]).state == "ready",
               f"view residency: nothing more valuable was given up for it "
               f"({con.memory()['evictions'] - ev0} evictions, join {con._manager.get(derived[0]).state})")
