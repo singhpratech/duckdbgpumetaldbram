@@ -4952,10 +4952,11 @@ set per statement behind them.
 fails · `rewrite_parity_check.sh`, `join_parity_check.sh`,
 `groupby_parity_check.sh` all pass.
 
-`scripts/wrapper_residency_gate.py` passed all three cadences on this branch
-earlier in the session (`q18_native` 0.98×, `small_scan` 1.00×,
-`point_lookup` 1.10×). Re-run late in the session, after many hours of
-continuous GPU work on this machine, it is flaky on BOTH sides: three
+`scripts/wrapper_residency_gate.py`, run last and alone on the final code:
+**0 failing rows** — `q18_native` 0.99×, `small_scan` 1.00×, `point_lookup`
+1.18×; and the same three cadences earlier in the session at 0.98× / 1.00× /
+1.10×. Run instead inside a batch that interleaved it with another process, it
+is flaky on BOTH sides: three
 interleaved rounds gave main 1 failing row of 3 rounds (`q18_native` 0.71×)
 and the branch 2 of 3 (`point_lookup` 0.88×, `q18_native` 0.89×), on a
 different row each time, with the branch ahead of main on `q18_native` in the
