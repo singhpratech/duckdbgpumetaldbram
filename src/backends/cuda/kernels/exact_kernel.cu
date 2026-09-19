@@ -362,6 +362,84 @@ __global__ void finalize_kernel(const ETup* __restrict__ t, std::size_t n,
     }
 }
 
+// ---- §4.8: the materialised key join ------------------------------------
+// The build side is a sorted array of its VALID keys, so a match is a binary
+// search and there is no hash table on the device. The build key is unique
+// among its valid cells (the operator's precondition, checked by the caller
+// via the run count), so lower_bound landing on an equal cell IS the match.
+__device__ __forceinline__ std::size_t dev_lower_bound(const i64* __restrict__ a,
+                                                       std::size_t n, i64 x) {
+    std::size_t lo = 0, hi = n;
+    while (lo < hi) {
+        const std::size_t mid = lo + ((hi - lo) >> 1);
+        if (a[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+__global__ void join_probe_kernel(const i64* __restrict__ bsorted, const i64* __restrict__ bperm,
+                                  std::size_t n_bvalid,
+                                  const i64* __restrict__ pkeys, const u64* __restrict__ pvalid,
+                                  std::size_t rows_probe,
+                                  const u64* __restrict__ keylane_valid, int key_from_build,
+                                  std::uint32_t* __restrict__ match,
+                                  unsigned char* __restrict__ cls) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows_probe; i += stride) {
+        match[i] = 0xFFFFFFFFu;
+        cls[i]   = 0;
+        if (!bit_at(pvalid, i)) continue;              // NULL probe key never matches
+        if (!n_bvalid) continue;
+        const i64 k = pkeys[i];
+        const std::size_t at = dev_lower_bound(bsorted, n_bvalid, k);
+        if (at >= n_bvalid || bsorted[at] != k) continue;
+        const std::size_t brow = static_cast<std::size_t>(bperm[at]);
+        match[i] = static_cast<std::uint32_t>(brow);
+        const std::size_t krow = key_from_build ? brow : i;
+        cls[i] = bit_at(keylane_valid, krow) ? 1u : 2u;
+    }
+}
+
+struct ClsIs {
+    const unsigned char* cls;
+    unsigned char        want;
+    __host__ __device__ __forceinline__ u64 operator()(std::size_t i) const {
+        return cls[i] == want ? 1ull : 0ull;
+    }
+};
+
+// Combine the two exclusive scans into one destination per probe row. Class 1
+// fills [0, n1); class 2 fills [n1, n1 + n2). Each keeps probe order, so the
+// NULL-key rows land as a suffix of every output column.
+__global__ void join_positions_kernel(const unsigned char* __restrict__ cls, std::size_t rows_probe,
+                                      const std::uint32_t* __restrict__ scan1,
+                                      const std::uint32_t* __restrict__ scan2,
+                                      std::size_t n1, std::uint32_t* __restrict__ pos) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows_probe; i += stride) {
+        const unsigned char c = cls[i];
+        pos[i] = c == 1u ? scan1[i]
+               : c == 2u ? static_cast<std::uint32_t>(n1) + scan2[i]
+                         : 0u;
+    }
+}
+
+__global__ void join_gather_kernel(const i64* __restrict__ src, const u64* __restrict__ src_valid,
+                                   int from_build, const std::uint32_t* __restrict__ match,
+                                   const unsigned char* __restrict__ cls,
+                                   const std::uint32_t* __restrict__ pos, std::size_t rows_probe,
+                                   i64* __restrict__ dst, u64* __restrict__ dst_valid) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows_probe; i += stride) {
+        if (!cls[i]) continue;                          // unmatched probe row: absent (inner join)
+        const std::size_t srow = from_build ? static_cast<std::size_t>(match[i]) : i;
+        put_cell(bit_at(src_valid, srow), src[srow], pos[i], dst, dst_valid);
+    }
+}
+
 // Read one device scalar back, synchronizing the stream (the callers that use
 // this need the value to size the next allocation, so there is nothing to
 // overlap with).
@@ -578,6 +656,76 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
     }
     *h_runs = static_cast<std::size_t>(runs);
     return cudaSuccess;
+}
+
+cudaError_t gpudb_cuda_join_mat_probe(const i64* d_bsorted, const i64* d_bperm,
+                                      std::size_t n_bvalid,
+                                      const i64* d_pkeys, const u64* d_pvalid,
+                                      std::size_t rows_probe,
+                                      const u64* d_keylane_valid, int key_from_build,
+                                      std::uint32_t* d_match, unsigned char* d_cls,
+                                      std::size_t* h_n1, std::size_t* h_n2, cudaStream_t s) {
+    *h_n1 = 0; *h_n2 = 0;
+    if (!rows_probe) return cudaSuccess;
+    join_probe_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
+        d_bsorted, d_bperm, n_bvalid, d_pkeys, d_pvalid, rows_probe,
+        d_keylane_valid, key_from_build, d_match, d_cls);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+
+    DevBuf out;
+    if ((e = out.alloc(2 * sizeof(u64))) != cudaSuccess) return e;
+    thrust::counting_iterator<std::size_t> it(0);
+    auto ones1 = thrust::make_transform_iterator(it, ClsIs{d_cls, 1u});
+    auto ones2 = thrust::make_transform_iterator(it, ClsIs{d_cls, 2u});
+    if ((e = gpudb_cuda_ops::sum_u64(ones1, rows_probe, static_cast<u64*>(out.p), s))
+        != cudaSuccess) return e;
+    if ((e = gpudb_cuda_ops::sum_u64(ones2, rows_probe, static_cast<u64*>(out.p) + 1, s))
+        != cudaSuccess) return e;
+    u64 counts[2] = {0, 0};
+    if ((e = cudaMemcpyAsync(counts, out.p, 2 * sizeof(u64), cudaMemcpyDeviceToHost, s))
+        != cudaSuccess) return e;
+    if ((e = cudaStreamSynchronize(s)) != cudaSuccess) return e;
+    *h_n1 = static_cast<std::size_t>(counts[0]);
+    *h_n2 = static_cast<std::size_t>(counts[1]);
+    return cudaSuccess;
+}
+
+cudaError_t gpudb_cuda_join_mat_positions(const unsigned char* d_cls, std::size_t rows_probe,
+                                          std::size_t n1, std::uint32_t* d_pos, cudaStream_t s) {
+    if (!rows_probe) return cudaSuccess;
+    DevBuf s1, s2;
+    cudaError_t e;
+    if ((e = s1.alloc(rows_probe * sizeof(std::uint32_t))) != cudaSuccess) return e;
+    if ((e = s2.alloc(rows_probe * sizeof(std::uint32_t))) != cudaSuccess) return e;
+    thrust::counting_iterator<std::size_t> it(0);
+    auto ones1 = thrust::make_transform_iterator(it, ClsIs{d_cls, 1u});
+    auto ones2 = thrust::make_transform_iterator(it, ClsIs{d_cls, 2u});
+    e = with_temp([&](void* tmp, std::size_t& b) {
+        return cub::DeviceScan::ExclusiveSum(tmp, b, ones1, static_cast<std::uint32_t*>(s1.p),
+                                             static_cast<int>(rows_probe), s);
+    });
+    if (e != cudaSuccess) return e;
+    e = with_temp([&](void* tmp, std::size_t& b) {
+        return cub::DeviceScan::ExclusiveSum(tmp, b, ones2, static_cast<std::uint32_t*>(s2.p),
+                                             static_cast<int>(rows_probe), s);
+    });
+    if (e != cudaSuccess) return e;
+    join_positions_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
+        d_cls, rows_probe, static_cast<const std::uint32_t*>(s1.p),
+        static_cast<const std::uint32_t*>(s2.p), n1, d_pos);
+    if ((e = cudaGetLastError()) != cudaSuccess) return e;
+    return cudaStreamSynchronize(s);           // s1 / s2 die on return
+}
+
+cudaError_t gpudb_cuda_join_mat_gather(const i64* d_src, const u64* d_src_valid, int from_build,
+                                       const std::uint32_t* d_match, const unsigned char* d_cls,
+                                       const std::uint32_t* d_pos, std::size_t rows_probe,
+                                       i64* d_dst, u64* d_dst_valid, cudaStream_t s) {
+    if (!rows_probe) return cudaSuccess;
+    join_gather_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
+        d_src, d_src_valid, from_build, d_match, d_cls, d_pos, rows_probe, d_dst, d_dst_valid);
+    return cudaGetLastError();
 }
 
 cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, int n_preds,

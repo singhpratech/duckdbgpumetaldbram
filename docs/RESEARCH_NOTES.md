@@ -3033,6 +3033,85 @@ works; the flag it reads does not flip until the last stub lands. The test is
 not measuring the kernel, it is measuring the gate — which is the correct thing
 for it to measure, and the reason the failure is still there.
 
+## 2026-09-19 — The join that needed no hash table, and the flag that could finally flip
+
+`join_materialize` is the last operator of the v0.7 exact path: an inner
+equi-join against a build side whose key is unique, producing a new exact row
+set. Every probe row has at most one match, so the result is a subset of the
+probe rows with build columns attached.
+
+The obvious device implementation is a hash table — the CPU reference builds an
+`unordered_map` from valid build key to row, and CUDA's own v0.5 hash join is
+open-addressing with `atomicCAS`. Neither was needed here, because the build
+column already carries what the join wants. The exact sort cache is its VALID
+keys in ascending order plus the row each came from, and it is built once and
+reused by every operator over that column. A match is then a binary search, and
+the cache was very likely already warm from a `prepare()` or an earlier query.
+
+The uniqueness precondition came out of the same structure for free. The
+operator must reject a build key with two equal valid cells, and the reference
+detects that on insertion into the map. On a sorted array it is simply:
+
+    a sorted array of n cells holds n distinct values iff it has n runs
+
+and `gpudb_cuda_exact_run_count` — written three milestones earlier to count
+GROUP BY groups — answers that with no new kernel. The check costs one pass
+over the sorted keys and reuses code whose correctness the GROUP BY tests were
+already covering.
+
+The lesson is not that binary search beats hashing; at large probe counts it
+may not. It is that an operator added to a set of operators that already share
+a derived structure should be asked what the structure can already answer,
+before it is given one of its own. Two of this join's three phases were
+answered by a cache and a kernel that existed for other reasons.
+
+### The path is complete; the default is not flipped
+
+With the last stub in, every exact operator runs on the device. The flag was
+not flipped with it, and the reason is a distinction worth writing down.
+
+The SQL suite proves the TABLE FUNCTIONS. It is green: 224 pass / 0 fail with
+the path on. What turning `exact_supported()` on additionally does is make the
+Python wrapper start rewriting plain SQL STATEMENTS on a CUDA box — and only
+`python/tests/test_wrapper.py` and `scripts/tpch_coverage.py` prove that a
+rewritten statement returns native's rows. Neither had ever executed against a
+CUDA exact backend.
+
+Those are different claims about different layers, and the green one does not
+imply the other. A runtime rule-1 check would catch a slow template, because
+slowness is observable while the query runs. Nothing at runtime catches a
+different ANSWER — a wrong row is returned, accepted, and never mentioned
+again. So the evidence for rule 2 has to be collected before the flip, not
+after it, and the flip costs nothing to hold: it is one line and there is no
+release waiting on it.
+
+The numbers either side of the gate, on the RTX 4090:
+
+    unit 711/711, zero skips (from 569/569 with nine at the start of the port)
+    SQL  224 pass / 0 fail with GPUDB_CUDA_EXACT=1
+    SQL  223 pass / 1 fail with the gate off
+
+That single failure is `gpu_agg_exact_global` q11 asserting `global=true`, and
+it is the correct answer for a disabled path: the backend genuinely does not
+run the global aggregate on its own device then. The test has been measuring
+the gate all along, which is why it was the last one standing.
+
+`GPUDB_CUDA_EXACT` stays the switch either way. It is coarse by necessity —
+a single-homed column has no per-operator way back to the CPU reference, so
+the only way back is to stop placing sets on the device at all. A per-operator
+fallback would have to move the data, which is the cost the resident model
+exists to avoid.
+
+### What is NOT proven by any of this
+
+Rule 1 — never slower than native — is unmeasured on CUDA. `python/gpudb/_thresholds.py`
+is Metal-measured, and those numbers were taken on a machine with unified
+memory and a different PCIe story. The thresholds decide when the wrapper
+rewrites at all, so applying Metal's answers to a discrete GPU across PCIe is
+an assumption, not a result. The correctness gate is green; the performance
+gate has not been run here. Those are different claims and this entry is
+careful not to let the first one stand in for the second.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
