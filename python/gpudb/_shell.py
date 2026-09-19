@@ -103,6 +103,13 @@ def _split_complete(buf: str) -> Tuple[str, str]:
     return (buf, "") if blank else (buf[:ends[-1] + 1], tail)
 
 
+
+_INTERRUPTED = "INTERRUPT: the statement was interrupted"
+
+
+class _Interrupted(Exception):
+    """The shell interrupted the running statement and DuckDB raised nothing."""
+
 class Shell:
     """One connection, one input buffer. `feed()` drives it from any source:
     the terminal, a file, `-c`, piped stdin."""
@@ -280,6 +287,9 @@ class Shell:
         del self._log[:]          # the detail in the footer is this statement's, or none
         try:
             self.interruptible(lambda: self.render(self.con.sql(sql)))
+        except _Interrupted:
+            self.fail(_INTERRUPTED)
+            return
         except duckdb.Error as e:
             note = self.recover(sql, e)
             if note is None:
@@ -311,6 +321,9 @@ class Shell:
         try:
             self.interruptible(lambda: self.con.execute(sql))
             self.interruptible(lambda: self.render(self.con.sql(sql)))
+        except _Interrupted:
+            self.fail(_INTERRUPTED)
+            return None
         except duckdb.Error as e2:
             self.fail(str(e2))
             return None
@@ -341,6 +354,7 @@ class Shell:
                 box["error"] = exc
         worker = threading.Thread(target=body, daemon=True)
         worker.start()
+        interrupted = False
         while True:
             # the ^C may land anywhere in this wait, including between two
             # join() calls, and the worker is left running whatever happens —
@@ -350,9 +364,14 @@ class Shell:
                     worker.join(0.05)
                 break
             except KeyboardInterrupt:
+                interrupted = True
                 self.con.interrupt()
         if "error" in box:
             raise box["error"]
+        if interrupted:
+            # DuckDB does not always raise for an interrupted statement (the client on some
+            # platforms returns quietly); the shell sent the interrupt, so it says so itself
+            raise _Interrupted()
         return box.get("value")
 
     def footer(self, ms: float, note: str = "") -> None:
