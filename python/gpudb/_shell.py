@@ -36,6 +36,7 @@ MAX_ROWS = 40                 # what the DuckDB CLI shows of a long result
 HISTORY = "~/.gpudb_history"
 HISTORY_LEN = 2000
 MAX_READ_DEPTH = 10           # `.read` of a file that reads itself
+CLOSE_S = 5.0                 # how long the way out may take before it is taken by force
 LABEL = 14                    # width of the `key:` column in the banner, `.gpu` and `.memory`
 DIM = "2"
 # a calm teal for the line that says the GPU answered; staying on DuckDB is
@@ -135,6 +136,8 @@ class Shell:
             and not os.environ.get("NO_COLOR")
         self._accent = _accent()
         self._sep = _sep(self.out)
+        self._termios = self._terminal_state()
+        self.interrupted_once = False
         # the wrapper's own log, kept only for the statement being run: it is
         # where a decline says how many groups or how few rows it was about,
         # which `last_rewrite()` does not carry
@@ -365,9 +368,12 @@ class Shell:
                 break
             except KeyboardInterrupt:
                 interrupted = True
+                self.interrupted_once = True
                 self.con.interrupt()
         if "error" in box:
             raise box["error"]
+        if interrupted:
+            self._restore_terminal()
         if interrupted:
             # DuckDB does not always raise for an interrupted statement (the client on some
             # platforms returns quietly); the shell sent the interrupt, so it says so itself
@@ -562,11 +568,38 @@ class Shell:
         if self.interactive:
             self.say(f"database: {database}")
 
-    def close(self) -> None:
+    def _terminal_state(self):
+        """The terminal's settings as the shell found them (None off a terminal)."""
         try:
-            self.con.close()
+            import termios
+            return termios.tcgetattr(sys.stdin.fileno()) if sys.stdin.isatty() else None
+        except Exception:
+            return None
+
+    def _restore_terminal(self) -> None:
+        """An interrupt can leave the line discipline altered; put back what was found."""
+        if self._termios is None:
+            return
+        try:
+            import termios
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, self._termios)
         except Exception:
             pass
+
+    def close(self) -> bool:
+        """Close the connection, but never wait on it for long: after an
+        interrupted statement DuckDB can still be unwinding the scan, and a
+        shell that hangs on its way out is worse than one that leaves. False
+        when the close did not finish within CLOSE_S."""
+        def body():
+            try:
+                self.con.close()
+            except Exception:
+                pass
+        closer = threading.Thread(target=body, daemon=True)
+        closer.start()
+        closer.join(CLOSE_S)
+        return not closer.is_alive()
 
 
 class _Ordered(argparse.Action):
@@ -644,5 +677,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             shell.banner()
             shell.repl()
     finally:
-        shell.close()
+        closed = shell.close()
+        if not closed or shell.interrupted_once:
+            # the interpreter's own teardown would wait on DuckDB's threads: leave now
+            for f in (sys.stdout, sys.stderr):
+                try:
+                    f.flush()
+                except Exception:
+                    pass
+            os._exit(shell.exit_code)
     return shell.exit_code

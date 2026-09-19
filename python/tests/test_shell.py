@@ -220,6 +220,9 @@ def run():
           "python -m gpudb --version")
     check(console_script(), "the console script `gpudb` resolves after an install")
 
+    print("== a bounded way out")
+    bounded_close()
+
     print("== interactive (pty)")
     interactive()
 
@@ -228,6 +231,37 @@ def run():
         print(f"{len(SKIPS)} skipped")
     print(f"{len(FAILS)} failures" if FAILS else "all shell tests passed")
     return 1 if FAILS else 0
+
+
+def bounded_close():
+    """The shell never waits long on the connection's close: after an
+    interrupted statement DuckDB can still be unwinding, and the shell leaves."""
+    import threading, time
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    from gpudb import _shell
+
+    class Stuck:
+        def close(self):
+            time.sleep(30)
+
+    sh = _shell.Shell.__new__(_shell.Shell)
+    sh.con = Stuck()
+    saved = _shell.CLOSE_S
+    _shell.CLOSE_S = 0.3
+    try:
+        t0 = time.time()
+        finished = sh.close()
+        took = time.time() - t0
+    finally:
+        _shell.CLOSE_S = saved
+    check(finished is False and took < 3.0,
+          f"a close that blocks is abandoned after the bound (finished={finished}, {took:.1f} s)")
+
+    class Quick:
+        def close(self):
+            pass
+    sh.con = Quick()
+    check(sh.close() is True, "an ordinary close finishes and says so")
 
 
 def console_script():
