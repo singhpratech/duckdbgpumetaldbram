@@ -13,7 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import _aggs, _classify, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax, _thresholds, _views
+from . import (_aggs, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax,
+               _thresholds, _views)
 from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
@@ -1295,7 +1296,7 @@ class Connection:
             self._cache.pop((self._normalise(flat)[0], self._settings_key), None)
             flat = None
         if flat is None:
-            flat = self._inline_views(sql)
+            flat = self._inline_ctes(self._inline_views(sql))
             sql_v = flat
             if "(" in flat or flat.lstrip()[:4].upper() == "WITH":
                 try:
@@ -1345,6 +1346,32 @@ class Connection:
             self._log(f"views: names / types changed ({want} -> {have}); left as written")
         except Exception as e:
             self._log(f"views: {str(e)[:120]}")
+        return sql
+
+    def _inline_ctes(self, sql: str) -> str:
+        """§4.22: a CTE that only projects and joins becomes the derived table it
+        is — at every reference, however many — so the fold (§4.16) and the
+        nested pass (§4.14) apply. A CTE that aggregates is left in place: the
+        nested pass answers it ONCE on the device and DuckDB reuses that result.
+        Names pinned, names + types verified with DESCRIBE; anything else keeps
+        the text."""
+        if "WITH" not in sql.upper():
+            return sql
+        try:
+            tree = self._serialize(sql)
+            if _ctes.inline(tree, self._function_ok) is None:   # cheap structural test first
+                return sql
+            want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
+            out = _ctes.inline(tree, self._function_ok, [w[0] for w in want])
+            if out is None:
+                return sql
+            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
+            if want == have:
+                return cand
+            self._log(f"CTEs: names / types changed ({want} -> {have}); left as written")
+        except Exception as e:
+            self._log(f"CTEs: {str(e)[:120]}")
         return sql
 
     def _views_unchanged(self, snapshot: Dict[str, str]) -> bool:

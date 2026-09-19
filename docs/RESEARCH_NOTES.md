@@ -2178,11 +2178,154 @@ materialising one, which is how it was noticed. When every kept row is class 1
 the vector is the identity by construction; the scan now runs only for the join
 that kept every row and still put some of them in the NULL-key suffix.
 
+## 2026-09-19 — A CTE is two things, and only one of them wants inlining
+
+The question was "the wrapper does not take a `WITH`", and the first surprise
+was that a good deal of it already did. `WITH revenue AS (SELECT … GROUP BY
+l_suppkey) SELECT … FROM supplier, revenue WHERE …` — TPC-H Q15 — reaches the
+nested pass (§4.14) like any other statement whose shape declines, the pass
+finds the aggregate inside the `WITH`, offers it to the ordinary path, and
+splices the rewritten SELECT back. A CTE read twice has worked that way since
+§4.14 shipped; the coverage map's `declined (not_found, device): table` for Q15
+is the LAST line of its log, not the reason, and the reason is two lines above
+it: `selectivity 0.04 < 0.5 for the plain form`. Q15's CTE keeps four percent
+of `lineitem` and returns all 10K groups, which is the cell the gate measured
+losing. Reading a log tail as a diagnosis cost an hour.
+
+Forced past the bounds, though, Q15 does NOT measure what the bounds say it
+measures: 1.83× at SF1 and 2.16× at SF10. Nor does Q13 at SF10, which the join
+bound declines at 1,488,128 groups — 10.91× forced. Both bounds are
+output-size bounds, and both were measured on statements that return their
+groups to the CLIENT. Here the groups are returned to DuckDB, inside the same
+process, and feed a join or another GROUP BY; one row leaves. Q22 at SF1 is a
+third of the kind under a different rule: the row floor counts `customer`'s
+150K rows while the statement's work is a `NOT EXISTS` over 1.5M `orders` rows
+that §4.18 turns into a lane — 7.71× forced. The join bounds already make that
+argument ("native runs a join whatever the FROM says"); the floor does not.
+None of the three was touched, because relaxing an output bound is a sweep of
+its own and rule 1 is not one query's ratio — but they are now written down
+with the rule that declines each of them named, which is what the next sweep
+needs. Q6, Q11, Q16 and Q18 forced confirm their bounds instead (Q16 measures
+0.08× at SF1 and 0.02× at SF10; Q18 with the bounds off picks a worse path
+entirely, which is a reminder that `--no-thresholds` is not "the shipping plan,
+forced").
+
+What genuinely did not work was the other kind of CTE. A body that only
+projects and joins — `WITH li AS (SELECT l_orderkey AS ok, l_extendedprice *
+(1 - l_discount) AS vol FROM lineitem)` — is a derived table with a name,
+exactly as a view is (§4.20), and derived tables have folded since §4.16. But
+the fold only ever took a single CTE that WAS the statement's `FROM` and that
+nothing else read; a CTE beside a base table in a join, two CTEs, a CTE that
+reads an earlier CTE, a CTE nobody reads at all — each of those declined with
+`CTE present` and ran native. Ordinary analytics SQL is mostly that shape.
+
+The fix is the shape of the §4.20 one: `python/gpudb/_ctes.py` replaces every
+reference with the body as a `SUBQUERY` node and drops the entry from the
+`WITH`, innermost and earliest first so a chain works and a name is never
+substituted into its own body. Then §4.16 does the rest. That immediately
+raised the second question, because a spliced CTE is usually one SIDE of a
+join and §4.16 folded only a whole `FROM`. Folding an arm is the same
+substitution with two more rules, and both of them are about what a name means
+somewhere else. The arm's `WHERE` is hoisted above the join, which is only
+sound when every join on the way is a plain inner one — an arm of a `LEFT
+JOIN` keeps its `WHERE` and is left as written. And the arm's alias disappears
+when the arm does, so `li.did = jd.did` becomes `did = jd.did`, which does not
+bind when the other side has a `did` too; over a single base table the
+substituted columns are re-qualified with that table, and where they cannot be
+(a self-join of the CTE flattens onto two copies of one unaliased table) the
+DESCRIBE check catches it and the original text runs.
+
+The third question was the one worth getting wrong slowly: a CTE that
+AGGREGATES must NOT be inlined. Splicing Q15's `revenue` into both of its
+references would run the aggregate twice where the statement asks for it once
+— it would trade a correct decline for a slower answer. So the splice is
+restricted to project-and-join bodies by construction, and aggregate CTEs keep
+going to §4.14, which answers them once. The two kinds of CTE want opposite
+treatment, and the rule that tells them apart is just "does the body
+aggregate".
+
+The rest is the trap list, and every one of them is a decline rather than a
+cleverness: `WITH RECURSIVE` (not a derived table), `AS MATERIALIZED` (the
+statement asked for exactly one evaluation, and inlining is not that), a body
+holding a function the computed-lane rules do not vouch for — `random()`,
+`now()` — because inlining it into several references would evaluate it a
+different number of times than the statement says, a body with `ORDER BY` /
+`LIMIT` / `DISTINCT` / a window, and an arm beside a subquery predicate, where
+substituting a bare name into a subquery could rebind it to the subquery's own
+relation (§4.18's scoping trap, the one that gives a wrong answer with no
+error). One latent case of exactly that came out of the work as a fix rather
+than a decline: `_views.inline` replaced any `BASE_TABLE` naming a view without
+looking at the `WITH` above it, so a CTE named after a view would have been
+replaced by the view's body. It now skips names a `cte_map` in scope defines.
+
+**The correlated subquery, and why nothing was built for it.** Q2 and Q20
+decline with `the statement does not bind on its own (correlated)`: the nested
+pass lifts the aggregate out of the statement and it names a column of an
+enclosing scope. Q17 is the same shape and IS answered, 26.8× at SF10 — but
+not by decorrelating anything. §4.18 lowers the whole predicate `l_quantity <
+(SELECT 0.2 * avg(…) WHERE l_partkey = p_partkey)` to a BOOLEAN lane that
+DuckDB evaluates during the upload, and the device only ever sees `lane = 1`.
+Q20 does not qualify for that because its outer statement is not an aggregate
+at all (`SELECT s_name, s_address FROM supplier, nation …`), and Q2's
+correlated subquery sits under another subquery rather than in a WHERE term of
+an aggregating statement.
+
+The classical decorrelation — the subquery as a `GROUP BY` over its
+correlation columns, joined back — is expressible here. It was measured before
+it was written, by running the GROUP BY it would produce. Q20's is `SELECT
+l_partkey, l_suppkey, 0.5 * sum(l_quantity) FROM lineitem WHERE l_shipdate >=
+… GROUP BY l_partkey, l_suppkey`: 543,210 groups at SF1 and 5,441,669 at SF10,
+declined by the bounds at both, and forced past them it measures 0.99× at SF1
+(256.6 ms native, 260.4 ms on the device) and 0.94× at SF10 (2528.4 vs
+2698.4 ms). Q2's is `SELECT ps_partkey, min(ps_supplycost) FROM partsupp,
+supplier, nation, region WHERE … GROUP BY ps_partkey`: 117,422 groups at SF1,
+below the row floor there, and 1,183,098 at SF10, where the bounds do admit it
+and it measures 1.01× with them on and 0.98× with them off — the continuous
+measured rule 1 is what would decline it. (The same probe is a good check on
+§4.18: Q17's subquery AS A STATEMENT declines at SF10 — 2M groups, 1.48×
+forced — while Q17 itself runs 26.8×, because the lane never returns those two
+million rows to DuckDB.) All of them are output-bound in exactly the way the
+plain form's bounds describe. Writing the decorrelation would therefore have added the `count(*)`
+0-vs-NULL trap, `NOT IN` over NULLs, DECIMAL result types and several
+correlation columns to the surface area, in order to produce two statements
+the measurement declines. It is not built, and the reason is a number rather
+than a taste.
+
+**What the sweep found, which was not the CTEs.** `transparent_gate.py --ctes`
+adds two forms to every cell, and the second of them — a project-and-join CTE
+joined to `orders` — is a shape nothing had measured before. Four of its cells
+came back at 0.98–0.99× and one at a flat 1.00×: keyed by `l_orderkey` it
+returns 664K–729K groups out of 6M lineitem rows, and the bounds admitted it.
+That is a rule-1 failure the CTE work introduced, since before §4.22 the same
+statement simply declined for shape. The same statement keyed by `l_partkey`
+returns 195K–200K groups and wins 1.05–1.11×, and every `li x orders` cell at
+~100K groups wins 1.15–3.18×, so the group count is not what separates them:
+rows read per group returned is — 8.2 losing, 30 thin, 60 clear, and SF10's
+1M-group cell is 60 too.
+
+The first fix was one line and wrong. Requiring 16 rows per group above
+`join_plain_small_groups` also declined TPC-H Q13 at SF1 — 146K groups out of
+1.5M `orders` rows, 10.3 per group, 8.8× — and took SF1 coverage from 15 of 22
+to 14. Q13's groups do not go to the client; they feed another GROUP BY inside
+DuckDB, which is the same observation as the Q13 / Q15 declines above, seen
+from the other side. So the ratio is a SECOND bound, applied only above 300K
+groups returned, which sits above every measured winner and below every
+measured loser. That is the shape of the rule the evidence supports, and the
+losing run is in BENCHMARK.md next to the passing one.
+
+Final: 956 cells, 628 rewritten, 328 declined, 0 below 1.0×, 0 differing. The
+CTE forms carry no bound of their own — after the splice they ARE the plain and
+join forms.
 
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
   need kernels or a different decomposition.
+- **Correlated aggregate subqueries outside a §4.18 WHERE term** (Q2, Q20):
+  the decorrelation is expressible, but the GROUP BY it produces is
+  output-bound and the bounds decline it (2026-09-19 entry, with the numbers).
+  What would change that is a cheaper way to return a million-group result, not
+  a rewrite.
 - **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
   HAVING; subqueries over other subqueries (Q2, Q20, Q22 — Q22 also sits below
   the row floor); Q16 combines `count(DISTINCT)` with a `NOT IN` subquery over

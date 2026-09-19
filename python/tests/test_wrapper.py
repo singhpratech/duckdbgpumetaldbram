@@ -826,6 +826,102 @@ def run():
                   f"fold decline {name}: runs native, answer unchanged ({con.last_rewrite()['reason']})")
     con.close()
 
+    # ---- CTEs (§4.22): a project-and-join CTE is a derived table with a name ----
+    print("== CTEs")
+    con = fresh()
+    if getattr(con, "_exact", False):
+        con.execute(JOIN_SETUP_EARLY)
+        con.execute("CREATE VIEW vshadow AS SELECT k AS kk, v * 100 AS vv FROM t")
+        ccases = {
+            # the CTE is the whole FROM (already folded before §4.22; kept as the baseline)
+            "cte_from":        "WITH r AS (SELECT k % 20 AS kk, v * 2 AS vv FROM t WHERE v > 1) SELECT kk, sum(vv), count(*) FROM r GROUP BY kk ORDER BY kk",
+            # the CTE is one ARM of a join
+            "cte_join_arm":    "WITH li AS (SELECT did, amt * (1 - 0.1) AS vol, g FROM jf) SELECT tier, sum(vol) AS s, count(*) FROM li, jd WHERE li.did = jd.did AND g < 250 GROUP BY tier ORDER BY tier",
+            "cte_join_arm_on": "WITH li AS (SELECT did AS d2, amt AS vol FROM jf WHERE g < 300) SELECT tier, sum(vol) FROM li JOIN jd ON d2 = jd.did GROUP BY tier ORDER BY tier",
+            # two CTEs, one on each side of the join
+            "two_ctes":        "WITH a AS (SELECT did AS ad, amt AS vol FROM jf), b AS (SELECT did AS bd, tier AS tt FROM jd) SELECT tt, sum(vol), count(*) FROM a, b WHERE ad = bd GROUP BY tt ORDER BY tt",
+            # a CTE that reads an earlier CTE
+            "cte_chain":       "WITH a AS (SELECT k AS kk, v AS vv FROM t), b AS (SELECT kk, vv FROM a WHERE vv > 5) SELECT kk, sum(vv) FROM b GROUP BY kk ORDER BY kk",
+            # the CTE's own column list
+            "cte_col_aliases": "WITH r(kk, vv) AS (SELECT k, v FROM t WHERE v > 5) SELECT kk, sum(vv) FROM r GROUP BY kk ORDER BY kk",
+            # a CTE nobody reads, beside a statement that is an ordinary shape
+            "cte_zero_refs":   "WITH unused AS (SELECT k, v FROM t) SELECT k, sum(a) FROM tm GROUP BY k ORDER BY k",
+            # the CTE's name is a real table's; SQL says the CTE wins
+            "cte_shadows_table": "WITH tm AS (SELECT k AS kk, v AS vv FROM t WHERE v > 3) SELECT kk, sum(vv) FROM tm GROUP BY kk ORDER BY kk",
+            # ... and a view's
+            "cte_shadows_view": "WITH vshadow AS (SELECT k AS kk, v AS vv FROM t WHERE v > 3) SELECT kk, sum(vv) FROM vshadow GROUP BY kk ORDER BY kk",
+            "cte_not_materialized": "WITH r AS NOT MATERIALIZED (SELECT k % 20 AS kk, v AS vv FROM t) SELECT kk, sum(vv) FROM r GROUP BY kk ORDER BY kk",
+            # an AGGREGATE CTE read twice: answered once on the device by the nested pass (§4.14), never spliced
+            "cte_aggregate_twice": "WITH r AS (SELECT k AS kk, sum(b) AS tot FROM tm WHERE z < 7 GROUP BY kk) SELECT kk, tot FROM r WHERE tot = (SELECT max(tot) FROM r) ORDER BY kk",
+        }
+        for name, sql in ccases.items():
+            want = con._raw.execute(sql).fetchall()
+            want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            got_desc = con._raw.execute("DESCRIBE " + lr["sql"]).fetchall() if lr["rewritten"] else None
+            check(lr["rewritten"], f"cte {name}: rewritten, form={lr['form']} ({lr['reason']})")
+            check(got == want, f"cte {name}: rows identical to native ({len(want)} rows)")
+            check(got_desc is None or [(r[0], r[1]) for r in got_desc] == [(r[0], r[1]) for r in want_desc],
+                  f"cte {name}: names and types identical")
+            check(bool(lr["detail"]), f"cte {name}: the decision says what happened ({(lr['detail'] or '')[:60]!r})")
+        check(con.execute(ccases["cte_aggregate_twice"]).fetchall() is not None
+              and con.last_rewrite()["form"] == "nested",
+              "cte: an aggregate CTE stays a CTE and runs once on the device (nested), not spliced per reference")
+        con.execute(ccases["cte_join_arm"]).fetchall()
+        check(con.last_rewrite()["form"] != "nested" and "join" in (con.last_rewrite()["detail"] or ""),
+              f"cte: a project-and-join CTE arm folds into the join "
+              f"({con.last_rewrite()['form']}, {con.last_rewrite()['detail']!r})")
+        # left as written — the answer must not change either way
+        cdeclines = {
+            "recursive":       "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 5) SELECT sum(n) AS s, count(*) FROM nums",
+            "materialized":    "WITH r AS MATERIALIZED (SELECT k % 20 AS kk, v AS vv FROM t) SELECT kk, sum(vv) FROM r GROUP BY kk ORDER BY kk",
+            "volatile_body":   "WITH r AS (SELECT k AS kk, random() AS vv FROM t) SELECT kk, count(vv) FROM r GROUP BY kk ORDER BY kk",
+            "now_body":        "WITH r AS (SELECT k AS kk, now() AS tnow, v AS vv FROM t) SELECT kk, sum(vv), count(DISTINCT tnow) FROM r GROUP BY kk ORDER BY kk",
+            "order_limit_body": "WITH r AS (SELECT k AS kk, v AS vv FROM t ORDER BY v, k LIMIT 5000) SELECT kk, sum(vv) FROM r GROUP BY kk ORDER BY kk",
+            "distinct_body":   "WITH r AS (SELECT DISTINCT k % 10 AS kk, v AS vv FROM t) SELECT kk, count(*) FROM r GROUP BY kk ORDER BY kk",
+            "self_join":       "WITH r AS (SELECT k AS kk, v AS vv FROM t WHERE v > 1) SELECT a.kk, sum(a.vv) FROM r a, r b WHERE a.kk = b.kk AND b.vv < 5 GROUP BY a.kk ORDER BY a.kk",
+            # the CTE's WHERE may NOT be hoisted above an outer join
+            "left_join_arm":   "WITH li AS (SELECT did, amt AS vol FROM jf WHERE g < 250) SELECT tier, sum(vol), count(*) FROM jd LEFT JOIN li ON li.did = jd.did GROUP BY tier ORDER BY tier",
+        }
+        for name, sql in cdeclines.items():
+            volatile = name in ("volatile_body", "now_body")
+            want = None if volatile else con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            if name in ("recursive", "materialized", "volatile_body", "now_body", "self_join"):
+                check(not lr["rewritten"], f"cte decline {name}: runs native ({lr['reason']})")
+            check(want is None or got == want, f"cte decline {name}: answer unchanged")
+        # a LEFT JOIN whose null-supplying side is a CTE must keep native's rows whichever path it takes
+        check(con._raw.execute(cdeclines["left_join_arm"]).fetchall() ==
+              con.execute(cdeclines["left_join_arm"]).fetchall(),
+              "cte: an outer join over a CTE arm gives native's rows")
+        # writes behind a folded CTE: the guard covers every base table it reads
+        sql = ccases["cte_join_arm"]
+        con.execute(sql).fetchall()
+        con.execute("UPDATE jf SET amt = amt WHERE g = 1")
+        check(con.execute(sql).fetchall() == con._raw.execute(sql).fetchall(),
+              "cte: answer correct right after a write to the CTE's table")
+        got = con.execute(sql).fetchall()
+        check(con.last_rewrite()["rewritten"] and got == con._raw.execute(sql).fetchall(),
+              "cte: rewritten again after the re-upload, answer correct")
+        other_c = con._raw.cursor()
+        other_c.execute("INSERT INTO jf VALUES (999999999, 1, 1, 1, 1, 1.00, 'AIR')")
+        got = con.execute(sql).fetchall()
+        check(got == con._raw.execute(sql).fetchall(),
+              "cte: a foreign write to the CTE's table does not change the answer")
+        # a parameterised statement over a CTE declines like any other
+        con.execute("SELECT kk, sum(vv) FROM (SELECT k AS kk, v AS vv FROM t) q GROUP BY kk").fetchall()
+        rel = con.sql("WITH r AS (SELECT k AS kk, v AS vv FROM t WHERE v > ?) SELECT kk, sum(vv) FROM r GROUP BY kk",
+                      params=[5])
+        check(con.last_rewrite()["reason"] == "params" and not con.last_rewrite()["rewritten"],
+              f"cte: a parameterised statement over a CTE declines ({con.last_rewrite()['reason']})")
+        check(sorted(rel.fetchall()) == sorted(con._raw.execute(
+            "WITH r AS (SELECT k AS kk, v AS vv FROM t WHERE v > 5) SELECT kk, sum(vv) FROM r GROUP BY kk").fetchall()),
+            "cte: ... and still answers it")
+        con.execute("DROP VIEW vshadow")
+    con.close()
+
     # ---- nested rewriting (§4.14): rewritable SELECTs inside a statement DuckDB keeps ----
     print("== nested rewriting")
     con = fresh()

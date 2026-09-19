@@ -1083,6 +1083,60 @@ c` (column order is not observable: `SELECT *` is never rewritten). ROLLUP / CUB
 GROUPING SETS, `DISTINCT ON`, `SELECT *` and an ordinal past the select list are
 left as written. Names pinned and verified with DESCRIBE, as §4.19.
 
+### 4.22 CTEs
+A CTE is a derived table with a name, and there are two kinds of them — which
+is why there are two answers.
+
+**A CTE that only projects and joins** (`WITH li AS (SELECT l_orderkey AS ok,
+l_extendedprice * (1 - l_discount) AS vol FROM lineitem)`) is spliced in at
+every reference, exactly as a view is (§4.20): `python/gpudb/_ctes.py` replaces
+each `BASE_TABLE` node naming it with a `SUBQUERY` node holding its body, the
+CTE's column list becomes the column aliases, the reference's alias (or the CTE
+name) the alias, and the entry leaves the `WITH`. From there §4.16 folds it and
+the statement is an ordinary shape. CTEs are processed in the order they are
+written, so a CTE that reads an earlier one is spliced too, and a name is never
+substituted inside its own body.
+
+**A CTE that aggregates** (TPC-H Q15's `revenue`) is deliberately NOT spliced.
+The nested pass (§4.14) already answers such a body ONCE on the device and
+leaves the rest of the statement to DuckDB, which reuses that one result for
+every reference — splicing would undo exactly that and run the aggregate per
+reference. This is why a CTE read twice needs nothing new: it has worked since
+§4.14, and the test suite pins it.
+
+**A derived table that is an ARM of a join.** Before this section §4.16 folded
+a derived table only when it was the whole `FROM`; a spliced CTE is usually one
+side of a join, so `_flatten` now folds an arm too. The arm's `WHERE` is
+hoisted above the join, so every join in sight has to be a plain inner or cross
+join (no `USING`, no `NATURAL`) — an arm of an outer join keeps its own
+`WHERE` and is left as written. Over a single base table the arm's columns are
+re-qualified with that table, because a bare name that also exists on the other
+side of the join would stop binding.
+
+What is left as written, and why:
+- `WITH RECURSIVE` — a recursive body is not a derived table.
+- `AS MATERIALIZED` — the statement asks for exactly one evaluation; splicing
+  a body into several references is not that. (`NOT MATERIALIZED` and the
+  default are spliced.)
+- a body holding a function the computed-lane rules do not vouch for
+  (`random()`, `now()`): inlining it into several references would evaluate it
+  a different number of times than the statement says, so the wrapper does not
+  inline it at all.
+- a body with `ORDER BY` / `LIMIT` / `DISTINCT` / a window / a set operation:
+  not a derived table the fold can take (the nested pass may still take an
+  aggregate inside it).
+- an arm beside a subquery predicate (§4.18): substituting a bare name inside a
+  subquery could bind it to the subquery's own relation, so those statements
+  are left alone.
+- a CTE joined to itself: both arms fold onto the same unaliased table and the
+  flattened statement no longer binds; the DESCRIBE check catches it and the
+  original text runs.
+
+One name-resolution fix came with this. `_views.inline` replaced any
+`BASE_TABLE` naming a view, without looking at the `WITH` above it; a CTE named
+after a view would have been replaced by the view's body. It now skips names a
+`cte_map` in scope defines, which is what SQL does.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -1095,7 +1149,9 @@ resolves the table reference the way the binder will, on the same
 connection:
 
 1. If any `cte_map` at any scope in the tree defines the name, the
-   statement runs native.
+   statement runs native. (A project-and-join CTE is spliced out of the
+   `cte_map` before this, §4.22; what reaches here is a CTE that aggregates
+   or one the splice refused.)
 2. An unqualified name is looked up in `duckdb_tables()` and
    `duckdb_views()` across the temp catalog and every catalog and schema on
    the search path (`current_setting('search_path')`, `current_database()`,

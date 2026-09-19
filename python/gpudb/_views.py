@@ -92,15 +92,15 @@ def inline(tree_json: str, catalog: ViewCatalog, serialize: Callable[[str], str]
         cache[name] = node
         return node
 
-    def walk(e, depth: int):
+    def walk(e, depth: int, shadowed: frozenset = frozenset()):
         if isinstance(e, list):
             for i, v in enumerate(e):
-                e[i] = walk(v, depth)
+                e[i] = walk(v, depth, shadowed)
             return e
         if not isinstance(e, dict):
             return e
         if e.get("type") == "BASE_TABLE" and not e.get("schema_name") and not e.get("catalog_name") \
-                and not e.get("at_clause"):
+                and not e.get("at_clause") and (e.get("table_name") or "").casefold() not in shadowed:
             vn = view_node(e.get("table_name") or "", depth)
             if vn is not None:
                 out = json.loads(json.dumps(vn))
@@ -109,9 +109,13 @@ def inline(tree_json: str, catalog: ViewCatalog, serialize: Callable[[str], str]
                     out["column_name_alias"] = list(e["column_name_alias"])
                 state["changed"] = True
                 return out
+        # a CTE of this statement hides a view of the same name (§4.22)
+        entries = ((e.get("cte_map") or {}) if isinstance(e.get("cte_map"), dict) else {}).get("map") or []
+        if entries:
+            shadowed = shadowed | {(c.get("key") or "").casefold() for c in entries if isinstance(c, dict)}
         for k, v in list(e.items()):
             if isinstance(v, (dict, list)) and k not in ("value", "cast_type", "type_info"):
-                e[k] = walk(v, depth)
+                e[k] = walk(v, depth, shadowed)
         return e
 
     walk(tree, 0)
