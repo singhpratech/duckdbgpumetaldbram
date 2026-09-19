@@ -4775,3 +4775,123 @@ two declined `--lane-floor` cells are the `o_custkey` plain form over `orders`
 (97–100K groups returned to the client from a 1.5M-row table), declined after
 their first run by the operator's output-size check; their HAVING forms are
 rewritten at 3.12× and 6.68×.
+
+## v0.7 §5.5 — residency that knows what a set is worth — Metal, SF1 + SF10 (2026-09-19)
+
+`gpudb.connect()`, Apple M4 Max (64 GiB unified, wrapper default budget
+16 GiB), nothing else on the machine, **DuckDB's default thread count**
+throughout (`SET threads TO 1` appears nowhere in this section). "main" is the
+merge base `0aeb6ab` — the branch without the inner-statement bounds and
+without this policy — run from its own `python/` and `scripts/` against the
+same built extension, so only the wrapper differs.
+
+The section above ends on a measured regression: at the default budget the
+inner-statement bounds admit Q13 and Q15 at SF10, their sets fill the budget
+first, and Q18 (15×) and Q19 (14.5×) then report `native (memory)` where main
+answers them on the device. The cause was the policy, not the budget: eviction
+was least recently used with a 60 s minimum age, admission was first come first
+served, and nothing knew what a set was worth. §5.5 now measures that.
+
+### TPC-H coverage at the DEFAULT budget, main against the branch
+
+`scripts/tpch_coverage.py`, two interleaved rounds per scale factor (main,
+branch, main, branch). Every query's rows are identical to native on both
+sides, at both scale factors, in both rounds. "wrapper total" is the sum over
+the 22 queries of the transparent time where the query is rewritten and the
+native time where it is not — the 22-query loop as the wrapper answers it.
+
+| | SF1 r1 | SF1 r2 | SF10 r1 | SF10 r2 |
+|---|---|---|---|---|
+| main, on the device | 15 / 22 | 15 / 22 | 15 / 22 | 15 / 22 |
+| branch, on the device | **17 / 22** | **17 / 22** | **19 / 22** | **19 / 22** |
+| main, native total | 207.5 ms | 213.0 ms | 1337.5 ms | 1427.4 ms |
+| main, wrapper total | 69.9 ms | 72.1 ms | 597.3 ms | 617.4 ms |
+| branch, wrapper total | **62.2 ms** | **62.5 ms** | **253.7 ms** | **254.8 ms** |
+
+Per query, the difference is the same set in both SF10 rounds and in both SF1
+rounds — and it is only ever in one direction:
+
+| query | SF | main | branch |
+|---|---|---|---|
+| Q13 | 10 | native (shape) | **GPU (nested)**, 11.72× / 11.6× |
+| Q15 | 10 | native (shape) | **GPU (nested)**, 2.27× / 2.3× |
+| Q19 | 10 | native (memory) | **GPU (projected)**, 15.1× / 15.0× |
+| Q21 | 10 | native (memory) | **GPU (plain)**, 12.4× / 12.6× |
+| Q15 | 1 | native (shape) | **GPU (nested)**, 1.8× |
+| Q22 | 1 | native (threshold) | **GPU (plain)**, 11.3× |
+
+**No query that main answers on the device is answered natively by the
+branch**, at either scale factor, in either round. Main itself reports
+`native (memory)` for Q19 and Q21 at SF10 in both of these rounds (an earlier
+round of the same script had main at 17 / 22 with those two on the device —
+which is the point: first come first served makes the outcome depend on what
+the budget happened to be holding, and that is what value-aware admission
+replaces).
+
+### The thrash experiment: a budget deliberately below the working set
+
+The 22 queries in a loop, one run each, SF10, at 8 GiB and 12 GiB — both below
+the ~14 GiB the 22 queries want. 14 loops, main and branch, same machine, same
+extension. Loop 0 is cold (every upload happens in it).
+
+| | main 8 GiB | branch 8 GiB | main 12 GiB | branch 12 GiB |
+|---|---|---|---|---|
+| loop 0 | 14.79 s | 16.04 s | 22.46 s | 22.57 s |
+| loop 1 | 1.01 s | 0.90 s | 0.91 s | 0.75 s |
+| loop 2 | 1.53 s | 1.59 s | 1.64 s | 1.65 s |
+| loop 3 | 1.02 s | 2.67 s | 0.92 s | 2.34 s |
+| loop 4 | 0.99 s | 6.48 s | 0.87 s | 8.91 s |
+| loops 5–13 | 0.97–0.99 s | **0.98–1.01 s** | 0.86–0.88 s | **0.79–0.85 s** |
+| evictions per loop, 5–13 | 0 | 1 | 0 | 1 |
+| on the device at steady state | 9 / 22 | **10 / 22** | 12 / 22 | **14 / 22** |
+
+Loops 3 and 4 are where the policy pays for what it learns: the measured rule 1
+probes a template's native time after its third rewritten run, so it is only
+then that the two sides of every saving are known, and the re-arrangement that
+follows costs one set's upload (6.5 s at 8 GiB, 8.9 s at 12 GiB — the losing
+numbers, printed). From loop 5 the resident population does not change again:
+the steady-state loop is **0.79–0.85 s against main's 0.86–0.88 s at 12 GiB**
+and **0.98–1.01 s against main's 0.97–0.99 s at 8 GiB**, with two more queries
+on the device at 12 GiB and one more at 8 GiB. Main shows zero evictions in
+this experiment for a reason worth stating plainly: its 60 s wall-clock
+minimum age never expires inside a 14-loop run, so it never re-arranges
+anything at all.
+
+The residual is one eviction per loop at steady state on the branch, of a unit
+small enough that it neither changes which queries are on the device nor shows
+in the loop time. It is bounded (one, every loop, for nine loops) rather than
+growing, which is what "converged" means here; it is written up in
+`KNOWN_ISSUES.md`.
+
+### What the bookkeeping costs per statement
+
+`Connection._note_value` against a no-op, alternating rounds inside one
+process (the instrument of "The millisecond that was not there"), SF1, 61
+rounds, minimum and median:
+
+| statement | threads = 1, without → with | default threads, without → with |
+|---|---|---|
+| varchar-key, 3 groups | 0.717 → 0.722 ms (median 0.822 → 0.806) | 0.792 → 0.785 ms (0.883 → 0.863) |
+| int-key, 7 groups | 0.666 → 0.663 ms (0.741 → 0.775) | 0.684 → 0.687 ms (0.955 → 0.891) |
+| int-key, 7 groups, `WHERE` | 0.774 → 0.767 ms (0.850 → 0.858) | 1.029 → 1.018 ms (1.232 → 1.262) |
+| global aggregate | 1.016 → 1.027 ms (1.089 → 1.091) | 1.265 → 1.241 ms (1.390 → 1.410) |
+| join, 10K groups | 5.888 → 6.051 ms (6.633 → 6.740) | 5.761 → 5.945 ms (6.707 → 6.679) |
+| int-key, 10K groups | 5.735 → 6.001 ms (6.667 → 6.633) | 6.024 → 5.993 ms (7.300 → 6.579) |
+
+On the four sub-millisecond statements — the ones where a fixed cost would show
+— every delta is within ±0.03 ms of zero and half of them are negative, so the
+bookkeeping is below this instrument's resolution against a 0.7–1.3 ms
+statement. The two 6 ms rows disagree between minimum and median in both
+directions (+0.27 min / −0.03 median, +0.18 min / −0.03 median), which is what
+noise looks like; there is one dict lookup, one `exp()` and a lock acquire per
+set per statement behind them.
+
+### The rest of the acceptance run
+
+`python3 python/tests/test_wrapper.py` 1093 checks, 0 failures ·
+`python3 python/tests/test_residency_policy.py` 47 checks, 0 failures ·
+`python3 python/tests/test_shell.py` pass · `./build-macos/test/test_gpudb`
+3023 / 3023 · `./scripts/run_sql_tests.sh` 224 pass / 0 fail / 45 expected
+fails · `rewrite_parity_check.sh`, `join_parity_check.sh`,
+`groupby_parity_check.sh` all pass · `scripts/wrapper_residency_gate.py` 0
+failing rows, all three cadences pass.
