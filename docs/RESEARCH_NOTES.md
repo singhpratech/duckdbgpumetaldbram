@@ -2655,6 +2655,73 @@ and writes canonical settings over canonical ones, which is not a change of
 reading (`pselect6`, and the second `^D` was answered at once). And anything
 gpudb-specific: the control has no gpudb in it.
 
+### The same window, one key over: a `^C` nobody was waiting for
+
+The loops above caught the check beside it as well. `^C throws away the
+half-typed line, the next statement runs on its own` failed **26 and 28 times in
+80 rounds** with eight busy processes beside it, **0 in 160** quiet rounds, and
+never in a real CI run. A first guess — that a redrawn prompt satisfied the wait
+early, so the wait was keyed on the prompt *after* the shell's own `^C` line —
+moved the loaded rate from 34 % to 31 %, which is to say it did not move it. So
+the check was made to print which of its three conditions failed and what the
+terminal had shown, and four loaded shards were run. All 37 failures say the
+same thing, character for character:
+
+    box=False, statement=True, old line gone=True,
+    saw 'SELECT 2 AS after_ctrl_c;\r\n^C\r\ngpudb> '
+
+The half-typed line is gone, so the `^C` did land. What is on the screen is the
+*next* statement being echoed, and then the shell's `^C` — the shell answered the
+interrupt a minute late, when that second statement arrived, and threw **that**
+line away instead. Three sixty-second `read_until` timeouts in a row is exactly
+the 183 s such a round takes, against 2.5 s for a passing one.
+
+**Where the signal waited.** `input()` is readline, and CPython's readline waits
+for a key in a `select()` and looks for a signal only on the branch where that
+`select()` returns `EINTR`. A SIGINT that arrives in the instant readline is
+digesting the previous keystroke — after the C-level handler has set its flag,
+before the next `select()` is entered — leaves a pending interrupt with nobody
+to read it, and the `select()` then blocks. Nothing is printed, so from the
+outside the shell looks idle. The KeyboardInterrupt is raised at the next byte,
+and it is that byte's line which is discarded.
+
+A control with no gpudb in it puts it beyond argument — eight lines of stock
+`input()` in a loop, GNU readline 8.2, the same runner, the same eight busy
+processes, 60 rounds each:
+
+| when the `^C` is written | silent for 3 s | of those, answered by the next byte |
+|---|---|---|
+| in the same instant as the echo of the last key | **32 of 60** | 32 |
+| a fifth of a second later | **0 of 60** | — |
+
+Every silent round answered the very next byte: the signal was pending, not
+lost. And the window is precisely the keystroke before it, which is why a fifth
+of a second is already an eternity — **no hand on a keyboard is that fast. The
+test was**, because it wrote the `^C` the moment it saw the echo.
+
+**So the fix is in the test again.** There is nothing the shell can print to say
+it has gone back to waiting for a key, so the test asks a second time: it types
+`^C`, waits for the shell's own `^C` line, and types another `^C` if none comes.
+A repeat is also what a person does when a key appears to do nothing, and it is
+enough — the second signal arrives with readline asleep in its `select()`, which
+is the branch that looks. The check now also fails if the `^C` was never
+answered at all, so a silent shell can no longer be mistaken for a working one.
+
+Measured on the same runner, four shards of 30 runs of the suite's interactive
+section each: loaded, **37 failures in 120** before, **0 in 120** after; quiet,
+**0 in 120**. The zero is not the whole argument — the mechanism is — but the
+arithmetic of the two agrees: 28 of those 120 loaded rounds took 6 s or more
+instead of 2.5 s, which is the retry firing, and 28 in 120 is the 37 in 120 that
+used to fail. The window still opens about as often as it ever did; it is simply
+no longer mistaken for an answer.
+
+**Ruled out** for this one: readline keeping the half-typed line (`old line
+gone=True` in every one of the 37 failures, and the pending interrupt clears it
+when it finally lands); the shell's own handler (`repl()` empties `self.buf` and
+prints `^C`, which is exactly what eventually appears); a prompt redrawn under
+the half-typed text satisfying the wait early (tried first, 34 % → 31 %); and
+anything gpudb-specific, again by the control.
+
 ## 2026-09-19 — The other build path, unexercised since the rewriting began
 
 Everything in this journal was built and measured through `./scripts/build.sh`,
