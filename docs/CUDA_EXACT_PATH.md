@@ -28,6 +28,39 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 | `device_memory_bytes()` | total device memory in bytes (`cudaMemGetInfo` total); reported by `gpu_build_info()`, sets the wrapper's default budget to half of it | 0 | `recommendedMaxWorkingSetSize` |
 | `exact_supported()`, `join_supported()` | return true only when the above are complete — these are rule-1 gates: a backend that claims support and throws makes statements fall back at run time | — | — |
 
+### 1.1 The WHERE stage: one fused pass (mirror this)
+
+`groupby_exact_masked_resident` reaches the device as a mask stage, and the
+shape of that stage is worth copying rather than rediscovering. Metal's first
+version was one kernel per term over the rows, each reading a byte of the mask
+and writing one back; at SF10 it cost 2.9 ms plus **3.3 ms per term**, the same
+whatever the lane's width and whatever survived, because the pass is bound by
+the byte it reads and the byte it writes, not by the comparison. TPC-H Q12's
+five terms were 19.7 ms of a 23.3 ms kernel.
+
+A CUDA port should write the mask in ONE pass that evaluates the whole
+conjunction per row — the predicate program (lane, op, value, IN-list slice)
+in constant or global memory, the lane table (pointer, validity bitmap, width,
+is-f64) bound once, an early exit on the first failing term. On Metal that is
+`gpred_eval` in `kernels/sum.metal`, one function called by the mask stage, by
+the global aggregate (§4.12) and by the direct reduce; writing it once is what
+made the third caller free. The second half is the same idea one level down:
+the sort path reads the mask through the permutation, so gather `mask[perm[i]]`
+ONCE, in the pass that counts the survivors of the key range, and keep the
+result as a mask in sorted order that every payload's reduce then reads
+sequentially — otherwise each payload re-gathers it (+1.4 to +2.6 ms per
+payload at SF10).
+
+Two constraints came with it. The number of lanes a kernel can bind is finite
+(Metal: 12 distinct columns, payloads and predicate columns sharing slots), and
+a WHERE over more than that must fall back to a per-term pass rather than
+throw. And a pipeline that will not build is a fallback, not an error — see the
+direct reduce's row below for why a backend asks the device what it is before
+it asks it to compile anything. Evaluating the predicates AT `perm[i]` instead,
+so no row-order mask exists at all, was measured and is slower: it trades one
+sequential read per lane for one random gather per lane, and a lane gather
+costs what a payload gather costs.
+
 Not needed: anything in `GroupByAggregator`, `WindowAggregator`, `HashJoinProbe`
 (v0.6 operators, unchanged). Also NOT part of this port: `topk_resident` and
 the three resident joins (`join_sum_resident_i64` / `_f64`,

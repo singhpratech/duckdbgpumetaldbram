@@ -467,6 +467,38 @@ compares integers. `'nan'::DOUBLE > 5` is true natively and must be true on
 the device; the parity scenarios include NaN and ±inf rows under every
 operator.
 
+**The mask stage is one pass (Metal, 2026-09-18).** It used to be one kernel
+dispatch per term: each of them read a byte of the mask and wrote one back to
+look at a single lane, so a five-term WHERE walked a 60 MB mask ten times and
+cost 2.9 ms plus 3.3 ms a term at SF10, independent of the lane's width and of
+what survived. `gpred_eval` — the per-row evaluation of a whole conjunction
+that §4.12's global aggregate and the direct reduce (`docs/RESIDENT_COLUMNS_DESIGN.md`
+§7) already call — now serves the mask stage too: `gbx_fused_mask_i64` reads
+each distinct lane once, evaluates every term for the row and writes the byte
+once. Term for term the answer is the one the loop produced (a NULL cell fails
+every comparison and `In`, `IsNull` / `IsNotNull` read the validity bit, an F64
+lane compares on the total-order image, a narrow lane widens on load).
+
+Beside it, the mask the reduce reads. The sort path visits rows through the
+permutation, so `mask[perm[i]]` was gathered once to count the survivors of the
+key range and again for every payload. The counting pass (`gbx_sel_smask_i64`)
+now keeps its gather as a second mask in SORTED order, and the masked reduce
+(a) and the compaction (b) read that sequentially: one random gather per call
+instead of one per payload plus one.
+
+The lanes are bound one buffer pair each, so the fused pass holds the same
+12-distinct-lane bound as the global aggregate; a WHERE over more columns than
+that keeps the per-term loop, which binds one column at a time. So does a
+device that will not build the fused pipelines — the capability lesson of
+`docs/RESIDENT_COLUMNS_DESIGN.md` §7 applies unchanged, and a refusal is a
+fallback, never a throw. `GPUDB_METAL_MASK_PATH=fused|legacy|permeval|auto`
+chooses (default `auto` = fused), `gpu_last_stats()` reports it as
+`path=sort/fused`, and `GPUDB_METAL_TRACE_EXACT=1` names it per call.
+`permeval` is the third shape the sweep compared: evaluate the WHERE at
+`row = perm[i]` and write only the sorted-order mask, which trades a
+sequential read per lane for a random gather per lane and loses everywhere the
+key range is large (BENCHMARK.md).
+
 ### 4.7 DOUBLE summation — not on the transparent path
 Native `sum(DOUBLE)` is order-dependent: the same table gives different
 last-ulp results across thread counts and insert orders, and a 1-ulp

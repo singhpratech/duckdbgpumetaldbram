@@ -1282,6 +1282,10 @@ kernel void gbx_topk_compact_i64(
 //  Variant (b)    gbx_sel_counts_i64 / gbx_sel_compact_i64: compact the
 //                 sorted keys + permutation to the surviving positions, then
 //                 the ordinary gbx_chunk / gbx_finalize run over them.
+//
+//  gbx_mask_i64 is the LEGACY shape, kept because a device that will not build
+//  the fused pass still has to answer. What runs by default is the one pass
+//  gbx_fused_mask_i64 further down, with gbx_sel_smask_i64 beside it.
 // ---------------------------------------------------------------------------
 
 inline ulong gbx_f64_key(long bits) {
@@ -1405,6 +1409,7 @@ kernel void gbxm_chunk_i64(
     device long*        head      [[buffer(15)]],  // 6 longs per chunk
     device long*        tail      [[buffer(16)]],
     constant uint&      vw        [[buffer(17)]],
+    constant uint&      sorted_mask [[buffer(18)]], // mask is in SORTED order, indexed by j
     uint                gid       [[thread_position_in_grid]])
 {
     const uint a = gid * GB_CHUNK;
@@ -1424,8 +1429,12 @@ kernel void gbxm_chunk_i64(
         const uint e  = min(re, b);
         GbxmAcc s = gbxm_zero();
         for (uint j = i; j < e; ++j) {
+            // The mask reaches this pass one of two ways. In sorted order it
+            // is read straight (the gather happened once, in the counting
+            // pass); in row order every payload gathers it again.
+            if (sorted_mask != 0u) { if (mask[j] == 0u) continue; }
             const uint row = perm[j];
-            if (mask[row] == 0u) continue;
+            if (sorted_mask == 0u && mask[row] == 0u) continue;
             s.cstar += 1l;
             if (with_vals != 0u && gbx_valid(valid, has_valid, (ulong)row)) gbxm_add(s, ldw(vals, vw, row));
         }
@@ -1518,13 +1527,14 @@ kernel void gbx_sel_compact_i64(
     device uint*        o_perm        [[buffer(6)]],
     constant uint&      kw            [[buffer(7)]],
     constant uint&      koff          [[buffer(8)]],
+    constant uint&      sorted_mask   [[buffer(9)]],   // mask is in SORTED order
     uint                gid           [[thread_position_in_grid]],
     uint                block_id      [[threadgroup_position_in_grid]],
     uint                lane          [[thread_index_in_simdgroup]],
     uint                sg            [[simdgroup_index_in_threadgroup]])
 {
     threadgroup uint sg_tot[BLOCK];
-    const uint f = (gid < n && mask[perm[gid]] != 0u) ? 1u : 0u;
+    const uint f = (gid < n && (sorted_mask != 0u ? mask[gid] : mask[perm[gid]]) != 0u) ? 1u : 0u;
     const uint lane_ex = simd_prefix_exclusive_sum(f);
     const uint sg_sum  = simd_sum(f);
     if (lane == 0) sg_tot[sg] = sg_sum;
@@ -1868,6 +1878,160 @@ kernel void gagg_masked_i64(
             }
         }
     }
+}
+
+// ===========================================================================
+//  v0.8 — the WHERE stage of the sort path, in one pass (§4.6)
+//
+//  gbx_mask_i64 is one dispatch per term, and each of them reads a byte of the
+//  60 MB mask and writes one back to look at a single lane: five terms walked
+//  the mask ten times for 3.3 ms apiece, whatever the lane's width and
+//  whatever survived. gpred_eval already evaluates a whole conjunction for one
+//  row — the global aggregate and the direct reduce call it — so the mask
+//  stage calls it too: one pass, one read per distinct lane, one byte written.
+//  Term for term the same answer (a NULL cell fails every comparison and In,
+//  IsNull / IsNotNull read the validity bit, an F64 lane compares on the
+//  total-order image, narrow lanes widen through ldw).
+//
+//  Beside it, the mask the REDUCE reads. The sort path visits rows through the
+//  permutation, so mask[perm[i]] was gathered once to count the survivors and
+//  again for every payload. gbx_sel_smask_i64 keeps that gather's result as a
+//  mask in SORTED order, and the masked reduce and the compaction read it
+//  sequentially — one random gather per call instead of one per payload plus
+//  one.
+// ===========================================================================
+
+struct GMaskU { uint n; uint n_preds; uint n_lanes; uint pad; };
+
+kernel void gbx_fused_mask_i64(
+    device const uchar*     d0    [[buffer(0)]],  device const ulong* v0  [[buffer(1)]],
+    device const uchar*     d1    [[buffer(2)]],  device const ulong* v1  [[buffer(3)]],
+    device const uchar*     d2    [[buffer(4)]],  device const ulong* v2  [[buffer(5)]],
+    device const uchar*     d3    [[buffer(6)]],  device const ulong* v3  [[buffer(7)]],
+    device const uchar*     d4    [[buffer(8)]],  device const ulong* v4  [[buffer(9)]],
+    device const uchar*     d5    [[buffer(10)]], device const ulong* v5  [[buffer(11)]],
+    device const uchar*     d6    [[buffer(12)]], device const ulong* v6  [[buffer(13)]],
+    device const uchar*     d7    [[buffer(14)]], device const ulong* v7  [[buffer(15)]],
+    device const uchar*     d8    [[buffer(16)]], device const ulong* v8  [[buffer(17)]],
+    device const uchar*     d9    [[buffer(18)]], device const ulong* v9  [[buffer(19)]],
+    device const uchar*     d10   [[buffer(20)]], device const ulong* v10 [[buffer(21)]],
+    device const uchar*     d11   [[buffer(22)]], device const ulong* v11 [[buffer(23)]],
+    device const GLaneMeta* meta  [[buffer(24)]],   // GAGG_MAX_LANES entries
+    device const GPred*     prog  [[buffer(25)]],
+    device const long*      lists [[buffer(26)]],
+    constant GMaskU&        u     [[buffer(27)]],
+    device uchar*           mask  [[buffer(28)]],   // one byte per ORIGINAL row
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg  [[threadgroups_per_grid]])
+{
+    GLane lanes[GAGG_MAX_LANES];
+    lanes[0].data = d0;  lanes[0].valid = v0;   lanes[1].data = d1;  lanes[1].valid = v1;
+    lanes[2].data = d2;  lanes[2].valid = v2;   lanes[3].data = d3;  lanes[3].valid = v3;
+    lanes[4].data = d4;  lanes[4].valid = v4;   lanes[5].data = d5;  lanes[5].valid = v5;
+    lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
+    lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
+    lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    // Only the slots the program names are described; gpred_eval never looks
+    // past n_lanes.
+    for (uint l = 0; l < u.n_lanes; ++l) {
+        lanes[l].width = meta[l].width;
+        lanes[l].has_valid = meta[l].has_valid;
+        lanes[l].is_f64 = meta[l].is_f64;
+    }
+    // A grid-stride loop, so the lane table above is set up once per thread
+    // and not once per row.
+    const uint gsize = BLOCK * ntg;
+    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize)
+        mask[i] = gpred_eval(lanes, prog, u.n_preds, lists, i) ? 1u : 0u;
+}
+
+// The survivors of the key range, counted per block of the SORTED order — and
+// the gather kept. Block for block the counts gbx_sel_counts_i64 produces, so
+// gbx_sel_compact_i64 reads the same offsets after the host's scan.
+kernel void gbx_sel_smask_i64(
+    device const uint*  perm         [[buffer(0)]],   // bound at the range's first position
+    device const uchar* mask         [[buffer(1)]],   // over ORIGINAL rows
+    constant uint&      n            [[buffer(2)]],   // rows of the key range
+    device uint*        block_counts [[buffer(3)]],
+    device uchar*       smask        [[buffer(4)]],   // out: one byte per position of the range
+    uint                tid          [[thread_position_in_threadgroup]],
+    uint                gid          [[thread_position_in_grid]],
+    uint                block_id     [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    uint f = 0u;
+    if (gid < n) {
+        f = (mask[perm[gid]] != 0u) ? 1u : 0u;
+        smask[gid] = (uchar)f;
+    }
+    shm[tid] = f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
+}
+
+// The other shape of the same product: evaluate the WHERE at row = perm[i]
+// and never build a row-order mask at all — one random gather per distinct
+// predicate lane instead of one sequential read per lane, a 60 MB write and
+// the byte gather above. It writes the same smask and the same block counts,
+// so it is interchangeable with gbx_sel_smask_i64. Measured slower wherever
+// the key range is large (a lane gather costs what a payload gather costs),
+// and it cannot serve a NULL-key group, whose rows are not in the
+// permutation; kept because it is the honest comparison and one env value
+// away (GPUDB_METAL_MASK_PATH=permeval).
+kernel void gbx_smask_eval_i64(
+    device const uchar*     d0    [[buffer(0)]],  device const ulong* v0  [[buffer(1)]],
+    device const uchar*     d1    [[buffer(2)]],  device const ulong* v1  [[buffer(3)]],
+    device const uchar*     d2    [[buffer(4)]],  device const ulong* v2  [[buffer(5)]],
+    device const uchar*     d3    [[buffer(6)]],  device const ulong* v3  [[buffer(7)]],
+    device const uchar*     d4    [[buffer(8)]],  device const ulong* v4  [[buffer(9)]],
+    device const uchar*     d5    [[buffer(10)]], device const ulong* v5  [[buffer(11)]],
+    device const uchar*     d6    [[buffer(12)]], device const ulong* v6  [[buffer(13)]],
+    device const uchar*     d7    [[buffer(14)]], device const ulong* v7  [[buffer(15)]],
+    device const uchar*     d8    [[buffer(16)]], device const ulong* v8  [[buffer(17)]],
+    device const uchar*     d9    [[buffer(18)]], device const ulong* v9  [[buffer(19)]],
+    device const uchar*     d10   [[buffer(20)]], device const ulong* v10 [[buffer(21)]],
+    device const uchar*     d11   [[buffer(22)]], device const ulong* v11 [[buffer(23)]],
+    device const GLaneMeta* meta  [[buffer(24)]],
+    device const GPred*     prog  [[buffer(25)]],
+    device const long*      lists [[buffer(26)]],
+    constant GMaskU&        u     [[buffer(27)]],
+    device const uint*      perm  [[buffer(28)]],   // bound at the range's first position
+    device uint*            block_counts [[buffer(29)]],
+    device uchar*           smask [[buffer(30)]],
+    uint tid      [[thread_position_in_threadgroup]],
+    uint gid      [[thread_position_in_grid]],
+    uint block_id [[threadgroup_position_in_grid]])
+{
+    threadgroup uint shm[BLOCK];
+    GLane lanes[GAGG_MAX_LANES];
+    lanes[0].data = d0;  lanes[0].valid = v0;   lanes[1].data = d1;  lanes[1].valid = v1;
+    lanes[2].data = d2;  lanes[2].valid = v2;   lanes[3].data = d3;  lanes[3].valid = v3;
+    lanes[4].data = d4;  lanes[4].valid = v4;   lanes[5].data = d5;  lanes[5].valid = v5;
+    lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
+    lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
+    lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    for (uint l = 0; l < u.n_lanes; ++l) {
+        lanes[l].width = meta[l].width;
+        lanes[l].has_valid = meta[l].has_valid;
+        lanes[l].is_f64 = meta[l].is_f64;
+    }
+    uint f = 0u;
+    if (gid < u.n) {
+        f = gpred_eval(lanes, prog, u.n_preds, lists, perm[gid]) ? 1u : 0u;
+        smask[gid] = (uchar)f;
+    }
+    shm[tid] = f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = BLOCK / 2; s > 0; s >>= 1) {
+        if (tid < s) shm[tid] += shm[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) block_counts[block_id] = shm[0];
 }
 
 // ===========================================================================
