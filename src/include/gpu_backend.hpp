@@ -182,15 +182,18 @@ struct Sum128 {
     static Sum128 from_i64(std::int64_t v) noexcept {
         return Sum128{static_cast<std::uint64_t>(v), v < 0 ? -1 : 0};
     }
-    // The DOUBLE value native DuckDB produces for this HUGEINT — what
-    // avg(BIGINT) returns as sum::DOUBLE / count. DuckDB's hugeint -> double
-    // cast is NOT correctly rounded: it is `double(lower) + double(upper) *
-    // 2^64` (two roundings), with upper == -1 special-cased as
-    // `-double(UINT64_MAX - lower) - 1` so small negatives stay exact.
-    // Reproduced here so avg matches native to the last bit (verified
-    // against native on 300k rows with 128-bit group sums, test/sql/
-    // gpu_groupby_exact.test). Do not "fix" this to a correctly rounded
-    // conversion: that would differ from native by 1 ulp on large sums.
+    // The DOUBLE value native DuckDB produces for this HUGEINT. DuckDB's
+    // hugeint -> floating cast is NOT correctly rounded: it is
+    // `F(lower) + F(upper) * 2^64` (two roundings), with upper == -1
+    // special-cased as `-F(UINT64_MAX - lower) - 1` so small negatives stay
+    // exact. Reproduced here for F = double. Do not "fix" it to a correctly
+    // rounded conversion: that would differ from native by 1 ulp on large
+    // sums.
+    // NOT the way to derive avg(BIGINT): native finalises average as a
+    // quotient in `long double`, so `to_double() / count` reproduces it only
+    // where long double IS double (Apple silicon). Use gpudb::native_avg
+    // (src/include/native_avg.hpp), which is templated on that type; on
+    // x86-64 the two differ by 1 ulp on ~28% of groups.
     double to_double() const noexcept {
         if (hi == -1)
             return -static_cast<double>(~std::uint64_t{0} - lo) - 1.0;

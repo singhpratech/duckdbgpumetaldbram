@@ -26,6 +26,7 @@
 #include "gpu_groupby_extension.hpp"
 #include "gpu_resident.hpp"          // resident registry
 #include "gpu_backend.hpp"
+#include "native_avg.hpp"
 #include "exact_path_note.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
@@ -852,7 +853,7 @@ void gx_function(duckdb_function_info info, duckdb_data_chunk output) {
                         duckdb_validity_set_row_invalid(ok, i);
                     } else {
                         const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[off + i]), r.sums_hi[off + i]};
-                        a[i] = sm.to_double() / static_cast<double>(cnt);
+                        a[i] = gpudb::native_avg(sm, cnt);
                     }
                 }
                 break;
@@ -1144,7 +1145,7 @@ void gm_function(duckdb_function_info info, duckdb_data_chunk output) {
                     if (cnt == 0) { a[i] = 0.0; null_at(vec, ok, i); }
                     else {
                         const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[off + i]), r.sums_hi[off + i]};
-                        a[i] = sm.to_double() / static_cast<double>(cnt);
+                        a[i] = gpudb::native_avg(sm, cnt);
                     }
                 }
                 break;
@@ -1341,7 +1342,7 @@ void gg_function(duckdb_function_info info, duckdb_data_chunk output) {
                 if (cnt == 0) { a[0] = 0.0; null_at(vec); }
                 else {
                     const gpudb::Sum128 sm{static_cast<std::uint64_t>(r.sums[p]), r.sums_hi[p]};
-                    a[0] = sm.to_double() / static_cast<double>(cnt);
+                    a[0] = gpudb::native_avg(sm, cnt);
                 }
                 break;
             }

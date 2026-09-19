@@ -2,6 +2,7 @@
 // Returns nonzero on failure so `ctest` and CI can pick it up.
 
 #include "gpu_backend.hpp"
+#include "native_avg.hpp"
 #include "exact_path_note.hpp"
 #include "resident_shed_note.hpp"
 #include "../../src/backends/groupby_filter.hpp"
@@ -28,6 +29,7 @@
 #include <tuple>
 #include <mutex>
 #include <atomic>
+#include <cfloat>
 #include <vector>
 
 void test_hashjoin();
@@ -3958,6 +3960,75 @@ void test_indexed_lanes() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// avg() is finalised the way DuckDB finalises it (src/include/native_avg.hpp).
+// No DuckDB needed, so this runs in CI's Linux job, which has no libduckdb and
+// therefore never ran the SQL parity tests that caught the bug in the first
+// place: the extension derived avg as double(sum) / double(count), which
+// reproduces native only where long double IS double. On x86-64 that is one
+// ulp out on ~28% of groups (856 of 3002 on the 300k-row set in
+// test/sql/gpu_groupby_exact.test).
+//
+// Two things are asserted. First, native_avg equals an INDEPENDENTLY written
+// long double quotient for every case — that is the contract. Second, on a
+// platform whose long double is wider than double, at least one crafted case
+// must differ from the plain double quotient: without that, a silent
+// regression to the double form would still pass, and the test would be
+// asserting nothing. Where long double IS double (Apple silicon) the second
+// assertion is skipped and said so, because there the two forms agree and
+// there is nothing to catch.
+// ---------------------------------------------------------------------------
+void test_native_avg() {
+    std::printf("\n--- avg finalised as DuckDB finalises it ---\n");
+    constexpr bool wide = LDBL_MANT_DIG > DBL_MANT_DIG;
+    std::printf("  long double mantissa %d bits, double %d bits -> %s\n",
+                LDBL_MANT_DIG, DBL_MANT_DIG,
+                wide ? "the double form is detectably wrong here"
+                     : "the two forms coincide on this platform");
+
+    std::mt19937_64 rng(0xAF6ULL);
+    std::size_t differ_from_double = 0, checked = 0, mismatches = 0;
+    for (int i = 0; i < 20000; ++i) {
+        // Sums that need both limbs, and counts that rarely divide evenly.
+        gpudb::Sum128 s;
+        s.lo = rng();
+        s.hi = static_cast<std::int64_t>(rng() >> 40) - (1 << 23);
+        const std::int64_t cnt = static_cast<std::int64_t>(rng() % 100000) + 1;
+
+        // The contract: the same expression DuckDB evaluates, in its type.
+        const long double ld_sum = (s.hi == -1)
+            ? -static_cast<long double>(~std::uint64_t{0} - s.lo) - 1.0L
+            : static_cast<long double>(s.lo) +
+              static_cast<long double>(s.hi) * 18446744073709551616.0L;
+        const double want = static_cast<double>(ld_sum / static_cast<long double>(cnt));
+        const double got  = gpudb::native_avg(s, cnt);
+        if (std::memcmp(&want, &got, sizeof(double)) != 0) ++mismatches;
+        ++checked;
+
+        const double as_double = s.to_double() / static_cast<double>(cnt);
+        if (std::memcmp(&as_double, &got, sizeof(double)) != 0) ++differ_from_double;
+    }
+    EXPECT(mismatches == 0);   // one check for the whole sweep, not 20000
+    std::printf("  %zu cases, %zu mismatches; the double form differs on %zu of them\n",
+                checked, mismatches, differ_from_double);
+    if (wide) {
+        EXPECT(differ_from_double > 0);   // otherwise this test proves nothing
+    } else {
+        EXPECT(differ_from_double == 0);  // on this platform the two MUST agree
+    }
+
+    // The DECIMAL divident is count * 10^scale, formed in the wide type.
+    {
+        gpudb::Sum128 s; s.lo = 123456789012345678ULL; s.hi = 0;
+        const double got = gpudb::native_avg_decimal(s, 7, 2);
+        const long double want_ld = static_cast<long double>(s.lo) /
+                                    (static_cast<long double>(7) * 100.0L);
+        const double want = static_cast<double>(want_ld);
+        EXPECT(std::memcmp(&want, &got, sizeof(double)) == 0);
+    }
+    std::printf("    ok\n");
+}
+
 void test_resident_prepare() {
     std::printf("\n--- ResidentColumn::prepare / concurrent upload ---\n");
     auto h = gpudb::make_hybrid_aggregator();
@@ -4110,6 +4181,7 @@ int main(int argc, char** argv) {
     test_direct_pso_fallback();
 #endif
     test_indexed_lanes();
+    test_native_avg();
     test_resident_prepare();
     test_hashjoin();
 

@@ -182,12 +182,17 @@ SELECT gpu_resident_info('c') LIKE 'dtype=I64 rows=7 device=% set=c origin=expli
 SELECT bytes FROM gpu_residents();
 -- expect: 16000
 
--- 22b. ... prepared: + sorted copy of the key column (8 B/row: a gpu_upload_pair
---      column is not on the narrow exact path) + its 4 B/row u32 permutation
+-- 22b. ... prepared: + the sorted copy of the key column (8 B/row: a
+--      gpu_upload_pair column is not on the narrow exact path) + its
+--      permutation. The permutation's width is BACKEND-PRIVATE, so both
+--      documented layouts are accepted here rather than one backend's choice:
+--      28000 = 16000 + 8000 sorted + 4000 for u32 row ids (Metal, and CUDA
+--      once it reaches stage C of docs/RESIDENT_COLUMNS_DESIGN.md), 32000 =
+--      16000 + 8000 sorted + 8000 for 64-bit row ids (CUDA today).
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(1000)
 -- setup: SELECT gpu_prepare_resident('p')
-SELECT bytes FROM gpu_residents();
--- expect: 28000
+SELECT bytes IN (28000, 32000) AS documented_layout FROM gpu_residents();
+-- expect: true
 
 -- 23. gpu_assert_rows on a BARE managed column: rows_seen is the upload's input count
 -- setup: CREATE TABLE t AS SELECT CASE WHEN i % 2 = 0 THEN NULL ELSE i END::BIGINT AS v FROM range(20) r(i)
