@@ -26,6 +26,15 @@ _PP = os.environ.get("PYTHONPATH")
 ENV = dict(os.environ, PYTHONPATH=os.pathsep.join([PKG] + ([_PP] if _PP else [])))
 
 
+def load(n):
+    """Busy processes, so the child and the test are descheduled the way they
+    are on a runner with something else on it. The window between readline
+    handing the terminal back and taking it again is microseconds wide on an
+    idle box; this is what widens it."""
+    return [subprocess.Popen([sys.executable, "-c", "while True: pass"])
+            for _ in range(n)]
+
+
 def run_cmd(argv, timeout=20):
     try:
         p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -106,8 +115,28 @@ class Round:
                 got.append(chunk.decode("utf-8", "replace"))
         return "".join(got)
 
+    def read_until_after(self, first, text, timeout=60.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            r, _, _ = select.select([self.primary], [], [], 0.2)
+            if r:
+                try:
+                    chunk = os.read(self.primary, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunk = chunk.decode("utf-8", "replace")
+                self.out.append(chunk)
+                self.all.append(chunk)
+            seen = "".join(self.out)
+            head = seen.find(first)
+            if head >= 0 and text in seen[head + len(first):]:
+                return True
+        return False
+
     # ---- the sequence the suite runs, step for step ----
-    def play(self):
+    def play(self, fixed=False):
         out, send, until = self.out, self.send, self.read_until
         until("Enter .help for usage.")
         until("gpudb> ")
@@ -140,10 +169,15 @@ class Round:
         until("INTERRUPT", timeout=60)
         del out[:]
         send(b"SELECT 3 AS still_here;\n")
-        until("still_here", timeout=60)
-        self.mark("still_here matched")
-        del out[:]
-        until("gpudb> ")
+        if fixed:
+            until("│", timeout=60)
+            self.mark("answer matched")
+            self.read_until_after("│", "gpudb> ")
+        else:
+            until("still_here", timeout=60)
+            self.mark("still_here matched")
+            del out[:]
+            until("gpudb> ")
         self.mark("prompt matched")
         del out[:]
         send(b"\x04")
@@ -232,7 +266,45 @@ def shape(r):
     return "?"
 
 
+def real(n):
+    """The suite's own `interactive()`, over and over: the measurement that
+    counts once the sequence has been fixed."""
+    import io
+    import contextlib
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_shell
+    fails = 0
+    for i in range(1, n + 1):
+        del test_shell.FAILS[:]
+        del test_shell.SKIPS[:]
+        buf = io.StringIO()
+        t0 = time.time()
+        with contextlib.redirect_stdout(buf):
+            test_shell.interactive()
+        if test_shell.FAILS:
+            fails += 1
+            print(f"[{i}/{n}] FAIL {test_shell.FAILS}\n{buf.getvalue()}", flush=True)
+        else:
+            print(f"[{i}/{n}] ok   ({time.time() - t0:4.1f}s)", flush=True)
+    print(f"\n{fails} failing rounds in {n} runs of the suite's interactive section")
+    return 1 if fails else 0
+
+
 def main():
+    busy = load(int(os.environ.get("PROBE_LOAD") or 0))
+    try:
+        return _main()
+    finally:
+        for b in busy:
+            b.kill()
+
+
+def _main():
+    if len(sys.argv) > 1 and sys.argv[1] == "real":
+        return real(int(sys.argv[2]) if len(sys.argv) > 2 else 40)
+    fixed = len(sys.argv) > 1 and sys.argv[1] == "fixed"
+    if fixed:
+        del sys.argv[1]
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 40
     print(run_cmd([sys.executable, "-c",
                    "import readline;print(readline.__doc__, "
@@ -241,7 +313,7 @@ def main():
     for i in range(1, n + 1):
         r = Round(i)
         try:
-            rc = r.play()
+            rc = r.play(fixed)
             s = shape(r)
             shapes[s] = shapes.get(s, 0) + 1
             if rc == 0:
@@ -251,7 +323,7 @@ def main():
                 print(f"[{i}/{n}] HANG rc={rc} prompt={s}\n{r.diagnose()}\n{'=' * 70}", flush=True)
         finally:
             r.cleanup()
-    print(f"\n{fails} hangs in {n} rounds; prompt shapes {shapes}")
+    print(f"\n{fails} hangs in {n} rounds of the {'fixed' if fixed else 'old'} sequence; prompt shapes {shapes}")
     return 1 if fails else 0
 
 

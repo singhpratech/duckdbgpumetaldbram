@@ -12,13 +12,15 @@ jobs:
       - uses: actions/checkout@v4
       - run: python3 python/tests/probe_eof_window.py
 
-  probe:
-    name: shell ctrl-d loop
+  loop:
+    name: ${{ matrix.mode }} load=${{ matrix.load }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6]
+        mode: [old, fixed, real]
+        load: [0, 8]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -26,10 +28,13 @@ jobs:
           python3 -m pip install --quiet --upgrade pip
           python3 -m pip install --quiet duckdb py-spy
           python3 -c "import readline; print(readline.__doc__, getattr(readline, '_READLINE_LIBRARY_VERSION', '?'))"
-          python3 -c "import sys; print(sys.version)"
-          cat /proc/sys/kernel/yama/ptrace_scope || true
-      - name: loop the interactive sequence
-        run: |
-          python3 python/tests/probe_ctrl_d.py ${PROBE_N:-80}
+          nproc
+      - name: loop
         env:
-          PROBE_N: 80
+          PROBE_LOAD: ${{ matrix.load }}
+        run: |
+          case "${{ matrix.mode }}" in
+            old)   python3 python/tests/probe_ctrl_d.py 80 ;;
+            fixed) python3 python/tests/probe_ctrl_d.py fixed 80 ;;
+            real)  python3 python/tests/probe_ctrl_d.py real 80 ;;
+          esac
