@@ -4682,3 +4682,48 @@ are below the 1,000,000-row floor and every one of them wins, because what
 native runs on every statement is the lane, and the device runs it once, during
 the upload. The floor now counts the largest table the statement's answer
 depends on, the tables a lane reads included.
+
+### TPC-H coverage, `main` against this branch
+
+`scripts/tpch_coverage.py`, two interleaved rounds per scale factor (main,
+branch, main, branch), nothing else on the machine, the wrapper's default
+device-memory budget.
+
+| | SF1 round 1 | SF1 round 2 | SF10 round 1 | SF10 round 2 |
+|---|---|---|---|---|
+| main | 15 / 22 | 15 / 22 | 17 / 22 | 17 / 22 |
+| branch | **17 / 22** | **17 / 22** | 17 / 22 | 17 / 22 |
+
+Every query's rows are identical to native on both sides, at both scale
+factors, in both rounds.
+
+**SF1: two queries move onto the device and none moves off.**
+
+| query | native ms (r1 / r2) | rewritten ms (r1 / r2) | ratio | the bound that used to decline it |
+|---|---|---|---|---|
+| Q15 | 4.2 / 4.6 | 2.3 / 2.7 | 1.85× / 1.72× | `selectivity 0.04 < 0.5 for the plain form` |
+| Q22 | 14.1 / 13.7 | 1.2 / 1.2 | 11.28× / 11.66× | `150000 rows < the 1000000-row floor` |
+
+Q13 was already on the device at SF1 (146K groups is under the join bound's
+300K) and stays there, 9.07× and 8.78× against main's 9.34× and 11.55×. The
+other 13 device queries take the same path with the same ratios inside
+run-to-run spread; where a gap looks wide it is native's time that moved (Q14
+at SF10 reads 8.04× against main's 14.28× on a native time of 37.0 ms against
+64.7, with the device at 4.7 ms against 4.6).
+
+**SF10: two move on, two are pushed off by the memory budget.**
+
+| query | native ms (r1 / r2) | rewritten ms (r1 / r2) | ratio |
+|---|---|---|---|
+| Q13 | 201.0 / 199.3 | 17.5 / 18.0 | 11.51× / 11.04× |
+| Q15 | 41.2 / 47.4 | 17.0 / 17.0 | 2.42× / 2.79× |
+
+and, in both rounds, Q18 and Q19 report `native (memory)` on the branch where
+main answers them on the device (15.34× / 16.06× and 14.53× / 14.78×). This is
+the device-memory budget, not a threshold: the 22 queries back to back already
+hold more at SF10 than the wrapper's default budget (a quarter of unified
+memory, 16 GiB on this machine), the sets Q13 and Q15 upload are two more, and
+a set younger than the eviction floor cannot be evicted to make room. Nothing
+runs slower than native — a set the budget refuses makes the statement native,
+which is what `reason == "memory"` means. The same comparison with a budget
+that holds the working set is below.
