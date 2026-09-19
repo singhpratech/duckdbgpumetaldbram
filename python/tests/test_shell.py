@@ -358,6 +358,22 @@ def interactive():
         while data:
             data = data[os.write(primary, data):]
 
+    def interrupt_at_the_prompt(tries=8, timeout=5.0):
+        """^C at the prompt, repeated until the shell answers with its own `^C`.
+
+        `input()` looks for a signal only where the `select()` inside readline
+        returns EINTR, so a SIGINT that lands in the instant readline is
+        digesting the previous keystroke stays pending, unseen, until the next
+        byte arrives — and it is THAT byte's line which is then thrown away.
+        Nothing is printed while it is pending, so the only way to tell the
+        shell is waiting again is to ask a second time."""
+        for _ in range(tries):
+            send(b"\x03")
+            if read_until("^C", timeout=timeout):
+                return True
+            timeout = 2.0
+        return False
+
     def read_until(text, timeout=60.0, after=None):
         """Wait for `text` in what the terminal has sent. `after` waits for it
         BEYOND an earlier marker — which clearing the buffer cannot do, because
@@ -410,13 +426,19 @@ def interactive():
         del out[:]
         send(b"SELECT 1 AS thrown_away")
         read_until("thrown_away")
-        send(b"\x03")                       # ^C with a half-typed line
-        read_until("gpudb> ")
+        took = interrupt_at_the_prompt()    # ^C with a half-typed line
+        # the prompt that FOLLOWS the shell's own `^C` line, never one that was
+        # already on screen: `after=` looks past a marker instead of clearing
+        # the buffer, which cannot separate them
+        read_until("gpudb> ", after="^C")
         del out[:]
         send(b"SELECT 2 AS after_ctrl_c;\n")
-        check(read_until("│") and "after_ctrl_c" in "".join(out)
-              and "thrown_away" not in "".join(out),
-              "^C throws away the half-typed line, the next statement runs on its own")
+        boxed = read_until("│")
+        seen = "".join(out)
+        check(took and boxed and "after_ctrl_c" in seen and "thrown_away" not in seen,
+              f"^C throws away the half-typed line, the next statement runs on its own "
+              f"(^C answered={took}, box={boxed}, statement={'after_ctrl_c' in seen}, "
+              f"old line gone={'thrown_away' not in seen}, saw {seen[-240:]!r})")
 
         # ^C flushes the terminal's queues, so the long statement has to be read
         # by the shell (prompt seen, line echoed) before the signal is sent
