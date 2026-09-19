@@ -2655,6 +2655,107 @@ and writes canonical settings over canonical ones, which is not a change of
 reading (`pselect6`, and the second `^D` was answered at once). And anything
 gpudb-specific: the control has no gpudb in it.
 
+## 2026-09-19 — The other build path, unexercised since the rewriting began
+
+Everything in this journal was built and measured through `./scripts/build.sh`,
+`scripts/run_sql_tests.sh` and the Python suites. None of it is what a user
+gets from `INSTALL gpudb FROM community`: that comes from the root `Makefile`,
+which the community-extensions pipeline drives, and which builds only the
+loadable extension against the vendored C API headers
+(`third_party/duckdb_capi/`, stable C_STRUCT ABI, `TARGET_DUCKDB_VERSION=v1.2.0`)
+with the `extension-ci-tools` submodule. Dozens of merges had gone by without
+anyone running it. This is what it does today.
+
+**It builds, and the artifact is complete.** `git submodule update --init`
+(pinned at `81e38c2`, on both `v1.5-variegata` and `v1.5.5`), then `make
+configure && make release`: `cmake -DEXTENSION_NAME=gpudb … -DGPUDB_BUILD_EXT=ON
+-DGPUDB_BUILD_TESTS=OFF -DGPUDB_BUILD_BENCH=OFF`, Metal on, 8 warnings, no
+errors, and `append_extension_metadata.py` stamps `abi_type=C_STRUCT`,
+`duckdb_version=v1.2.0`, `duckdb_platform=osx_arm64`. The `.duckdb_extension`
+is 1.6 MB. Copied OUTSIDE the repository and loaded by path from a DuckDB that
+has never seen the source tree, it registers **64 `gpu_*` functions** —
+`gpu_build_info()` reports `compiled=cpu,metal runtime=metal exact=true
+join=true global=true narrow=true store=true` — and a 2M-row `GROUP BY` through
+`gpudb.connect()` comes back rewritten onto `gpu_groupby_exact_resident`, with
+native's rows. The Metal shaders are embedded as C strings at build time and
+compiled by `newLibraryWithSource:` at run time, so there is no `.metallib` to
+find and nothing that depends on where the extension was installed from.
+
+The two CMake targets (`src/extension/CMakeLists.txt`) name the same five
+translation units; the loadable one adds `duckdb_loadable.cpp`. Nothing the
+loadable target needs lives only in the embedded-CLI target — the 64 names in
+the catalogue are the check, and they cover every function the wrapper and the
+`test/sql` suite call.
+
+**`make test` passed, and tested none of it.** The sqllogictest suite it runs
+(`test/sqllogic/`, redirected there by the `TEST_RUNNER_BASE` override so it
+does not pick up the incompatible `test/sql/` format) was one file covering
+`gpu_sum` / `gpu_min` / `gpu_max` and the v0.4 resident columns. The whole
+exact surface — the uploads, the exact GROUP BY and its `_where` / `_having` /
+`_topk` forms, the global aggregate, the materialised join, the column store,
+the staleness guard — had no coverage on the path that ships. `gpudb_exact.test`
+now covers them: a fixture with a NULL-key group, an all-NULL group and a group
+whose sum leaves 64 bits pins the 128-bit sum and the NULL semantics; the
+predicate program is checked both as a masked GROUP BY and as a global
+aggregate, including the one-row zero-count answer a `WHERE` that keeps nothing
+must give; the join drops its NULL key and its dangling row and is compared
+against native `JOIN … GROUP BY`; the store is uploaded, listed, queried,
+guarded and dropped.
+
+Nothing in it asserts a backend. That is not politeness — the CPU backend is
+the reference implementation of all of these operators (`exact_supported`,
+`global_supported` and `join_supported` all return true there), and the registry
+containers have no GPU. Rebuilt with `-DGPUDB_ENABLE_METAL=OFF`, both sqllogic
+files pass unchanged, which is the machine the registry actually builds on. Worth
+recording while looking: the Linux legs of that pipeline run inside a container
+with `LINUX_CI_IN_DOCKER=1`, and `base.Makefile` turns the test target into a
+no-op there — so these tests are the macOS legs' to run.
+
+**A client and an extension can be different ages.** The wrapper is installed
+from PyPI and the extension by `INSTALL gpudb FROM community`; the registry
+serves one version at a time. Pointing today's wrapper at the v0.6.0 binary the
+registry actually served (it was sitting in `~/.duckdb/extensions/v1.5.5/`)
+showed what that costs: `gpu_build_info()` answers, so the connection thought it
+had a Metal backend, and then every statement uploaded a 2M-row table through
+`gpu_upload_begin` (absent), rendered a statement naming `gpu_assert_rows`
+(absent), failed, and was answered natively. No wrong answer anywhere and no
+traceback — but wasted work on every statement, catalogue errors in the log, and
+a `detail` that said *the resident set is not ready yet* when the truth was that
+the extension was three versions old.
+
+The fix is one catalogue query at probe time. `REQUIRED_FUNCTIONS` lists every
+function the client can name — including the ones composed at render time, whose
+suffixes no grep for a literal would find — and if the loaded extension is short
+of any of them the connection reports no backend at all, exactly as it does when
+nothing is loaded, with `last_rewrite()["detail"]` and the new
+`Connection.extension_note` saying which functions are absent and how to
+reinstall. Against the v0.6.0 binary: no uploads, no rendered statement, no
+errors, `reason="backend"` and a sentence naming the first three missing names.
+A test pins the list against a built extension, so it cannot drift from what the
+rewriter emits.
+
+**What a new user meets.** From a wheel built out of `python/` and installed into
+a fresh virtualenv with nothing else: `gpudb -c "SELECT 42"` prints the box,
+a 2M-row `GROUP BY` returns native's rows, `last_rewrite()["reason"]` is
+`backend` and the banner says `backend: none — the extension is not loaded`.
+Degraded, correct and legible. What is not there is any attempt to fetch the
+extension: `gpudb.connect()` looks at `GPUDB_EXTENSION_PATH`, then at a
+repo-relative `build-macos/` / `build-linux/`, then tries a bare `LOAD gpudb`,
+and never runs `INSTALL gpudb FROM community`. And `INSTALL` is version-shaped:
+on DuckDB 1.4.5 it is a 404 (`…/v1.4.5/osx_arm64/gpudb.duckdb_extension.gz`),
+because the registry has built gpudb for v1.5.5 only. `pyproject.toml` asks for
+`duckdb>=1.4` and `python>=3.9`, and duckdb publishes no 1.5.x wheel for 3.9 —
+so a Python 3.9 environment resolves to 1.4.5 and can never obtain the
+extension at all.
+
+Left open: the descriptor in `docs/COMMUNITY_EXTENSION_DESCRIPTION.yml` is a
+historical mirror that still describes v0.1.3, three of whose stated limitations
+(BIGINT-only GROUP BY keys, the v0.2 type plan, the CPU-wins note) are no longer
+the code's. The static-libstdc++ change for the Linux loadable extension is
+still only on its branch, so a hand-built Linux asset still carries the build
+box's `GLIBCXX_3.4.32` floor; the registry's own Linux build is made in an older
+container and does not.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

@@ -1996,6 +1996,58 @@ def run():
               f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
     con.close()
 
+    # ---- the client and the extension can be different ages -----------------
+    # The pip package and the loadable extension are installed separately
+    # (PyPI / `INSTALL gpudb FROM community`), so a client can meet an older
+    # extension than the one it was written against. That must read as a plain
+    # DuckDB connection with a sentence saying why, never as a statement
+    # naming a function the catalogue does not have.
+    from gpudb import connection as _conn
+
+    con = fresh()
+    if con._backend:                         # an extension is loaded for these tests
+        missing = con._missing_functions()
+        check(not missing,
+              f"REQUIRED_FUNCTIONS: the built extension registers every one ({missing})")
+    con.close()
+
+    # An extension one name short of what this client calls: no rewrite, no
+    # upload, the right answer, and a detail that names what is absent.
+    real = _conn.REQUIRED_FUNCTIONS
+    _conn.REQUIRED_FUNCTIONS = real + ("gpu_function_from_a_later_version",)
+    try:
+        con = fresh()
+        check(con._backend == "", "old extension: the connection reports no backend")
+        note = con.extension_note
+        check("older than this client" in note and "gpu_function_from_a_later_version" in note,
+              f"old extension: extension_note names the missing function ({note[:80]}...)")
+        rows = con.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
+        want, _ = native("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
+        last = con.last_rewrite()
+        check(rows == want, "old extension: DuckDB answers, and the rows are native's")
+        check(last["rewritten"] is False and last["reason"] == "backend",
+              f"old extension: not rewritten, reason=backend ({last['reason']})")
+        check(last["detail"] == note, "old extension: last_rewrite()['detail'] says the same")
+        check(not last["error"] and not last["fallback"],
+              "old extension: nothing failed on the way — no fallback, no error")
+        check(con.store_columns() == [] or con._backend == "",
+              "old extension: nothing was uploaded for a statement that cannot use it")
+        con.close()
+    finally:
+        _conn.REQUIRED_FUNCTIONS = real
+
+    # No extension at all: the same degraded mode, with its own sentence.
+    bare = _conn.Connection(duckdb.connect(), floor_rows=0)
+    bare.execute(SETUP)
+    check(bare._backend == "" and "is not loaded" in bare.extension_note,
+          f"no extension: extension_note says it is not loaded ({bare.extension_note[:60]}...)")
+    rows = bare.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
+    want, _ = native("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
+    check(rows == want, "no extension: DuckDB answers, and the rows are native's")
+    check(bare.last_rewrite()["detail"] == bare.extension_note,
+          "no extension: last_rewrite()['detail'] says it too")
+    bare.close()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0
