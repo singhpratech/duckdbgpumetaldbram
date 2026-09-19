@@ -447,6 +447,13 @@ class Connection:
         self._global = self._exact and self._store and "global=true" in info
         # stage C: lanes stored at their narrowest width — the memory estimate sizes them by type
         self._narrow = "narrow=true" in info
+        # The mantissa width the extension finalises avg() in. native avg over an
+        # integer type is a long double quotient, and the SQL derivation used for a
+        # DECIMAL payload can only reproduce it where long double IS double (53
+        # bits). An extension too old to report the field leaves this 0, which is
+        # "not proven" and declines the same way — see _rewrite.check_types.
+        am = re.search(r"avgf=(\d+)", info)
+        self._avg_float_bits = int(am.group(1)) if am else 0
         dm = re.search(r"device_memory=(\d+)", info)
         self._device_bytes = int(dm.group(1)) if dm else 0   # 0 = the backend does not report it (§5.5)
         try:
@@ -2183,7 +2190,8 @@ class Connection:
                 for n, c in computed.items())
             probe_from = f"(SELECT *, {proj} FROM {base_from}) gpudb_c"
         try:
-            _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False))
+            _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False),
+                                 avg_float_bits=getattr(self, "_avg_float_bits", 0))
         except _rewrite.Decline as e:
             return Decision(False, e.reason, why=e.detail or "")
         # thresholds: the row count floor (§9.1); group estimate comes from
