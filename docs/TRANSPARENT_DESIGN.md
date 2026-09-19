@@ -261,10 +261,52 @@ The rewriter never parses SQL text itself; every decision is made on the
 tree DuckDB produced, and the SQL that runs is the SQL DuckDB unparsed.
 Failure containment (see §5.4 for the transaction rule): the rewritten
 statement raises a **typed** error for a stale set (the `gpu_assert_rows`
-text); on that error, and only on that error, the wrapper marks the set
-stale and re-runs the original text natively. Any other error from the
-rewritten statement surfaces to the user unchanged — a silent fallback on an
-arbitrary error would hide a rule 2 bug.
+text); on that error the wrapper marks the set stale and re-runs the
+original text natively. Any OTHER error from the rewritten statement is
+answered the same way and the template is kept native from then on
+(`_on_rewrite_error`, reason `error`, `last_rewrite()["fallback"]` true):
+the user's statement is the original one, so whatever went wrong in a form
+the wrapper substituted — a device allocation that failed, a set dropped
+behind its back, a bug — DuckDB answers what was actually asked. If DuckDB
+raises too, that error is the user's own and surfaces unchanged. This is not
+a silent fallback: it is recorded, it is visible in `last_rewrite()`, and it
+retires the template.
+
+**`execute()` and `sql()` take the same path.** `execute()` runs the
+statement; `sql()` hands back a *relation* that is read after the call has
+returned. Both go through one `_route`, one template cache, one set of
+thresholds, and both fall back the same way. Two things the lazy relation
+forces, and neither is papered over:
+
+* **Rule 1 is measured from side cursors on the `sql()` side.** `execute()`
+  times the user's own run and probes native once per template per interval
+  (§9.1). `sql()` has no run to time — timing the bind would be timing the
+  wrong thing — so it times the rewritten form and the original on a cursor
+  each, at most once per template per interval, and writes the verdict into
+  the same decision `execute()` uses. A template the two calls share is
+  measured once for both. The caller's relation is never the experiment.
+  The pair costs one execution more than the single native probe `execute()`
+  already pays, and it is spent on the same terms: `execute()` measures a
+  template after its third rewritten run, so `sql()` measures one after its
+  third sighting. A statement asked once is never made three times as slow
+  to settle a question about a template that is not coming back — and the
+  thresholds, which cost nothing, have already decided that one.
+* **The output-size check waits.** `_check_output_size` reads the operator's
+  `rows_out` *after* it has run, which through `sql()` is after the call has
+  returned. The decision keeps `output_checked` false, so the first
+  `execute()` of that template performs it. It is not attempted at bind
+  time: the only stats available then are the previous statement's, and
+  declining a template on another statement's numbers would be worse than
+  declining it late.
+
+Staleness is brought back inside `sql()` rather than left to the caller: the
+rewritten statement's own `gpu_assert_rows` guard is run once, on a side
+cursor, before the relation leaves the wrapper (one `count(*)` per base
+table the statement reads). A write that commits between that check and the
+caller's first fetch still reaches the relation's own guard and raises
+there, where the wrapper is no longer in the call; `execute()` on the same
+statement is the way back, and that is exactly what the shell's `recover()`
+does. The same holds for any error that only appears at materialisation.
 
 ### 3.4 What this removes from the plan
 No C++ extension API migration; `third_party/duckdb_capi/` and
@@ -1494,6 +1536,22 @@ and the gate are the proof. Join results are still copies — stage D.
    `python/gpudb/connection.py`), which is also what the gate
    parses. `EXPLAIN` of the rewritten statement shows the `gpu_*` table
    function in the plan.
+   Beside `reason` it carries **`detail`**: one sentence, for a person rather
+   than a program, saying what the reason was about. `reason` stays the short
+   code a caller matches on and never moves; `detail` explains it, and it is
+   written by whoever took the decision rather than reconstructed afterwards —
+   a threshold hands over its own text (`7 groups < 1000`, `selectivity 0.09 <
+   0.5 for the plain form`), the matcher hands over the expression it could
+   not express, a measured decline hands over the two times it compared
+   (`measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)`), a
+   set that is not ready hands over what it is waiting on, and a rewritten
+   statement names the path it took (`the resident GROUP BY`, `a key join
+   materialised on the device`, `the global masked aggregate — no GROUP BY,
+   one pass, one row`). It is empty when the reason is the whole answer. The
+   quantities in it are the ones the decision actually used: a decline that
+   measured 0.9x prints 0.9x. Every client reads the same sentence — the
+   shell's footer and `.gpu` print `detail` verbatim rather than inventing
+   their own wording, which is why it lives here and not in `_shell.py`.
    Two forms the reference renderer and the scalar both produce, settled
    while building them (2026-09-03): a `HAVING count(*) <cmp> n` beside
    `sum(v)` uses the SUM function and carries the count predicate in the

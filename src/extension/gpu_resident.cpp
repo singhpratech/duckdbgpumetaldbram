@@ -99,6 +99,7 @@
 #include "gpu_resident.hpp"
 #include "gpu_sum_extension.hpp"
 #include "gpu_backend.hpp"
+#include "backend_notes.hpp"
 #include "resident_shed_note.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
@@ -2552,6 +2553,7 @@ void drop_column_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb
 struct StoreColumnsRow {
     std::string store, catalog, schema, table, column, dtype;
     std::int64_t table_oid = -1, rows = 0, bytes = 0, epoch = 0, uploaded_at_us = 0, last_used_at_us = 0;
+    std::int64_t width = 0;     // storage width of the lane in bytes; 0 = the backend does not say
     bool prepared = false;
 };
 struct StoreColumnsInit { std::vector<StoreColumnsRow> rows; std::size_t offset = 0; };
@@ -2575,6 +2577,11 @@ void store_columns_bind(duckdb_bind_info info) {
     add("epoch",        DUCKDB_TYPE_BIGINT);
     add("uploaded_at",  DUCKDB_TYPE_TIMESTAMP);
     add("last_used_at", DUCKDB_TYPE_TIMESTAMP);
+    // Added after the columns above, so a caller that reads this table
+    // positionally keeps reading the same values it always did. NULL when the
+    // backend leaves no width note (src/include/backend_notes.hpp): an absent
+    // answer, not a width of zero.
+    add("width",        DUCKDB_TYPE_BIGINT);     // bytes per row of the lane (stage C)
 }
 
 void store_columns_init(duckdb_init_info info) {
@@ -2593,6 +2600,7 @@ void store_columns_init(duckdb_init_info info) {
                 r.rows = static_cast<std::int64_t>(c.col->rows());
                 r.bytes = static_cast<std::int64_t>(c.col->resident_bytes());
                 r.prepared = c.col->prepared();
+                r.width = static_cast<std::int64_t>(gpudb::lane_storage_width(*c.col));
                 r.epoch = static_cast<std::int64_t>(st.epoch);
                 r.uploaded_at_us = c.uploaded_at_us;
                 r.last_used_at_us = c.last_used_at_us.load();
@@ -2637,6 +2645,13 @@ void store_columns_function(duckdb_function_info info, duckdb_data_chunk output)
         set_i64(7, i, r.rows); set_i64(8, i, r.bytes);
         static_cast<bool*>(duckdb_vector_get_data(vec(9)))[i] = r.prepared;
         set_i64(10, i, r.epoch); set_ts(11, i, r.uploaded_at_us); set_ts(12, i, r.last_used_at_us);
+        if (r.width > 0) {
+            set_i64(13, i, r.width);
+        } else {
+            duckdb_vector v = vec(13);
+            duckdb_vector_ensure_validity_writable(v);
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(v), i);
+        }
     }
     duckdb_data_chunk_set_size(output, out_n);
     init->offset += static_cast<std::size_t>(out_n);
@@ -2940,6 +2955,10 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   device_memory=<bytes>  → what the backend reports for the memory budget (0 = unknown, §5.5)
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
+//   device='<name>'        → what the GPU calls itself (src/include/backend_notes.hpp).
+//                            Absent on a CPU-only build and on a backend that leaves
+//                            no note; quoted because the name carries spaces, and last
+//                            on the line so a reader can find it either way
 void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
                      duckdb_vector output) {
     std::string info = "compiled=cpu";
@@ -2963,6 +2982,15 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     info += " store=true";
     info += " rebuilds=" + std::to_string(gpudb::resident_cache_rebuilds().load()) +
             "/" + std::to_string(gpudb::resident_lane_rebuilds().load());
+    // The backend leaves its device name in backend_notes.hpp when it has
+    // one; a CPU-only build leaves none and this clause is simply absent.
+    // Quotes and anything that would end the value early are dropped: the
+    // name is a label, not a channel.
+    std::string device = gpudb::device_name();
+    std::string clean;
+    for (const char c : device)
+        if (c != '\'' && c != '\n' && c != '\r') clean += c;
+    if (!clean.empty()) info += " device='" + clean + "'";
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());

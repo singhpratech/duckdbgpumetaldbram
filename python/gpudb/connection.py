@@ -43,6 +43,10 @@ STALE_MARKER = "GPUDB_STALE"
 # measured rule 1 (§9.1): a template is re-measured against native at most this often — one
 # side-cursor probe per template per interval, the user's own statement never the experiment
 _REMEASURE_S = 60.0
+# ... and how many times sql() must see a template before it measures one. The
+# same number execute() waits for (three rewritten runs): sql() has no time of
+# its own to collect, so it counts sightings instead.
+_LAZY_SIGHTINGS = 3
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
            "not_found", "manual", "error", "off", "params", "multi", "memory")
@@ -139,6 +143,12 @@ class Decision:
     """Cached per (normalised template, identity, settings)."""
     rewritten: bool
     reason: str = ""
+    # The measured or estimated quantity the decision turned on, in the words
+    # of whoever took it — a threshold's own text ('7 groups < 1000'), the
+    # matcher's decline text, the two times a measurement compared. It is what
+    # last_rewrite()['detail'] is built from and it is never a second reason:
+    # a decision without anything to add leaves it empty.
+    why: str = ""
     plan: Optional[_rewrite.Plan] = None
     fqn: str = ""
     tag: str = ""
@@ -170,6 +180,9 @@ class Decision:
     # was not resident yet, against its first rewritten runs
     native_ms: Optional[float] = None
     rewritten_ms: List[float] = field(default_factory=list)
+    # sightings through sql(), which produces no time of its own: the measured
+    # rule waits for as many of them as execute() waits for timed runs
+    lazy_sightings: int = 0
     timing_checked: bool = False
     measured_declined: bool = False      # sent native by a measurement, not by the thresholds
     next_check_at: float = 0.0           # when the next side-cursor probe may run
@@ -190,6 +203,12 @@ class LastRewrite:
                                  # statement declined for residency, what the set is waiting on
     round_trip_ms: float = 0.0
     engine: str = ""             # 'scalar' (gpu_rewrite_ast) | 'python' (reference renderer)
+    # One sentence saying WHY, in the words of whoever decided: which path a
+    # rewritten statement took, or which bound declined it and the quantity it
+    # was measured or estimated against. `reason` stays the short code a
+    # program matches on; `detail` is for a person reading a footer. Empty
+    # when there is nothing to add beyond the reason.
+    detail: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return dict(self.__dict__)
@@ -306,6 +325,26 @@ class Connection:
 
     def residents(self) -> Dict[str, str]:
         return self._manager.snapshot()
+
+    def store_columns(self) -> List[Dict[str, Any]]:
+        """One entry per resident table column (stage B): the table it belongs
+        to, its name and dtype, the rows it holds and the bytes per row it is
+        stored at (`width`, None where the backend leaves no note), and the
+        backend memory it costs. Read on a side cursor, so `last_rewrite()`
+        still describes the user's last statement; an empty list on a build
+        with no extension loaded."""
+        try:
+            cur = self._raw.cursor()
+            try:
+                rows = cur.execute(
+                    'SELECT "table", "column", dtype, rows, width, bytes, prepared '
+                    "FROM gpu_store_columns() ORDER BY \"table\", \"column\"").fetchall()
+            finally:
+                cur.close()
+        except Exception:
+            return []
+        names = ("table", "column", "dtype", "rows", "width", "bytes", "prepared")
+        return [dict(zip(names, r)) for r in rows]
 
     def _refresh_settings(self) -> None:
         row = self._raw.execute(
@@ -430,6 +469,7 @@ class Connection:
                     self._log(f"threshold: measured {probe:.2f} ms rewritten vs {ms:.2f} ms native — "
                               f"template rewritten again")
                     d.rewritten, d.reason, d.measured_declined = True, "", False
+                    d.why = ""
                     d.rewritten_ms = [probe]
                     d.native_ms = ms
             return
@@ -459,12 +499,77 @@ class Connection:
         else:
             return
         best = min(d.rewritten_ms[-3:])
+        self._decide_measured(d, best, native)
+
+    def _decide_measured(self, d: "Decision", best: float, native: float) -> None:
+        """The comparison itself, shared by the two ways it is reached: the
+        user's own timed run (execute) and the pair of side-cursor probes
+        sql() has to use. Slower or even means native from here on."""
         if best >= native:
             self._log(f"threshold: measured {best:.2f} ms rewritten vs {native:.2f} ms native — "
                       f"template declined (re-measured in {_REMEASURE_S:.0f} s)")
             d.rewritten = False
             d.reason = "threshold"
             d.measured_declined = True
+            d.why = (f"measured {best:.2f} ms rewritten vs {native:.2f} ms native "
+                     f"(re-measured in {_REMEASURE_S:.0f} s)")
+
+    def _note_timing_lazy(self, query) -> None:
+        """Rule 1, measured, for `sql()`. `sql()` hands back a relation before
+        the statement has run, so there is no time of the user's own run to
+        compare — and timing the bind would be timing the wrong thing. The
+        comparison still happens, from side cursors alone: the rewritten form
+        and the original are each timed once on a cursor of their own, at most
+        once per template per _REMEASURE_S, and the verdict is written into
+        the same Decision `execute()` uses. So a template first seen through
+        `sql()` is decided by measurement like any other, and a template the
+        two calls share is measured once for both.
+
+        The caller's relation is never touched. What the pair costs is one
+        execution more than the single native probe execute() already pays,
+        and it is spent on the same terms: `execute()` measures a template
+        after its third rewritten run, so this measures one after its third
+        sighting. A statement asked once is never made three times as slow to
+        answer a question about a template that is not coming back — and the
+        thresholds, which cost nothing, have already decided that one."""
+        d = getattr(self, "_timing_decision", None)
+        if d is None or not getattr(self, "_thresholds", True) or self._last.fallback:
+            return
+        if not isinstance(query, str):
+            return
+        now = time.monotonic()
+        if self._last.rewritten:
+            rewritten_sql = self._last.sql or ""
+            if not d.probe_sql:
+                d.probe_sql = rewritten_sql
+            d.lazy_sightings += 1
+            if d.lazy_sightings < _LAZY_SIGHTINGS and not d.timing_checked:
+                return
+        elif d.measured_declined and d.probe_sql:
+            rewritten_sql = d.probe_sql
+        else:
+            return
+        if now < d.next_check_at:
+            return
+        if not rewritten_sql:
+            return
+        d.next_check_at = now + _REMEASURE_S
+        probe = self._probe_ms(rewritten_sql, None)
+        if probe is None:
+            return
+        native = self._probe_ms(query, None)
+        if native is None:
+            return
+        d.rewritten_ms.append(probe)
+        del d.rewritten_ms[:-5]
+        d.native_ms = native
+        d.timing_checked = True
+        if self._last.rewritten:
+            self._decide_measured(d, probe, native)
+        elif probe < native:
+            self._log(f"threshold: measured {probe:.2f} ms rewritten vs {native:.2f} ms native — "
+                      f"template rewritten again")
+            d.rewritten, d.reason, d.measured_declined, d.why = True, "", False, ""
 
     def _probe_ms(self, sql: str, parameters) -> Optional[float]:
         """Time one execution of `sql` on a side cursor (the caller still
@@ -514,6 +619,36 @@ class Connection:
             self._after()
         return self
 
+    def _guard_now(self) -> None:
+        """Run the rewritten statement's OWN staleness guard now, before the
+        relation `sql()` is about to build leaves the wrapper.
+
+        A rewritten statement carries `gpu_assert_rows(<tag>, count(*))`, and
+        for `execute()` that is enough: the guard runs inside the statement,
+        raises GPUDB_STALE there, and the wrapper answers natively in the
+        `except` around it. A relation is read after `sql()` has returned, so
+        its guard fires where nothing can catch it — the user would see a
+        GPUDB_STALE error for a statement plain DuckDB answers. Running the
+        same guard here, on a side cursor, moves that raise back inside
+        `sql()`, where `_on_stale` and the native re-run are.
+
+        It costs one `count(*)` per base table the statement reads (DuckDB
+        answers it from the table's own count, ~0.05 ms). What it does NOT do
+        is close the window completely: a write that commits between this
+        check and the caller's first fetch still reaches the relation's own
+        guard. `execute()` on the same statement is the way back from that,
+        and it is what `_shell.Shell.recover` does."""
+        if not self._last.rewritten:
+            return
+        d = getattr(self, "_last_decision", None)
+        if d is None or d.plan is None:
+            return
+        cur = self._raw.cursor()
+        try:
+            cur.execute(_rewrite.guard_statement(d.plan, d.fqn, d.tag)).fetchall()
+        finally:
+            cur.close()
+
     def _on_rewrite_error(self, e: Exception) -> None:
         """The rewritten statement failed for a reason that is not staleness:
         answer natively now, and keep this template native from here on (its
@@ -521,6 +656,10 @@ class Connection:
         self._last.fallback = True
         self._drop_plans()
         self._last.error = str(e)[:300]
+        # the decision was taken before the statement ran, so its sentence is
+        # re-read now that the statement's own answer is known
+        self._last.detail = ("the rewritten statement failed and DuckDB answered the original: "
+                             + self._last.error.splitlines()[0])
         self._log(f"rewritten statement failed, answered natively: {str(e)[:160]}")
         d = getattr(self, "_last_decision", None)
         if d is not None:
@@ -566,12 +705,34 @@ class Connection:
                       f"template declined from now on")
             d.rewritten = False
             d.reason = "threshold"
+            d.why = f"{rows_out} rows returned by the resident operator > {bound} (output-bound)"
 
     def sql(self, query, **kw):
-        sql = self._route(query, None)
+        """`duckdb.sql`: a RELATION over the statement, rewritten where the
+        decision says so. It takes the same decision path as `execute()` —
+        the same cache, the same thresholds, the same staleness and error
+        fallbacks, the same measured rule 1 — with the two differences a lazy
+        relation forces, both written up in docs/TRANSPARENT_DESIGN.md §3.3:
+
+          * rule 1 is measured from side cursors on both sides here, because
+            the statement has not run when this call returns
+            (`_note_timing_lazy`);
+          * the operator's output size (`_check_output_size`) is read after a
+            run, so it is left to the first `execute()` of the same template;
+            the decision keeps `output_checked` False until then.
+
+        An error the rewritten form raises only when the relation is finally
+        read is outside this call and cannot be answered here; the wrapper's
+        `execute()` re-run remains the way back (the shell does exactly that,
+        `_shell.Shell.recover`)."""
+        # DuckDB's own `params` kwarg: a parameterised statement is one the
+        # rewrite may not touch, exactly as in execute().
+        parameters = kw.get("params")
+        sql = self._route(query, parameters)
         self._manager.statement_begin()
         try:
             try:
+                self._guard_now()
                 rel = self._raw.sql(sql, **kw)
                 # the relation binds here; reading its columns is what forces
                 # that bind to have happened, so a rewritten statement that
@@ -582,10 +743,18 @@ class Connection:
                 # nothing.
                 if self._last.rewritten:
                     _ = rel.columns
+                self._note_timing_lazy(query)
                 return rel
             except duckdb.Error as e:
                 if self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
+                    return self._raw.sql(query, **kw)
+                if self._last.rewritten and "INTERRUPT" not in str(e).upper():
+                    # Rule 2, as in execute(): the user's statement is the ORIGINAL
+                    # one. Whatever went wrong in the rewritten form, DuckDB answers
+                    # the original — and if that raises too, it is DuckDB's own error
+                    # for the user's own statement.
+                    self._on_rewrite_error(e)
                     return self._raw.sql(query, **kw)
                 raise
         finally:
@@ -657,6 +826,8 @@ class Connection:
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
         self._drop_plans()
+        self._last.detail = ("the data moved under the resident set, so DuckDB answered "
+                             "the original and the set is being rebuilt")
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
         # a joined set: the error does not say which table moved, so every table the
         # statement reads is suspect — the sources' stores go with the set's own
@@ -813,9 +984,86 @@ class Connection:
         self._deallocate(names)
 
     def _route(self, query: Any, parameters) -> Any:
-        """Return the SQL to run in place of `query`."""
+        """Return the SQL to run in place of `query`, and leave
+        `last_rewrite()` describing the decision — including its `detail`,
+        which the body fills in where it knows better and `_detail()`
+        composes from the decision otherwise."""
+        out = self._route_body(query, parameters)
+        if not self._last.detail:
+            try:
+                self._last.detail = self._detail()
+            except Exception:                       # a diagnostic never fails a statement
+                self._last.detail = ""
+        return out
+
+    # The sentence behind a reason code that has nothing else to say. Kept
+    # here rather than in the shell: the reason is the wrapper's, so its
+    # wording is too, and every client reads the same words.
+    _REASON_TEXT = {
+        "off": "the transparent path is off on this connection",
+        "backend": "this build has no GPU backend to rewrite for",
+        "transaction": "a transaction is open, so the resident sets cannot be trusted",
+        "too_long": f"the statement is longer than the {_MAX_STATEMENT_BYTES} bytes the wrapper parses",
+        "params": "the statement takes parameters",
+        "multi": "more than one statement in the call",
+        "shape": "not a shape the rewrite expresses",
+        "manual": "residency is manual and this set was not uploaded by hand",
+        "not_found": "the statement's FROM does not resolve to one base table",
+        "view": "the name is a view, which has no identity of its own",
+        "temp": "the table is temporary",
+        "ambiguous": "the name resolves to more than one table",
+        "nulls": "a column this path needs carries NULLs",
+        "overflow": "the sum can leave the 64-bit range",
+        "double": "a DOUBLE this path does not carry",
+        "decimal": "a DECIMAL this path does not carry",
+        "collation": "a collation other than binary is in force",
+        "error": "the rewrite raised while deciding",
+    }
+
+    def _detail(self) -> str:
+        """`last_rewrite()['detail']`: one sentence for a person."""
+        last = self._last
+        d = getattr(self, "_detail_decision", None)
+        if last.fallback and last.error:
+            return ("the rewritten statement failed and DuckDB answered the original: "
+                    + last.error.splitlines()[0])
+        if last.rewritten:
+            return self._rewritten_detail(d)
+        why = (d.why if d is not None else "") or ""
+        reason = last.reason
+        if reason in ("not_resident", "memory"):
+            base = ("the resident set is not ready yet" if reason == "not_resident"
+                    else "the set does not fit the device-memory budget")
+            first = (last.error or "").splitlines()[0] if last.error else ""
+            return f"{base}: {first}" if first else base
+        text = self._REASON_TEXT.get(reason, "")
+        if why and text:
+            return f"{text}: {why}"
+        return why or text
+
+    def _rewritten_detail(self, d: Optional["Decision"]) -> str:
+        """Which path a rewritten statement took."""
+        if self._last.engine == "nested":
+            n = len([t for t in self._last_tags if t])
+            return (f"a rewritable SELECT inside the statement runs on the device "
+                    f"({n} resident set{'' if n == 1 else 's'}); the rest stays DuckDB's")
+        if d is None:
+            return "the resident exact path"
+        if d.join is not None:
+            path = ("a key join whose result is uploaded as one set" if ":joinu-" in (d.tag or "")
+                    else "a key join materialised on the device")
+        elif d.plan is not None and getattr(d.plan, "no_key", False):
+            path = "the global masked aggregate — no GROUP BY, one pass, one row"
+        else:
+            path = "the resident GROUP BY"
+        if d.wrap is not None:
+            path += ", with DuckDB evaluating the expressions over its aggregates"
+        return path
+
+    def _route_body(self, query: Any, parameters) -> Any:
         self._last = LastRewrite(statement=query if isinstance(query, str) else "")
         self._timing_decision = None
+        self._detail_decision = None
         self._last_tags = []
         if not isinstance(query, str):
             self._last.reason = "shape"
@@ -833,6 +1081,9 @@ class Connection:
             agg = _maybe_aggregate(query, sg)         # two DOTALL regexes over the text: run once
             if not big or (not agg and not self._names_view(query)):
                 self._last.reason = "threshold" if agg else "shape"
+                self._last.detail = (
+                    f"the statement names no table at or above the {self._floor_rows}-row floor"
+                    if not big else "no GROUP BY and no aggregate the rewrite reads")
                 return query
         # DuckDB's splitter is a round trip, and what it answers depends on the
         # text alone — so the same text is split once (§5.2 is unchanged: every
@@ -992,6 +1243,7 @@ class Connection:
         self._last = LastRewrite(statement=sql)
         self._timing_decision = None
         self._last_decision = None
+        self._detail_decision = d        # the nested statement's own decision, not a sub-statement's
         if not any(outs):
             self._last.reason = "not_resident" if pending else "threshold"
             if pending:
@@ -1175,11 +1427,13 @@ class Connection:
             if v is None:
                 if len(d.variants) >= 16:
                     self._last.reason = "threshold"
+                    self._last.detail = "16 literal variants of one template already decided"
                     return None
                 v = self._decide(sql)
                 v.literals = literals
                 d.variants[literals] = v
             d = v
+        self._detail_decision = d
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if not d.rewritten:
             self._last.reason = d.reason
@@ -1566,7 +1820,7 @@ class Connection:
         d = self._decide(inner_sql, allow_split=False, reagg=reagg, global_agg=is_global)
         if not d.rewritten:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
-            return Decision(False, d.reason)
+            return Decision(False, d.reason, why=d.why or "the GROUP BY under the expressions declined")
         head, tail = outer_sql.split(_split.PLACEHOLDER)
         if is_global:
             # no GROUP BY: one row even when nothing qualifies, as native
@@ -1608,16 +1862,16 @@ class Connection:
     def _decide_body(self, sql: str, mode: str, reagg: bool = False,
                      global_agg: bool = False) -> Decision:
         if global_agg and not getattr(self, "_global", False):
-            return Decision(False, "backend")
+            return Decision(False, "backend", why="this backend has no global masked aggregate")
         try:
             plan, low, computed = self._match(sql, mode)
         except _rewrite.Decline as e:
             if e.detail:
                 self._log(f"declined ({e.reason}, {mode}): {e.detail}")
-            return Decision(False, e.reason)
+            return Decision(False, e.reason, why=e.detail or "")
         except Exception as e:
             self._log(f"rewrite error: {e}")
-            return Decision(False, "error")
+            return Decision(False, "error", why=str(e)[:160])
         if low is None:
             ident, why = _resolve.resolve(self._raw, plan.catalog, plan.schema, plan.table)
             if ident is None:
@@ -1647,7 +1901,8 @@ class Connection:
             biggest = max(t.rows for t in low.tables)
             if join_rows > min(4 * biggest, 0xFFFFFFFF - 64):
                 self._log(f"declined (threshold): the join returns {join_rows} rows from tables of at most {biggest}")
-                return Decision(False, "threshold", is_join=True)
+                return Decision(False, "threshold", is_join=True,
+                                why=f"the join returns {join_rows} rows from tables of at most {biggest}")
             columns = dict(columns)
             for cname, comp in computed.items():
                 columns[cname] = comp.lane_type
@@ -1667,13 +1922,14 @@ class Connection:
         try:
             _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False))
         except _rewrite.Decline as e:
-            return Decision(False, e.reason)
+            return Decision(False, e.reason, why=e.detail or "")
         # thresholds: the row count floor (§9.1); group estimate comes from
         # the resident set once it exists
         nrows = (max(t.rows for t in low.tables) if low is not None     # the largest joined table decides
                  else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
         if nrows < self._floor_rows:
-            return Decision(False, "threshold")
+            return Decision(False, "threshold",
+                            why=f"{nrows} rows < the {self._floor_rows}-row floor")
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
         stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
@@ -1701,16 +1957,19 @@ class Connection:
                                   "min_raw": st.min, "max_raw": st.max}   # temporal bounds stay text
                 continue
             if st is None or st.has_null:
-                return Decision(False, "nulls")
+                return Decision(False, "nulls",
+                                why=f"no statistics for {col}" if st is None else f"{col} carries NULLs")
             stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
                           "approx_unique": st.approx_unique}
             if col == plan.val and plan.needs_sum:
                 try:
                     bound = max(abs(float(st.min)), abs(float(st.max))) * (10 ** plan.scale)
                 except ValueError:
-                    return Decision(False, "overflow")
+                    return Decision(False, "overflow",
+                                    why=f"the bounds of {col} do not read as numbers")
                 if nrows * bound >= 2.0 ** 63:
-                    return Decision(False, "overflow")
+                    return Decision(False, "overflow",
+                                    why=f"{nrows} rows x a bound of {bound:.0f} can pass 2^63")
         if plan.dict_key or any(t in _rewrite._STRING_TYPES for t in plan.pred_types.values()):
             # byte-wise dictionary: only under binary collation, column and session
             coll = (self._settings["default_collation"] or "").lower()
@@ -1782,7 +2041,8 @@ class Connection:
                         est = max(1, min(est, int(kept)))
                 except Exception as e:
                     self._log(f"selectivity probe failed: {e}")
-                    return Decision(False, "threshold")
+                    return Decision(False, "threshold",
+                                    why=f"the WHERE's selectivity could not be measured: {str(e)[:100]}")
             # a lane with a subquery (EXISTS / IN / correlated scalar, §4.18) makes native run a
             # join too, whatever the FROM says: the join bounds apply
             ok, why = _thresholds.decide(self._backend, plan.form, est, sel, bool(plan.where),
@@ -1794,12 +2054,12 @@ class Connection:
                                          where_terms=len(plan.where))
             if not ok:
                 self._log(f"threshold: {why}")
-                return Decision(False, "threshold")
+                return Decision(False, "threshold", why=why)
         try:
             described = self._raw.execute("DESCRIBE " + sql).fetchall()
             _rewrite.apply_describe(plan, [(r[0], r[1]) for r in described])
         except _rewrite.Decline as e:
-            return Decision(False, e.reason)
+            return Decision(False, e.reason, why=e.detail or "")
         except Exception as e:
             self._log(f"describe failed: {e}")
             return Decision(False, "error")
@@ -1841,7 +2101,7 @@ class Connection:
                       else _join.plan_residency(low, plan, computed))
             except _rewrite.Decline as e:
                 self._log(f"declined ({e.reason}): {e.detail}")
-                return Decision(False, e.reason)
+                return Decision(False, e.reason, why=e.detail or "")
             except ValueError:
                 return Decision(False, "shape")          # an identifier the tag cannot carry
             plan.tag = jr.tag
@@ -1928,7 +2188,9 @@ class Connection:
                 else:
                     self._log(f"scalar declined ({info.get('reason')}: {info.get('detail', '')}); "
                               f"reference matcher accepted — following the scalar")
-                    return Decision(False, info.get("reason") or "shape")
+                    return Decision(False, info.get("reason") or "shape",
+                                    why=((info.get("detail") or "") +
+                                         " (the extension's renderer declined)").strip())
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form

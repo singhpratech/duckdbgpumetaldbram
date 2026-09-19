@@ -16,6 +16,7 @@
 //     IEEE-754 double precision in MSL.
 
 #include "gpu_backend.hpp"
+#include "backend_notes.hpp"
 #include "exact_path_note.hpp"
 #include "resident_shed_note.hpp"
 #include "../groupby_filter.hpp"
@@ -174,6 +175,11 @@ public:
             if (!device_) throw std::runtime_error("MTLCreateSystemDefaultDevice returned nil");
             queue_ = [device_ newCommandQueue];
             if (!queue_) throw std::runtime_error("Failed to create Metal command queue");
+            // backend_notes.hpp: what this GPU calls itself, and how wide a
+            // lane of ours is stored — two facts the frozen interface has no
+            // field for and gpu_build_info() / gpu_store_columns() report.
+            if (const char* n = [[device_ name] UTF8String]) set_device_name(n);
+            register_lane_width_reporter(&MetalAggregator::lane_width_note);
             sort_ctx_ = std::make_shared<SortCtx>();
             sort_ctx_->device = device_;
             sort_ctx_->queue  = queue_;
@@ -1362,6 +1368,14 @@ private:
         mutable std::atomic<bool> cache_shed_{false};
         mutable std::atomic<bool> cache_pinned_{false};
     };
+
+    // backend_notes.hpp reporter: the storage width of one of OUR columns
+    // (stage C), 0 for a column this backend did not create. A plain function
+    // pointer, so the note header needs to know nothing about this class.
+    static unsigned lane_width_note(const ResidentColumn& col) {
+        const auto* c = dynamic_cast<const MetalResidentColumn*>(&col);
+        return c ? c->width() : 0u;
+    }
 
     enum class GbMode { SumI64, SumF64, Count };
 

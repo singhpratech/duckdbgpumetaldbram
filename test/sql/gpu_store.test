@@ -173,3 +173,29 @@ SELECT gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k',
 SELECT gpu_join_materialize('jv', getvariable('p'), 'i0', getvariable('b'), 'k', 'p.k, p.v, b.v') AS joined_rows,
        (SELECT count(*) FROM gpu_store_columns() WHERE store = 'gpudb:v1:memory:main:f:' || getvariable('fo')) AS f_cols;
 -- expect: 120000  3
+
+-- 9. gpu_store_columns().width: the bytes a row of the lane is stored at (stage C).
+-- A lane is kept at the narrowest signed width its values fit, so three columns of
+-- the same 120000 rows cost 1, 2 and 8 bytes a row and say so. NULL where the
+-- backend leaves no width note (a CPU-only build), which is why the check reads
+-- 'width IS NULL OR width = n'.
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS small, (i % 30000)::INTEGER AS mid, (i * 1000000000)::BIGINT AS big, (i % 3) / 2.0 AS d FROM range(120000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SET VARIABLE st = 'gpudb:v1:memory:main:t:' || getvariable('oid') || ':small,mid,big,d:store'
+-- setup: SELECT gpu_upload_columns(getvariable('st'), rowid, [small::BIGINT, mid::BIGINT, big], [d], []::VARCHAR[]) FROM t
+SELECT (SELECT width IS NULL OR width = 1 FROM gpu_store_columns() WHERE "column" = 'small') AS small_width,
+       (SELECT width IS NULL OR width = 2 FROM gpu_store_columns() WHERE "column" = 'mid') AS mid_width,
+       (SELECT width IS NULL OR width = 8 FROM gpu_store_columns() WHERE "column" = 'big') AS big_width,
+       (SELECT width IS NULL OR width = 8 FROM gpu_store_columns() WHERE "column" = 'd') AS double_width,
+       (SELECT bool_and(rows = 120000) FROM gpu_store_columns()) AS every_column_reports_rows,
+       (SELECT bool_and(width IS NULL OR width IN (1, 2, 4, 8)) FROM gpu_store_columns()) AS widths_are_lane_widths;
+-- expect: true  true  true  true  true  true
+
+-- 10. The width column is the LAST of gpu_store_columns(), so a caller that reads
+-- the table positionally keeps reading the values it always did.
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(120000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+SELECT (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM gpu_store_columns()))[-1] AS last_column,
+       (SELECT count(*) FROM (DESCRIBE SELECT * FROM gpu_store_columns())) AS columns;
+-- expect: width  14
