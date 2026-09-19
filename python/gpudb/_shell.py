@@ -198,6 +198,9 @@ class Shell:
             return "off — every statement goes straight to DuckDB"
         if info is None:
             return "a plain DuckDB shell — every statement goes straight to DuckDB"
+        note = getattr(self.con, "extension_note", "")
+        if note:                       # loaded, but older than this client
+            return f"off — {note}"
         if "exact=true" not in info:
             return "not on this build — every statement goes straight to DuckDB"
         return "available — every statement goes through the wrapper"

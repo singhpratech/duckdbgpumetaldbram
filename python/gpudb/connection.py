@@ -18,6 +18,36 @@ from . import (_aggs, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewr
 from ._residency import MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
+
+# Every SQL function this client can put in a rendered statement or call while
+# deciding one. The loadable extension must register all of them before the
+# transparent path may run at all (`_missing_functions`): the client and the
+# extension are installed separately and can be different ages, and a name the
+# extension does not have would surface as a failed statement rather than as
+# "this is a plain DuckDB connection". Names composed at render time (the
+# `_where` / `_having` / `_topk` suffixes in _rewrite.py) are spelled out.
+# test_wrapper.py pins this list against a built extension, so it cannot rot.
+REQUIRED_FUNCTIONS = (
+    "gpu_build_info", "gpu_last_stats", "gpu_residents", "gpu_store_columns",
+    "gpu_resident_dictionary", "gpu_resident_dict_component",
+    "gpu_upload", "gpu_upload_pair", "gpu_upload_pair_exact", "gpu_upload_rows_exact",
+    "gpu_upload_columns", "gpu_upload_begin", "gpu_upload_finish", "gpu_upload_abort",
+    "gpu_upload_status", "gpu_prepare_resident", "gpu_invalidate",
+    "gpu_drop_column", "gpu_drop_resident", "gpu_note_rows", "gpu_assert_rows",
+    "gpu_groupby_sum_resident", "gpu_groupby_sum_resident_having",
+    "gpu_groupby_sum_resident_topk",
+    "gpu_groupby_count_resident", "gpu_groupby_count_resident_having",
+    "gpu_groupby_count_resident_topk",
+    "gpu_groupby_exact_resident", "gpu_groupby_exact_resident_having",
+    "gpu_groupby_exact_resident_topk", "gpu_groupby_exact_resident_where",
+    "gpu_groupby_exact_resident_where_having", "gpu_groupby_exact_resident_where_topk",
+    "gpu_groupby_exact_multi", "gpu_agg_exact_global",
+    "gpu_join_materialize", "gpu_rewrite_ast",
+)
+
+_NO_EXTENSION = ("the gpudb extension is not loaded on this connection — install it with "
+                 "`INSTALL gpudb FROM community` in DuckDB, or point GPUDB_EXTENSION_PATH "
+                 "at a built one")
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 # an aggregate without GROUP BY (§4.12). Over a join it was always worth
 # parsing; over a SINGLE table it is worth parsing since the global masked
@@ -287,6 +317,7 @@ class Connection:
         self._settings: Dict[str, str] = {}
         self._settings_key = ""
         self._backend = ""
+        self._backend_note = ""          # why there is no backend, when there is none
         self._has_rewrite_scalar = False
         self._refresh_after = False
         self._big_tables: Optional[set] = None    # names of tables above the floor (§0)
@@ -309,6 +340,7 @@ class Connection:
             self._settings = dict(_parent._settings)
             self._settings_key = _parent._settings_key
             self._backend = _parent._backend
+            self._backend_note = getattr(_parent, "_backend_note", "")
             self._has_rewrite_scalar = _parent._has_rewrite_scalar
 
     # ---- settings ----
@@ -323,6 +355,14 @@ class Connection:
     @property
     def residency(self) -> str:
         return self._residency_mode
+
+    @property
+    def extension_note(self) -> str:
+        """Empty while the loaded extension can serve this client. Otherwise
+        one sentence saying why it cannot — it is not loaded, or it is older
+        than the client and lacks functions the client calls — which is also
+        what `last_rewrite()['detail']` says for every statement."""
+        return getattr(self, "_backend_note", "")
 
     def last_rewrite(self) -> Dict[str, Any]:
         return self._last.as_dict()
@@ -376,7 +416,27 @@ class Connection:
             info = self._raw.execute("SELECT gpu_build_info()").fetchone()[0]
         except Exception:
             self._backend = ""
+            self._backend_note = _NO_EXTENSION
             return
+        missing = self._missing_functions()
+        if missing:
+            # The client and the extension ship separately: the pip package is
+            # installed from PyPI, the extension by `INSTALL gpudb FROM
+            # community`, and the registry serves one version at a time. A
+            # client newer than the extension would otherwise render
+            # statements naming functions that are not in the catalogue —
+            # every one of them failing and being answered natively, after the
+            # work of uploading a table for it. One catalogue query decides
+            # it, and the connection then behaves exactly as it does with no
+            # extension at all: every statement on DuckDB, and `detail` saying
+            # which functions are absent.
+            self._backend = ""
+            self._backend_note = (
+                "the loaded gpudb extension is older than this client: it does not provide "
+                + (", ".join(missing[:3]) + (" and %d more" % (len(missing) - 3) if len(missing) > 3 else ""))
+                + " — reinstall it with `INSTALL gpudb FROM community; LOAD gpudb;`")
+            return
+        self._backend_note = ""
         m = re.search(r"runtime=(\w+)", info)
         self._backend = (m.group(1) if m else "").upper()   # CPU | METAL | CUDA
         self._exact = "exact=true" in info                   # the v0.7 exact path runs on the GPU side
@@ -394,6 +454,18 @@ class Connection:
             self._has_rewrite_scalar = True
         except Exception:
             self._has_rewrite_scalar = False
+
+    def _missing_functions(self) -> List[str]:
+        """Which of the functions this client can name are absent from the
+        loaded extension, in the order REQUIRED_FUNCTIONS lists them. An empty
+        list means the extension is at least as new as the client."""
+        try:
+            have = {r[0] for r in self._raw.execute(
+                "SELECT function_name FROM duckdb_functions() "
+                "WHERE function_name LIKE 'gpu\\_%' ESCAPE '\\'").fetchall()}
+        except Exception:
+            return []              # no catalogue to read: leave the decision to the probe
+        return [f for f in REQUIRED_FUNCTIONS if f not in have]
 
     # ---- duckdb surface ----
     def cursor(self) -> "Connection":
@@ -1124,6 +1196,8 @@ class Connection:
             first = (last.error or "").splitlines()[0] if last.error else ""
             return f"{base}: {first}" if first else base
         text = self._REASON_TEXT.get(reason, "")
+        if reason == "backend" and getattr(self, "_backend_note", ""):
+            text = self._backend_note        # absent, or older than this client
         if why and text:
             return f"{text}: {why}"
         return why or text
