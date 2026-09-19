@@ -15,7 +15,11 @@
 # Usage: ./scripts/rewrite_parity_check.sh [build_dir] [tpch_db]
 #   tpch_db  optional data/tpch_bench/tpch_sf1.duckdb for the Q18-inner scenario
 set -u
-BUILD_DIR="${1:-build-linux}"
+case "$(uname -s)" in
+    Darwin*) DEFAULT_BUILD_DIR=build-macos ;;
+    *)       DEFAULT_BUILD_DIR=build-linux ;;
+esac
+BUILD_DIR="${1:-$DEFAULT_BUILD_DIR}"
 TPCH="${2:-data/tpch_bench/tpch_sf1.duckdb}"
 SQL="$BUILD_DIR/bin/gpudb-sql"
 [ -x "$SQL" ] || { echo "missing $SQL — run ./scripts/build.sh"; exit 2; }

@@ -29,7 +29,11 @@
 # hides contention entirely). GPUDB_UPLOAD_POOL_MAX_MB is raised to 8192 for
 # the SF10 upload unless already set.
 set -u
-BUILD_DIR="${1:-build-linux}"
+case "$(uname -s)" in
+    Darwin*) DEFAULT_BUILD_DIR=build-macos ;;
+    *)       DEFAULT_BUILD_DIR=build-linux ;;
+esac
+BUILD_DIR="${1:-$DEFAULT_BUILD_DIR}"
 DB="${2:-data/tpch_bench/tpch_sf10.duckdb}"
 THRESH="${3:-0.8}"
 BENCH="$BUILD_DIR/bin/gpudb-concurrent-bench"
