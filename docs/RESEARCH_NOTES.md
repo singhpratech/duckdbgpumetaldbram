@@ -2029,6 +2029,155 @@ against native's, the stale write caught inside the call, a parameterised
 and the per-column table. All of them pass with no extension too, which is
 where the wrapper is only a pass-through and the shell is a plain DuckDB shell.
 
+## 2026-09-19 — The index that had nowhere to be bound
+
+Stage D's first step is a mechanism, not a saving: a join result stops carrying
+a gathered copy of a joined table's column and carries one index vector per
+table instead, and the kernels read `lane[idx[row]]`. Before writing any of it I
+re-measured what stage D was aimed at, because the plan was drawn against a main
+that no longer exists.
+
+**What moved under the design.** At SF10 the 22 queries now leave 18.73 GiB
+resident, not the 22.94 the plan was drawn against: 33 sets holding 14.69 GiB
+and 35 store columns holding 4.04 GiB. The device-join sets are 3.16 GiB of
+that and the uploaded ones 11.53 — so the device joins, which are all D1
+touches, are 17 % of the problem, and the plan's own arithmetic already said so.
+Two of the three shrank for a reason worth recording: Q12's set went from 26 to
+**15 bytes a row** and Q11's from 18 to 12, because the direct row-order reduce
+replaced the key's 12-byte sort cache with a 1-byte group-id lane. Q21's is
+unchanged at 40 bytes a row and 2.4 GiB, because its key has 100,000 groups and
+still takes the sort path. Key shedding turned Q11's key lane into the `-`
+placeholder, and the base views now carry `k#` lanes.
+
+**The claim that needed correcting.** The plan priced D1 as removing 97 ms of
+gather on Q12 and 190 ms on Q21, from a table of one-rep timings. Those reps
+were cold. Hot, at SF10 and one thread, Q12 answers in **10.4 ms**, Q21 in
+**20.5 ms** and Q11 in **47.1 ms**; the join's gather runs once, when the set is
+built, and never again. So D1 cannot make a hot query faster, and the honest
+claim for it is: the residency build does less work, the device-join sets get
+smaller, and the hot statement must not get slower. That last one is the part
+that needs watching, because every kernel that reads a lane now also asks
+whether the lane has an index.
+
+**Where the index vectors had to live.** The plan put them in one buffer of
+their own with a per-slot offset, "31 argument-table slots exactly". They do not
+fit: the direct reduce already binds 0..30 — twelve lane pairs, the meta table,
+the program, the lists, the payload map, the uniform, the output and the
+group-id lane — and that is all 31 that Metal offers. The way through is that an
+index vector is *already shaped like a lane*: it has a storage width, it has a
+validity bitmap, and a NULL cell in it is exactly the NULL row an outer join
+wants. So it is bound as an ordinary lane and the lane that reads through it
+names its slot, in the word `GLaneMeta` was padding with. No new binding, no new
+pipeline, nothing new to compile — and therefore no capability gate and no
+fallback to arrange, because the kernels that gained the indirection are the
+ones this backend already builds and already falls back from. What it costs
+instead is budget: the twelve distinct lanes a statement may read now have to
+cover its index vectors too.
+
+A slot is the pair *(column, index)*, not the column: one store column read
+through two different indexes holds two different values per row and needs two
+slots. That is the sort of thing that is obvious once written down and silently
+wrong otherwise.
+
+**The bound nobody else can check.** A kernel takes an index cell and uses it as
+a row. There is no bound on the device and there should not be one — it would be
+a compare per lane per row to catch a planner bug. So the bound is proved on the
+host, once, from the index column's own minimum and maximum over its valid
+cells, and kept on the column; an index vector is read by every statement over
+its join set, so a single sequential pass at the lane's stage-C width amortises
+away. The CPU reference checks every cell, because it is the reference.
+
+**What is built.** `IndexedColumn`, the defaulted `index` fields on `Predicate`,
+`MultiPayload` and `JoinLane`, `join_index`, `indexed_supported()` and
+`groupby_exact_masked_multi_indexed` are additive in `gpu_backend.hpp` — nothing
+existing changed, which the CUDA port needs. The CPU backend implements all of
+it as the obvious loop and is the parity oracle. On Metal the indexed read is in
+`gl_load`, and through it in `gpred_eval` — so every WHERE program, on every
+path that evaluates one — and in the global masked aggregate and both shapes of
+the direct reduce. The defaults refuse an index rather than ignore one, in the
+base class and in the multi-payload fan-out, which is the only behaviour that
+cannot produce a wrong answer by omission.
+
+**Composition came free.** A chained join composes index vectors —
+`idx_new[d] = idx_old[probe_rows[d]]` — and that is a gather of the old index at
+the new probe rows, which is exactly what the materialise path already does to
+any lane. So a chain hands the previous step's index vector to the next step as
+an ordinary materialised lane and gets the composition out; there is no new
+operator for it.
+
+**Then the mechanism charged rent before anyone used it.** The read went in as
+one test inside every kernel that reads a lane — *is this lane indexed?* — and
+since no statement was indexed, the honest thing was to measure what that test
+cost before building anything on top of it. It cost 8 to 15 percent at SF10 on
+the masked kernels: Q19 1.148x, Q14 1.118x, Q6 1.116x, Q12 1.110x, against a
+main built in its own worktree and interleaved run for run at one thread. A
+mechanism that is dormant and still takes a tenth of the hot path is not a
+mechanism, it is a tax, and it would have been invisible a week later under the
+things stage D was going to add.
+
+The branch was not the problem. `row` is the row loop's induction variable, so
+the address of `lane[row]` and the word of its validity bitmap fall out of the
+loop by strength reduction; a row that comes back from a function does not, and
+every masked kernel quietly lost its address arithmetic. Two shapes were tried.
+Returning the ROW instead of the value through an out-parameter recovered some
+of it and left Q19 at 1.148x, which says the spill was never the story. What
+worked was refusing to decide at run time at all: `gl_row` and `gpred_eval` are
+templated on whether any lane of this dispatch is indexed, every kernel that
+reads a lane is compiled twice, and each dispatch picks its instance from a
+flag that is uniform over the whole grid and comes from the lane table the host
+already writes. No new uniform, no new binding, no new pipeline. With the flag
+false the kernel that runs is, instruction for instruction, the kernel that ran
+before stage D — and the last tenth came back by not writing the index slot
+into the thread's lane table when there is no index to write. Worst case across
+the 22 queries is now 1.012x at SF10 and 1.011x at SF1, with fourteen of
+seventeen device queries at or below main. That is spread.
+
+**And then the measurement said the plan was wrong.** With `join_index` and the
+indexed grouped reduce working on Metal, the obvious next question was what the
+index costs when it IS used. Sixteen million probe rows onto a two-hundred
+thousand row dimension, the same lane read through an index against the same
+lane gathered into result order: the indexed read loses by 1.16x at four groups
+and one payload, and by 1.92x at a thousand groups and three payloads. It loses
+on every shape tried, and it loses harder the more work a row brings, because
+the gather is random where the materialised read is sequential.
+
+The step-0 inventory had priced D1 as neutral on hot query time, on the
+reasoning that the join's gather runs once at residency build and hot
+statements read the result either way. That reasoning was right about the
+gather and wrong about the read: what a join set hands a hot statement is not
+the same object at all, and reading `store[idx[row]]` sixty million times is not
+free just because nobody gathered anything. The build IS faster — the join that
+returns row vectors builds 1.3 to 1.4 times quicker than the one that gathers
+lanes, and that is before the bytes it does not write — so stage D still buys
+what it was for. It just buys memory, not speed, and rule 1 for it has to be a
+memory rule.
+
+Which settles the order of the remaining work rather than delaying it. Nothing
+in SQL was switched over to index vectors in this step, and the extension and
+the wrapper were left alone deliberately: emitting index steps for the three
+device sets today would have made hot statements 1.16 to 1.9 times slower to
+save 3.16 GiB, and the one rule this project does not bend is that a query is
+never slower than it was. What the admission rule should key on — memory
+pressure against a per-statement loss that is now measured rather than guessed
+— is D2's question, and it is a better question than the one the plan asked.
+
+The sort path kept the gather for the same reason, and not as a concession: it
+reads a lane at `perm[i]`, so an index there is a second gather on a path whose
+reduce is already gather-bound. An indexed lane arriving there is gathered once
+by the operator, and the operator that ran before stage D then runs bit for bit.
+The key is always gathered too, on both paths, because everything either path
+reads a key THROUGH — the sort cache, the group-id lane, the distinct keys — is
+derived from the column and shared by every statement over it, and an index
+would make all of it per statement.
+
+**What the sweep found on the way.** `join_index` was proving `probe_identity`
+by scanning the whole probe-row vector whenever nothing had been dropped, which
+is single-threaded host work and cost four to five milliseconds at sixteen
+million rows — enough to make the indexed join look slower to build than the
+materialising one, which is how it was noticed. When every kept row is class 1
+the vector is the identity by construction; the scan now runs only for the join
+that kept every row and still put some of them in the NULL-key suffix.
+
 ## 2026-09-19 — A CTE is two things, and only one of them wants inlining
 
 The question was "the wrapper does not take a `WITH`", and the first surprise

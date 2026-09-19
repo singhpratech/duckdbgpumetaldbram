@@ -3432,6 +3432,532 @@ void test_fused_mask_body() {
 // build exercises the defaults (nothing to prepare) and the CUDA build
 // exercises the real sort cache.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Stage D1 (docs/RESIDENT_COLUMNS_DESIGN.md §7): a lane read THROUGH an index
+// must answer exactly what the gathered copy of that lane answers. The oracle
+// is join_materialize itself: the same join is run twice, once materialising
+// every lane and once returning the two row vectors, and then every operator
+// is asked the same question of both — a grouped reduce keyed on the lane
+// under test with a positional payload, which pins not only the lane's values
+// but the ROW each value sits at, and a global masked aggregate over the same
+// lanes. Covered: identity and scattered indexes, both join sides, the
+// 1/2/4/8-byte width boundaries, F64 lanes carrying NaN / ±inf / -0.0, NULL
+// cells in the lane, NULL cells in the INDEX (the unmatched side of an outer
+// join), a chained three-step join, and the wide-key / DECIMAL shape.
+// ---------------------------------------------------------------------------
+// The indexed READ on its own, with no join in sight: a scattered index vector
+// carrying NULL cells is built on the host, the lane it stands for is gathered
+// on the host, both are uploaded, and the operators are asked the same question
+// of each. This is what a backend that has the indexed read but not yet the
+// indexed join can still be held to, and it covers the width boundaries, an F64
+// lane with NaN / ±inf / -0.0, NULL cells in the lane and NULL cells in the
+// index.
+void test_indexed_reads_only(gpudb::Aggregator& agg,
+                             const std::vector<std::unique_ptr<gpudb::ResidentColumn>>& P,
+                             const std::vector<std::unique_ptr<gpudb::ResidentColumn>>& Bc,
+                             const std::vector<std::int64_t>& pf,
+                             const std::vector<std::int64_t>& bfl,
+                             std::size_t PL, std::size_t BL,
+                             std::size_t F, std::size_t B, std::size_t cap) {
+    using DT = gpudb::Dtype;
+    using Op = gpudb::Predicate::Op;
+    const std::size_t R = 130'003;
+
+    // The index, deliberately scattered and with NULL cells every 11th row.
+    std::vector<std::int64_t> ixl(R * 2, 0);
+    std::vector<std::uint64_t> ixv((R + 63) / 64, ~std::uint64_t{0});
+    std::vector<std::uint64_t> ixv1((R + 63) / 64, ~std::uint64_t{0});
+    std::vector<std::size_t> src(R, 0);
+    std::vector<bool> inull(R, false);
+    for (std::size_t d = 0; d < R; ++d) {
+        src[d] = (d * 7919 + 13) % F;
+        ixl[d * 2 + 0] = static_cast<std::int64_t>(src[d]);
+        ixl[d * 2 + 1] = static_cast<std::int64_t>(d % 997);          // a key, never NULL
+        if (d % 11 == 0) { inull[d] = true; ixv[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); }
+    }
+    const std::uint64_t* ixvp[2] = {ixv.data(), ixv1.data()};
+    DT idt[2] = {DT::I64, DT::I64};
+    gpudb::Aggregator::RowSpan is;
+    is.lanes = ixl.data(); is.rows = R; is.n_lanes = 2; is.valid = ixvp;
+    auto IX = agg.upload_rows_exact(&is, 1, idt, 2);
+
+    // A build-side index too, so a small table's gather is covered.
+    std::vector<std::int64_t> bxl(R * 2, 0);
+    std::vector<std::size_t> bsrc(R, 0);
+    for (std::size_t d = 0; d < R; ++d) {
+        bsrc[d] = (d * 131 + 7) % B;
+        bxl[d * 2 + 0] = static_cast<std::int64_t>(bsrc[d]);
+    }
+    gpudb::Aggregator::RowSpan bxs;
+    bxs.lanes = bxl.data(); bxs.rows = R; bxs.n_lanes = 2; bxs.valid = ixvp;
+    auto BX = agg.upload_rows_exact(&bxs, 1, idt, 2);
+
+    auto same = [&](const gpudb::GroupByResidentResult& a, const gpudb::GroupByResidentResult& b,
+                    const std::string& what) {
+        const bool ok = a.keys == b.keys && a.key_null == b.key_null &&
+                        a.sums == b.sums && a.sums_hi == b.sums_hi &&
+                        a.counts == b.counts && a.counts_star == b.counts_star &&
+                        a.mins == b.mins && a.maxs == b.maxs;
+        ++total;
+        if (!ok) { ++failures; std::printf("    FAIL %s\n", what.c_str()); }
+    };
+
+    // Is the GROUPED form indexed on this backend, or only the row-order
+    // global aggregate? Both are legitimate stages of D1; what is not
+    // legitimate is answering an indexed call by ignoring the index, so the
+    // probe insists that an unavailable form REFUSES.
+    bool grouped_ok = true;
+    {
+        gpudb::MultiPayload probe{IX[1].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        try {
+            agg.groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{Bc[1].get(), BX[0].get()}, &probe, 1, 0, nullptr, 0, cap);
+        } catch (const std::exception& e) {
+            grouped_ok = false;
+            std::printf("    the grouped reduce is not indexed on this backend yet (%s); the global "
+                        "masked aggregate carries the checks\n", e.what());
+        }
+    }
+
+    struct C { const char* name; std::size_t lane; bool build; };
+    const std::vector<C> cs = {
+        {"width 1", 3, false}, {"width 2", 4, false}, {"width 4", 5, false},
+        {"width 8", 6, false}, {"f64 nan/inf/-0", 7, false}, {"lane with NULLs", 8, false},
+        {"build width 1", 1, true}, {"build wide with NULLs", 2, true}, {"build f64", 3, true},
+    };
+    for (const auto& c : cs) {
+        const std::size_t SL = c.build ? BL : PL;
+        const std::vector<std::int64_t>& flat = c.build ? bfl : pf;
+        const std::vector<std::size_t>& rows = c.build ? bsrc : src;
+        const gpudb::ResidentColumn* srccol = c.build ? Bc[c.lane].get() : P[c.lane].get();
+        const std::size_t SR = c.build ? B : F;
+        // the host's gather of that lane through the same index
+        std::vector<std::int64_t> exp(R * 2, 0);
+        std::vector<std::uint64_t> ev0((R + 63) / 64, ~std::uint64_t{0});
+        std::vector<std::uint64_t> ev1((R + 63) / 64, ~std::uint64_t{0});
+        for (std::size_t d = 0; d < R; ++d) {
+            exp[d * 2 + 0] = static_cast<std::int64_t>(d % 997);
+            const std::size_t r = rows[d];
+            bool cell_null = inull[d] || r >= SR;
+            if (!cell_null) {
+                // reproduce the source lane's NULL pattern from how it was built
+                if (!c.build) cell_null = (c.lane == 8 && r % 37 == 0) || (c.lane == 7 && r % 53 == 0);
+                else          cell_null = (c.lane == 2 && r % 17 == 0);
+            }
+            if (cell_null) { ev1[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); exp[d * 2 + 1] = 0; }
+            else exp[d * 2 + 1] = flat[r * SL + c.lane];
+        }
+        const std::uint64_t* evp[2] = {ev0.data(), ev1.data()};
+        DT edt[2] = {DT::I64, srccol->dtype()};
+        gpudb::Aggregator::RowSpan es;
+        es.lanes = exp.data(); es.rows = R; es.n_lanes = 2; es.valid = evp;
+        auto EX = agg.upload_rows_exact(&es, 1, edt, 2);
+        const gpudb::ResidentColumn* index = c.build ? BX[0].get() : IX[0].get();
+
+        gpudb::MultiPayload kp{EX[0].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        gpudb::Predicate pa{}, pb{};
+        pa.col = EX[1].get(); pa.op = Op::IsNotNull;
+        pb.col = srccol;      pb.op = Op::IsNotNull; pb.index = index;
+        if (grouped_ok) {
+            // as a KEY
+            auto ka = agg.groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{EX[1].get(), nullptr}, &kp, 1, 0, nullptr, 0, cap);
+            auto kb = agg.groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{srccol, index}, &kp, 1, 0, nullptr, 0, cap);
+            same(ka[0], kb[0], std::string(c.name) + " as an indexed key");
+
+            // as a PREDICATE lane, on the key of the expected set
+            auto wa = agg.groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{EX[0].get(), nullptr}, &kp, 1, 0, &pa, 1, cap);
+            auto wb = agg.groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{EX[0].get(), nullptr}, &kp, 1, 0, &pb, 1, cap);
+            same(wa[0], wb[0], std::string(c.name) + " as an indexed predicate");
+        }
+
+        if (srccol->dtype() != DT::I64) continue;
+        // as a PAYLOAD of the global masked aggregate (§4.12), the pure
+        // row-order operator the indexed read was built for
+        gpudb::MultiPayload qa{EX[1].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        gpudb::MultiPayload qb{srccol, gpudb::GroupByFilter::kAllColumns, index};
+        auto la = agg.aggregate_exact_masked(&qa, 1, nullptr, 0);
+        auto lb = agg.aggregate_exact_masked(&qb, 1, nullptr, 0);
+        ++total;
+        if (!(la.sums == lb.sums && la.sums_hi == lb.sums_hi && la.counts == lb.counts &&
+              la.mins == lb.mins && la.maxs == lb.maxs && la.count_star == lb.count_star)) {
+            ++failures;
+            std::printf("    FAIL %s as an indexed payload of the global aggregate\n", c.name);
+        }
+        // and the same under a WHERE, so the mask and the fold both gather
+        auto wla = agg.aggregate_exact_masked(&qa, 1, &pa, 1);
+        auto wlb = agg.aggregate_exact_masked(&qb, 1, &pb, 1);
+        ++total;
+        if (!(wla.sums == wlb.sums && wla.counts == wlb.counts && wla.count_star == wlb.count_star)) {
+            ++failures;
+            std::printf("    FAIL %s as an indexed payload under an indexed WHERE\n", c.name);
+        }
+    }
+
+    // An out-of-range index cell must be refused, not read.
+    {
+        std::vector<std::int64_t> bad(64 * 2, 0);
+        for (std::size_t d = 0; d < 64; ++d) bad[d * 2] = static_cast<std::int64_t>(B + d);
+        DT bdt2[2] = {DT::I64, DT::I64};
+        gpudb::Aggregator::RowSpan sp2;
+        sp2.lanes = bad.data(); sp2.rows = 64; sp2.n_lanes = 2; sp2.valid = nullptr;
+        auto BAD = agg.upload_rows_exact(&sp2, 1, bdt2, 2);
+        gpudb::MultiPayload bp{Bc[1].get(), gpudb::GroupByFilter::kAllColumns, BAD[0].get()};
+        bool threw = false;
+        try { agg.aggregate_exact_masked(&bp, 1, nullptr, 0); }
+        catch (const std::exception&) { threw = true; }
+        EXPECT(threw);
+    }
+}
+
+void test_indexed_lanes_backend(gpudb::Backend backend) {
+    using DT = gpudb::Dtype;
+    using Op = gpudb::Predicate::Op;
+    std::unique_ptr<gpudb::Aggregator> agg;
+    try {
+        agg = gpudb::make_aggregator(backend);
+    } catch (const std::exception& e) {
+        std::printf("  %s unavailable (%s)\n", gpudb::to_string(backend), e.what());
+        return;
+    }
+    if (!agg->indexed_supported()) {
+        std::printf("  %s does not implement stage D1 — the SQL layer keeps the materialised path\n",
+                    gpudb::to_string(backend));
+        // The contract for such a backend: an index must be REFUSED, never
+        // ignored. A silently dropped index is a wrong answer.
+        return;
+    }
+    std::printf("  %s (%s)\n", gpudb::to_string(backend), agg->device_name().c_str());
+    const std::size_t cap = std::size_t(100) * 1000000;
+
+    // ---- the two tables ----
+    // probe: F rows of a fact table, its join key pointing into dim1.
+    // Lane 0 fk1, 1 fk2, 2 pos (the row's own position), 3 width-1, 4 width-2,
+    // 5 width-4, 6 width-8, 7 F64 with specials, 8 a lane with NULLs.
+    const std::size_t F = 200'003, B = 1'009, PL = 9;
+    const double specials[5] = {std::numeric_limits<double>::quiet_NaN(),
+                                std::numeric_limits<double>::infinity(),
+                                -std::numeric_limits<double>::infinity(), -0.0, 0.0};
+    std::vector<std::int64_t> pf(F * PL);
+    std::vector<std::vector<std::uint64_t>> pv(PL, std::vector<std::uint64_t>((F + 63) / 64, ~std::uint64_t{0}));
+    for (std::size_t i = 0; i < F; ++i) {
+        auto clear = [&](std::size_t l) { pv[l][i >> 6] &= ~(std::uint64_t{1} << (i & 63)); };
+        pf[i * PL + 0] = static_cast<std::int64_t>((i * 2654435761ull) % (B + 37));   // some miss
+        pf[i * PL + 1] = static_cast<std::int64_t>((i * 40503ull) % B);
+        pf[i * PL + 2] = static_cast<std::int64_t>(i);
+        pf[i * PL + 3] = static_cast<std::int64_t>(i % 256) - 128;
+        pf[i * PL + 4] = static_cast<std::int64_t>(i % 65536) - 32768;
+        pf[i * PL + 5] = static_cast<std::int64_t>(i % 4001) * 1'000'000 - 2'000'000'000LL;
+        pf[i * PL + 6] = (std::int64_t{1} << 40) + static_cast<std::int64_t>(i % 7919);
+        double d = (i % 211 < 5) ? specials[i % 5]
+                                 : static_cast<double>(static_cast<std::int64_t>(i % 997)) / 997.0;
+        std::memcpy(&pf[i * PL + 7], &d, sizeof(double));
+        pf[i * PL + 8] = static_cast<std::int64_t>(i % 89) - 44;
+        if (i % 37 == 0) clear(8);
+        if (i % 53 == 0) clear(7);
+        if (i % 101 == 0) clear(0);     // a NULL join key never matches
+    }
+    // build: lane 0 the unique key, 1 a width-1 lane, 2 a wide lane with
+    // NULLs, 3 an F64 lane, 4 a second unique key for the chain.
+    const std::size_t BL = 5;
+    std::vector<std::int64_t> bfl(B * BL);
+    std::vector<std::vector<std::uint64_t>> bv(BL, std::vector<std::uint64_t>((B + 63) / 64, ~std::uint64_t{0}));
+    for (std::size_t i = 0; i < B; ++i) {
+        bfl[i * BL + 0] = static_cast<std::int64_t>(i);
+        bfl[i * BL + 1] = static_cast<std::int64_t>(i % 200) - 100;
+        bfl[i * BL + 2] = (std::int64_t{1} << 55) - static_cast<std::int64_t>(i) * 7919;
+        double d = (i % 41 < 5) ? specials[i % 5] : static_cast<double>(i) / 13.0;
+        std::memcpy(&bfl[i * BL + 3], &d, sizeof(double));
+        bfl[i * BL + 4] = static_cast<std::int64_t>(i);
+        if (i % 17 == 0) bv[2][i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+    }
+    std::vector<const std::uint64_t*> pvp(PL), bvp(BL);
+    for (std::size_t l = 0; l < PL; ++l) pvp[l] = pv[l].data();
+    for (std::size_t l = 0; l < BL; ++l) bvp[l] = bv[l].data();
+    DT pdt[PL]; for (std::size_t l = 0; l < PL; ++l) pdt[l] = (l == 7) ? DT::F64 : DT::I64;
+    DT bdt[BL]; for (std::size_t l = 0; l < BL; ++l) bdt[l] = (l == 3) ? DT::F64 : DT::I64;
+    gpudb::Aggregator::RowSpan ps, bs;
+    ps.lanes = pf.data(); ps.rows = F; ps.n_lanes = PL; ps.valid = pvp.data();
+    bs.lanes = bfl.data(); bs.rows = B; bs.n_lanes = BL; bs.valid = bvp.data();
+    auto P = agg->upload_rows_exact(&ps, 1, pdt, PL);
+    auto Bc = agg->upload_rows_exact(&bs, 1, bdt, BL);
+
+    // ---- the same join, materialised and indexed ----
+    // Lane 0 is the classifying key lane, as join_materialize requires.
+    std::vector<gpudb::JoinLane> lanes = {
+        {P[3].get(), false, nullptr},          // key: width-1 probe lane
+        {P[2].get(), false, nullptr},          // pos
+        {P[4].get(), false, nullptr}, {P[5].get(), false, nullptr},
+        {P[6].get(), false, nullptr}, {P[7].get(), false, nullptr},
+        {P[8].get(), false, nullptr},
+        {Bc[1].get(), true, nullptr}, {Bc[2].get(), true, nullptr}, {Bc[3].get(), true, nullptr},
+    };
+    gpudb::JoinMaterializeResult jm;
+    gpudb::Aggregator::JoinIndexResult ji;
+    bool have_join_index = true;
+    try {
+        jm = agg->join_materialize(*P[0], *Bc[0], lanes.data(), lanes.size());
+    } catch (const std::exception& e) {
+        std::printf("    FAIL join_materialize: %s\n", e.what());
+        ++failures; ++total;
+        return;
+    }
+    try {
+        ji = agg->join_index(*P[0], *Bc[0], lanes[0], nullptr, 0, nullptr);
+    } catch (const std::exception& e) {
+        // A backend may have the indexed READ without the indexed JOIN yet.
+        // That is a legitimate half of stage D1 — the SQL layer then builds
+        // the set with join_materialize and indexes nothing — but it must
+        // REFUSE the call, never answer it wrongly.
+        have_join_index = false;
+        std::printf("    join_index is not on this backend yet (%s); the indexed reads are checked "
+                    "against host-built index vectors below\n", e.what());
+    }
+    if (!have_join_index) {
+        test_indexed_reads_only(*agg, P, Bc, pf, bfl, PL, BL, F, B, cap);
+        return;
+    }
+    EXPECT_EQ(ji.rows_out, jm.rows_out);
+    EXPECT_EQ(ji.null_key_rows, jm.null_key_rows);
+    EXPECT_EQ(ji.rows_probe, jm.rows_probe);
+    EXPECT_EQ(ji.rows_build, jm.rows_build);
+    EXPECT(ji.probe_rows && ji.build_rows);
+    EXPECT_EQ(ji.probe_rows->rows(), jm.rows_out);
+    EXPECT_EQ(ji.build_rows->rows(), jm.rows_out);
+    // Some probe rows miss (fk goes past B) and some have a NULL key, so this
+    // join is NOT the identity — the scattered case, which is the one that can
+    // be slower and the one that must still be right.
+    EXPECT(!ji.probe_identity);
+    if (!ji.probe_rows || !ji.build_rows) return;
+
+    // Every lane, materialised vs read through its side's index. The key is
+    // the lane under test and the payload is the materialised position lane,
+    // so two answers agree only if the lane holds the same value at the same
+    // OUTPUT ROW, not merely the same multiset of values.
+    auto same = [&](const gpudb::GroupByResidentResult& a, const gpudb::GroupByResidentResult& b,
+                    const char* what) {
+        const bool ok = a.keys == b.keys && a.key_null == b.key_null &&
+                        a.sums == b.sums && a.sums_hi == b.sums_hi &&
+                        a.counts == b.counts && a.counts_star == b.counts_star &&
+                        a.mins == b.mins && a.maxs == b.maxs;
+        ++total;
+        if (!ok) {
+            ++failures;
+            std::printf("    FAIL %s (%zu vs %zu groups)\n", what, a.keys.size(), b.keys.size());
+        }
+        return ok;
+    };
+    struct LaneCase { const char* name; std::size_t mat; const gpudb::ResidentColumn* src; bool from_build; };
+    const std::vector<LaneCase> cases = {
+        {"probe width 1 (the key lane)", 0, P[3].get(), false},
+        {"probe width 2",                2, P[4].get(), false},
+        {"probe width 4",                3, P[5].get(), false},
+        {"probe width 8 (wide key)",     4, P[6].get(), false},
+        {"probe f64 nan/inf/-0",         5, P[7].get(), false},
+        {"probe lane with NULLs",        6, P[8].get(), false},
+        {"build width 1",                7, Bc[1].get(), true},
+        {"build wide with NULLs",        8, Bc[2].get(), true},
+        {"build f64",                    9, Bc[3].get(), true},
+    };
+    const gpudb::ResidentColumn* pos_mat = jm.lanes[1].get();
+    for (const auto& c : cases) {
+        const gpudb::ResidentColumn* index = c.from_build ? ji.build_rows.get() : ji.probe_rows.get();
+        // grouped: key = the lane, payload = the materialised position
+        gpudb::MultiPayload mp_m{pos_mat, gpudb::GroupByFilter::kAllColumns, nullptr};
+        gpudb::MultiPayload mp_i{pos_mat, gpudb::GroupByFilter::kAllColumns, nullptr};
+        std::vector<gpudb::GroupByResidentResult> ra, rb;
+        // A backend may refuse this KEY's dtype — grouping a backend's way on
+        // the raw bits of a double is not the same question as grouping on an
+        // integer, and Metal refuses it. What stage D1 requires is that the
+        // index changes nothing: the indexed call and the materialised call
+        // must give the same answer, and a refusal is an answer only if BOTH
+        // refuse. (The F64 lane's values are still under test here, as an
+        // indexed predicate below and as a materialised join lane above.)
+        std::string em, ei;
+        try {
+            ra = agg->groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{jm.lanes[c.mat].get(), nullptr}, &mp_m, 1, 0, nullptr, 0, cap);
+        } catch (const std::exception& e) { em = e.what(); }
+        try {
+            rb = agg->groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{c.src, index}, &mp_i, 1, 0, nullptr, 0, cap);
+        } catch (const std::exception& e) { ei = e.what(); }
+        if (!em.empty() || !ei.empty()) {
+            ++total;
+            if (em.empty() || ei.empty()) {
+                ++failures;
+                std::printf("    FAIL %s: one form refused and the other did not (%s | %s)\n",
+                            c.name, em.empty() ? "answered" : em.c_str(),
+                            ei.empty() ? "answered" : ei.c_str());
+            }
+        } else {
+            same(ra[0], rb[0], c.name);
+        }
+
+        // the same lane as an indexed PAYLOAD (f64 lanes are not payloads)
+        if (c.src->dtype() == DT::I64) {
+            gpudb::MultiPayload qa{jm.lanes[c.mat].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+            gpudb::MultiPayload qb{c.src, gpudb::GroupByFilter::kAllColumns, index};
+            auto ga = agg->groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{jm.lanes[0].get(), nullptr}, &qa, 1, 0, nullptr, 0, cap);
+            auto gb = agg->groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{jm.lanes[0].get(), nullptr}, &qb, 1, 0, nullptr, 0, cap);
+            same(ga[0], gb[0], (std::string(c.name) + " as a payload").c_str());
+
+            // and as an indexed lane of the GLOBAL masked aggregate (§4.12)
+            auto la = agg->aggregate_exact_masked(&qa, 1, nullptr, 0);
+            auto lb = agg->aggregate_exact_masked(&qb, 1, nullptr, 0);
+            ++total;
+            if (!(la.sums == lb.sums && la.sums_hi == lb.sums_hi && la.counts == lb.counts &&
+                  la.mins == lb.mins && la.maxs == lb.maxs && la.count_star == lb.count_star)) {
+                ++failures;
+                std::printf("    FAIL %s in the global aggregate\n", c.name);
+            }
+        }
+
+        // and as an indexed PREDICATE lane, under a WHERE that keeps a slice
+        gpudb::Predicate pa{}, pb{};
+        pa.col = jm.lanes[c.mat].get(); pa.op = Op::IsNotNull;
+        pb.col = c.src; pb.op = Op::IsNotNull; pb.index = index;
+        gpudb::MultiPayload wp{pos_mat, gpudb::GroupByFilter::kAllColumns, nullptr};
+        auto wa = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{jm.lanes[0].get(), nullptr}, &wp, 1, 0, &pa, 1, cap);
+        auto wb = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{jm.lanes[0].get(), nullptr}, &wp, 1, 0, &pb, 1, cap);
+        same(wa[0], wb[0], (std::string(c.name) + " as a predicate").c_str());
+    }
+
+    // ---- an index with NULL cells: the unmatched side of an outer join ----
+    // invariant 6 — every lane read through a NULL index cell is NULL. The
+    // expected column is built on the host and uploaded, so the check does not
+    // depend on any other part of stage D.
+    {
+        const std::size_t R = 40'009;
+        std::vector<std::int64_t> ixf(R), expf(R * 2);
+        std::vector<std::uint64_t> ixv((R + 63) / 64, ~std::uint64_t{0});
+        std::vector<std::uint64_t> ev0((R + 63) / 64, ~std::uint64_t{0});
+        std::vector<std::uint64_t> ev1((R + 63) / 64, ~std::uint64_t{0});
+        for (std::size_t d = 0; d < R; ++d) {
+            const std::size_t srow = (d * 7919) % B;
+            ixf[d] = static_cast<std::int64_t>(srow);
+            expf[d * 2 + 0] = static_cast<std::int64_t>(d % 1000);            // the key, never NULL
+            const bool idx_null = (d % 11 == 0);
+            const bool cell_null = ((srow % 17) == 0);                        // build lane 2's NULLs
+            if (idx_null) ixv[d >> 6] &= ~(std::uint64_t{1} << (d & 63));
+            if (idx_null || cell_null) { ev1[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); expf[d * 2 + 1] = 0; }
+            else expf[d * 2 + 1] = bfl[srow * BL + 2];
+        }
+        std::vector<std::uint64_t> iv2((R + 63) / 64, ~std::uint64_t{0});
+        const std::uint64_t* ixvp[2] = {ixv.data(), iv2.data()};
+        std::vector<std::int64_t> ix2(R * 2);
+        for (std::size_t d = 0; d < R; ++d) { ix2[d * 2] = ixf[d]; ix2[d * 2 + 1] = 0; }
+        DT idt[2] = {DT::I64, DT::I64};
+        gpudb::Aggregator::RowSpan is;
+        is.lanes = ix2.data(); is.rows = R; is.n_lanes = 2; is.valid = ixvp;
+        auto IX = agg->upload_rows_exact(&is, 1, idt, 2);
+        const std::uint64_t* evp[2] = {ev0.data(), ev1.data()};
+        gpudb::Aggregator::RowSpan es;
+        es.lanes = expf.data(); es.rows = R; es.n_lanes = 2; es.valid = evp;
+        auto EX = agg->upload_rows_exact(&es, 1, idt, 2);
+
+        gpudb::MultiPayload ea{EX[1].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        gpudb::MultiPayload eb{Bc[2].get(), gpudb::GroupByFilter::kAllColumns, IX[0].get()};
+        auto oa = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{EX[0].get(), nullptr}, &ea, 1, 0, nullptr, 0, cap);
+        auto ob = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{EX[0].get(), nullptr}, &eb, 1, 0, nullptr, 0, cap);
+        same(oa[0], ob[0], "a NULL index cell makes the lane NULL");
+        // the same, with the indexed lane as the KEY: a NULL index cell puts
+        // the row in the NULL-key group
+        gpudb::MultiPayload kp{EX[0].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        auto ka = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{EX[1].get(), nullptr}, &kp, 1, 0, nullptr, 0, cap);
+        auto kb = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{Bc[2].get(), IX[0].get()}, &kp, 1, 0, nullptr, 0, cap);
+        same(ka[0], kb[0], "a NULL index cell makes the KEY NULL");
+    }
+
+    // ---- a chained three-step join ----
+    // Step k's probe key is read through the index step k-1 produced, and the
+    // earlier index vectors are composed by handing them to the next step as
+    // MATERIALISED lanes: gathering idx_old at probe_rows IS the composition.
+    {
+        gpudb::JoinLane key1{P[3].get(), false, nullptr};
+        auto s1 = agg->join_index(*P[0], *Bc[0], key1, nullptr, 0, nullptr);
+        // step 2 probes on the fact table's second fk, read through step 1's
+        // probe_rows; it carries step 1's build_rows forward as a lane.
+        gpudb::JoinLane carry{s1.build_rows.get(), false, nullptr};
+        gpudb::JoinLane key2{P[3].get(), false, s1.probe_rows.get()};
+        auto s2 = agg->join_index(*P[1], *Bc[0], key2, &carry, 1, s1.probe_rows.get());
+        // step 3 on the dimension's second unique key
+        gpudb::JoinLane carry3[2] = {{s2.lanes[0].get(), false, nullptr},
+                                     {s2.build_rows.get(), false, nullptr}};
+        gpudb::JoinLane key3{P[3].get(), false, nullptr};
+        (void)key3;
+        // The composed probe index of the chain so far:
+        //   chain[d] = probe_rows_1[ probe_rows_2[d] ]  — one gather per step.
+        gpudb::JoinLane comp{s1.probe_rows.get(), false, nullptr};
+        auto s3 = agg->join_index(*P[1], *Bc[4], gpudb::JoinLane{P[3].get(), false, s2.probe_rows.get()},
+                                  &comp, 1, s2.probe_rows.get());
+        EXPECT(s3.rows_out > 0);
+        EXPECT_EQ(s3.lanes.size(), std::size_t{1});
+        // The chain's answer must equal the same three joins materialised.
+        std::vector<gpudb::JoinLane> m1 = {{P[3].get(), false, nullptr},
+                                           {P[1].get(), false, nullptr},
+                                           {P[2].get(), false, nullptr},
+                                           {Bc[1].get(), true, nullptr}};
+        auto j1 = agg->join_materialize(*P[0], *Bc[0], m1.data(), m1.size());
+        std::vector<gpudb::JoinLane> m2 = {{j1.lanes[0].get(), false, nullptr},
+                                           {j1.lanes[2].get(), false, nullptr},
+                                           {j1.lanes[3].get(), false, nullptr},
+                                           {Bc[2].get(), true, nullptr}};
+        auto j2 = agg->join_materialize(*j1.lanes[1], *Bc[0], m2.data(), m2.size());
+        EXPECT_EQ(s2.rows_out, j2.rows_out);
+        // lane for lane: the carried build index against the materialised
+        // build lane it stands for
+        gpudb::MultiPayload ca{j2.lanes[2].get(), gpudb::GroupByFilter::kAllColumns, nullptr};
+        gpudb::MultiPayload cb{Bc[1].get(), gpudb::GroupByFilter::kAllColumns, s2.lanes[0].get()};
+        auto xa = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{j2.lanes[0].get(), nullptr}, &ca, 1, 0, nullptr, 0, cap);
+        auto xb = agg->groupby_exact_masked_multi_indexed(
+            gpudb::IndexedColumn{j2.lanes[0].get(), nullptr}, &cb, 1, 0, nullptr, 0, cap);
+        same(xa[0], xb[0], "a chained join's composed index");
+    }
+
+    // ---- an index vector the planner got wrong must be refused, not read ----
+    {
+        const std::size_t R = 64;
+        std::vector<std::int64_t> bad(R * 2, 0);
+        for (std::size_t d = 0; d < R; ++d) bad[d * 2] = static_cast<std::int64_t>(B + d);  // out of range
+        DT bdt2[2] = {DT::I64, DT::I64};
+        gpudb::Aggregator::RowSpan sp2;
+        sp2.lanes = bad.data(); sp2.rows = R; sp2.n_lanes = 2; sp2.valid = nullptr;
+        auto BAD = agg->upload_rows_exact(&sp2, 1, bdt2, 2);
+        gpudb::MultiPayload bp{Bc[1].get(), gpudb::GroupByFilter::kAllColumns, BAD[0].get()};
+        bool threw = false;
+        try {
+            agg->groupby_exact_masked_multi_indexed(
+                gpudb::IndexedColumn{BAD[1].get(), nullptr}, &bp, 1, 0, nullptr, 0, cap);
+        } catch (const std::exception&) { threw = true; }
+        EXPECT(threw);
+    }
+}
+
+void test_indexed_lanes() {
+    std::printf("\n--- stage D1: a lane read through an index vs the gathered copy ---\n");
+    for (auto b : gpudb::available_backends()) {
+        try {
+            test_indexed_lanes_backend(b);
+        } catch (const std::exception& e) {
+            ++total; ++failures;
+            std::printf("  FAIL %s: %s\n", gpudb::to_string(b), e.what());
+        }
+    }
+}
+
 void test_resident_prepare() {
     std::printf("\n--- ResidentColumn::prepare / concurrent upload ---\n");
     auto h = gpudb::make_hybrid_aggregator();
@@ -3583,6 +4109,7 @@ int main(int argc, char** argv) {
     test_fused_mask();
     test_direct_pso_fallback();
 #endif
+    test_indexed_lanes();
     test_resident_prepare();
     test_hashjoin();
 

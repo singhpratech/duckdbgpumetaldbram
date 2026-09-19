@@ -1566,6 +1566,51 @@ inline bool jm_valid(device const ulong* valid, uint has_valid, uint null_from, 
     return row < (ulong)null_from && gbx_valid(valid, has_valid, row);
 }
 
+// ---- stage D1: the row a lane is read at ----------------------------------
+// `mode` 0 = read at the row itself (what every caller before stage D does,
+// and one comparison of a register), 1 = through an index with no NULL cell,
+// 2 = through an index that has a validity bitmap. False means the index cell
+// is NULL, and then every lane read through it is NULL — which is what a
+// gathered lane holds for the unmatched side of an outer join. The kernels
+// below use the cell as a row with no bound of their own; the bound is proved
+// on the host, once per column, before any of this runs.
+inline bool ix_row(device const uchar* ix, device const ulong* ixv, uint mode, uint w,
+                   uint row, thread uint& out) {
+    if (mode == 0u) { out = row; return true; }
+    if (mode == 2u && !gbx_valid(ixv, 1u, (ulong)row)) return false;
+    out = (uint)ldw(ix, w, row);
+    return true;
+}
+
+// Materialise one lane through an index: dst[i] = src[ix[i]], the gather the
+// join used to do per output lane, kept for the paths that still want a lane
+// in result order. `dvalid` starts all-ones and a NULL cell clears its bit.
+kernel void ix_gather(
+    device const uchar* src         [[buffer(0)]],
+    device const ulong* svalid      [[buffer(1)]],
+    constant uint&      s_has_valid [[buffer(2)]],
+    device const uchar* ix          [[buffer(3)]],
+    device const ulong* ixvalid     [[buffer(4)]],
+    constant uint&      ix_mode     [[buffer(5)]],
+    constant uint&      ix_w        [[buffer(6)]],
+    constant uint&      n           [[buffer(7)]],
+    device uchar*       dst         [[buffer(8)]],
+    device atomic_uint* dvalid      [[buffer(9)]],
+    constant uint&      w           [[buffer(10)]],
+    uint                gid         [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    uint srow = gid;
+    const bool live = ix_row(ix, ixvalid, ix_mode, ix_w, gid, srow) &&
+                      gbx_valid(svalid, s_has_valid, (ulong)srow);
+    if (live) {
+        stw(dst, w, gid, ldw(src, w, srow));
+    } else {
+        stw(dst, w, gid, 0l);
+        atomic_fetch_and_explicit(&dvalid[gid >> 5], ~(1u << (gid & 31u)), memory_order_relaxed);
+    }
+}
+
 kernel void jm_unique_i64(
     device const uchar* sorted [[buffer(0)]],
     constant uint&     n      [[buffer(1)]],
@@ -1595,13 +1640,29 @@ kernel void jm_probe_i64(
     device uchar*       cls          [[buffer(13)]],
     constant uint&      pw           [[buffer(14)]],
     constant uint&      sw           [[buffer(15)]],
+    // ---- stage D1 ----
+    // `px`: the probe SET's own index (a chained join, whose probe side is
+    // already described by an index vector) — the probe key is read at
+    // px[gid], and the row this kernel classifies stays gid, so the caller
+    // composes the chain's vectors itself. `kx`: the classifying key lane's
+    // own index, read at the row of the lane's side of the join.
+    device const uchar* px           [[buffer(16)]],
+    device const ulong* pxvalid      [[buffer(17)]],
+    constant uint&      px_mode      [[buffer(18)]],
+    constant uint&      px_w         [[buffer(19)]],
+    device const uchar* kx           [[buffer(20)]],
+    device const ulong* kxvalid      [[buffer(21)]],
+    constant uint&      kx_mode      [[buffer(22)]],
+    constant uint&      kx_w         [[buffer(23)]],
     uint                gid          [[thread_position_in_grid]])
 {
     if (gid >= n) return;
     uint  m = 0xFFFFFFFFu;
     uchar c = 0u;
-    if (jm_valid(pvalid, p_has_valid, p_null_from, (ulong)gid)) {
-        const long k = ldw(pkey, pw, gid);
+    uint prow = gid;
+    const bool p_live = ix_row(px, pxvalid, px_mode, px_w, gid, prow);
+    if (p_live && jm_valid(pvalid, p_has_valid, p_null_from, (ulong)prow)) {
+        const long k = ldw(pkey, pw, prow);
         uint lo = 0u, hi = nb;
         while (lo < hi) {
             const uint mid = lo + ((hi - lo) >> 1);
@@ -1609,12 +1670,41 @@ kernel void jm_probe_i64(
         }
         if (lo < nb && ldw(sorted, sw, lo) == k) {
             m = perm[lo];
-            const ulong krow = (k_from_build != 0u) ? (ulong)m : (ulong)gid;
-            c = jm_valid(kvalid, k_has_valid, k_null_from, krow) ? 1u : 2u;
+            // The key lane is read on its own side, at its own row, through
+            // its own index: the probe side addresses the statement's row gid
+            // (the index vector already stands for the chain), the build side
+            // the matched build row.
+            const uint side = (k_from_build != 0u) ? m : gid;
+            uint krow = side;
+            const bool k_live = ix_row(kx, kxvalid, kx_mode, kx_w, side, krow);
+            c = (k_live && jm_valid(kvalid, k_has_valid, k_null_from, (ulong)krow)) ? 1u : 2u;
         }
     }
     match[gid] = m;
     cls[gid]   = c;
+}
+
+// ---- stage D1: the two row vectors the gather would have read -------------
+// join_index stops after jm_pos and writes, per kept output row d, the probe
+// row that produced it and the build row it matched — narrow, because each is
+// bounded by its side's row count. probe_rows is strictly increasing within
+// each class and build_rows is never NULL for an inner join, so neither
+// carries a validity bitmap.
+kernel void jm_rows(
+    device const uint*  match [[buffer(0)]],
+    device const uchar* cls   [[buffer(1)]],
+    device const uint*  pos   [[buffer(2)]],
+    constant uint&      n     [[buffer(3)]],
+    device uchar*       prow  [[buffer(4)]],
+    constant uint&      pw    [[buffer(5)]],
+    device uchar*       brow  [[buffer(6)]],
+    constant uint&      bw    [[buffer(7)]],
+    uint                gid   [[thread_position_in_grid]])
+{
+    if (gid >= n || cls[gid] == 0u) return;
+    const uint d = pos[gid];
+    stw(prow, pw, d, (long)gid);
+    stw(brow, bw, d, (long)match[gid]);
 }
 
 kernel void jm_counts(
@@ -1683,12 +1773,20 @@ kernel void jm_gather(
     device uchar*       dst         [[buffer(9)]],
     device atomic_uint* dvalid      [[buffer(10)]],
     constant uint&      w           [[buffer(11)]],
+    // stage D1: the lane's own index, read at the row of the lane's side of
+    // the join — a lane of a probe set that is itself already indexed.
+    device const uchar* lx          [[buffer(12)]],
+    device const ulong* lxvalid     [[buffer(13)]],
+    constant uint&      lx_mode     [[buffer(14)]],
+    constant uint&      lx_w        [[buffer(15)]],
     uint                gid         [[thread_position_in_grid]])
 {
     if (gid >= n || cls[gid] == 0u) return;
-    const uint srow = (from_build != 0u) ? match[gid] : gid;
+    const uint side = (from_build != 0u) ? match[gid] : gid;
+    uint srow = side;
+    const bool live = ix_row(lx, lxvalid, lx_mode, lx_w, side, srow);
     const uint  d = pos[gid];
-    if (jm_valid(svalid, s_has_valid, s_null_from, (ulong)srow)) {
+    if (live && jm_valid(svalid, s_has_valid, s_null_from, (ulong)srow)) {
         stw(dst, w, d, ldw(src, w, srow));
     } else {
         stw(dst, w, d, 0l);
@@ -1724,9 +1822,56 @@ struct GLane {
     uint width;
     uint has_valid;
     uint is_f64;
+    // stage D1 (docs/RESIDENT_COLUMNS_DESIGN.md §7): the slot of the index
+    // vector this lane is read through, or GL_NO_IDX to read at the row
+    // itself. An index vector is bound as an ORDINARY LANE — it has a width
+    // and a validity bitmap like any other — so stage D costs no new argument
+    // table slot, which matters because the direct reduce already binds all 31
+    // of them.
+    uint idx_slot;
 };
 // The per-lane part that travels in a buffer (the pointers are bindings).
-struct GLaneMeta { uint width; uint has_valid; uint is_f64; uint pad; };
+// `idx_slot` took the place of the old padding word, so the struct is the same
+// size it always was.
+struct GLaneMeta { uint width; uint has_valid; uint is_f64; uint idx_slot; };
+
+constant uint GL_NO_IDX = 0xFFFFFFFFu;
+
+// A row no lane has: what gl_row returns when the index cell is NULL, so that
+// every lane read through it is NULL (the unmatched side of an outer join).
+// The host refuses a column of 2^32-64 rows or more, so this cannot be a real
+// row.
+constant uint GL_NULL_ROW = 0xFFFFFFFFu;
+
+// The row lane `ln` is read at for statement row `row`: the row itself, or
+// the lane's index cell there.
+//
+// IX is a COMPILE-TIME parameter, not a test in the loop, and that is the
+// whole point. `row` is the row loop's induction variable, so the address of
+// `lane[row]` and the word of its validity bitmap strength-reduce across the
+// loop; a row that comes back from a function does not, and the measurement
+// said so — routing the read through a runtime test cost the masked kernels
+// 8-15% at SF10 (BENCHMARK.md, 2026-09-19) although no statement was indexed.
+// So every kernel that reads a lane is instantiated twice and picks the
+// instance once, from a flag that is uniform over the whole dispatch: with
+// IX == false the body below compiles away and what is left is, literally,
+// the pre-stage-D kernel.
+template <bool IX>
+inline uint gl_row(thread const GLane* lanes, GLane ln, uint row) {
+    if (!IX) return row;
+    if (ln.idx_slot == GL_NO_IDX) return row;
+    const GLane ix = lanes[ln.idx_slot];
+    if (!gbx_valid(ix.valid, ix.has_valid, (ulong)row)) return GL_NULL_ROW;
+    return (uint)ldw(ix.data, ix.width, row);
+}
+
+// Does any lane of this dispatch name an index? Read from the lane table the
+// host wrote, so it is the same for every thread.
+inline uint gl_any_idx(device const GLaneMeta* meta, uint n_lanes) {
+    uint any = 0u;
+    for (uint l = 0; l < n_lanes; ++l) any |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;
+    return any;
+}
 
 // One term of the conjunction. `op` is gbx_mask_i64's encoding (0 EQ, 1 NE,
 // 2 LT, 3 LE, 4 GT, 5 GE, 6 IsNull, 7 IsNotNull, 8 In); an In list is
@@ -1737,6 +1882,7 @@ struct GPred { uint lane; uint op; uint list_off; uint n_list; long value; };
 // table + validity in, one bool out. Semantics are gbx_mask_i64's, term for
 // term — a NULL cell fails every comparison and In, IsNull / IsNotNull read
 // the validity bit, F64 lanes compare on the total-order image.
+template <bool IX>
 inline bool gpred_eval(thread const GLane* lanes,
                        device const GPred* prog, uint n_preds,
                        device const long* lists, uint row)
@@ -1744,13 +1890,17 @@ inline bool gpred_eval(thread const GLane* lanes,
     for (uint t = 0; t < n_preds; ++t) {
         const GPred pr = prog[t];
         const GLane ln = lanes[pr.lane];
-        const bool v = gbx_valid(ln.valid, ln.has_valid, (ulong)row);
+        // The row this lane is read at — its own, or its index cell's. A NULL
+        // index cell makes the lane NULL, so IsNull passes on it and every
+        // comparison fails: the same answer a gathered lane gives.
+        const uint lr = gl_row<IX>(lanes, ln, row);
+        const bool v = (!IX || lr != GL_NULL_ROW) && gbx_valid(ln.valid, ln.has_valid, (ulong)lr);
         bool pass;
         if (pr.op == 6u)      pass = !v;
         else if (pr.op == 7u) pass = v;
         else if (!v)          pass = false;
         else {
-            const long raw = ldw(ln.data, ln.width, row);
+            const long raw = ldw(ln.data, ln.width, lr);
             if (ln.is_f64 != 0u) {
                 const ulong a = gbx_f64_key(raw);
                 if (pr.op == 8u) {
@@ -1819,27 +1969,43 @@ kernel void gagg_masked_i64(
     lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
     lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
     lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    // stage D1: `any_idx` is uniform over the dispatch and picks the
+    // instance below. The index SLOT is written into the thread's lane table
+    // only when there is one, so a statement that reads no join set sets up
+    // exactly the table it set up before stage D.
+    uint any_idx = 0u;
     for (uint l = 0; l < GAGG_MAX_LANES; ++l) {
         lanes[l].width = meta[l].width;
         lanes[l].has_valid = meta[l].has_valid;
         lanes[l].is_f64 = meta[l].is_f64;
+        any_idx |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;
     }
+    if (any_idx) for (uint l = 0; l < GAGG_MAX_LANES; ++l) lanes[l].idx_slot = meta[l].idx_slot;
 
     GAggAcc acc[GAGG_MAX_ACC];
     long cstar[GAGG_MAX_ACC];
     for (uint a = 0; a < GAGG_MAX_ACC; ++a) { acc[a] = gagg_zero(); cstar[a] = 0l; }
 
-    const uint gsize = BLOCK * ntg;
-    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {
-        if (!gpred_eval(lanes, prog, u.n_preds, lists, i)) continue;
-        const uint g = 0u;                 // one group; a few-group variant reads its id here
-        cstar[g] += 1l;
-        for (uint p = 0; p < u.n_pays; ++p) {
-            const GLane ln = lanes[pay[p]];
-            if (!gbx_valid(ln.valid, ln.has_valid, (ulong)i)) continue;
-            gagg_add(acc[g * u.n_pays + p], ldw(ln.data, ln.width, i));
-        }
+    // Stage D1: the fold is written once and compiled twice, and the dispatch
+    // picks an instance from a flag that is the same for every thread. The
+    // indexed instance is only built because a statement over a join set asks
+    // for it; the other one is the kernel this always was.
+#define GAGG_FOLD(IX)                                                                  \
+    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {                           \
+        if (!gpred_eval<IX>(lanes, prog, u.n_preds, lists, i)) continue;               \
+        const uint g = 0u;             /* one group; a few-group variant reads it */   \
+        cstar[g] += 1l;                                                                \
+        for (uint p = 0; p < u.n_pays; ++p) {                                          \
+            const GLane ln = lanes[pay[p]];                                            \
+            const uint lr = gl_row<IX>(lanes, ln, i);                                  \
+            if ((IX && lr == GL_NULL_ROW) ||                                           \
+                !gbx_valid(ln.valid, ln.has_valid, (ulong)lr)) continue;               \
+            gagg_add(acc[g * u.n_pays + p], ldw(ln.data, ln.width, lr));               \
+        }                                                                              \
     }
+    const uint gsize = BLOCK * ntg;
+    if (any_idx) { GAGG_FOLD(true) } else { GAGG_FOLD(false) }
+#undef GAGG_FOLD
 
     // threadgroup reduction, one accumulator at a time through `scr`
     const uint stride = 1u + 5u * u.n_pays;          // longs per (threadgroup, group) block
@@ -1934,16 +2100,28 @@ kernel void gbx_fused_mask_i64(
     lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
     // Only the slots the program names are described; gpred_eval never looks
     // past n_lanes.
+    // stage D1: `any_idx` is uniform over the dispatch and picks the
+    // instance below. The index SLOT is written into the thread's lane table
+    // only when there is one, so a statement that reads no join set sets up
+    // exactly the table it set up before stage D.
+    uint any_idx = 0u;
     for (uint l = 0; l < u.n_lanes; ++l) {
         lanes[l].width = meta[l].width;
         lanes[l].has_valid = meta[l].has_valid;
         lanes[l].is_f64 = meta[l].is_f64;
+        any_idx |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;
     }
+    if (any_idx) for (uint l = 0; l < u.n_lanes; ++l) lanes[l].idx_slot = meta[l].idx_slot;
     // A grid-stride loop, so the lane table above is set up once per thread
     // and not once per row.
     const uint gsize = BLOCK * ntg;
-    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize)
-        mask[i] = gpred_eval(lanes, prog, u.n_preds, lists, i) ? 1u : 0u;
+    if (any_idx) {
+        for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize)
+            mask[i] = gpred_eval<true>(lanes, prog, u.n_preds, lists, i) ? 1u : 0u;
+    } else {
+        for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize)
+            mask[i] = gpred_eval<false>(lanes, prog, u.n_preds, lists, i) ? 1u : 0u;
+    }
 }
 
 // The survivors of the key range, counted per block of the SORTED order — and
@@ -2015,14 +2193,22 @@ kernel void gbx_smask_eval_i64(
     lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
     lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
     lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    // stage D1: `any_idx` is uniform over the dispatch and picks the
+    // instance below. The index SLOT is written into the thread's lane table
+    // only when there is one, so a statement that reads no join set sets up
+    // exactly the table it set up before stage D.
+    uint any_idx = 0u;
     for (uint l = 0; l < u.n_lanes; ++l) {
         lanes[l].width = meta[l].width;
         lanes[l].has_valid = meta[l].has_valid;
         lanes[l].is_f64 = meta[l].is_f64;
+        any_idx |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;
     }
+    if (any_idx) for (uint l = 0; l < u.n_lanes; ++l) lanes[l].idx_slot = meta[l].idx_slot;
     uint f = 0u;
     if (gid < u.n) {
-        f = gpred_eval(lanes, prog, u.n_preds, lists, perm[gid]) ? 1u : 0u;
+        f = (any_idx ? gpred_eval<true>(lanes, prog, u.n_preds, lists, perm[gid])
+                     : gpred_eval<false>(lanes, prog, u.n_preds, lists, perm[gid])) ? 1u : 0u;
         smask[gid] = (uchar)f;
     }
     shm[tid] = f;
@@ -2117,7 +2303,7 @@ struct GDirU { uint n; uint n_preds; uint n_pays; uint n_groups; uint gw; uint p
 
 // One pass, one capacity. CAP bounds n_groups * n_pays (and n_groups, which
 // cstar needs); the host never dispatches an instantiation that is too small.
-template <uint CAP>
+template <uint CAP, bool IX>
 void gdir_body(thread const GLane* lanes,
                device const GPred* prog, device const long* lists,
                device const uint* pay, constant GDirU& u,
@@ -2131,13 +2317,14 @@ void gdir_body(thread const GLane* lanes,
 
     const uint gsize = BLOCK * ntg;
     for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {
-        if (!gpred_eval(lanes, prog, u.n_preds, lists, i)) continue;
+        if (!gpred_eval<IX>(lanes, prog, u.n_preds, lists, i)) continue;
         const uint g = ldg(ids, u.gw, i);
         cstar[g] += 1l;
         for (uint p = 0; p < u.n_pays; ++p) {
             const GLane ln = lanes[pay[p]];
-            if (!gbx_valid(ln.valid, ln.has_valid, (ulong)i)) continue;
-            gagg_add(acc[g * u.n_pays + p], ldw(ln.data, ln.width, i));
+            const uint lr = gl_row<IX>(lanes, ln, i);
+            if ((IX && lr == GL_NULL_ROW) || !gbx_valid(ln.valid, ln.has_valid, (ulong)lr)) continue;
+            gagg_add(acc[g * u.n_pays + p], ldw(ln.data, ln.width, lr));
         }
     }
 
@@ -2214,12 +2401,17 @@ kernel void NAME(                                                               
     lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;   \
     lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;   \
     lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11; \
+    uint any_idx = 0u;                              /* stage D1, see gl_row */         \
     for (uint l = 0; l < GAGG_MAX_LANES; ++l) {                                        \
         lanes[l].width = meta[l].width;                                                \
         lanes[l].has_valid = meta[l].has_valid;                                        \
         lanes[l].is_f64 = meta[l].is_f64;                                              \
+        any_idx |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;                          \
     }                                                                                  \
-    gdir_body<CAP>(lanes, prog, lists, pay, u, ids, out, scr, tid, tgid, ntg);         \
+    if (any_idx)                                                                       \
+        for (uint l = 0; l < GAGG_MAX_LANES; ++l) lanes[l].idx_slot = meta[l].idx_slot;\
+    if (any_idx) gdir_body<CAP, true>(lanes, prog, lists, pay, u, ids, out, scr, tid, tgid, ntg); \
+    else         gdir_body<CAP, false>(lanes, prog, lists, pay, u, ids, out, scr, tid, tgid, ntg);\
 }
 
 GDIR_KERNEL(gdir_masked_8_i64,   8u)
@@ -2291,11 +2483,18 @@ kernel void gdir_slab_i64(
     lanes[6].data = d6;  lanes[6].valid = v6;   lanes[7].data = d7;  lanes[7].valid = v7;
     lanes[8].data = d8;  lanes[8].valid = v8;   lanes[9].data = d9;  lanes[9].valid = v9;
     lanes[10].data = d10; lanes[10].valid = v10; lanes[11].data = d11; lanes[11].valid = v11;
+    // stage D1: `any_idx` is uniform over the dispatch and picks the
+    // instance below. The index SLOT is written into the thread's lane table
+    // only when there is one, so a statement that reads no join set sets up
+    // exactly the table it set up before stage D.
+    uint any_idx = 0u;
     for (uint l = 0; l < GAGG_MAX_LANES; ++l) {
         lanes[l].width = meta[l].width;
         lanes[l].has_valid = meta[l].has_valid;
         lanes[l].is_f64 = meta[l].is_f64;
+        any_idx |= (meta[l].idx_slot != GL_NO_IDX) ? 1u : 0u;
     }
+    if (any_idx) for (uint l = 0; l < GAGG_MAX_LANES; ++l) lanes[l].idx_slot = meta[l].idx_slot;
 
     const uint R  = u.ncopy;
     const uint c  = tid & (R - 1u);
@@ -2310,42 +2509,48 @@ kernel void gdir_slab_i64(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    // Stage D1: written once, compiled twice, chosen by a flag that is the
+    // same for every thread — see gl_row.
+#define GDIR_SLAB_FOLD(IX) \
+    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {                                            \
+        if (!gpred_eval<IX>(lanes, prog, u.n_preds, lists, i)) continue;                                \
+        const uint g = ldg(ids, u.gw, i);                                                               \
+        atomic_fetch_add_explicit(&slab[P6 + g * R + c], 1u, memory_order_relaxed);                     \
+        for (uint p = 0; p < u.n_pays; ++p) {                                                           \
+            const GLane ln = lanes[pay[p]];                                                             \
+            const uint lr = gl_row<IX>(lanes, ln, i);                                                   \
+            if ((IX && lr == GL_NULL_ROW) || !gbx_valid(ln.valid, ln.has_valid, (ulong)lr)) continue;   \
+            const long  v  = ldw(ln.data, ln.width, lr);                                                \
+            const ulong uv = (ulong)v;                                                                  \
+            const uint  s  = g * u.n_pays + p;                                                          \
+            const uint  b  = (s * 6u) * R + c;                                                          \
+            const uint a0 = (uint)(uv & 0xFFFFFFFFul), a1 = (uint)(uv >> 32);                           \
+            uint old = atomic_fetch_add_explicit(&slab[b], a0, memory_order_relaxed);                   \
+            uint carry = (old + a0 < old) ? 1u : 0u;                                                    \
+            old = atomic_fetch_add_explicit(&slab[b + R], a1, memory_order_relaxed);                    \
+            uint carry2 = (old + a1 < old) ? 1u : 0u;                                                   \
+            if (carry) {                                                                                \
+                old = atomic_fetch_add_explicit(&slab[b + R], 1u, memory_order_relaxed);                \
+                if (old + 1u < old) carry2 += 1u;                                                       \
+            }                                                                                           \
+            if (carry2) {                                                                               \
+                old = atomic_fetch_add_explicit(&slab[b + 2u * R], carry2, memory_order_relaxed);       \
+                if (old + carry2 < old)                                                                 \
+                    atomic_fetch_add_explicit(&slab[b + 3u * R], 1u, memory_order_relaxed);             \
+            }                                                                                           \
+            if (v < 0l) atomic_fetch_add_explicit(&slab[b + 4u * R], 1u, memory_order_relaxed);         \
+            atomic_fetch_add_explicit(&slab[b + 5u * R], 1u, memory_order_relaxed);                     \
+            if (u.minmax) {                                                                             \
+                const uint uo = (uint)((int)v) ^ 0x80000000u; /*  order-preserving, 32-bit lane */      \
+                const uint mb = MB + (s * 2u) * R + c;                                                  \
+                atomic_fetch_min_explicit(&slab[mb], uo, memory_order_relaxed);                         \
+                atomic_fetch_max_explicit(&slab[mb + R], uo, memory_order_relaxed);                     \
+            }                                                                                           \
+        }                                                                                               \
+    }                                                                                                  
     const uint gsize = BLOCK * ntg;
-    for (uint i = tgid * BLOCK + tid; i < u.n; i += gsize) {
-        if (!gpred_eval(lanes, prog, u.n_preds, lists, i)) continue;
-        const uint g = ldg(ids, u.gw, i);
-        atomic_fetch_add_explicit(&slab[P6 + g * R + c], 1u, memory_order_relaxed);
-        for (uint p = 0; p < u.n_pays; ++p) {
-            const GLane ln = lanes[pay[p]];
-            if (!gbx_valid(ln.valid, ln.has_valid, (ulong)i)) continue;
-            const long  v  = ldw(ln.data, ln.width, i);
-            const ulong uv = (ulong)v;
-            const uint  s  = g * u.n_pays + p;
-            const uint  b  = (s * 6u) * R + c;
-            const uint a0 = (uint)(uv & 0xFFFFFFFFul), a1 = (uint)(uv >> 32);
-            uint old = atomic_fetch_add_explicit(&slab[b], a0, memory_order_relaxed);
-            uint carry = (old + a0 < old) ? 1u : 0u;
-            old = atomic_fetch_add_explicit(&slab[b + R], a1, memory_order_relaxed);
-            uint carry2 = (old + a1 < old) ? 1u : 0u;
-            if (carry) {
-                old = atomic_fetch_add_explicit(&slab[b + R], 1u, memory_order_relaxed);
-                if (old + 1u < old) carry2 += 1u;
-            }
-            if (carry2) {
-                old = atomic_fetch_add_explicit(&slab[b + 2u * R], carry2, memory_order_relaxed);
-                if (old + carry2 < old)
-                    atomic_fetch_add_explicit(&slab[b + 3u * R], 1u, memory_order_relaxed);
-            }
-            if (v < 0l) atomic_fetch_add_explicit(&slab[b + 4u * R], 1u, memory_order_relaxed);
-            atomic_fetch_add_explicit(&slab[b + 5u * R], 1u, memory_order_relaxed);
-            if (u.minmax) {
-                const uint uo = (uint)((int)v) ^ 0x80000000u;   // order-preserving, 32-bit lane
-                const uint mb = MB + (s * 2u) * R + c;
-                atomic_fetch_min_explicit(&slab[mb], uo, memory_order_relaxed);
-                atomic_fetch_max_explicit(&slab[mb + R], uo, memory_order_relaxed);
-            }
-        }
-    }
+    if (any_idx) { GDIR_SLAB_FOLD(true) } else { GDIR_SLAB_FOLD(false) }
+#undef GDIR_SLAB_FOLD
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Fold the copies into this threadgroup's block; gdir_merge_i64 folds the

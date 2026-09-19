@@ -286,6 +286,36 @@ struct Predicate {
     std::int64_t          value = 0;
     const std::int64_t*   list = nullptr;   // In: n_list constants, same encoding as value
     std::size_t           n_list = 0;
+    // ---- stage D1 (docs/RESIDENT_COLUMNS_DESIGN.md §7): read the lane through an index ----
+    // nullptr (the default, and what every caller before stage D passes) = read
+    // `col` at the row itself, exactly as before. Otherwise an index vector with
+    // one cell per row of the statement: `col` is read at `index[row]`, and a
+    // NULL index cell makes the read NULL (the unmatched side of an outer join).
+    // See IndexedColumn below for the full contract.
+    const ResidentColumn* index = nullptr;
+};
+
+// ---- stage D1: a lane and the index it is read through ----
+// A join result stops carrying a gathered COPY of a joined table's column and
+// carries, per joined table, one index vector instead: cell i of the index is
+// the row POSITION (not a DuckDB rowid) of result row i inside that table's
+// column, and every lane of that table is read as `col[index[i]]`.
+//   - `index == nullptr` is the identity: the lane is read at the row itself
+//     and the cost is exactly what it was before stage D;
+//   - an index cell that is NULL makes every lane read through it NULL — which
+//     is what a gathered lane produces for the unmatched side of an outer join;
+//   - the index is an ordinary resident column of Dtype::I64 whose cells are
+//     in [0, col->rows()); a backend that stores lanes at 8 bytes stores it at
+//     8 bytes and is correct, just larger;
+//   - the statement's row count is the INDEX's row count when there is one,
+//     and the column's own row count when there is not. Every lane of one
+//     operator call must agree on that row count.
+// Backends that do not implement stage D report indexed_supported() == false
+// and throw when handed a non-null index; the SQL layer then keeps the
+// materialised path, so this is additive in behaviour as well as in source.
+struct IndexedColumn {
+    const ResidentColumn* col   = nullptr;
+    const ResidentColumn* index = nullptr;
 };
 
 // ---- v0.7 milestone 5: the materialised key join (docs/TRANSPARENT_DESIGN.md §4.8) ----
@@ -295,6 +325,10 @@ struct Predicate {
 struct JoinLane {
     const ResidentColumn* col = nullptr;
     bool                  from_build = false;
+    // stage D1: the lane's own column is read through this index vector before
+    // the join's match is applied — a CHAINED join, whose probe set is itself
+    // already described by index vectors. nullptr (the default) = at the row.
+    const ResidentColumn* index = nullptr;
 };
 // One payload of Aggregator::groupby_exact_masked_multi (v0.7 §4.9): a BIGINT
 // column row-aligned with the keys, and the result vectors the caller reads
@@ -302,6 +336,10 @@ struct JoinLane {
 struct MultiPayload {
     const ResidentColumn* vals = nullptr;
     std::uint32_t         columns = GroupByFilter::kAllColumns;
+    // stage D1: read `vals` through this index vector (see IndexedColumn).
+    // nullptr — the default, and what every caller before stage D passes —
+    // reads at the row itself.
+    const ResidentColumn* index = nullptr;
 };
 
 struct JoinMaterializeResult {
@@ -698,6 +736,74 @@ public:
                                                    const ResidentColumn& build_key,
                                                    const JoinLane* out, std::size_t n_out);
     [[nodiscard]] virtual bool join_supported() const noexcept { return false; }
+
+    // ---- stage D1: the same join, returning row positions instead of copies ----
+    // join_materialize runs probe -> classify -> positions -> ONE GATHER PER
+    // OUTPUT LANE, and every lane it returns is a copy of a column that is
+    // already resident. join_index stops one kernel earlier and returns the two
+    // row vectors the gather would have read:
+    //   probe_rows[d] = the probe row that produced output row d — strictly
+    //                   increasing, and the identity when every probe row is
+    //                   kept (rows_out == rows_probe);
+    //   build_rows[d] = the matching build row, NULL where there is none.
+    // Both are ordinary I64 resident columns of rows_out cells, and they are
+    // the index vectors of IndexedColumn: a lane of the probe table is read as
+    // probe_col[probe_rows[d]], a lane of the build table as
+    // build_col[build_rows[d]], by the operators, with no copy in between.
+    //
+    // `key_lane` is the lane that CLASSIFIES the output — join_materialize's
+    // lane 0 — read through its own index if it has one. It is never
+    // materialised here; it only decides, per kept row, whether the row's key
+    // cell is valid (class 1) or NULL (class 2), so that NULL-key rows stay a
+    // suffix of the output and null_key_rows keeps its meaning. `mat` names the
+    // lanes the caller still wants MATERIALISED (a cross-table expression, or a
+    // key whose sort cache has to be built in result order); n_mat may be 0.
+    // `probe_index`: the probe set is itself indexed (a chained join) — the
+    // probe key is read at probe_index[i], and probe_rows then addresses the
+    // rows of the index, so the caller composes the chain's earlier vectors
+    // with probe_rows exactly as it composes any two index vectors.
+    // Everything else — the uniqueness check on the build key, the class-1 /
+    // class-2 split, probe order within each class, rows_out, null_key_rows —
+    // is join_materialize's, term for term, and the two must agree lane for
+    // lane and bit for bit. Default throws; indexed_supported() is the rule-1
+    // gate, as exact_supported() and join_supported() are.
+    struct JoinIndexResult {
+        std::unique_ptr<ResidentColumn> probe_rows;   // rows_out cells, I64
+        std::unique_ptr<ResidentColumn> build_rows;   // rows_out cells, I64, NULL = no match
+        std::vector<std::unique_ptr<ResidentColumn>> lanes;   // n_mat materialised lanes
+        std::size_t rows_probe = 0;
+        std::size_t rows_build = 0;
+        std::size_t rows_out = 0;
+        std::size_t null_key_rows = 0;
+        bool        probe_identity = false;   // probe_rows[d] == d for every d
+        double      wall_ms = 0.0;
+        double      kernel_ms = 0.0;
+    };
+    virtual JoinIndexResult join_index(const ResidentColumn& probe_key,
+                                       const ResidentColumn& build_key,
+                                       const JoinLane& key_lane,
+                                       const JoinLane* mat, std::size_t n_mat,
+                                       const ResidentColumn* probe_index);
+
+    // Does this backend read a lane through an index on its own device — the
+    // `index` fields of Predicate / MultiPayload / JoinLane, the indexed
+    // grouped reduce, and join_index? False means those fields must be left
+    // null: the operators then behave exactly as they did before stage D, and
+    // the SQL layer keeps the materialised path (rule 1).
+    [[nodiscard]] virtual bool indexed_supported() const noexcept { return false; }
+
+    // groupby_exact_masked_multi whose KEY may itself be read through an index.
+    // Payload and predicate lanes carry their own index on MultiPayload /
+    // Predicate, so this exists only for the key. Every semantic — the output
+    // contract, the NULL-key group, the filter, the cap, thread-safety — is
+    // groupby_exact_masked_multi's, and with keys.index == nullptr and no lane
+    // index anywhere the two are the same call. The default delegates when
+    // nothing is indexed and throws otherwise, so a backend that has not
+    // implemented stage D keeps building and keeps working.
+    virtual std::vector<GroupByResidentResult> groupby_exact_masked_multi_indexed(
+        const IndexedColumn& keys, const MultiPayload* pays, std::size_t n_pays,
+        std::size_t filter_payload, const Predicate* preds, std::size_t n_preds,
+        std::size_t max_groups, const GroupByFilter& filter = GroupByFilter{});
     // Device memory the wrapper's memory budget (docs/TRANSPARENT_DESIGN.md §5.5) may
     // plan against, in bytes: the working-set size on unified memory, total device memory
     // on a discrete GPU; 0 = unknown (the wrapper then uses a conservative default).

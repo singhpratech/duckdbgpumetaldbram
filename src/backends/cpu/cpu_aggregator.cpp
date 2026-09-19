@@ -1,6 +1,7 @@
 #include "gpu_backend.hpp"
 #include "../groupby_filter.hpp"
 #include "../predicate_mask.hpp"
+#include "../multi_fanout.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -100,10 +101,42 @@ private:
     std::size_t nulls_ = 0;
 };
 
+// ---- stage D1 (docs/RESIDENT_COLUMNS_DESIGN.md §7): a lane read through an index ----
+// The reference shape of `value = lane[idx[row]]`, written as the obvious loop
+// so it can be the parity oracle for the device kernels. `rows` is the
+// STATEMENT's row count — the index's when there is one, the column's
+// otherwise — and every lane of one call must agree on it. An index cell that
+// is NULL makes the lane read NULL, which is what a gathered lane produces for
+// the unmatched side of an outer join.
+struct IdxLane {
+    const CpuResidentColumn* col = nullptr;
+    const CpuResidentColumn* idx = nullptr;   // nullptr = the identity
+    std::size_t rows = 0;
+
+    // The source row of statement row i; false = the index cell is NULL.
+    bool source(std::size_t i, std::size_t& row) const noexcept {
+        if (!idx) { row = i; return true; }
+        if (!idx->valid(i)) return false;
+        row = static_cast<std::size_t>(idx->as_i64()[i]);
+        return true;
+    }
+    bool valid(std::size_t i) const noexcept {
+        std::size_t r;
+        return source(i, r) && col->valid(r);
+    }
+    std::int64_t cell(std::size_t i) const noexcept {
+        std::size_t r;
+        if (!source(i, r)) return 0;
+        return col->as_i64()[r];
+    }
+    Dtype dtype() const noexcept { return col->dtype(); }
+};
+
 class CpuAggregator final : public Aggregator {
 public:
     Backend backend() const noexcept override { return Backend::CPU; }
     bool exact_supported() const noexcept override { return true; }   // the reference
+    bool indexed_supported() const noexcept override { return true; }  // the reference
 
     std::string device_name() const override {
 #if GPUDB_HAVE_OPENMP
@@ -568,24 +601,26 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         if (n_pays == 0 && n_preds == 0)
             throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
-        std::vector<const CpuResidentColumn*> pc(n_pays, nullptr);
+        // stage D1: every lane may carry an index, and the statement's row
+        // count is then the index's. With no index anywhere this is the same
+        // binding it always was.
+        std::vector<IdxLane> pc(n_pays);
         std::size_t n = 0;
         bool have_n = false;
         for (std::size_t p = 0; p < n_pays; ++p) {
             if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
-            pc[p] = &check_i64_nullable(*pays[p].vals);
-            if (!have_n) { n = pc[p]->rows(); have_n = true; }
-            else if (pc[p]->rows() != n)
+            (void)check_i64_nullable(*pays[p].vals);
+            pc[p] = bind_lane(*pays[p].vals, pays[p].index, op, "payload");
+            if (!have_n) { n = pc[p].rows; have_n = true; }
+            else if (pc[p].rows != n)
                 throw std::runtime_error(std::string(op) + ": payload row counts differ");
         }
-        std::vector<const CpuResidentColumn*> prc(n_preds, nullptr);
+        std::vector<IdxLane> prc(n_preds);
         for (std::size_t q = 0; q < n_preds; ++q) {
             if (!preds[q].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
-            if (preds[q].col->backend_tag() != Backend::CPU)
-                throw std::runtime_error("ResidentColumn from wrong backend");
-            prc[q] = static_cast<const CpuResidentColumn*>(preds[q].col);
-            if (!have_n) { n = prc[q]->rows(); have_n = true; }
-            else if (prc[q]->rows() != n)
+            prc[q] = bind_lane(*preds[q].col, preds[q].index, op, "predicate column");
+            if (!have_n) { n = prc[q].rows; have_n = true; }
+            else if (prc[q].rows != n)
                 throw std::runtime_error(std::string(op) + ": predicate column row count differs from the payloads");
         }
 
@@ -611,17 +646,16 @@ public:
             for (std::size_t i = b; i < e; ++i) {
                 bool keep = true;
                 for (std::size_t q = 0; keep && q < n_preds; ++q) {
-                    const CpuResidentColumn& c = *prc[q];
-                    const std::int64_t* d = c.as_i64();
+                    const IdxLane& c = prc[q];
                     keep = predicate_row(preds[q], c.dtype(), i,
-                                         [d](std::size_t row) { return d[row]; },
+                                         [&c](std::size_t row) { return c.cell(row); },
                                          [&c](std::size_t row) { return c.valid(row); });
                 }
                 if (!keep) continue;
                 ++part.cstar;
                 for (std::size_t p = 0; p < n_pays; ++p) {
-                    if (!pc[p]->valid(i)) continue;
-                    const std::int64_t x = pc[p]->as_i64()[i];
+                    if (!pc[p].valid(i)) continue;
+                    const std::int64_t x = pc[p].cell(i);
                     Acc& a = part.acc[p];
                     a.s.add(x); ++a.cnt;
                     if (x < a.mn) a.mn = x;
@@ -744,20 +778,161 @@ public:
         return r;
     }
 
+    // ---- stage D1: the same join, returning row positions ----
+    // The obvious loop, and deliberately the same one join_materialize runs:
+    // the same build map, the same uniqueness error, the same class-1 /
+    // class-2 split, the same destinations. What changes is what it writes —
+    // two row vectors instead of one gathered copy per lane — so the two must
+    // agree lane for lane, and the unit tests check exactly that.
+    std::vector<GroupByResidentResult> groupby_exact_masked_multi_indexed(
+        const IndexedColumn& keys, const MultiPayload* pays, std::size_t n_pays,
+        std::size_t filter_payload, const Predicate* preds, std::size_t n_preds,
+        std::size_t max_groups, const GroupByFilter& filter) override {
+        static const char* op = "groupby_exact_masked_multi_indexed";
+        return multi_payload_fanout(pays, n_pays, filter_payload, filter, op,
+                                    [&](std::size_t p, const GroupByFilter& f) {
+                                        return exact_impl_indexed(keys, pays[p].vals, pays[p].index,
+                                                                  preds, n_preds, max_groups, f, op);
+                                    });
+    }
+
+    JoinIndexResult join_index(const ResidentColumn& probe_key, const ResidentColumn& build_key,
+                               const JoinLane& key_lane, const JoinLane* mat, std::size_t n_mat,
+                               const ResidentColumn* probe_index) override {
+        static const char* op = "join_index";
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk_col = check_i64_nullable(probe_key);
+        const auto& bk = check_i64_nullable(build_key);
+        (void)pk_col;
+        const IdxLane pk = bind_lane(probe_key, probe_index, op, "the probe key");
+        if (!key_lane.col) throw std::runtime_error(std::string(op) + ": no key lane");
+        if (key_lane.col->dtype() != Dtype::I64)
+            throw std::runtime_error(std::string(op) + ": the key lane must be I64");
+        const IdxLane kc = bind_lane(*key_lane.col, key_lane.index, op, "the key lane");
+        const std::size_t n = pk.rows;
+        if (n > 0xFFFFFFFEull || bk.rows() > 0xFFFFFFFEull)
+            throw std::runtime_error(std::string(op) + ": > 2^32-2 rows unsupported");
+        if (!key_lane.from_build && kc.rows != n)
+            throw std::runtime_error(std::string(op) + ": the key lane's row count differs from the probe side");
+        std::vector<IdxLane> ml(n_mat);
+        for (std::size_t l = 0; l < n_mat; ++l) {
+            if (!mat[l].col) throw std::runtime_error(std::string(op) + ": output lane without a column");
+            ml[l] = bind_lane(*mat[l].col, mat[l].index, op, "an output lane");
+            if (ml[l].rows != (mat[l].from_build ? bk.rows() : n))
+                throw std::runtime_error(std::string(op) + ": lane " + std::to_string(l) +
+                                         " row count differs from its side of the join");
+        }
+
+        JoinIndexResult r;
+        r.rows_probe = n;
+        r.rows_build = bk.rows();
+
+        // Build side: valid key -> row; a second row for one key is the error.
+        std::unordered_map<std::int64_t, std::uint32_t> map;
+        map.reserve(bk.rows() * 2);
+        const std::int64_t* bd = bk.as_i64();
+        for (std::size_t i = 0; i < bk.rows(); ++i) {
+            if (!bk.valid(i)) continue;
+            if (!map.emplace(bd[i], static_cast<std::uint32_t>(i)).second)
+                throw std::runtime_error(std::string(op) + ": build key not unique");
+        }
+
+        std::vector<std::uint32_t> match(n, 0xFFFFFFFFu);
+        std::vector<std::uint8_t>  cls(n, 0);
+        std::size_t n1 = 0, n2 = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!pk.valid(i)) continue;
+            const auto it = map.find(pk.cell(i));
+            if (it == map.end()) continue;
+            match[i] = it->second;
+            // The key lane decides the class, read on its own side and through
+            // its own index — exactly as join_materialize reads lane 0.
+            const bool key_ok = key_lane.from_build ? kc.valid(it->second) : kc.valid(i);
+            if (key_ok) { cls[i] = 1; ++n1; } else { cls[i] = 2; ++n2; }
+        }
+        const std::size_t rows_out = n1 + n2;
+        std::vector<std::uint32_t> pos(n, 0);
+        {
+            std::size_t a = 0, b = n1;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (cls[i] == 1) pos[i] = static_cast<std::uint32_t>(a++);
+                else if (cls[i] == 2) pos[i] = static_cast<std::uint32_t>(b++);
+            }
+        }
+
+        // The two row vectors. probe_rows is strictly increasing within each
+        // class; build_rows is never NULL here (an inner join keeps only
+        // matched rows) but carries a bitmap so an outer-join caller can hand
+        // the same shape to the operators.
+        const std::size_t words = (rows_out + 63) / 64;
+        std::vector<std::int64_t> prow(rows_out, 0), brow(rows_out, 0);
+        for (std::size_t i = 0; i < n; ++i) {
+            if (!cls[i]) continue;
+            const std::size_t d = pos[i];
+            prow[d] = static_cast<std::int64_t>(i);
+            brow[d] = static_cast<std::int64_t>(match[i]);
+        }
+        bool identity = rows_out == n;
+        for (std::size_t d = 0; identity && d < rows_out; ++d)
+            identity = prow[d] == static_cast<std::int64_t>(d);
+        r.probe_identity = identity;
+        r.probe_rows = std::make_unique<CpuResidentColumn>(std::move(prow), std::vector<std::uint64_t>{}, 0);
+        r.build_rows = std::make_unique<CpuResidentColumn>(std::move(brow), std::vector<std::uint64_t>{}, 0);
+
+        // Whatever the planner still wants materialised, gathered exactly as
+        // join_materialize gathers it.
+        r.lanes.reserve(n_mat);
+        for (std::size_t l = 0; l < n_mat; ++l) {
+            std::vector<std::int64_t>  data(rows_out, 0);
+            std::vector<std::uint64_t> valid(words, ~std::uint64_t{0});
+            std::size_t nulls = 0;
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!cls[i]) continue;
+                const std::size_t srow = mat[l].from_build ? match[i] : i;
+                const std::size_t d = pos[i];
+                if (ml[l].valid(srow)) data[d] = ml[l].cell(srow);
+                else { valid[d >> 6] &= ~(std::uint64_t{1} << (d & 63)); ++nulls; }
+            }
+            std::vector<std::uint64_t> vb = (nulls == 0) ? std::vector<std::uint64_t>{} : std::move(valid);
+            r.lanes.push_back(std::make_unique<CpuResidentColumn>(std::move(data), std::move(vb),
+                                                                  nulls, mat[l].col->dtype()));
+        }
+        r.rows_out = rows_out;
+        r.null_key_rows = n2;
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
     GroupByResidentResult exact_impl(const ResidentColumn& keys, const ResidentColumn* vals,
                                      const Predicate* preds, std::size_t n_preds,
                                      std::size_t max_groups, const GroupByFilter& filter,
                                      const char* op) {
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto& k = check_i64_nullable(keys);
-        const CpuResidentColumn* v = vals ? &check_i64_nullable(*vals) : nullptr;
-        if (v && v->rows() != k.rows())
-            throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
-        GroupByResidentResult r{};
-        r.rows_in = k.rows();
-        if (k.rows() == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+        return exact_impl_indexed(IndexedColumn{&keys, nullptr}, vals, nullptr,
+                                  preds, n_preds, max_groups, filter, op);
+    }
 
-        const std::size_t n = k.rows();
+    // The same operator with stage-D1 indexes on the key, the payload and each
+    // predicate. With every index null it is exact_impl, line for line.
+    GroupByResidentResult exact_impl_indexed(const IndexedColumn& keys,
+                                             const ResidentColumn* vals,
+                                             const ResidentColumn* val_index,
+                                             const Predicate* preds, std::size_t n_preds,
+                                             std::size_t max_groups, const GroupByFilter& filter,
+                                             const char* op) {
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!keys.col) throw std::runtime_error(std::string(op) + ": no key column");
+        const IdxLane k = bind_lane(*keys.col, keys.index, op, "keys");
+        const std::size_t n = k.rows;
+        IdxLane v{};
+        const bool has_v = vals != nullptr;
+        if (has_v) {
+            v = bind_lane(*vals, val_index, op, "vals");
+            if (v.rows != n)
+                throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
+        }
+        GroupByResidentResult r{};
+        r.rows_in = n;
+        if (n == 0) { r.wall_ms = elapsed_ms(t0); return r; }
 
         // ---- WHERE mask (§4.6): one byte per row, conjunction of preds ----
         std::vector<std::uint8_t> mask;
@@ -765,39 +940,35 @@ public:
             mask.assign(n, 1);
             for (std::size_t p = 0; p < n_preds; ++p) {
                 if (!preds[p].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
-                if (preds[p].col->backend_tag() != Backend::CPU)
-                    throw std::runtime_error("ResidentColumn from wrong backend");
-                const auto& pc = static_cast<const CpuResidentColumn&>(*preds[p].col);
-                if (pc.rows() != n)
+                const IdxLane pl = bind_lane(*preds[p].col, preds[p].index, op, "predicate column");
+                if (pl.rows != n)
                     throw std::runtime_error(std::string(op) + ": predicate column row count differs from the keys");
-                const std::int64_t* pd = pc.as_i64();      // raw 8-byte cells (IEEE bits for F64)
                 for (std::size_t i = 0; i < n; ++i) {
                     if (!mask[i]) continue;
-                    mask[i] = predicate_row(preds[p], pc.dtype(), i,
-                                            [pd](std::size_t row) { return pd[row]; },
-                                            [&pc](std::size_t row) { return pc.valid(row); }) ? 1 : 0;
+                    mask[i] = predicate_row(preds[p], pl.dtype(), i,
+                                            [&pl](std::size_t row) { return pl.cell(row); },
+                                            [&pl](std::size_t row) { return pl.valid(row); }) ? 1 : 0;
                 }
             }
         }
         auto in_mask = [&](std::size_t row) { return mask.empty() || mask[row]; };
 
         // Sort the surviving valid-key rows by key; the surviving NULL-key rows
-        // are one group (any position: the key's bitmap says which rows).
+        // are one group (any position: the key's bitmap — read through the
+        // index — says which rows).
         std::vector<std::size_t> idx, null_idx;
-        idx.reserve(n - k.null_count());
         for (std::size_t i = 0; i < n; ++i) {
             if (!in_mask(i)) continue;
             if (k.valid(i)) idx.push_back(i); else null_idx.push_back(i);
         }
         const std::size_t n_sel = idx.size();
-        const std::int64_t* kd = k.as_i64();
         std::stable_sort(idx.begin(), idx.end(),
-                         [kd](std::size_t a, std::size_t b) { return kd[a] < kd[b]; });
+                         [&k](std::size_t a, std::size_t b) { return k.cell(a) < k.cell(b); });
         const std::size_t null_rows = null_idx.size();
 
         std::size_t groups = 0;
         for (std::size_t i = 0; i < n_sel; ++i)
-            groups += (i == 0 || kd[idx[i]] != kd[idx[i - 1]]);
+            groups += (i == 0 || k.cell(idx[i]) != k.cell(idx[i - 1]));
         if (null_rows) ++groups;
         if (!filter.active()) check_group_cap(groups, max_groups, op);
 
@@ -806,18 +977,17 @@ public:
             Sum128 s; std::int64_t cnt_v = 0, cnt_star = 0;
             std::int64_t mn = std::numeric_limits<std::int64_t>::max();
             std::int64_t mx = std::numeric_limits<std::int64_t>::min();
-            const std::int64_t* vd = v ? v->as_i64() : nullptr;
             for (std::size_t i = b; i < e; ++i) {
                 const std::size_t row = ix[i];               // mask already applied when ix was built
                 ++cnt_star;
-                if (!v) continue;
-                if (!v->valid(row)) continue;
-                const std::int64_t x = vd[row];
+                if (!has_v) continue;
+                if (!v.valid(row)) continue;
+                const std::int64_t x = v.cell(row);
                 s.add(x); ++cnt_v;
                 if (x < mn) mn = x;
                 if (x > mx) mx = x;
             }
-            if (!v) cnt_v = cnt_star;
+            if (!has_v) cnt_v = cnt_star;
             r.keys.push_back(key);
             r.key_null.push_back(key_is_null ? 1 : 0);
             r.sums.push_back(static_cast<std::int64_t>(s.lo));
@@ -829,9 +999,9 @@ public:
         };
         std::size_t i = 0;
         while (i < n_sel) {
-            const std::int64_t key = kd[idx[i]];
+            const std::int64_t key = k.cell(idx[i]);
             std::size_t j = i + 1;
-            while (j < n_sel && kd[idx[j]] == key) ++j;
+            while (j < n_sel && k.cell(idx[j]) == key) ++j;
             emit(key, false, i, j, idx);
             i = j;
         }
@@ -839,6 +1009,36 @@ public:
         apply_group_filter_host(r, filter, FilterAgg::Exact, max_groups, op);
         r.wall_ms = elapsed_ms(t0);
         return r;
+    }
+
+    // ---- stage D1: bind a lane to its index, checking what the kernels assume ----
+    // The index is an I64 column of the statement's rows whose valid cells all
+    // address a row of `col`; an out-of-range cell is a planner bug and must
+    // never reach a kernel, so the reference checks for it here.
+    static IdxLane bind_lane(const ResidentColumn& col, const ResidentColumn* index,
+                             const char* op, const char* what) {
+        IdxLane l;
+        if (col.backend_tag() != Backend::CPU)
+            throw std::runtime_error("ResidentColumn from wrong backend");
+        l.col = static_cast<const CpuResidentColumn*>(&col);
+        l.rows = col.rows();
+        if (!index) return l;
+        if (index->backend_tag() != Backend::CPU)
+            throw std::runtime_error("ResidentColumn from wrong backend (index)");
+        if (index->dtype() != Dtype::I64)
+            throw std::runtime_error(std::string(op) + ": the index of " + what + " must be I64");
+        l.idx = static_cast<const CpuResidentColumn*>(index);
+        l.rows = index->rows();
+        const std::size_t bound = col.rows();
+        for (std::size_t i = 0; i < l.rows; ++i) {
+            if (!l.idx->valid(i)) continue;
+            const std::int64_t c = l.idx->as_i64()[i];
+            if (c < 0 || static_cast<std::size_t>(c) >= bound)
+                throw std::runtime_error(std::string(op) + ": index cell " + std::to_string(i) +
+                                         " of " + what + " addresses row " + std::to_string(c) +
+                                         " of a column with " + std::to_string(bound) + " rows");
+        }
+        return l;
     }
 
     TopKResult topk_resident(const ResidentColumn& col, std::size_t k,
