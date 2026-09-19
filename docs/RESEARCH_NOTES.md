@@ -2638,6 +2638,15 @@ that came after the answer, where before it did so in barely half of them — pl
 ten runs of the whole shell suite with the Metal extension and five without it,
 all passing.
 
+The same loops with eight busy processes beside them, which finished after the
+lines above were written: the sequence as it was, **1 hang in 160 rounds** (so
+8 in 800 in all, and 48 of every 80 rounds sent the ^D before the answer); the
+corrected one, **0 in 80** (0 in 240 in all), every round of it at a prompt that
+followed the answer. Three more loaded jobs were still running when this was
+merged and are not counted. The zero is not the argument on its own — 240 rounds
+at a 1 % rate would miss it one time in eleven; the argument is that the window
+the byte was lost in opened in half the old rounds and in none of the new ones.
+
 **Ruled out.** The exit path (bounded, and `py-spy` puts the thread in `input()`,
 not in `close()`). `_restore_terminal()` (it runs before the prompt is printed
 and writes canonical settings over canonical ones, which is not a change of
