@@ -1799,6 +1799,52 @@ surviving a re-queue, a prefix invalidation matching whole segments, a derived
 set following its source, and both interleavings end to end: native answers
 throughout, back on the GPU afterwards, nothing left `failed`. The four
 connection-level checks fail on the code before this and pass after.
+## 2026-09-18 — A terminal is a client
+
+`LOAD gpudb` in the `duckdb` CLI gives the explicit `gpu_*` functions and
+nothing else, and it always will: the stable C extension API the loadable
+extension is built against — deliberately, so one binary keeps working across
+DuckDB versions — has no hook that sees a statement before it is planned. The
+transparent path therefore lives in a client (§6), and until now the only
+client was `import gpudb`. This adds the other one people actually live in:
+`gpudb` on the command line (`python/gpudb/_shell.py`, `python -m gpudb`, a
+console script declared in both `pyproject.toml` and `setup.cfg`).
+
+The rule that made it small was to write no SQL logic at all. Statements are
+split by `duckdb.tokenize` (a `;` inside a string, a comment or a dollar-quoted
+body is not a terminator, because the tokenizer says which offsets are
+operators) and then by `duckdb.extract_statements`; results are printed by the
+relation's own `show()`, so the box, the type row under the names and the
+`N rows (40 shown)` footer are DuckDB's; and where a statement ran is read from
+`last_rewrite()`, never guessed.
+
+**Two things the shell had to decide for itself.** The first: `execute()` or
+`sql()`. `execute()` carries the wrapper's per-statement machinery (the measured
+rule 1 of §9.1, the rule-2 fallback), but hands back no relation to render;
+`sql()` hands back the relation but is past its own guard by the time the rows
+are read. The shell runs `sql()` and, when a REWRITTEN statement raises while
+rendering, hands the same statement to `execute()` — the wrapper then re-runs
+the user's original on DuckDB and drops the sets behind the failure, exactly as
+rule 2 says — and renders it afterwards. So an error costs three runs of a
+statement, on a path that only opens when a resident set has gone bad. What
+stays unpaid is the measured rule: the wrapper's native-vs-rewritten timing is
+inside `execute()`, so shell statements do not feed it and only the predicted
+thresholds apply there.
+
+The second: ^C. A Python signal handler cannot run while the main thread is
+inside DuckDB, so an interactive statement runs on a worker thread and the main
+thread waits on it and calls `interrupt()` when the signal lands — including
+when it lands between two `join()` calls, which is what a first version got
+wrong: the interrupt then escaped as a `KeyboardInterrupt`, the prompt came back
+and the query kept running behind it. Every interrupt is answered and then
+waited out. Getting the *test* right took as long: a `pty` only turns ^C into a
+signal for a child that owns the terminal (`setsid` + `TIOCSCTTY`), and the
+signal flushes both of the terminal's queues, so a test that stops reading while
+the statement runs throws away the line it was about to interrupt.
+
+`python/tests/test_shell.py` runs the shell as a subprocess, the way a user
+does — 45 checks, in the wrapper-check script and in CI, where there is no
+extension and every one of them still has to pass on the plain-DuckDB path.
 
 ## Open questions
 

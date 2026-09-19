@@ -1477,6 +1477,15 @@ and the gate are the proof. Join results are still copies — stage D.
    `getvariable()`, plain SQL on every DuckDB version). No `SET gpudb_*`
    config options: the v1.2.0 API struct cannot register them and the API
    floor does not move.
+6. A terminal is a client too, so the package carries one: `gpudb` (the
+   console script, `python -m gpudb`, `python/gpudb/_shell.py`). It is a thin
+   shell over this same wrapper — DuckDB's own tokenizer splits the input,
+   `gpudb.connect()` answers each statement, DuckDB's own box renderer prints
+   it — and after each statement one line says where it ran, read from
+   `last_rewrite()`. It exists because the stock `duckdb` CLI cannot have the
+   transparent path: with no statement hook in the stable C API, `LOAD gpudb`
+   there gives the explicit `gpu_*` functions only. `python/README.md` has the
+   invocation and the dot-commands.
 
 ## 7. Backend work (both, in parallel)
 
