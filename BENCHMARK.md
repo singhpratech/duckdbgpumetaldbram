@@ -4294,7 +4294,9 @@ mask it shares with the fused pass is what carries it (up to 1.73×). A lane
 gather costs what a payload gather costs, and a term buys one of those instead
 of one sequential read. It stays behind `GPUDB_METAL_MASK_PATH=permeval`.
 
-**What it does to whole queries.** `scripts/tpch_coverage.py`, threads = 1,
+**What it does to whole queries.** `scripts/tpch_coverage.py`, DuckDB's default
+thread count (an earlier revision of this entry said `threads = 1`; the driver
+never set it — the kernel sweep above was single-threaded, these runs were not),
 resident, the same build with `GPUDB_METAL_MASK_PATH=legacy` and with the
 default, two runs of each, interleaved (rewritten statement ms, run 1 / run 2;
 the ratio is min over min):
