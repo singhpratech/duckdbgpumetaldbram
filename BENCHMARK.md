@@ -4727,3 +4727,24 @@ a set younger than the eviction floor cannot be evicted to make room. Nothing
 runs slower than native — a set the budget refuses makes the statement native,
 which is what `reason == "memory"` means. The same comparison with a budget
 that holds the working set is below.
+
+**With a budget that holds the working set, SF10 is 17 / 22 against 19 / 22.**
+`scripts/tpch_coverage.py --memory-budget 40GB`, one round each:
+
+| query | main | branch |
+|---|---|---|
+| Q13 | native (shape) 201.1 ms | **GPU (nested)** 17.6 ms — 11.31× |
+| Q15 | native (shape) 27.4 ms | **GPU (nested)** 17.0 ms — 2.17× |
+| Q18 | GPU (plain) 15.15× | GPU (plain) 15.66× |
+| Q19 | GPU (projected) 14.20× | GPU (projected) 14.51× |
+| the other 18 | — | same path, same ratios inside spread |
+
+So the two `native (memory)` rows at the default budget are the budget and
+nothing else. The 22 queries at SF10 leave **14.49 GiB** resident on main (33
+sets of 11.28 GiB plus 30 store columns of 3.20 GiB) and **14.10 GiB** on the
+branch (35 sets of 10.23 GiB plus 31 store columns of 3.87 GiB) — the branch
+holds a little less because the two sets it could not admit are larger than the
+two it did. Both sit just under the wrapper's default 16 GiB on this machine
+(a quarter of unified memory, §5.5), which is why two more sets tip it: a set
+younger than the eviction floor cannot be evicted to make room, so whichever
+statements arrive last are the ones refused.
