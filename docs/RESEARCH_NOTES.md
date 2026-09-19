@@ -2142,10 +2142,31 @@ correlation columns to the surface area, in order to produce two statements
 the measurement declines. It is not built, and the reason is a number rather
 than a taste.
 
-Measured, `scripts/transparent_gate.py --ctes` (Metal, SF1): the `cte` and
-`cte_arm` cells are in BENCHMARK.md with the losing ones. The two CTE forms
-carry no bounds of their own — after the splice they ARE the plain / join
-forms, and the bounds that decide them are the ones already measured for those.
+**What the sweep found, which was not the CTEs.** `transparent_gate.py --ctes`
+adds two forms to every cell, and the second of them — a project-and-join CTE
+joined to `orders` — is a shape nothing had measured before. Four of its cells
+came back at 0.98–0.99× and one at a flat 1.00×: keyed by `l_orderkey` it
+returns 664K–729K groups out of 6M lineitem rows, and the bounds admitted it.
+That is a rule-1 failure the CTE work introduced, since before §4.22 the same
+statement simply declined for shape. The same statement keyed by `l_partkey`
+returns 195K–200K groups and wins 1.05–1.11×, and every `li x orders` cell at
+~100K groups wins 1.15–3.18×, so the group count is not what separates them:
+rows read per group returned is — 8.2 losing, 30 thin, 60 clear, and SF10's
+1M-group cell is 60 too.
+
+The first fix was one line and wrong. Requiring 16 rows per group above
+`join_plain_small_groups` also declined TPC-H Q13 at SF1 — 146K groups out of
+1.5M `orders` rows, 10.3 per group, 8.8× — and took SF1 coverage from 15 of 22
+to 14. Q13's groups do not go to the client; they feed another GROUP BY inside
+DuckDB, which is the same observation as the Q13 / Q15 declines above, seen
+from the other side. So the ratio is a SECOND bound, applied only above 300K
+groups returned, which sits above every measured winner and below every
+measured loser. That is the shape of the rule the evidence supports, and the
+losing run is in BENCHMARK.md next to the passing one.
+
+Final: 956 cells, 628 rewritten, 328 declined, 0 below 1.0×, 0 differing. The
+CTE forms carry no bound of their own — after the splice they ARE the plain and
+join forms.
 
 ## Open questions
 
