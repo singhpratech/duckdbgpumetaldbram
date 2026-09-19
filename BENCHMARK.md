@@ -4567,3 +4567,118 @@ CTE forms themselves: `cte` 75 rewritten at 1.17–67.0× with 43 declined,
 `cte_arm` 30 rewritten at 1.05–13.68× with 25 declined. Neither form carries a
 bound of its own — after the splice they ARE the plain and join forms, and the
 bounds that decide them are those.
+
+## v0.7 §4.23 — inner statements, and what a row floor should count — Metal, SF1 + SF10 (2026-09-19)
+
+`gpudb.connect()`, Apple M4 Max, statement vs statement through the wrapper,
+warm, minimum of 5, nothing else on the machine. The §4.22 section recorded
+that three TPC-H declines — Q13 at SF10, Q15 at both scale factors, Q22 at SF1
+— are conservative, and named the rule that declines each. This section is the
+sweep that revisits them.
+
+### The three declines, re-measured on the path the shipping code would take
+
+`--no-thresholds` is not "the shipping plan, forced" (for Q18 it picks a path
+that is 0.03× of native), so each query was run with **one bound overridden and
+everything else shipping**. Two interleaved rounds, minimum and median of 5.
+
+| query | SF | bound lifted | path | native ms (min / med) | device ms (min / med) | ratio, round 1 / 2 |
+|---|---|---|---|---|---|---|
+| Q13 | 1  | the two join output bounds (neither fires at SF1) | nested | 18.1 / 19.2 · 38.6 / 42.5 | 2.8 / 2.9 · 3.6 / 3.6 | 6.40× / 10.69× |
+| Q13 | 10 | `join_plain_max_groups` **and** `join_plain_min_rows_per_group` | nested | 161.8 / 174.2 · 296.4 / 319.4 | 15.2 / 15.3 · 17.4 / 17.5 | 10.64× / 17.07× |
+| Q15 | 1  | `plain_min_selectivity` | nested | 3.7 / 3.9 · 4.4 / 5.0 | 2.2 / 2.2 · 2.3 / 2.3 | 1.72× / 1.95× |
+| Q15 | 10 | `plain_min_selectivity` **and** `plain_max_groups_where` | nested | 26.5 / 27.5 · 33.6 / 34.1 | 16.3 / 16.6 · 16.4 / 16.6 | 1.63× / 2.05× |
+| Q22 | 1  | the row floor | plain | 12.8 / 13.1 · 12.7 / 12.8 | 1.3 / 1.3 · 1.2 / 1.2 | 10.17× / 10.62× |
+| Q22 | 10 | none — already on the device | plain | 77.0 / 87.5 | 1.8 / 1.9 | 43.63× |
+
+Two things the earlier `--no-thresholds` numbers did not show. Q13 at SF10
+declines on **both** join output bounds, not just the group cap: with only
+`join_plain_max_groups` lifted it still reads `10.1 rows per group over a join
+with 1488128 groups < 16.0`. Q15 at SF10 declines on two as well, and its log
+tail (`declined (not_found, device): table`) names neither.
+
+### The sweep: the same GROUP BY, consumed four ways
+
+`scripts/transparent_gate.py --inner` adds four forms to every cell. Three
+consumers reduce the inner result — an outer aggregate, an outer `GROUP BY`
+over the inner aggregate (Q13's shape), a CTE compared against a scalar
+subquery over itself (Q15's shape) — and one does not: a join back to the key's
+own table, which returns every group to the client after all. `--no-thresholds`
+so every cell reports a ratio; SF1, plain `l_quantity` payload.
+
+| key | groups | WHERE | rows kept per group | inner_agg | inner_group | inner_scalar | join-back | client-facing plain |
+|---|---|---|---|---|---|---|---|---|
+| l_linenumber | 7 | — | 857K | 1.04× | 1.20× | 1.73× | — | 1.04× |
+| l_returnflag | 3 | — | 2.0M | 2.46× | 1.90× | 2.28× | — | 3.48× |
+| l_suppkey | 10K | — | 600 | 1.33× | 2.77× | 2.22× | 1.35× | 1.49× |
+| l_partkey | 200K | — | 30 | 3.76× | 5.14× | 3.53× | 1.24× | 1.15× |
+| l_orderkey | 1.5M | — | 4.0 | **0.44×** | **0.97×** | **0.44×** | **0.93×** | **0.97×** |
+| l_linenumber | 7 | 9 % | 77K | 1.73× | 1.32× | 1.61× | — | 1.76× |
+| l_returnflag | 3 | 9 % | 180K | 1.18× | **0.86×** | **0.84×** | — | 1.21× |
+| l_suppkey | 10K | 9 % | 54 | 1.24× | 1.23× | 1.22× | 1.05× | 1.04× |
+| l_partkey % 25000 | 25K | 9 % | 21.6 | 1.34× | 1.39× | 1.41× | — | **0.87×** |
+| l_partkey % 50000 | 50K | 9 % | 10.8 | 1.39× | 1.52× | 1.10× | — | **0.91×** |
+| l_partkey % 100000 | 99,550 | 9 % | 5.4 | 1.05× | 1.34× | 1.11× | — | **0.93×** |
+| l_partkey % 150000 | 143,339 | 9 % | 3.8 | **0.93×** | 1.27× | **0.83×** | — | **0.95×** |
+| l_partkey | 186,984 | 9 % | 2.9 | **0.73×** | 1.15× | **0.71×** | **0.97×** | **0.94×** |
+| l_partkey % 25000 | 25K | 25 % | 60 | 2.09× | 2.11× | 2.00× | — | 1.14× |
+| l_partkey % 50000 | 50K | 25 % | 30 | 2.51× | 2.22× | 2.36× | — | 1.03× |
+| l_partkey % 100000 | 100K | 25 % | 15 | 1.29× | 2.48× | 1.96× | — | 1.01× |
+| l_partkey % 150000 | 149,955 | 25 % | 10.0 | 1.55× | 2.37× | 1.47× | — | 1.00× |
+| l_partkey | 199,893 | 25 % | 7.5 | 1.35× | 1.86× | 1.38× | — | 1.00× |
+| l_partkey % 25000 | 25K | 91 % | 218 | 3.91× | 3.93× | 3.80× | — | 1.58× |
+| l_partkey % 50000 | 50K | 91 % | 109 | 5.20× | 5.52× | 4.95× | — | 1.32× |
+| l_partkey % 100000 | 100K | 91 % | 55 | 4.35× | 5.16× | 3.80× | — | 1.21× |
+| l_partkey % 150000 | 149,955 | 91 % | 36 | 3.40× | 4.71× | 3.18× | — | 1.13× |
+| l_partkey | 199,893 | 91 % | 27 | 2.96× | — | — | — | 1.11× |
+
+Every cell in bold is below 1.0×. The group count does not separate them (150K
+groups lose under a 9 % `WHERE` and win 1.47× under a 25 % one), and neither
+does selectivity (9 % wins at 50K groups and loses at 150K). **Rows kept per
+group returned** does: every losing inner cell is at 2.9 to 4.0, the band at
+5.4 measures 1.05–1.34×, and every cell at 7.5 or more measures 1.29× or
+better. The two few-group rows that lose (`l_returnflag` under the 9 % `WHERE`)
+are declined by `min_groups` and the VARCHAR-key rules whatever happens here.
+
+So the bound is **7 rows read per group returned**, placed between the last
+cell that loses (4.0, at 0.44×) and the first that wins clearly (7.5, at
+1.35×), above the thin band. It admits Q13 (10.1 rows per group at SF10, 10.3
+at SF1) and Q15 (24.5 at SF10, 26.4 at SF1) with room, and declines two cells
+that measured 1.05×, which is the direction a bound is allowed to be wrong in.
+
+The join-back column is why the relaxation asks for a reducing consumer. That
+form returns every inner group to the client, and it wins and loses exactly
+where the client-facing plain form does — 1.24–1.35× at 200K groups with no
+`WHERE`, 0.93× at 1.5M, 0.97× at 187K under the 9 % one. A consumer that
+reduces nothing is not an inner statement in the sense that matters, so
+anything returning less than 4× fewer rows keeps the bounds above.
+
+Checked after the fact, `decide()` against all 26 measured cells plus the six
+TPC-H rows: **0 admitted below 1.0×**.
+
+### The row floor, and the table it was not counting
+
+`scripts/transparent_gate.py --lane-floor`: a small table whose `WHERE` holds a
+§4.18 subquery lane over a much larger one, which is TPC-H Q22's shape. Five
+outer tables, three lane kinds, plain and HAVING forms, SF1.
+
+| outer table (rows at SF1) | lane | over | plain | HAVING |
+|---|---|---|---|---|
+| supplier (10K) | `NOT EXISTS` | lineitem (6M) | 1.65× | 1.64× |
+| supplier | `IN` | lineitem | 1.82× | 1.27× |
+| supplier | correlated `avg` | lineitem | 3.75× | 3.95× |
+| customer (150K), by c_nationkey | `NOT EXISTS` | orders (1.5M) | 10.64× | 8.60× |
+| customer, by c_nationkey | `IN` | orders | 2.27× | 2.26× |
+| customer, by c_nationkey | correlated `avg` | orders | 4.09× | 4.58× |
+| customer, by c_mktsegment | `NOT EXISTS` / `IN` / `avg` | orders | 10.42× / 2.79× / 3.91× | 6.98× / 2.62× / 4.14× |
+| part (200K), by p_brand | `NOT EXISTS` / `IN` / `avg` | lineitem | 8.97× / 4.47× / 12.15× | 7.47× / 4.14× / 13.15× |
+| part, by p_size | `NOT EXISTS` / `IN` / `avg` | lineitem | 10.49× / 3.90× / 14.45× | 8.75× / 3.96× / 17.12× |
+| partsupp (800K) | `NOT EXISTS` / `IN` / `avg` | lineitem | 2.77× / 2.49× / 3.39× | 8.33× / 6.50× / 13.58× |
+| orders (1.5M), by o_orderpriority | `NOT EXISTS` / `IN` / `avg` | lineitem | 14.82× / 4.78× / 29.02× | 10.12× / 4.18× / 31.44× |
+| orders, by o_custkey | `NOT EXISTS` / `IN` / `avg` | lineitem | 1.59× / 1.22× / 21.95× | 6.49× / 3.04× / 23.05× |
+
+**48 cells, 1.22× to 31.44×, none below 1.0×.** Four of the five outer tables
+are below the 1,000,000-row floor and every one of them wins, because what
+native runs on every statement is the lane, and the device runs it once, during
+the upload. The floor now counts the largest table the statement's answer
+depends on, the tables a lane reads included.

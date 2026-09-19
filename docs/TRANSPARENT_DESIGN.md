@@ -1137,6 +1137,77 @@ One name-resolution fix came with this. `_views.inline` replaced any
 after a view would have been replaced by the view's body. It now skips names a
 `cte_map` in scope defines, which is what SQL does.
 
+### 4.23 An inner statement is not the statement the bounds were swept on
+Every output-size bound in `python/gpudb/_thresholds.py` — the plain form's
+group caps, its selectivity bound, the join form's two — was measured on a
+statement whose groups the CLIENT fetches. At large outputs that fetch is what
+the statement is bound by (§9.1, "Output cost"), which is why those bounds
+exist at all.
+
+When the nested pass (§4.14) lifts a `GROUP BY` out of a bigger statement, the
+groups are not fetched. DuckDB reads them out of the table function inside the
+same process, joins or re-aggregates or compares them, and one row — or a few —
+leaves. TPC-H Q13 is a derived table feeding an outer `GROUP BY`; Q15's CTE
+feeds a join and a scalar subquery and the statement returns one row. Applying
+a fetch-bound number to those is applying a measurement of one thing to
+another.
+
+**What decides instead.** The same quantity §4.22 found for the join bound:
+rows read per row returned, counted after the `WHERE`. The device wins by
+reducing; when it hands back nearly as many rows as survive the filter there is
+nothing left to win, whoever reads them. The sweep is
+`scripts/transparent_gate.py --inner`, which wraps every cell four ways — an
+outer aggregate, an outer `GROUP BY` over the inner aggregate (Q13's shape), a
+CTE against a scalar subquery over itself (Q15's shape), and a join back to the
+key's own table, which returns every group to the client after all. The numbers
+and the losing cells are in `_thresholds.py` and BENCHMARK.md; the bound is
+**7 rows read per group returned**.
+
+Three conditions, and only inside all three do the output bounds step aside:
+
+- the consumer **reduces**: the whole statement returns at least four times
+  fewer rows than the inner one produces. The join-back form is the measured
+  extreme — it reduces nothing — and it behaves exactly like the client-facing
+  plain form, winning and losing where that form does, so anything that
+  reducing is decided by the ordinary bounds;
+- the device is **reducing**: at least 7 rows kept per group returned;
+- the statement is inside the **measured envelope**: at most 2,000,000 groups,
+  which is just above the largest inner statement the sweep saw (Q13 at SF10,
+  1,488,128).
+
+Everything else is unchanged. `min_groups`, the VARCHAR-key rules, HAVING and
+top-k, the several-payload bounds and the `count(DISTINCT)` pair bounds all
+decide an inner statement as they decide any other, and the continuous measured
+rule 1 (§9.1) is the backstop for all of them.
+
+**How the wrapper knows.** It measures, once per statement text, and only when
+it would change the answer. The nested pass walks the statement offering each
+aggregate `SELECT` to the ordinary path; when one is declined by a bound,
+`decide()` is asked the same question a second time with the statement marked
+inner (a pure call, no probe) and records `inner_relaxable` if the answer would
+flip. Only then does `_consumer_rows` run one native `SELECT count(*) FROM
+(<the whole statement>)` and the walk repeat with that number. A statement
+whose sub-`SELECT` declines for any other reason — too few groups, too thin a
+reduction — never pays the probe. The number is part of the cached decision's
+key, because the same text decides differently where its groups go somewhere
+else.
+
+`last_rewrite()["detail"]` says which rule spoke: *the inner-statement bounds:
+1488128 groups reduced to 45 row(s) inside DuckDB, 10.1 rows read per group
+returned* when they admit, and when they decline it names both the bound that
+fired and the reason the inner bounds did not apply either.
+
+**The row floor is the same mistake, one level down.** The floor asks whether
+there is enough work to be worth a device at all, and it counted the rows of
+the statement's own `FROM`. A statement over a small table whose `WHERE` holds
+`NOT EXISTS (SELECT … FROM <big>)` makes native read `<big>` on every run; the
+device reads it once, during the upload, into a §4.18 lane. The join bounds
+already make that argument — native runs a join whatever the `FROM` says — and
+the floor did not. It now counts the largest table the answer depends on, the
+tables a subquery lane reads included, and says so in the detail. TPC-H Q22 is
+the case: 150,000 `customer` rows at SF1 over a `NOT EXISTS` on 1,500,000
+`orders` rows.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -1758,6 +1829,24 @@ state. The user's own statement is never the experiment. In the gate a row
 that measures slower in the slow mode reads `declined after the first run
 (threshold)`: no ratio, and no statement ran slower for a user.
 
+**Inner bounds and client-facing bounds (measured 2026-09-19).** A threshold is
+a measurement of a particular situation, and the situation every output-size
+bound here was measured in is *the client fetches the groups*. Three TPC-H
+declines turned out to be that measurement applied to a different situation —
+a statement whose groups DuckDB reads out of the table function and consumes
+itself — and a fourth, the row floor, was counting the wrong table. §4.23 has
+the rule and the sweep; what belongs here is the shape of the argument. A bound
+does not move because a query would be faster past it: `--no-thresholds` said
+Q13 was worth 10.91×, but `--no-thresholds` is not the shipping plan forced
+(for Q18 it picks a path that is 0.03× of native), so each of the three was
+re-measured with **one bound overridden and everything else shipping**, which
+is the path the code would actually take. Then the rule itself came from a
+sweep of its own — the same cells as the plain and join forms, wrapped in four
+different consumers — and it was placed where every admitted cell measured at
+least 1.29× and every cell below 1.0× stayed declined, not where TPC-H wanted
+it. Two cells that measure 1.05× are declined by it; that is the direction a
+bound is allowed to be wrong in.
+
 **A faster kernel is not a looser threshold (2026-09-18).** The direct grouped
 reduce (§4.1, `docs/RESIDENT_COLUMNS_DESIGN.md` §7) makes a few-group exact
 GROUP BY 1.65× to 8.57× faster at SF10, which is the obvious moment to ask
@@ -1794,6 +1883,15 @@ shadowing / `ATTACH` + `USE` / a second connection writing / a write inside
 an open transaction with the query before and after `COMMIT`.
 
 ### 9.3 `scripts/transparent_gate.sh` (rule 1)
+Form groups the script adds on request, each the same grid of keys,
+selectivities and joins seen through a different surface: `--exprs` (computed
+lanes, §4.10), `--subqueries` (§4.18 lanes), `--ctes` (§4.22), `--inner` (the
+same `GROUP BY` consumed inside DuckDB by four different consumers, §4.23) and
+`--lane-floor` (a small table whose work is a lane over a large one — what the
+row floor should count). `--forms` restricts a run to named forms and
+`--no-thresholds` turns every bound off, which is how the tables those bounds
+are read off are collected; neither is the shipping configuration.
+
 Every rewritable shape and every §9.1 sweep point, transparent vs native,
 same process, warm, min-of-N with N ≥ 5 and the GPU clock printed beside
 each row (the 4090's boost clock is bimodal, 1665–2400 MHz, and a 1.0× row

@@ -279,6 +279,25 @@ CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
+def inner_blocked(backend: str, est_groups: Optional[int], selectivity: Optional[float],
+                  has_where: bool, rows: int) -> str:
+    """Why the inner-statement bounds (§4.23) would not apply to this statement
+    even if DuckDB consumed its groups — '' when they would. Said out loud so a
+    decline names the rule that refused to relax, not only the one that fired."""
+    t = TABLE.get((backend or "").upper())
+    if t is None or not est_groups:
+        return ""
+    if est_groups > t.inner_max_groups:
+        return (f"{est_groups} groups is past the {t.inner_max_groups} the inner-statement bounds "
+                f"were measured over")
+    kept = rows * (selectivity if (has_where and selectivity is not None) else 1.0)
+    per_group = kept / est_groups
+    if per_group < t.inner_min_rows_per_group:
+        return (f"{per_group:.1f} rows read per group returned < {t.inner_min_rows_per_group}, so the "
+                f"inner-statement bounds do not apply either")
+    return ""
+
+
 def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Optional[float],
            has_where: bool, join: bool = False, payloads: int = 1, string_key: bool = False,
            limited: bool = False, computed_payloads: int = 0,

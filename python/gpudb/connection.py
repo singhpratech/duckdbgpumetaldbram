@@ -1236,7 +1236,7 @@ class Connection:
                 self._last.reason = "shape"
                 return None
 
-            def walk(e, path, top, inner_out, subs, relaxable):
+            def walk(e, path, top, inner_out, subs, relaxable, bounded):
                 if isinstance(e, dict):
                     if not top and self._is_aggregate_select(e):
                         try:
@@ -1250,18 +1250,23 @@ class Connection:
                                 subs.append((list(path), sub_sql))
                                 return                      # rewritten as a whole: do not descend
                             sd = getattr(self, "_detail_decision", None)
-                            if sd is not None and sd.inner_relaxable:
-                                relaxable.append(sub_sql)
+                            if self._last.reason == "threshold" and sd is not None:
+                                # the log tail is not the reason: a SELECT inside the
+                                # statement was rewritable and a BOUND declined it
+                                bounded.append(sd.why or "")
+                                if sd.inner_relaxable:
+                                    relaxable.append(sub_sql)
                     for k, v in e.items():
-                        walk(v, path + [k], False, inner_out, subs, relaxable)
+                        walk(v, path + [k], False, inner_out, subs, relaxable, bounded)
                 elif isinstance(e, list):
                     for i, v in enumerate(e):
-                        walk(v, path + [i], False, inner_out, subs, relaxable)
+                        walk(v, path + [i], False, inner_out, subs, relaxable, bounded)
 
             subs: List[Tuple[list, str]] = []
             relaxable: List[str] = []
+            bounded: List[str] = []
             root, path0 = stmts[0].get("node"), ["statements", 0, "node"]
-            walk(root, path0, True, None, subs, relaxable)
+            walk(root, path0, True, None, subs, relaxable, bounded)
             inner_out = None
             if relaxable:
                 # §4.23: an aggregate inside this statement was declined by an
@@ -1273,17 +1278,16 @@ class Connection:
                 inner_out = self._consumer_rows(sql)
                 if inner_out is not None:
                     subs2: List[Tuple[list, str]] = []
-                    walk(root, path0, True, inner_out, subs2, [])
+                    walk(root, path0, True, inner_out, subs2, [], [])
                     if len(subs2) > len(subs):
                         subs = subs2
                     else:
                         inner_out = None
             if not subs or len(self._nested_cache) > 512:
                 self._last = LastRewrite(statement=sql, reason="shape")
-                if relaxable:
-                    sd = getattr(self, "_detail_decision", None)
+                if bounded:
                     self._last.reason = "threshold"
-                    self._last.detail = (sd.why if sd is not None and sd.why else
+                    self._last.detail = (bounded[0] or
                                          "a rewritable SELECT inside the statement was declined by a bound")
                     self._nested_cache[key] = (self._last.reason, self._last.detail)
                 else:
@@ -2193,6 +2197,10 @@ class Connection:
                     computed_payloads=sum(1 for v in set(plan.vals) if v in computed),
                     reaggregated=reagg, global_agg=global_agg, rows=nrows,
                     where_terms=len(plan.where), inner_out=0)[0]
+                if inner_out is None and not relax:
+                    blocked = _thresholds.inner_blocked(self._backend, est, sel, bool(plan.where), nrows)
+                    if blocked:
+                        why = f"{why}; {blocked}"
                 return Decision(False, "threshold", why=why, inner_relaxable=bool(relax))
             if why:                          # §4.23: names the rule that admitted it
                 self._inner_admit = (self._inner_admit + "; " + why) if self._inner_admit else why

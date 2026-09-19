@@ -1901,6 +1901,70 @@ def run():
           "sql(): ... and still answers it")
     con.close()
 
+    # ---- §4.23: an inner statement's groups are DuckDB's, not the client's ----
+    print("== inner-statement bounds")
+    con = fresh(thresholds=True, floor_rows=0)
+    if con._backend not in ("", "CPU"):
+        # 1000 groups under a WHERE that keeps ~10%: the client-facing plain form is
+        # declined by plain_min_selectivity, and the SAME GROUP BY consumed inside
+        # DuckDB is admitted — 30 rows read per group returned, well past the bound
+        plain = "SELECT k, sum(v) AS s FROM t WHERE v < 10 GROUP BY k"
+        con.execute(plain).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "threshold"
+              and "selectivity" in (lr["detail"] or ""),
+              f"inner: the client-facing form is still declined by the selectivity bound ({lr['detail']!r})")
+        reduced = f"SELECT count(*) AS n, max(s) AS top FROM ({plain}) gpudb_x"
+        want = con._raw.execute(reduced).fetchall()
+        got = con.execute(reduced).fetchall()
+        lr = con.last_rewrite()
+        check(got == want, "inner: an outer aggregate over it gets native's rows")
+        check(lr["rewritten"] and "inner-statement bounds" in (lr["detail"] or ""),
+              f"inner: ... and the detail names the rule that admitted it ({lr['detail']!r})")
+        # a consumer that does NOT reduce keeps the client-facing bounds
+        passthru = f"SELECT k, s FROM ({plain}) gpudb_x WHERE s IS NOT NULL"
+        want = sorted(con._raw.execute(passthru).fetchall())
+        got = sorted(con.execute(passthru).fetchall())
+        lr = con.last_rewrite()
+        check(got == want, "inner: a consumer that returns every group gets native's rows")
+        check(not lr["rewritten"], f"inner: ... and is still declined ({lr['reason']}, {lr['detail']!r})")
+        # ... and so does an inner statement that is not reducing enough: a WHERE
+        # keeping 1% leaves ~3 rows per group returned, below the measured bound
+        thin = "SELECT k, sum(v) AS s FROM t WHERE v = 3 GROUP BY k"
+        thin_in = f"SELECT count(*) AS n, max(s) AS top FROM ({thin}) gpudb_x"
+        want = con._raw.execute(thin_in).fetchall()
+        got = con.execute(thin_in).fetchall()
+        lr = con.last_rewrite()
+        check(got == want, "inner: a thin inner statement gets native's rows")
+        check(not lr["rewritten"] and lr["reason"] == "threshold"
+              and "rows read per group returned" in (lr["detail"] or ""),
+              f"inner: ... and the detail says the inner bounds do not apply either "
+              f"({lr['reason']}, {lr['detail']!r})")
+    con.close()
+
+    # ---- §4.23: the row floor counts the table a subquery lane reads ----
+    print("== the row floor and a subquery lane")
+    con = fresh(thresholds=True, floor_rows=200_000)
+    con.execute("CREATE TABLE tsmall AS SELECT (i % 40)::INTEGER AS k2, i::BIGINT AS w "
+                f"FROM range({N // 100}) r(i)")
+    con._big_tables = None                     # tsmall is new: re-read what is above the floor
+    if con._backend not in ("", "CPU"):
+        lane = ("SELECT k2, sum(w), count(*) FROM tsmall "
+                "WHERE NOT EXISTS (SELECT 1 FROM t WHERE t.k = tsmall.k2) GROUP BY k2")
+        want = sorted(con._raw.execute(lane).fetchall())
+        for _ in range(3):
+            got = sorted(con.execute(lane).fetchall())
+        lr = con.last_rewrite()
+        check(got == want, "floor: a lane over a big table gets native's rows")
+        check(lr["rewritten"] and "subquery lane reads" in (lr["detail"] or ""),
+              f"floor: ... and the detail says which table the floor counted ({lr['detail']!r})")
+        # without the lane the same small table is still below the floor
+        con.execute("SELECT k2, sum(w) FROM tsmall GROUP BY k2").fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and "floor" in (lr["detail"] or ""),
+              f"floor: a small table on its own is still declined ({lr['detail']!r})")
+    con.close()
+
     # store_columns(): what .residents prints per column, and it leaves last_rewrite() alone
     print("== store_columns()")
     con = fresh()
