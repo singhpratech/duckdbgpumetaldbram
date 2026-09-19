@@ -14,6 +14,7 @@ import gpudb                       # noqa: E402
 
 N = 300_000
 FAILS = []
+SKIPS = []
 
 
 def check(cond, msg):
@@ -22,6 +23,14 @@ def check(cond, msg):
         print("  FAIL", msg)
     else:
         print("  ok  ", msg)
+
+
+def skip(msg):
+    """Announce a check this build cannot make, the way test_shell.py does.
+    A skip is not a pass and not a failure: it says the suite knows the case
+    exists and that this backend cannot reach it."""
+    SKIPS.append(msg)
+    print("  skip", msg)
 
 
 def native(sql):
@@ -66,6 +75,18 @@ def run():
     con = fresh()
     if con._backend in ("", "CPU"):
         print("no GPU backend; only the never-rewrite path can be tested here")
+    elif not getattr(con, "_exact", False):
+        # A GPU backend that has not implemented the v0.7 exact path declines
+        # every rewritable shape with reason "shape", so most checks below
+        # assert something this build cannot do. They are reported as failures
+        # rather than skips on purpose: a blanket "degraded, count it as a
+        # skip" rule would also swallow a REAL wrong answer from the backend
+        # under test, which is the one thing this suite exists to catch. Treat
+        # the count as "how much of the wrapper this backend cannot reach yet";
+        # it falls to zero on its own as the backend's kernels land.
+        print(f"backend {con._backend} reports exact=false: the transparent path is not "
+              "reachable on this build, so the rewrite and parity checks below will fail "
+              "rather than skip — see the header comment in run()")
     cases = {
         "plain":      "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k",
         "aliases":    "SELECT k AS kk, sum(v) AS s, count(*) AS c FROM t GROUP BY k ORDER BY kk",
@@ -1435,7 +1456,15 @@ def run():
         d2 = con._timing_decision
         check(d2 is not None and d2 is not d and d2.timing_checked and d2.probe_sql,
               "measured (eager): the second template was probed too and remembers its rewritten form")
-        if True:
+        # A backend without the exact path rewrites nothing, so no template is
+        # ever probed and there is no decision to re-measure. That is a skip,
+        # not a crash: before this guard the suite died here with an
+        # AttributeError on None and every later section went unrun, which is
+        # what a CUDA box saw for the whole of the v0.7 effort.
+        if d2 is None:
+            skip("measured: re-measurement needs a template the backend kept "
+                 f"(backend={con._backend or 'none'}, exact={getattr(con, '_exact', False)})")
+        else:
             d2.rewritten, d2.reason, d2.measured_declined = True, "", False   # start from "kept", whatever the tiny table measured
             saved_probe = con._probe_ms
             try:
@@ -1997,6 +2026,10 @@ def run():
     con.close()
 
     print()
+    if SKIPS:
+        print(f"{len(SKIPS)} skipped (this backend cannot reach them):")
+        for m in SKIPS:
+            print(f"  - {m}")
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0
 
