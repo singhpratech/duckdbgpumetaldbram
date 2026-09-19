@@ -407,6 +407,155 @@ same, and the parity tests compare them. Chunks (appends, tables above the
 budget) come with the same stage: an index vector already addresses rows by
 id, and a chunk is a range of ids.
 
+### 8.1 D1 — the mechanism (2026-09-19)
+
+**What is built.** The interface additions are in `gpu_backend.hpp` and are
+additive only, because the file is frozen for the CUDA port: `IndexedColumn`
+(a lane and the index it is read through), a defaulted `index` field on
+`Predicate`, `MultiPayload` and `JoinLane`, `join_index` with
+`Aggregator::JoinIndexResult`, `indexed_supported()` as the rule-1 gate, and
+`groupby_exact_masked_multi_indexed`. Nothing existing changed shape.
+
+The CPU backend implements all of it as the obvious loop and is the parity
+oracle. On Metal the indexed read lives in one helper, `gl_load` in
+`sum.metal`, and reaches every operator that reads a lane through a `GLane`:
+`gpred_eval` — and so every WHERE program, on the sort path, the direct path
+and the global aggregate alike — the global masked aggregate itself, and both
+shapes of the direct row-order reduce.
+
+**Where the index vectors are bound.** The plan gave them a buffer of their
+own. There is no room: the direct reduce already binds 0..30, which is every
+argument-table slot Metal offers. An index vector is already shaped like a
+lane — a storage width, a validity bitmap, and a NULL cell that means exactly
+the NULL row an outer join wants — so it is bound as an ordinary lane and the
+lane that reads through it names that slot, in the word `GLaneMeta` used as
+padding. No new binding, no new pipeline, nothing new to compile, and so no
+capability gate and no fallback to arrange: the kernels that gained the
+indirection are the ones the backend already builds and already falls back
+from. The cost is budget instead — the twelve distinct lanes a statement may
+read now have to cover its index vectors too, and the operator refuses above
+that, as it always has.
+
+A slot is the pair *(column, index)*, not the column: one store column read
+through two different indexes holds two different values per row.
+
+**The bound.** A kernel uses an index cell as a row and has no bound of its
+own. The bound is proved on the host from the index column's minimum and
+maximum over its valid cells, computed once and kept on the column — an index
+vector is read by every statement over its join set, so one sequential pass at
+the lane's stage-C width amortises away. The CPU reference checks every cell.
+
+**Composition.** A chained join composes index vectors,
+`idx_new[d] = idx_old[probe_rows[d]]`. That is a gather of the old index at
+the new probe rows, which is what the materialise path already does to any
+lane, so a chain hands the previous step's index vector to the next step as an
+ordinary materialised lane. No new operator.
+
+**What was measured first.** The plan was drawn against a main that has since
+changed, so the inventory was re-taken at SF10 before any code was written:
+18.73 GiB resident after the 22 queries (33 sets at 14.69 GiB, 35 store
+columns at 4.04 GiB), of which the three device-join sets are 3.16 GiB and the
+ten uploaded ones 11.53. Q12's device set had fallen from 26 to 15 bytes a row
+and Q11's from 18 to 12, because the direct reduce replaced the key's 12-byte
+sort cache with a 1-byte group-id lane; Q21's is unchanged at 40, its key
+having 100,000 groups and still taking the sort path.
+
+The plan priced D1 as removing 97 ms of gather on Q12 and 190 ms on Q21. Those
+figures are cold: hot, at SF10 and one thread, Q12 answers in 10.4 ms, Q21 in
+20.5 ms and Q11 in 47.1 ms, and the join's gather runs once when the set is
+built. So D1's saving is on the residency build and on the size of the
+device-join sets, and the hot statement must only be no slower. That is the
+honest claim for it.
+
+### 8.2 D1 on Metal — what it cost, and what it is worth (2026-09-19)
+
+**The read had to be compiled, not tested.** The first shape of the indexed
+read put one test inside every kernel that reads a lane: *is this lane read
+through an index?* No statement was indexed, so any difference was pure
+overhead — and it was 8–15% at SF10 on the masked kernels, measured against
+`main` with two interleaved runs of the 22 queries at one thread (Q19 1.148×,
+Q14 1.118×, Q6 1.116×, Q12 1.110×, Q1 1.082×). The reason is not the branch.
+`row` is the row loop's induction variable, so the address of `lane[row]` and
+the word of its validity bitmap strength-reduce across the loop; a row that
+comes back from a function does not, and every masked kernel lost its address
+arithmetic.
+
+So the read is a compile-time parameter. `gl_row` and `gpred_eval` are
+templated on whether any lane of the dispatch is indexed, every kernel that
+reads a lane is built twice, and each dispatch picks its instance from a flag
+that is uniform over the whole grid (computed from the lane table the host
+already writes — no new uniform, no new binding). The index slot reaches the
+thread's lane table only when there is one. With the flag false the kernel is,
+literally, the pre-stage-D kernel. Re-measured the same way: worst 1.012× at
+SF10 and 1.011× at SF1, with 14 of 17 device queries at or below `main` — run
+to run spread, and no query slower.
+
+**What the index costs when it IS used.** A lane read through an index against
+the same lane gathered into result order, on the exact grouped reduce, 16M
+probe rows joined to a 200k dimension, min of 7 (`ixsweep`, M4 Max):
+
+| groups | payloads | WHERE | join build ms (materialise / index) | reduce ms materialised | reduce ms indexed | indexed / materialised |
+|---|---|---|---|---|---|---|
+| 4 | 1 | no | 13.8 / 9.4 | 1.78 | 2.10 | 1.180× |
+| 4 | 3 | no | 12.5 / 8.7 | 3.18 | 3.70 | 1.161× |
+| 4 | 1 | yes | 11.7 / 8.6 | 1.96 | 2.40 | 1.224× |
+| 64 | 1 | no | 11.9 / 8.6 | 1.77 | 2.06 | 1.163× |
+| 64 | 3 | no | 11.9 / 8.7 | 2.88 | 3.57 | 1.240× |
+| 64 | 1 | yes | 11.9 / 8.7 | 2.03 | 2.42 | 1.193× |
+| 1000 | 1 | no | 12.2 / 8.9 | 3.74 | 5.65 | 1.512× |
+| 1000 | 3 | no | 12.3 / 9.2 | 5.81 | 11.13 | 1.917× |
+| 1000 | 1 | yes | 12.8 / 9.5 | 5.21 | 8.89 | 1.706× |
+
+The indexed read loses on **every** shape tried, by 1.16× at the smallest and
+1.92× at the largest, and the loss grows with the groups and the payloads —
+the gather is random where the materialised read is sequential, and the more
+work per row the more of it is gather. The join that returns row vectors is
+1.3–1.4× faster to build than the one that gathers lanes, which together with
+the bytes is what stage D was for.
+
+**So the rule.** An index vector is a residency-build and memory win and a
+hot-query loss, and rule 1 is written from the measurement, not from the
+plan: a lane a hot statement READS keeps its materialised copy; the index is
+for what a set carries but statements do not read per row. The step-0
+inventory said D1 should be neutral on hot query time; it is not, and the
+honest consequence is that the SQL layer must not simply swap the three
+device sets over to index vectors. What that admission rule should key on —
+memory pressure against the per-statement loss above — is D2's question.
+
+**The sort path keeps the gather.** The sort path does not read a lane at the
+row; it reads it at `perm[i]`. An index there is a double gather on a path
+whose reduce is already gather-bound, so an indexed lane reaching the sort
+path is gathered once, by the operator, and the operator that ran before
+stage D then runs bit for bit. The indexed read on that path is not built and
+is not claimed either way. The direct path reads every lane at the row, so
+there the index is the one extra load the table above prices.
+
+**The key is always a lane.** Both paths read a key through structures derived
+from the key column and shared by every statement over it — the sort cache,
+the group-id lane, the distinct keys. An index would make those per statement.
+So an indexed key reaching `groupby_exact_masked_multi_indexed` is gathered
+into a lane first, which is what §8 says a join set's key is.
+
+**Built.** `join_index` on Metal: `join_materialize` and it now share one
+probe stage — uniqueness, the binary-search probe, the class counts — so the
+two agree term for term by construction, and the last dispatch is `jm_rows`
+(the probe and build row of each kept output row, each at the narrowest width
+its side's row count fits) instead of one gather per lane. The probe key, the
+classifying key lane and every materialised lane may each be read through an
+index, which is what a chained join needs. `groupby_exact_masked_multi_indexed`
+on Metal, with the direct path reading payload and predicate lanes through
+their index vectors and the sort path gathering them. Parity is checked
+against the CPU reference and against `join_materialize` for the 1/2/4/8-byte
+widths, F64 NaN / ±inf / −0.0, NULL lane cells, NULL index cells as payload
+and as key, the chained three-step composition, and an out-of-range index
+(refused, not read).
+
+**Not yet built.** The extension's `gpu_join_index()` and a join set that owns
+index vectors; the `gpu_residents()` reporting columns; the wrapper emitting
+index steps. Until those land nothing in SQL takes the indexed path, and the
+measured behaviour of every query is today's — which, given the table above,
+is also the right order to do it in.
+
 ## 9. Shedding — a derived structure a column stops needing
 
 Every structure §7 added is derived: the sort cache is derived from the lane,
