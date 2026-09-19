@@ -252,7 +252,14 @@ public:
                                    Dtype vdt) override {
         std::size_t rows = 0;
         for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
-        if (gpu_) {
+        // Placement follows exact_supported(), not "did the GPU throw?". A
+        // column is single-homed: once a set is resident on the GPU, EVERY
+        // exact operator over it must run there, because the CPU reference
+        // cannot read device memory and there is no per-operator fallback
+        // left to take. A backend that implements the upload but not yet the
+        // rest of the path would otherwise capture the set and turn the
+        // reference's clean answer into a thrown error.
+        if (gpu_ && gpu_->exact_supported()) {
             try {
                 ResidentPair inner = gpu_->upload_pair_exact(spans, n_spans, vdt);
                 ResidentPair out;
@@ -523,7 +530,7 @@ public:
                     Backend::CPU, std::move(inner[l]), rows, dtypes[l], on_gpu));
             return out;
         };
-        if (gpu_) {
+        if (gpu_ && gpu_->exact_supported()) {          // see upload_pair_exact
             try {
                 return wrap(gpu_->upload_rows_exact(spans, n_spans, dtypes, n_lanes), /*on_gpu=*/true);
             } catch (const std::exception&) {
