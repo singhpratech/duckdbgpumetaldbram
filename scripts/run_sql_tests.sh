@@ -14,6 +14,14 @@
 #     requires_file, expected_fail) OR right after it (expect):
 #       -- expect: <line>           expected output line, one per result row
 #       -- requires_file: <path>    skip query if file missing (relative root)
+#       -- requires_backend: <b>    skip query unless the runtime backend
+#                                   matches: `gpu` (anything but CPU), or a
+#                                   name — `cpu`, `cuda`, `metal`. For the
+#                                   handful of answers that are a property of
+#                                   the backend rather than of the query (a
+#                                   CPU column derives nothing, so it is
+#                                   prepared from birth and carries no sort
+#                                   cache — src/include/gpu_backend.hpp)
 #       -- env: KEY=VAL             set env var for this query only
 #       -- setup: <statement>       run <statement> before the query on the
 #                                   SAME connection (repeatable; uploads that
@@ -63,6 +71,24 @@ if [ ! -x "$GPUDB_SQL" ]; then
         exit 1
     fi
 fi
+
+# Which backend did dispatch actually select in this binary? Asked once, from
+# the binary itself, so `-- requires_backend:` gates on the truth rather than
+# on the platform name. A CPU-only build (every hosted CI runner) answers
+# `cpu`; anything else is a GPU.
+RUNTIME_BACKEND="$("$GPUDB_SQL" --sql "SELECT gpu_build_info();" 2>/dev/null \
+                   | grep -oE 'runtime=[a-z]+' | head -1 | cut -d= -f2)"
+RUNTIME_BACKEND="${RUNTIME_BACKEND:-cpu}"
+echo "==> runtime backend: $RUNTIME_BACKEND"
+
+# 0 = this query should run here, 1 = skip it.
+backend_satisfies() {
+    local want="$1"
+    case "$want" in
+        gpu) [ "$RUNTIME_BACKEND" != "cpu" ] ;;
+        *)   [ "$RUNTIME_BACKEND" = "$want" ] ;;
+    esac
+}
 
 # Resolve which .test files to run.
 declare -a TEST_FILES
@@ -131,11 +157,18 @@ declare -a FAIL_DETAILS=()
 #     each new query.
 
 execute_query() {
-    # Args: file_label sql expects env requires_file expected_fail setup
-    local label="$1" sql="$2" expects="$3" envspec="$4" reqfile="$5" xfail="$6" setup="${7:-}"
+    # Args: file_label sql expects env requires_file expected_fail setup requires_backend
+    local label="$1" sql="$2" expects="$3" envspec="$4" reqfile="$5" xfail="$6" setup="${7:-}" reqbackend="${8:-}"
 
     if [ -n "$reqfile" ] && [ ! -e "$reqfile" ]; then
         printf "  %-32s  %sSKIP%s  (missing %s)\n" "$label" "$C_YEL" "$C_OFF" "$reqfile"
+        skip=$((skip + 1))
+        return
+    fi
+
+    if [ -n "$reqbackend" ] && ! backend_satisfies "$reqbackend"; then
+        printf "  %-32s  %sSKIP%s  (needs backend %s, have %s)\n" \
+            "$label" "$C_YEL" "$C_OFF" "$reqbackend" "$RUNTIME_BACKEND"
         skip=$((skip + 1))
         return
     fi
@@ -275,11 +308,11 @@ run_file() {
     pass=0; fail=0; skip=0; efail=0; unexpected_pass=0
 
     # Parsed query arrays
-    local -a Q_SQL=() Q_EXP=() Q_ENV=() Q_REQ=() Q_XF=() Q_SETUP=()
+    local -a Q_SQL=() Q_EXP=() Q_ENV=() Q_REQ=() Q_XF=() Q_SETUP=() Q_REQB=()
 
     # Per-query in-flight scratch
     local cur_sql=""
-    local cur_pre_env="" cur_pre_req="" cur_pre_xf="" cur_pre_setup=""
+    local cur_pre_env="" cur_pre_req="" cur_pre_xf="" cur_pre_setup="" cur_pre_reqb=""
 
     # State: have we emitted any query yet that subsequent `-- expect:`
     # lines should attach to?
@@ -297,6 +330,7 @@ run_file() {
             Q_REQ+=("$cur_pre_req")
             Q_XF+=("$cur_pre_xf")
             Q_SETUP+=("$cur_pre_setup")
+            Q_REQB+=("$cur_pre_reqb")
             last_idx=$((${#Q_SQL[@]} - 1))
         fi
         cur_sql=""
@@ -304,6 +338,7 @@ run_file() {
         cur_pre_req=""
         cur_pre_xf=""
         cur_pre_setup=""
+        cur_pre_reqb=""
     }
 
     while IFS= read -r line || [ -n "$line" ]; do
@@ -334,6 +369,12 @@ run_file() {
                 local val="${trimmed#*requires_file:}"
                 val="${val# }"
                 cur_pre_req="$val"
+                continue
+                ;;
+            "-- requires_backend:"*|"--requires_backend:"*)
+                local val="${trimmed#*requires_backend:}"
+                val="${val# }"
+                cur_pre_reqb="$val"
                 continue
                 ;;
             "-- env:"*|"--env:"*)
@@ -386,7 +427,8 @@ run_file() {
         local label
         label="$(basename "$file"):q$((i+1))"
         execute_query "$label" "${Q_SQL[$i]}" "${Q_EXP[$i]}" \
-                      "${Q_ENV[$i]}" "${Q_REQ[$i]}" "${Q_XF[$i]}" "${Q_SETUP[$i]}"
+                      "${Q_ENV[$i]}" "${Q_REQ[$i]}" "${Q_XF[$i]}" "${Q_SETUP[$i]}" \
+                      "${Q_REQB[$i]}"
         i=$((i + 1))
     done
 

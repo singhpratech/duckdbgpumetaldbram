@@ -2823,6 +2823,60 @@ still only on its branch, so a hand-built Linux asset still carries the build
 box's `GLIBCXX_3.4.32` floor; the registry's own Linux build is made in an older
 container and does not.
 
+### 2026-09-19 — the SQL suite now runs on x86-64, and the DuckDB libs are pinned
+
+**The hole.** `avg(BIGINT)` differed from native DuckDB on x86-64 and sat on
+`main` undetected (fixed in #146/#149). Nothing about the bug was subtle: DuckDB
+finalises `avg` in `long double`, which is 80-bit on x86-64 and a plain 64-bit
+`double` on arm64, so the only machine that could see the difference was the
+Linux one — and the Linux job in `.github/workflows/ci.yml` never ran
+`./scripts/run_sql_tests.sh`. It built, ran the unit tests, ran two smoke
+benchmarks and three Python scripts. Not one step compared a SQL answer with
+native's. The macOS job did not run the suite either, but macOS could not have
+caught this one anyway.
+
+The reason the Linux job skipped it is mechanical rather than deliberate:
+`run_sql_tests.sh` drives `gpudb-sql`, which only exists when
+`third_party/duckdb-libs/` is present (that is what flips `build.sh` into
+`-DGPUDB_BUILD_EXT=ON`), and CI never fetched those libs.
+
+**What the Linux job runs now.** After the existing steps — which keep
+exercising the no-extension paths they were written for — it fetches the
+pre-built libs, rebuilds with the extension and `gpudb-sql`, and runs the whole
+of `test/sql/*.test` on the CPU backend (hosted runners have no GPU). The
+suite's `avg` coverage is an `EXCEPT` both ways against native
+(`gpu_groupby_exact.test`, `gpu_groupby_exact_multi.test`,
+`gpu_agg_exact_global.test`), so the shape of bug that got through is now a red
+build on the machine that can see it.
+
+**Three answers that are the backend's, not the query's.** Running the suite
+with the GPU compiled out, six queries in `gpu_resident_registry.test` failed,
+all for the same reason and none of them about a result: a CPU-resident column
+has nothing to derive and is "prepared from birth"
+(`src/include/gpu_backend.hpp`), so an explicit set reads `ready` at upload
+rather than `uploaded`, and `bytes` never grows past the raw lanes because
+there is no sort cache to add. Three of the six only mentioned the state in
+passing — what they assert is which sets an invalidation took down, and that an
+epoch moved on — and now compare `state <> 'stale'`, which is the same
+assertion on every backend. The other three *are* about the device's derived
+structures, and are gated by a new `-- requires_backend: gpu` directive, a
+sibling of `-- requires_file:`: the runner asks the binary once
+(`gpu_build_info()` → `runtime=cpu|cuda|metal`) and skips with a printed reason.
+CPU-only: 220 pass, 0 fail, 45 guardrails, 4 skips. Metal, same tree: the three
+gated queries run and pass, nothing skipped.
+
+**The pin.** `get_duckdb_libs.sh` fetched `releases/latest`, so the DuckDB build
+underneath the suite was whatever shipped most recently — a moving floor under
+a set of expected answers, and a different one on each machine (this box was
+still on v1.5.2). It now defaults to **v1.5.5**: the version the community
+registry serves gpudb for, the hard leg of `duckdb-compat.yml`, and the floor
+README states. `DUCKDB_VERSION=<tag>` overrides it and `DUCKDB_VERSION=latest`
+restores the old behaviour; `FORCE=1` re-fetches over an existing tree, which
+otherwise short-circuits (and now prints the version it found). This is the
+runtime library for the dev-side CLI only — the loadable extension's ABI is
+still the vendored C_STRUCT headers at `TARGET_DUCKDB_VERSION=v1.2.0`.
+`duckdb-compat.yml` fetches CLI zips by tag itself and does not use this script.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

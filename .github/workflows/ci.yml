@@ -52,6 +52,35 @@ jobs:
         run: |
           python3 python/tests/test_residency_policy.py
 
+      # --- the SQL suite, on x86-64 -------------------------------------
+      # Everything above this line builds and runs code; nothing above it
+      # checks a SQL ANSWER. That gap let a rule-2 bug (avg(BIGINT) finalised
+      # differently from native) sit on main: x86-64 computes long double in
+      # 80 bits, arm64 makes it a plain double, so the only machine that could
+      # see the difference was the one machine not running the suite.
+      #
+      # gpudb-sql (and therefore ./scripts/run_sql_tests.sh) needs the
+      # pre-built libduckdb, which build.sh detects and turns into
+      # -DGPUDB_BUILD_EXT=ON. Fetched here, AFTER the steps above, so those
+      # keep exercising the no-extension path they were written for.
+      - name: fetch pre-built DuckDB libs (pinned; enables the extension + gpudb-sql)
+        run: |
+          sudo apt-get install -y --no-install-recommends unzip
+          ./scripts/get_duckdb_libs.sh
+
+      - name: build the extension and gpudb-sql
+        env:
+          GPUDB_NO_CUDA: "1"
+        run: |
+          ./scripts/build.sh
+
+      # No GPU on hosted runners, so this is the CPU backend end to end: the
+      # answers, not the plumbing. Queries tagged `-- requires_file:` (only
+      # the TPC-H parquet one today) skip themselves when the data is absent.
+      - name: SQL suite (test/sql/*.test, CPU backend)
+        run: |
+          ./scripts/run_sql_tests.sh
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2
