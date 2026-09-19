@@ -20,7 +20,14 @@ Conservative by construction:
   device and DuckDB reuses that one result for every reference, which is what
   splicing would undo;
 - `WITH RECURSIVE` and `AS MATERIALIZED` are left alone (a recursive body is
-  not a derived table, and `MATERIALIZED` asks for exactly one evaluation);
+  not a derived table, and `MATERIALIZED` asks for exactly one evaluation).
+  The hint has to be read from the STATEMENT TEXT, not from the tree: DuckDB's
+  json_serialize_sql does not round-trip it. On 1.5.5, `AS MATERIALIZED`,
+  `AS NOT MATERIALIZED` and a plain CTE all serialize to
+  `materialized: CTE_MATERIALIZE_DEFAULT`, and deserializing any of them gives
+  back a plain `WITH r AS (...)`. The tree-level test below is kept because it
+  is correct where the field IS populated, but it cannot be the only one — on
+  its own it never fires, which is what let a MATERIALIZED CTE be spliced;
 - a body holding a function the caller does not vouch for (a volatile one:
   `random()`, `now()`) is left alone — inlining it into several references
   would evaluate it a different number of times than the statement says;
@@ -34,11 +41,42 @@ Conservative by construction:
 from __future__ import annotations
 
 import json
+import re
 from typing import Callable, Dict, List, Optional
 
 _NO_LOC = 18446744073709551615
 _MAX_CTES = 16
 
+
+
+# CTE names the statement declares `AS MATERIALIZED`, read from the text
+# because the serializer drops the hint (see the module docstring). `AS NOT
+# MATERIALIZED` asks for inlining, which is what splicing does, so it is not
+# matched here and stays eligible.
+#
+# Comments and string literals are blanked first: a statement may legitimately
+# contain the word inside a string, and matching that would decline a statement
+# for a word in its data.
+_BLANK_RE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'|\$\$.*?\$\$", re.S)
+_MAT_RE = re.compile(
+    r'(?:^|[\s,(])(?P<name>[A-Za-z_]\w*|"(?:[^"]|"")+")\s*(?:\([^()]*\)\s*)?AS\s+MATERIALIZED\b',
+    re.I)
+
+
+def materialized_names(sql: str) -> set:
+    """The CTE names declared AS MATERIALIZED in `sql`, casefolded."""
+    # Cheap reject first: this runs on every statement, and almost none of
+    # them contain the word at all.
+    if "materialized" not in sql.casefold():
+        return set()
+    scrubbed = _BLANK_RE.sub(lambda m: " " * len(m.group(0)), sql)
+    out = set()
+    for m in _MAT_RE.finditer(scrubbed):
+        name = m.group("name")
+        if name.startswith('"'):
+            name = name[1:-1].replace('""', '"')
+        out.add(name.casefold())
+    return out
 
 def _has_class(e, classes) -> bool:
     if isinstance(e, dict):
@@ -92,6 +130,7 @@ def _projects_and_joins(node) -> bool:
 
 
 def inline(tree_json: str, function_ok: Optional[Callable[[str], bool]] = None,
+           blocked: Optional[set] = None,
            names: Optional[list] = None) -> Optional[str]:
     """The statement with its project-and-join CTEs spliced in as derived
     tables, or None when there is nothing to splice."""
@@ -142,6 +181,7 @@ def inline(tree_json: str, function_ok: Optional[Callable[[str], bool]] = None,
                     value["query"]["node"] = body
                 key = (entry.get("key") or "").casefold()
                 if key and value.get("materialized") != "CTE_MATERIALIZE_ALWAYS" \
+                        and not (blocked and key in blocked) \
                         and _projects_and_joins(body) and ok_functions(body):
                     scope[key] = {"type": "SUBQUERY", "alias": entry.get("key") or "", "sample": None,
                                   "query_location": _NO_LOC, "subquery": {"node": body},
