@@ -4438,3 +4438,42 @@ branch reads 7.21× / 3.42× / 19.66× / 55.81× against main's 8.82× / 4.04× 
 the same round. The one wider gap, Q21 at SF1 round 1 (4.46× branch against
 7.21× main), reads 5.31× against 4.74× in round 2 — the two modes of a short
 kernel (§9.1), which is why the rounds are interleaved.
+
+### The CTE sweep, and the bound it found
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes`, SF1, alone on the
+machine. `--ctes` adds two forms to every (key, WHERE) cell: `cte`, the same
+aggregate read through a `WITH` that is the whole `FROM`, and `cte_arm`, a
+project-and-join CTE joined to `orders` — the shape §4.22 newly folds.
+
+First run, on the code before the threshold change: 954 cells, 631 rewritten,
+323 declined, **4 below 1.0×**, 0 differing.
+
+| key | WHERE | form | rows out | native ms | device ms | ratio |
+|---|---|---|---|---|---|---|
+| l_orderkey | — | cte_arm | 729,413 | 396.0 | 398.4 | 0.99× |
+| l_orderkey | `l_linenumber = 1` (25 %) | cte_arm | 729,413 | 387.7 | 396.8 | 0.98× |
+| l_orderkey | `l_discount <= 0.09` (91 %) | cte_arm | 718,859 | 397.9 | 400.9 | 0.99× |
+| l_orderkey | mixed (55 %) | cte_arm | 663,994 | 359.6 | 363.0 | 0.99× |
+| l_orderkey | `l_linenumber <= 3` (64 %) | cte_arm | 729,413 | — | — | 1.00× (passed, a tie) |
+
+Against, from the same run: the SAME statement keyed by `l_partkey` returns
+194,821–199,999 groups and measures 1.05–1.11× on every WHERE; every `li x
+orders` and `li x orders x customer` plain / cte cell at ~99–100K groups
+measures 1.15–3.18×. The group count does not separate those from the losers;
+**rows read per group returned** does — 8.2 where it loses, 30 where it wins
+thinly, 60 where it wins clearly, and SF10's 1M-group cell is 60 too. The plain
+form over a join now also needs 16 rows per group, applied only above 300K
+groups returned: TPC-H Q13 at SF1 returns 146K groups out of 1.5M `orders` rows
+— 10.3 per group — and measures 8.8×, because its groups feed another GROUP BY
+inside DuckDB rather than the client. A first attempt without that second
+condition declined Q13 and took SF1 coverage from 15 to 14 of 22; the run is
+recorded here because it is the reason the bound has two parts.
+
+Final run, on the shipped code: **956 cells, 628 rewritten, 328 declined, 0
+below 1.0×, 0 differing, exit 0.** The four cells above are now declined with
+`8.2 rows per group over a join with 729413 groups < 16.0 (output-bound)`. The
+CTE forms themselves: `cte` 75 rewritten at 1.17–67.0× with 43 declined,
+`cte_arm` 30 rewritten at 1.05–13.68× with 25 declined. Neither form carries a
+bound of its own — after the splice they ARE the plain and join forms, and the
+bounds that decide them are those.
