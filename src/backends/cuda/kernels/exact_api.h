@@ -138,6 +138,40 @@ cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, i
                                     gpudb::cuda_exact::ExactTuple* h_out,
                                     std::int64_t* h_count_star, cudaStream_t s);
 
+// ---- v0.7 §4.8: the materialised key join ----
+// The build side is the exact sort cache of the build key (valid rows only),
+// so the uniqueness check is free: a sorted array of n cells holds n distinct
+// values iff its run count is n, which gpudb_cuda_exact_run_count already
+// answers. No hash table is built on the device at all.
+//
+// Classify every probe row: d_cls is 0 (no match), 1 (matched, output key
+// cell valid) or 2 (matched, output key cell NULL), d_match the build ROW it
+// matched (0xFFFFFFFF where none). `d_keylane_valid` is output lane 0's
+// bitmap and `key_from_build` says which row of it to read — that pair is
+// what decides class 1 vs class 2, exactly as the reference's kc.valid(krow).
+cudaError_t gpudb_cuda_join_mat_probe(const std::int64_t* d_bsorted, const std::int64_t* d_bperm,
+                                      std::size_t n_bvalid,
+                                      const std::int64_t* d_pkeys, const unsigned long long* d_pvalid,
+                                      std::size_t rows_probe,
+                                      const unsigned long long* d_keylane_valid, int key_from_build,
+                                      std::uint32_t* d_match, unsigned char* d_cls,
+                                      std::size_t* h_n1, std::size_t* h_n2, cudaStream_t s);
+
+// Destination row of each kept probe row: class 1 fills [0, n1) and class 2
+// fills [n1, n1 + n2), each in probe order — which is what makes the NULL-key
+// rows a suffix of EVERY output column.
+cudaError_t gpudb_cuda_join_mat_positions(const unsigned char* d_cls, std::size_t rows_probe,
+                                          std::size_t n1, std::uint32_t* d_pos, cudaStream_t s);
+
+// One output lane: dst[pos[i]] = src[from_build ? match[i] : i] for every
+// classified probe row, with the source cell's validity carried across.
+cudaError_t gpudb_cuda_join_mat_gather(const std::int64_t* d_src, const unsigned long long* d_src_valid,
+                                       int from_build, const std::uint32_t* d_match,
+                                       const unsigned char* d_cls, const std::uint32_t* d_pos,
+                                       std::size_t rows_probe,
+                                       std::int64_t* d_dst, unsigned long long* d_dst_valid,
+                                       cudaStream_t s);
+
 // The NULL-key group: the same tuple over every row whose KEY is NULL and
 // which passes the mask. *h_rows is that group's count(*) — zero means the
 // group does not exist and the host appends nothing.
