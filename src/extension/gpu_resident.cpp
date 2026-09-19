@@ -109,6 +109,7 @@ DUCKDB_EXTENSION_EXTERN
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <cfloat>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -2991,6 +2992,12 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     for (const char c : device)
         if (c != '\'' && c != '\n' && c != '\r') clean += c;
     if (!clean.empty()) info += " device='" + clean + "'";
+    // The mantissa width avg() is finalised in (src/include/native_avg.hpp).
+    // 53 means long double IS double here, so the SQL derivation the wrapper
+    // uses for a DECIMAL payload — double(unscaled sum) / (count * 10^s) —
+    // reproduces native; anything wider means it does not, and the wrapper
+    // must decline that shape rather than return a different answer.
+    info += " avgf=" + std::to_string(LDBL_MANT_DIG);
     const idx_t n = duckdb_data_chunk_get_size(input);
     for (idx_t i = 0; i < n; ++i) {
         duckdb_vector_assign_string_element(output, i, info.c_str());

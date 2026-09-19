@@ -478,6 +478,40 @@ def run():
     check(seen == (2000000,), f"big: rows_seen after re-upload: {seen}")
     con.close()
 
+    # ---- avg over DECIMAL is declined where SQL cannot reproduce native (rule 2) ----
+    # Native finalises an average as a long double quotient; the wrapper derives
+    # avg over a DECIMAL payload in SQL as double(unscaled sum) / (count * 10^s),
+    # which is the same expression only where long double IS double. The
+    # extension reports the width it finalises in as gpu_build_info()'s avgf=,
+    # and the shape is declined unless that says 53. Driven through check_types
+    # directly so both answers are exercised on any platform — end to end only
+    # one of them would ever be reachable.
+    from gpudb import _rewrite as _rw
+
+    def _plan(kind, scale):
+        p = _rw.Plan(catalog="memory", schema="main", table="d", key="k")
+        p.keys, p.key_types, p.key_type = ["k"], ["BIGINT"], "BIGINT"
+        p.val = "v"
+        p.val_type = "DECIMAL(18,2)" if scale else "BIGINT"
+        p.scale, p.scales, p.vals = scale, {"v": scale}, ["v"]
+        p.needs_sum = True
+        p.outputs = [_rw.OutItem(kind=kind, name=kind + "(v)", native_type="DOUBLE", pay=0)]
+        return p
+
+    def _declines(kind, scale, bits):
+        try:
+            _rw.check_types(_plan(kind, scale), {"k": "BIGINT", "v": "DECIMAL(18,2)"},
+                            exact=True, avg_float_bits=bits)
+            return False
+        except _rw.Decline:
+            return True
+
+    check(_declines("avg", 2, 64), "avg(DECIMAL) declined where long double is wider (avgf=64)")
+    check(not _declines("avg", 2, 53), "avg(DECIMAL) rewritten where long double is double (avgf=53)")
+    check(_declines("avg", 2, 0), "avg(DECIMAL) declined when the extension does not report avgf")
+    check(not _declines("avg", 0, 64), "avg over an integer payload is unaffected")
+    check(not _declines("sum", 2, 64), "sum over DECIMAL is unaffected")
+
     # ---- computed lanes (§4.10): expressions as payloads, keys and predicates ----
     print("== computed lanes")
     con = fresh()
