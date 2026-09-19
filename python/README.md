@@ -19,3 +19,68 @@ DuckDB itself (`INSTALL gpudb FROM community; LOAD gpudb;`).
 Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
 `memory_budget` (e.g. `"16GB"`), `thresholds`. Design, limits and measurements:
 `docs/TRANSPARENT_DESIGN.md`, `KNOWN_ISSUES.md` and `BENCHMARK.md` in the repository.
+
+## The `gpudb` shell
+
+```
+$ gpudb my.duckdb
+gpudb 0.7.0.dev0
+backend:      Metal · 51.8 GiB device memory
+transparent:  available — every statement goes through the wrapper
+database:     my.duckdb
+Enter .help for usage.
+
+gpudb> SELECT k, sum(v) FROM t GROUP BY k ORDER BY k LIMIT 3;
+┌───────┬───────────┐
+│   k   │  sum(v)   │
+│ int64 │  int128   │
+├───────┼───────────┤
+│     0 │ 398000000 │
+│     1 │ 398000200 │
+│     2 │ 398000400 │
+└───────┴───────────┘
+
+GPU (plain) · 3.3 ms
+```
+
+The same shell runs a script or a single statement:
+`gpudb my.duckdb -c "SELECT …"`, `gpudb -f script.sql`, `gpudb < script.sql`,
+`python -m gpudb`. Options: `--readonly`, `--no-gpu`, `--residency`,
+`--memory-budget`, `--timer` / `--no-timer`, `--version`, `--help`. A statement
+that fails ends a `-c` / `-f` / piped run with a non-zero exit code; at the
+terminal the session keeps going.
+
+There is a shell because the transparent path cannot live in the extension.
+DuckDB's stable C extension API — the one the loadable extension uses on
+purpose, so that one binary keeps working across DuckDB versions — has no hook
+that sees a statement before it is planned. `LOAD gpudb` in the stock `duckdb`
+CLI therefore gives the explicit `gpu_*` functions and nothing more; ordinary
+SQL is answered on the device only through a client that can look at the
+statement first. This shell is that client: it splits statements with DuckDB's
+own tokenizer, hands each one to `gpudb.connect()`, and prints the result with
+DuckDB's own box renderer.
+
+The dim line under each result says where the statement ran and how long it
+took, from `con.last_rewrite()`: `GPU (plain) · 3.3 ms`,
+`DuckDB (threshold: 7 groups < 1000) · 5.0 ms`, `DuckDB (off) · 12.0 ms`. It is
+on at a terminal, off in `-c` / `-f` / piped output unless `--timer` is given,
+and colour follows `NO_COLOR` and whether the output is a terminal.
+
+Dot-commands, kept small on purpose — this is not an emulation of the DuckDB
+CLI:
+
+| | |
+|---|---|
+| `.help` | the list |
+| `.quit`, `.exit` | leave (Ctrl-D does too) |
+| `.timer on\|off` | the footer line |
+| `.gpu` | the last statement's whole `last_rewrite()` |
+| `.gpu on\|off` | the transparent path, live |
+| `.residents`, `.memory` | the resident sets, the device-memory budget |
+| `.read FILE`, `.open [DATABASE]` | run a file, open another database |
+| `.tables`, `.schema [TABLE]` | plain SQL underneath (`SHOW TABLES`, `DESCRIBE`) |
+| `.version` | gpudb and duckdb versions |
+
+Statements may span lines and end at `;`; Ctrl-C stops the running statement
+(or clears what you were typing) and Ctrl-D leaves. History is kept in
+`~/.gpudb_history` when the Python build has `readline`.

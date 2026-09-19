@@ -15,6 +15,9 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.scripts]
+gpudb = "gpudb._shell:main"
+
 [project.urls]
 Homepage = "https://github.com/singhpratech/duckdbgpumetaldbram"
 Documentation = "https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/TRANSPARENT_DESIGN.md"

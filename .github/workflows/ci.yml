@@ -44,6 +44,10 @@ jobs:
           python3 -m pip install --quiet /tmp/gpudb-wheel/*.whl
           cd /tmp && python3 -c "import gpudb; con = gpudb.connect(); con.execute('SELECT 1').fetchall(); print('gpudb', gpudb.__version__, 'without an extension:', con.last_rewrite()['reason'])"
 
+      - name: python shell tests (no extension here, so the plain-DuckDB path)
+        run: |
+          python3 python/tests/test_shell.py
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2
