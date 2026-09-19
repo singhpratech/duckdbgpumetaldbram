@@ -1,0 +1,305 @@
+# name: test/sqllogic/gpudb_exact.test
+# description: gpudb loadable extension — the exact (v0.7) surface, CPU-safe
+# group: [gpudb]
+#
+# The second SQLLogicTest-format file run by the community-extensions CI
+# (extension-ci-tools duckdb_sqllogictest runner, pointed at test/sqllogic/ by
+# the root Makefile's TEST_RUNNER_BASE override). test/sqllogic/gpudb.test
+# covers the streaming aggregates and the v0.4 resident columns; this file
+# covers the functions the transparent path is built on:
+#
+#   gpu_upload_pair_exact / gpu_upload_rows_exact / gpu_upload_columns
+#   gpu_groupby_exact_resident[_having|_topk|_where]
+#   gpu_agg_exact_global
+#   gpu_join_materialize
+#   gpu_store_columns / gpu_residents / gpu_assert_rows / gpu_drop_column
+#   gpu_build_info / gpu_last_stats / gpu_rewrite_ast
+#
+# Every assertion here is deterministic and backend-independent: the CPU
+# backend is the reference implementation of all of these operators
+# (exact_supported / global_supported / join_supported are true on it), and
+# the GPU backends are required to return the same rows in the same order.
+# Nothing below asserts which backend ran, so this passes on the CI machines,
+# which have no GPU, exactly as it does on a CUDA or Metal box.
+
+# The functions do not exist until the extension is loaded.
+statement error
+SELECT gpu_agg_exact_global('x', '', 'v');
+----
+
+require gpudb
+
+# ---------------------------------------------------------------------------
+# gpu_build_info reports the exact-path capability fields the client reads
+# before it rewrites anything. Only their PRESENCE is asserted — whether each
+# is true depends on the backend that resolved at load time.
+# ---------------------------------------------------------------------------
+
+query T
+SELECT gpu_build_info() LIKE '%exact=%'
+   AND gpu_build_info() LIKE '%store=%'
+   AND gpu_build_info() LIKE '%global=%'
+   AND gpu_build_info() LIKE '%join=%'
+   AND gpu_build_info() LIKE '%narrow=%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# gpu_upload_pair_exact + gpu_groupby_exact_resident: the exact GROUP BY.
+# The fixture carries a NULL key group, NULL payloads, an all-NULL group and
+# a group whose sum overflows 64 bits, so the 128-bit sum and the native NULL
+# semantics are both pinned.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t1 AS SELECT * FROM (VALUES
+  (1,10),(1,NULL),(NULL,5),(2,20),(NULL,NULL),(3,NULL),(3,NULL),
+  (4,9223372036854775807),(4,9223372036854775807),(4,5)) t(k,v);
+
+# The upload returns the number of rows it took.
+query I
+SELECT gpu_upload_pair_exact('e1', k, v) FROM t1;
+----
+10
+
+# Rows come back key-ascending with the NULL key last, which is what
+# `GROUP BY k ORDER BY k NULLS LAST` returns natively.
+query IIIIII
+SELECT key, sum, count, count_star, min, max
+FROM gpu_groupby_exact_resident('e1');
+----
+1	10	1	2	10	10
+2	20	1	1	20	20
+3	NULL	0	2	NULL	NULL
+4	18446744073709551619	3	3	5	9223372036854775807
+NULL	5	1	2	5	5
+
+# The output types follow native aggregation: a HUGEINT sum (a BIGINT one
+# would be wrong on the overflowed group), BIGINT counts and min/max, DOUBLE
+# avg.
+query TTTTTTT
+SELECT typeof(key), typeof(sum), typeof(count), typeof(count_star),
+       typeof(min), typeof(max), typeof(avg)
+FROM gpu_groupby_exact_resident('e1') LIMIT 1;
+----
+BIGINT	HUGEINT	BIGINT	BIGINT	BIGINT	BIGINT	DOUBLE
+
+# Same rows as native, both directions of EXCEPT.
+query II
+SELECT
+  (SELECT count(*) FROM ((SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident('e1'))
+                  EXCEPT (SELECT k, sum(v), count(v), count(*) FROM t1 GROUP BY k))) AS gpu_minus_native,
+  (SELECT count(*) FROM ((SELECT k, sum(v), count(v), count(*) FROM t1 GROUP BY k)
+                  EXCEPT (SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident('e1')))) AS native_minus_gpu;
+----
+0	0
+
+# HAVING on the device — the comparison is 128-bit, and a NULL sum never passes.
+query II
+SELECT key, sum FROM gpu_groupby_exact_resident_having('e1', 'sum', '>', 15) ORDER BY key;
+----
+2	20
+4	18446744073709551619
+
+# Top-k on the device.
+query II
+SELECT key, count_star FROM gpu_groupby_exact_resident_topk('e1', 'count_star', 2, 'desc')
+ORDER BY count_star DESC, key;
+----
+4	3
+1	2
+
+# An unknown set name is a clean error, never a wrong answer.
+statement error
+SELECT key FROM gpu_groupby_exact_resident('never_uploaded');
+----
+
+# ---------------------------------------------------------------------------
+# gpu_upload_rows_exact + gpu_agg_exact_global: aggregates without GROUP BY
+# under a predicate program, one fused pass. `payloads` names the lanes:
+# `v` is the payload, `i0`/`i1` the BIGINT predicate lanes.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE t2 AS SELECT * FROM (VALUES
+  (1,10,100,5),(1,NULL,200,NULL),(2,NULL,NULL,7),(2,NULL,50,8),(3,3,NULL,1),(3,4,9,NULL)) t(k,a,b,c);
+
+query I
+SELECT gpu_upload_rows_exact('g', k, a, [b, c], []) FROM t2;
+----
+6
+
+# count(*) counts every row; each payload aggregates its own non-NULL cells.
+query IIIIIII
+SELECT count_star, sum0, count0, min0, max0, sum1, count1
+FROM gpu_agg_exact_global('g', '', 'v, i0, i1');
+----
+6	17	3	3	10	359	4
+
+# Matches native over the same lanes.
+query I
+SELECT count(*) FROM (
+  (SELECT count_star, sum0, count0, min0, max0 FROM gpu_agg_exact_global('g', '', 'v'))
+  EXCEPT
+  (SELECT count(*), sum(a), count(a), min(a), max(a) FROM t2));
+----
+0
+
+# A predicate that keeps nothing still returns exactly one row: zero counts and
+# NULL sums / min / max — native's answer for an aggregate over no rows.
+query IIIII
+SELECT count_star, sum0, count0, min0, max0 FROM gpu_agg_exact_global('g', 'i0 > 100000', 'v');
+----
+0	NULL	0	NULL	NULL
+
+# The same predicate program drives the masked GROUP BY.
+query IIII
+SELECT key, sum, count, count_star FROM gpu_groupby_exact_resident_where('g', 'i0 >= 100');
+----
+1	10	1	2
+
+# An empty program is the unmasked set.
+query I
+SELECT count(*) FROM ((SELECT * FROM gpu_groupby_exact_resident_where('g', ''))
+                EXCEPT (SELECT * FROM gpu_groupby_exact_resident('g')));
+----
+0
+
+# ---------------------------------------------------------------------------
+# gpu_join_materialize: an inner equi-join of two exact sets published as a
+# new exact set, which every gpu_groupby_exact_resident* form then reads.
+# NULL join keys never match and dangling probe rows vanish, as in native SQL.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE f AS SELECT * FROM (VALUES
+  (1,10,100),(1,20,NULL),(2,30,100),(2,NULL,200),(3,40,300),(NULL,50,100),(4,60,999)) t(g,v,fk);
+
+statement ok
+CREATE TABLE d AS SELECT * FROM (VALUES (100,7),(200,NULL),(300,8),(NULL,9),(400,7)) t(id,attr);
+
+statement ok
+SELECT gpu_upload_rows_exact('f', g, v, [fk], []) FROM f;
+
+statement ok
+SELECT gpu_upload_rows_exact('d', id, attr, [], []) FROM d;
+
+# 5 of the 7 probe rows join: the NULL foreign key and the dangling 999 drop.
+query I
+SELECT gpu_join_materialize('j', 'f', 'i0', 'd', 'k', 'p.k, p.v');
+----
+5
+
+query III
+SELECT key, sum, count_star FROM gpu_groupby_exact_resident('j');
+----
+1	10	1
+2	30	2
+3	40	1
+NULL	50	1
+
+# Native does the same join and grouping.
+query II
+SELECT
+  (SELECT count(*) FROM ((SELECT key, sum, count_star FROM gpu_groupby_exact_resident('j'))
+                  EXCEPT (SELECT f.g, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id GROUP BY f.g))),
+  (SELECT count(*) FROM ((SELECT f.g, sum(f.v), count(*) FROM f JOIN d ON f.fk = d.id GROUP BY f.g)
+                  EXCEPT (SELECT key, sum, count_star FROM gpu_groupby_exact_resident('j'))));
+----
+0	0
+
+# ---------------------------------------------------------------------------
+# The column store: gpu_upload_columns puts a table's lanes in a store in
+# row-id order, a view over those lanes answers a GROUP BY without owning any
+# memory of its own, gpu_store_columns / gpu_residents list them,
+# gpu_assert_rows is the staleness guard and gpu_drop_column frees a lane.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE s AS SELECT (i % 4)::BIGINT AS k, i::BIGINT AS v FROM range(1000) r(i);
+
+query I
+SELECT gpu_upload_columns('gpudb:v1:memory:main:s:1:k,v:store', rowid, [k, v], []::DOUBLE[], []::VARCHAR[]) FROM s;
+----
+1000
+
+query TTI
+SELECT "column", dtype, rows FROM gpu_store_columns() ORDER BY "column";
+----
+k	I64	1000
+v	I64	1000
+
+query III
+SELECT key, sum, count_star FROM gpu_groupby_exact_resident('gpudb:v1:memory:main:s:1:k,v');
+----
+0	124500	250
+1	124750	250
+2	125000	250
+3	125250	250
+
+# The view is listed and costs nothing: it shares the store's columns.
+query I
+SELECT count(*) FROM gpu_residents() WHERE kind = 'view' AND bytes = 0;
+----
+1
+
+# The guard passes on the row count the set was uploaded from...
+query T
+SELECT gpu_assert_rows('gpudb:v1:memory:main:s:1:k,v', 1000);
+----
+true
+
+# ...and refuses any other, so a stale set can never answer a query.
+statement error
+SELECT gpu_assert_rows('gpudb:v1:memory:main:s:1:k,v', 999);
+----
+
+# Dropping a lane frees it and every view built on it.
+query T
+SELECT gpu_drop_column('gpudb:v1:memory:main:s:1', 'v');
+----
+true
+
+query I
+SELECT count(*) FROM gpu_store_columns();
+----
+1
+
+statement error
+SELECT key FROM gpu_groupby_exact_resident('gpudb:v1:memory:main:s:1:k,v');
+----
+
+# ---------------------------------------------------------------------------
+# gpu_last_stats describes the last operator that ran: the shape is asserted,
+# never the backend name, which differs per machine.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT count(*) FROM gpu_groupby_exact_resident('e1');
+
+query T
+SELECT gpu_last_stats() LIKE 'op=groupby_exact_resident backend=%rows_in=10%groups=5%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# gpu_rewrite_ast answers with a JSON verdict rather than throwing when it is
+# handed a tree it cannot rewrite — the client reads `rewritten` and `reason`.
+# ---------------------------------------------------------------------------
+
+query T
+SELECT gpu_rewrite_ast('{}', '{}') LIKE '%"rewritten":false%';
+----
+true
+
+# ---------------------------------------------------------------------------
+# Cleanup: dropping the sets leaves nothing resident.
+# ---------------------------------------------------------------------------
+
+statement ok
+SELECT gpu_drop_resident(name) FROM gpu_residents();
+
+query I
+SELECT count(*) FROM gpu_residents();
+----
+0
