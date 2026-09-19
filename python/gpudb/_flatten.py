@@ -22,6 +22,13 @@ keeps the derived column's name as its alias, so output names are unchanged.
 The folded text is only ever used to DECIDE and to build the rewritten
 statement: when the rewrite declines, the original statement runs native.
 A single CTE that is the statement's FROM is folded the same way.
+
+A derived table that is one ARM of a join folds too (§4.22, which is where a
+project-and-join CTE usually lands): the arm's WHERE is hoisted above the
+join, so every join in sight has to be a plain inner one, and over a single
+base table the arm's columns are re-qualified with that table so a bare name
+cannot collide with the other side. An arm beside a subquery predicate is
+left as written — substituting a bare name into a subquery could rebind it.
 """
 from __future__ import annotations
 

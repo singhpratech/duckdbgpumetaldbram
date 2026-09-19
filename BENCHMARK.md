@@ -4352,3 +4352,89 @@ They are printed as measured.
 the machine, on the final code: 782 cells, 509 rewritten and at or above the
 bound, 273 declined by a threshold, 0 slower, 0 differing, exit 0. No threshold
 changed.
+
+## v0.7 §4.22 — CTEs, and what the two declines of Q2 / Q15 / Q20 measure — Metal, SF1 + SF10 (2026-09-19)
+
+`gpudb.connect()`, Apple M4 Max, statement vs statement through the wrapper,
+warm, minimum of 5. Two questions: what the CTE work changes, and what the
+TPC-H queries that still decline would measure if they did not.
+
+### Forced past the bounds: what each declining query is worth
+
+`scripts/tpch_coverage.py --no-thresholds` rewrites every shape the engine
+accepts and drops the row floor, so a query that the bounds decline still runs
+and reports its ratio. This is data collection, not a proposal: no bound was
+changed on it.
+
+| query | SF | shipping | forced | the shipping decline, in its own words |
+|---|---|---|---|---|
+| Q2  | 1, 10 | native | native (still correlated) | `the statement does not bind on its own (correlated)` — no bound involved |
+| Q20 | 1, 10 | native | native (still correlated) | the same |
+| Q6  | 1 | native | 1.11× | `6001215 rows < 16000000 for an aggregate without GROUP BY` |
+| Q11 | 1 | native | 1.11× | `the statement names no table at or above the 1000000-row floor` (SF1 partsupp is 800K) |
+| Q16 | 1 | native | **0.08×** | the row floor; the forced run confirms it |
+| Q16 | 10 | native | **0.02×** | `count(DISTINCT)` pair bounds; the forced run confirms them |
+| Q15 | 1 | native | **1.83×** | `selectivity 0.04 < 0.5 for the plain form`, on the CTE's own GROUP BY |
+| Q15 | 10 | native | **2.16×** | the same bound |
+| Q13 | 10 | native | **10.91×** | `1488128 groups returned over a join > 1000000 (output-bound)` |
+| Q22 | 1 | native | **7.71×** | `150000 rows < the 1000000-row floor` |
+| Q18 | 1 | 11.57× | 0.03× | with the bounds OFF a different, far worse path is chosen — `--no-thresholds` is not a "forced version of the shipping plan" for every query |
+| Q18 | 10 | 15.33× | 0.02× | the same |
+
+Read honestly: Q6, Q11, Q16 and Q18 support the bounds as they stand. **Q13,
+Q15 and Q22 do not**, and the three of them fail in the same way. Q13's and
+Q15's bounds are output-size bounds — measured for a statement whose groups are
+returned to the CLIENT — applied to a sub-statement whose groups are consumed
+inside DuckDB and never leave the process (Q15's CTE feeds a join and one row
+comes out; Q13's derived table feeds an outer GROUP BY). Q22's is the row
+floor, which counts the rows of the statement's own table (`customer`, 150K)
+while the statement's actual work is the `NOT EXISTS` over 1.5M `orders` rows
+that §4.18 turns into a lane — the same "native runs a join whatever the FROM
+says" that the join bounds already account for and the floor does not.
+
+Nothing was changed on this. An output-size bound and a row floor are each a
+sweep of their own, and rule 1 is not one query's ratio; what this table is for
+is to record that the three declines are conservative and to say exactly which
+rule, so the sweep that revisits them knows what it is looking at.
+
+### The decorrelation Q2 and Q20 would need, measured before it was written
+
+The classical rewrite turns a correlated aggregate subquery into a `GROUP BY`
+over its correlation columns, joined back. Running that GROUP BY on its own
+says what the rewrite could be worth.
+
+| statement | groups | SF | native ms | device ms | ratio | shipping bounds |
+|---|---|---|---|---|---|---|
+| Q20's inner: `lineitem` by `(l_partkey, l_suppkey)` under a 1-year WHERE | 543,210 | 1 | 256.6 | 260.4 | 0.99× | declined |
+| ... | 5,441,669 | 10 | 2528.4 | 2698.4 | 0.94× | declined |
+| Q2's inner: `partsupp × supplier × nation × region` by `ps_partkey` | 117,422 | 1 | 49.3 | — | — | below the row floor |
+| ... | 1,183,098 | 10 | 490.3 | 498.2 | 0.98× | admitted by the bounds; the measured rule 1 declines it |
+| Q17's inner (the shape §4.18 already answers as a lane) | 200,000 | 1 | 36.9 | 24.2 | 1.53× | — |
+| ... | 2,000,000 | 10 | 344.1 | 233.1 | 1.48× | declined as a statement of its own |
+
+The last two rows are the control: Q17 runs 26.8× at SF10 not because its
+subquery is fast as a statement — as a statement it is declined — but because
+§4.18 never returns those two million rows to DuckDB at all. Q2's and Q20's
+decorrelated forms have to. That is why the shape is not built.
+
+### TPC-H coverage, `main` against this branch
+
+`scripts/tpch_coverage.py`, two interleaved rounds per scale factor (main,
+branch, main, branch), nothing else on the machine. Both rounds at both scale
+factors: **every query takes the same path on both sides**, 15 of 22 on the
+device at SF1 and 17 of 22 at SF10, 0 rows differing. No query moved onto the
+device and none moved off — the CTE work takes shapes TPC-H does not contain
+(TPC-H's only CTE, Q15's `revenue`, aggregates, and those are answered by
+§4.14 and declined by the bounds, as above).
+
+| | SF1 round 1 | SF1 round 2 | SF10 round 1 | SF10 round 2 |
+|---|---|---|---|---|
+| main | 15 / 22 | 15 / 22 | 17 / 22 | 17 / 22 |
+| branch | 15 / 22 | 15 / 22 | 17 / 22 | 17 / 22 |
+
+Per-query ratios move with the run, not with the branch: at SF10 round 2 the
+branch reads 7.21× / 3.42× / 19.66× / 55.81× against main's 8.82× / 4.04× /
+19.97× / 56.54× on Q1 / Q3 / Q4 / Q5, and ahead of it on Q10, Q17, Q18, Q21 in
+the same round. The one wider gap, Q21 at SF1 round 1 (4.46× branch against
+7.21× main), reads 5.31× against 4.74× in round 2 — the two modes of a short
+kernel (§9.1), which is why the rounds are interleaved.
