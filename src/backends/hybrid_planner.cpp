@@ -53,6 +53,7 @@
 
 #include "gpu_backend.hpp"
 #include "backend_internal.hpp"
+#include "backend_notes.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -134,6 +135,9 @@ public:
         } else {
             gpu_backend_ = Backend::CPU;
         }
+        // backend_notes.hpp: our columns wrap somebody else's, so the width
+        // reporter here only unwraps and asks again.
+        register_lane_width_reporter(&HybridAggregatorImpl::lane_width_note);
     }
 
     Backend backend() const noexcept override { return Backend::CPU; /* hybrid label */ }
@@ -678,6 +682,13 @@ private:
         Dtype       dtype_;
         bool        on_gpu_;
     };
+
+    // backend_notes.hpp reporter: a hybrid column holds the real one, so the
+    // width is whatever the backend that made the inner column answers.
+    static unsigned lane_width_note(const ResidentColumn& col) {
+        const auto* h = dynamic_cast<const HybridResidentColumn*>(&col);
+        return h ? lane_storage_width(h->inner()) : 0u;
+    }
 
     static const HybridResidentColumn& check_hybrid(const ResidentColumn& c) {
         // We require the caller use a column produced by THIS hybrid

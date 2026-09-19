@@ -1649,6 +1649,178 @@ def run():
               f"view residency: resident again after the eviction ({con.residents()})")
     con.close()
 
+    # ---- last_rewrite()['detail']: one sentence explaining the decision ----
+    print("== last_rewrite detail")
+    con = fresh(thresholds=True, floor_rows=1_000_000)
+    con.execute("SELECT 1 AS one").fetchall()
+    lr = con.last_rewrite()
+    check("floor" in (lr["detail"] or "") and lr["reason"] == "shape",
+          f"detail: a statement over nothing big says which floor declined it ({lr['detail']!r})")
+    con.close()
+
+    con = fresh(thresholds=True)
+    # 10 distinct keys is below min_groups on every backend table: the bound's own
+    # words, with the estimate and the bound in them
+    con.execute("SELECT k, sum(v) FROM tn GROUP BY k").fetchall()
+    lr = con.last_rewrite()
+    if lr["reason"] == "threshold":
+        check(bool(lr["detail"]) and "groups" in lr["detail"],
+              f"detail: a static threshold names the estimate and the bound ({lr['detail']!r})")
+    elif con._backend in ("", "CPU"):
+        check(lr["detail"] == con._REASON_TEXT["backend"],
+              f"detail: a build with no GPU backend says so ({lr['detail']!r})")
+    else:
+        check(bool(lr["detail"]), f"detail: every decision carries one ({lr!r})")
+    con.close()
+
+    con = fresh()          # thresholds off: the exact shapes are rewritten
+    if con._backend not in ("", "CPU"):
+        con.execute("SELECT k, sum(v) FROM t GROUP BY k").fetchall()
+        lr = con.last_rewrite()
+        check(lr["rewritten"] and "resident GROUP BY" in (lr["detail"] or ""),
+              f"detail: a rewrite names the path it took ({lr['detail']!r})")
+        check("detail" in con.last_rewrite(), "detail: last_rewrite() carries the field")
+        con.execute("SELECT count(*) FROM tn WHERE v > 5").fetchall()
+        lr = con.last_rewrite()
+        if lr["rewritten"]:
+            check("global masked aggregate" in (lr["detail"] or ""),
+                  f"detail: an aggregate without GROUP BY names the global path ({lr['detail']!r})")
+        # a measured decline reports the two times it compared
+        d = con._cache and next(iter(con._cache.values()))
+        if d is not None:
+            con._decide_measured(d, 9.0, 4.0)
+            check("9.00 ms rewritten vs 4.00 ms native" in d.why,
+                  f"detail: a measured decline carries both times ({d.why!r})")
+    con.close()
+
+    # ---- sql() takes the same path as execute() ----
+    print("== sql() parity with execute()")
+    from gpudb import connection as _cn                      # noqa: F811
+    con = fresh(thresholds=True)
+    q = "SELECT k, sum(v), count(*) FROM t GROUP BY k"
+    want = sorted(con._raw.execute(q).fetchall())
+    check(sorted(con.sql(q).fetchall()) == want, "sql(): the rows are native's")
+    lr = con.last_rewrite()
+    check(bool(lr["detail"]), f"sql(): the decision carries a detail too ({lr['detail']!r})")
+    if con._backend not in ("", "CPU") and lr["rewritten"]:
+        d = con._timing_decision
+        check(d is not None and not d.timing_checked,
+              "sql(): one sighting of a template is not measured — it may never come back")
+        # the third sighting is: the same number of runs execute() waits for
+        for _ in range(_cn._LAZY_SIGHTINGS - 1):
+            check(sorted(con.sql(q).fetchall()) == want, "sql(): the rows stay native's")
+        d = con._timing_decision
+        check(d is not None and d.timing_checked and d.native_ms is not None and d.rewritten_ms,
+              f"sql(): the measured rule-1 check fires on the third sighting "
+              f"({None if d is None else (d.timing_checked, d.native_ms, d.rewritten_ms)})")
+        # the verdict is the comparison's, and it is the SAME decision execute() uses
+        verdict = "threshold" if min(d.rewritten_ms) >= d.native_ms else "rewritten"
+        con.execute(q).fetchall()
+        now = "rewritten" if con.last_rewrite()["rewritten"] else con.last_rewrite()["reason"]
+        check(now == verdict,
+              f"sql(): execute() inherits the verdict sql() measured ({now} vs {verdict})")
+        # a declined template comes back through sql() the same way it does through execute()
+        d.rewritten, d.reason, d.measured_declined, d.why = False, "threshold", True, "x"
+        d.probe_sql = d.probe_sql or ""
+        if d.probe_sql:
+            saved_probe = con._probe_ms
+            try:
+                calls = []
+                con._probe_ms = lambda s, p: (calls.append(s), 1.0 if s == d.probe_sql else 9.0)[1]
+                d.next_check_at = 0.0
+                con.sql(q).fetchall()
+                check(d.rewritten and not d.measured_declined and len(calls) == 2,
+                      f"sql(): a declined template that re-measures faster is rewritten again "
+                      f"({d.rewritten}, {len(calls)} probes)")
+            finally:
+                con._probe_ms = saved_probe
+    con.close()
+
+    # the error fallback: rule 2 says the user's statement is the ORIGINAL one
+    con = fresh()
+    q = "SELECT k, sum(v) FROM t GROUP BY k"
+    want = sorted(con._raw.execute(q).fetchall())
+    con.execute(q).fetchall()
+    if con.last_rewrite()["rewritten"]:
+        class _FailsOnce:
+            """The raw connection with its next sql() raising — a resident
+            operator that fails for a reason that is not staleness."""
+
+            def __init__(self, raw):
+                self._raw, self.n = raw, 0
+
+            def sql(self, text, **kw):
+                self.n += 1
+                if self.n == 1:
+                    raise duckdb.Error("GPUDB_TEST: the resident operator failed")
+                return self._raw.sql(text, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+        real = con._raw
+        con._raw = _FailsOnce(real)
+        try:
+            got = sorted(con.sql(q).fetchall())
+        finally:
+            con._raw = real
+        lr = con.last_rewrite()
+        check(got == want, "sql(): a failed rewrite is answered natively, with native's rows")
+        check(lr["fallback"] and "GPUDB_TEST" in (lr["error"] or ""),
+              f"sql(): the fallback is recorded with the error ({lr['fallback']}, {lr['error'][:40]!r})")
+        check("failed and DuckDB answered the original" in (lr["detail"] or ""),
+              f"sql(): the detail says what happened ({lr['detail']!r})")
+        check(sorted(con.sql(q).fetchall()) == want,
+              "sql(): the template keeps answering natively afterwards")
+    con.close()
+
+    # stale data behind sql(): a write from another connection, then the same relation
+    con = fresh()
+    con.execute("SELECT k, sum(v) FROM tu GROUP BY k").fetchall()
+    was_rewritten = con.last_rewrite()["rewritten"]     # nothing is, on a build with no backend
+    other = con._raw.cursor()
+    other.execute("INSERT INTO tu VALUES (7, 7)")
+    want = sorted(con._raw.execute("SELECT k, sum(v) FROM tu GROUP BY k").fetchall())
+    got = sorted(con.sql("SELECT k, sum(v) FROM tu GROUP BY k").fetchall())
+    check(got == want, "sql(): a write behind the wrapper does not change the answer")
+    if was_rewritten:
+        check(con.last_rewrite()["fallback"],
+              f"sql(): the staleness is caught inside the call, not thrown at the caller "
+              f"({con.last_rewrite()['fallback']}, {con.last_rewrite()['reason']})")
+        check("the data moved under the resident set" in (con.last_rewrite()["detail"] or ""),
+              f"sql(): the detail says the set went stale ({con.last_rewrite()['detail']!r})")
+    for _ in range(3):
+        got = sorted(con.sql("SELECT k, sum(v) FROM tu GROUP BY k").fetchall())
+        want = sorted(con._raw.execute("SELECT k, sum(v) FROM tu GROUP BY k").fetchall())
+    check(got == want, "sql(): still native's rows once the sets are rebuilt")
+    con.close()
+
+    # a parameterised sql() is never rewritten (execute() declines it for the same reason)
+    con = fresh()
+    rel = con.sql("SELECT k, sum(v) FROM t WHERE v > ? GROUP BY k", params=[5])
+    check(con.last_rewrite()["reason"] == "params" and not con.last_rewrite()["rewritten"],
+          f"sql(): a parameterised statement declines like execute()'s ({con.last_rewrite()['reason']})")
+    check(sorted(rel.fetchall()) ==
+          sorted(con._raw.execute("SELECT k, sum(v) FROM t WHERE v > 5 GROUP BY k").fetchall()),
+          "sql(): ... and still answers it")
+    con.close()
+
+    # store_columns(): what .residents prints per column, and it leaves last_rewrite() alone
+    print("== store_columns()")
+    con = fresh()
+    con.execute("SELECT k, sum(v) FROM t GROUP BY k").fetchall()
+    before = con.last_rewrite()
+    cols = con.store_columns()
+    check(con.last_rewrite() == before, "store_columns(): the last statement's record is untouched")
+    if con._backend not in ("", "CPU") and cols:
+        keys = set(cols[0])
+        check(keys == {"table", "column", "dtype", "rows", "width", "bytes", "prepared"},
+              f"store_columns(): every field is there ({sorted(keys)})")
+        check(all(c["rows"] > 0 for c in cols), "store_columns(): every column reports its rows")
+        check(all(c["width"] is None or c["width"] in (1, 2, 4, 8) for c in cols),
+              f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
+    con.close()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all wrapper tests passed")
     return 1 if FAILS else 0

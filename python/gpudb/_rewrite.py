@@ -835,6 +835,15 @@ def _guard_sql(plan: Plan, fqn: str, tag: str) -> str:
     return f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd"
 
 
+def guard_statement(plan: Plan, fqn: str, tag: str) -> str:
+    """The staleness guard of a rewritten statement, as a statement of its
+    own. Same expression render() embeds, for the one caller that has to run
+    it AHEAD of the statement: `connection.sql()` hands back a relation that
+    is read after the call has returned, so a guard inside it would raise
+    where the wrapper is no longer there to answer natively."""
+    return "SELECT ok FROM " + _guard_sql(plan, fqn, tag)
+
+
 def _render_global(plan: Plan, fqn: str) -> str:
     """§4.12: aggregates without GROUP BY. One table function call, one row —
     over an empty input too, so the outer statement of the split needs nothing

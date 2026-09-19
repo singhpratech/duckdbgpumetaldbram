@@ -49,7 +49,8 @@ HELP = """\
 .timer on|off         the footer line after each statement
 .gpu                  where the last statement ran, in full
 .gpu on|off           the transparent path (off: every statement on DuckDB)
-.residents            the resident sets and their state
+.residents            the resident sets, then the columns behind them
+                      with the rows and the width each one is stored at
 .memory               the device-memory budget and what holds it
 .read FILE            run the statements in FILE
 .open [DATABASE]      open another database (no argument: in-memory)
@@ -174,14 +175,19 @@ class Shell:
         self.say()
 
     def _backend(self) -> str:
-        """What the extension says it is running on, plus the device memory it
-        reports (`gpu_build_info()` names no device, so neither does this)."""
+        """What the extension says it is running on: the runtime, the device's
+        own name where the backend leaves one (`gpu_build_info()` reports it as
+        device='…'), and the device memory it reports. A CPU-only build names
+        no device and neither does this line."""
         info = self.info
         if info is None:
             return "none — the extension is not loaded"
         m = re.search(r"runtime=(\w+)", info)
         name = {"metal": "Metal", "cuda": "CUDA", "cpu": "CPU"}.get(
             (m.group(1) if m else "").lower(), "unknown")
+        dev = re.search(r"device='([^']*)'", info)
+        if dev and dev.group(1):
+            name = f"{name} {self._sep} {dev.group(1)}"
         mem = re.search(r"device_memory=(\d+)", info)
         size = int(mem.group(1)) if mem else 0
         return f"{name} {self._sep} {self._bytes(size)} device memory" if size else name
@@ -383,29 +389,28 @@ class Shell:
     def footer(self, ms: float, note: str = "") -> None:
         """One line: where the statement ran and how long it took. Where it ran
         is the wrapper's answer, never the shell's guess — `last_rewrite()` for
-        the verdict, the wrapper's own log line for the `reason:` clause."""
+        the verdict and for the `detail` clause that explains it."""
         last = self.con.last_rewrite()
-        if last.get("rewritten"):
-            form = last.get("form") or ""
-            inside = form
-            colour = self._accent
-        else:
-            inside = last.get("reason") or ""
-            detail = note or self._detail(inside)
-            if detail:
-                inside = f"{inside}: {detail}" if inside else detail
-            colour = DIM
-        where = ("GPU" if last.get("rewritten") else "DuckDB") + (f" ({inside})" if inside else "")
-        self.say(self.paint(f"{where} {self._sep} {ms:.1f} ms", colour))
+        rewritten = bool(last.get("rewritten"))
+        head = (last.get("form") or "") if rewritten else (last.get("reason") or "")
+        detail = note or self._detail(last)
+        inside = f"{head}: {detail}" if head and detail else (head or detail)
+        where = ("GPU" if rewritten else "DuckDB") + (f" ({inside})" if inside else "")
+        self.say(self.paint(f"{where} {self._sep} {ms:.1f} ms", self._accent if rewritten else DIM))
 
-    def _detail(self, reason: str) -> str:
-        """The clause after the reason. `last_rewrite()` carries no detail
-        field, so it comes from what the wrapper logged while deciding THIS
-        statement (a decision it took earlier and cached logs nothing, and then
-        the footer simply names the reason), plus the two the wrapper's own
-        tables answer."""
-        if reason == "error" or self.con.last_rewrite().get("fallback"):
-            err = self.con.last_rewrite().get("error") or ""
+    def _detail(self, last: dict) -> str:
+        """The clause after the form or the reason. The wrapper's own sentence
+        (`last_rewrite()["detail"]`) is the answer wherever it has one — the
+        decision is the wrapper's, so the wording is too. What is left here is
+        the older fallback for a build whose wrapper carries no detail field,
+        and the one thing only the shell can count: how many sets are still
+        uploading."""
+        detail = last.get("detail") or ""
+        if detail:
+            return detail
+        reason = last.get("reason") or ""
+        if reason == "error" or last.get("fallback"):
+            err = last.get("error") or ""
             if err:
                 return "the rewritten statement failed: " + err.splitlines()[0]
         for line in self._log:
@@ -486,30 +491,57 @@ class Shell:
             self.say(self.paint(f"{key + ':':<{LABEL}}") + str(value))
 
     def residents(self) -> None:
-        """One line per resident set, from the wrapper's own table. The set's
-        table and columns are read out of its identity tag
-        (`gpudb:v1:<catalog>:<schema>:<table>:<oid>:<columns>[:extra]`)."""
+        """Two tables. First the wrapper's SETS — what each statement is
+        waiting on — read out of their identity tags
+        (`gpudb:v1:<catalog>:<schema>:<table>:<oid>:<columns>[:extra]`). Then
+        the COLUMNS those sets are views over, from the extension's
+        `gpu_store_columns()`: the rows each one holds and the width it is
+        stored at, which is what it actually costs the device (a lane is kept
+        at the narrowest signed width its values fit, so a column whose values
+        stay under 32767 is stored two bytes to the row, not eight)."""
         mem = self.con.memory()
         sets = mem.get("sets") or {}
-        if not sets:
+        cols = self.con.store_columns()
+        if not sets and not cols:
             self.say(self.paint("Nothing is resident yet."))
             return
-        rows = []
-        for tag, s in sets.items():
-            parts = tag.split(":")
-            table = ".".join(parts[3:5]) if len(parts) > 6 and parts[0] == "gpudb" else tag
-            cols = parts[6] if len(parts) > 6 and parts[0] == "gpudb" else ""
-            rows.append((table, cols, s.get("state", ""), self._bytes(s.get("bytes") or 0),
-                         self._bytes(s.get("est_bytes") or 0), s.get("error") or ""))
-        head = ("table", "columns", "state", "bytes", "estimated")
-        width = [max(len(str(r[i])) for r in rows + [head]) for i in range(5)]
+        if sets:
+            rows = []
+            for tag, s in sets.items():
+                parts = tag.split(":")
+                table = ".".join(parts[3:5]) if len(parts) > 6 and parts[0] == "gpudb" else tag
+                names = parts[6] if len(parts) > 6 and parts[0] == "gpudb" else ""
+                rows.append((table, names, s.get("state", ""), self._bytes(s.get("bytes") or 0),
+                             self._bytes(s.get("est_bytes") or 0), s.get("error") or ""))
+            self._table(("table", "columns", "state", "bytes", "estimated"), rows, note=5)
+            held = sum((s.get("bytes") or 0) for s in sets.values())
+            self.say(self.paint(f"{len(sets)} set{'s' if len(sets) > 1 else ''} {self._sep} "
+                                f"{self._bytes(held)} held {self._sep} `.memory` for the budget"))
+        if cols:
+            self.say()
+            rows = [(c["table"], c["column"], c["dtype"] or "",
+                     f"{c['rows']:,}" if c["rows"] is not None else "",
+                     f"{c['width']} B" if c["width"] else "-",
+                     self._bytes(c["bytes"] or 0),
+                     "ready" if c["prepared"] else "preparing")
+                    for c in cols]
+            self._table(("table", "column", "dtype", "rows", "width", "bytes", "state"), rows)
+            self.say(self.paint(f"{len(cols)} resident column{'s' if len(cols) > 1 else ''} "
+                                f"{self._sep} width is the bytes a row of the lane is stored at "
+                                f"{self._sep} `-` where the backend does not say"))
+
+    def _table(self, head, rows, note: Optional[int] = None) -> None:
+        """A header line and one line per row, every column padded to its
+        widest cell. `note` names a trailing field printed dim after the
+        columns instead of in one (an error, which has no width to keep)."""
+        n = len(head)
+        width = [max(len(str(r[i])) for r in list(rows) + [head]) for i in range(n)]
         self.say(self.paint("  ".join(h.ljust(width[i]) for i, h in enumerate(head))))
         for r in rows:
-            self.say("  ".join(str(r[i]).ljust(width[i]) for i in range(5))
-                     + (("  " + self.paint(r[5])) if r[5] else ""))
-        held = sum((s.get("bytes") or 0) for s in sets.values())
-        self.say(self.paint(f"{len(sets)} set{'s' if len(sets) > 1 else ''} {self._sep} "
-                            f"{self._bytes(held)} held {self._sep} `.memory` for the budget"))
+            line = "  ".join(str(r[i]).ljust(width[i]) for i in range(n))
+            if note is not None and r[note]:
+                line += "  " + self.paint(str(r[note]))
+            self.say(line)
 
     def memory(self) -> None:
         mem = self.con.memory()

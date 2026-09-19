@@ -25,7 +25,7 @@ Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
 ```
 $ gpudb my.duckdb
 gpudb 0.7.0.dev0
-backend:      Metal · 51.8 GiB device memory
+backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
 database:     my.duckdb
 Enter .help for usage.
@@ -40,7 +40,7 @@ gpudb> SELECT k, sum(v) FROM t GROUP BY k ORDER BY k LIMIT 3;
 │     2 │ 398000400 │
 └───────┴───────────┘
 
-GPU (plain) · 3.3 ms
+GPU (plain: the resident GROUP BY) · 3.3 ms
 ```
 
 The same shell runs a script or a single statement:
@@ -60,11 +60,38 @@ statement first. This shell is that client: it splits statements with DuckDB's
 own tokenizer, hands each one to `gpudb.connect()`, and prints the result with
 DuckDB's own box renderer.
 
-The dim line under each result says where the statement ran and how long it
-took, from `con.last_rewrite()`: `GPU (plain) · 3.3 ms`,
-`DuckDB (threshold: 7 groups < 1000) · 5.0 ms`, `DuckDB (off) · 12.0 ms`. It is
-on at a terminal, off in `-c` / `-f` / piped output unless `--timer` is given,
-and colour follows `NO_COLOR` and whether the output is a terminal.
+The banner's `backend:` line names the runtime, the device as the driver
+reports it, and the device memory the budget plans against; a build without a
+GPU backend names no device.
+
+The dim line under each result says where the statement ran, why, and how long
+it took — all of it from `con.last_rewrite()`, which carries both a short
+`reason` code and a `detail` sentence explaining it:
+
+```
+GPU (plain: the resident GROUP BY) · 3.3 ms
+GPU (topk: a key join materialised on the device) · 8.1 ms
+DuckDB (threshold: 7 groups < 1000) · 5.0 ms
+DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
+DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
+DuckDB (off: the transparent path is off on this connection) · 12.0 ms
+```
+
+The footer is on at a terminal, off in `-c` / `-f` / piped output unless
+`--timer` is given, and colour follows `NO_COLOR` and whether the output is a
+terminal. `.gpu` prints the whole record, `detail` included.
+
+`.residents` prints two tables: the wrapper's resident SETS — what a statement
+is waiting on — and, under them, the COLUMNS those sets are views over, with
+the rows each one holds and the width it is stored at. A lane is kept at the
+narrowest signed width its values fit, so a column of small integers costs one
+or two bytes a row rather than eight, and the table says which:
+
+```
+table  column  dtype  rows       width  bytes     state
+t      k       I64    2,000,000  2 B    15.3 MiB  ready
+t      v       I64    2,000,000  4 B    7.6 MiB   ready
+```
 
 Dot-commands, kept small on purpose — this is not an emulation of the DuckDB
 CLI:
@@ -74,9 +101,10 @@ CLI:
 | `.help` | the list |
 | `.quit`, `.exit` | leave (Ctrl-D does too) |
 | `.timer on\|off` | the footer line |
-| `.gpu` | the last statement's whole `last_rewrite()` |
+| `.gpu` | the last statement's whole `last_rewrite()`, `detail` included |
 | `.gpu on\|off` | the transparent path, live |
-| `.residents`, `.memory` | the resident sets, the device-memory budget |
+| `.residents` | the resident sets, then the columns behind them with rows and width |
+| `.memory` | the device-memory budget and what holds it |
 | `.read FILE`, `.open [DATABASE]` | run a file, open another database |
 | `.tables`, `.schema [TABLE]` | plain SQL underneath (`SHOW TABLES`, `DESCRIBE`) |
 | `.version` | gpudb and duckdb versions |

@@ -1846,6 +1846,107 @@ the statement runs throws away the line it was about to interrupt.
 does — 45 checks, in the wrapper-check script and in CI, where there is no
 extension and every one of them still has to pass on the plain-DuckDB path.
 
+## 2026-09-18 — The second door into the wrapper
+
+Putting a terminal in front of the wrapper was useful before it was finished,
+because a shell asks a library questions a test never does. Four of them came
+back, and the interesting one was the sentence the previous entry ended on:
+shell statements go through `sql()`, the measured rule 1 lives in `execute()`,
+so a shell session was decided by predicted thresholds alone. That is not a
+shell bug. It is `sql()` being a second door into the wrapper with less behind
+it than the first, and the fix is to make the two doors open on the same room.
+
+Reading them side by side, `sql()` was missing four things `execute()` had: the
+continuous measured check (`_note_timing`), the fallback for an error that is
+not staleness (`_on_rewrite_error`), the operator's output-size check
+(`_check_output_size`), and — a real rule-2 hole rather than a missing
+optimisation — it passed `None` where `execute()` passes the caller's
+parameters, so a statement carrying `?` was offered to the rewrite instead of
+being declined as `params`. The last one is a two-character fix. The others are
+all the same problem wearing different clothes: `sql()` returns a relation, and
+a relation is read after the call has returned, so the moment a statement
+actually runs is a moment the wrapper is not there.
+
+What that moment is needed for decides what could be repaired and what could
+not. **Rule 1** needs a time; the bind is not the statement, so timing the bind
+would be timing the wrong thing and calling it rule 1. But nothing says the
+measurement has to be of the user's run — `execute()` already probes NATIVE on a
+side cursor, and the rule's own standing constraint is that the user's statement
+is never the experiment. So `sql()` times both sides on side cursors, at most
+once per template per interval, and writes the verdict into the same `Decision`
+`execute()` reads: a template the two calls share is measured once for both,
+and a template first seen through the shell is now declined by measurement like
+any other.
+
+The first version of that probed on the first sighting, which is wrong in a way
+worth recording: the probes run before the relation is handed back, so a
+statement asked once waited for three executions of itself to answer a question
+about a template that was not coming back. `execute()` does not do that — it
+measures a template after its THIRD rewritten run — and the same rule fixes
+this one. A statement typed once costs what it always did and is decided by the
+thresholds, which cost nothing; a template that comes back three times is
+measured, once, and then at most once a minute. **The error fallback** needs nothing but the error, so it is
+the same code path, moved. **The output-size check** needs `rows_out` from a run
+that has not happened; the honest answer is that it waits for the first
+`execute()` of that template, and the reason it is not attempted at bind time is
+that the only stats available then belong to the previous statement, and
+declining a template on another statement's numbers is worse than declining it
+late.
+
+**Staleness** is the one that turned out to be repairable after all. The
+rewritten statement carries its own `gpu_assert_rows` guard, and through
+`execute()` that guard raises inside the call, where the wrapper answers
+natively. Through `sql()` it raises inside the caller's `fetchall()` — a
+GPUDB_STALE error for a statement plain DuckDB answers, which is the shape of a
+rule-2 failure even though no wrong row was ever produced. The guard is a
+statement like any other, so `sql()` now runs it once on a side cursor before
+the relation leaves the wrapper: one `count(*)` per base table, and the raise
+moves back inside the call where `_on_stale` and the native re-run live. It
+narrows the window; it does not close it, and the entry should say so — a write
+that commits between the check and the caller's first fetch still reaches the
+relation's own guard. `execute()` on the same statement remains the way back
+from that, which is exactly what the shell's `recover()` has been doing.
+
+The other three follow-ups are all the same kind of thing: the wrapper knew
+something and was not saying it.
+
+`last_rewrite()` reported a reason code and the shell reconstructed a sentence
+by scraping the wrapper's own log lines — which worked for a decision taken just
+now and silently gave nothing for a decision taken earlier and cached, the
+common case. So the sentence moved to where the decision is: `detail`, written
+by whoever decided, carried on the record. A threshold hands over its own text
+(`7 groups < 1000`), the matcher hands over the expression it could not express,
+a measured decline hands over the two times it compared, a set that is not ready
+hands over what it is waiting on, and a rewritten statement names the path it
+took. `reason` is unchanged and still the thing a program matches on. Every
+client now prints one sentence rather than inventing its own.
+
+`gpu_build_info()` named no device. `gpu_backend.hpp` is frozen for the CUDA
+port, so the device name goes where the algorithm note already goes — a small
+header beside `exact_path_note.hpp`, a backend leaving a fact the interface has
+no field for. The same header carries the other thing the frozen interface
+hides: a lane's storage width. Since stage C a lane is kept at the narrowest
+signed width its values fit, which is backend-private and invisible everywhere,
+so `gpu_store_columns()` grew a `width` column (last in the list, so a
+positional reader keeps reading what it always did; NULL where no backend
+answers, because "the interface's own width" is not a thing to assume). `gpudb`'s
+`.residents` now prints the sets and, under them, the columns they are views
+over with their rows and widths — which is where a two-byte lane holding two
+million values stops being a number only the profiler knows.
+
+Measured: `Apple M4 Max`, and a 2M-row table whose key fits in 16 bits costing
+15.3 MiB at 2 bytes a row beside a payload at 4.
+
+Tests: two cases in `test/sql/gpu_store.test` (three lanes of the same rows
+reporting 1, 2 and 8 bytes; `width` last of fourteen columns), a
+`last_rewrite detail` and a `sql() parity` section in
+`python/tests/test_wrapper.py` — the measured check firing for `sql()` and its
+verdict inheriting to `execute()`, the error fallback with the rows compared
+against native's, the stale write caught inside the call, a parameterised
+`sql()` declining as `params` — and shell checks for the banner's device line
+and the per-column table. All of them pass with no extension too, which is
+where the wrapper is only a pass-through and the shell is a plain DuckDB shell.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
