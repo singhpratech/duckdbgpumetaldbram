@@ -2873,3 +2873,90 @@ container and does not.
   whole aggregate. So an Arrow-native result path would move the plain-form
   bounds, and a cheaper table-function hand-off would move the inner ones —
   they are different problems.
+
+## 2026-09-19 — A formula verified bit-exact on one architecture and wrong on the other
+
+The CUDA port began with a baseline run of the whole suite on the RTX 4090
+box, which is the first time main had been measured on x86-64 in a while.
+`test_gpudb` was 566/566 with nine blocks skipped (the exact path CUDA does
+not implement yet). The SQL suite was 218 pass / 6 fail — against 224 pass /
+0 fail on the M4 Max, the same 224 statements. The six were not CUDA's: four
+of them were `avg`.
+
+On the 300k-row parity set in `test/sql/gpu_groupby_exact.test`, `sum`,
+`count`, `count(*)`, `min` and `max` came back bit-exact against native — each
+isolated, zero differing rows. `avg` differed in **856 of 3002 groups**,
+always by exactly one ulp.
+
+It was not reduction order: the answer is identical under `threads = 1` and
+the default, so nothing about how the GPU or the CPU reference groups the rows
+was involved. It was not the group tuple either, since the sum those averages
+are derived from is bit-exact. Three candidate formulas were measured against
+native over the same groups:
+
+| formula | groups differing from native (of 3002) |
+|---|---|
+| `sum(v)::DOUBLE / count(v)` | 856 |
+| `sum(v::DOUBLE) / count(v)` | 2236 |
+| `(sum(v)::DECIMAL(38,0) / count(v))::DOUBLE` | 856 |
+
+None reproduced native, and the extension's own derivation —
+`Sum128::to_double() / double(count)` — is the first of them. Reconstructing
+the diverging groups' 128-bit sums and recomputing the quotient by hand
+settled it: evaluated in `double` the extension's formula reproduced native 0
+times out of 3, and evaluated in `long double` it reproduced it 3 times out of
+3.
+
+That is the whole story. DuckDB's average over an integer type keeps a HUGEINT
+sum and a count and finalises the quotient in `long double`, narrowing to
+double on return. `long double` is the 80-bit x87 type on x86-64 (64-bit
+mantissa) and plain `double` on Apple silicon. So on the Mac the extension's
+double quotient and native's long double quotient are the *same expression*
+and agree bit for bit — which is exactly how the formula came to be written
+down and marked verified. On x86-64 the extra 11 bits of mantissa change the
+rounding often enough to move one ulp on a quarter of all groups.
+
+Two things are worth keeping from this beyond the fix.
+
+The first is that "verified bit-exact against native" is a claim about a
+platform, not about a formula, whenever the expression's *type* is part of
+what is being reproduced. The fix (`src/include/native_avg.hpp`) is therefore
+not "use long double" but "evaluate the expression DuckDB evaluates, in the
+type it evaluates it in, in the same order" — `hugeint_to_float<F>` is
+templated on that type and `AvgFloat` names the one place that chooses it.
+Because the extension is compiled for the same platform ABI as the DuckDB it
+loads into, the two agree on every target by construction: 80-bit on x86-64,
+128-bit on aarch64 Linux, 64-bit on Apple silicon. The assumption that would
+break it is a toolchain mismatch across the ABI boundary (a MinGW-built
+extension inside an MSVC-built DuckDB); Windows is not a target today, and
+that is the thing to revisit if it becomes one.
+
+The second is why nobody saw it. CI's Linux job builds and runs the unit
+tests but not the SQL suite — there is no libduckdb in that job — and the SQL
+suite is where every parity test against native lives. So the only machine
+that ran those tests was the Mac, and on the Mac the formula is right. The
+fix therefore also adds a unit check that needs no DuckDB at all: it sweeps
+crafted (sum, count) pairs, asserts `native_avg` equals an independently
+written long double quotient, and — on a platform whose `long double` is
+wider than `double` — asserts that at least one case *differs* from the plain
+double form, so that a silent regression to the old expression cannot pass. On
+a platform where the two types coincide it asserts the opposite, that they
+agree. The measured sweep finds the double form differing on 5030 of 20000
+cases here.
+
+**Scope.** Released v0.6.0 predates avg on any transparent path, so no
+released build ever returned a wrong average; this was main only. After the
+fix the parity set differs in 0 of 3002 groups and the suite is 222 pass / 2
+fail on the 4090, the two remaining being a capability assertion that waits on
+CUDA's global aggregate and a bytes expectation that encoded one backend's
+permutation width.
+
+**Still open: `avg` over DECIMAL.** That one is derived by the wrapper in SQL
+(`_avg_decimal_expr`), as `double(unscaled sum) / (count * 10^s)`, and SQL has
+no wider type to divide in. Measured on x86 over a DECIMAL(18,2) payload it
+differs from native on **70 of 401 groups**. It cannot be fixed the way the
+integer path was; the honest choices are a C++ derivation of the column (the
+helper already has `native_avg_decimal` for it) or declining `avg(DECIMAL)` on
+platforms where `long double` is wider than `double`. Left for a decision
+rather than fixed silently.
+

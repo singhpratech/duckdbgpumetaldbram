@@ -8,6 +8,7 @@
 // host (Metal f64 sums) and by unit/parity checks.
 #pragma once
 #include "gpu_backend.hpp"
+#include "native_avg.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -43,8 +44,11 @@ inline void apply_group_filter_host(GroupByResidentResult& r, const GroupByFilte
         }
     };
     auto ex_f64 = [&](std::size_t i) -> double {   // exact op, Avg
-        return Sum128{static_cast<std::uint64_t>(r.sums[i]), r.sums_hi[i]}.to_double() /
-               static_cast<double>(r.counts[i]);
+        // The SAME expression the emitted avg column uses (native_avg.hpp):
+        // a HAVING that compared a differently-rounded average would keep a
+        // different set of groups than the values it then returns.
+        return native_avg(Sum128{static_cast<std::uint64_t>(r.sums[i]), r.sums_hi[i]},
+                          r.counts[i]);
     };
     auto ex_s128 = [&](std::size_t i) -> Sum128 {
         return Sum128{static_cast<std::uint64_t>(r.sums[i]), r.sums_hi[i]};
