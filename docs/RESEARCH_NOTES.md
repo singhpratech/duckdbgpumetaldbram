@@ -2992,6 +2992,47 @@ which is the reason the exact path chose 128-bit integers over compensated
 floating point in the first place, and the first time that choice paid for
 itself on a device with a non-deterministic reduction order.
 
+## 2026-09-19 — The aggregate that has no use for a sort
+
+`aggregate_exact_masked` is the keyless form: `SELECT sum(a), count(b),
+min(c) ... WHERE <mask>` with no GROUP BY. The exact GROUP BY reaches it by
+sorting the keys, walking the runs and reducing each one; a keyless query
+could be expressed that way too, as a single group, and it would be correct.
+It would also pay for a radix sort and a permutation it never reads.
+
+So this operator exists to not do that. One pass over the rows in storage
+order, the mask evaluated once, each payload folded into its own 128-bit
+accumulator. No key, no sort cache, no permutation — the row index IS the row.
+
+Two things fell out of writing it that were not obvious beforehand.
+
+**The mask is the shared work, not the payload.** A query with four payloads
+over one predicate conjunction evaluates the conjunction once and reads it four
+times, which is why the payloads are one call rather than four. Calling a
+single-payload aggregate per column would re-evaluate the WHERE per column —
+the same mistake as computing a GROUP BY per aggregate, one level down.
+
+**count(*) is already in every payload's tuple.** The per-payload reduction
+carries `cnt_star` as well as `count(payload)`, because the tuple is the same
+one the GROUP BY uses. But `count(*)` does not depend on the payload at all: a
+row either survives the mask or it does not, whatever its cells hold. So the
+answer is read off payload 0 instead of scanning the mask again, and only a
+call with predicates and no payload at all has to count the mask itself. A
+small thing, but it is the difference between n+1 passes and n.
+
+### What it closed, and what it did not
+
+Unit tests went 652/652 to 674/674, and the SQL suite with the gate on went 19
+failures to 11. Every remaining failure is `join_materialize` — the last stub.
+
+`gpu_agg_exact_global` q11 still fails by default, and that is worth being
+precise about rather than counting as progress. It asserts `global=true` in
+`gpu_build_info()`, and `global_supported()` is gated on `exact_supported()`,
+which stays off until the exact path is complete. The operator it tests now
+works; the flag it reads does not flip until the last stub lands. The test is
+not measuring the kernel, it is measuring the gate — which is the correct thing
+for it to measure, and the reason the failure is still there.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

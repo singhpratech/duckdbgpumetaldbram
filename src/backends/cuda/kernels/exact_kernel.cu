@@ -175,6 +175,31 @@ struct NullKeyTuple {
     }
 };
 
+// §4.12: one row's contribution to the global aggregate. No key, no
+// permutation — the row index IS the row, which is the whole point of the
+// operator: it exists so a keyless aggregate does not pay for a sort it has no
+// use for.
+struct GlobalTuple {
+    const unsigned char* mask;
+    const i64*           vals;
+    const u64*           vvalid;
+    __host__ __device__ __forceinline__ ETup operator()(std::size_t i) const {
+        ETup t = etup_identity();
+        if (mask && !mask[i]) return t;
+        t.cnt_star = 1;
+        if (!bit_at(vvalid, i)) return t;   // NULL payload: in count(*) only
+        return etup_of_value(vals[i]);
+    }
+};
+
+// Surviving rows when there is no payload to carry the count for us.
+struct MaskOne {
+    const unsigned char* mask;
+    __host__ __device__ __forceinline__ u64 operator()(std::size_t i) const {
+        return (!mask || mask[i]) ? 1ull : 0ull;
+    }
+};
+
 // Valid bits of word w, with the bits past `rows` masked off — the tail word
 // is filled with ones at upload, so counting it whole would under-report NULLs.
 struct PopValid {
@@ -552,6 +577,66 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
         if ((e = cudaStreamSynchronize(s)) != cudaSuccess) return e;   // tuples dies on return
     }
     *h_runs = static_cast<std::size_t>(runs);
+    return cudaSuccess;
+}
+
+cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, int n_preds,
+                                    std::size_t rows,
+                                    const i64* const* d_vals, const u64* const* d_vvalid,
+                                    int n_pays, gpudb::cuda_exact::ExactTuple* h_out,
+                                    std::int64_t* h_count_star, cudaStream_t s) {
+    *h_count_star = 0;
+    for (int p = 0; p < n_pays; ++p) h_out[p] = gpudb::cuda_exact::ExactTuple{};
+    if (!rows) return cudaSuccess;
+    cudaError_t e;
+
+    // The mask is evaluated ONCE and every payload reads it, which is the
+    // difference between this and calling the aggregate per payload.
+    DevBuf maskbuf;
+    const unsigned char* mask = nullptr;
+    if (n_preds) {
+        if ((e = maskbuf.alloc(rows)) != cudaSuccess) return e;
+        mask = static_cast<const unsigned char*>(maskbuf.p);
+        mask_kernel<<<grid_for(rows), kBlock, 0, s>>>(d_preds, n_preds, rows,
+                                                      static_cast<unsigned char*>(maskbuf.p));
+        if ((e = cudaGetLastError()) != cudaSuccess) return e;
+    }
+
+    DevBuf out;
+    if ((e = out.alloc(sizeof(ETup))) != cudaSuccess) return e;
+    thrust::counting_iterator<std::size_t> it(0);
+    for (int p = 0; p < n_pays; ++p) {
+        auto vals = thrust::make_transform_iterator(it, GlobalTuple{mask, d_vals[p], d_vvalid[p]});
+        e = with_temp([&](void* tmp, std::size_t& b) {
+            return cub::DeviceReduce::Reduce(tmp, b, vals, static_cast<ETup*>(out.p),
+                                             static_cast<int>(rows), AddExact(), etup_identity(), s);
+        });
+        if (e != cudaSuccess) return e;
+        ETup t{};
+        if ((e = fetch(out.p, &t, s)) != cudaSuccess) return e;
+        h_out[p].lo       = t.lo;
+        h_out[p].hi       = t.hi;
+        h_out[p].cnt_v    = t.cnt_v;
+        h_out[p].cnt_star = t.cnt_star;
+        h_out[p].mn       = t.cnt_v ? t.mn : 0;
+        h_out[p].mx       = t.cnt_v ? t.mx : 0;
+    }
+
+    // count(*) is the same number for every payload — a row either survives the
+    // mask or it does not, whatever its payload cells hold. So take it from the
+    // first payload rather than scanning again; only a payload-less call
+    // (predicates alone) has to count the mask itself.
+    if (n_pays > 0) {
+        *h_count_star = h_out[0].cnt_star;
+        return cudaSuccess;
+    }
+    DevBuf cnt;
+    if ((e = cnt.alloc(sizeof(u64))) != cudaSuccess) return e;
+    auto ones = thrust::make_transform_iterator(it, MaskOne{mask});
+    if ((e = gpudb_cuda_ops::sum_u64(ones, rows, static_cast<u64*>(cnt.p), s)) != cudaSuccess) return e;
+    u64 c = 0;
+    if ((e = fetch(cnt.p, &c, s)) != cudaSuccess) return e;
+    *h_count_star = static_cast<std::int64_t>(c);
     return cudaSuccess;
 }
 
