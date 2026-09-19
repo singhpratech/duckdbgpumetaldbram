@@ -4895,3 +4895,13 @@ set per statement behind them.
 fails · `rewrite_parity_check.sh`, `join_parity_check.sh`,
 `groupby_parity_check.sh` all pass · `scripts/wrapper_residency_gate.py` 0
 failing rows, all three cadences pass.
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor`,
+SF1, last and alone on the machine, on this code: **1506 cells, 904 rewritten,
+602 declined, 0 below 1.0×, 0 differing, exit 0.** The same run on the code
+before this change measured 914 rewritten and 591 declined; the ten cells that
+moved are `declined after the first run (threshold)` — the operator's
+output-size check, which reads the run's own `rows_out` and is therefore
+process-state dependent, and which declines in the safe direction. SF1 sets are
+far below the budget, so no cell in this gate reaches the admission rule at
+all; it is here to show that nothing else moved.
