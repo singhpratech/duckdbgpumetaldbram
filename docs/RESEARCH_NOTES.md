@@ -1846,6 +1846,88 @@ the statement runs throws away the line it was about to interrupt.
 does — 45 checks, in the wrapper-check script and in CI, where there is no
 extension and every one of them still has to pass on the plain-DuckDB path.
 
+## 2026-09-18 — The WHERE that read the mask ten times
+
+The open question at the end of the direct-reduce entry was the sort path's mask
+stage. `gbx_mask_i64` is one kernel dispatch per predicate, and each of them
+reads a byte of the 60 MB mask and writes one back in order to look at a single
+lane. At SF10 that measured 2.9 ms fixed plus **3.3 ms per term** — 3.26, 3.30
+and 3.44 ms on 1-, 2- and 4-byte lanes, 3.28 ms when the term re-reads a column
+an earlier term already read, and the same figure at every selectivity. It is
+not the comparison that costs; it is 60 MB in and 60 MB out at about 36 GB/s
+against a sequential floor of 312–336. Q12's five terms were 19.65 ms of a
+23.3 ms kernel before that query moved to the direct path, and every many-group
+masked statement still paid it.
+
+The fix was not a kernel; it was a caller. `gpred_eval` — one row, the whole
+conjunction, written for the global aggregate two entries ago and reused by the
+direct reduce — is exactly what the mask stage wants: read each distinct lane
+once, evaluate every term, write the byte once. Measured at SF10 on a 100k-group
+key with one payload, a term costs the legacy stage +3.1 to +3.5 ms and the
+fused stage +0.3 to +0.9 ms.
+
+**The half I did not expect to matter.** Fusing the terms only addresses one of
+the two mask reads. The sort path visits rows through the permutation, so
+`mask[perm[i]]` was gathered once to count the survivors of the key range — the
+flat 2.9 ms — and then again, in full, for every payload the statement reduces.
+Keeping that gather, by writing it out as a second mask in SORTED order which
+the masked reduce and the compaction read sequentially, costs one 60 MB write
+and removes one random gather per payload. It is where the large ratios are: at
+50 % survival and 100k groups, three terms over five payloads go 120.6 ms to
+55.0, and one term over five payloads 79.6 to 42.0. Over 98 measured cells the
+median is 1.43× on kernel time and nothing is slower than 1.06×, so the rule is
+"fused whenever it can express the WHERE" and there is no region to split.
+
+**The shape that looked elegant and lost.** If the reduce wants the mask in
+sorted order, why build a row-order mask at all? Evaluate the predicates at
+`row = perm[i]`, write only the sorted-order mask, and the 60 MB write, the
+60 MB read and the 2.9 ms gather all disappear. It loses in 98 of 98 cells
+(fused takes 0.48–0.93× of its kernel), and it is slower than the pass it was
+meant to replace wherever little survives — 0.71× of legacy at 1 % with one
+term and one payload. A lane gather costs what a payload gather costs, 5 to
+7 ms at 60M rows, and a term buys one of those instead of one sequential read;
+it beats legacy only at 50–90 % survival with several payloads, and there it is
+the sorted-order mask, which the fused pass also has, doing the work. It cannot
+serve a NULL-key group either, whose rows are not in the permutation at all. I
+kept the kernel behind `GPUDB_METAL_MASK_PATH=permeval`: it is the honest
+comparison, and it is the shape a CUDA port will otherwise try.
+
+**What did not move, and why.** The masked call is three synchronous command
+buffers with a serial host prefix scan between two of them. Stage B and the
+multi-payload pass are now one command buffer — nothing between them needed the
+host — which removes a round trip from every several-payload statement. The
+first boundary stays: the host needs the survivor count to choose between the
+compaction variant and the masked reduce, and to size the output buffers.
+Encoding stage A speculatively over the whole key range in the first command
+buffer would remove that round trip at high selectivity and cost a full pass
+over the sorted keys at low selectivity — precisely the case the compaction
+variant exists for. A fixed ~0.15 ms saved against a cost that grows with the
+range is a rule I would have to fit, for a win smaller than the one already
+banked; it is written down rather than built.
+
+**The discipline the direct path taught, applied unchanged.** The fused pass
+binds one buffer pair per lane, so it holds the global aggregate's
+12-distinct-lane bound; a WHERE over more columns keeps the per-term loop, which
+binds one column at a time, and the unit tests assert the fallback by reading
+the stage back from `exact_mask_note()` rather than inferring it from a time. A
+pipeline that will not build is a fallback, never a throw, and a virtualised
+Apple GPU is never asked to build one at all — the same deny that protects the
+direct path, for the same reason: one refused build there leaves that process's
+Metal compiler unusable. `GPUDB_METAL_MASK_DISABLE_PSO` makes the pipelines
+refuse on a device where they would build, which is how that path is tested.
+
+**What it bought, in whole queries.** Two interleaved runs of the 22 TPC-H
+queries per setting, same build, `GPUDB_METAL_MASK_PATH=legacy` against the
+default. At SF10 the six queries whose sort-path GROUP BY carries a WHERE moved:
+Q3 21.1 → 13.4 ms, Q7 20.6 → 11.0, Q10 21.5 → 13.9, Q18 11.2 → 8.9, Q21 33.2 →
+21.5, Q22 1.5 → 0.7; the stage trace puts their mask stage at 13–14 ms before
+and 6–7 ms after. The other eleven do not run the stage and sit within ±3 %.
+At SF1 the same queries gain 1.16–1.50× and three statements of 1.2–1.4 ms that
+never touch the mask (Q5, Q8, Q9) read 0.86–0.93× — the two modes of a short
+kernel again, visible inside each setting's own pair of runs (Q8 fused: 2.7 and
+1.4 ms). They are in BENCHMARK.md as measured. The gate, alone on the machine on
+the final code: 782 cells, 509 rewritten, 0 slower, 0 differing.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -1867,11 +1949,14 @@ extension and every one of them still has to pass on the plain-DuckDB path.
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel
   time in `gpu_last_stats`) could re-check at once instead of on the clock.
-- **The GROUP BY mask stage**: `gbx_mask_i64` runs one kernel dispatch per
-  predicate and writes a byte a row that the next pass reads back — 19.7 ms of
-  Q12's ~23 ms kernel at SF10. The global aggregate (§4.12) evaluates the whole
-  program per row in one pass through `gpred_eval`, a function written to be
-  called from anywhere; switching the mask stage to it is the obvious next move.
+- **The GROUP BY mask stage**: done on Metal (2026-09-18) — one fused
+  `gpred_eval` pass per statement instead of one per term, and the counting
+  pass's gather kept as a mask in sorted order so the reduce stops re-gathering
+  it per payload. 1.06× to 2.38× on the sort path's kernel over 98 measured
+  cells at SF10, nothing slower. What is open is CUDA
+  (`docs/CUDA_EXACT_PATH.md` §1.1) and the one round trip that stays: the
+  compaction-versus-masked-reduce choice still needs the survivor count on the
+  host.
 - **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
   shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
   they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
