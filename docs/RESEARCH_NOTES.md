@@ -2662,9 +2662,9 @@ half-typed line, the next statement runs on its own` failed **26 and 28 times in
 80 rounds** with eight busy processes beside it, **0 in 160** quiet rounds, and
 never in a real CI run. A first guess — that a redrawn prompt satisfied the wait
 early, so the wait was keyed on the prompt *after* the shell's own `^C` line —
-moved the loaded rate from 34 % to 27 %, which is to say it did not move it. So
+moved the loaded rate from 34 % to 31 %, which is to say it did not move it. So
 the check was made to print which of its three conditions failed and what the
-terminal had shown, and three loaded shards were run. All 24 failures say the
+terminal had shown, and four loaded shards were run. All 37 failures say the
 same thing, character for character:
 
     box=False, statement=True, old line gone=True,
@@ -2708,18 +2708,18 @@ is the branch that looks. The check now also fails if the `^C` was never
 answered at all, so a silent shell can no longer be mistaken for a working one.
 
 Measured on the same runner, four shards of 30 runs of the suite's interactive
-section: loaded, **24 failures in 90** before, **0 in 120** after; quiet, **0 in
-120**. The zero is not the whole argument — the mechanism is — but the arithmetic
-of the two agrees: 28 of those 120 loaded rounds took 6 s or more instead of
-2.5 s, which is the retry firing, and 28 in 120 is the 24 in 90 that used to
-fail. The window still opens as often as it ever did; it is simply no longer
-mistaken for an answer.
+section each: loaded, **37 failures in 120** before, **0 in 120** after; quiet,
+**0 in 120**. The zero is not the whole argument — the mechanism is — but the
+arithmetic of the two agrees: 28 of those 120 loaded rounds took 6 s or more
+instead of 2.5 s, which is the retry firing, and 28 in 120 is the 37 in 120 that
+used to fail. The window still opens about as often as it ever did; it is simply
+no longer mistaken for an answer.
 
 **Ruled out** for this one: readline keeping the half-typed line (`old line
-gone=True` in every one of the 24 failures, and the pending interrupt clears it
+gone=True` in every one of the 37 failures, and the pending interrupt clears it
 when it finally lands); the shell's own handler (`repl()` empties `self.buf` and
 prints `^C`, which is exactly what eventually appears); a prompt redrawn under
-the half-typed text satisfying the wait early (tried first, 34 % → 27 %); and
+the half-typed text satisfying the wait early (tried first, 34 % → 31 %); and
 anything gpudb-specific, again by the control.
 
 ## Open questions
