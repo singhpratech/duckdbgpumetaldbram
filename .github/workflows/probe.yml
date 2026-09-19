@@ -5,6 +5,13 @@ on:
     branches: ['ci/shell-ctrl-d-diagnosis']
 
 jobs:
+  window:
+    name: what a terminal does with a ^D nobody is reading
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 python/tests/probe_eof_window.py
+
   probe:
     name: shell ctrl-d loop
     runs-on: ubuntu-24.04
@@ -23,6 +30,6 @@ jobs:
           cat /proc/sys/kernel/yama/ptrace_scope || true
       - name: loop the interactive sequence
         run: |
-          python3 python/tests/probe_ctrl_d.py ${PROBE_N:-60}
+          python3 python/tests/probe_ctrl_d.py ${PROBE_N:-80}
         env:
-          PROBE_N: 60
+          PROBE_N: 80

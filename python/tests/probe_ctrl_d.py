@@ -4,6 +4,10 @@ at that moment.
 
     python3 python/tests/probe_ctrl_d.py [iterations]
 
+The window under suspicion is microseconds wide, so nothing between the reads
+and the writes that bound it does any work: marks are (label, time, index into
+the transcript) tuples, formatted only when a round hangs.
+
 Not part of the suite; it lives only on the diagnosis branch.
 """
 import fcntl
@@ -43,8 +47,9 @@ def lflags(attrs):
 class Round:
     def __init__(self, n):
         self.n = n
-        self.out = []
-        self.log = []
+        self.out = []          # cleared by the sequence, the way the suite does
+        self.all = []          # everything, never cleared
+        self.marks = []        # (label, t, index into self.all)
         self.t0 = time.time()
         self.primary, secondary = pty.openpty()
         self.slave = os.ttyname(secondary)
@@ -59,8 +64,10 @@ class Round:
                                   preexec_fn=own_the_terminal)
         os.close(secondary)
 
-    def note(self, what):
-        self.log.append(f"  +{time.time() - self.t0:6.2f}s {what:<34} tail={''.join(self.out)[-120:]!r}")
+    def mark(self, label):
+        # a shallow copy of the (few, short) chunks the suite has not cleared:
+        # cheap enough not to move the race, enough to say what was on screen
+        self.marks.append((label, time.time() - self.t0, len(self.all), tuple(self.out)))
 
     def send(self, text):
         data = text if isinstance(text, bytes) else text.encode()
@@ -78,7 +85,9 @@ class Round:
                     break
                 if not chunk:
                     break
-                self.out.append(chunk.decode("utf-8", "replace"))
+                chunk = chunk.decode("utf-8", "replace")
+                self.out.append(chunk)
+                self.all.append(chunk)
             if text in "".join(self.out):
                 return True
         return False
@@ -97,11 +106,10 @@ class Round:
                 got.append(chunk.decode("utf-8", "replace"))
         return "".join(got)
 
-    # ---- the sequence the suite runs ----
+    # ---- the sequence the suite runs, step for step ----
     def play(self):
         out, send, until = self.out, self.send, self.read_until
         until("Enter .help for usage.")
-        self.note("banner")
         until("gpudb> ")
         send(b"SELECT 1 AS a,\n")
         until("...> ")
@@ -110,7 +118,7 @@ class Round:
         until(" ms")
         del out[:]
         until("gpudb> ")
-        self.note("first statement done")
+        self.mark("first statement done")
 
         del out[:]
         send(b"SELECT 1 AS thrown_away")
@@ -120,31 +128,26 @@ class Round:
         del out[:]
         send(b"SELECT 2 AS after_ctrl_c;\n")
         until("after_ctrl_c")
-        self.note("^C on a half-typed line")
+        self.mark("^C on a half-typed line")
 
         del out[:]
         until("gpudb> ")
         del out[:]
         send(b"SELECT count(*) FROM range(100000000000) r(i) WHERE i % 7 = 3;\n")
         until("\x00", timeout=2.0)
-        self.note("long statement running")
+        self.mark("long statement running")
         send(b"\x03")
-        ok = until("INTERRUPT", timeout=60)
-        self.note(f"INTERRUPT seen={ok}")
-
+        until("INTERRUPT", timeout=60)
         del out[:]
         send(b"SELECT 3 AS still_here;\n")
-        ok = until("still_here", timeout=60)
-        self.note(f"still_here seen={ok}")
-        # was that the echo or the rendered result?
-        seen = "".join(out)
-        self.echo_only = "│" not in seen
+        until("still_here", timeout=60)
+        self.mark("still_here matched")
         del out[:]
-        ok = until("gpudb> ")
-        self.note(f"prompt back={ok} (echo_only={self.echo_only})")
-
+        until("gpudb> ")
+        self.mark("prompt matched")
         del out[:]
         send(b"\x04")
+        self.mark("^D sent")
         until("\x00", timeout=30)
         try:
             return self.p.wait(timeout=30)
@@ -153,10 +156,14 @@ class Round:
 
     # ---- what the child looks like when it will not leave ----
     def diagnose(self):
-        say = []
-        say.append(f"child pid={self.p.pid} poll={self.p.poll()} slave={self.slave}")
-        say.append("timeline:\n" + "\n".join(self.log))
-        say.append(f"tail of the pty: {''.join(self.out)[-400:]!r}")
+        say = [f"child pid={self.p.pid} poll={self.p.poll()} slave={self.slave}"]
+        whole = "".join(self.all)
+        cuts = []
+        for label, t, idx, seen in self.marks:
+            cuts.append(f"  +{t:6.2f}s {label:<28} seen so far ends: "
+                        f"{''.join(self.all[:idx])[-90:]!r}")
+        say.append("timeline:\n" + "\n".join(cuts))
+        say.append(f"whole transcript ({len(whole)} chars):\n{whole!r}")
         for name in ("status", "wchan", "syscall", "stack"):
             path = f"/proc/{self.p.pid}/{name}"
             try:
@@ -188,10 +195,9 @@ class Round:
         say.append(run_cmd(["stty", "-a", "-F", self.slave]))
         spy = shutil.which("py-spy") or os.path.expanduser("~/.local/bin/py-spy")
         say.append(run_cmd(["sudo", "-n", spy, "dump", "--pid", str(self.p.pid), "--nonblocking"]))
-        say.append(run_cmd([spy, "dump", "--pid", str(self.p.pid), "--nonblocking"]))
 
-        # does a SECOND ^D get it out? (byte lost)   a \n first? (line not empty)
-        # a whole command? (not reading at all)
+        # a SECOND ^D out (the byte was lost)?  a \n first (the line was not
+        # empty)?  a whole command (it is not reading at all)?
         for label, keys, wait in (("second ^D", [b"\x04"], 6),
                                   ("newline then ^D", [b"\n", b"\x04"], 6),
                                   (".quit", [b".quit\n"], 6)):
@@ -217,27 +223,35 @@ class Round:
             pass
 
 
+def shape(r):
+    """Which prompt the round matched: the one readline prints when it arms
+    (nothing rendered yet) or the one after the answer."""
+    for label, _, _, seen in r.marks:
+        if label == "prompt matched":
+            return "answered" if "│" in "".join(seen) else "armed"
+    return "?"
+
+
 def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 40
     print(run_cmd([sys.executable, "-c",
                    "import readline;print(readline.__doc__, "
-                   "getattr(readline,'_READLINE_LIBRARY_VERSION','?'))"]))
-    fails, echo_only = 0, 0
+                   "getattr(readline,'_READLINE_LIBRARY_VERSION','?'))"]), flush=True)
+    fails, shapes = 0, {}
     for i in range(1, n + 1):
         r = Round(i)
         try:
             rc = r.play()
-            if getattr(r, "echo_only", False):
-                echo_only += 1
+            s = shape(r)
+            shapes[s] = shapes.get(s, 0) + 1
             if rc == 0:
-                print(f"[{i}/{n}] ok  ({time.time() - r.t0:.1f}s, echo_only={getattr(r, 'echo_only', '?')})",
-                      flush=True)
+                print(f"[{i}/{n}] ok   ({time.time() - r.t0:4.1f}s, prompt={s})", flush=True)
             else:
                 fails += 1
-                print(f"[{i}/{n}] HANG rc={rc}\n{r.diagnose()}\n{'=' * 70}", flush=True)
+                print(f"[{i}/{n}] HANG rc={rc} prompt={s}\n{r.diagnose()}\n{'=' * 70}", flush=True)
         finally:
             r.cleanup()
-    print(f"\n{fails} hangs in {n} rounds; {echo_only} rounds matched only the echo of still_here")
+    print(f"\n{fails} hangs in {n} rounds; prompt shapes {shapes}")
     return 1 if fails else 0
 
 
