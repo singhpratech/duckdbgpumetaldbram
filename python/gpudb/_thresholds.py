@@ -35,6 +35,23 @@ sides). SF10 (60M x 15M rows): every one of 78 rows wins, the plain form
 1.08–1.28× at 1M groups returned, 1.12–1.14× at 320K under the 3% WHERE,
 HAVING / top-k 2.0–9.9×                               → join_plain_max_groups,
 join_plain_small_groups, join_plain_min_selectivity
+A group count alone did not describe that last bound, and the CTE sweep
+(2026-09-19, `transparent_gate.py --ctes`, SF1) showed where it fails. The
+`cte_arm` form joins lineitem to orders and groups the result; keyed by
+`l_orderkey` it returns 664K–729K groups out of 6M rows and measures 0.98–1.00×
+on four cells (no WHERE, 25 %, 55 %, 91 % kept), while the SAME statement keyed
+by `l_partkey` returns 195K–200K groups and measures 1.05–1.11×, and every
+`li x orders` / `li x orders x customer` cell at ~100K groups measures
+1.15–3.18×. What separates them is not the group count but how much the device
+reduces: 8.2 rows per group where it loses, 30 where it wins thinly, 60 where it
+wins clearly — and SF10's 1M-group cell is 60 as well. The rule is a SECOND
+bound rather than a replacement, because the ratio alone is not it either:
+TPC-H Q13 at SF1 returns 146K groups out of 1.5M orders rows — 10.3 per group —
+and measures 8.8x, since its groups feed another GROUP BY inside DuckDB instead
+of going to the client. Above 300K groups returned over a join the device also
+has to be reducing at least 16 rows into each of them
+                                    → join_plain_thin_max_groups,
+                                      join_plain_min_rows_per_group
 Few groups, by key type (2026-09-17, SF1, 1 to 5 payload columns with an
 expression payload, after the block-level reduce): an INTEGER key with 7
 groups loses or ties on every form (0.62–1.28×; native aggregates a tiny
@@ -161,6 +178,10 @@ class Thresholds:
     join_plain_max_groups: int = 1_000_000      # measured up to 1M groups returned (SF10), 1.08x there
     join_plain_small_groups: int = 20_000       # at or below this the plain form wins at any selectivity
     join_plain_min_selectivity: float = 0.08    # above it, the plain form under a WHERE needs this much kept
+    # ... and above this many groups it also has to be REDUCING something:
+    # at least this many rows read per group returned
+    join_plain_thin_max_groups: int = 300_000
+    join_plain_min_rows_per_group: float = 16.0
     # statements aggregating several payload columns (§4.9)
     multi_plain_max_groups: int = 50_000        # plain form, single table, no WHERE (under a WHERE: native)
     multi_join_plain_max_groups: int = 20_000   # plain form over a key join
@@ -252,6 +273,14 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
             return True, ""
         if est_groups > t.join_plain_max_groups:
             return False, f"{est_groups} groups returned over a join > {t.join_plain_max_groups} (output-bound)"
+        if est_groups > t.join_plain_thin_max_groups and rows:
+            # the device wins by reducing many rows into each row it returns; when a
+            # join returns nearly as many rows as its largest table has, both sides
+            # are doing the same output work and there is nothing left to win
+            per_group = rows / est_groups
+            if per_group < t.join_plain_min_rows_per_group:
+                return False, (f"{per_group:.1f} rows per group over a join with {est_groups} groups "
+                               f"< {t.join_plain_min_rows_per_group} (output-bound)")
         if has_where and est_groups > t.join_plain_small_groups:
             if selectivity is None:
                 return False, "selectivity unknown"
