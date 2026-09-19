@@ -3214,8 +3214,17 @@ void test_fused_mask_body() {
     // Is the fused pass available on this GPU? A device that will not build
     // its pipelines answers everything through the legacy pass, which costs
     // the suite the path assertions and nothing else.
+    // The device is read from its name, not from the note under test, so the
+    // assertions stay independent of the code they check: the fused pass is
+    // offered to Apple7 and later, and never to a virtualised Apple GPU.
     const char* knob = std::getenv("GPUDB_METAL_MASK_DISABLE_PSO");
-    const bool refused = knob && *knob;
+    const std::string dev = metal->device_name();
+    const bool offered = dev.find("Apple7") != std::string::npos &&
+                         dev.find("Paravirtual") == std::string::npos;
+    if (!offered)
+        std::printf("  the fused pass is not offered to this device: every shape must answer "
+                    "through the legacy pass (%s)\n", dev.c_str());
+    const bool refused = (knob && *knob) || !offered;
 
     const std::size_t N = 2'600'003, L = 16;
     // Lanes: 0 key (10k distinct, NULLs), 1 key (120k distinct), 2 wide
