@@ -41,6 +41,11 @@ else runs on DuckDB, untouched, at its usual speed. Same rows, same column
 names, same column types, either way. No hints, no schema changes, nothing to
 call.
 
+On Apple Silicon this path is on by default; on NVIDIA the same path is
+implemented and **opt-in** — set `GPUDB_CUDA_EXACT=1` — because the thresholds
+it decides with were swept on Metal hardware rather than on CUDA
+([Platforms and install](#platforms-and-install) has the detail).
+
 On TPC-H at SF10 that is **19 of 22 queries on the device, 0 rows differing,
 up to 52.9× on an M4 Max** — warm, with the tables already resident — and
 17 of 22 at SF1. The ones that stay are declined on purpose, and this README
@@ -62,7 +67,10 @@ gpudb my.duckdb                                 # a shell whose footer says wher
 > **Where this stands today.** The `duckdb-gpudb` package is not on PyPI yet
 > and the community registry serves v0.6.0; both change when v0.7.0 is
 > released. Until then, route 2 — [from a checkout](#installing-in-full) — is
-> the one that works end to end.
+> the one that works end to end. On Linux the three lines above install a
+> binary that may carry no CUDA at all: `SELECT gpu_build_info();` says what
+> the one in front of you has, and [Platforms and
+> install](#platforms-and-install) says what to do about it.
 
 There are **two pieces**, and you need both: the *extension*, which is the GPU
 code and lives inside DuckDB, and the *wrapper*, which is the `gpudb` command
@@ -109,9 +117,11 @@ gpudb
 ```
 
 and read the `backend:` and `transparent:` lines of the banner. `backend:
-none — the extension is not loaded` means the extension is missing (route 1
-step 1, or `GPUDB_EXTENSION_PATH`). `transparent: available` means both
-pieces are in place.
+none — the extension is not loaded` means the extension is missing: install
+it into DuckDB with `INSTALL gpudb FROM community;`, or point
+`GPUDB_EXTENSION_PATH` at a binary you built ([Installing, in
+full](#installing-in-full)). `transparent: available` means both pieces are
+in place.
 
 Then run a statement over a table of at least a million rows and read the
 footer. `GPU (…)` is the GPU; `DuckDB (not_resident: …)` means it is on its
@@ -149,8 +159,8 @@ Enter .help for usage.
 ```
 
 Those first three lines are the extension announcing, on stderr, which
-function families it registered and which backend it found — DuckDB prints
-them for any extension load, and you will see them from the stock CLI too.
+function families it registered and which backend it found. The extension
+prints them itself as it loads, so you will see them from the stock CLI too.
 
 `backend:` names the runtime, the device as the driver reports it, and the
 device memory the budget plans against. A build with no GPU backend names no
@@ -643,10 +653,8 @@ common way to end up with a shell that works but never uses the GPU.
    ```
 
    The `duckdb` module `pip` pulls in (or the one you already have) must be a
-   version the registry publishes a gpudb build for: **the registry builds
-   gpudb for DuckDB ≥ 1.5.5**. A `duckdb` outside that range loads fine and
-   simply finds no gpudb to install — `INSTALL gpudb FROM community` on DuckDB
-   1.4.5 is a 404. Pin it with `pip install "duckdb==1.5.5"` if you need to.
+   version the registry publishes a gpudb build for — **Supported versions**,
+   at the end of this section, says which and how to pin it.
 
 **Route 2 — from a checkout.** Three steps; the first is the one that is easy
 to miss, because `scripts/build.sh` only builds the loadable extension when
@@ -686,18 +694,19 @@ runs on DuckDB.
 
 **Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 — the
 wrapper's own requirements, and they are *not* the same as route 1's. The
-registry builds gpudb for DuckDB ≥ 1.5.5, so a `duckdb` module that satisfies
-`pip` can still be a version the registry has nothing to install for: on
-DuckDB 1.4.5, `INSTALL gpudb FROM community` is a 404. Pin it with `pip install
-"duckdb==1.5.5"` if you are taking route 1. A binary from the releases page
-needs only DuckDB ≥ 1.2, because the loadable extension is built against the
-stable C API v1.2.0.
+registry builds gpudb separately for each DuckDB version from 1.5.5 on, so a
+`duckdb` module that satisfies `pip` can still be a version the registry has
+nothing to install for: on DuckDB 1.4.5, `INSTALL gpudb FROM community` is a
+404. Pin it with `pip install "duckdb==1.5.5"` if you are taking route 1. A
+binary from the releases page needs only DuckDB ≥ 1.2, because the loadable
+extension is built against the stable C API v1.2.0.
 
-macOS: an Apple silicon Mac for the Metal backend. Building it needs the
-macOS 15 SDK, which is where `MTLLanguageVersion3_2` comes from (CI builds on
-`macos-15`); the built binary asks the OS at run time and compiles its shaders
-as MSL 3.2 on macOS 15 and later, MSL 3.1 below
-(`src/backends/metal/metal_groupby.mm`). Linux with CUDA: see the [CUDA
+macOS: **macOS 14 or later on Apple silicon** (Metal shading language 3.1;
+3.2 is used on macOS 15 and later). The binary asks the OS at run time and
+compiles its shaders as MSL 3.2 where that is available, MSL 3.1 below
+(`src/backends/metal/metal_groupby.mm`). Building needs the macOS 15 SDK,
+which is where `MTLLanguageVersion3_2` comes from (CI builds on `macos-15`).
+Linux with CUDA: see the [CUDA
 requirements](#cuda-requirements-build-from-source-on-linux) table — the short
 version is that a binary built with CUDA 13 needs an R580+ driver, and one
 built with CUDA 12.x reaches the GPU on R525+.
@@ -740,7 +749,10 @@ returns *different rows* from DuckDB is the bug we most want to hear about.
 
 ### Explicit `gpu_*` functions — any DuckDB client, including the CLI
 
-**Everything you use keeps working.** v0.6.0 registered 38 `gpu_*` functions; v0.7 registers 65. Nothing was removed and nothing changed shape — every v0.6 function is registered in v0.7 under the same name, with the same return type and the same parameter types. None of them needs the wrapper. This is
+**Everything you use keeps working.** v0.6.0 registered 38 `gpu_*` functions;
+v0.7 registers 65. Nothing was removed and nothing changed shape — every v0.6
+function is registered in v0.7 under the same name, with the same return type
+and the same parameter types. None of them needs the wrapper. This is
 also the only route from the stock `duckdb` CLI, because DuckDB's stable C
 extension API — the one the loadable extension uses on purpose, so that one
 binary keeps working across DuckDB versions — has no hook that sees a statement
@@ -1188,11 +1200,24 @@ SELECT gpu_join_sum_resident('l.k', 'l.v', 'o');   -- = sum(...) FROM lineitem J
 
 ## Why this exists
 
-Every standalone GPU database from 2013-2024 was acqui-hired or pivoted (HEAVY.AI → NVIDIA 2025, BlazingSQL dormant, Voltron Data 50% layoff). Building "another GPU SQL engine" is not a viable bet.
+Two things are missing from the GPU-database landscape, and both are addressed
+by writing an extension rather than an engine.
 
-What's open in 2026: **no published SQL engine targets Apple Silicon GPUs**. Sirius (UW + NVIDIA, CIDR 2026) is CUDA-only. cuDF is CUDA-only. So is everything else. Apple Silicon's unified memory architecture (up to 512 GB at 819 GB/s on M3 Ultra) is a genuine architectural advantage that nobody has wired into a database.
+**No published SQL engine targets Apple Silicon GPUs.** Sirius (UW + NVIDIA,
+CIDR 2026) is CUDA-only; cuDF is CUDA-only. Apple Silicon's unified memory —
+up to 512 GB at 819 GB/s on an M3 Ultra — is a column store's natural home:
+there is no PCIe hop, so a table the CPU already holds is a table the GPU can
+read. `gpudb` wires that into a database, with the same operators on CUDA.
 
-`gpudb` is a DuckDB *extension* (not a fork, not a new database) that closes that gap with a real dual-backend implementation. Operator-level benchmarks (GROUP BY, multi-aggregate fusion, hash join) live in [BENCHMARK.md](BENCHMARK.md)'s earlier entries.
+**An engine is mostly not the operators.** A parser, an optimizer, a storage
+format, a type system and a client ecosystem are the bulk of the work, and
+DuckDB has them. As an extension, gpudb adds the GPU underneath them and
+nothing else: DuckDB still answers every statement the GPU does not take, at
+its usual speed, and the GPU takes only the shapes it is measured to win. The
+extension reaches DuckDB through its stable C API, so one binary keeps working
+across DuckDB versions, and turning it off leaves a plain DuckDB session.
+
+Operator-level benchmarks (GROUP BY, multi-aggregate fusion, hash join) live in [BENCHMARK.md](BENCHMARK.md)'s earlier entries.
 
 ## Quick start
 
@@ -1242,7 +1267,8 @@ duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
 
 The loadable extension is built against the stable C API v1.2.0, so a release
 binary loads in any DuckDB ≥ 1.2; the community install above is what needs
-≥ 1.5.5, because that is the DuckDB version the registry builds and serves for.
+≥ 1.5.5, because the registry builds gpudb separately for each DuckDB version
+from 1.5.5 on.
 Release binaries track the latest tag. `LOAD` needs `-unsigned` here because
 release-page binaries are unsigned — the community install above does not.
 

@@ -25,8 +25,8 @@ DuckDB itself has installed. If it finds none — or finds one older than this
 client — `con.extension_note` says so in one sentence and every statement runs
 on DuckDB.
 
-**Requires** Python >= 3.9 and the `duckdb` module >= 1.4. The community
-registry publishes gpudb for DuckDB 1.5.5; a binary from the project's releases
+**Requires** Python >= 3.9 and the `duckdb` module >= 1.4. The registry builds
+gpudb separately for each DuckDB version from 1.5.5 on; a binary from the project's releases
 page needs only DuckDB >= 1.2, because the loadable extension is built against
 the stable C API v1.2.0. Apple silicon for the Metal backend; on NVIDIA
 hardware the path is opt-in behind `GPUDB_CUDA_EXACT=1`.

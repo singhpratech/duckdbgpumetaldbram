@@ -135,10 +135,10 @@ docs:
     NVIDIA CUDA: any GPU with sm_75 or later (Turing and newer). The driver
     a binary needs follows the CUDA toolkit it was built with: a CUDA 13
     build needs R580 or newer, a CUDA 12.x build reaches the GPU on R525+.
-    Apple Metal: any Apple Silicon Mac (M1 or later). The binary asks the
-    OS at run time and compiles its shaders as MSL 3.2 on macOS 15 and
-    later, MSL 3.1 below; building from source needs the macOS 15 SDK.
-    Falls back to CPU otherwise.
+    Apple Metal: an Apple Silicon Mac (M1 or later) on macOS 14 or later.
+    The binary asks the OS at run time and compiles its shaders as Metal
+    shading language 3.2 on macOS 15 and later, 3.1 below; building from
+    source needs the macOS 15 SDK. Falls back to CPU otherwise.
 
   known_limitations: |
     * Window functions, FULL joins, median / stddev / quantiles, and
