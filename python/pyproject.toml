@@ -30,5 +30,9 @@ include = ["gpudb*"]
 # repository and in the sdist: scripts/build_wheels.sh puts exactly one built
 # `.duckdb_extension` there for the platform wheel and removes it again for the
 # `py3-none-any` wheel. See setup.py for the wheel tag that goes with it.
+#
+# On Linux the same directory also gets libgomp.so.1 and its licence: the
+# extension links OpenMP dynamically and a minimal userland has no copy, so the
+# artifact carries one and finds it through its $ORIGIN runpath.
 [tool.setuptools.package-data]
-gpudb = ["_ext/*.duckdb_extension"]
+gpudb = ["_ext/*.duckdb_extension", "_ext/libgomp.so.*", "_ext/LICENSE.libgomp"]
