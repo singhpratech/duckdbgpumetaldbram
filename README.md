@@ -283,7 +283,7 @@ SELECT gpu_last_stats();
 The full surface, the identity-tag rules and the one footgun are further down
 under [The resident model in 20 seconds](#the-resident-model-in-20-seconds).
 
-### The two rules
+## The two rules
 
 **Never slower than DuckDB.** Not on average — per statement, per shape, per
 size. Which shapes may be rewritten at all comes from bounds a gate measures
@@ -304,7 +304,7 @@ is also checked against the original statement text with `DESCRIBE` before it is
 used. Where "the same as native" is not definable — `sum(DOUBLE)`, which DuckDB
 itself computes in an order-dependent way — the shape is simply never rewritten.
 
-### What runs on the GPU, and what stays on DuckDB
+## What runs on the GPU, and what stays on DuckDB
 
 A row marked DuckDB is not a missing answer: the statement runs as it always
 did, at its usual speed. A `§n` in the Note column is a section of
@@ -367,7 +367,7 @@ by form](KNOWN_ISSUES.md#the-size-bounds-form-by-form).
 - The statement is rewritten **before DuckDB plans it**, through DuckDB's own
   parser (`json_serialize_sql`) and a pure function in the extension
   (`gpu_rewrite_ast`) — no plan surgery, no C++ API.
-- Two of those bounds explain most of what you will see. A key estimated at
+- Two of the bounds above explain most of what you will see. A key estimated at
   fewer than 1,000 distinct values does not rewrite on a single table — native
   aggregates a tiny integer domain through a perfect hash in 1.5–5 ms per 6M
   rows — but a `VARCHAR` key is exempt for the **plain** form, with no `WHERE`
