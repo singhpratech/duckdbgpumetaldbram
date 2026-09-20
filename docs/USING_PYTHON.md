@@ -174,9 +174,9 @@ print("memory:", con.memory())
 con.close()
 ```
 
-Run as written on an M4 Max, TPC-H SF1, DuckDB 1.5.5 (the three `[gpudb]
-registered …` lines the extension writes to stderr on load come first, as in
-the shell):
+Run as written on an M4 Max, TPC-H SF1, DuckDB 1.5.5, on the v0.7.0 release
+build of 2026-09-20 (the three `[gpudb] registered …` lines the extension writes
+to stderr on load come first, as in the shell):
 
 ```
 extension_note: ''
@@ -206,12 +206,8 @@ extension_note: ''
     detail: not a shape the rewrite expresses: select expression
 
 residents: {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': 'ready'}
-memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': {'state': 'ready', 'est_bytes': 217609579, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}}
+memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'refusals': 0, 'refusals_held': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': {'state': 'ready', 'est_bytes': 169599859, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}, 'bytes': 84017010, 'device_allocated': 338264064}
 ```
-
-This session was captured before `con.memory()` gained `bytes`,
-`device_allocated`, `refusals` and `refusals_held`; the table above is the
-current set of keys, and the per-set figures are unchanged.
 
 Three statements, three outcomes — a win, a size threshold, and a shape with
 no kernel behind it. `6 groups` in the second is the wrapper's

@@ -54,7 +54,8 @@ community registry there reports `compiled=cpu` and carries no CUDA at all —
 ## The `gpudb` shell
 
 The first way in, and the one that shows its work. This is one session on an
-M4 Max over TPC-H SF1, opened read-only (the three `[gpudb] registered …` lines
+M4 Max over TPC-H SF1, opened read-only, on the v0.7.0 release build of
+2026-09-20 (the three `[gpudb] registered …` lines
 are the extension announcing itself on stderr as DuckDB loads it):
 
 ```
@@ -80,7 +81,7 @@ gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey
 │     10426 │       1513.00 │
 └───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 24.1 ms
+DuckDB (not_resident: the resident set is not ready yet) · 25.7 ms
 ```
 
 The first ask is on DuckDB on purpose: the columns are uploaded in short
@@ -91,17 +92,18 @@ same statement, nine runs each way in the same session:
 ```
 gpudb> .gpu off
 GPU path off — statements go straight to DuckDB.
-… DuckDB · 20.7, 17.4, 15.5, 15.1, 14.8, 14.8, 14.9, 14.8, 14.8 ms
+… DuckDB · 30.4, 24.5, 16.5, 19.5, 20.9, 22.3, 21.6, 22.1, 23.0 ms
 gpudb> .gpu on
 GPU path on — residency: background.
-… GPU (topk: the resident GROUP BY) · 9.6, 32.3, 8.7, 8.7, 8.7, 8.7, 8.5, 8.4, 8.4 ms
+… GPU (topk: the resident GROUP BY) · 12.9, 47.3, 10.0, 11.4, 14.1, 14.4, 14.4, 14.5, 14.8 ms
 ```
 
-Median 14.9 ms against 8.7 ms — 1.7×, with both series printed whole so the
-warm-up runs and the wrapper's own measuring run stay visible. A statement this
-short has two speeds on Apple silicon — 5–6 ms on a quiet machine, 8–9 ms when
-other threads are waking — which is why the wrapper measures in your process
-instead of trusting a published ratio.
+Median 22.1 ms against 14.4 ms — 1.53×, with both series printed whole so the
+warm-up runs and the wrapper's own measuring run stay visible. The nine GPU runs
+spread from 10.0 to 14.8 ms with nothing changed between them: a statement this
+short has more than one speed on Apple silicon depending on what else is waking,
+which is why the wrapper measures in your process instead of trusting a
+published ratio. Expect your own numbers rather than these.
 
 The banner's `backend:` line names the runtime, the device as the driver
 reports it, and the device memory the budget plans against; a build without a
@@ -158,7 +160,7 @@ one or two bytes a row rather than eight. Same session as above:
 ```
 gpudb> .residents
 table          columns               state  bytes     estimated  worth
-main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  2.13
+main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  161.7 MiB  3.99
 1 set · 80.1 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
 
 table     column      dtype  rows       width  bytes     state
@@ -242,13 +244,16 @@ sentence behind it.
 | `off` / `manual` | the path is off (`.gpu off`, `--no-gpu`, `transparent=False`), or residency is `manual` and this set was not uploaded by hand |
 | `nulls` `overflow` `decimal` `collation` `view` `temp` `ambiguous` `not_found` | a narrower refusal, each with its own sentence in `detail` |
 
+What those look like in the shell's footer — these are the *shapes*, collected
+from different statements and different sessions, not one run:
+
 ```
 GPU (plain: the resident GROUP BY) · 3.3 ms
 GPU (topk: a key join materialised on the device) · 8.1 ms
 DuckDB (threshold: 7 groups < 1000) · 5.0 ms
 DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
 DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
-DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 43.8 ms
+DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 49.9 ms
 DuckDB (off: the transparent path is off on this connection) · 12.0 ms
 ```
 
