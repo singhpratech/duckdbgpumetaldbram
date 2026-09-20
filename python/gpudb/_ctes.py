@@ -57,6 +57,7 @@ _MAX_CTES = 16
 # Comments and string literals are blanked first: a statement may legitimately
 # contain the word inside a string, and matching that would decline a statement
 # for a word in its data.
+_WORD_RE = re.compile(r"materialized", re.I)
 _BLANK_RE = re.compile(r"--[^\n]*|/\*.*?\*/|'(?:[^']|'')*'|\$\$.*?\$\$", re.S)
 _MAT_RE = re.compile(
     r'(?:^|[\s,(])(?P<name>[A-Za-z_]\w*|"(?:[^"]|"")+")\s*(?:\([^()]*\)\s*)?AS\s+MATERIALIZED\b',
@@ -65,9 +66,11 @@ _MAT_RE = re.compile(
 
 def materialized_names(sql: str) -> set:
     """The CTE names declared AS MATERIALIZED in `sql`, casefolded."""
-    # Cheap reject first: this runs on every statement, and almost none of
-    # them contain the word at all.
-    if "materialized" not in sql.casefold():
+    # Cheap reject first: this runs on every statement and almost none contain
+    # the word. re.search, not sql.casefold(), because casefolding copies the
+    # whole statement — a multi-megabyte INSERT ... VALUES would pay for that
+    # copy on every execute.
+    if not _WORD_RE.search(sql):
         return set()
     scrubbed = _BLANK_RE.sub(lambda m: " " * len(m.group(0)), sql)
     out = set()
