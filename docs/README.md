@@ -1,0 +1,116 @@
+# Reading guide — the research and design record
+
+Everything that was tried, measured, kept or dropped while building gpudb is
+written down in this repository. This page says where, and in what order to
+read it.
+
+## Start here
+
+| If you want | Read |
+|---|---|
+| The story: what was asked, what was tried, what failed, what was decided | **[RESEARCH_NOTES.md](RESEARCH_NOTES.md)** — a dated lab journal, written to be read front to back |
+| Every number, with the losing cells left in | **[../BENCHMARK.md](../BENCHMARK.md)** |
+| What does not work, or is slower than DuckDB, today | **[../KNOWN_ISSUES.md](../KNOWN_ISSUES.md)** |
+| How a plain `SELECT` reaches the GPU and how the answer is kept identical | **[TRANSPARENT_DESIGN.md](TRANSPARENT_DESIGN.md)** |
+| How columns live on the device: the store, narrow lanes, shedding, index vectors | **[RESIDENT_COLUMNS_DESIGN.md](RESIDENT_COLUMNS_DESIGN.md)** |
+
+The journal records *how we got there*; the design documents stay
+authoritative for *how things are*.
+
+## The two rules every entry is judged by
+
+1. **Never slower than DuckDB.** A statement goes to the GPU only where
+   measurement says it wins; otherwise DuckDB answers it. Thresholds come from
+   sweeps, and a running connection keeps re-measuring its own statements.
+2. **Never a different answer.** Row for row, including names and types —
+   NULLs, 128-bit sums, NaN ordering, DECIMAL, stale data after a write.
+
+A result that loses is printed next to the ones that win. Those cells are the
+reason the thresholds look the way they do.
+
+## The journal by theme
+
+Entries are in date order in the file; this groups them by question.
+
+**Exactness**
+- Exactness first: NULLs and 128-bit sums
+- Subqueries in WHERE, a silent wrong answer avoided, and a 0.03× caught by the coverage map
+- The write the guard could not see
+- A view is not a thing you can remember
+- A guard that tested for a value the serializer never emits
+- A formula verified bit-exact on one architecture and wrong on the other
+
+**Deciding when the GPU should answer**
+- The gate: thresholds come from measurements
+- Few groups, and what a benchmark loop hides
+- Two modes of a short kernel: what the gate's three losing rows were
+- The millisecond that was not there
+- The second door into the wrapper
+- A bound is a measurement of a situation, and three of ours were in the wrong one
+- The gate whose native shapes had stopped being native
+
+**Widening the SQL that qualifies**
+- WHERE on the device
+- Widening the key: dates, several columns, strings
+- Joins · The join that needed no hash table, and the flag that could finally flip
+- Several aggregated columns in one statement
+- Expressions: computed lanes · Expressions over aggregates · Aggregates in disguise
+- No GROUP BY, and the joins the device cannot do
+- A coverage map: the 22 TPC-H queries · Working down the coverage map
+- Derived tables, an expensive guard, count(DISTINCT)
+- Views are derived tables with a name · GROUP BY ALL · Probing 36 shapes, taking four
+- A CTE is two things, and only one of them wants inlining
+
+**Memory: what has to stay on the device**
+- The memory budget that was only on paper
+- Lane sharing measured before it was built: not worth building
+- Reinvention, stage A (row order), stage B (the store), stage C (the width the data asks for)
+- The index that had nowhere to be bound (stage D, measured and not wired into SQL)
+- What a column stops needing
+- Least recently used knows when, not what for (value-aware residency)
+
+**Kernels**
+- Raw performance first: where a statement's time goes
+- One group is not a GROUP BY (the global masked aggregate)
+- Few keys do not need a sort: the direct grouped reduce
+- The WHERE that read the mask ten times (the fused mask)
+- The aggregate that has no use for a sort
+- A capability flag that was really a placement decision (CUDA)
+
+**Using it**
+- pip install gpudb (the Python wrapper; the distribution is named `duckdb-gpudb`, the import is `gpudb`)
+- A terminal is a client (the `gpudb` shell)
+- The end-of-file that arrived while nobody was reading, and the Ctrl-C that had nobody to wake — two pty races that turned out to be stock Python's
+- The other build path, unexercised since the rewriting began
+- The SQL suite now runs on x86-64, and the DuckDB libs are pinned
+
+The journal ends with **Open questions** — what is not answered yet.
+
+## Reference documents
+
+| Document | What it covers |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Layers, backends, the abstract interface |
+| [GROUPBY_RESIDENT_DESIGN.md](GROUPBY_RESIDENT_DESIGN.md) | The explicit `gpu_*` SQL functions and the resident GROUP BY |
+| [WINDOW_FUNCTIONS_DESIGN.md](WINDOW_FUNCTIONS_DESIGN.md) | Window functions — a design note; they are not implemented |
+| [CUDA_EXACT_PATH.md](CUDA_EXACT_PATH.md) | The interface contract for the exact path, and the tests that prove it on every backend |
+| [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md) · [DATASETS.md](DATASETS.md) | How the benchmarks are run and on what data |
+| [DEVELOPMENT.md](DEVELOPMENT.md) · [MACOS_EXTENSION_BUILD.md](MACOS_EXTENSION_BUILD.md) · [CI_RECIPES.md](CI_RECIPES.md) | Building, testing, CI |
+| [RELEASE_NOTES_v0.7.md](RELEASE_NOTES_v0.7.md) | What v0.7 ships, by theme |
+| [RELEASE_READINESS.md](RELEASE_READINESS.md) | Historical: the first community-extension submission's punch list |
+
+## Reproducing a number
+
+Every table names its command. The common ones:
+
+```bash
+SF=1 ./scripts/gen_tpch.sh                                  # data
+./scripts/build.sh                                          # extension + tools
+python3 scripts/tpch_coverage.py                            # the 22 TPC-H queries: who answers, how fast, identical?
+python3 scripts/transparent_gate.py --subqueries --exprs    # the sweep behind the thresholds (about an hour)
+```
+
+Measurements are on an Apple M4 Max (Metal) unless an entry says otherwise.
+Timings of statements under about 5 ms are taken with `SET threads TO 1`,
+interleaved, min and median — the journal entry *Two modes of a short kernel*
+explains why.
