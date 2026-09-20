@@ -93,17 +93,25 @@ gpudb my.duckdb --readonly        # nobody writes while you look
 python -m gpudb                   # the same entry point
 ```
 
-The banner is the machine's answer to "is this actually going to use the GPU":
-
-<!-- RE-RUN: banner, device line and every timing in this section, on the release build -->
+The banner is the machine's answer to "is this actually going to use the GPU".
+Every transcript in this section comes from one session on an M4 Max over
+TPC-H SF1, opened read-only, default settings, DuckDB 1.5.5:
 
 ```
+$ gpudb data/tpch_sf1/tpch.duckdb --readonly
+[gpudb] registered gpu_inner_join + gpu_join_rows_resident
+[gpudb] registered gpu_groupby_{sum,sum_f64,count,exact}_resident[_having|_topk] + gpu_topk_resident[_f64]
+[gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates + resident-column functions (gpu_upload, gpu_*_resident) (backend=Metal)
 gpudb 0.7.0
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
-database:     /data/tpch_sf1/tpch.duckdb
+database:     data/tpch_sf1/tpch.duckdb
 Enter .help for usage.
 ```
+
+Those first three lines are the extension announcing, on stderr, which
+function families it registered and which backend it found — DuckDB prints
+them for any extension load, and you will see them from the stock CLI too.
 
 `backend:` names the runtime, the device as the driver reports it, and the
 device memory the budget plans against. A build with no GPU backend names no
@@ -112,50 +120,82 @@ device, and `transparent:` says what is missing instead.
 #### Type SQL, read the footer
 
 Under each result is one dim line: where the statement ran, why, and how long
-it took. Captured on an M4 Max over TPC-H SF1, default settings:
+it took. The five parts with the most units shipped, out of 200,000:
 
 ```
-gpudb> SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5;
-┌────────────┬───────────────┐
-│ l_orderkey │      qty      │
-│   int64    │ decimal(38,2) │
-├────────────┼───────────────┤
-│    4806726 │        328.00 │
-│    2199712 │        327.00 │
-│    4722021 │        323.00 │
-│    4702759 │        320.00 │
-│    1263015 │        320.00 │
-└────────────┴───────────────┘
+gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+┌───────────┬───────────────┐
+│ l_partkey │      qty      │
+│   int64   │ decimal(38,2) │
+├───────────┼───────────────┤
+│    125009 │       1642.00 │
+│    140633 │       1562.00 │
+│     49981 │       1553.00 │
+│    149443 │       1537.00 │
+│     10426 │       1513.00 │
+└───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 37.0 ms
+DuckDB (not_resident: the resident set is not ready yet) · 24.3 ms
 ```
 
 **That first line is not a failure, and it is the one thing worth understanding
 before anything else.** In the default `background` residency the wrapper
 records the statement, leaves it with DuckDB, and uploads the columns it needs
 in short row-id segments taken only while your connection is idle — so an
-upload never runs a long scan beside a query you are waiting for. Ask again a
-few seconds later and the same statement is on the device:
+upload never runs a long scan beside a query you are waiting for. Ten seconds
+later the same statement is on the device, and `.residents` (below) is how you
+see that it got there:
 
 ```
-gpudb> SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5;
-…
-GPU (topk: the resident GROUP BY) · 35.7 ms
+gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+… the same five rows …
+GPU (topk: the resident GROUP BY) · 29.8 ms
 ```
 
-If you would rather pay for it now — a script that knows its workload, or a
-benchmark — start with `--residency eager` and the upload happens inside the
-statement that asked for it (that statement therefore reads in seconds).
-`--residency manual` never uploads by itself; only sets you uploaded by hand
-are used.
+That run is still the first one through the device pipelines. Nine more of it
+against nine with the path off, same session, same connection, is the A/B:
+
+```
+gpudb> .gpu off
+GPU path off — statements go straight to DuckDB.
+… 9 runs …
+DuckDB (off: the transparent path is off on this connection) · 25.9, 18.6, 16.2, 15.1, 15.0, 15.0, 15.0, 14.9, 15.1 ms
+gpudb> .gpu on
+GPU path on — residency: background.
+… 9 runs …
+GPU (topk: the resident GROUP BY) · 12.8, 34.0, 5.0, 5.0, 4.9, 4.8, 5.1, 4.7, 4.7 ms
+```
+
+**Median 15.1 ms on DuckDB against 5.0 ms on the GPU — 3.0×.** Both series are
+printed whole on purpose: DuckDB's first two runs are its own warm-up, the
+GPU's first is the pipeline's, and the 34.0 ms is a real outlier on a laptop
+that is doing other things. The 24.3 ms at the top of the section is the
+honest cost of asking before the column was there. Those numbers are one
+machine's; the point of the footer is that you can take the same five
+measurements on yours.
+
+If you would rather pay the upload now — a script that knows its workload, or
+a benchmark — start with `--residency eager` and the upload happens inside the
+statement that asked for it (which therefore takes as long as a scan of the
+column, 61 ms for this one at SF1). `--residency manual` never uploads by
+itself; only sets you uploaded by hand are used, and ["Uploading by
+hand"](#uploading-by-hand) is how.
 
 Statements the GPU does not take say so in the same place. Printing them is the
 point:
 
 ```
 gpudb> SELECT l_returnflag, median(l_quantity) FROM lineitem GROUP BY 1 ORDER BY 1;
-…
-DuckDB (shape: not a shape the rewrite expresses: select expression) · 56.4 ms
+┌──────────────┬────────────────────┐
+│ l_returnflag │ median(l_quantity) │
+│   varchar    │   decimal(15,2)    │
+├──────────────┼────────────────────┤
+│ A            │              26.00 │
+│ N            │              25.00 │
+│ R            │              26.00 │
+└──────────────┴────────────────────┘
+
+DuckDB (shape: not a shape the rewrite expresses: select expression) · 52.6 ms
 ```
 
 The reason codes you will actually meet:
@@ -163,7 +203,7 @@ The reason codes you will actually meet:
 | Reason | What it means |
 |---|---|
 | `not_resident` | the columns are not on the device yet — the background uploader is working on it |
-| `threshold` | a measured bound says DuckDB is faster for this shape and size (`6 groups < 1000`), **or** this machine measured it slower: `measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)` |
+| `threshold` | a measured bound says DuckDB is faster for this shape and size (`6001215 rows < 16000000 for an aggregate without GROUP BY`), **or** this machine measured it slower: `measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)` |
 | `shape` | not a shape the rewrite expresses: a window function, `median`, `ROLLUP`, a set operation, a subquery in the select list |
 | `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, by design (see the two rules) |
 | `backend` | this build has no GPU backend to rewrite for (a CPU-only binary), or the installed extension is older than the client |
@@ -173,9 +213,10 @@ The reason codes you will actually meet:
 | `error` | the rewritten statement raised and DuckDB answered the original — the text is in `.gpu` |
 | `off` / `manual` | the path is off (`.gpu off`, `--no-gpu`), or residency is `manual` |
 
-`shape` also covers the smaller refusals with their own codes — `nulls`,
-`overflow`, `decimal`, `collation`, `too_long`, `multi`, `view`, `temp`,
-`ambiguous`, `not_found` — each with its sentence in `detail`.
+Ten more codes name a smaller refusal precisely where `shape` would only say
+"no": `nulls`, `overflow`, `decimal`, `collation`, `too_long`, `multi`,
+`view`, `temp`, `ambiguous`, `not_found`. Each is a `reason` of its own, with
+its own sentence in `detail`.
 
 #### Look underneath
 
@@ -184,48 +225,98 @@ actually ran:
 
 ```
 gpudb> .gpu
-statement:    SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5;
+statement:    SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
 rewritten:    True
 form:         topk
-tag:          gpudb:v1:tpch:main:lineitem:20631:l_orderkey,l_quantity
-sql:          SELECT "key" AS l_orderkey, (CAST(sum AS DECIMAL(36,0)) * 0.01) AS qty FROM gpu_groupby_exact_resident_topk('gpudb:v1:tpch:main:lineitem:20631:l_orderkey,l_quantity', 'sum', 5, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:tpch:main:lineitem:20631:l_orderkey,l_quantity', count_star()) AS ok FROM tpch.main.lineitem) AS gd WHERE gd.ok ORDER BY qty DESC LIMIT 5
-round_trip_ms:4.444167003384791
+tag:          gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity
+sql:          SELECT "key" AS l_partkey, (CAST(sum AS DECIMAL(36,0)) * 0.01) AS qty FROM gpu_groupby_exact_resident_topk('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', 'sum', 5, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', count_star()) AS ok FROM tpch.main.lineitem) AS gd WHERE gd.ok ORDER BY qty DESC LIMIT 5
+round_trip_ms:0.06245900294743478
 engine:       scalar
 detail:       the resident GROUP BY
 ```
 
-`.gpu off` turns the path off live, which makes an honest A/B against DuckDB
-one keystroke away (`.gpu on` puts it back; `--no-gpu` starts that way).
-`.residents` shows what is on the device — the sets a statement waits on, then
-the columns behind them with the width each lane is stored at:
+- `form` is which device shape answered: `plain`, `having`, `topk`,
+  `projected`, or `nested` when the rewrite reached inside a bigger statement.
+- `tag` is the **identity tag** of the resident set it used —
+  `gpudb:v1:<catalog>:<schema>:<table>:<oid>:<columns>`. Two statements that
+  need the same columns of the same table name the same tag and share one copy.
+- `round_trip_ms` is the wrapper's own overhead: parse, decide, render. Not
+  the statement's time, which the footer prints.
+- `engine` says who produced the rewritten SQL — `scalar` for the extension's
+  pure `gpu_rewrite_ast`, `python` for the wrapper's reference renderer,
+  `nested` for the pass that rewrites a `SELECT` inside a larger statement.
+
+`.gpu off` turns the path off live, which is what the A/B above is made of
+(`.gpu on` puts it back; `--no-gpu` starts that way). `.residents` shows what
+is on the device — the sets a statement waits on, then the columns behind
+them. This is the same session, after those nineteen runs:
 
 ```
 gpudb> .residents
-table          columns                  state  bytes      estimated  worth
-main.lineitem  l_orderkey,l_quantity    ready  80.1 MiB   207.5 MiB  -
-main.lineitem  l_returnflag,l_quantity  ready  131.6 MiB  161.0 MiB  -
-2 sets · 211.8 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
+table          columns               state  bytes     estimated  worth
+main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  1.08
+1 set · 80.1 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
 
-table     column          dtype  rows       width  bytes      state
-lineitem  k#l_returnflag  STR    6,001,215  8 B    120.2 MiB  ready
-lineitem  l_orderkey      I64    6,001,215  4 B    68.7 MiB   ready
-lineitem  l_quantity      I64    6,001,215  2 B    11.4 MiB   preparing
-3 resident columns · width is the bytes a row of the lane is stored at · `-` where the backend does not say
+table     column      dtype  rows       width  bytes     state
+lineitem  l_partkey   I64    6,001,215  4 B    68.7 MiB  ready
+lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
+2 resident columns · width is the bytes a row of the lane is stored at · `-` where the backend does not say
 ```
+
+- The **set** line is what a statement waits on: `ready` means uploaded and
+  its sort cache built. `estimated` is the upper bound the budget reserved
+  against; `bytes` is what the extension actually holds, which is smaller
+  because each lane is stored at the narrowest signed width its values fit
+  (here `l_quantity` in 2 bytes, `l_partkey` in 4).
+- `worth` is the set's value: milliseconds of DuckDB time it saves per second
+  of wall time, per GiB it holds. It reads `-` until the set has been used
+  enough to have one, and it is what the budget compares when it has to
+  choose. Nineteen runs of one statement put this one at 1.08.
+- The **column** lines are the store underneath, and their `state` means
+  something narrower: whether *that lane* has a sort cache. Only a key lane
+  ever needs one, so a payload lane reads `preparing` and stays there. Read
+  the set's state, not the payload's.
 
 `.memory` is the budget side of the same picture:
 
 ```
 gpudb> .memory
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
-resident:     200.3 MiB in 2 sets
+resident:     80.1 MiB in 1 set
 budget:       16.0 GiB
-residency:    eager
+residency:    background
 ```
 
 Raise or lower it with `--memory-budget 16GB` (`unlimited` removes the cap).
 A set that does not fit is not uploaded, and its statements keep running on
-DuckDB.
+DuckDB. [When GPU memory is full](#when-gpu-memory-is-full) has the rest.
+
+#### Uploading by hand
+
+Under `--residency manual` nothing is uploaded for you, and a statement that
+would need a set it does not have declines with `manual`. Its `.gpu` record
+still names the `tag:` it wanted, and that is the whole recipe: upload a set
+under exactly that name and the statement is rewritten from then on.
+
+```
+gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+DuckDB (manual: residency is manual and this set was not uploaded by hand) · …
+gpudb> .gpu
+…
+tag:          gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity
+
+gpudb> SELECT gpu_upload_pair_exact('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity',
+                                    l_partkey, (l_quantity*100)::BIGINT) FROM lineitem;
+-- 6001215
+gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+GPU (topk: the resident GROUP BY) · …
+```
+
+The payload is scaled to an integer because a `DECIMAL(15,2)` lives on the
+device as a scaled integer — `l_quantity` has two decimal places, so `* 100`.
+An integer column needs no cast. This is an escape hatch for people who want
+to decide exactly what is resident; the default `background` residency does
+all of it for you.
 
 #### Scripts, options, keys
 
@@ -245,14 +336,16 @@ colour follows `NO_COLOR`.
 | Option | |
 |---|---|
 | `gpudb [DATABASE]` | open a database (no argument: in-memory) |
-| `-c SQL`, `-f FILE` | run a statement or a file, repeatable, in order |
-| `--readonly` | open read-only |
+| `-c SQL` | run a statement and exit, repeatable |
+| `-f FILE`, `--file FILE` | run a file and exit, repeatable; `-c` and `-f` run in the order given |
+| `--readonly`, `--read-only` | open read-only |
 | `--no-gpu` | every statement on DuckDB — the control for a comparison |
 | `--residency background\|eager\|manual` | when tables become resident (default `background`) |
 | `--memory-budget SIZE` | e.g. `16GB`, or `unlimited` |
 | `--timer` / `--no-timer` | force the footer line on or off |
 | `--debug` | show tracebacks instead of one-line errors |
-| `--version` | the gpudb version |
+| `--version` | the gpudb and duckdb versions |
+| `-h`, `--help` | the same list, from the program |
 
 Dot-commands, kept small on purpose — this is the terminal client for the
 transparent path, not an emulation of the DuckDB CLI (no `.mode`, `.output`,
@@ -274,11 +367,10 @@ transparent path, not an emulation of the DuckDB CLI (no `.mode`, `.output`,
 Statements may span lines and end at `;`. **Ctrl-C** stops the running
 statement, or clears what you were typing; **Ctrl-D** at a waiting prompt
 leaves. History lives in `~/.gpudb_history` when the Python build has
-`readline`. One platform quirk, measured and written down rather than papered
-over: on Linux a Ctrl-D typed *while a statement is running* is swallowed by
-the terminal's line discipline and the shell stays at the next prompt — stock
-Python's `input()` does the same thing, and
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md) has the mechanism.
+`readline`. One platform quirk, measured and written down: on Linux a Ctrl-D
+typed *while a statement is running* is swallowed by the terminal's line
+discipline and the shell stays at the next prompt — stock Python's `input()`
+does the same thing, and [KNOWN_ISSUES.md](KNOWN_ISSUES.md) has the mechanism.
 
 ### The Python way
 
@@ -321,7 +413,8 @@ the first statements answer from DuckDB and the uploads fill in behind them.
 
 `con.last_rewrite()` returns the record for the last statement. Its keys are
 `rewritten`, `reason`, `detail`, `form`, `tag`, `sql`, `statement`, `engine`,
-`round_trip_ms`, `fallback` and `error`.
+`round_trip_ms`, `fallback` and `error` — the same fields the shell's `.gpu`
+prints, described [above](#look-underneath).
 
 `con.memory()` returns `budget`, `evictions`, `evictions_wasted` (evictions
 made for a candidate that was then declined — it is counted rather than
@@ -329,6 +422,65 @@ assumed, and measures 0) and `sets`, each with its state, the size the wrapper
 expected, the size the extension reports, and what the set is worth.
 `con.extension_note` is empty while the loaded extension can serve the client,
 and one sentence saying why not otherwise.
+
+#### The rest of the object
+
+`gpudb.connect()` returns a wrapper, not a subclass, so everything below is
+the whole of what it adds. Everything else is DuckDB's.
+
+| | |
+|---|---|
+| `con.residents()` | `{identity tag: state}` for every set the wrapper is managing. State is `missing`, `pending`, `uploading`, `ready`, `stale` or `failed`. |
+| `con.store_columns()` | one dict per resident column — `table`, `column`, `dtype`, `rows`, `width` (bytes a row of the lane is stored at), `bytes`, `prepared`. This is what the shell's `.residents` prints underneath. Returns `[]` when no usable extension is loaded. |
+| `con.transparent` | readable and settable. `con.transparent = False` leaves every statement on DuckDB from then on (`reason == "off"`); `True` puts it back. Nothing is dropped either way — resident sets and decisions survive the round trip, which is what makes it usable as an A/B switch. |
+| `con.residency` | read-only: `"background"`, `"eager"` or `"manual"`, as passed to `connect()`. To change it, open another connection. |
+| `con.interrupt()` | DuckDB's own interrupt, on this connection's handle. It stops the statement running on **this** connection; a `cursor()` has its own handle and is not affected. |
+| `con.duplicate()` | exactly `con.cursor()`, under DuckDB's name for it. |
+| `con.cursor()` | another connection over the same database, sharing the resident sets and the memory budget, with its own `last_rewrite()` and its own decision cache. |
+| `con.close()` | closes the connection; on the original (not a cursor) it also stops the background uploader. |
+
+#### Threads and several connections
+
+What the code guarantees, and no more:
+
+- **One `Connection` per thread.** `last_rewrite()` is a single record per
+  connection object, so two threads sharing one connection overwrite each
+  other's. Give each thread its own `con.cursor()`: it shares the resident
+  sets, and the shared residency state is the part that is lock-protected.
+  That is the shape the suite tests — two threads, twenty statements each on
+  one cached template, forty identical answers.
+- **Prepared plans are not shared across threads by name.** A plan name is
+  never reused for a different statement, and a thread that reaches a name
+  just after it was deallocated gets an error, which the wrapper answers by
+  running your original statement on DuckDB, like any other error.
+- **`interrupt()` is per handle**, as above. It does not stop a background
+  upload — the uploader yields to your statements by itself.
+- **Writes from another connection** are noticed on a file-backed database
+  (the file and its write-ahead log are stat'ed before every rewritten
+  statement). On an **in-memory** database there is no file to watch, so a
+  write through a raw `duckdb` cursor is invisible to the guard; use the
+  wrapper's own cursors there, or a file-backed database.
+
+#### When GPU memory is full
+
+The budget is a hard admission bound, not a target. A set whose estimated size
+would put the total over it is refused **before** the upload, its statements
+keep running on DuckDB, and `last_rewrite()["reason"]` is `memory` with the
+arithmetic in `["error"]` — *"900 MiB resident + about 300 MiB needed > 1024
+MiB, and this set is worth 0.012 ms/s (12.9 per GiB) against 0.030 ms/s for
+&lt;the set that would have to go&gt;"*.
+
+What is kept under pressure is decided by measured value per byte, not by
+recency. A set's value is the DuckDB time it has saved, decayed over about
+five minutes; divided by its bytes that is the density admission compares.
+Eviction only runs when the candidate is worth at least 25% more than what it
+would displace, a set younger than 60 seconds that has not earned anything yet
+is protected unless the candidate is twice the median density, and a set in
+use by a running operator, a set another resident set was derived from, and
+anything you uploaded by hand are never evicted at all. A refused set is
+retried after 30 seconds — and because statements that ran on DuckDB still
+feed the value model, a set that was refused once can be admitted later on its
+own merit.
 
 #### A run, end to end
 
@@ -339,10 +491,10 @@ con = gpudb.connect("data/tpch_sf1/tpch.duckdb", read_only=True, residency="eage
 print("extension_note:", repr(con.extension_note))
 
 QUERIES = {
-    "top 5 orders by quantity":
-        "SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem "
-        "GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5",
-    "pricing summary (few groups)":
+    "top 5 parts by quantity shipped":
+        "SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem "
+        "GROUP BY l_partkey ORDER BY qty DESC LIMIT 5",
+    "pricing summary (a handful of groups)":
         "SELECT l_returnflag, l_linestatus, sum(l_quantity) AS qty, count(*) AS n "
         "FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY 1, 2 ORDER BY 1, 2",
     "median (no kernel)":
@@ -353,31 +505,37 @@ for title, q in QUERIES.items():
     rows = con.execute(q).fetchall()
     r = con.last_rewrite()
     print(f"\n--- {title}")
-    for row in rows[:3]:
+    for row in rows:
         print("   ", row)
     print("    rewritten:", r["rewritten"], "| reason:", r["reason"], "| form:", repr(r["form"]))
     print("    detail:", r["detail"])
 
-print("\nmemory:", con.memory())
+print("\nresidents:", con.residents())
+print("memory:", con.memory())
 con.close()
 ```
 
-Its output on an M4 Max, TPC-H SF1, DuckDB 1.5.5 <!-- RE-RUN -->:
+Run as written on an M4 Max, TPC-H SF1, DuckDB 1.5.5 (the three `[gpudb]
+registered …` lines the extension writes to stderr on load come first, as in
+the shell):
 
 ```
 extension_note: ''
 
---- top 5 orders by quantity
-    (4806726, Decimal('328.00'))
-    (2199712, Decimal('327.00'))
-    (4722021, Decimal('323.00'))
+--- top 5 parts by quantity shipped
+    (125009, Decimal('1642.00'))
+    (140633, Decimal('1562.00'))
+    (49981, Decimal('1553.00'))
+    (149443, Decimal('1537.00'))
+    (10426, Decimal('1513.00'))
     rewritten: True | reason:  | form: 'topk'
     detail: the resident GROUP BY
 
---- pricing summary (few groups)
+--- pricing summary (a handful of groups)
     ('A', 'F', Decimal('37734107.00'), 1478493)
     ('N', 'F', Decimal('991417.00'), 38854)
     ('N', 'O', Decimal('74476040.00'), 2920374)
+    ('R', 'F', Decimal('37719753.00'), 1478870)
     rewritten: False | reason: threshold | form: ''
     detail: 6 groups < 1000
 
@@ -388,11 +546,16 @@ extension_note: ''
     rewritten: False | reason: shape | form: ''
     detail: not a shape the rewrite expresses: select expression
 
-memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_orderkey,l_quantity': {'state': 'ready', 'est_bytes': 217609579, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}}
+residents: {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': 'ready'}
+memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': {'state': 'ready', 'est_bytes': 217609579, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}}
 ```
 
-Three statements, three different honest outcomes — a win, a size threshold,
-and a shape with no kernel behind it.
+Three statements, three different outcomes — a win, a size threshold, and a
+shape with no kernel behind it. `6 groups` in the second is the wrapper's
+*estimate* of the key's distinct count (three return flags × two line
+statuses); the statement actually returns four rows, and a statement is
+decided before it runs, on the estimate. Why that estimate declines here while
+TPC-H Q1 over the very same two keys runs on the GPU is the next section.
 
 #### Writes, transactions, parameters
 
@@ -604,12 +767,25 @@ Every trade-off above, with its reason, is in
   parser (`json_serialize_sql`) and a pure function in the extension
   (`gpu_rewrite_ast`) — no plan surgery, no C++ API.
 - Size bounds come from a measured sweep (`python/gpudb/_thresholds.py`, from
-  `scripts/transparent_gate.py`): tables under `floor_rows` (default 1,000,000)
-  are never parsed; keys with fewer than 1,000 distinct values never rewrite;
-  the plain form returns at most 300K groups (50K under a `WHERE`); an
-  aggregate without `GROUP BY` over a single table needs 16M rows. The shapes
-  outside those bounds measured 0.23–0.99× against native, and those rows stay
-  in the gate output.
+  `scripts/transparent_gate.py`): tables under `floor_rows` (default
+  1,000,000) are never parsed; the plain form returns at most 300K groups (50K
+  under a `WHERE`); top-k needs at least 100K distinct keys; an aggregate
+  without `GROUP BY` over a single table needs 16M rows, and 60M rows ×
+  predicate terms. The shapes outside those bounds measured 0.23–0.99× against
+  native, and those rows stay in the gate output.
+- **The group floor is a floor with one exemption, and it is worth knowing.**
+  A key estimated at fewer than 1,000 distinct values does not rewrite —
+  native aggregates a tiny integer domain through a perfect hash in 1.5–5 ms
+  per 6M rows and the device cannot beat that. The exemption is a `VARCHAR`
+  key, which native has to hash on every row: those rewrite below the floor
+  with no `WHERE` at all, and under a `WHERE` when at least two of the
+  payloads are computed expressions and at least half the rows survive —
+  because from two expressions on, native pays per expression per row and a
+  resident lane does not. That is why TPC-H Q1 (two `VARCHAR` keys, eight
+  aggregates over expressions, 98% of rows kept) is on the GPU at 3.8× while
+  the four-aggregate `sum` and `count(*)` over the *same* two keys in the
+  example above is declined: plain column payloads, no expressions, no
+  exemption.
 - Then the run-time measurement above overrides the bounds in either direction.
   `last_rewrite()["detail"]` names the rule that decided, in both directions.
 - Any error on the rewritten path re-runs the user's original statement on
