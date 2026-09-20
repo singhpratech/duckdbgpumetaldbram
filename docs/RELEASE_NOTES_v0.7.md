@@ -13,8 +13,9 @@ touches DuckDB through the stable C API only (the C_STRUCT ABI): it links no
 libduckdb, includes no DuckDB C++ headers and does no plan surgery.
 
 **Measured** on an Apple M4 Max (Metal), TPC-H, warm, with every table the
-query reads already resident, minimum of 5 runs, every row compared with
-native (conditions and the per-query tables: `BENCHMARK.md`):
+query reads already resident, at the default memory budget, minimum of 5 runs,
+every row compared with native (conditions and the per-query tables:
+`BENCHMARK.md`):
 
 | | Queries on the GPU | Rows differing | Speed-up on those queries |
 |---|---|---|---|
