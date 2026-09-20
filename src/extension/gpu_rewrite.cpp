@@ -594,6 +594,60 @@ json j_cast(json child, json type, const std::string& alias = "") {
                 {"cast_type", std::move(type)}, {"try_cast", false}};
 }
 
+// <fn>() OVER (ORDER BY <expr> <dir> <null_order>) — one window specification,
+// shared by the two functions the tie guard below compares.
+json j_window(const char* wtype, const char* fname, const json& order_expr,
+              const std::string& dir, const std::string& null_order) {
+    return json{{"class", "WINDOW"}, {"type", wtype}, {"alias", ""},
+                {"query_location", kNoLocation}, {"function_name", fname},
+                {"schema", ""}, {"catalog", ""}, {"children", json::array()},
+                {"partitions", json::array()},
+                {"orders", json::array({json{{"type", dir}, {"null_order", null_order},
+                                             {"expression", order_expr}}})},
+                {"start", "UNBOUNDED_PRECEDING"}, {"end", "CURRENT_ROW_RANGE"},
+                {"start_expr", nullptr}, {"end_expr", nullptr}, {"offset_expr", nullptr},
+                {"default_expr", nullptr}, {"ignore_nulls", false}, {"filter_expr", nullptr},
+                {"exclude_clause", "NO_OTHER"}, {"distinct", false}, {"arg_orders", json::array()}};
+}
+
+// The tie guard of a PUSHED top-k, as a QUALIFY expression (§4.24; the
+// reference renderer's _rewrite.ties_qualify() builds the same clause as text).
+//
+// A device top-k picks k rows out of the groups by its own rule when their
+// ordering values are equal, and that rule is not DuckDB's. DuckDB's is not
+// anything either: plain DuckDB returns a different set of tied rows from one
+// run to the next at any `threads` above 1 (docs/RESEARCH_NOTES.md,
+// 2026-09-20). So a tie has no answer to reproduce — it is DuckDB's to choose,
+// and the statement is handed back to it.
+//
+// The device is asked for k + 1 rows, so the k-th / (k + 1)-th boundary is
+// visible here; this raises GPUDB_TIES when any two of the first k rows share
+// an ordering value, at the boundary or inside the top k (where the SET is
+// right but the ORDER is not). rank() and row_number() differ exactly on the
+// second and later member of a group of equal values, and `rank() > k` excludes
+// the ones past the k-th row, which no LIMIT k returns.
+json j_ties_qualify(const json& order_expr, const std::string& dir, const std::string& null_order,
+                    std::int64_t k, const std::string& col) {
+    json eq = json{{"class", "COMPARISON"}, {"type", "COMPARE_EQUAL"}, {"alias", ""},
+                   {"query_location", kNoLocation},
+                   {"left", j_window("WINDOW_RANK", "rank", order_expr, dir, null_order)},
+                   {"right", j_window("WINDOW_ROW_NUMBER", "row_number", order_expr, dir, null_order)}};
+    json past = json{{"class", "COMPARISON"}, {"type", "COMPARE_GREATERTHAN"}, {"alias", ""},
+                     {"query_location", kNoLocation},
+                     {"left", j_window("WINDOW_RANK", "rank", order_expr, dir, null_order)},
+                     {"right", j_const_bigint(k)}};
+    json when = json{{"class", "CONJUNCTION"}, {"type", "CONJUNCTION_OR"}, {"alias", ""},
+                     {"query_location", kNoLocation}, {"children", json::array({eq, past})}};
+    const std::string msg = "GPUDB_TIES: the first " + std::to_string(k) +
+                            " rows are not ordered uniquely by " + col;
+    return json{{"class", "CASE"}, {"type", "CASE_EXPR"}, {"alias", ""},
+                {"query_location", kNoLocation},
+                {"case_checks", json::array({json{
+                    {"when_expr", when},
+                    {"then_expr", j_cast(j_const_varchar("t"), j_type("BOOLEAN"))}}})},
+                {"else_expr", j_function("error", json::array({j_const_varchar(msg)}))}};
+}
+
 // CAST(<col> AS <type string from DESCRIBE>) AS <name>. HUGEINT / integer
 // types are a plain cast; DECIMAL(p, s) becomes CAST(col AS DECIMAL(38-s,0)) * 10^-s.
 json j_output(const std::string& col, const std::string& type, const std::string& name) {
@@ -1239,6 +1293,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
 
     std::int64_t topk = 0;
     bool topk_desc = false;
+    json ties_qualify = nullptr;       // the pushed top-k's tie guard (§4.24)
     json new_mods = json::array();
     if (order_mod) {
         json om = *order_mod;
@@ -1259,7 +1314,17 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
                 const json& lv = field(lim, "value");
                 if (!field(lv, "is_null").get<bool>() && lv["value"].is_number_integer()) {
                     const std::int64_t k = lv["value"].get<std::int64_t>();
-                    if (k > 0) { topk = k; topk_desc = dir == "DESCENDING"; }
+                    // k + 1 has to stay a BIGINT the device function can take
+                    if (k > 0 && k < std::numeric_limits<std::int64_t>::max()) {
+                        topk = k;
+                        topk_desc = dir == "DESCENDING";
+                        // the window says what the ORDER BY beside it says, word
+                        // for word, so `default_order` / `default_null_order`
+                        // resolve the two the same way
+                        ties_qualify = j_ties_qualify(o["expression"], sfield(o, "type"),
+                                                      sfield(o, "null_order"), k,
+                                                      o["expression"]["column_names"][0].get<std::string>());
+                    }
                 }
             }
         }
@@ -1287,7 +1352,8 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
         } else if (having_agg != XAgg::None) {
             r.form = "having";
         } else if (topk > 0) {
-            filter = "topk " + p_of(order_pay) + " " + xagg_col(order_agg) + " " + std::to_string(topk) +
+            // k + 1: the tie guard needs the k-th / (k + 1)-th boundary row
+            filter = "topk " + p_of(order_pay) + " " + xagg_col(order_agg) + " " + std::to_string(topk + 1) +
                      (topk_desc ? " desc" : " asc");
             r.form = "topk";
         } else {
@@ -1311,7 +1377,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     } else if (topk > 0) {
         fn += "_topk";
         args.push_back(j_const_varchar(xagg_col(order_agg)));
-        args.push_back(j_const_bigint(topk));
+        args.push_back(j_const_bigint(topk + 1));   // k + 1: the tie guard's boundary row
         args.push_back(j_const_varchar(topk_desc ? "desc" : "asc"));
         r.form = "topk";
     } else {
@@ -1378,6 +1444,7 @@ Result do_rewrite_exact(json tree, json node, const Context& cx,
     node["group_expressions"] = json::array();
     node["group_sets"] = json::array();
     node["having"] = nullptr;
+    node["qualify"] = ties_qualify;
     node["modifiers"] = new_mods;
     tree["statements"][0]["node"] = node;
     r.tree = std::move(tree);
@@ -1565,6 +1632,7 @@ Result do_rewrite(json tree, const json& ctxj) {
     // Top-k push: ORDER BY <the aggregate> [dir] LIMIT k, no HAVING.
     std::int64_t topk = 0;
     bool topk_desc = false;
+    json ties_qualify = nullptr;       // the pushed top-k's tie guard (§4.24)
     json new_mods = json::array();
     if (order_mod) {
         json om = *order_mod;
@@ -1585,7 +1653,12 @@ Result do_rewrite(json tree, const json& ctxj) {
                 const json& lv = field(lim, "value");
                 if (!field(lv, "is_null").get<bool>() && lv["value"].is_number_integer()) {
                     const std::int64_t k = lv["value"].get<std::int64_t>();
-                    if (k > 0) { topk = k; topk_desc = dir == "DESCENDING"; }
+                    if (k > 0 && k < std::numeric_limits<std::int64_t>::max()) {
+                        topk = k;
+                        topk_desc = dir == "DESCENDING";
+                        ties_qualify = j_ties_qualify(o["expression"], sfield(o, "type"),
+                                                      sfield(o, "null_order"), k, ordered);
+                    }
                 }
             }
         }
@@ -1619,7 +1692,7 @@ Result do_rewrite(json tree, const json& ctxj) {
         r.form = "having";
     } else if (topk > 0) {
         fn += "_topk";
-        args.push_back(j_const_bigint(topk));
+        args.push_back(j_const_bigint(topk + 1));   // k + 1: the tie guard's boundary row
         args.push_back(j_const_varchar(topk_desc ? "desc" : "asc"));
         r.form = "topk";
     } else {
@@ -1678,6 +1751,7 @@ Result do_rewrite(json tree, const json& ctxj) {
     node["group_expressions"] = json::array();
     node["group_sets"] = json::array();
     node["having"] = nullptr;
+    node["qualify"] = ties_qualify;
     node["modifiers"] = new_mods;
     tree["statements"][0]["node"] = node;
     r.tree = std::move(tree);

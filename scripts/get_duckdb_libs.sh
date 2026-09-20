@@ -72,7 +72,11 @@ else
 fi
 
 echo "==> fetching $asset ($DUCKDB_VERSION)"
-curl -fsSL -o "$DEST/$asset" "$url"
+# GitHub's release CDN resets a connection now and then, and CI has failed on
+# `curl: (35) Recv failure: Connection reset by peer`. --retry alone only retries
+# transient HTTP codes and timeouts, so --retry-all-errors is what covers a reset
+# mid-transfer (curl >= 7.71; ubuntu-24.04 ships 8.5, macOS 15 ships 8.7).
+curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$DEST/$asset" "$url"
 
 echo "==> extracting"
 (cd "$DEST" && unzip -o "$asset" && rm "$asset")
