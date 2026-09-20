@@ -1,8 +1,46 @@
 cmake_minimum_required(VERSION 3.20)
 
+# -------------------------------------------------------------------
+# macOS deployment target — the minimum macOS the produced binaries
+# declare (Mach-O LC_BUILD_VERSION minos). It must be set BEFORE
+# project(), because that is when the compiler is probed and the value
+# baked into the toolchain.
+#
+# Left unset, a binary inherits the floor of whatever SDK built it, and
+# claims to need the macOS it was compiled on. That is how the
+# extension the community registry serves ended up at minos 15.0 while
+# DuckDB's own core extensions ship at 11.0 — extension-ci-tools sets no
+# deployment target of its own, so the value is whatever the CI runner
+# happened to have. For a pip wheel that floor is not a detail: the
+# platform tag is read from the binary, and it decides where the wheel
+# can be installed at all.
+#
+# 15.0 is the floor of the binary the registry has been serving, so it
+# is the one floor this project has evidence for.
+#
+# It is not the lowest that COMPILES: 14.0 also builds with no
+# unguarded-availability warnings. But the shader-compile paths choose
+# their Metal language version at run time — 3.2 on macOS 15 or newer,
+# 3.1 below — and that 3.1 branch has never executed anywhere, because
+# every machine this has run on is 15 or newer. A target of 14.0 would
+# ship that branch on the compiler's word alone. Lower still (11.0) does
+# not even compile cleanly: MTLLanguageVersion3_1 (macOS 14.0) in the
+# shader-compile paths and MTLGPUFamilyMetal3 (macOS 13.0) in the
+# aggregator are then reached unguarded, and guarding them would need a
+# fallback language version this code does not have.
+#
+# So: 15.0 is claimed because a 15.0 binary has shipped and run. 14.0 is
+# not claimed, and nothing here was tested on a macOS older than the one
+# it was built on — no such machine is available.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET
+         AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING
+        "Minimum macOS version the produced binaries declare")
+endif()
+
 project(gpudb
-    VERSION 0.6.0
-    DESCRIPTION "GPU-accelerated operators for DuckDB (CUDA + Metal)"
+    VERSION 0.7.0
+    DESCRIPTION "GPU-accelerated operators for DuckDB (Metal + CUDA)"
     LANGUAGES CXX
 )
 

@@ -307,7 +307,38 @@ def _num(x: Optional[str]):
             return None
 
 
+def _first_extension_in(d: str) -> Optional[str]:
+    """The one `.duckdb_extension` file in `d`, or None. Sorted, so a
+    directory that somehow holds two is resolved the same way every time."""
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return None
+    for f in names:
+        if f.endswith(".duckdb_extension"):
+            return os.path.join(d, f)
+    return None
+
+
 def _find_extension(explicit: Optional[str]) -> Optional[str]:
+    """Where the extension binary comes from, in order:
+
+    1. the `extension=` argument,
+    2. GPUDB_EXTENSION_PATH,
+    3. a source checkout's own fresh build (`build-macos` / `build-linux`),
+    4. the copy bundled in this package (`gpudb/_ext/`), present only in a
+       platform wheel,
+    5. nothing — and `connect()` then falls back to `LOAD gpudb`, the copy
+       DuckDB itself has installed from the community registry.
+
+    A checkout's build comes before the bundled copy on purpose: someone who
+    has just built the extension is testing THAT binary, and an installed
+    wheel's `_ext/` would otherwise shadow it silently. The bundled copy comes
+    before `LOAD gpudb` because the two are released on different clocks — the
+    package is published before the registry serves the matching extension, and
+    an older registry build is declined by the catalogue check in
+    `_probe_extension` anyway, which would leave a pip-only install with no GPU
+    at all."""
     if explicit:
         return explicit
     env = os.environ.get(GPUDB_EXTENSION_ENV)
@@ -316,12 +347,10 @@ def _find_extension(explicit: Optional[str]) -> Optional[str]:
     here = os.path.dirname(os.path.abspath(__file__))
     root = os.path.abspath(os.path.join(here, "..", ".."))
     for build in ("build-macos", "build-linux"):
-        d = os.path.join(root, build, "src", "extension")
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.endswith(".duckdb_extension"):
-                    return os.path.join(d, f)
-    return None
+        found = _first_extension_in(os.path.join(root, build, "src", "extension"))
+        if found:
+            return found
+    return _first_extension_in(os.path.join(here, "_ext"))
 
 
 class Connection:

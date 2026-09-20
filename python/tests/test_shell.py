@@ -23,6 +23,11 @@ ENV = dict(os.environ, PYTHONPATH=os.pathsep.join([PKG] + ([_PP] if _PP else [])
 # a big enough table for the wrapper to look at a statement at all (floor_rows)
 BIG = "CREATE TABLE t AS SELECT (i%20000)::BIGINT k, i::BIGINT v FROM range(2000000) r(i)"
 FEW = "CREATE TABLE f AS SELECT (i%7)::BIGINT k, i::BIGINT v FROM range(2000000) r(i)"
+# two grouping keys over one payload: grouping by each in turn makes two
+# resident sets that SHARE the payload column, so the sum of their per-set
+# bytes is more than the device holds
+SHARED = ("CREATE TABLE s AS SELECT (i%20000)::BIGINT k, (i%977)::BIGINT j, "
+          "i::BIGINT v FROM range(2000000) r(i)")
 
 
 def check(cond, msg):
@@ -56,6 +61,48 @@ def field(out, key):
 
 def footers(out):
     return " / ".join(l for l in out.splitlines() if l.endswith(" ms"))
+
+
+_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4}
+
+
+def size(text):
+    """The leading `12.3 MiB` of a shell line, in bytes. None if there is none."""
+    m = re.match(r"\s*([\d.]+) (B|KiB|MiB|GiB|TiB)\b", text or "")
+    return float(m.group(1)) * _UNITS[m.group(2)] if m else None
+
+
+def memory_is_physical(gpu):
+    """`.memory`'s `resident:` is what the device PHYSICALLY holds, not the sum
+    of the per-set `bytes` that `.residents` prints. Two resident sets over one
+    table are views over the same store columns, so that sum counts the shared
+    ones twice and the two numbers have to differ. `allocated:` is the driver's
+    own total, which resident cannot exceed."""
+    if not gpu:
+        skip("no exact GPU path on this build: .memory's physical total")
+        return
+    rc, out, _ = shell("--residency", "eager", "-c", SHARED,
+                       "-c", "SELECT k, sum(v) FROM s GROUP BY k ORDER BY k LIMIT 1",
+                       "-c", "SELECT j, sum(v) FROM s GROUP BY j ORDER BY j LIMIT 1",
+                       "-c", ".residents", "-c", ".memory")
+    resident = size(field(out, "resident"))
+    check(rc == 0 and resident is not None,
+          f".memory prints a resident total (rc={rc})")
+    m = re.search(r"(\d+) sets? .*?([\d.]+ (?:B|KiB|MiB|GiB|TiB)) held", out)
+    if m and int(m.group(1)) >= 2 and resident is not None:
+        per_set = size(m.group(2))
+        check(per_set is not None and resident < per_set,
+              f".memory reports the physical total, not the per-set sum "
+              f"({field(out, 'resident')} against {m.group(2)} summed over {m.group(1)} sets)")
+    else:
+        skip(".memory against the per-set sum: fewer than two sets became resident")
+    allocated = size(field(out, "allocated"))
+    if allocated is None:
+        skip(".memory's allocated line: this backend reports no driver total")
+    else:
+        check(resident is not None and resident <= allocated,
+              f".memory: resident ({field(out, 'resident')}) is within "
+              f"allocated ({field(out, 'allocated')})")
 
 
 def backend():
@@ -150,7 +197,9 @@ def run():
     check(rc == 0 and "CREATE TABLE u" in out, ".schema with no argument shows the DDL")
     rc, out, _ = shell(stdin=".residents\n.memory\n")
     check(rc == 0 and "Nothing is resident yet." in out and "budget:" in out
-          and "residency:" in out, ".residents and .memory print the wrapper's own tables")
+          and "residency:" in out and field(out, "resident") is not None,
+          ".residents and .memory print the wrapper's own tables")
+    memory_is_physical(gpu)
     rc, out, _ = shell("--residency", "eager", "-c", BIG,
                        "-c", "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k LIMIT 1",
                        "-c", ".residents")

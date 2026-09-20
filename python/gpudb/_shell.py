@@ -559,12 +559,32 @@ class Shell:
             self.say(line)
 
     def memory(self) -> None:
+        """What the device holds and what it is allowed to hold.
+
+        `resident` is the PHYSICAL total — every store column counted once plus
+        every set that holds columns of its own — and it is the number the
+        budget is compared with. It is deliberately not the sum of the per-set
+        `bytes` that `.residents` prints: a store-backed set is a view over
+        shared columns and reports what its own lanes cost, so summing those
+        counts a shared column once per set that reads it (measured: 4.5x).
+
+        `allocated` is what the DRIVER says this process holds, when a backend
+        can say. It is larger than `resident` by the backend's own machinery
+        and any in-progress operator's working memory, and that difference is
+        exactly what the budget does not account for. The line is absent where
+        no backend could answer: that is not the same fact as zero."""
         mem = self.con.memory()
         sets = mem.get("sets") or {}
         budget = mem.get("budget") or 0
-        held = sum((s.get("bytes") or 0) for s in sets.values())
+        held = mem.get("bytes")
+        n = len(sets)
+        in_sets = f" in {n} set{'' if n == 1 else 's'}"
         self.field("backend", self._backend())
-        self.field("resident", f"{self._bytes(held)} in {len(sets)} set{'' if len(sets) == 1 else 's'}")
+        self.field("resident",
+                   (self._bytes(held) if held is not None else "unknown") + in_sets)
+        allocated = mem.get("device_allocated")
+        if allocated is not None:
+            self.field("allocated", f"{self._bytes(allocated)} on the device, everything included")
         self.field("budget", "unlimited" if not budget else self._bytes(budget))
         self.field("residency", self.con.residency)
         if mem.get("evictions"):
