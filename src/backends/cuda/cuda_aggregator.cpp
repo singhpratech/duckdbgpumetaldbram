@@ -6,6 +6,10 @@
 
 #include "gpu_backend.hpp"
 
+#include "backend_notes.hpp"
+#include "../groupby_filter.hpp"
+#include "kernels/exact_api.h"
+
 #include <cuda_runtime.h>
 
 #if defined(__linux__)
@@ -19,6 +23,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -133,9 +138,12 @@ public:
         if (bytes_ > 0) GPUDB_CUDA_CHECK(cudaMalloc(&dptr_, bytes_), "cudaMalloc resident");
     }
     ~CudaResidentColumn() override {
-        if (d_sorted_) cudaFree(d_sorted_);
-        if (d_perm_)   cudaFree(d_perm_);
-        if (dptr_)     cudaFree(dptr_);
+        if (d_sorted_)    cudaFree(d_sorted_);
+        if (d_perm_)      cudaFree(d_perm_);
+        if (d_ex_sorted_) cudaFree(d_ex_sorted_);
+        if (d_ex_perm_)   cudaFree(d_ex_perm_);
+        if (d_valid_)     cudaFree(d_valid_);
+        if (dptr_)        cudaFree(dptr_);
         if (own_stream_) cudaStreamDestroy(own_stream_);
     }
 
@@ -157,13 +165,102 @@ public:
     }
 
     // ResidentColumn::prepare — build the sort cache now, on our own stream.
-    void prepare() override { ensure_sort_cache(own_stream()); }
+    // A column carrying NULLs needs the EXACT cache (the valid rows only);
+    // building the legacy one for it would sort the NULL rows' zeroed cells in
+    // as if they were data, which no operator wants.
+    void prepare() override {
+        cudaStream_t s = own_stream();
+        if (null_count_ > 0 && dtype_ == Dtype::I64) ensure_exact_cache(s);
+        else                                          ensure_sort_cache(s);
+    }
     bool prepared() const noexcept override {
-        return rows_ == 0 || d_sorted_.load(std::memory_order_acquire) != nullptr;
+        if (rows_ == 0) return true;
+        if (null_count_ > 0 && dtype_ == Dtype::I64)
+            return d_ex_sorted_.load(std::memory_order_acquire) != nullptr;
+        return d_sorted_.load(std::memory_order_acquire) != nullptr;
     }
     std::size_t resident_bytes() const noexcept override {
-        return bytes_ + (d_sorted_.load(std::memory_order_acquire)
-                             ? bytes_ + rows_ * sizeof(std::int64_t) : 0);
+        std::size_t b = bytes_;
+        if (d_sorted_.load(std::memory_order_acquire))    b += bytes_ + rows_ * sizeof(std::int64_t);
+        if (d_ex_sorted_.load(std::memory_order_acquire)) b += 2 * rows_ * sizeof(std::int64_t);
+        if (d_valid_) b += ((rows_ + 63) / 64) * sizeof(unsigned long long);
+        return b;
+    }
+
+    // ---- v0.7 §4.1: the validity bitmap and the exact sort cache ----
+    // The bitmap is allocated all-ones and the upload kernels clear one bit per
+    // NULL; finish_exact_upload() then counts the NULLs once and DROPS the
+    // bitmap when there turn out to be none. That drop is what puts a NULL-free
+    // exact column back on the fast path: valid_bits() returns nullptr, which
+    // every kernel reads as "every row is valid" and skips the load entirely.
+    std::size_t null_count() const noexcept override { return null_count_; }
+    const unsigned long long* valid_bits() const noexcept { return d_valid_; }
+    unsigned long long*       valid_bits_mutable() noexcept { return d_valid_; }
+
+    void ensure_valid_bitmap() {
+        if (d_valid_ || rows_ == 0) return;
+        const std::size_t words = (rows_ + 63) / 64;
+        GPUDB_CUDA_CHECK(cudaMalloc(&d_valid_, words * sizeof(unsigned long long)),
+                         "cudaMalloc validity bitmap");
+        cudaStream_t s = own_stream();
+        cudaError_t e = gpudb_cuda_exact_fill_valid(d_valid_, rows_, s);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e != cudaSuccess) cuda_throw(e, "validity bitmap fill");
+        null_count_ = 0;
+    }
+
+    void finish_exact_upload() {
+        if (!d_valid_) { null_count_ = 0; return; }
+        cudaStream_t s = own_stream();
+        std::size_t nulls = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_count(d_valid_, rows_, &nulls, s),
+                         "exact upload null count");
+        null_count_ = nulls;
+        if (nulls == 0) { cudaFree(d_valid_); d_valid_ = nullptr; }
+    }
+
+    // The sort cache over the VALID keys: sorted keys and the row each came
+    // from. With no NULLs this IS the v0.5 join cache (every row is valid and
+    // the permutation is over all rows), so the two never coexist and a column
+    // pays for one sort, not two.
+    void ensure_exact_cache(cudaStream_t s) const {
+        if (dtype_ != Dtype::I64)
+            throw std::runtime_error("CUDA exact GROUP BY: keys must be an i64 column");
+        if (null_count_ == 0) { ensure_sort_cache(s); return; }
+        if (rows_ == 0 || d_ex_sorted_.load(std::memory_order_acquire)) return;
+        std::lock_guard<std::mutex> lock(cache_mu_);
+        if (d_ex_sorted_.load(std::memory_order_relaxed)) return;   // lost the race: built
+        void* sorted = nullptr;
+        void* perm   = nullptr;
+        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, rows_ * sizeof(std::int64_t)),
+                         "cudaMalloc exact cache (sorted keys)");
+        cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
+        if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc exact cache (perm)"); }
+        std::size_t n_valid = 0;
+        e = gpudb_cuda_exact_sort(static_cast<const std::int64_t*>(dptr_), d_valid_, rows_,
+                                  static_cast<std::int64_t*>(sorted),
+                                  static_cast<std::int64_t*>(perm), &n_valid, s);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e != cudaSuccess) {
+            cudaFree(sorted); cudaFree(perm);
+            cuda_throw(e, "exact cache build (sort of the valid keys)");
+        }
+        n_valid_ = n_valid;
+        d_ex_perm_.store(perm, std::memory_order_relaxed);
+        d_ex_sorted_.store(sorted, std::memory_order_release);
+    }
+    const std::int64_t* exact_sorted() const noexcept {
+        return null_count_ == 0
+                   ? sorted_keys()
+                   : static_cast<const std::int64_t*>(d_ex_sorted_.load(std::memory_order_acquire));
+    }
+    const std::int64_t* exact_perm() const noexcept {
+        return null_count_ == 0
+                   ? perm()
+                   : static_cast<const std::int64_t*>(d_ex_perm_.load(std::memory_order_acquire));
+    }
+    std::size_t exact_valid_rows() const noexcept {
+        return null_count_ == 0 ? rows_ : n_valid_;
     }
 
     // Build-side join cache: keys sorted + original-index permutation, built
@@ -235,6 +332,12 @@ private:
     void*                       dptr_     = nullptr;
     mutable std::atomic<void*>  d_sorted_ { nullptr };
     mutable std::atomic<void*>  d_perm_   { nullptr };
+    // The exact path's own cache (valid keys only) and the validity bitmap.
+    mutable std::atomic<void*>  d_ex_sorted_ { nullptr };
+    mutable std::atomic<void*>  d_ex_perm_   { nullptr };
+    mutable std::size_t         n_valid_  = 0;
+    unsigned long long*         d_valid_  = nullptr;
+    std::size_t                 null_count_ = 0;
     mutable cudaStream_t        own_stream_ = nullptr;
     mutable std::mutex          cache_mu_;   // guards cache build + own_stream_ creation
     std::size_t rows_  = 0;
@@ -251,6 +354,10 @@ public:
         GPUDB_CUDA_CHECK(cudaStreamCreate(&stream_), "cudaStreamCreate");
         GPUDB_CUDA_CHECK(cudaEventCreate(&ev_start_), "cudaEventCreate");
         GPUDB_CUDA_CHECK(cudaEventCreate(&ev_stop_),  "cudaEventCreate");
+        // Leave the device's name where gpu_build_info() can read it
+        // (backend_notes.hpp): the interface is frozen, so a backend that
+        // wants to be named says so here rather than growing a field.
+        set_device_name(props_.name);
     }
 
     ~CudaAggregator() override {
@@ -632,6 +739,383 @@ public:
                                             max_groups, filter, t0);
     }
 
+    // ---- v0.7 milestone 3: the exact path (§4.1, §4.2, §4.6) ----
+    // Whether the transparent rewrite may target this backend for an exact
+    // statement. The exact path is now COMPLETE — upload, GROUP BY, the global
+    // aggregate and the materialised key join all run here — but the default
+    // stays opt-in behind GPUDB_CUDA_EXACT=1 until the wrapper-level evidence
+    // exists on a CUDA box.
+    //
+    // The distinction that keeps this flag off is worth keeping in view: the
+    // SQL suite proves the TABLE FUNCTIONS, and it is green. What flipping this
+    // on additionally does is make the Python wrapper start rewriting plain SQL
+    // statements here, and only python/tests/test_wrapper.py and
+    // scripts/tpch_coverage.py prove a rewritten statement returns native's
+    // rows. Neither has ever run against a CUDA exact backend. A runtime rule-1
+    // check would catch a slow template; nothing at runtime catches a different
+    // answer, so that evidence has to come first.
+    //
+    // The flag is also not only a capability answer: it decides where
+    // upload_rows_exact PUTS the columns, and a resident column is
+    // single-homed, so a set on this device cannot fall back to the CPU
+    // reference for any operator.
+    bool exact_supported() const noexcept override {
+        static const bool on = [] {
+            const char* e = std::getenv("GPUDB_CUDA_EXACT");
+            return e && e[0] == '1' && e[1] == '\0';
+        }();
+        return on;
+    }
+
+    // Row-major exact upload. Each span is staged on the device once (its
+    // lanes and its per-lane validity words), then one scatter kernel per lane
+    // places the rows at dst_row and clears a bit per NULL. The host never
+    // de-interleaves and never builds a bitmap.
+    std::vector<std::unique_ptr<ResidentColumn>>
+    upload_rows_exact(const RowSpan* spans, std::size_t n_spans,
+                      const Dtype* dtypes, std::size_t n_lanes) override {
+        if (n_lanes == 0) throw std::runtime_error("upload_rows_exact: no lanes");
+        if (dtypes[0] != Dtype::I64)
+            throw std::runtime_error("upload_rows_exact: the key lane must be I64");
+        std::size_t rows = 0;
+        for (std::size_t s = 0; s < n_spans; ++s) {
+            if (spans[s].n_lanes != n_lanes)
+                throw std::runtime_error("upload_rows_exact: span lane count differs");
+            rows += spans[s].rows;
+        }
+        std::vector<std::unique_ptr<CudaResidentColumn>> cols;
+        cols.reserve(n_lanes);
+        for (std::size_t l = 0; l < n_lanes; ++l) {
+            cols.push_back(std::make_unique<CudaResidentColumn>(rows, dtypes[l]));
+            cols.back()->ensure_valid_bitmap();
+        }
+
+        if (rows > 0) {
+            // One staging pair, sized for the largest span and reused. The
+            // stream is synchronized per span precisely because it IS reused:
+            // the next H2D must not overwrite bytes a running kernel is still
+            // reading. (A double buffer would overlap the two; the upload is
+            // PCIe-bound either way, so that is a later measurement, not a
+            // guess to make now.)
+            std::size_t max_lanes = 0, max_words = 0;
+            for (std::size_t s = 0; s < n_spans; ++s) {
+                max_lanes = std::max(max_lanes, spans[s].rows * n_lanes);
+                max_words = std::max(max_words, (spans[s].valid_bit + spans[s].rows + 63) / 64);
+            }
+            cudaStream_t s = cols[0]->own_stream();
+            DeviceOut<std::int64_t>       stage(max_lanes, "exact upload staging (lanes)");
+            DeviceOut<unsigned long long> bits(max_words * n_lanes, "exact upload staging (bitmaps)");
+
+            std::size_t next = 0;
+            for (std::size_t si = 0; si < n_spans; ++si) {
+                const RowSpan& sp = spans[si];
+                const std::size_t d0 = (sp.dst_row == RowSpan::kNext) ? next : sp.dst_row;
+                if (d0 + sp.rows > rows)
+                    throw std::runtime_error("upload_rows_exact: span destination out of range");
+                next = d0 + sp.rows;
+                if (sp.rows == 0) continue;
+
+                const std::size_t words = (sp.valid_bit + sp.rows + 63) / 64;
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(stage.p, sp.lanes,
+                                                 sp.rows * n_lanes * sizeof(std::int64_t),
+                                                 cudaMemcpyHostToDevice, s),
+                                 "exact upload lanes H2D");
+                for (std::size_t l = 0; l < n_lanes; ++l) {
+                    const std::uint64_t* src = sp.valid ? sp.valid[l] : nullptr;
+                    if (!src) continue;
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p + l * max_words, src,
+                                                     words * sizeof(unsigned long long),
+                                                     cudaMemcpyHostToDevice, s),
+                                     "exact upload bitmap H2D");
+                }
+                for (std::size_t l = 0; l < n_lanes; ++l) {
+                    const bool has_bits = sp.valid && sp.valid[l];
+                    GPUDB_CUDA_CHECK(
+                        gpudb_cuda_exact_scatter_lane(
+                            stage.p, sp.rows, n_lanes, l,
+                            has_bits ? bits.p + l * max_words : nullptr, sp.valid_bit,
+                            static_cast<std::int64_t*>(cols[l]->device_ptr()),
+                            cols[l]->valid_bits_mutable(), d0, s),
+                        "exact upload scatter");
+                }
+                GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact upload span sync");
+            }
+        }
+
+        std::vector<std::unique_ptr<ResidentColumn>> out;
+        out.reserve(n_lanes);
+        for (auto& c : cols) { c->finish_exact_upload(); out.push_back(std::move(c)); }
+        return out;
+    }
+
+    // The two-lane form. Same machinery, one kernel instead of two, because a
+    // (key, payload) span is already interleaved the way the scatter wants it.
+    ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans, Dtype vdt) override {
+        if (vdt != Dtype::I64)
+            throw std::runtime_error(
+                "upload_pair_exact: DOUBLE payloads are not on the exact path (docs/TRANSPARENT_DESIGN.md §4.7)");
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        auto k = std::make_unique<CudaResidentColumn>(rows, Dtype::I64);
+        auto v = std::make_unique<CudaResidentColumn>(rows, Dtype::I64);
+        k->ensure_valid_bitmap();
+        v->ensure_valid_bitmap();
+
+        if (rows > 0) {
+            std::size_t max_rows = 0;
+            for (std::size_t i = 0; i < n_spans; ++i) max_rows = std::max(max_rows, spans[i].rows);
+            const std::size_t max_words = (max_rows + 63) / 64;
+            cudaStream_t s = k->own_stream();
+            DeviceOut<std::int64_t>       stage(max_rows * 2, "exact pair staging (kv)");
+            DeviceOut<unsigned long long> bits(max_words * 2, "exact pair staging (bitmaps)");
+
+            std::size_t dst = 0;
+            for (std::size_t i = 0; i < n_spans; ++i) {
+                const KvSpan& sp = spans[i];
+                if (sp.rows == 0) continue;
+                const std::size_t words = (sp.rows + 63) / 64;
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(stage.p, sp.kv,
+                                                 sp.rows * 2 * sizeof(std::int64_t),
+                                                 cudaMemcpyHostToDevice, s),
+                                 "exact pair kv H2D");
+                if (sp.key_valid)
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p, sp.key_valid,
+                                                     words * sizeof(unsigned long long),
+                                                     cudaMemcpyHostToDevice, s),
+                                     "exact pair key bitmap H2D");
+                if (sp.val_valid)
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p + max_words, sp.val_valid,
+                                                     words * sizeof(unsigned long long),
+                                                     cudaMemcpyHostToDevice, s),
+                                     "exact pair val bitmap H2D");
+                GPUDB_CUDA_CHECK(
+                    gpudb_cuda_exact_scatter_pair(
+                        stage.p, sp.rows,
+                        sp.key_valid ? bits.p : nullptr,
+                        sp.val_valid ? bits.p + max_words : nullptr, /*valid_bit=*/0,
+                        static_cast<std::int64_t*>(k->device_ptr()),
+                        static_cast<std::int64_t*>(v->device_ptr()),
+                        k->valid_bits_mutable(), v->valid_bits_mutable(), dst, s),
+                    "exact pair scatter");
+                GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact pair span sync");
+                dst += sp.rows;
+            }
+        }
+        k->finish_exact_upload();
+        v->finish_exact_upload();
+        ResidentPair out;
+        out.keys = std::move(k);
+        out.vals = std::move(v);
+        return out;
+    }
+
+    GroupByResidentResult groupby_exact_resident(const ResidentColumn& keys,
+                                                 const ResidentColumn* vals,
+                                                 std::size_t max_groups,
+                                                 const GroupByFilter& filter) override {
+        return exact_common("groupby_exact_resident", keys, vals, nullptr, 0, max_groups, filter);
+    }
+
+    GroupByResidentResult groupby_exact_masked_resident(const ResidentColumn& keys,
+                                                        const ResidentColumn* vals,
+                                                        const Predicate* preds,
+                                                        std::size_t n_preds,
+                                                        std::size_t max_groups,
+                                                        const GroupByFilter& filter) override {
+        return exact_common("groupby_exact_masked_resident", keys, vals, preds, n_preds,
+                            max_groups, filter);
+    }
+
+    // ---- v0.7 §4.12: the global masked aggregate ----
+    // No key, no sort, no permutation: one pass over the rows, the mask
+    // evaluated once and shared by every payload. Gated as exact_supported()
+    // is, and for the same reason — it reads columns this backend placed.
+    bool global_supported() const noexcept override { return exact_supported(); }
+
+    GlobalAggResult aggregate_exact_masked(const MultiPayload* pays, std::size_t n_pays,
+                                           const Predicate* preds, std::size_t n_preds) override {
+        static const char* op = "aggregate_exact_masked";
+        const auto t0 = std::chrono::steady_clock::now();
+        if (n_pays == 0 && n_preds == 0)
+            throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
+
+        std::vector<const std::int64_t*>       pay_data(n_pays, nullptr);
+        std::vector<const unsigned long long*> pay_valid(n_pays, nullptr);
+        std::size_t rows = 0;
+        bool        have_rows = false;
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            if (!pays[p].vals) throw std::runtime_error(std::string(op) + ": payload without a column");
+            if (pays[p].index)
+                throw std::runtime_error(std::string(op) +
+                                         ": indexed payloads are not on this backend");
+            const auto& c = check_i64_nullable(*pays[p].vals);
+            if (!have_rows) { rows = c.rows(); have_rows = true; }
+            else if (c.rows() != rows)
+                throw std::runtime_error(std::string(op) + ": payload row counts differ");
+            pay_data[p]  = static_cast<const std::int64_t*>(c.device_ptr());
+            pay_valid[p] = c.valid_bits();
+        }
+
+        GlobalAggResult r{};
+        r.sums.assign(n_pays, 0); r.sums_hi.assign(n_pays, 0); r.counts.assign(n_pays, 0);
+        r.mins.assign(n_pays, 0); r.maxs.assign(n_pays, 0);
+
+        DeviceOut<std::int64_t>               d_lists(0, "");
+        DeviceOut<gpudb::cuda_exact::DevPred> d_preds(0, "");
+        std::vector<gpudb::cuda_exact::DevPred> h_preds;
+        std::vector<std::int64_t>               h_lists;
+        std::vector<std::size_t>                off(n_preds, 0);
+        for (std::size_t q = 0; q < n_preds; ++q) {
+            if (!preds[q].col) throw std::runtime_error(std::string(op) + ": predicate without a column");
+            if (preds[q].index)
+                throw std::runtime_error(std::string(op) +
+                                         ": indexed predicate columns are not on this backend");
+            if (preds[q].col->backend_tag() != Backend::CUDA)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            const auto& pc = static_cast<const CudaResidentColumn&>(*preds[q].col);
+            if (!have_rows) { rows = pc.rows(); have_rows = true; }
+            else if (pc.rows() != rows)
+                throw std::runtime_error(
+                    std::string(op) + ": predicate column row count differs from the payloads");
+        }
+        r.rows_in = rows;
+        if (rows == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        if (n_preds) {
+            h_preds.resize(n_preds);
+            for (std::size_t q = 0; q < n_preds; ++q) {
+                off[q] = h_lists.size();
+                if (preds[q].op == Predicate::Op::In)
+                    h_lists.insert(h_lists.end(), preds[q].list, preds[q].list + preds[q].n_list);
+            }
+            d_lists.reset(h_lists.size(), "global IN lists");
+            if (!h_lists.empty())
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_lists.p, h_lists.data(),
+                                                 h_lists.size() * sizeof(std::int64_t),
+                                                 cudaMemcpyHostToDevice, stream_),
+                                 "global IN lists H2D");
+            for (std::size_t q = 0; q < n_preds; ++q) {
+                const auto& pc = static_cast<const CudaResidentColumn&>(*preds[q].col);
+                auto& d  = h_preds[q];
+                d.data   = static_cast<const std::int64_t*>(pc.device_ptr());
+                d.valid  = pc.valid_bits();
+                d.list   = d_lists.p ? d_lists.p + off[q] : nullptr;
+                d.value  = preds[q].value;
+                d.n_list = static_cast<int>(preds[q].n_list);
+                d.op     = static_cast<int>(preds[q].op);
+                d.is_f64 = (pc.dtype() == Dtype::F64) ? 1 : 0;
+            }
+            d_preds.reset(n_preds, "global predicates");
+            GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_preds.p, h_preds.data(),
+                                             n_preds * sizeof(gpudb::cuda_exact::DevPred),
+                                             cudaMemcpyHostToDevice, stream_),
+                             "global predicates H2D");
+        }
+
+        std::vector<gpudb::cuda_exact::ExactTuple> tup(n_pays ? n_pays : 1);
+        std::int64_t count_star = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_global(d_preds.p, static_cast<int>(n_preds), rows,
+                                                 pay_data.data(), pay_valid.data(),
+                                                 static_cast<int>(n_pays), tup.data(),
+                                                 &count_star, stream_),
+                         "global masked aggregate");
+        r.kernel_ms = stop_kernel_timer();
+
+        for (std::size_t p = 0; p < n_pays; ++p) {
+            r.sums[p]    = static_cast<std::int64_t>(tup[p].lo);
+            r.sums_hi[p] = tup[p].hi;
+            r.counts[p]  = tup[p].cnt_v;
+            r.mins[p]    = tup[p].mn;
+            r.maxs[p]    = tup[p].mx;
+        }
+        r.count_star = count_star;
+        r.wall_ms    = elapsed_ms(t0);
+        return r;
+    }
+
+    // ---- v0.7 §4.8: the materialised key join ----
+    // The build side needs no hash table: it is the exact sort cache of the
+    // build key (its VALID rows), so a match is a binary search, and the
+    // uniqueness precondition falls out of the run count — a sorted array of n
+    // cells holds n distinct values iff it has n runs. Gated with
+    // exact_supported(), which is what placed the columns here.
+    bool join_supported() const noexcept override { return exact_supported(); }
+
+    JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                           const ResidentColumn& build_key,
+                                           const JoinLane* out, std::size_t n_out) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64_nullable(probe_key);
+        const auto& bk = check_i64_nullable(build_key);
+        if (n_out == 0 || !out) throw std::runtime_error("join_materialize: no output lanes");
+        for (std::size_t l = 0; l < n_out; ++l) {
+            if (!out[l].col) throw std::runtime_error("join_materialize: output lane without a column");
+            if (out[l].index)
+                throw std::runtime_error("join_materialize: indexed output lanes are not on this backend");
+            if (out[l].col->backend_tag() != Backend::CUDA)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            if (out[l].col->rows() != (out[l].from_build ? bk.rows() : pk.rows()))
+                throw std::runtime_error("join_materialize: lane " + std::to_string(l) +
+                                         " row count differs from its side of the join");
+        }
+        if (out[0].col->dtype() != Dtype::I64)
+            throw std::runtime_error("join_materialize: the key lane must be I64");
+        if (pk.rows() > 0xFFFFFFFEull || bk.rows() > 0xFFFFFFFEull)
+            throw std::runtime_error("join_materialize: > 2^32-2 rows unsupported");
+
+        JoinMaterializeResult r;
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+
+        // The build key's sorted valid cells, and the uniqueness check on them.
+        bk.ensure_exact_cache(stream_);
+        const std::size_t n_bvalid = bk.exact_valid_rows();
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(bk.exact_sorted(), n_bvalid, &runs, stream_),
+                         "join build uniqueness");
+        if (runs != n_bvalid)
+            throw std::runtime_error("join_materialize: build key not unique");
+
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const std::size_t n = pk.rows();
+        DeviceOut<std::uint32_t> d_match(n, "join match rows");
+        DeviceOut<std::uint32_t> d_pos(n, "join destinations");
+        DeviceOut<unsigned char> d_cls(n, "join row class");
+        const auto& kc = static_cast<const CudaResidentColumn&>(*out[0].col);
+        std::size_t n1 = 0, n2 = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_probe(
+                             bk.exact_sorted(), bk.exact_perm(), n_bvalid,
+                             static_cast<const std::int64_t*>(pk.device_ptr()), pk.valid_bits(), n,
+                             kc.valid_bits(), out[0].from_build ? 1 : 0,
+                             d_match.p, d_cls.p, &n1, &n2, stream_),
+                         "join probe");
+        const std::size_t rows_out = n1 + n2;
+        GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_positions(d_cls.p, n, n1, d_pos.p, stream_),
+                         "join destinations");
+
+        r.lanes.reserve(n_out);
+        for (std::size_t l = 0; l < n_out; ++l) {
+            const auto& sc = static_cast<const CudaResidentColumn&>(*out[l].col);
+            auto col = std::make_unique<CudaResidentColumn>(rows_out, sc.dtype());
+            col->ensure_valid_bitmap();      // returns with the fill complete
+            GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_gather(
+                                 static_cast<const std::int64_t*>(sc.device_ptr()), sc.valid_bits(),
+                                 out[l].from_build ? 1 : 0, d_match.p, d_cls.p, d_pos.p, n,
+                                 static_cast<std::int64_t*>(col->device_ptr()),
+                                 col->valid_bits_mutable(), stream_),
+                             "join lane gather");
+            GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "join lane sync");
+            col->finish_exact_upload();      // counts the NULLs, drops a bitmap it did not need
+            r.lanes.push_back(std::move(col));
+        }
+        r.kernel_ms     = stop_kernel_timer();
+        r.rows_out      = rows_out;
+        r.null_key_rows = n2;
+        r.wall_ms       = elapsed_ms(t0);
+        return r;
+    }
+
     // top-k = a slice of the cached sort. kernel_ms covers the sort on the
     // first call for a column and is ~0 on later calls (cache hit); the
     // descending order is the tail of the ascending run, reversed on the host.
@@ -755,6 +1239,174 @@ private:
                 " (raise GPUDB_GROUPBY_ROWS_MAX_M if intentional)");
         return groups;
     }
+    // ---- v0.7 §4.2: the exact GROUP BY, both forms ----
+    // Five device stages: WHERE mask -> select the surviving sorted positions
+    // -> count the runs (the cap is checked against THAT, before anything is
+    // copied back) -> reduce each run into the six aggregates -> reduce the
+    // NULL-key rows separately. Only the HAVING / top-k runs on the host.
+    GroupByResidentResult exact_common(const char* op, const ResidentColumn& keys,
+                                       const ResidentColumn* vals,
+                                       const Predicate* preds, std::size_t n_preds,
+                                       std::size_t max_groups, const GroupByFilter& f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& k = check_i64_nullable(keys);
+        const CudaResidentColumn* v = nullptr;
+        if (vals) {
+            v = &check_i64_nullable(*vals);
+            if (v->rows() != k.rows())
+                throw std::runtime_error(std::string(op) + ": keys and vals row counts differ");
+        }
+        GroupByResidentResult r{};
+        const std::size_t rows = k.rows();
+        r.rows_in = rows;
+        if (rows == 0) { r.wall_ms = elapsed_ms(t0); return r; }
+
+        k.ensure_exact_cache(stream_);
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+
+        // ---- the WHERE mask (§4.6) ----
+        // The host builds one DevPred per comparison and one device copy of
+        // every IN list; both live until this call returns, which is after the
+        // last kernel that reads them has been synchronized.
+        DeviceOut<unsigned char>              d_mask(n_preds ? rows : 0, "exact where mask");
+        DeviceOut<std::int64_t>               d_lists(0, "");
+        DeviceOut<gpudb::cuda_exact::DevPred> d_preds(0, "");
+        std::vector<gpudb::cuda_exact::DevPred> h_preds;
+        std::vector<std::int64_t>               h_lists;
+        if (n_preds) {
+            h_preds.resize(n_preds);
+            std::vector<std::size_t> off(n_preds, 0);
+            for (std::size_t p = 0; p < n_preds; ++p) {
+                if (!preds[p].col)
+                    throw std::runtime_error(std::string(op) + ": predicate without a column");
+                if (preds[p].index)
+                    throw std::runtime_error(std::string(op) +
+                                             ": indexed predicate columns are not on this backend");
+                off[p] = h_lists.size();
+                if (preds[p].op == Predicate::Op::In)
+                    h_lists.insert(h_lists.end(), preds[p].list, preds[p].list + preds[p].n_list);
+            }
+            d_lists.reset(h_lists.size(), "exact IN lists");
+            if (!h_lists.empty())
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_lists.p, h_lists.data(),
+                                                 h_lists.size() * sizeof(std::int64_t),
+                                                 cudaMemcpyHostToDevice, stream_),
+                                 "exact IN lists H2D");
+            for (std::size_t p = 0; p < n_preds; ++p) {
+                const auto& col = *preds[p].col;
+                if (col.backend_tag() != Backend::CUDA)
+                    throw std::runtime_error("ResidentColumn from wrong backend");
+                const auto& pc = static_cast<const CudaResidentColumn&>(col);
+                if (pc.rows() != rows)
+                    throw std::runtime_error(
+                        std::string(op) + ": predicate column row count differs from the keys");
+                auto& q  = h_preds[p];
+                q.data   = static_cast<const std::int64_t*>(pc.device_ptr());
+                q.valid  = pc.valid_bits();
+                q.list   = d_lists.p ? d_lists.p + off[p] : nullptr;
+                q.value  = preds[p].value;
+                q.n_list = static_cast<int>(preds[p].n_list);
+                q.op     = static_cast<int>(preds[p].op);
+                q.is_f64 = (pc.dtype() == Dtype::F64) ? 1 : 0;
+            }
+            d_preds.reset(n_preds, "exact predicates");
+            GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_preds.p, h_preds.data(),
+                                             n_preds * sizeof(gpudb::cuda_exact::DevPred),
+                                             cudaMemcpyHostToDevice, stream_),
+                             "exact predicates H2D");
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_mask(d_preds.p, static_cast<int>(n_preds), rows,
+                                                   d_mask.p, stream_),
+                             "exact where mask");
+        }
+        const unsigned char* mask = n_preds ? d_mask.p : nullptr;
+
+        // ---- the surviving sorted positions ----
+        // With no WHERE the sort cache IS the input: no copy, no compaction.
+        const std::size_t    n_valid    = k.exact_valid_rows();
+        const std::int64_t*  use_sorted = k.exact_sorted();
+        const std::int64_t*  use_perm   = k.exact_perm();
+        std::size_t          n_sel      = n_valid;
+        DeviceOut<std::int64_t> sel_sorted(0, ""), sel_perm(0, "");
+        if (mask && n_valid) {
+            sel_sorted.reset(n_valid, "exact selected keys");
+            sel_perm.reset(n_valid, "exact selected rows");
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_select_sorted(use_sorted, use_perm, n_valid, mask,
+                                                            sel_sorted.p, sel_perm.p, &n_sel,
+                                                            stream_),
+                             "exact where select");
+            use_sorted = sel_sorted.p;
+            use_perm   = sel_perm.p;
+        }
+
+        const std::int64_t*       vptr   = v ? static_cast<const std::int64_t*>(v->device_ptr())
+                                             : nullptr;
+        const unsigned long long* vvalid = v ? v->valid_bits() : nullptr;
+        const int                 has_v  = v ? 1 : 0;
+
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, n_sel, &runs, stream_),
+                         "exact run count");
+        gpudb::cuda_exact::ExactTuple nullg{};
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_group(k.valid_bits(), mask, rows, vptr, vvalid,
+                                                     has_v, &nullg, stream_),
+                         "exact null-key group");
+        const bool        has_null_group = nullg.cnt_star > 0;
+        const std::size_t groups         = runs + (has_null_group ? 1 : 0);
+        r.groups_total = groups;
+        if (!f.active() && groups > max_groups) throw_cap(op, groups, max_groups, false);
+
+        DeviceOut<std::int64_t> d_keys(runs, "exact out keys");
+        DeviceOut<std::int64_t> d_lo(runs, "exact out sum (low limb)");
+        DeviceOut<std::int64_t> d_hi(runs, "exact out sum (high limb)");
+        DeviceOut<std::int64_t> d_cv(runs, "exact out count(v)");
+        DeviceOut<std::int64_t> d_cs(runs, "exact out count(*)");
+        DeviceOut<std::int64_t> d_mn(runs, "exact out min");
+        DeviceOut<std::int64_t> d_mx(runs, "exact out max");
+        std::size_t got = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, use_perm, n_sel, vptr, vvalid, has_v,
+                                                 d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
+                                                 d_mn.p, d_mx.p, &got, stream_),
+                         "exact reduce_by_key");
+        check_runs(op, got, runs);
+        r.kernel_ms = stop_kernel_timer();
+
+        const auto tx = std::chrono::steady_clock::now();
+        d2h_raw(r.keys,        d_keys.p, runs, "exact keys D2H");
+        d2h_raw(r.sums,        d_lo.p,   runs, "exact sums D2H");
+        d2h_raw(r.sums_hi,     d_hi.p,   runs, "exact sums_hi D2H");
+        d2h_raw(r.counts,      d_cv.p,   runs, "exact counts D2H");
+        d2h_raw(r.counts_star, d_cs.p,   runs, "exact counts_star D2H");
+        d2h_raw(r.mins,        d_mn.p,   runs, "exact mins D2H");
+        d2h_raw(r.maxs,        d_mx.p,   runs, "exact maxs D2H");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
+        r.transfer_ms = elapsed_ms(tx);
+        r.key_null.assign(runs, 0);
+
+        // The NULL keys are ONE group and it goes last — where native's
+        // `ORDER BY key NULLS LAST` puts it. Its key cell is unused (key_null
+        // marks it); the reference writes 0 there, so we do too.
+        if (has_null_group) {
+            r.keys.push_back(0);
+            r.key_null.push_back(1);
+            r.sums.push_back(static_cast<std::int64_t>(nullg.lo));
+            r.sums_hi.push_back(nullg.hi);
+            r.counts.push_back(nullg.cnt_v);
+            r.counts_star.push_back(nullg.cnt_star);
+            r.mins.push_back(nullg.mn);
+            r.maxs.push_back(nullg.mx);
+        }
+
+        // HAVING / top-k stay on the HOST, deliberately. The avg comparison is
+        // a long double quotient (native_avg.hpp) and there is no 80-bit float
+        // on a GPU: evaluating it on the device would keep a different set of
+        // groups than the values we then return — the exact bug #146 fixed, in
+        // a new place. The integer comparisons could move to the device later
+        // (sum <=> k*count in 128 bits); the avg one never can.
+        apply_group_filter_host(r, f, FilterAgg::Exact, max_groups, op);
+        r.wall_ms = elapsed_ms(t0);
+        return r;
+    }
+
     static void check_runs(const char* op, std::size_t runs, std::size_t groups) {
         if (runs != groups)
             throw std::runtime_error(std::string(op) + ": reduce produced " +
@@ -1028,7 +1680,19 @@ private:
         }
     }
 
+    // Legacy ops have no NULL semantics: refuse a column that carries NULLs
+    // (only the exact uploads produce one) instead of reading NULL rows as
+    // data — those cells hold a zero that is not a value. Word for word the
+    // CPU reference's guard, because the SQL layer surfaces it verbatim.
     static const CudaResidentColumn& check_i64(const ResidentColumn& c) {
+        const auto& r = check_i64_nullable(c);
+        if (r.null_count() != 0)
+            throw std::runtime_error(
+                "ResidentColumn carries NULL rows (uploaded by gpu_upload_pair_exact) — "
+                "only the exact GROUP BY (gpu_groupby_exact_resident) accepts it");
+        return r;
+    }
+    static const CudaResidentColumn& check_i64_nullable(const ResidentColumn& c) {
         if (c.backend_tag() != Backend::CUDA)
             throw std::runtime_error("ResidentColumn from wrong backend");
         if (c.dtype() != Dtype::I64)

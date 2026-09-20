@@ -2958,8 +2958,13 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //                            device; the wrapper only rewrites when true
 //   device='<name>'        → what the GPU calls itself (src/include/backend_notes.hpp).
 //                            Absent on a CPU-only build and on a backend that leaves
-//                            no note; quoted because the name carries spaces, and last
-//                            on the line so a reader can find it either way
+//                            no note; quoted because the name carries spaces
+//
+// The line is an UNORDERED set of space-separated key=value fields, and fields
+// come and go by build. Parse it by key — never by position, and never by
+// assuming a given key is present. (This comment used to promise device= came
+// last; avgf= was appended after it and the promise silently stopped being
+// true, which is the whole reason the rule is written down here.)
 void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
                      duckdb_vector output) {
     std::string info = "compiled=cpu";
