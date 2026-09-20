@@ -51,8 +51,9 @@ gpudb is for workloads that **ask the same aggregate questions of the same big d
 
 ## Plain DuckDB SQL on the GPU — new in v0.7
 
-Where that happens is a client that sees the statement before DuckDB plans it:
-the `gpudb` shell, or `gpudb.connect()` from Python. Until now you called
+Plain SQL reaches the GPU through a client that sees the statement before
+DuckDB plans it: the `gpudb` shell, or `gpudb.connect()` from Python — the
+extension alone gives the functions, not the rewrite. Until now you called
 `gpu_*` functions by name; they all still work, from any client, and now the
 same questions can be asked in the SQL you already write. Same rows, same
 column names, same column types as native, either way. No hints, no schema
@@ -374,7 +375,8 @@ by form](KNOWN_ISSUES.md#the-size-bounds-form-by-form).
   computed-expression payloads, because native hashes the strings and evaluates
   the expressions on every row. That is why TPC-H Q1 (two `VARCHAR` keys, eight
   aggregates over expressions, 98% of rows kept) is on the GPU at 3.8× while
-  the plain `sum` and `count(*)` over the *same* two keys in the example above
+  the plain `sum` and `count(*)` over the *same* two keys — the second
+  statement of [the run end to end](docs/USING_PYTHON.md#a-run-end-to-end) —
   declines at `6 groups < 1000`: column payloads, no expressions, no exemption.
   And over a **join** there is no group floor at all — native has to run the
   join whatever the group count, so a join returning one group is rewritten.
