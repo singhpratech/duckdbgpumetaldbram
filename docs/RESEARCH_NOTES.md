@@ -5115,6 +5115,97 @@ straddles 1.0x on this box — 0.97x through `execute`, 1.03x through `sql` — 
 the one shape that might ever justify a CUDA-specific constant is the one the
 measured rule is currently handling per process.
 
+## 2026-09-20 — Shipping the binary with the client
+
+The pip package and the loadable extension reach a user by two different
+routes: `pip install duckdb-gpudb` from PyPI, and `INSTALL gpudb FROM
+community` from the DuckDB community registry. Until now the wrapper found the
+extension in one of three places — an explicit `extension=` path, the
+`GPUDB_EXTENSION_PATH` environment variable, or a source checkout's own
+`build-macos/` / `build-linux/` — and otherwise fell back to `LOAD gpudb`,
+whatever DuckDB itself had installed.
+
+For this release those two routes are not simultaneous. The package is
+published first; the registry serves the previous version until its own build
+lands. And the client will not use an older extension: `_probe_extension` asks
+the catalogue whether every name in `REQUIRED_FUNCTIONS` is registered and, if
+any is missing, puts the connection into plain-DuckDB mode with a sentence
+saying which ones are absent. That check is correct — a client that renders
+statements naming functions the extension does not have would fail every one of
+them after paying for an upload first — but combined with the release order it
+means a pip-only install would have had no GPU path at all.
+
+Measured, in a clean virtual environment with the pure wheel installed and the
+registry's current build present in `~/.duckdb`:
+
+    extension_note : the loaded gpudb extension is older than this client:
+                     it does not provide gpu_residents, gpu_store_columns,
+                     gpu_resident_dictionary and 23 more
+    last_rewrite   : rewritten=False reason=backend
+    rows           : identical to native
+
+So the fix is to put the binary in the wheel. `gpudb/_ext/` is package data —
+empty in the repository, never committed — and `scripts/build_wheels.sh` copies
+one built `.duckdb_extension` into it, builds the platform wheel, takes it out
+again, and builds the `py3-none-any` wheel and the sdist with nothing in them.
+The script fails loudly unless the platform wheel holds exactly one binary and
+the other two hold none.
+
+### The lookup order, and why the checkout comes first
+
+    explicit extension= → GPUDB_EXTENSION_PATH → build-macos/ | build-linux/
+                        → gpudb/_ext/ → LOAD gpudb
+
+The bundled copy is looked for after a source checkout's build and before
+DuckDB's own installed extension. Someone who has just built the extension is
+testing that binary; an installed wheel's `_ext/` shadowing it silently would
+be the worst kind of wrong. And `LOAD gpudb` stays last because it is the only
+entry that can hand back something older than the client.
+
+### What the clean-environment runs showed
+
+Three virtual environments outside the checkout, with no `GPUDB_EXTENSION_PATH`
+and no `PYTHONPATH`, run from a directory with no repository on `sys.path`:
+
+| wheel | Python | DuckDB | `_find_extension` | plain GROUP BY over 2M rows |
+|---|---|---|---|---|
+| platform | 3.9.6 | 1.4.5 | the bundled `_ext/` copy | rewritten, rows identical to native |
+| platform | 3.13.9 | 1.5.5 | the bundled `_ext/` copy | rewritten, rows identical to native |
+| any | 3.13.9 | 1.5.5 | `None` | declined, rows identical to native |
+
+`gpu_build_info()` reports `runtime=metal exact=true join=true global=true
+store=true` in both platform runs, `duckdb_extensions()` reports `v0.7.0`, and
+the `gpudb` console script starts and answers a statement piped on stdin in all
+three. One binary, built once, loads under both DuckDB 1.4.5 and 1.5.5 — which
+is what the stable C_STRUCT ABI is for, and the first time it has been
+demonstrated from an installed package rather than a checkout.
+
+The third row is the documented degradation and nothing more: the wrapper says
+in one sentence why it cannot use what it found, every statement runs on
+DuckDB, and the answers are native's.
+
+### The wheel tags
+
+The platform wheel contains a Mach-O binary and no Python C extension, so
+`py3-none-<platform>` is the honest tag: any CPython 3.x, no ABI, one platform.
+Left alone setuptools stamps the interpreter and ABI of whichever Python ran
+the build, which claims less than the contents support, so `setup.py` overrides
+`get_tag` and marks the distribution impure. The `any` wheel and the sdist are
+built with the directory empty and come out `py3-none-any`.
+
+The platform part is read from the binary rather than from the machine:
+`otool -l` gives `LC_BUILD_VERSION`, whose `minos` field is the minimum macOS
+the loader will accept, and `lipo -archs` gives the architecture. On this build
+`minos` is **26.0**, so the tag is `macosx_26_0_arm64` and not the
+`macosx_11_0_arm64` that was assumed — nothing in the build sets
+`CMAKE_OSX_DEPLOYMENT_TARGET`, so the binary inherits the SDK's own floor and
+claims to need the macOS it was compiled on. A wheel may not claim to install
+where the loader will refuse the binary, so the true value is what the script
+uses; lowering the floor is a build change, with its own weak-linking
+questions, and it belongs in its own measurement rather than in a release
+commit. On Linux the tag must be passed in: the manylinux/glibc floor is a
+property of the toolchain and the script does not guess it.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
