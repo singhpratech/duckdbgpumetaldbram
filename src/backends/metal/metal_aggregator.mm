@@ -180,6 +180,13 @@ public:
             // field for and gpu_build_info() / gpu_store_columns() report.
             if (const char* n = [[device_ name] UTF8String]) set_device_name(n);
             register_lane_width_reporter(&MetalAggregator::lane_width_note);
+            // ... and what the driver says this process holds on the device
+            // right now. Unified memory or not, currentAllocatedSize is the
+            // one figure that can be compared with what the extension thinks
+            // is resident, which is what a memory budget has to be checked
+            // against. A property read — no encode, no wait.
+            note_device_ = device_;
+            set_device_allocated_reporter(&MetalAggregator::device_allocated_note);
             sort_ctx_ = std::make_shared<SortCtx>();
             sort_ctx_->device = device_;
             sort_ctx_->queue  = queue_;
@@ -1699,6 +1706,49 @@ private:
         return c ? c->width() : 0u;
     }
 
+    // ---- a device refusal, on demand (GPUDB_METAL_UPLOAD_REFUSE_MB) ----
+    // What a full card does to an upload cannot be produced on a 51 GiB
+    // machine by asking for more memory, and the paths that hang off a
+    // refused upload — the wrapper dropping the set, remembering the refusal,
+    // and never leaving a half-placed store behind — are exactly the paths
+    // that must be tested rather than argued about. So this backend refuses
+    // any exact upload of more than N MiB when asked to. Unset (the default)
+    // and the branch is one getenv per upload and nothing else; it changes no
+    // answer, only whether one upload is allowed to happen.
+    static std::size_t refuse_above_bytes() {
+        static const std::size_t v = [] () -> std::size_t {
+            const char* e = std::getenv("GPUDB_METAL_UPLOAD_REFUSE_MB");
+            if (!e || !*e) return 0;
+            char* end = nullptr;
+            const double mb = std::strtod(e, &end);
+            return (end == e || mb <= 0.0) ? 0 : static_cast<std::size_t>(mb * 1048576.0);
+        }();
+        return v;
+    }
+
+    static void refuse_if_injected(const RowSpan* spans, std::size_t n_spans,
+                                   std::size_t n_lanes, const char* what) {
+        const std::size_t cap = refuse_above_bytes();
+        if (!cap) return;
+        std::size_t rows = 0;
+        for (std::size_t i = 0; i < n_spans; ++i) rows += spans[i].rows;
+        const std::size_t want = rows * n_lanes * sizeof(std::int64_t);
+        if (want <= cap) return;
+        throw std::runtime_error(
+            std::string(what) + ": device allocation failed (Metal): " +
+            std::to_string(want >> 20) + " MiB over the " + std::to_string(cap >> 20) +
+            " MiB GPUDB_METAL_UPLOAD_REFUSE_MB a test set");
+    }
+
+    // ... and how many bytes the driver says this process holds on the
+    // device. `note_device_` is the device the first MetalAggregator opened;
+    // every one of them opens the system default device, so there is one.
+    static unsigned long long device_allocated_note() {
+        id<MTLDevice> d = note_device_;
+        return d ? static_cast<unsigned long long>([d currentAllocatedSize]) : 0ull;
+    }
+    static id<MTLDevice> note_device_;
+
     enum class GbMode { SumI64, SumF64, Count };
 
     // F64 sort cache (top-k by value): built on the column, see
@@ -2304,6 +2354,7 @@ private:
                       const Dtype* dtypes, std::size_t n_lanes) override {
         if (n_lanes == 0) throw std::runtime_error("upload_rows_exact: no lanes");
         if (dtypes[0] != Dtype::I64) throw std::runtime_error("upload_rows_exact: the key lane must be I64");
+        refuse_if_injected(spans, n_spans, n_lanes, "upload_rows_exact");
         // (lane 1 may be F64: a store upload orders lanes row id, ints, doubles, strings; the
         // exact operators check the payload's dtype themselves)
         @autoreleasepool {
@@ -5368,6 +5419,11 @@ private:
     const void*   zerocopy_src_   = nullptr;
     std::size_t   zerocopy_bytes_ = 0;
 };
+
+// The device the backend_notes.hpp allocation reporter reads. Written once
+// in the constructor, read by a plain function pointer that cannot carry an
+// instance with it.
+id<MTLDevice> MetalAggregator::note_device_ = nil;
 
 } // namespace
 

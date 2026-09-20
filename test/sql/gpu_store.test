@@ -191,11 +191,40 @@ SELECT (SELECT width IS NULL OR width = 1 FROM gpu_store_columns() WHERE "column
        (SELECT bool_and(width IS NULL OR width IN (1, 2, 4, 8)) FROM gpu_store_columns()) AS widths_are_lane_widths;
 -- expect: true  true  true  true  true  true
 
--- 10. The width column is the LAST of gpu_store_columns(), so a caller that reads
--- the table positionally keeps reading the values it always did.
+-- 10. New columns of gpu_store_columns() are APPENDED, so a caller that reads the
+-- table positionally keeps reading the values it always did: `width` stays the
+-- fourteenth and `on_gpu` is the fifteenth.
 -- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(120000) r(i)
 -- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
 -- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
-SELECT (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM gpu_store_columns()))[-1] AS last_column,
+SELECT (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM gpu_store_columns()))[14] AS fourteenth,
+       (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM gpu_store_columns()))[-1] AS last_column,
        (SELECT count(*) FROM (DESCRIBE SELECT * FROM gpu_store_columns())) AS columns;
--- expect: width  14
+-- expect: width  on_gpu  15
+
+-- 11. gpu_store_columns().on_gpu: which side the lane actually landed on. An
+-- upload routes to the GPU where there is one, so on a GPU build every lane is
+-- on the device; a lane that is NOT would be what a device refusal used to leave
+-- behind, and it is what makes a later operator say "columns are resident on
+-- different backends". NULL where no backend installs a placement reporter, and
+-- an absent answer is not "on the host" — which is why the check reads
+-- 'on_gpu IS NULL OR on_gpu'.
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(120000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+SELECT (SELECT bool_and(on_gpu IS NULL OR on_gpu) FROM gpu_store_columns()) AS nothing_on_the_host,
+       (SELECT count(*) FROM gpu_store_columns() WHERE on_gpu IS NOT NULL AND NOT on_gpu) AS host_lanes;
+-- expect: true  0
+
+-- 12. An exact upload the DEVICE refuses is reported, not placed on the host:
+-- the statement raises rather than quietly producing a set that would answer from
+-- the CPU reference (slower than DuckDB, rule 1) and would mix with device lanes
+-- of the same store. GPUDB_METAL_UPLOAD_REFUSE_MB makes the Metal backend refuse
+-- any exact upload above that many MiB, which is the only way to reach this on a
+-- machine with memory to spare.
+-- requires_backend: metal
+-- env: GPUDB_METAL_UPLOAD_REFUSE_MB=1
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(300000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t;
+-- expected_fail: the device refused the upload; a host-placed exact set is not offered in its place

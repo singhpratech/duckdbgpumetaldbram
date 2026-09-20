@@ -902,6 +902,33 @@ void upload_state_destroy(duckdb_aggregate_state* states, idx_t count) {
     }
 }
 
+// Release ONE state's pool buffer now, rather than waiting for
+// upload_state_destroy.
+//
+// Finalize says it must not mutate state and that destroy cleans up
+// unconditionally. Measured on an M4 Max, 2026-09-20: it does not when
+// finalize sets an error. Twelve executions of one statement whose upload the
+// device refuses grew the process from 271 MiB to 1810 MiB — 140 MiB of host
+// segments per refused upload, live RSS, never returned, for a statement that
+// answers natively and looks perfectly well-behaved from the outside. An
+// upload that fails is exactly the case where the buffer is largest and the
+// caller is most likely to try again, so this is the one path that cannot
+// wait for a destroy that may not come. Idempotent: the entry is erased under
+// the pool lock and the state is left with no buffer, so a later destroy finds
+// nothing to do.
+inline void release_state_buf(UploadState* s) {
+    if (!s || s->magic != UploadState::kMagic || s->buf_id == 0) return;
+    Pool& P = pool();
+    std::lock_guard<std::mutex> lock(P.mu);
+    auto it = P.bufs.find(s->buf_id);
+    if (it != P.bufs.end()) {
+        P.bytes.fetch_sub(it->second->charged, std::memory_order_relaxed);
+        P.bufs.erase(it);
+    }
+    s->buf_id = 0;
+    s->buf    = nullptr;
+}
+
 inline UploadState* probe_upload_state(void* p) {
     if (!p) return nullptr;
     auto* s = reinterpret_cast<UploadState*>(p);
@@ -1289,6 +1316,9 @@ void upload_finalize(duckdb_function_info info, duckdb_aggregate_state* source,
             out[offset + i] = static_cast<std::int64_t>(
                 finish_upload(ctx, *b, /*pair*/false, b->dtype, "gpu_upload"));
         } catch (const std::exception& e) {
+            // the buffer is the caller's to try again with, not ours to keep
+            // (release_state_buf: a finalize that errors is not followed by a destroy)
+            release_state_buf(s);
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload failed: ") + e.what()).c_str());
             return;
@@ -1444,6 +1474,9 @@ void upload_pair_finalize_t(duckdb_function_info info, duckdb_aggregate_state* s
             out[offset + i] = static_cast<std::int64_t>(
                 finish_upload(ctx, *b, /*pair*/true, VDT, "gpu_upload_pair"));
         } catch (const std::exception& e) {
+            // the buffer is the caller's to try again with, not ours to keep
+            // (release_state_buf: a finalize that errors is not followed by a destroy)
+            release_state_buf(s);
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_pair failed: ") + e.what()).c_str());
             return;
@@ -1564,6 +1597,9 @@ void upload_pair_exact_finalize(duckdb_function_info info, duckdb_aggregate_stat
             }
             out[offset + i] = static_cast<std::int64_t>(finish_upload_exact(ctx, *b, "gpu_upload_pair_exact"));
         } catch (const std::exception& e) {
+            // the buffer is the caller's to try again with, not ours to keep
+            // (release_state_buf: a finalize that errors is not followed by a destroy)
+            release_state_buf(s);
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_pair_exact failed: ") + e.what()).c_str());
             return;
@@ -1955,6 +1991,9 @@ void upload_rows_exact_finalize(duckdb_function_info info, duckdb_aggregate_stat
             }
             out[offset + i] = static_cast<std::int64_t>(finish_upload_exact(ctx, *b, "gpu_upload_rows_exact"));
         } catch (const std::exception& e) {
+            // the buffer is the caller's to try again with, not ours to keep
+            // (release_state_buf: a finalize that errors is not followed by a destroy)
+            release_state_buf(s);
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_rows_exact failed: ") + e.what()).c_str());
             return;
@@ -2505,6 +2544,9 @@ void upload_columns_finalize(duckdb_function_info info, duckdb_aggregate_state* 
             }
             out[offset + i] = static_cast<std::int64_t>(finish_upload_columns(ctx, *b, "gpu_upload_columns"));
         } catch (const std::exception& e) {
+            // the buffer is the caller's to try again with, not ours to keep
+            // (release_state_buf: a finalize that errors is not followed by a destroy)
+            release_state_buf(s);
             duckdb_aggregate_function_set_error(info,
                 (std::string("gpu_upload_columns failed: ") + e.what()).c_str());
             return;
@@ -2556,6 +2598,12 @@ struct StoreColumnsRow {
     std::string store, catalog, schema, table, column, dtype;
     std::int64_t table_oid = -1, rows = 0, bytes = 0, epoch = 0, uploaded_at_us = 0, last_used_at_us = 0;
     std::int64_t width = 0;     // storage width of the lane in bytes; 0 = the backend does not say
+    // Unknown | Device | Host: which side the upload actually put the lane
+    // on (src/include/backend_notes.hpp). A lane that fell back to the host
+    // is what makes a later operator refuse with "columns are resident on
+    // different backends", and this is the only place it is visible before
+    // then.
+    gpudb::ColumnPlacement placement = gpudb::ColumnPlacement::Unknown;
     bool prepared = false;
 };
 struct StoreColumnsInit { std::vector<StoreColumnsRow> rows; std::size_t offset = 0; };
@@ -2584,6 +2632,11 @@ void store_columns_bind(duckdb_bind_info info) {
     // backend leaves no width note (src/include/backend_notes.hpp): an absent
     // answer, not a width of zero.
     add("width",        DUCKDB_TYPE_BIGINT);     // bytes per row of the lane (stage C)
+    // Appended after `width` for the same reason it was appended after the
+    // rest. NULL = no installed reporter could say where the lane lives,
+    // which is NOT "on the host": a reader must treat an absent answer as an
+    // absent answer.
+    add("on_gpu",       DUCKDB_TYPE_BOOLEAN);
 }
 
 void store_columns_init(duckdb_init_info info) {
@@ -2603,6 +2656,7 @@ void store_columns_init(duckdb_init_info info) {
                 r.bytes = static_cast<std::int64_t>(c.col->resident_bytes());
                 r.prepared = c.col->prepared();
                 r.width = static_cast<std::int64_t>(gpudb::lane_storage_width(*c.col));
+                r.placement = gpudb::column_placement(*c.col);
                 r.epoch = static_cast<std::int64_t>(st.epoch);
                 r.uploaded_at_us = c.uploaded_at_us;
                 r.last_used_at_us = c.last_used_at_us.load();
@@ -2653,6 +2707,14 @@ void store_columns_function(duckdb_function_info info, duckdb_data_chunk output)
             duckdb_vector v = vec(13);
             duckdb_vector_ensure_validity_writable(v);
             duckdb_validity_set_row_invalid(duckdb_vector_get_validity(v), i);
+        }
+        if (r.placement == gpudb::ColumnPlacement::Unknown) {
+            duckdb_vector v = vec(14);
+            duckdb_vector_ensure_validity_writable(v);
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(v), i);
+        } else {
+            static_cast<bool*>(duckdb_vector_get_data(vec(14)))[i] =
+                r.placement == gpudb::ColumnPlacement::Device;
         }
     }
     duckdb_data_chunk_set_size(output, out_n);
@@ -2954,6 +3016,9 @@ void last_stats_exec(duckdb_function_info info, duckdb_data_chunk input,
 //   rebuilds=<c>/<l>       → sort caches and key lanes a resident column shed and had to
 //                            rebuild, process-wide (docs/RESIDENT_COLUMNS_DESIGN.md §9).
 //                            Zero on a workload whose shapes the shed rule read right
+//   device_allocated=<bytes> → what the DRIVER says this process holds on the device
+//                            right now, everything included (src/include/backend_notes.hpp).
+//                            ABSENT where no backend can answer — never 0 for "unknown"
 //   device_memory=<bytes>  → what the backend reports for the memory budget (0 = unknown, §5.5)
 //                            (NULL-aware, HUGEINT sums, WHERE mask) on its own
 //                            device; the wrapper only rewrites when true
@@ -2986,6 +3051,16 @@ void build_info_exec(duckdb_function_info info_, duckdb_data_chunk input,
     info += ctx_of(info_).aggregator().global_supported() ? " global=true" : " global=false";
     info += ctx_of(info_).aggregator().narrow_lanes() ? " narrow=true" : " narrow=false";
     info += " device_memory=" + std::to_string(ctx_of(info_).aggregator().device_memory_bytes());
+    // What the DRIVER says this process holds on the device right now, when a
+    // backend installed a reporter for it (src/include/backend_notes.hpp).
+    // The field is absent — not zero — where nobody can answer, because
+    // "nothing is allocated" and "nobody could say" are different facts and
+    // only one of them is a measurement.
+    {
+        unsigned long long allocated = 0;
+        if (gpudb::device_allocated_bytes(allocated))
+            info += " device_allocated=" + std::to_string(allocated);
+    }
     info += " store=true";
     info += " rebuilds=" + std::to_string(gpudb::resident_cache_rebuilds().load()) +
             "/" + std::to_string(gpudb::resident_lane_rebuilds().load());
