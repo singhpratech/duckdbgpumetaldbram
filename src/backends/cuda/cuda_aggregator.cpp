@@ -174,22 +174,21 @@ public:
     // as if they were data, which no operator wants.
     void prepare() override {
         cudaStream_t s = own_stream();
-        if (dtype_ == Dtype::I64 && (null_count_ > 0 || width_ != 8)) ensure_exact_cache(s);
-        else                                                          ensure_sort_cache(s);
+        if (exact_ && dtype_ == Dtype::I64) ensure_exact_cache(s);
+        else                                ensure_sort_cache(s);
     }
     bool prepared() const noexcept override {
         if (rows_ == 0) return true;
-        if (dtype_ == Dtype::I64 && (null_count_ > 0 || width_ != 8))
+        if (exact_ && dtype_ == Dtype::I64)
             return d_ex_sorted_.load(std::memory_order_acquire) != nullptr;
         return d_sorted_.load(std::memory_order_acquire) != nullptr;
     }
     std::size_t resident_bytes() const noexcept override {
-        std::size_t b = bytes_;
-        // the caches still hold i64 keys and i64 row ids (narrowing them is
-        // the next step of stage C), so they are sized from rows, not bytes_
-        if (d_sorted_.load(std::memory_order_acquire))
+        std::size_t b = bytes_;                             // the lane, at its stored width
+        if (d_sorted_.load(std::memory_order_acquire))      // v0.5 cache: i64 keys + i64 row ids
             b += 2 * rows_ * sizeof(std::int64_t);
-        if (d_ex_sorted_.load(std::memory_order_acquire)) b += 2 * rows_ * sizeof(std::int64_t);
+        if (d_ex_sorted_.load(std::memory_order_acquire))   // exact cache: lane width + u32 row ids
+            b += rows_ * (static_cast<std::size_t>(width_) + sizeof(std::uint32_t));
         if (d_valid_) b += ((rows_ + 63) / 64) * sizeof(unsigned long long);
         return b;
     }
@@ -223,6 +222,7 @@ public:
     }
 
     void finish_exact_upload() {
+        exact_ = true;          // only the exact uploads call this
         cudaStream_t s = own_stream();
         if (d_valid_) {
             std::size_t nulls = 0;
@@ -274,25 +274,24 @@ public:
     void ensure_exact_cache(cudaStream_t s) const {
         if (dtype_ != Dtype::I64)
             throw std::runtime_error("CUDA exact GROUP BY: keys must be an i64 column");
-        // With no NULLs AND a full-width lane the v0.5 cache is the exact
-        // cache — every row is valid and the permutation covers all of them,
-        // so the two never coexist. A NARROWED lane cannot use it: that
-        // builder reads the values as raw int64, which is exactly what a
-        // packed lane stops being.
-        if (null_count_ == 0 && width_ == 8) { ensure_sort_cache(s); return; }
+        // The exact cache always has its own format now — keys at the lane's
+        // width, row ids as u32 — so it is never the v0.5 cache, even for a
+        // NULL-free 8-byte lane. Sharing was an optimisation worth having
+        // while the two formats coincided; they no longer do, and one format
+        // is worth more than one buffer (the conditional version of this
+        // sharing is what broke when lanes first narrowed).
         if (rows_ == 0 || d_ex_sorted_.load(std::memory_order_acquire)) return;
         std::lock_guard<std::mutex> lock(cache_mu_);
         if (d_ex_sorted_.load(std::memory_order_relaxed)) return;   // lost the race: built
         void* sorted = nullptr;
         void* perm   = nullptr;
-        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, rows_ * sizeof(std::int64_t)),
+        GPUDB_CUDA_CHECK(cudaMalloc(&sorted, rows_ * static_cast<std::size_t>(width_)),
                          "cudaMalloc exact cache (sorted keys)");
-        cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
+        cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::uint32_t));
         if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc exact cache (perm)"); }
         std::size_t n_valid = 0;
-        e = gpudb_cuda_exact_sort(dptr_, width_, d_valid_, rows_,
-                                  static_cast<std::int64_t*>(sorted),
-                                  static_cast<std::int64_t*>(perm), &n_valid, s);
+        e = gpudb_cuda_exact_sort(dptr_, width_, d_valid_, rows_, sorted,
+                                  static_cast<std::uint32_t*>(perm), &n_valid, s);
         if (e == cudaSuccess) e = cudaStreamSynchronize(s);
         if (e != cudaSuccess) {
             cudaFree(sorted); cudaFree(perm);
@@ -302,19 +301,13 @@ public:
         d_ex_perm_.store(perm, std::memory_order_relaxed);
         d_ex_sorted_.store(sorted, std::memory_order_release);
     }
-    const std::int64_t* exact_sorted() const noexcept {
-        return (null_count_ == 0 && width_ == 8)
-                   ? sorted_keys()
-                   : static_cast<const std::int64_t*>(d_ex_sorted_.load(std::memory_order_acquire));
+    const void* exact_sorted() const noexcept {
+        return d_ex_sorted_.load(std::memory_order_acquire);
     }
-    const std::int64_t* exact_perm() const noexcept {
-        return (null_count_ == 0 && width_ == 8)
-                   ? perm()
-                   : static_cast<const std::int64_t*>(d_ex_perm_.load(std::memory_order_acquire));
+    const std::uint32_t* exact_perm() const noexcept {
+        return static_cast<const std::uint32_t*>(d_ex_perm_.load(std::memory_order_acquire));
     }
-    std::size_t exact_valid_rows() const noexcept {
-        return (null_count_ == 0 && width_ == 8) ? rows_ : n_valid_;
-    }
+    std::size_t exact_valid_rows() const noexcept { return n_valid_; }
 
     // Build-side join cache: keys sorted + original-index permutation, built
     // on first use as a join build side (or by prepare()), reused across
@@ -395,6 +388,12 @@ private:
     unsigned long long*         d_valid_  = nullptr;
     std::size_t                 null_count_ = 0;
     int                         width_ = 8;
+    // Which cache this column's operators will want. An exact column is read
+    // by the exact path (narrow keys + u32 row ids); a column from upload_i64
+    // is read by the v0.6 ops (i64 + i64). prepare() must build the one that
+    // will actually be used — building both costs 36 bytes a row where 24 is
+    // right, which is what the prepare() test caught.
+    bool                        exact_ = false;
     mutable cudaStream_t        own_stream_ = nullptr;
     mutable std::mutex          cache_mu_;   // guards cache build + own_stream_ creation
     std::size_t rows_  = 0;
@@ -1207,7 +1206,7 @@ public:
         bk.ensure_exact_cache(stream_);
         const std::size_t n_bvalid = bk.exact_valid_rows();
         std::size_t runs = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(bk.exact_sorted(), n_bvalid, &runs, stream_),
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(bk.exact_sorted(), bk.width(), n_bvalid, &runs, stream_),
                          "join build uniqueness");
         if (runs != n_bvalid)
             throw std::runtime_error("join_materialize: build key not unique");
@@ -1220,7 +1219,7 @@ public:
         const auto& kc = static_cast<const CudaResidentColumn&>(*out[0].col);
         std::size_t n1 = 0, n2 = 0;
         GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_probe(
-                             bk.exact_sorted(), bk.exact_perm(), n_bvalid,
+                             bk.exact_sorted(), bk.width(), bk.exact_perm(), n_bvalid,
                              pk.device_ptr(), pk.width(), pk.valid_bits(), n,
                              kc.valid_bits(), out[0].from_build ? 1 : 0,
                              d_match.p, d_cls.p, &n1, &n2, stream_),
@@ -1476,17 +1475,19 @@ private:
 
         // ---- the surviving sorted positions ----
         // With no WHERE the sort cache IS the input: no copy, no compaction.
-        const std::size_t    n_valid    = k.exact_valid_rows();
-        const std::int64_t*  use_sorted = k.exact_sorted();
-        const std::int64_t*  use_perm   = k.exact_perm();
-        std::size_t          n_sel      = n_valid;
-        DeviceOut<std::int64_t> sel_sorted(0, ""), sel_perm(0, "");
+        const std::size_t     n_valid    = k.exact_valid_rows();
+        const int             kwidth     = k.width();
+        const void*           use_sorted = k.exact_sorted();
+        const std::uint32_t*  use_perm   = k.exact_perm();
+        std::size_t           n_sel      = n_valid;
+        DeviceOut<unsigned char> sel_sorted(0, "");
+        DeviceOut<std::uint32_t> sel_perm(0, "");
         if (mask && n_valid) {
-            sel_sorted.reset(n_valid, "exact selected keys");
+            sel_sorted.reset(n_valid * static_cast<std::size_t>(kwidth), "exact selected keys");
             sel_perm.reset(n_valid, "exact selected rows");
-            GPUDB_CUDA_CHECK(gpudb_cuda_exact_select_sorted(use_sorted, use_perm, n_valid, mask,
-                                                            sel_sorted.p, sel_perm.p, &n_sel,
-                                                            stream_),
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_select_sorted(use_sorted, kwidth, use_perm, n_valid,
+                                                            mask, sel_sorted.p, sel_perm.p,
+                                                            &n_sel, stream_),
                              "exact where select");
             use_sorted = sel_sorted.p;
             use_perm   = sel_perm.p;
@@ -1498,7 +1499,7 @@ private:
         const int                 vwidth = v ? v->width() : 8;
 
         std::size_t runs = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, n_sel, &runs, stream_),
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, kwidth, n_sel, &runs, stream_),
                          "exact run count");
         gpudb::cuda_exact::ExactTuple nullg{};
         GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_group(k.valid_bits(), mask, rows, vptr, vwidth,
@@ -1517,7 +1518,7 @@ private:
         DeviceOut<std::int64_t> d_mn(runs, "exact out min");
         DeviceOut<std::int64_t> d_mx(runs, "exact out max");
         std::size_t got = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, use_perm, n_sel, vptr, vwidth, vvalid, has_v,
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, kwidth, use_perm, n_sel, vptr, vwidth, vvalid, has_v,
                                                  d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
                                                  d_mn.p, d_mx.p, &got, stream_),
                          "exact reduce_by_key");

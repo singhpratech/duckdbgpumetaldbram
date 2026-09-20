@@ -114,7 +114,7 @@ cudaError_t gpudb_cuda_exact_null_count(const unsigned long long* d_valid, std::
 // A nullptr bitmap means every row is valid.
 cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
                                   const unsigned long long* d_valid,
-                                  std::size_t rows, std::int64_t* d_sorted, std::int64_t* d_perm,
+                                  std::size_t rows, void* d_sorted, std::uint32_t* d_perm,
                                   std::size_t* h_n_valid, cudaStream_t s);
 
 // Evaluate a conjunction of predicates over `rows` rows into a byte mask, in
@@ -124,20 +124,22 @@ cudaError_t gpudb_cuda_exact_mask(const gpudb::cuda_exact::DevPred* d_preds, int
 
 // Keep the sorted positions whose row passes the mask: out[k] = (sorted[i],
 // perm[i]) for every i with mask[perm[i]].
-cudaError_t gpudb_cuda_exact_select_sorted(const std::int64_t* d_sorted, const std::int64_t* d_perm,
+cudaError_t gpudb_cuda_exact_select_sorted(const void* d_sorted, int key_width,
+                                           const std::uint32_t* d_perm,
                                            std::size_t n_valid, const unsigned char* d_mask,
-                                           std::int64_t* d_sorted_out, std::int64_t* d_perm_out,
+                                           void* d_sorted_out, std::uint32_t* d_perm_out,
                                            std::size_t* h_n_sel, cudaStream_t s);
 
 // Distinct keys in an ascending-sorted array (the group count, before any
 // filter — the cap is checked against it BEFORE anything is copied back).
-cudaError_t gpudb_cuda_exact_run_count(const std::int64_t* d_sorted, std::size_t n,
+cudaError_t gpudb_cuda_exact_run_count(const void* d_sorted, int key_width, std::size_t n,
                                        std::size_t* h_runs, cudaStream_t s);
 
 // One row per key run: the 128-bit sum, count(payload), count(*), min and max
 // over the payloads of the rows in that run. `d_vals` / `d_vvalid` may be
 // null (has_vals == 0: the keys-only form, where count(payload) is count(*)).
-cudaError_t gpudb_cuda_exact_reduce(const std::int64_t* d_sorted, const std::int64_t* d_perm,
+cudaError_t gpudb_cuda_exact_reduce(const void* d_sorted, int key_width,
+                                    const std::uint32_t* d_perm,
                                     std::size_t n_sel, const void* d_vals, int val_width,
                                     const unsigned long long* d_vvalid, int has_vals,
                                     std::int64_t* d_keys_out, std::int64_t* d_lo, std::int64_t* d_hi,
@@ -169,8 +171,8 @@ cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, i
 // matched (0xFFFFFFFF where none). `d_keylane_valid` is output lane 0's
 // bitmap and `key_from_build` says which row of it to read — that pair is
 // what decides class 1 vs class 2, exactly as the reference's kc.valid(krow).
-cudaError_t gpudb_cuda_join_mat_probe(const std::int64_t* d_bsorted, const std::int64_t* d_bperm,
-                                      std::size_t n_bvalid,
+cudaError_t gpudb_cuda_join_mat_probe(const void* d_bsorted, int bkey_width,
+                                      const std::uint32_t* d_bperm, std::size_t n_bvalid,
                                       const void* d_pkeys, int pkey_width,
                                       const unsigned long long* d_pvalid,
                                       std::size_t rows_probe,

@@ -3843,6 +3843,63 @@ documentation says so, which is lucky rather than clever. Keys at the lane's
 width and a u32 permutation take that 91.6 MiB to ~34.3 MiB, and that is the
 next change.
 
+## 2026-09-20 — The number went the wrong way
+
+The sort cache for the exact path now holds its keys at the lane's width and
+its row ids as u32. On TPC-H SF1 that is 183.1 MiB of derived structures down
+to 103.0, and a resident total of 257.5 MiB down to 177.4 — 31% off, with the
+lanes untouched.
+
+The part worth recording is how nearly it shipped wrong.
+
+Having narrowed the cache, I measured a controlled 100k-row set and it reported
+**25 bytes a row against main's 19**. The change that was supposed to shrink the
+cache had apparently grown the footprint by a third.
+
+The first instinct was that the reporting must be wrong — and it was, but not in
+the way that instinct wanted. I spent a while trying to reconcile 25 against
+combinations of lane widths and cache formats, and none of them fit: not
+8+8+16, not 2+1+6, nothing. The arithmetic refusing to close is what eventually
+forced a print statement instead of another hypothesis, and the print said the
+key column was returning 2,400,000 bytes from a 200,000-byte lane.
+
+`resident_bytes()` was counting the exact cache twice. My edit had added the
+new term — `rows * (width + 4)` — without removing the old one, `rows * 16`,
+because the text I matched against had already changed in the previous PR and
+the replacement silently appended rather than replaced. 16 + 6 = 22 a row, plus
+the lane, is exactly the 25 that made no sense.
+
+Two things follow.
+
+The obvious one: an edit that matches text is only as good as the text it
+matched, and a replacement that fails to find its target should be an error
+rather than a no-op. It was — in the scripts I write for this — and it was not
+here, because this particular edit was an *addition* next to a line I believed
+I had already replaced.
+
+The one I would rather remember: **the measurement going the wrong way is what
+caught it.** If the double count had been a 20% overstatement rather than a
+tripling, or if I had only measured the branch and not compared it against main,
+the number would have looked plausible and gone into a benchmark table. The A/B
+was not there to prove the improvement; it was there because a number without a
+control is not a measurement. It earned its keep by being the thing that said
+"this cannot be right" before anyone else had to.
+
+### The layout, for the record
+
+    before   i64 sorted key + i64 row id   = 16 bytes a row
+    after    lane-width key + u32 row id   =  3 to 12, 6 at width 2
+
+The row id was always the easy half: the cache already refuses a column above
+2^32 rows, so eight bytes for a row id was more than it could ever use. Apple
+Silicon Metal has stored u32 row ids since stage C landed there; this brings
+the two backends to the same layout.
+
+`gpu_resident_registry` q26 is unaffected — it measures a v0.6 `gpu_upload_pair`
+set, whose cache is still i64 and i64. That one stays at 32000 rather than
+settling on 28000, and narrowing it is a different change over a different set
+of kernels.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
