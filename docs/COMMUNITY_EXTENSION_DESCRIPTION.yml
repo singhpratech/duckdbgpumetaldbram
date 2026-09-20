@@ -72,7 +72,7 @@ docs:
         gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem
                GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
         ...
-        GPU (topk: the resident GROUP BY) - 5.0 ms
+        GPU (topk: the resident GROUP BY)
 
     **2. Python — `gpudb.connect()`** — the same decision, for applications and
     notebooks.
@@ -113,15 +113,24 @@ docs:
 
     ### Measured (TPC-H, every row compared with native DuckDB)
 
-    | | queries answered on the GPU | rows differing | speed-up on those queries |
-    |---|---|---|---|
-    | Apple M4 Max (Metal), SF1 | 17 of 22 | 0 | 1.4x - 13.6x |
-    | Apple M4 Max (Metal), SF10 | 19 of 22 | 0 | 1.3x - 52.9x |
-    | RTX 4090 Laptop (CUDA), SF1 | 17 of 22 | 0 | 0.95x - 23.3x |
+    Release build of 2026-09-20, default memory budget, N=5. A statement reaches the
+    GPU through `execute()` or through `sql()` — two different code paths, timed
+    separately:
 
-    Plain SQL runs on the GPU by default on both backends. The CUDA row's low end is
-    one query, TPC-H Q1, which sits at parity on that machine and which the
-    per-process measured rule declines where it loses.
+    | | asked through | on the GPU | rows differing | speed-up on those queries |
+    |---|---|---|---|---|
+    | Apple M4 Max (Metal), SF1 | execute() | 17 of 22 | 0 | 1.52x - 15.32x |
+    | Apple M4 Max (Metal), SF1 | sql() | 17 of 22 | 0 | 1.37x - 9.49x |
+    | Apple M4 Max (Metal), SF10 | execute() | 19 of 22 | 0 | 1.06x - 48.10x |
+    | Apple M4 Max (Metal), SF10 | sql() | 19 of 22 | 0 | 0.92x - 26.39x |
+    | RTX 4090 Laptop (CUDA), SF1 | execute() | 17 of 22 | 0 | 0.96x - 21.40x |
+    | RTX 4090 Laptop (CUDA), SF1 | sql() | 17 of 22 | 0 | 0.98x - 13.30x |
+
+    Plain SQL runs on the GPU by default on both backends. Two rows are below 1.0x
+    and are printed rather than dropped: TPC-H Q11 at SF10 on Metal (a 6-7 ms
+    statement, 1.06x one way and 0.92x the other) and TPC-H Q1 on CUDA both
+    straddle parity, and the per-process measured rule is what declines such a
+    statement where it loses. Nothing else rewritten in the run is below 1.0x.
 
     The remaining queries are declined on purpose (correlated subqueries, or shapes
     where DuckDB was measured faster) and run on DuckDB unchanged. Every measurement,

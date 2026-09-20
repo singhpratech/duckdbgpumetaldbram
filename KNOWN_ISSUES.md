@@ -286,8 +286,8 @@ cd duckdbgpumetaldbram
 ./scripts/build.sh
 ./scripts/local_check.sh        # builds + cpp tests + smoke benchmarks
 ./build-macos/test/test_gpudb   # (or build-linux/) unit tests across the backends the build carries
-                                # (752 on CPU + CUDA on the RTX 4090 Laptop)
-./scripts/run_sql_tests.sh      # 225 passing cases, 45 expected failures
+                                # (3056 on CPU + Metal on the M4 Max; 752 on CPU + CUDA on the RTX 4090 Laptop)
+./scripts/run_sql_tests.sh      # 225 passing cases, 46 expected failures, 1 skipped
                                 # (the `-- expected_fail:` cases, which assert that misuse is rejected)
 ./scripts/join_parity_check.sh  # 11 adversarial join scenarios, native vs gpudb in the same statement
 ```
@@ -295,12 +295,13 @@ cd duckdbgpumetaldbram
 For the transparent path (the Python wrapper and the `gpudb` shell):
 
 ```bash
-PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # over 1200 checks: parity against native
+PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # 1267 checks: parity against native
                                 # DuckDB for every shape, staleness, background residency, the memory
                                 # budget, error fallback — needs the extension built (above).
-                                # Green under DuckDB 1.4.5 and 1.5.5
+                                # Same count under DuckDB 1.4.5 and 1.5.5
 PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-H queries at SF1:
                                 # 17 of 22 on the device, rows identical to native (Metal);
-                                # --db data/tpch_sf10/tpch.duckdb with GPUDB_MEMORY_BUDGET_MB=200000
-                                # → 19 of 22, also identical
+                                # --db data/tpch_sf10/tpch.duckdb at the DEFAULT budget
+                                # → 19 of 22, also identical. Add --path sql for the
+                                # other entry point; both are in BENCHMARK.md.
 ```
