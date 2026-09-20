@@ -30,6 +30,16 @@ cd "$(git rev-parse --show-toplevel)"
 
 DUCKDB_VERSION="${DUCKDB_VERSION:-v1.5.5}"
 
+# `--print-version` prints the tag this script would fetch and exits. It exists
+# so that a caller which must install something ELSE at the same version reads
+# the pin from here instead of repeating it: CI installs the pip `duckdb`
+# module at exactly this version to run python/tests/test_wrapper.py, and a
+# second copy of the number would drift the day this default moves.
+if [ "${1:-}" = "--print-version" ]; then
+    echo "$DUCKDB_VERSION"
+    exit 0
+fi
+
 DEST="third_party/duckdb-libs"
 mkdir -p "$DEST"
 
