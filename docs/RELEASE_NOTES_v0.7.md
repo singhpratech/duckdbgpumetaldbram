@@ -1,5 +1,7 @@
 # gpudb v0.7.0 — plain DuckDB SQL on the GPU
 
+Released 2026-09-20.
+
 Until v0.6 you called `gpu_*` functions by name. From v0.7 you write the SQL
 you already write — in the `gpudb` shell, or through `gpudb.connect()` — and
 the GPU answers it when that has been measured faster on your machine.
@@ -287,11 +289,19 @@ same resident columns:
    every v0.6 one is still there under the same name, return type and parameter
    types.
 
-Installing both pieces:
+Installing, in one line where the wheel carries the binary:
 
 ```bash
-pip install duckdb-gpudb          # the `gpudb` command and the gpudb module
+pip install duckdb-gpudb          # the `gpudb` command, the gpudb module, and the extension
 ```
+
+On Apple Silicon (macOS 15 or later) and on x86-64 Linux (glibc 2.34 or newer —
+Ubuntu 22.04 and later) the platform wheel bundles the v0.7.0 extension in
+`gpudb/_ext/` (#173), so there is nothing to `INSTALL` and nothing to build.
+Anywhere else `pip` installs the `py3-none-any` wheel, which carries no binary,
+and the extension comes from DuckDB's own install — which is also the route for
+any client that wants the explicit `gpu_*` functions without the wrapper:
+
 ```sql
 INSTALL gpudb FROM community;     -- the extension, into DuckDB
 LOAD gpudb;
@@ -344,6 +354,44 @@ full licence text so GitHub detects it (#89).
   top-k reading 2.15× through `execute()` and 2.12× through `sql()`.
 - The SQL suite now runs on Linux with the DuckDB libs pinned (#151), and the
   wrapper suite runs against the built extension in CI (#158).
+- **The platform wheels carry the extension binary** (#173).
+  `scripts/build_wheels.sh` puts one built `.duckdb_extension` into
+  `gpudb/_ext/`, builds the platform wheel, takes it out again and builds the
+  `py3-none-any` wheel and the sdist empty; it fails unless exactly one binary
+  is in the first and none in the other two. The bundled copy sits between a
+  source checkout's own build and `LOAD gpudb` in the lookup order, so a
+  checkout under test is never shadowed. One binary was shown loading under
+  **both DuckDB 1.4.5 and 1.5.5** from a clean install — three virtual
+  environments outside the checkout, plain GROUP BY over 2M rows, rows
+  identical to native in each.
+- **macOS binaries now declare a deployment target of 15.0** (#173). Nothing
+  set one before, so a binary inherited the floor of whatever SDK built it — a
+  local build came out at `minos 26.0`, installable only on the macOS that
+  compiled it. 15.0 is claimed because a 15.0 binary has shipped and run: it is
+  the floor of the binary the community registry has been serving. 14.0 also
+  compiles with no unguarded-availability warnings and is deliberately **not**
+  claimed, because the MSL 3.1 branch it would ship has never executed
+  anywhere. The wheel tag follows from the binary: `macosx_15_0_arm64`.
+- **The Linux loadable extension links libstdc++ and libgcc statically**
+  (#82), so it carries no `GLIBCXX_`/`CXXABI_` symbol-version floor from the
+  build machine — a v0.6.0 asset built on 24.04 needed `GLIBCXX_3.4.32` and
+  would not `LOAD` on a 22.04 userland. glibc stays dynamic, and release assets
+  are built on Ubuntu 22.04. OpenMP stays dynamic too, so a Linux machine needs
+  `libgomp.so.1` at load time (`apt install libgomp1`); the wheel bundles its
+  own copy.
+- **`test_gpudb` skips the CUDA-only device checks when no device is present**
+  (#174), so the unit binary is meaningful on a machine with no GPU instead of
+  failing checks it cannot run.
+- **`.memory` reports the physical device total** (#173) — every store column
+  counted once plus what each set holds of its own, the number the budget is
+  actually compared with, rather than the sum of the per-set figures, which
+  counts a shared column once per set that reads it (4.5× on one measured
+  session). An `allocated:` line beside it gives what the driver says the
+  process holds, where a backend can answer.
+- **The root `Makefile` refuses to build outside a git checkout** (#173). That
+  path stamps the extension version from `git describe`; built from an unpacked
+  tarball, git's error text lands in the metadata footer and the binary will
+  not load at all. It now stops at `make configure` and says why.
 - sqllogic coverage for the exact surface and a guard against an older
   extension (#148); parity and residency scripts default to the platform's
   build directory (#141); the residency gate measures native shapes (#156); the
@@ -374,6 +422,14 @@ build its constant key from (#164 fixed the sentence, not the decision).
 | Plain SQL on the GPU | yes | yes, on by default — from a binary that carries CUDA | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
 | From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `gpu_build_info()` answers it for whichever binary is in front of you | yes |
+
+**macOS 15 or later on Apple silicon** — the floor the binaries declare, and the
+floor of the binary the registry has been serving. **x86-64 Linux with glibc
+2.34 or newer** (Ubuntu 22.04 and later; the release binary and the platform
+wheel are built there), plus `libgomp.so.1` on the machine at load time, which
+the wheel bundles and a registry install does not. For the GPU on Linux: an
+NVIDIA driver R525 or newer and a card in the sm_75 – sm_90 range. With no
+driver at all the extension still loads and falls back to the CPU backend.
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
 #154) and the path is **on by default** there (#168). On an RTX 4090 Laptop the

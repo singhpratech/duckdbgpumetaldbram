@@ -2,7 +2,7 @@
 
 What shipped in each release, newest first.
 
-### Latest — v0.7.0
+### Latest — v0.7.0 (2026-09-20)
 
 - [x] **Plain DuckDB SQL on the GPU** — a statement is rewritten before DuckDB
   plans it, through DuckDB's own parser and the pure `gpu_rewrite_ast` scalar in
@@ -40,8 +40,19 @@ What shipped in each release, newest first.
   60 seconds, with `last_rewrite()["detail"]` naming the rule in both
   directions.
 - [x] **The `gpudb` shell and the Python package** — a SQL shell whose footer
-  says where each statement ran and why, `.gpu` / `.residents` / `.memory`, and
-  the `duckdb-gpudb` distribution (import name `gpudb`).
+  says where each statement ran and why, `.gpu` / `.residents` / `.memory`
+  (which reports the physical device total, plus what the driver says the
+  process holds), and the `duckdb-gpudb` distribution (import name `gpudb`).
+- [x] **`pip` carries the binary** — the platform wheels for Apple Silicon
+  (macOS 15 or later) and x86-64 Linux (glibc 2.34 or newer) bundle the v0.7.0
+  extension, so `pip install duckdb-gpudb` is the whole install; one binary
+  loads under both DuckDB 1.4.5 and 1.5.5. macOS binaries now declare a 15.0
+  deployment target — the floor of the binary the registry has been serving —
+  and the Linux extension links libstdc++ and libgcc statically so it carries
+  no `GLIBCXX_` floor from its build machine. The unit binary skips the
+  CUDA-only device checks where there is no device, and the root `Makefile`
+  refuses to build outside a git checkout, where the version stamp would be
+  git's error text.
 - [x] Design: [docs/TRANSPARENT_DESIGN.md](TRANSPARENT_DESIGN.md),
   [docs/RESIDENT_COLUMNS_DESIGN.md](RESIDENT_COLUMNS_DESIGN.md);
   journal: [docs/RESEARCH_NOTES.md](RESEARCH_NOTES.md);

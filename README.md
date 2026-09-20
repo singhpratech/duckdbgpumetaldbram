@@ -778,10 +778,11 @@ test` path.
 
 ## Release history
 
-**v0.7.0** — plain DuckDB SQL on the GPU: a statement rewritten before DuckDB
-plans it, the exact operators behind it, the resident column store with narrow
-lanes and a value-aware budget, rule 1 as a running measurement, and the
-`gpudb` shell and Python package. What shipped, theme by theme:
+**v0.7.0** (2026-09-20) — plain DuckDB SQL on the GPU: a statement rewritten
+before DuckDB plans it, the exact operators behind it, the resident column store
+with narrow lanes and a value-aware budget, rule 1 as a running measurement, and
+the `gpudb` shell and Python package, whose platform wheels carry the extension
+binary with them. What shipped, theme by theme:
 **[docs/RELEASE_NOTES_v0.7.md](docs/RELEASE_NOTES_v0.7.md)**. Every release
 and every entry before it, in full:
 **[docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md)**.
