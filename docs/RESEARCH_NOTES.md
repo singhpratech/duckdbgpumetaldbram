@@ -5043,6 +5043,78 @@ failure whose worst case is "behaves like the CPU build" is not the same kind
 of thing as a failure that returns a row, and treating them the same would be
 its own error.
 
+## 2026-09-20 — A gate measures the system it runs on
+
+The CUDA exact path is on by default. What is worth recording is not the flip
+but the two runs of the same gate that bracket it.
+
+The first, on 2026-09-20 with the gate's then-default of
+`--memory-budget unlimited`: exit 1, two cells slower than native, twenty-six
+cells reported as `declined (error)`, device memory climbing to 15807 MiB of
+16376 and pinning there. The second, after the budget was enforced: exit 0,
+1011 PASS, nothing slower, nothing differing, no error declines, memory
+plateauing around 8.4 GiB with a peak of 8557 against a 7967 MiB budget.
+
+Same box, same sweeps, same kernels. One configuration flag.
+
+### What I concluded from the first run, and what was actually true
+
+Two cells lost, and I diagnosed both. `l_returnflag` at three groups was
+admitted by the string-key `few_ok` escape that bypasses `min_groups`; the
+escape is a win on Apple Silicon Metal and 0.97x here, so the constant did not
+transfer. `li left orders: l_suppkey` at ten groups went through the `if join:`
+branch, which has only upper bounds and returns before `topk_min_groups` is
+consulted, so join forms had no lower floor at all — and `est_groups` is
+pre-filter, so the estimate said ten thousand where the truth was ten.
+
+Every one of those statements about the code is true. None of them was why
+those cells lost.
+
+The join cell measured 100.2 ms rewritten in the first run and 4.1 ms in the
+second — a factor of twenty-four. It sat at line 1471 of the first log, in the
+stretch where the card was full and allocations were failing. It was never a
+slow template; it was a measurement of a machine that had run out of memory.
+The `l_returnflag` cell is now declined by the measured rule after one
+rewritten run, which is that rule doing exactly its job.
+
+A per-backend CUDA threshold table had been scoped on the strength of those two
+cells. It is not being written. The constants would have been real, the
+measurements behind them reproducible, and the justification would have
+evaporated the moment anyone re-ran the gate correctly — while the table
+remained, defended by a commit message saying it was measured.
+
+### The general form
+
+A benchmark is a measurement of a system in a state. The state is part of the
+result and is almost never recorded next to it. This gate had no memory cap, so
+by the last third of its run it was benchmarking a full card: every number in
+that region describes memory pressure rather than the query shape the row is
+named after. Nothing in the output said so — the cells reported ratios, and a
+ratio looks like a property of the query.
+
+What made it visible was not suspicion of the numbers but an unrelated
+investigation into an error class, which happened to sample device memory over
+time. The trajectory — monotonic to the card limit — is what reframed every
+ratio measured after it. A run that had merely been slow would have looked
+identical in the table.
+
+The cheap defence is to record the state beside the result. This gate now takes
+the wrapper's own budget by default, `scripts/budget_gate.py` asserts the
+plateau directly, and `scripts/vram_sampler.sh` is in the repository so the
+trajectory can be taken alongside any long run. None of those would have caught
+the original problem by themselves; what catches it is asking, before reading a
+table, what the machine was doing while the table was produced.
+
+### What the flip does not settle
+
+The budget accounts for resident sets and not for operator working memory,
+which is why the plateau sits about 7% above the line. Scratch enters the
+budget only after the fact, through the `needs N MiB of working memory, M MiB
+free` message and the N−M headroom the wrapper then holds back. And TPC-H Q1
+straddles 1.0x on this box — 0.97x through `execute`, 1.03x through `sql` — so
+the one shape that might ever justify a CUDA-specific constant is the one the
+measured rule is currently handling per process.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

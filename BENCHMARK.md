@@ -5320,3 +5320,81 @@ failure mode meanwhile is "the set never becomes resident, so the statement
 stays on DuckDB" — correct answers, never slower than native, just not
 accelerated. That is the safe direction, which is why it does not gate the flip.
 
+## v0.7 — the CUDA exact path on by default, RTX 4090, SF1 (2026-09-20, rerun)
+
+The flip, measured on the tree that merges. Supersedes the earlier default-on
+section: that one was taken before the memory budget was enforced, and the
+difference between the two runs is the most useful thing in this entry.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds on, N=9,
+`data/tpch_sf1/tpch.duckdb`. No environment variable — this is the default.
+
+`gpu_build_info()`: `exact=true join=true global=true narrow=true store=true
+device_memory=16718168064 device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **752 / 752** |
+| SQL suite, default | **225 pass / 0 fail**, 45 guardrail, 2 skip |
+| SQL, `GPUDB_CUDA_EXACT=0` | 223 / 2 — the two assert device capabilities, correct for a disabled path |
+| wrapper (`test_wrapper.py`) | **1258 ok / 0 fail / 0 skip** |
+| TPC-H SF1 `--path execute` | **17 of 22 on the device, 0 differing** |
+| TPC-H SF1 `--path sql` | **17 of 22 on the device, 0 differing** |
+| `scripts/budget_gate.py` | **PASS** — 169 statements, 0 differing, 0 errors, resident never above the budget |
+
+### The two transparent-gate runs, side by side
+
+Same box, same sweeps (`--subqueries --exprs --ctes --inner --lane-floor`).
+The only difference that matters is that the first ran with the gate's old
+default of `--memory-budget unlimited`.
+
+| | unbudgeted | budgeted |
+|---|---|---|
+| exit | 1 | **0** |
+| cells slower than native | 2 | **0** |
+| cells differing | 0 | **0** |
+| `(error)` declines | 26 | **0** |
+| device memory | climbed to 15807 MiB of 16376 and pinned | **plateau ≈ 8.4 GiB, peak 8557 MiB** |
+| minimum ratio | 0.96× | **1.07×** |
+
+The budget is 7967 MiB (half of the card, via `device_memory_bytes()`). The
+peak sits ~7% above that line, and the reason is worth stating rather than
+rounding away: **the budget accounts for resident sets, not for operator
+working memory.** A reduce's temporaries are not in it. The only way scratch
+enters the budget at all is after the fact — an out-of-memory failure reports
+`needs N MiB of working memory, M MiB free`, and the wrapper holds N−M back as
+headroom from then on. So a plateau slightly above the budget is the expected
+shape, not a breach of it.
+
+### The two cells that used to lose
+
+Both were artefacts of the unbudgeted run, and neither was a threshold defect.
+
+| cell | unbudgeted | budgeted |
+|---|---|---|
+| `li left orders: l_suppkey`, EXISTS, topk, 10 groups | native 95.8, rewritten **100.2** ms → 0.96× | native 102.3, rewritten **4.1** ms → **25.19×** |
+| `l_returnflag`, no WHERE, plain, 3 groups | rewritten, 0.97× | **declined (threshold)** after its first run |
+
+The first sat in the region of the log where the card was full and the
+out-of-memory failures were firing: it was not a slow template, it was a
+measurement of a degraded system. The second is the measured rule doing its
+job — one rewritten run, found not worth it, declined thereafter.
+
+A CUDA-specific threshold table was drafted on the strength of those two cells
+and is **not** being written. `_thresholds.TABLE["CUDA"]` stays `METAL`.
+
+### Budget gate
+
+`scripts/budget_gate.py`, 256 MiB budget: physical resident 166–240 MiB at
+every sample, evictions 2 with **wasted 0**, refusals 9, **at most 1 upload
+attempt for any one set**, reasons `{rewritten: 18, threshold: 142, memory: 9}`.
+RSS 178 → 644 MiB. Device memory peaked at 437 MiB across the run.
+
+### The caveat worth carrying
+
+TPC-H **Q1 straddles 1.0×** on this box: 0.97× on `--path execute` and 1.03× on
+`--path sql` in this run, and 0.95–1.04× across earlier runs of the same build.
+The measured rule handles it per process. It is the one shape to re-check if a
+CUDA-specific table is ever reconsidered.
+
