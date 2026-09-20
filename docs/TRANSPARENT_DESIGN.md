@@ -136,6 +136,101 @@ GROUP BY k1 [, k2, k3]
   and keeping it is what makes the direction, NULL order, VARCHAR ordering
   and session defaults native's problem, not ours.
 
+  **Ties (§4.24).** `ORDER BY agg LIMIT k` is not a total order, and when
+  groups share the ordering value the answer is not one answer. The device
+  picks its k rows by its own rule; DuckDB picks by an order that depends on
+  which thread finished which partition. Measured on TPC-H SF1
+  (`SELECT l_orderkey, sum(l_quantity) qty FROM lineitem GROUP BY l_orderkey
+  ORDER BY qty DESC LIMIT 5`, three groups tied at 320.00 for positions 4–5):
+  plain DuckDB returned **5 different orderings and 3 different row SETS over
+  20 runs** at `threads=16`, on 1.4.5 and 1.5.5 alike — deterministic only at
+  `threads=1`. So there is nothing to reproduce and nothing to match; a tie is
+  DuckDB's to choose, and the statement is handed back to it.
+
+  The mechanism is inside the rewritten statement. The device is asked for
+  **k + 1** rows instead of k, and the statement carries
+
+  ```sql
+  QUALIFY CASE WHEN rank() OVER w = row_number() OVER w OR rank() OVER w > k
+               THEN TRUE ELSE error('GPUDB_TIES: …') END     -- w = (ORDER BY <agg> <dir>)
+  ```
+
+  `rank()` and `row_number()` differ on exactly the second and later member of
+  a group of equal values, and `rank() > k` excludes the rows past the k-th,
+  which no `LIMIT k` returns — so this raises when the k-th and (k+1)-th rows
+  tie **and** when two rows inside the top k do (where the row set is right
+  but the order is not). The wrapper answers the user's original statement on
+  DuckDB when it sees `GPUDB_TIES` and reports `reason = "ties"`
+  (`Connection._on_ties`); the shell footer reads
+  `DuckDB (ties: two of the first 5 rows tie on qty, …)`.
+
+  Cost with no tie: one extra row out of the device and two window functions
+  over k + 1 rows — one window specification, so one pass. `execute()` pays
+  nothing else. `sql()` returns a lazy relation that is read after the call
+  has returned, where a raise could not be answered, so it runs the guard on a
+  side cursor first (`_guard_now`) — one extra device top-k, the same bargain
+  the staleness guard already strikes there.
+
+  **The fallback is a loss, and rule 1 is told so.** The tie is decided against
+  the data on every execution, but a tie that does not go away would otherwise
+  cost the device pass *and* DuckDB's run for ever — a dashboard's top-10 over
+  a coarse measure ties every time, and the statement would be permanently
+  slower than native with nothing looking at the arithmetic, which is rule 1's
+  whole job. So the honest rewritten cost of a tied execution (device pass +
+  the native run that followed) is compared against native alone, a comparison
+  that can only go one way, and the template is measured-declined exactly as
+  any losing template is (§9.1) — same reason code, same `measured_declined`
+  flag, same window, with the tie named in `detail`:
+
+  ```
+  DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the
+  device pass costs 10.19 ms on top of native's 11.52 ms, so the template is native from
+  here (re-measured in 60 s))
+  ```
+
+  Coming back needs nothing of its own. After `_REMEASURE_S` the ordinary
+  declined-template path probes the rewritten form on a side cursor; while the
+  tie is there that probe raises and `_probe_ms` answers None, so the template
+  stays native, and once the data stops tying the probe returns a time and the
+  template is rewritten again. A tie that appears once and goes away therefore
+  costs one window and no more — and a write clears the decision outright, so
+  a `DELETE` that removes the tie does not wait for the window at all.
+
+  The decline follows the **literals**, not just the template text: `LIMIT 4`
+  and `LIMIT 5` normalise to one template and do not behave alike here, since
+  the 5th row can tie with the 6th while the first four are in no doubt. The
+  decision is made literal-sensitive and the decline attaches to the k that
+  tied; every other k gets a decision of its own (the §4.10 `variants`
+  machinery) and keeps the device.
+
+  `gpudb.connect(thresholds=False)` turns the measured rule off along with the
+  rest of the table, so there the tie is re-tested on every execution and no
+  template is ever declined — which is what that setting means.
+
+  Two shapes are *not* in doubt and keep the fast path: an `ORDER BY` that is
+  already total (a second key — `ORDER BY qty DESC, k` — is never pushed as a
+  top-k, so DuckDB sorts every group by a total order and the rows are
+  native's), and a `LIMIT k` above the group count with no tie among the
+  groups. `LIMIT … OFFSET` declines earlier, on shape.
+
+  The **explicit** table functions (`gpu_groupby_*_resident_topk`,
+  `gpu_topk_resident`) are unchanged: their documented contract is that the
+  tie order is unspecified (KNOWN_ISSUES.md), and a caller who names them has
+  asked for the device's answer.
+
+  **What this does not cover.** The guard rides on the push, so a `LIMIT` whose
+  top-k is *not* pushed does not carry it: an `ORDER BY` on an aggregate beside
+  a `HAVING`, an `avg` or temporal ordering value on the exact path, and
+  `ORDER BY count(*)` over a v0.6 sum set. Those statements hand every group
+  the device produced to DuckDB, which applies the `ORDER BY … LIMIT` itself —
+  the same multiset of rows native would sort, so the choice among ties is
+  DuckDB's own both ways. It is still not *identical*: DuckDB's top-N is
+  sensitive to the order its input arrives in, and the device's group order is
+  not the hash aggregate's, so at `threads=1` — the one setting where native is
+  reproducible — a tie there can still land differently. Covering it means a
+  window sort over every group returned rather than over k + 1 rows, which is a
+  cost with its own measurements; it is left open rather than guessed at.
+
 **Rejected by field, not by node.** The matcher reads every field of every
 node on the path and declines the statement when any of these is present
 (field names as `json_serialize_sql` emits them, checked 2026-09-03 on

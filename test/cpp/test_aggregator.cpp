@@ -2143,7 +2143,7 @@ void test_cuda_device_fault_is_an_error() {
 
 
 // ---------------------------------------------------------------------------
-// The direct, row-order grouped reduce (v0.8): a GROUP BY key with few
+// The direct, row-order grouped reduce: a GROUP BY key with few
 // distinct values gets a dense group-id lane and the exact operators run one
 // row-order pass over it instead of the sort path's mask + run starts +
 // gather. The choice is backend-private and changes no answer, which is what

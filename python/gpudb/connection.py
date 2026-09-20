@@ -45,9 +45,14 @@ REQUIRED_FUNCTIONS = (
     "gpu_join_materialize", "gpu_rewrite_ast",
 )
 
+# The community registry builds one extension per DuckDB version and installs
+# it under that version's own directory (~/.duckdb/extensions/v<version>/...),
+# so an INSTALL only produces a file THIS client can load when it is run from
+# the same DuckDB version as the `duckdb` module here. (Checked: from DuckDB
+# 1.4.5 the same statement is a 404 while 1.5.5 installs.)
 _NO_EXTENSION = ("the gpudb extension is not loaded on this connection — install it with "
-                 "`INSTALL gpudb FROM community` in DuckDB, or point GPUDB_EXTENSION_PATH "
-                 "at a built one")
+                 "`INSTALL gpudb FROM community` run on the same DuckDB version as this "
+                 "client's `duckdb` module, or point GPUDB_EXTENSION_PATH at a built one")
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 # an aggregate without GROUP BY (§4.12). Over a join it was always worth
 # parsing; over a SINGLE table it is worth parsing since the global masked
@@ -71,6 +76,9 @@ _MAX_STATEMENT_BYTES = 16 * 1024
 _LITERAL_RE = re.compile(r"""('(?:[^']|'')*')|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)""")
 _WS_RE = re.compile(r"\s+")
 STALE_MARKER = "GPUDB_STALE"
+# ... and what a pushed top-k's tie guard says when it stops (_rewrite.ties_qualify):
+# the k it was rendered for and the column the ORDER BY named.
+_TIES_RE = re.compile(r"GPUDB_TIES: the first (\d+) rows are not ordered uniquely by (.*?)(?:\n|$)")
 # measured rule 1 (§9.1): a template is re-measured against native at most this often — one
 # side-cursor probe per template per interval, the user's own statement never the experiment
 _REMEASURE_S = 60.0
@@ -80,7 +88,12 @@ _REMEASURE_S = 60.0
 _LAZY_SIGHTINGS = 3
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
-           "not_found", "manual", "error", "off", "params", "multi", "memory")
+           "not_found", "manual", "error", "off", "params", "multi", "memory",
+           # 'ties': a pushed top-k found the k-th and (k+1)-th rows — or two
+           # rows inside the top k — equal on the value the ORDER BY names, so
+           # which rows come back, and in what order, is DuckDB's to choose
+           # (_rewrite.ties_qualify). Decided per execution, on the data.
+           "ties")
 
 
 def _host_memory_bytes() -> int:
@@ -433,10 +446,17 @@ class Connection:
             # extension at all: every statement on DuckDB, and `detail` saying
             # which functions are absent.
             self._backend = ""
+            # A plain `INSTALL` does nothing when a copy is already installed —
+            # it keeps the file it finds, which is the old one. `FORCE INSTALL`
+            # fetches the current build (measured: the installed file changes
+            # only under FORCE); `UPDATE EXTENSIONS` is the same thing for every
+            # installed extension at once. Neither reaches a process that has
+            # already loaded the old copy, so the advice ends in a restart.
             self._backend_note = (
                 "the loaded gpudb extension is older than this client: it does not provide "
                 + (", ".join(missing[:3]) + (" and %d more" % (len(missing) - 3) if len(missing) > 3 else ""))
-                + " — reinstall it with `INSTALL gpudb FROM community; LOAD gpudb;`")
+                + " — update it with `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), "
+                  "then start a new session")
             return
         self._backend_note = ""
         m = re.search(r"runtime=(\w+)", info)
@@ -771,7 +791,16 @@ class Connection:
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
-                if self._last.rewritten and STALE_MARKER in str(e):
+                if self._last.rewritten and _rewrite.TIES_MARKER in str(e):
+                    # what the device pass cost before it stopped, and what
+                    # DuckDB then charged for the same statement: together they
+                    # are this execution's honest rewritten time (_note_ties_loss)
+                    device_ms = (time.perf_counter() - t0) * 1000.0
+                    self._on_ties(e)
+                    t1 = time.perf_counter()
+                    self._raw.execute(query, parameters)
+                    self._note_ties_loss(device_ms, (time.perf_counter() - t1) * 1000.0)
+                elif self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
                     self._raw.execute(query, parameters)
                 elif self._last.rewritten and "INTERRUPT" not in str(e).upper():
@@ -809,6 +838,28 @@ class Connection:
         and it is what `_shell.Shell.recover` does."""
         if not self._last.rewritten:
             return
+        # A pushed top-k carries its own tie guard (_rewrite.ties_qualify), and
+        # inside execute() that guard raising is enough: the wrapper answers
+        # natively in the `except` around the statement. A relation is read
+        # after sql() has returned, so the guard has to run HERE instead, where
+        # `_on_ties` and the native re-run still are. Ahead of the staleness
+        # guard below, and not behind the decision check after it: a nested
+        # rewrite (§4.14) has no single decision to read and still carries the
+        # clause, and running the statement runs its own row guards anyway.
+        #
+        # It costs a second device top-k for this one statement — the same
+        # bargain the staleness guard strikes, and the price of a lazy
+        # relation. execute() pays nothing but the (k + 1)-th row.
+        if _rewrite.TIES_MARKER in (self._last.sql or ""):
+            cur = self._raw.cursor()
+            t0 = time.perf_counter()
+            try:
+                cur.execute(self._last.sql).fetchall()
+            finally:
+                # what it cost, whether it stopped at a tie or not: `sql()` has
+                # it ready for _note_ties_loss and never times it twice
+                self._ties_device_ms = (time.perf_counter() - t0) * 1000.0
+                cur.close()
         d = getattr(self, "_last_decision", None)
         if d is None or d.plan is None:
             return
@@ -817,6 +868,101 @@ class Connection:
             cur.execute(_rewrite.guard_statement(d.plan, d.fqn, d.tag)).fetchall()
         finally:
             cur.close()
+
+    def _on_ties(self, e: Exception) -> None:
+        """The rewritten statement stopped at a tie: two of the first k rows
+        share the value the ORDER BY names, so which rows a LIMIT returns — and
+        in what order — is DuckDB's to choose. It is given the statement.
+
+        This call is the ANSWER: the statement runs natively from here. What
+        happens to the TEMPLATE is `_note_ties_loss`, below, and the two are
+        separate because only the caller knows what the native run cost.
+
+        The k and the column come out of the raised message rather than off the
+        cached decision: a statement whose LIMIT differs from the template's is
+        re-rendered from its own literals, and only the message that was
+        rendered with it knows which k this run asked for."""
+        m = _TIES_RE.search(str(e))
+        k, col = (m.group(1), m.group(2).strip()) if m else ("", "")
+        rows = f"the first {k} rows" if k else "the top rows"
+        on = f" on {col}" if col else ""
+        self._ties_phrase = f"two of {rows} tie{on}"
+        self._last.rewritten = False
+        self._last.fallback = True
+        self._last.reason = "ties"
+        self._last.detail = (
+            f"two of {rows} tie{on}, so which rows come back — and in what order — is "
+            f"DuckDB's to choose, and DuckDB answered the original")
+        self._log(f"ties: {rows} are not ordered uniquely{on} — DuckDB answered the statement")
+
+    def _note_ties_loss(self, device_ms: float, native_ms: Optional[float]) -> None:
+        """A tie fallback is a LOSS for the template, and the measured rule
+        (§9.1) has to hear about it.
+
+        A tie is a property of the DATA, so the first version of this left the
+        template rewritten and tested the data again on every execution. That
+        is right for a tie that comes and goes, and wrong for one that does
+        not: a dashboard's top-10 over a coarse measure ties every time, and
+        the statement would pay the device pass AND DuckDB's own run for ever,
+        permanently slower than native, with nothing looking at the arithmetic
+        — rule 1's whole job.
+
+        So it is recorded as what it is. The honest rewritten cost of this
+        execution is the device pass plus the native run that followed it;
+        native alone is what the statement costs without us. That comparison
+        can only go one way, so the template is declined by measurement
+        exactly as any losing template is: same reason code, same
+        `measured_declined` flag, same window. No second mechanism, and
+        `last_rewrite()['detail']` says the tie is why.
+
+        Coming back is the ordinary declined-template path and needs nothing
+        of its own: after _REMEASURE_S it probes the rewritten form on a side
+        cursor, and while the tie is there that probe raises — `_probe_ms`
+        answers None and the template stays native. Once the data no longer
+        ties, the probe returns a time and the template is rewritten again. So
+        a tie that appears once and goes away costs one window and no more,
+        and a write clears the decision outright (`_invalidate_all`), which is
+        why an INSERT that removes a tie does not wait for the window at all.
+
+        `native_ms` is None on the `sql()` path, where the wrapper hands back a
+        relation and never sees the native run: the device pass is a certain
+        loss there too, since DuckDB answers the statement either way, and the
+        native time the re-measure needs arrives with the next execution."""
+        d = getattr(self, "_timing_decision", None) or getattr(self, "_last_decision", None)
+        if d is None or not getattr(self, "_thresholds", True):
+            return
+        if not d.probe_sql:
+            d.probe_sql = self._last.sql or ""
+        if not d.probe_sql:
+            return
+        # A tie belongs to the k that was asked for. `LIMIT 4` and `LIMIT 5`
+        # normalise to ONE template and share one decision, and they do not
+        # behave alike here: the 5th row can tie with the 6th while the first
+        # four are in no doubt at all. So the decision is made literal-sensitive
+        # and the decline attaches to THIS statement's literals; every other k
+        # gets a decision of its own (`variants`, the §4.10 machinery) and keeps
+        # the device. `scalar_sql` was rendered for whatever literals the
+        # decision used to carry, so it goes with them.
+        lits = getattr(self, "_last_literals", None)
+        if lits is not None and lits != d.literals:
+            d.literals, d.scalar_sql = lits, ""
+        d.literal_sensitive = True
+        if native_ms is not None:
+            d.native_ms = native_ms if d.native_ms is None else min(d.native_ms, native_ms)
+        cost = device_ms + (native_ms or 0.0)
+        d.rewritten_ms.append(cost)
+        del d.rewritten_ms[:-5]
+        d.timing_checked = True
+        d.next_check_at = time.monotonic() + _REMEASURE_S
+        d.rewritten = False
+        d.reason = "threshold"
+        d.measured_declined = True
+        against = (f"native's {native_ms:.2f} ms" if native_ms is not None
+                   else "whatever native costs")
+        d.why = (f"{getattr(self, '_ties_phrase', 'the top rows tie')}, so DuckDB answers it — "
+                 f"and the device pass costs {device_ms:.2f} ms on top of {against}, so the "
+                 f"template is native from here (re-measured in {_REMEASURE_S:.0f} s)")
+        self._log(f"threshold: {d.why}")
 
     def _on_rewrite_error(self, e: Exception) -> None:
         """The rewritten statement failed for a reason that is not staleness:
@@ -922,6 +1068,12 @@ class Connection:
                 self._note_value()
                 return rel
             except duckdb.Error as e:
+                if self._last.rewritten and _rewrite.TIES_MARKER in str(e):
+                    self._on_ties(e)
+                    # the relation is handed back unread, so there is no native
+                    # time here; the next execution of the template brings one
+                    self._note_ties_loss(getattr(self, "_ties_device_ms", 0.0), None)
+                    return self._raw.sql(query, **kw)
                 if self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
                     return self._raw.sql(query, **kw)
@@ -1194,6 +1346,7 @@ class Connection:
         "decimal": "a DECIMAL this path does not carry",
         "collation": "a collation other than binary is in force",
         "error": "the rewrite raised while deciding",
+        "ties": "the top rows are not ordered uniquely, so the order is DuckDB's to choose",
     }
 
     def _detail(self) -> str:
@@ -1698,6 +1851,9 @@ class Connection:
         sql = self._folded(sql)
         t0 = time.perf_counter()
         template, literals = self._normalise(sql)
+        # kept for _note_ties_loss: a tie belongs to the k this statement asked
+        # for, not to every k the template is ever called with
+        self._last_literals = literals
         key = (template, self._settings_key + ("" if inner_out is None else f"|inner:{inner_out}"))
         d = self._cache.get(key)
         if d is None:

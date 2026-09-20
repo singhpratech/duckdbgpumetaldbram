@@ -4,7 +4,7 @@
 // returns the requested backend, or throws if unavailable.
 //
 // Shared file: any change that breaks the ABI must be coordinated between
-// Linux (CUDA) and macOS (Metal) Claude Code instances via PR.
+// the Linux (CUDA) and macOS (Metal) instances via PR.
 
 #pragma once
 
