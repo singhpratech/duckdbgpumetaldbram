@@ -265,7 +265,11 @@ def run():
     rc, out, _ = shell("--version")
     check(rc == 0 and out.startswith("gpudb ") and gpudb.__version__ in out,
           "python -m gpudb --version")
-    check(console_script(), "the console script `gpudb` resolves after an install")
+    # None = this environment cannot make the check; console_script() has
+    # already said which part of it was missing
+    installed = console_script()
+    if installed is not None:
+        check(installed, "the console script `gpudb` resolves after an install")
 
     print("== a bounded way out")
     bounded_close()
@@ -321,24 +325,41 @@ def console_script():
             venv.create(tmp, with_pip=True, system_site_packages=True)
         except Exception as e:
             skip(f"no virtual environment available ({e})")
-            return True
+            return None
         pip = os.path.join(tmp, "bin", "pip")
         exe = os.path.join(tmp, "bin", "gpudb")
         if not os.path.exists(pip):
             skip("the virtual environment has no pip")
-            return True
+            return None
         p = subprocess.run([pip, "install", "--quiet", "--no-deps", "--no-build-isolation", PKG],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True, timeout=600)
         if p.returncode != 0:
             skip(f"pip install of the package did not run here ({p.stdout.strip()[-200:]})")
-            return True
+            return None
         if not os.path.exists(exe):
             print("  FAIL console script not installed:", os.listdir(os.path.join(tmp, "bin")))
             return False
+        # --no-deps means this environment has to bring its own `duckdb`, and
+        # --system-site-packages only inherits the packages of the interpreter
+        # `venv` was told to build from. Run from a virtual environment of its
+        # own (`venv155/bin/python`), the new one is built from that venv's
+        # BASE interpreter and inherits nothing, so the entry point dies on
+        # `import duckdb` — which says nothing about the entry point. It is a
+        # skip there and a hard check everywhere the import works.
+        p = subprocess.run([os.path.join(tmp, "bin", "python"), "-c", "import duckdb"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=300)
+        if p.returncode != 0:
+            skip("the throwaway virtual environment cannot import duckdb (--no-deps, and "
+                 "--system-site-packages inherited none), so the entry point cannot start")
+            return None
         p = subprocess.run([exe, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True, timeout=300)
-        return p.returncode == 0 and p.stdout.startswith("gpudb ")
+        if p.returncode != 0 or not p.stdout.startswith("gpudb "):
+            print("  FAIL console script did not run:", p.stdout.strip()[-200:])
+            return False
+        return True
 
 
 def interactive():
