@@ -3882,11 +3882,68 @@ already strikes on that path. With a tie: the device pass, then DuckDB's own
 answer; the statement is slower than native by the device pass, and it is
 correct.
 
-The decline is **per execution, never cached**, because a tie is a property of
-the data and not of the shape: an `INSERT` can put one into a template that had
-none, and a `DELETE` can take it away (both directions are in the suite). The
-template stays rewritten, and a run that raised recorded no rewritten time, so
-the measured rule (§9.1) sees nothing from it either.
+### The second version: a tie that does not go away
+
+The first version of this left the template rewritten and re-tested the data on
+every execution, on the grounds that a tie is data and not shape. That is right
+for a tie that comes and goes and wrong for one that does not. A dashboard's
+top-10 over a coarse measure ties on every execution, and that statement would
+have paid the device pass **and** DuckDB's own run for ever — permanently
+slower than native, with nothing looking at the arithmetic, which is rule 1's
+whole job. Recorded as "no rewritten time", it was invisible to the one
+mechanism built to catch exactly this.
+
+So the fallback is recorded as what it is. The honest rewritten cost of a tied
+execution is the device pass plus the native run that followed it; native alone
+is what the statement costs without us; that comparison can only go one way. So
+the template is measured-declined exactly as any losing template is — same
+reason code, same `measured_declined` flag, same window — and the tie is named
+in `detail` rather than in a second reason code:
+
+```
+DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the
+device pass costs 10.19 ms on top of native's 11.52 ms, so the template is native from
+here (re-measured in 60 s))
+```
+
+Coming back needed no new code at all, which is the part worth writing down.
+The declined-template path already probes the rewritten form on a side cursor
+after `_REMEASURE_S`, and `_probe_ms` already answers None when the probe
+raises. While the tie is there the probe raises `GPUDB_TIES` and the template
+stays native; once the data stops tying the probe returns a time and the
+template is rewritten again. A tie that appears once and goes away costs one
+window and no more — and a write clears the decision outright, so the `DELETE`
+that removes a tie does not wait for the window at all.
+
+One thing the template alone could not express. `LIMIT 4` and `LIMIT 5`
+normalise to ONE template and share one decision, and here they genuinely do
+not behave alike: the 5th row can tie with the 6th while the first four are in
+no doubt. Declining the template would have taken a k that never tied down with
+the one that did. The machinery for this already exists for computed lanes that
+embed a literal (§4.10, `literal_sensitive` + `variants`), so the decline
+attaches to the literals that tied and every other k gets a decision of its own
+and keeps the device. Measured on SF1: `LIMIT 5` declined, `LIMIT 3` still
+`form=topk`.
+
+Measured, on the reported SF1 statement, `thresholds` on:
+
+| execution | what runs | time |
+|---|---|---|
+| 1st | device pass (10.19 ms) + DuckDB's answer (11.52 ms) | 21.7 ms of work |
+| 2nd … 8th | DuckDB alone, no device pass at all | 9.9 – 11.5 ms |
+| native alone, same connection | — | 9.6 – 10.0 ms |
+
+From the second execution on, `last_rewrite()["sql"]` is empty and
+`fallback` is False — the wrapper handed DuckDB no rewritten statement, so no
+device top-k ran, which the suite asserts twice over (that pair, and
+`gpu_last_stats()` unchanged). An untied top-k template is untouched by any of
+this; the suite pins that too.
+
+`gpudb.connect(thresholds=False)` turns the measured rule off with the rest of
+the table, so there the tie is re-tested on every execution and no template is
+ever declined. That is what the setting means, and it is why the parity
+connections in the suite — which run with thresholds off on purpose — see a tie
+decline on every execution.
 
 Untouched: the explicit `gpu_groupby_*_resident_topk` / `gpu_topk_resident`
 table functions, whose documented contract is that the tie order is unspecified

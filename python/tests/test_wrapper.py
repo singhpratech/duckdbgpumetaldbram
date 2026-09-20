@@ -2297,9 +2297,9 @@ def run():
 TIES_SETUP = "CREATE TABLE tk AS SELECT (i % 500)::BIGINT AS k, (i % 500)::BIGINT AS v FROM range(300000) r(i);"
 
 
-def ties_native(sql, *inserts):
+def ties_native(sql, *inserts, setup=None):
     c = duckdb.connect()
-    c.execute(TIES_SETUP)
+    c.execute(setup or TIES_SETUP)
     for i in inserts:
         c.execute(i)
     rows = c.execute(sql).fetchall()
@@ -2454,7 +2454,86 @@ def ties_checks():
               "ties: and both rewrite the same tie-free top-k to the same rows")
         py.close()
     con.close()
+    ties_rule1()
     ties_tpch()
+
+
+# 150K groups of two rows each: sum(v) = 2k, distinct for every group, and
+# above `topk_min_groups` so the thresholds admit the top-k at all. Adding 2 to
+# group 149994 makes its sum group 149995's — the 5th and 6th rows of an
+# ORDER BY … DESC tie, and nothing below the 5th does.
+RULE1_SETUP = ("CREATE TABLE tr AS SELECT (i % 150000)::BIGINT AS k, (i % 150000)::BIGINT AS v "
+               "FROM range(300000) r(i);")
+RULE1_TIE = "INSERT INTO tr VALUES (149994, 2)"
+
+
+def ties_rule1():
+    """Rule 1 under a tie that does not go away.
+
+    A tie fallback costs the device pass AND DuckDB's own run. Leaving the
+    template rewritten would be right for a tie that comes and goes and wrong
+    for one that does not — a dashboard's top-10 over a coarse measure ties on
+    every execution, and the statement would be permanently slower than native
+    with nothing looking at the arithmetic. So the fallback is recorded as the
+    loss it is and the template is measured-declined like any other, with the
+    tie named in `detail`; the ordinary re-measure brings it back when the data
+    stops tying, and a write brings it back at once.
+
+    Needs `thresholds=True`: the measured rule IS the thresholds, and the
+    parity connections above run with them off (every shape rewritten), which
+    is why the checks before this one see a tie decline on every execution."""
+    print("== top-k ties and rule 1: a tie that does not go away is a measured loss")
+    con = fresh(thresholds=True)
+    if not has_device(con):
+        skip("top-k ties and rule 1 — needs a GPU backend")
+        con.close()
+        return
+    con.execute(RULE1_SETUP)
+    q = "SELECT k, sum(v) AS s FROM tr GROUP BY k ORDER BY s DESC LIMIT {}"
+    con.execute(RULE1_TIE)
+    check(tie_is_there(con, "SELECT sum(v) AS s FROM tr GROUP BY k ORDER BY s DESC LIMIT 6"),
+          "rule1/ties: the 5th and 6th rows really do tie (checked on DuckDB)")
+
+    first = con.execute(q.format(5)).fetchall()
+    lr = con.last_rewrite()
+    check(not lr["rewritten"] and lr["reason"] == "ties" and lr["fallback"] and lr["sql"],
+          f"rule1/ties: the first execution tries the device and falls back (reason={lr['reason']})")
+    if lr["reason"] != "ties":
+        skip("rule1/ties: this build declined the shape before the device saw it")
+        con.close()
+        return
+    # ... and from here the device is not tried again: `sql` empty and
+    # `fallback` False together mean the wrapper handed DuckDB no rewritten
+    # statement at all, so no device top-k ran.
+    stats = con._raw.execute("SELECT gpu_last_stats()").fetchone()[0]
+    for n in (2, 3):
+        rows = con.execute(q.format(5)).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and not lr["fallback"] and not lr["sql"],
+              f"rule1/ties: execution {n} runs no device pass (sql={lr['sql'][:20]!r})")
+        check(con._raw.execute("SELECT gpu_last_stats()").fetchone()[0] == stats,
+              f"rule1/ties: execution {n} left the resident operator untouched")
+        check(rows == ties_native(q.format(5), RULE1_TIE, setup=RULE1_SETUP)
+              or [r[1] for r in rows] == [r[1] for r in ties_native(q.format(5), RULE1_TIE, setup=RULE1_SETUP)],
+              f"rule1/ties: execution {n} is DuckDB's answer")
+    check("tie" in lr["detail"] and lr["reason"] == "threshold",
+          f"rule1/ties: the measured decline says the tie is why ({lr['detail'][:110]})")
+
+    # the decline belongs to the k that tied: LIMIT 4 is a different literal of
+    # the same template text and is in no doubt, so it keeps the device
+    con.execute(q.format(4)).fetchall()
+    lr4 = con.last_rewrite()
+    check(lr4["rewritten"] and lr4["form"] == "topk",
+          f"rule1/ties: a k below the tie keeps the device (reason={lr4['reason']})")
+
+    # a write clears the decision, so removing the tie brings the template back
+    # without waiting for the re-measure window
+    con.execute("DELETE FROM tr WHERE k = 149994 AND v = 2")
+    con.execute(q.format(5)).fetchall()
+    lr = con.last_rewrite()
+    check(lr["rewritten"] and lr["form"] == "topk",
+          f"rule1/ties: once the tie is deleted the template is rewritten again (reason={lr['reason']})")
+    con.close()
 
 
 def ties_tpch():

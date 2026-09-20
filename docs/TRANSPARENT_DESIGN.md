@@ -171,11 +171,41 @@ GROUP BY k1 [, k2, k3]
   side cursor first (`_guard_now`) — one extra device top-k, the same bargain
   the staleness guard already strikes there.
 
-  The decision is **per execution and never cached**: a tie is a property of
-  the data, so an `INSERT` can put one into a template that had none and a
-  `DELETE` can take it away. The template stays rewritten, the measured rule
-  (§9.1) sees no rewritten time from a run that raised, and the next execution
-  asks the data again.
+  **The fallback is a loss, and rule 1 is told so.** The tie is decided against
+  the data on every execution, but a tie that does not go away would otherwise
+  cost the device pass *and* DuckDB's run for ever — a dashboard's top-10 over
+  a coarse measure ties every time, and the statement would be permanently
+  slower than native with nothing looking at the arithmetic, which is rule 1's
+  whole job. So the honest rewritten cost of a tied execution (device pass +
+  the native run that followed) is compared against native alone, a comparison
+  that can only go one way, and the template is measured-declined exactly as
+  any losing template is (§9.1) — same reason code, same `measured_declined`
+  flag, same window, with the tie named in `detail`:
+
+  ```
+  DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the
+  device pass costs 10.19 ms on top of native's 11.52 ms, so the template is native from
+  here (re-measured in 60 s))
+  ```
+
+  Coming back needs nothing of its own. After `_REMEASURE_S` the ordinary
+  declined-template path probes the rewritten form on a side cursor; while the
+  tie is there that probe raises and `_probe_ms` answers None, so the template
+  stays native, and once the data stops tying the probe returns a time and the
+  template is rewritten again. A tie that appears once and goes away therefore
+  costs one window and no more — and a write clears the decision outright, so
+  a `DELETE` that removes the tie does not wait for the window at all.
+
+  The decline follows the **literals**, not just the template text: `LIMIT 4`
+  and `LIMIT 5` normalise to one template and do not behave alike here, since
+  the 5th row can tie with the 6th while the first four are in no doubt. The
+  decision is made literal-sensitive and the decline attaches to the k that
+  tied; every other k gets a decision of its own (the §4.10 `variants`
+  machinery) and keeps the device.
+
+  `gpudb.connect(thresholds=False)` turns the measured rule off along with the
+  rest of the table, so there the tie is re-tested on every execution and no
+  template is ever declined — which is what that setting means.
 
   Two shapes are *not* in doubt and keep the fast path: an `ORDER BY` that is
   already total (a second key — `ORDER BY qty DESC, k` — is never pushed as a
