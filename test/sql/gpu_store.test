@@ -209,11 +209,31 @@ SELECT (SELECT list(column_name) FROM (DESCRIBE SELECT * FROM gpu_store_columns(
 -- different backends". NULL where no backend installs a placement reporter, and
 -- an absent answer is not "on the host" — which is why the check reads
 -- 'on_gpu IS NULL OR on_gpu'.
+--
+-- Gated on a GPU runtime because "nothing is on the host" is a property of the
+-- BACKEND and not of the query: a CPU-only build places every lane on the host
+-- by definition and answers false / 2 here, correctly. Case 11b below is that
+-- same fact asserted from the other side, so the CPU build still checks
+-- something true rather than skipping the column altogether.
+-- requires_backend: gpu
 -- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(120000) r(i)
 -- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
 -- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
 SELECT (SELECT bool_and(on_gpu IS NULL OR on_gpu) FROM gpu_store_columns()) AS nothing_on_the_host,
        (SELECT count(*) FROM gpu_store_columns() WHERE on_gpu IS NOT NULL AND NOT on_gpu) AS host_lanes;
+-- expect: true  0
+
+-- 11b. The same column on a CPU-only build: there is no device, so every lane
+-- is on the host and says so. The point of asserting it is that `on_gpu` must
+-- be ANSWERED rather than left NULL — the hybrid planner knows where it put the
+-- column whichever side that was, and a build that reported NULL here would be
+-- one where the wrapper could not tell a host-placed set from an unknown one.
+-- requires_backend: cpu
+-- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(120000) r(i)
+-- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
+-- setup: SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t
+SELECT (SELECT bool_and(NOT on_gpu) FROM gpu_store_columns()) AS every_lane_on_the_host,
+       (SELECT count(*) FROM gpu_store_columns() WHERE on_gpu IS NULL) AS unanswered;
 -- expect: true  0
 
 -- 12. An exact upload the DEVICE refuses is reported, not placed on the host:
