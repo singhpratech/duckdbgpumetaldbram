@@ -165,11 +165,32 @@ GROUP BY k1 [, k2, k3]
   `DuckDB (ties: two of the first 5 rows tie on qty, …)`.
 
   Cost with no tie: one extra row out of the device and two window functions
-  over k + 1 rows — one window specification, so one pass. `execute()` pays
-  nothing else. `sql()` returns a lazy relation that is read after the call
-  has returned, where a raise could not be answered, so it runs the guard on a
-  side cursor first (`_guard_now`) — one extra device top-k, the same bargain
-  the staleness guard already strikes there.
+  over k + 1 rows — one window specification, so one pass. Measured on TPC-H
+  SF1 (`l_partkey` top-5, round-robin against the pre-guard form so neither
+  owns the device's clock state): **8.9 ms against 8.2 ms**, +0.4 ms of it the
+  windows and the (k+1)-th row. `execute()` pays that and nothing else.
+
+  `sql()` returns a lazy relation that is read after the call has returned,
+  where a raise could not be answered, so it runs the guard on a side cursor
+  first (`_guard_now`) — and for a pushed top-k the device pass IS the
+  statement, so that is the whole statement a second time, not a `count(*)`
+  like the staleness guard beside it. Paid on every call it would double the
+  shape: 8.5 ms through `execute()` became 17.1 ms through `sql()`, against
+  14.7–17.7 ms of native (the regression #164 shipped; docs/RESEARCH_NOTES.md,
+  2026-09-20). So the verdict is **remembered** (`_ties_guard`): whether the
+  first k ordering values tie is a function of the rendered statement — its
+  tag, its lanes, its literals, its k — and of the data the resident set
+  holds, and the device computes the top-k from that set rather than from the
+  table. Neither can move without the sets being dropped, so the entry is
+  dropped exactly where they are: `_invalidate_all` (any write, DDL, `SET`,
+  `ATTACH` or foreign write the wrapper sees, from any cursor of the family),
+  `_on_stale` (the row count moved under the set) and `_on_rewrite_error`. The
+  statement's own `gpu_assert_rows` guard runs immediately before the verdict
+  is read, so a row count that no longer matches the set has already raised. A
+  *tie* verdict is never cached: it raises, and the template is measured-
+  declined below, which is a stronger answer than a cache entry. From the
+  second call on the guard costs a dict lookup, and `sql()` costs what
+  `execute()` costs (8.7 ms against 8.6 ms, same statement, same session).
 
   **The fallback is a loss, and rule 1 is told so.** The tie is decided against
   the data on every execution, but a tie that does not go away would otherwise
@@ -373,19 +394,39 @@ returned. Both go through one `_route`, one template cache, one set of
 thresholds, and both fall back the same way. Two things the lazy relation
 forces, and neither is papered over:
 
-* **Rule 1 is measured from side cursors on the `sql()` side.** `execute()`
-  times the user's own run and probes native once per template per interval
-  (§9.1). `sql()` has no run to time — timing the bind would be timing the
-  wrong thing — so it times the rewritten form and the original on a cursor
-  each, at most once per template per interval, and writes the verdict into
-  the same decision `execute()` uses. A template the two calls share is
-  measured once for both. The caller's relation is never the experiment.
-  The pair costs one execution more than the single native probe `execute()`
-  already pays, and it is spent on the same terms: `execute()` measures a
-  template after its third rewritten run, so `sql()` measures one after its
-  third sighting. A statement asked once is never made three times as slow
-  to settle a question about a template that is not coming back — and the
-  thresholds, which cost nothing, have already decided that one.
+* **Rule 1 is measured from side cursors on the `sql()` side, and it is
+  measured on the PATH.** `execute()` times the user's own run and probes
+  native once per template per interval (§9.1). `sql()` has no run to time —
+  timing the bind would be timing the wrong thing — so it times the rewritten
+  form and the original on a cursor each, at most once per template per
+  interval. The caller's relation is never the experiment. The pair costs one
+  execution more than the single native probe `execute()` already pays, and it
+  is spent on the same terms: `execute()` measures a template after its third
+  rewritten run, so `sql()` measures one after its third sighting **on this
+  path**, even when `execute()` has already measured the template. A statement
+  asked once is never made three times as slow to settle a question about a
+  template that is not coming back — and the thresholds, which cost nothing,
+  have already decided that one. The third sighting rather than the first is
+  also what makes the number honest: the first sighting through `sql()` is the
+  call that asks the device for the §4.24 tie verdict, so it pays a cost no
+  repeat caller pays.
+
+  What is compared against native is the rewritten form's probe **plus what
+  the guards below cost this call**, because that is what a caller on this
+  path pays. The verdict then belongs to the path: `Decision.lazy_ms`,
+  `lazy_declined`, `lazy_next_check_at` are the `sql()` path's, and a template
+  declined there is still rewritten for `execute()` if it wins there
+  (`last_rewrite()['detail']` says `measured … rewritten through sql() vs …
+  native`). The asymmetry is real and only goes one way: `sql()` costs what
+  `execute()` costs plus the guards, so a template whose STATEMENT is not
+  faster than native loses on both paths and is declined on both — which is
+  why the statement's own probe, and the verdict it supports, stay shared. The
+  path is deliberately NOT in the decision's cache key: the plan, the
+  residency decision and the output-size bound belong to the template, and a
+  second decision per path would decide and upload twice while never reaching
+  the output-size check at all (see the next bullet). Timing the statement
+  instead of the path is what let a pushed top-k stay rewritten at 8 ms
+  measured while the caller paid 17 (docs/RESEARCH_NOTES.md, 2026-09-20).
 * **The output-size check waits.** `_check_output_size` reads the operator's
   `rows_out` *after* it has run, which through `sql()` is after the call has
   returned. The decision keeps `output_checked` false, so the first
@@ -402,6 +443,14 @@ caller's first fetch still reaches the relation's own guard and raises
 there, where the wrapper is no longer in the call; `execute()` on the same
 statement is the way back, and that is exactly what the shell's `recover()`
 does. The same holds for any error that only appears at materialisation.
+
+A pushed top-k's tie guard (§2, §4.24) has to come back inside the call for
+the same reason, and it is not a `count(*)`: it is the statement. So it runs
+**after** the staleness guard — a set whose row count has moved is not worth
+asking about ties — and its answer is remembered per rendered statement for
+as long as the resident sets stand, which makes it one device pass per data
+version rather than one per call. §2 has the invalidation rules and the
+measurements.
 
 ### 3.4 What this removes from the plan
 No C++ extension API migration; `third_party/duckdb_capi/` and
@@ -2219,6 +2268,21 @@ same `GROUP BY` consumed inside DuckDB by four different consumers, §4.23) and
 row floor should count). `--forms` restricts a run to named forms and
 `--no-thresholds` turns every bound off, which is how the tables those bounds
 are read off are collected; neither is the shipping configuration.
+
+**`--path` picks the entry point**, and both sides of a cell go through the
+same one. The wrapper has two public ones and they do not cost the same: a
+lazy relation runs the statement's own guards on side cursors inside the call
+(§3.3). Until 2026-09-20 every cell here went through `execute()`, and a gate
+that measures one door proves nothing about the other — it passed on the
+commit that made every pushed top-k through `sql()`, the path the `gpudb`
+shell takes, slower than native (RESEARCH_NOTES.md, 2026-09-20). The default
+is now `auto`: `execute()` for every form, plus `sql()` for the top-k forms,
+whose guard is a device pass of its own — about one minute on top of the
+gate's twelve. `--path both` forces both everywhere, `--path sql` neither.
+`scripts/tpch_coverage.py` takes the same flag with `execute|sql` (one row per
+query, so `both` would be a second table rather than a wider one).
+`wrapper_residency_gate.py` stays on `execute()`: every statement it times is
+a *declined* one, where `sql()` adds a relation object and no guard at all.
 
 Every rewritable shape and every §9.1 sweep point, transparent vs native,
 same process, warm, min-of-N with N ≥ 5 and the GPU clock printed beside

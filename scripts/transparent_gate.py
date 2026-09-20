@@ -11,9 +11,22 @@ Rows the wrapper rewrote and that came out below RATIO_MIN (default 1.0)
 FAIL; rows the wrapper declined are printed with the reason and never fail.
 The losing side of every sweep stays printed.
 
+A cell is measured through the wrapper entry point `--path` names, and both
+sides of the ratio go through the same one. `execute()` runs the statement
+inside the call; `sql()` hands back a lazy relation and therefore runs the
+statement's own guards on side cursors first (docs/TRANSPARENT_DESIGN.md §3.3
+and §4.24), which is real cost for the user and is what the `gpudb` shell
+pays. Measuring only `execute()` says nothing about the other path: it is how
+a 2x top-k could turn into 0.9x through `sql()` and the gate still pass
+(docs/RESEARCH_NOTES.md, 2026-09-20). The default `auto` therefore measures
+every form through `execute()` and the top-k forms — the ones that carry a
+device-pass guard — through both, which costs about one extra minute of the
+gate's ~12.
+
 Usage:
   python3 scripts/transparent_gate.py [--db data/tpch_sf1/tpch.duckdb] [--n 5]
                                       [--min-ratio 1.0] [--keys l_orderkey,l_partkey,...]
+                                      [--path auto|execute|sql|both]
 Needs a built extension (build-macos / build-linux) or GPUDB_EXTENSION_PATH.
 """
 from __future__ import annotations
@@ -181,6 +194,26 @@ def lane_where(kind: str, own_key: str, big: str, big_key: str, filt: str, paylo
 
 PACE_S = 0.0     # --pace-ms: idle gap before EVERY timed statement
 
+# The two entry points a client has, and what a form is measured through by
+# default. A pushed top-k is the shape whose `sql()` guard is a device pass of
+# its own (§4.24), so it is the one `auto` measures on both paths.
+BOTH_FORMS = ("topk",)
+
+
+def run_path(con, sql: str, path: str):
+    """One execution of `sql` through the entry point `path` names, rows
+    fetched — the whole of what a client pays on that path."""
+    if path == "sql":
+        rel = con.sql(sql)
+        return rel.fetchall() if rel is not None else []
+    return con.execute(sql).fetchall()
+
+
+def paths_for(form: str, arg: str) -> tuple:
+    if arg == "auto":
+        return ("execute", "sql") if form in BOTH_FORMS else ("execute",)
+    return ("execute", "sql") if arg == "both" else (arg,)
+
 
 def time_min(run, n: int) -> float:
     """Hot loop: the minimum of n back-to-back runs. Paced (--pace-ms): the
@@ -225,6 +258,10 @@ def main() -> int:
                     help="add EXISTS / IN / correlated scalar subquery predicates (BOOLEAN lanes, §4.18)")
     ap.add_argument("--forms", default="all",
                     help="'all' or a ','-separated list of form names to restrict the sweep to")
+    ap.add_argument("--path", default="auto", choices=("auto", "execute", "sql", "both"),
+                    help="the wrapper entry point both sides of a cell are measured through: "
+                         "execute(), sql() (the lazy relation the gpudb shell uses), both, or "
+                         "'auto' (default) — both for the top-k forms, execute() elsewhere")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
     ap.add_argument("--memory-budget", default="unlimited",
                     help="device memory budget for the run (§5.5); the gate sweeps more distinct sets than a "
@@ -257,11 +294,11 @@ def main() -> int:
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
     rows_total = con._raw.execute("SELECT count(*) FROM lineitem").fetchone()[0]
     print(f"# transparent_gate — {args.db} ({rows_total:,} rows), {info}, N={args.n}, min ratio {args.min_ratio}, "
-          f"payload columns {args.payloads}, "
+          f"payload columns {args.payloads}, path {args.path}, "
           + (f"paced {args.pace_ms:.0f} ms (medians)" if PACE_S > 0 else "hot loop (minimums)"))
     print()
-    print("| key | WHERE | selectivity | form | rows out | native ms | transparent ms | ratio | result |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| key | WHERE | selectivity | form | path | rows out | native ms | transparent ms | ratio | result |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
 
     keys = [k for k in args.keys.split(",") if k]
     wheres = list(WHERES) if args.wheres == "all" else args.wheres.split(";")
@@ -314,18 +351,18 @@ def main() -> int:
             if args.forms != "all":
                 want = args.forms.split(",")
                 forms = tuple(f for f in forms if f in want)
-            for form in forms:
+            for form, path in [(f, p) for f in forms for p in paths_for(f, args.path)]:
                 sql = build(key, where, form, thr_s, source, args.payloads)
-                # native
+                # native, through the same entry point as the transparent side
                 con.transparent = False
-                nat = con.execute(sql).fetchall()
-                t_nat = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                nat = run_path(con, sql, path)
+                t_nat = time_min(lambda: run_path(con, sql, path), args.n)
                 # transparent (first call may upload; timed calls are warm)
                 con.transparent = True
-                got = con.execute(sql).fetchall()
+                got = run_path(con, sql, path)
                 lr = con.last_rewrite()
                 if not lr["rewritten"]:
-                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {path} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"declined ({lr['reason']}) |")
                     continue
                 if form in ("global", "nested"):
@@ -340,13 +377,14 @@ def main() -> int:
                     identical = sorted(str(r[1]) for r in got) == sorted(str(r[1]) for r in nat)
                 else:
                     identical = sorted(map(str, got)) == sorted(map(str, nat))
-                t_tr = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                t_tr = time_min(lambda: run_path(con, sql, path), args.n)
                 lr2 = con.last_rewrite()
                 if not lr2["rewritten"]:
                     # the once-per-template output-size check sent the template
-                    # back to native after its first rewritten run: the timed
-                    # runs were native, there is no ratio to report
-                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(nat)} | {t_nat:.1f} | — | — | "
+                    # back to native after its first rewritten run — or, on the
+                    # sql() path, the measured rule declined it there (§9.1):
+                    # the timed runs were native, there is no ratio to report
+                    print(f"| {key_label} | {where or '—'} | {sel} | {form} | {path} | {len(nat)} | {t_nat:.1f} | — | — | "
                           f"{'declined after the first run' if identical else 'FAIL rows differ'} ({lr2['reason']}) |")
                     if not identical:
                         fails.append((key_label, where, form, 0.0, identical))
@@ -368,8 +406,8 @@ def main() -> int:
                     for transparent in (False, True):
                         con.transparent = transparent
                         for _w in range(20):
-                            con.execute(sql).fetchall()
-                        t = time_min(lambda: con.execute(sql).fetchall(), args.n)
+                            run_path(con, sql, path)
+                        t = time_min(lambda: run_path(con, sql, path), args.n)
                         if transparent:
                             t_tr = min(t_tr, t)
                         else:
@@ -379,8 +417,8 @@ def main() -> int:
                 ok = identical and ratio >= args.min_ratio
                 result = "PASS" if ok else ("FAIL rows differ" if not identical else "FAIL")
                 if not ok:
-                    fails.append((key_label, where, form, ratio, identical))
-                print(f"| {key_label} | {where or '—'} | {sel} | {form} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
+                    fails.append((f"{key_label} [{path}]", where, form, ratio, identical))
+                print(f"| {key_label} | {where or '—'} | {sel} | {form} | {path} | {len(got)} | {t_nat:.1f} | {t_tr:.1f} | "
                       f"{ratio:.2f}× | {result} |")
                 sys.stdout.flush()
     print()

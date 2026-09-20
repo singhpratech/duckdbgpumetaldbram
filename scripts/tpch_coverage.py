@@ -9,8 +9,15 @@ both (hot loop, minimum of N; rewritten queries are warmed first). It is a
 coverage map, not a gate: nothing fails on a declined query. A rewritten
 query whose rows differ from native DOES exit non-zero.
 
+Both sides go through one wrapper entry point, `--path`: `execute()` by
+default, or `sql()` — the lazy relation the `gpudb` shell hands back, which
+runs the statement's own guards on side cursors inside the call
+(docs/TRANSPARENT_DESIGN.md §3.3). The two can differ in both time and
+coverage, since the measured rule 1 decides per path (§9.1).
+
 Usage:
   python3 scripts/tpch_coverage.py [--db data/tpch_sf1/tpch.duckdb] [--n 5] [--no-thresholds]
+                                   [--path execute|sql]
 """
 from __future__ import annotations
 import argparse
@@ -21,6 +28,14 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "python"))
 import duckdb  # noqa: E402
 import gpudb   # noqa: E402
+
+
+def run_path(con, sql: str, path: str):
+    """One execution through the entry point `path` names, rows fetched."""
+    if path == "sql":
+        rel = con.sql(sql)
+        return rel.fetchall() if rel is not None else []
+    return con.execute(sql).fetchall()
 
 
 def best(run, n):
@@ -37,6 +52,9 @@ def main() -> int:
     ap.add_argument("--db", default="data/tpch_sf1/tpch.duckdb")
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--no-thresholds", action="store_true", help="rewrite every shape the engine accepts")
+    ap.add_argument("--path", default="execute", choices=("execute", "sql"),
+                    help="the wrapper entry point both sides are measured through: execute() (default) "
+                         "or sql(), the lazy relation the gpudb shell uses")
     ap.add_argument("--memory-budget", default=None,
                     help="device memory budget (§5.5), e.g. 40GB or unlimited; default: the wrapper's default "
                          "(a quarter of unified memory) — at SF50 the 22 queries need more than that back-to-back")
@@ -58,7 +76,8 @@ def main() -> int:
                         floor_rows=0 if args.no_thresholds else 1_000_000,
                         thresholds=not args.no_thresholds, log=logs.append)
     info = con._raw.execute("SELECT gpu_build_info()").fetchone()[0]
-    print(f"# TPC-H coverage — {args.db}, {info}, thresholds {'off' if args.no_thresholds else 'on'}, N={args.n}")
+    print(f"# TPC-H coverage — {args.db}, {info}, thresholds {'off' if args.no_thresholds else 'on'}, "
+          f"path {args.path}, N={args.n}")
     print()
     print("| query | path | native ms | transparent ms | ratio | identical | note |")
     print("|---|---|---|---|---|---|---|")
@@ -66,10 +85,10 @@ def main() -> int:
     for nr, sql in queries:
         sql = sql.strip().rstrip(";")
         con.transparent = False
-        nat, t_nat = best(lambda: con.execute(sql).fetchall(), args.n)
+        nat, t_nat = best(lambda: run_path(con, sql, args.path), args.n)
         con.transparent = True
         mark = len(logs)
-        got = con.execute(sql).fetchall()
+        got = run_path(con, sql, args.path)
         lr = con.last_rewrite()
         if not lr["rewritten"]:
             why = [x for x in logs[mark:] if "declined" in x or "threshold" in x or "split" in x]
@@ -77,8 +96,8 @@ def main() -> int:
             print(f"| Q{nr} | native ({lr['reason']}) | {t_nat:.1f} | — | — | — | {note} |")
             continue
         for _ in range(15):
-            con.execute(sql).fetchall()
-        got, t_tr = best(lambda: con.execute(sql).fetchall(), args.n)
+            run_path(con, sql, args.path)
+        got, t_tr = best(lambda: run_path(con, sql, args.path), args.n)
         same = got == nat or sorted(map(str, got)) == sorted(map(str, nat))
         rewritten += 1
         wrong += 0 if same else 1
