@@ -2111,7 +2111,17 @@ extern "C" void        gpudb_cuda_debug_release(void* p);
 
 void test_cuda_failed_upload_leaves_nothing() {
     std::printf("  a refused exact upload frees what it touched:\n");
-    auto agg = gpudb::make_aggregator(gpudb::Backend::CUDA);
+    // Same skip rule as test_backend(): CUDA can be compiled in on a machine
+    // with no device (a build container, a CPU-only box), and there
+    // make_aggregator throws. Without this the binary aborts on an uncaught
+    // exception instead of finishing the checks that do not need a device.
+    std::unique_ptr<gpudb::Aggregator> agg;
+    try {
+        agg = gpudb::make_aggregator(gpudb::Backend::CUDA);
+    } catch (const std::exception& e) {
+        std::printf("    SKIP (%s)\n", e.what());
+        return;
+    }
 
     // a set far larger than the sliver left free below
     const std::size_t N = 4'000'000;
@@ -2180,6 +2190,14 @@ int cuda_fault_child() {
 
 void test_cuda_device_fault_is_an_error() {
     std::printf("--- CUDA device fault surfaces as std::runtime_error (child process) ---\n");
+    // No device: the child cannot poison a context it never had, and its rc=4
+    // would read as a failure rather than as "not reachable here".
+    try {
+        (void)gpudb::make_aggregator(gpudb::Backend::CUDA);
+    } catch (const std::exception& e) {
+        std::printf("  SKIP (%s)\n", e.what());
+        return;
+    }
     std::fflush(stdout);
     const pid_t pid = fork();
     if (pid == 0) {
