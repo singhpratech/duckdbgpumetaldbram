@@ -1,12 +1,23 @@
-# The CUDA backend and the v0.7 exact path — what to implement, and the tests that prove it
+# The CUDA backend and the v0.7 exact path — the interface contract, and the tests that prove it
 
-Status 2026-09-18. Everything the transparent path needs from a backend exists on
-the CPU reference and on Metal; the CUDA backend still runs the v0.6 operators only
-(`exact_supported() == false`, `join_supported() == false`). Until it opts in, the
-Python wrapper leaves every statement on DuckDB on a CUDA machine — correct, no
-speed-up. This page is the checklist for the Linux instance: the interface is
-frozen, the semantics are pinned by tests that already run for every compiled
-backend, and the measurements that decide the thresholds have a script.
+**Status 2026-09-19: implemented.** Every method below exists on the CPU
+reference, on Metal and on CUDA (#152, #153, #154): exact `GROUP BY`, the
+`WHERE` mask, the global masked aggregate and the materialised join. On the
+RTX 4090 Laptop the unit suite is 711 / 711 and the SQL suite 224 / 0 with the
+path on, and `scripts/tpch_coverage.py` answers 17 of 22 TPC-H queries at SF1
+on the device with 0 rows differing from native.
+
+It is **opt-in in v0.7**: `GPUDB_CUDA_EXACT=1` makes the CUDA backend report
+`exact_supported()`, and with it `global_supported()` and `join_supported()`,
+true. The default stays off until `scripts/transparent_gate.py` has been swept
+on that machine, because the thresholds a CUDA build would use are Metal's
+until then, and rule 1 is a measurement rather than an assumption. Note that a
+column is single-homed: a set resident on the GPU cannot fall back to the CPU
+reference for an operator the GPU lacks.
+
+This page stays the interface contract — what each method must do, and what
+proves it. Read it as the specification the three backends are held to, not as
+a to-do list.
 
 Ownership per the contributor instructions at the repository root: `src/backends/cuda/**` and `src/include/cuda/**` are the
 Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only by PR.
@@ -22,7 +33,7 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 | `groupby_exact_masked_resident(keys, vals, preds, n_preds, cap, filter)` | the same under a WHERE program: conjunction of `Predicate`s over predicate lanes (EQ NE LT LE GT GE IsNull IsNotNull In) | same | mask → selection → reduce |
 | `groupby_exact_masked_multi(keys, pays, n_pays, filter_payload, preds, n_preds, cap, filter)` | several payloads in ONE pass; `MultiPayload::columns` bits select what to produce per payload | the base-class default in `src/backends/backend_factory.cpp` — one `groupby_exact_masked_resident` pass per payload, merged and cross-checked — so this method comes for free on CUDA as soon as the masked single-payload op works; fusing it is a later optimisation | fused: mask / selection / run starts once, reduce per payload |
 | `aggregate_exact_masked(pays, n_pays, preds, n_preds)` | **optional, added 2026-09-18 (§4.12)**: aggregates without GROUP BY under a WHERE — one fused pass over the rows in storage order, no key, no sort cache, no permutation. Returns `GlobalAggResult`: per payload the exact 128-bit sum, `count(payload)`, min and max, plus one `count_star` of the surviving rows. Semantics are one group of `groupby_exact_masked_multi`; `n_pays` may be 0 (`count(*)` only) and `n_preds` may be 0. `global_supported()` is its rule-1 gate, defaulting to false — the CUDA backend builds and answers unchanged until it overrides both | `cpu_aggregator.cpp` (the reference) | `metal_aggregator.mm` + `gagg_masked_i64` in `kernels/sum.metal`: one lane table bound per distinct lane (payloads and predicate columns share slots, 12 of them), per-thread accumulators indexed `[group * n_pays + payload]`, threadgroup tree reduce, host merge |
-| the direct grouped reduce | **backend-private, optional, added 2026-09-18** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7): a key with few distinct values gets a dense group-id lane derived from its sort cache (`gid[row]` = the rank of the row's key among the distinct valid keys ascending, a NULL key taking the reserved last id) and the exact operators answer with ONE row-order pass over it — the whole WHERE per row, every payload folded into `acc[gid]`, no mask buffer, no run starts, no permutation, no gather. **Nothing in `gpu_backend.hpp` changes**: same methods, same results, same order, same NULL-key group last, same absent-when-emptied groups, HAVING / top-k on the host over the group rows through `apply_group_filter_host`. The tests are the parity block in `test_aggregator.cpp` (every exact form, both algorithms, keys either side of the id-lane's limits) — CUDA gets them free. The one thing to report is which algorithm ran: `gpudb::exact_path_note()` (`src/include/exact_path_note.hpp`), printed by `gpu_last_stats()` as `path=…` | not implemented (the reference is always the sort path) | `metal_aggregator.mm` + `gdir_*` in `kernels/sum.metal`. CUDA has 64-bit atomics and `atomicCAS`, which Apple GPUs do not, so the accumulator design does NOT transfer: Metal replicates a slab of 32-bit atomics per threadgroup and carries the 128-bit sums by hand. A CUDA port should use shared-memory 64-bit atomics (or `cub::BlockReduce` per group) and will have a different crossover — measure it, do not copy the numbers. The admission rule Metal needs (`groups >= 3` and `rows x (payloads + WHERE terms) >= 6M`) exists because a threadgroup clears and folds its accumulator slab whatever the rows: sweep ROWS as well as groups, or the fixed cost hides at the top of the range. And gate the path on the DEVICE before asking it to compile anything: a kernel that will not build is a fallback, not an error — Metal marks the path unavailable for the aggregator's lifetime, keeps the compiler's text and answers through the sort path — but a fallback after the fact is not always enough. On a virtualised Apple GPU ("Apple Paravirtual device", a hosted macOS runner) ONE refused pipeline build left that process's Metal compiler unusable: kernels that had built moments before then failed too. So a backend must not ask an unsuitable device to compile an optional kernel at all; it decides from the device's identity and capabilities first, once, before any state the path would leave behind exists |
+| the direct grouped reduce | **backend-private, optional, added 2026-09-18; built on Metal only** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7): a key with few distinct values gets a dense group-id lane derived from its sort cache (`gid[row]` = the rank of the row's key among the distinct valid keys ascending, a NULL key taking the reserved last id) and the exact operators answer with ONE row-order pass over it — the whole WHERE per row, every payload folded into `acc[gid]`, no mask buffer, no run starts, no permutation, no gather. **Nothing in `gpu_backend.hpp` changes**: same methods, same results, same order, same NULL-key group last, same absent-when-emptied groups, HAVING / top-k on the host over the group rows through `apply_group_filter_host`. The tests are the parity block in `test_aggregator.cpp` (every exact form, both algorithms, keys either side of the id-lane's limits) — CUDA gets them free. The one thing to report is which algorithm ran: `gpudb::exact_path_note()` (`src/include/exact_path_note.hpp`), printed by `gpu_last_stats()` as `path=…` | not implemented (the reference is always the sort path) | `metal_aggregator.mm` + `gdir_*` in `kernels/sum.metal`. CUDA has 64-bit atomics and `atomicCAS`, which Apple GPUs do not, so the accumulator design does NOT transfer: Metal replicates a slab of 32-bit atomics per threadgroup and carries the 128-bit sums by hand. A CUDA port should use shared-memory 64-bit atomics (or `cub::BlockReduce` per group) and will have a different crossover — measure it, do not copy the numbers. The admission rule Metal needs (`groups >= 3` and `rows x (payloads + WHERE terms) >= 6M`) exists because a threadgroup clears and folds its accumulator slab whatever the rows: sweep ROWS as well as groups, or the fixed cost hides at the top of the range. And gate the path on the DEVICE before asking it to compile anything: a kernel that will not build is a fallback, not an error — Metal marks the path unavailable for the aggregator's lifetime, keeps the compiler's text and answers through the sort path — but a fallback after the fact is not always enough. On a virtualised Apple GPU ("Apple Paravirtual device", a hosted macOS runner) ONE refused pipeline build left that process's Metal compiler unusable: kernels that had built moments before then failed too. So a backend must not ask an unsuitable device to compile an optional kernel at all; it decides from the device's identity and capabilities first, once, before any state the path would leave behind exists |
 | `narrow_lanes()` | **optional**: does this backend store an exact I64 lane at the narrowest signed width its values fit (`docs/RESIDENT_COLUMNS_DESIGN.md` §6)? Storage width stays backend-private; the flag exists because the wrapper's PRE-upload memory estimate sizes lanes from their DuckDB type when it is true and charges 8 bytes a lane when it is false. Defaults to false, which is correct for a CUDA backend that stores 8-byte lanes | false | true |
 | `join_materialize(probe_key, build_key, lanes, n)` | inner join onto a UNIQUE build key; returns row-aligned lanes (probe or build side), NULL-key rows dropped; `join_supported()` gates it | `cpu_aggregator.cpp` | sort-merge (Metal has no 64-bit atomic CAS); CUDA should use open-addressing with `atomicCAS` as `join_kernel.cu` already does for the v0.6 join |
 | `device_memory_bytes()` | total device memory in bytes (`cudaMemGetInfo` total); reported by `gpu_build_info()`, sets the wrapper's default budget to half of it | 0 | `recommendedMaxWorkingSetSize` |
@@ -108,18 +119,19 @@ is being added.
   that keeps nothing, an empty column, a 128-bit sum that leaves 64 bits, and
   2.6M rows so the parallel reduction runs many threadgroups — every case
   compared limb for limb against the CPU reference.
-- `./scripts/run_sql_tests.sh` — the whole suite is 219 passing cases and 42
-  expected fails on Metal at the time of writing (2026-09-18). The exact path's
+- `./scripts/run_sql_tests.sh` — the whole suite is 224 passing cases and 45
+  expected fails, on Metal and on CUDA with the exact path on (2026-09-19). The exact path's
   own files: `test/sql/gpu_agg_exact_global.test` (the
   table function, including its guardrails), `test/sql/gpu_groupby_exact*.test`,
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
-- `python/tests/test_wrapper.py` — 808 checks through `gpudb.connect()`: parity
+- `python/tests/test_wrapper.py` — 1158 checks through `gpudb.connect()`: parity
   against native DuckDB for every shape, staleness, background residency, the
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
-- `scripts/tpch_coverage.py` — the 22 TPC-H queries, SF1: expect 15 of 22 on the
-  device with identical rows (Metal); `--db data/tpch_sf10/tpch.duckdb` (with `GPUDB_MEMORY_BUDGET_MB=200000`) 17 of 22.
+- `scripts/tpch_coverage.py` — the 22 TPC-H queries, SF1: expect 17 of 22 on the
+  device with identical rows (Metal, and CUDA with the path on);
+  `--db data/tpch_sf10/tpch.duckdb` (with `GPUDB_MEMORY_BUDGET_MB=200000`) 19 of 22 on Metal.
 
 ## 4. Rule 1 on CUDA: measure, then set the thresholds
 

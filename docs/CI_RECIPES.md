@@ -148,6 +148,15 @@ binary your Linux users get:
 For the real CUDA backend on Linux, build from source on a machine with
 `nvcc` (see recipe 4).
 
+This repository's own `linux (cpu-only build + tests)` job goes further than
+the smoke above: it builds without CUDA, runs the unit suite and the smoke
+benchmarks, imports the Python wrapper and runs the shell and residency-policy
+tests that need no extension, then fetches the pinned pre-built DuckDB libs,
+builds the loadable extension and `gpudb-sql`, and runs the whole
+`test/sql/*.test` suite on the CPU backend — so a change that breaks SQL-level
+behaviour is caught on x86-64 and not only on the macOS runner. See
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
 ## 3. Docker
 
 Bake the extension into an image so containers don't re-download at runtime

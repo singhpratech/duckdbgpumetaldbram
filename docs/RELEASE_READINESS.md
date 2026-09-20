@@ -1,8 +1,13 @@
 # Release readiness — DuckDB Community Extensions submission
 
-This document tracks what's needed to ship `gpudb_duckdb` to
-[duckdb/community-extensions](https://github.com/duckdb/community-extensions),
-the official catalog. It's the Goal-MD-item-9 punch list.
+> **Historical.** This was the punch list for the first submission to
+> [duckdb/community-extensions](https://github.com/duckdb/community-extensions),
+> written on 2026-05-09 and closed out when PR #1898 merged and
+> `INSTALL gpudb FROM community` went live. Every blocker below is resolved. It
+> is kept as the record of what the first submission needed; for how the
+> extension is built and tested now, read `docs/DEVELOPMENT.md`,
+> `docs/MACOS_EXTENSION_BUILD.md` and `docs/CI_RECIPES.md`, and for what ships
+> in each release, the README's Release history.
 
 Last validated: 2026-05-09 on Apple M4 Max + macOS 15.x (Darwin 25.4.0).
 

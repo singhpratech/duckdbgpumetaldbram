@@ -1,5 +1,9 @@
 # gpudb — plain DuckDB SQL on the GPU
 
+```bash
+pip install duckdb-gpudb        # the distribution is duckdb-gpudb; the import is gpudb
+```
+
 ```python
 import gpudb
 con = gpudb.connect("my.duckdb")          # same surface as duckdb.connect
@@ -16,15 +20,29 @@ explicit `extension=` path, the `GPUDB_EXTENSION_PATH` environment variable, a
 local build next to a source checkout, and finally the extension installed in
 DuckDB itself (`INSTALL gpudb FROM community; LOAD gpudb;`).
 
-Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
-`memory_budget` (e.g. `"16GB"`), `thresholds`. Design, limits and measurements:
-`docs/TRANSPARENT_DESIGN.md`, `KNOWN_ISSUES.md` and `BENCHMARK.md` in the repository.
+`connect()` takes `database`, `read_only` and `config` as `duckdb.connect`
+does, plus `extension=` (an explicit path to the `.duckdb_extension`),
+`transparent=` (default `True`), `residency=` (`background` | `eager` |
+`manual`), `floor_rows=` (default 1,000,000), `idle_ms=` (default 20.0),
+`thresholds=` (default `True`; `False` rewrites every exact shape regardless of
+the predicted win — for parity testing only), `memory_budget=` (bytes or
+`"16GB"`; `0` / `"unlimited"` removes the cap) and `log=` (a callable that
+receives the wrapper's decisions as text).
+
+`con.last_rewrite()` returns `rewritten`, `reason`, `detail`, `form`, `tag`,
+`sql`, `statement`, `engine`, `round_trip_ms`, `fallback` and `error`.
+`con.memory()` returns `budget`, `evictions`, `evictions_wasted` and `sets`.
+`con.extension_note` is empty while the loaded extension can serve the client,
+and one sentence saying why not otherwise.
+
+Design, limits and measurements: `docs/TRANSPARENT_DESIGN.md`,
+`KNOWN_ISSUES.md` and `BENCHMARK.md` in the repository.
 
 ## The `gpudb` shell
 
 ```
 $ gpudb my.duckdb
-gpudb 0.7.0.dev0
+gpudb 0.7.0
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
 database:     my.duckdb
@@ -46,7 +64,8 @@ GPU (plain: the resident GROUP BY) · 3.3 ms
 The same shell runs a script or a single statement:
 `gpudb my.duckdb -c "SELECT …"`, `gpudb -f script.sql`, `gpudb < script.sql`,
 `python -m gpudb`. Options: `--readonly`, `--no-gpu`, `--residency`,
-`--memory-budget`, `--timer` / `--no-timer`, `--version`, `--help`. A statement
+`--memory-budget`, `--timer` / `--no-timer`, `--debug`, `--version`,
+`--help`. A statement
 that fails ends a `-c` / `-f` / piped run with a non-zero exit code; at the
 terminal the session keeps going.
 
