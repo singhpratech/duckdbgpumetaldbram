@@ -5651,6 +5651,17 @@ through its zone maps. It is in `KNOWN_ISSUES.md` and in the release notes'
 "what stays on DuckDB" list, with the note that the measured rule is what hands
 it back, after one run.
 
+## 2026-09-20 — The registry descriptor describes the registry's own binary
+
+The `hardware_requirements` Linux passage stated a glibc 2.34 floor and x86-64
+only, which are properties of this project's release binary and pip wheel, not
+of what the community registry builds and serves — the registry builds
+linux_amd64 and linux_arm64 in its own image, and the amd64 binary it produced
+was measured with a GLIBC_2.14 symbol floor. The passage now leads with what is
+true of the registry build (libgomp.so.1 at load time, with the install hints
+and the exact `LOAD` error), states no glibc floor for it, and puts the x86-64 /
+glibc 2.34 floor in one sentence about the release binary and the wheel.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
