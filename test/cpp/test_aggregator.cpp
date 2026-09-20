@@ -1928,7 +1928,7 @@ void test_backend(gpudb::Backend b) {
 } // namespace
 
 // =====================================================================
-//  Hybrid planner tests (GOAL.md item 7)
+//  Hybrid planner tests — the per-call CPU/GPU dispatch rule
 // =====================================================================
 //
 // We verify (a) correctness — hybrid produces the same results as the

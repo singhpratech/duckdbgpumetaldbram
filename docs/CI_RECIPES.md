@@ -148,6 +148,16 @@ binary your Linux users get:
 For the real CUDA backend on Linux, build from source on a machine with
 `nvcc` (see recipe 4).
 
+This repository's own `linux (cpu-only build + tests)` job goes further than
+the smoke above: it builds without CUDA, runs the unit suite and the smoke
+benchmarks, imports the Python wrapper and runs the shell and residency-policy
+tests that need no extension, then fetches the pinned pre-built DuckDB libs,
+builds the loadable extension and `gpudb-sql`, runs the whole
+`test/sql/*.test` suite on the CPU backend, and runs the Python wrapper suite
+against that built extension — so a change that breaks SQL-level or
+transparent-path behaviour is caught on x86-64 and not only on the macOS
+runner. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
 ## 3. Docker
 
 Bake the extension into an image so containers don't re-download at runtime
@@ -155,7 +165,10 @@ Bake the extension into an image so containers don't re-download at runtime
 
 ```dockerfile
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y curl unzip \
+# libgomp1 is the one runtime dependency worth naming: the extension links
+# OpenMP dynamically, and a base image this small does not carry it. Without
+# it LOAD fails with "libgomp.so.1: cannot open shared object file".
+RUN apt-get update && apt-get install -y curl unzip libgomp1 \
  && curl -sL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip \
  && unzip /tmp/duckdb.zip -d /usr/local/bin && rm /tmp/duckdb.zip
 # pre-install gpudb into the image's extension directory
@@ -188,7 +201,36 @@ cache the artifact:
           ./build-linux/test/test_gpudb
 ```
 
-## 5. Colab / Jupyter
+## 5. A Linux binary and the distribution it was built on
+
+A Linux extension inherits the floors of the machine it was compiled on, and
+v0.7.0 removes one of the two. What this repository records:
+
+- **The C++ runtime floor is gone.** The Linux loadable extension links
+  libstdc++ and libgcc statically, so it carries no `GLIBCXX_`/`CXXABI_`
+  symbol-version floor from its build box at all. That was not always so: a
+  v0.6.0 asset built on an `ubuntu-24.04` runner needed `GLIBCXX_3.4.32` and
+  would not `LOAD` on an Ubuntu 22.04-class host, Google Colab included.
+- **The glibc floor remains**, because glibc itself stays dynamic — its floor
+  is set by the build environment's headers. Release assets are therefore built
+  on the oldest supported userland, Ubuntu 22.04, and a release binary or pip
+  platform wheel needs glibc 2.34 or newer. The CI job in
+  `.github/workflows/ci.yml` builds on `ubuntu-24.04` and is a *test* build, not
+  a published asset.
+- **OpenMP stays dynamic**, so a Linux machine needs `libgomp.so.1` present at
+  load time (`apt install libgomp1`, `dnf install libgomp`). CI installs it
+  explicitly for that reason. Most desktop, CI and notebook images already have
+  it; a minimal container does not, and `LOAD` then fails with
+  `libgomp.so.1: cannot open shared object file`.
+- On a machine older than the release floor, build from source there (Option C
+  in the README) or install from the community registry.
+
+Which CUDA toolkit needs which driver is in the README's [CUDA
+requirements](INSTALL.md#cuda-requirements-build-from-source-on-linux) table:
+a binary built with CUDA 13 needs an R580+ driver, and one built with CUDA 12.x
+reaches the GPU on R525+.
+
+## 6. Colab / Jupyter
 
 There is a ready-made notebook at
 [`examples/gpudb_quickstart.ipynb`](../examples/gpudb_quickstart.ipynb) —

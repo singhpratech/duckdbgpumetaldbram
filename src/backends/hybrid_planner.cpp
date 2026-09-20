@@ -1,4 +1,4 @@
-// hybrid_planner.cpp — GOAL.md item 7. The hybrid CPU/GPU planner.
+// hybrid_planner.cpp — the hybrid CPU/GPU planner.
 //
 // Picks CPU vs GPU per call based on N, expected_groups, and whether the
 // data is resident on the GPU. The dispatch rule is a SIMPLE deterministic

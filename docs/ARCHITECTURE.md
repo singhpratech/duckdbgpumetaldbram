@@ -36,7 +36,7 @@ else             → CPU
 
 ## Memory model
 - **CUDA**: explicit `cudaMalloc` + `cudaMemcpyAsync` over a single stream. Reuses device buffers across calls (`ensure_buffers`).
-- **Metal** (planned): `MTLBuffer` with `MTLResourceStorageModeShared` — Apple Silicon UMA means no transfer cost, just a CPU-visible pointer the GPU can read directly.
+- **Metal**: `MTLBuffer` with `MTLResourceStorageModeShared` — Apple Silicon UMA means no transfer cost, just a CPU-visible pointer the GPU can read directly. Buffers are released under ARC since v0.6.0.
 - **CPU**: zero-copy obviously.
 
 ## Why this shape (and not a full DuckDB extension first)
@@ -58,10 +58,31 @@ Pass 2: single-block final reduction
    read partials → tree reduction → 1 scalar
 ```
 
-This avoids needing CUB/Thrust for week 1. We'll swap to CUB once we add more operators (it has well-tuned `DeviceReduce::Sum`, `DeviceScan::ExclusiveSum`, `DeviceRadixSort` — all of which we'll need).
+This hand-written reduction is what the first SUM/MIN/MAX kernels use, and it
+needs neither CUB nor Thrust. The operators added since take CUB where CUB is
+the better primitive: the CUDA GROUP BY, top-k and sort paths call
+`DeviceReduce`, `DeviceSelect`, `DeviceRadixSort` and `DeviceScan` on explicit
+temp storage (`src/backends/cuda/kernels/`), and Thrust is used for iterators
+only.
 
-## Future shape (not yet implemented)
-- `src/operators/group_by_aggregate.cpp` — hash group-by
-- `src/operators/hash_join.cpp` — radix-partitioned probe
-- `src/operators/window.cpp` — the differentiator vs Sirius
-- `src/extension/duckdb_gpu_extension.cpp` — registers operator overrides via DuckDB's Substrait or operator-replacement API
+## Where the operators live now
+- `src/backends/{cpu,cuda,metal}/*_groupby.*` — the GROUP BY family, exact and v0.6
+- `src/backends/{cpu,cuda,metal}/*_hashjoin.*` — the join probe (CUDA: open-addressing atomicCAS; Metal: sort-merge)
+- `src/backends/{cpu,metal}/*_window.*` — the window operators, which no SQL path takes: window functions run on DuckDB
+- `src/extension/duckdb_loadable.cpp` — the loadable extension's entry point, on the stable C API
+
+## The two SQL paths
+
+- **Streaming** `gpu_sum/min/max` — CPU-shaped running accumulators, native
+  parity in any query shape. Deliberate: the v0.2.0 numbers in
+  [BENCHMARK.md](../BENCHMARK.md) showed per-query buffering-for-GPU loses
+  3×–110× through this interface.
+- **Resident** `gpu_upload` + `gpu_*_resident` — the GPU path with substance:
+  pay the transfer once, then reductions run on-device (CUDA and Metal) at
+  memory-bandwidth speed with `transfer_ms=0.000`. This is where the
+  4–25× numbers above come from.
+- **Resident joins (v0.5.0)** `gpu_upload_pair` + `gpu_[left_|semi_|anti_]join_{sum,count}_resident[_f64]`
+  — fused join + reduction against a device-cached sorted build side; the
+  11–376× join rows above. Row-returning `gpu_join_rows_resident` exists as
+  the composability primitive (wins on unified memory, loses to native across
+  PCIe — [BENCHMARK.md](../BENCHMARK.md) states both).

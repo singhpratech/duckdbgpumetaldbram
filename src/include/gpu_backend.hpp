@@ -947,7 +947,7 @@ std::unique_ptr<HashJoinProbe> make_hashjoin_probe(Backend);
 [[nodiscard]] std::vector<Backend> available_backends() noexcept;
 
 // =========================================================================
-//  Hybrid CPU/GPU planner (GOAL.md item 7)
+//  Hybrid CPU/GPU planner — pick the backend per call, deterministically
 //
 // Picks CPU vs GPU per call based on:
 //   - N (input cardinality / row count)

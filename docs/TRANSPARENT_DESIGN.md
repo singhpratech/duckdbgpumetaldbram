@@ -1,9 +1,10 @@
 # v0.7 — transparent GPU execution (design)
 
-Status: proposal, 2026-09-01; revised 2026-09-03 after an adversarial review
-and the milestone-1 spike (§13). Companion to `GROUPBY_RESIDENT_DESIGN.md` (v0.6). Carries the v0.6.1
-maintenance release plan in §11; its portable Linux build is the build every
-later release uses.
+Written 2026-09-01, revised 2026-09-03 after an adversarial review and a
+first implementation spike, and kept in step with the code since. Companion
+to `GROUPBY_RESIDENT_DESIGN.md` (v0.6). How the Linux release asset is built
+so that it loads on older distributions is in
+[CI_RECIPES.md](CI_RECIPES.md).
 
 ## 0. Two rules
 
@@ -68,8 +69,8 @@ Five pieces, in dependency order:
 | D | **The rewrite** (§6): `GROUP BY` with `WHERE`, `HAVING`, `ORDER BY … LIMIT`, over resident columns, with a device-side predicate mask | the user-visible feature |
 | E | **The gate** (§9): break-even sweeps, thresholds per backend, `transparent_gate.sh`, three-way parity | rules 1 and 2 mechanically |
 
-Joins on the transparent path are v0.8 (§10) and are designed for here so
-nothing in A–E has to be redone for them.
+Joins on the transparent path (§4.8, §4.13) are designed for here so nothing
+in A–E had to be redone for them.
 
 ## 2. Plan shapes covered
 
@@ -95,9 +96,13 @@ GROUP BY k1 [, k2, k3]
   by equalities — many-to-many, `USING`, composite or non-integer keys, extra
   `ON` predicates, self joins, keys or expressions that mix columns of several
   tables — is answered from an upload of the join's result (§4.13, Python
-  wrapper). RIGHT / FULL / semi / anti joins, cross products, subqueries as
-  join inputs and joins whose result is more than four times the largest
-  table run native.
+  wrapper). `A RIGHT JOIN B` is normalised to `B LEFT JOIN A` first (§4.21) and
+  goes the same way. A derived table as a join input is folded in and then
+  joined like any other input. `FULL` joins, `SEMI` / `ANTI` join syntax,
+  `NATURAL` joins (`shape: … INNER NATURAL join`), a `USING` clause over a
+  derived table that renamed the column (`shape: … JOIN ... USING`), cross
+  products, and joins whose result is more than four times the largest table
+  run native.
 - No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is its own
   device operator, a single fused pass with no key (§4.12): accepted over a
   join at any size, and over a single table above a measured row and
@@ -705,7 +710,8 @@ their DOUBLE paths with the parity tolerance `groupby_parity_check.sh`
 already applies, and the device result there is deterministic run to run
 (fixed reduction tree, no atomics on either backend), which the docs may
 state. The double-double option stays a setting on the explicit path.
-Revisited in v0.8 only if a definition of exactness against native exists.
+This is revisited only if a definition of exactness against native ever
+exists for it.
 
 ### 4.8 Key joins, materialised on the device
 The join shapes analytics SQL is made of are fact-to-dimension: `lineitem
@@ -1360,6 +1366,72 @@ tables a subquery lane reads included, and says so in the detail. TPC-H Q22 is
 the case: 150,000 `customer` rows at SF1 over a `NOT EXISTS` on 1,500,000
 `orders` rows.
 
+### 4.24 A tie in a pushed top-k
+
+`ORDER BY <aggregate> LIMIT k` is not a total order, and where it ties DuckDB
+has no answer of its own to reproduce: plain DuckDB — no extension, no wrapper
+— returned 3 different row *sets*, and up to 6 different orderings, over 20
+runs of one such statement on TPC-H SF1, on 1.4.5 and 1.5.5 alike, and was
+deterministic only at `threads=1`. The summary and the measurement are in §2
+under *Ties*; this is where the mechanism lives.
+
+The rewritten statement asks the device for **k + 1** rows and carries a
+`QUALIFY` that raises `GPUDB_TIES` when `rank()` and `row_number()` disagree at
+or above rank k. Those two differ on exactly the second and later member of a
+group of equal values, and the `rank() > k` arm excludes the rows past the k-th
+that no `LIMIT k` returns — so one clause covers both a tie at the k-th/(k+1)-th
+boundary and a tie *inside* the top k, where the row set is right and the order
+is not. The wrapper answers the user's original statement on DuckDB when it sees
+that marker, with `reason = "ties"`.
+
+Five properties worth stating, because each was a decision:
+
+- **It is decided against the data, per execution**, not cached as a shape. The
+  decline follows the *literals*: `LIMIT 4` and `LIMIT 5` share a template and
+  not a fate, so a k below the tie keeps the device.
+- **The fallback is still a loss**, and §9.1 has to hear about it — the
+  statement paid a device pass and then DuckDB's own run. So the template is
+  measured-declined exactly as any losing template is (same reason code, same
+  window), with the tie named in `detail`; otherwise a dashboard's top-10 over
+  a coarse measure would tie on every execution and be permanently slower than
+  native with nothing looking at the arithmetic. Coming back is the ordinary
+  declined-template path: while the tie is there the re-measure probe raises and
+  the template stays native, and a write clears the decision outright.
+- **With no tie it costs one extra row** and two window functions sharing one
+  specification over k + 1 rows — measured at `LIMIT 3` on the reviewer's
+  statement, best of 30 each, 7.21 ms with the guard against 7.35 ms without,
+  inside the noise, against 9.5 ms native. `execute()` pays nothing else.
+- **Through `sql()` the verdict is remembered**, because there the guard is not
+  a clause of the statement. A lazy relation is read after the call has
+  returned, where a raise could not be answered natively, so the guard runs on a
+  side cursor inside the call (`_guard_now`) — and for a pushed top-k that side
+  cursor IS the device pass, not a cheap `count(*)` like the staleness guard
+  beside it. Paid per call it doubles the shape. So the answer is cached instead
+  (`_ties_guard`, keyed by the rendered statement, on the family's root): whether
+  the first k ordering values tie is a function of that rendered text — tag,
+  lanes, literals, k — and of the data the resident set holds, and the device
+  computes the top-k from the set rather than from the table, so neither can
+  move without the sets being dropped. The entry is therefore dropped exactly
+  where they are: `_invalidate_all` (any write, DDL, `SET`, `ATTACH` or foreign
+  write the wrapper sees, from any cursor of the family), `_on_stale` and
+  `_on_rewrite_error`; and the statement's own `gpu_assert_rows` guard now runs
+  immediately *before* the verdict is read, so a row count that no longer
+  matches the set has already raised. A *tie* verdict is never cached — it
+  raises, and the template is measured-declined, which is the stronger answer.
+  One device pass per data version instead of one per call; from the second call
+  on the guard is a dict lookup and `sql()` costs what `execute()` costs.
+  §3.3 has the path-measured rule that goes with it.
+- **An `ORDER BY` that is already total** (`ORDER BY qty DESC, k`) is not pushed
+  as a top-k at all and keeps the device.
+
+Not covered: a `LIMIT` whose top-k is not pushed — a `HAVING` beside it, an
+`avg` or a temporal ordering value, `ORDER BY count(*)` over a v0.6 sum set —
+hands every group to DuckDB, which does the `ORDER BY … LIMIT` itself. That is
+the same multiset native sorts, so the tie is DuckDB's either way, but its
+top-N depends on the order its input arrives in and the device's group order is
+not the hash aggregate's, so at `threads=1` such a tie can still land
+differently.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
@@ -1966,7 +2038,7 @@ same database — the extension stays free of threads and hidden connections
   sets, no rewrite).
 
 ### 5.6 Concurrency — prerequisite of the background path
-Before milestone 0b, `gpu_resident.cpp` took the global mutex inside
+Before the residency work described here, `gpu_resident.cpp` took the global mutex inside
 `upload_update` and `upload_combine` (DuckDB's per-thread aggregate
 callbacks) and incremented one process-wide atomic (the host pool-cap
 accounting) **per row** from every scan thread. Measured on SF10: Q18-inner
@@ -1992,7 +2064,7 @@ each mattered for footprint (host peak 2.8 GB → 0.9 GB, finalize
   zero, so LRU can never free a column mid-query.
 
 This is shared-extension plus CUDA-backend work carried as one
-`feat/core-*` PR from the Linux instance (milestone 0b, #84); the Metal
+`feat/core-*` PR from the Linux machine (#84); the Metal
 backend implements `prepare()` and the interleaved pair upload on its side
 (#85).
 
@@ -2017,8 +2089,8 @@ never come back unnoticed.
 
 ### 5.7 Shared with joins
 A resident set is `{identity, columns, sorted key permutation, validity,
-state}`. The v0.5 join build side is the same object, which is what lets
-v0.8 route joins through the same manager (§10).
+state}`. The v0.5 join build side is the same object, which is what lets the
+transparent path's joins (§4.8, §4.13) go through the same manager.
 
 ### 5.9 Foreign writes: the file is the change log
 The staleness guard (`gpu_assert_rows`) compares row counts, so a write from
@@ -2198,8 +2270,8 @@ Findings update this document before implementation. Status 2026-09-03:
 item 1 done (every construct and rejection serialized and round-tripped;
 fields recorded in §2; the `HAVING` literal `300.5` arrives as
 `DECIMAL(4,1)` value `3005`, confirming the rescale in §6); item 2 done for
-the evaluation-order and cost questions (§5.4) — the C-API scalar itself is
-milestone 0b; item 3 done for classification (§5.2) and resolution sources
+the evaluation-order and cost questions (§5.4) — the C-API scalar itself came
+with the registry work; item 3 done for classification (§5.2) and resolution sources
 (§5.1), open for the wrapper's cache and transaction handling until the
 wrapper exists; item 4 done (§4.2).
 
@@ -2413,6 +2485,24 @@ ready shortly after the pass ends instead of in the middle of it, and the
 session's wall time grows from ~4.7 s to ~11.7 s. The row is judged exactly as
 before — the tolerance, the statistic and the shapes did not move.
 
+**`scripts/budget_gate.py` (2026-09-20)** is the third gate, and the one §5.5
+points at: a long eager session over 169 distinct templates under a budget too
+small for them. Its assertions are listed under §5.5; what matters here is that
+it is a different question from the two above. `transparent_gate.py` asks
+whether a rewritten statement is faster and identical; this one asks whether
+the engine stays inside the memory it was given while answering the same
+statements correctly. It runs in `local_check.sh` (56 s at SF1), and
+`--refuse-mb N` makes the Metal backend turn an exact upload down so the
+device-refusal paths are exercised on a machine with memory to spare.
+
+One thing `transparent_gate.py` no longer does is run without a budget.
+Its `--memory-budget` default was `unlimited`, which meant the one long eager
+session anybody runs was the one session with no cap: on a 16 GiB card a full
+run climbed to 15.8 GiB and then measured a degraded machine, which is how two
+cells came to read as losses that were nothing of the kind. The default is now
+the wrapper's own — what ships, and therefore what a gate has to measure — and
+`unlimited` stays available for seeing every shape the engine accepts.
+
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
 test`) on Linux plus the registry-smoke workflow. The registry's Linux
@@ -2424,165 +2514,34 @@ explicit upload + `gpu_groupby_*` call returns the native answer. The GPU
 node is demonstrated on the release assets (Metal, CUDA), not on the
 community binary.
 
-## 10. v0.8, designed for now
+## 10. Not in v0.7, and why
 
-- **Transparent joins**: `t1 JOIN t2 ON t1.k = t2.k` with aggregates above,
-  routed to the v0.5 resident join on the same resident sets (§5). The
-  matcher gains one more shape; the residency manager and gate are already
-  there.
-- **Fused aggregate → join** (TPC-H Q18 end to end: filtered groups joined
-  back to `orders`/`customer` on the device without materialising the group
-  rows). New kernel, both backends.
-- **Window functions** over resident sorted columns (`WINDOW_FUNCTIONS_DESIGN.md`).
-- **DOUBLE sums**, only with a definition of exactness against native (§4.7).
+Each of these runs on DuckDB. The statement is answered; it is simply not
+answered on the device.
 
-## 11. v0.6.1 — maintenance release (first)
+- **Window functions.** The `WINDOW` class is rejected in §2. There is no
+  kernel: what one would look like over resident sorted columns is worked out
+  in `WINDOW_FUNCTIONS_DESIGN.md`, which is a design note and not an
+  implementation.
+- **`sum` / `avg` over `DOUBLE` or `FLOAT`.** Not a gap but a decision (§4.7):
+  native's own result depends on the order the values are added, so there is no
+  single answer for a device to match, and rule 2 forbids guessing at one. This
+  is revisited only if a definition of exactness against native ever exists.
+- **`median`, `stddev`, quantiles.** No kernel and no decomposition that keeps
+  rule 2.
+- **`FULL` joins, `SEMI` / `ANTI` join *syntax*, `NATURAL` joins, cross
+  products.** §2 rejects them on shape. The `EXISTS` / `IN` *forms* are
+  rewritten — §4.18 lowers them to predicate lanes — and the fused semi / anti
+  joins remain available as explicit `gpu_*` calls. A derived table as a join
+  input is *not* in this list: it is folded in and joined like any other input
+  (§4.16). A `USING` clause is rewritten over base tables, and declines over a
+  derived table that renamed the join column.
+- **Correlated subqueries outside a `WHERE` term** (TPC-H Q2, Q20). The inner
+  statement does not bind on its own (§4.14). The decorrelation is expressible;
+  the `GROUP BY` it produces is output-bound and the measured bounds decline it,
+  which is rule 1 working rather than a missing feature.
+- **Prepared-statement parameters, several statements in one call, and
+  statements inside an explicit transaction.** §5.2 and §5.4.
 
-Packaging only. No operator changes.
-
-**Problem.** The v0.6.0 `gpudb.linux_amd64.duckdb_extension` release asset
-was built on Ubuntu 24.04 and needs `GLIBCXX_3.4.32` / `GLIBC_2.38`, so it
-does not load on Ubuntu 22.04 hosts (glibc 2.35), Google Colab included. It
-is also built against CUDA 13, which needs an R580+ driver; CUDA 12.x
-minor-version compatibility means a 12.8-built asset gets the GPU on any
-R525+ driver, which is what Colab's T4 runtime has — that is the reason for
-building with 12.8, and it is the line the README "Requirements" row should
-carry. The registry's Linux binary is unaffected (CPU-only, built by
-community CI); this concerns the CUDA release asset only.
-
-**Fix (built and verified, not released).**
-- PR #82: `-static-libstdc++ -static-libgcc` for the loadable on Linux.
-- Build in `nvidia/cuda:12.8.1-devel-ubuntu22.04` (glibc 2.35, CUB 2.7.0),
-  static CUDA runtime → 12,645,358 B, glibc floor 2.34 (plus `OMP_1.0` from
-  libgomp; no CXXABI dependency), NEEDED only `libgomp.so.1`, `libc.so.6`,
-  `ld-linux-x86-64.so.2`. Verified: unit 366/366, SQL 29/0, GROUP BY parity
-  12/12, `LOAD` on ubuntu:22.04 (CPU) and on the 24.04 host, v1.5.5 CLI SF1
-  smoke equal to native with `backend=CUDA` on the 4090. This is a
-  **v0.6.0-based verification build** (footer `C_STRUCT, v0.6.0, v1.2.0,
-  linux_amd64`; SHA-256
-  `ae64f1e3f2dad2a1db73d1781e0eb80c204da44504d07f37653403b5a652f9c7`); the
-  release asset is rebuilt at the v0.6.1 tag and will have a different
-  SHA. The asset, `REPORT.md`, `container_build.sh`, `loadtest.sh` are
-  parked outside the repo on the Linux machine.
-- Two facts the README "Requirements" row must carry, since neither is
-  DuckDB's own floor: the asset needs `libgomp.so.1` on the host (not
-  present on minimal images; `apt install libgomp1`), and its glibc floor
-  is 2.34, which is stricter than the DuckDB CLI's.
-- `scripts/build.sh` honours `GPUDB_CUDA_STATIC_RUNTIME` from the environment
-  (today it must be set on the CMake cache by hand; the container script
-  already does) and `scripts/container_build_linux.sh` is added so the
-  portable build is reproducible from the repo — one PR from the Linux
-  instance.
-- `examples/gpudb_quickstart.ipynb` (PR #81): loads the release asset, falls
-  back to a direct `cmake --target gpudb_duckdb` build with Colab's `nvcc`.
-  Needs one end-to-end T4 run that reaches the benchmark cells before it
-  leaves draft. A PTX-only fallback does not help drivers older than the
-  toolkit's JIT expects, so the asset carries SASS for the T4's sm_75.
-
-**Release steps (each on the user's explicit go).**
-1. Merge #82. Rebuild the portable asset from the final commit in the
-   container; re-run `loadtest.sh` on Ubuntu 22.04 and 24.04.
-2. Bump `CMakeLists.txt` to 0.6.1; tag; release notes = the problem
-   statement, the glibc/CUDA/libgomp floors, the SHA-256s. macOS asset
-   rebuilt at the tag so both carry the same footer.
-3. Registry `description.yml` ref → the v0.6.1 tag (same CPU-only binary;
-   the ref should point at a tag that exists).
-4. Un-draft #81 after the Colab run is seen.
-5. README "Requirements": Linux asset glibc floor + libgomp + CUDA
-   12.8/driver line; the CUDA-13 note moves to "building from source".
-
-**Why first.** The container build, the static CUDA runtime and
-`-static-libstdc++` (#82) are the portable Linux build for every release
-from here on — the loadable stays on the C API (§3.4), so nothing C++ ever
-crosses into DuckDB and the static runtime remains correct.
-
-## 12. Milestones (no calendar — each gated on being right)
-
-| # | Deliverable | Gate |
-|---|---|---|
-| 0a | v0.6.1 (§11) | user go per step |
-| 0b | Residency prerequisite PR (§5.3, §5.5, §5.6): identity-keyed registry with origin, per-set state + epoch + refcount, lock-free `update`, `ResidentColumn::prepare()` on the upload stream, `gpu_assert_rows`, `gpu_residents()` columns; Linux instance, Metal implements `prepare()` | unit + parity unchanged; SF10 concurrent-upload row ≥ 1.0× at p99 |
-| 0c | Upload session in the extension (§5.5): `gpu_upload_begin` / segment append to an open session / `gpu_upload_finish` → device copy + `prepare()`, rows_seen accumulated across segments, discarded on epoch change; Linux instance, Metal follows | registry test rows for begin/append/finish/interrupt; unit + parity unchanged |
-| 1 | Spike remainder (§8): tree shapes and rejections, `gpu_assert_rows` evaluation-order proof, classification/cache/invalidation, output names and types; this doc updated | findings written down |
-| 2 | `gpu_rewrite_ast` (pure, context-driven) for the plain `GROUP BY` shape + the Python wrapper (classification, resolution, template cache, transaction rule, typed fallback, settings), three-way parity on the v0.6 operators as they are | PR |
-| 3 | Exactness (§4): CPU reference first, then Metal + CUDA in parallel; native output types and names; unit + parity | per-kernel PRs |
-| 4 | Residency manager in the wrapper (§5.5): budget, eviction, quiet period, epoch, all write scenarios in parity | PR |
-| 5 | Full §2 shape in the rewriter, `HAVING` rescale, kept `ORDER BY` + top-k push, `last_rewrite()`, `gpu_residents()` stats; Node/R/JDBC wrappers | PR |
-| 6 | Gate (§9): sweeps, floor and thresholds per backend, `transparent_gate.sh` all ≥ 1.0× on both machines (first-sighting row within its bound), BENCHMARK/KNOWN_ISSUES rows | PR; gate must pass |
-| 7 | Audit (v0.6 shape), tag v0.7.0, registry bump, `pip` package release (per-platform assets; `allow_unsigned_extensions` requirement stated) | user go per step |
-| — | Upstream proposal for a C API statement-rewrite hook (§3.5) | drafted after milestone 2 proves the interface; user sign-off before anything is posted |
-
-Milestones 0b and 0c precede everything that uploads in the background. Milestones
-3 and 4 run in parallel across the two machines; 1, 2, 5, 6 are shared-file
-work and go one at a time. The loadable extension's build, ABI (plus the one
-`prepare()` entry) and release shape do not change at any milestone.
-
-## 13. Review record (2026-09-02/03)
-
-The 2026-09-01 revision was put through an adversarial review: eight
-independent reviewers, one lens each (exactness, rewrite, invalidation,
-rule 1, security, packaging, consistency, alternatives), 99 findings, each
-argued against by two further reviewers; every kept finding was reproduced
-on the v1.5.2 CLI with the local Metal build or on Python `duckdb` 1.4.5.
-The Linux instance then checked the resulting changes against the CUDA code.
-
-**Kept and folded in above:** the unbound tree (§3.2, §5.1); the row-count
-check that could not bind and its empty-result hole (§5.4); DML invisible
-to `json_serialize_sql` (§5.2); the transaction abort (§5.4);
-the in-flight upload surviving an invalidation (§5.5); the process-global
-registry (§5.3); rule 1 on first sighting and on distinct literals (§0,
-§3.2, §9.1); upload contention and its cause in the `update` callback
-(§5.6); no `SET gpudb_*` on the v1.2.0 struct (§3.4, §6); output names and
-types (§4.2); session-dependent `ORDER BY` (§2); `HAVING` rescale, VARCHAR
-collation, DOUBLE predicate total order, DOUBLE sums (§4.5–4.7); the CPU
-backend never rewriting (§7, §9.4); the unmeasured 0.05 ms claim (§6);
-ready-means-prepared (§5.5); and the medium items on shape rejection,
-all-NULL groups, empty groups under the mask, memory accounting, `count(*)`
-cost, per-device thresholds and the parity method.
-
-**Rejected after argument (do not re-raise):** parameters baked into the
-cache (`PARAMETER` nodes are rejected by shape); the C++ shim as primary
-route (its bind hook runs only on bind failure); "no config-option API"
-(the API exists from v1.5; the constraint is the v1.2.0 floor, which
-stays); `sum(FLOAT)` in f32 (no f32 path exists); `gpu_rewrite_ast` as a
-crash surface (the deep-nesting crash is DuckDB's own
-`json_deserialize_sql`, reachable without gpudb); incomplete catch blocks
-(every backend throw is `std::runtime_error`); the documented gap being
-too narrow.
-
-**Milestone-1 spike, 2026-09-03 (Python `duckdb` 1.4.5 + the v0.6.0 Metal
-build):** the cross-join guard as first written was pruned by the optimizer
-and passed a stale set silently; the referenced form (`WHERE gd.ok`) raises
-in every case including the empty result and streaming fetch (§5.4).
-`avg` is DOUBLE for every input and native computes it exactly, so it stays
-on the transparent path (§4.2). The splitter's statement types are coarser
-than the SQL keywords (§5.2). `register()` creates a non-temporary view;
-temp tables live in the `temp` catalog (§5.1). One `DESCRIBE` per template
-gives native names and types at 0.08 ms (§4.2). Every §2 construct and
-rejection has a distinguishing serialized field (§2).
-
-**Milestone 0b gate, Linux, 2026-09-03:** the starvation was a per-row
-atomic, not the mutex; with it fixed, a neighbouring native statement still
-loses 2–18% at p99 to a whole-table upload because one process has one
-worker pool — the same loss DuckDB's own `list()` inflicts. The user ruled
-that loss unacceptable, so the upload became idle segments with
-`interrupt()` (§5.5) and the gate row became "native shapes with the
-residency manager active ≥ 1.0×" (§9.3); the extension gains an upload
-session (milestone 0c).
-
-**Milestone 0c, both machines, 2026-09-04:** upload sessions landed in the
-extension (Linux: SF10 `lineitem` as 115 segment statements of 4.7/6.2/12.9
-ms min/mean/max scan each, finish 285 ms) and the wrapper's residency
-manager moved to them (Metal and CUDA: the gate rows above, all within
-the band at p99, finish invisible to neighbours on both; a
-20-segment session completes while statements flow with 0–10 ms gaps with
-`rows_seen` equal to `count(*)` exactly; a write mid-session drops the
-open session and the set comes back after the quiet period). Milestones
-0b, 0c and 2 are therefore in: #85, #86 merged, #87 rebased and green, #88
-and the segment-mode manager on their branches.
-
-**Decided by the user, 2026-09-03:** the bounded first-sighting cost (§0)
-and the out-of-process same-count write as the one documented gap (§0),
-each over the stricter alternative that would have made the feature
-impossible (no rewrite without a prior native timing; a full fingerprint
-scan on every hit).
+`docs/RESEARCH_NOTES.md` ends with the open questions behind several of these,
+with the measurements that produced them.

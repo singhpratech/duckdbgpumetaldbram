@@ -5346,6 +5346,75 @@ Tag: `manylinux_2_34_x86_64`. Ubuntu 20.04 is out of reach twice over — glibc
 2.31 against our 2.33 symbols, and DuckDB publishes no 1.5.5 wheel for the
 Python 3.8 that ships with it.
 
+## 2026-09-20 — The use cases were still the v0.6 ones
+
+`README.md`'s *What you'd use it for* still opened on "workloads that ask the
+same aggregate questions of the same big data, over and over" — the resident-column
+framing from v0.6, when a column had to be uploaded by name before anything ran
+on the device. With the shell and `gpudb.connect()` making tables resident on
+their own, that sentence describes where the payoff is largest, not who the
+extension is for; the scope it should state is the analytical SQL already being
+run in DuckDB over big tables. The section was re-scoped accordingly: bullets
+for the one-line client change, the shell, and whole multi-table queries (where
+the TPC-H coverage numbers come from) now sit ahead of the seven workload
+bullets, each cut to a headline figure plus a link, and `**Not for:**` became
+`**What DuckDB keeps answering:**`, since those statements are not refused —
+they run in the same session, over the same rows, at DuckDB's speed. Section
+length went from 611 words to 379; no figure was changed, and none was removed
+from BENCHMARK.md or the Numbers card.
+
+## 2026-09-20 — The docs on release day, first pass: text only
+
+The docs branch was brought onto the release build by merge rather than rebase:
+thirteen of its forty-two commits rewrite `python/README.md`, so replaying them
+one at a time against a file main had also edited would have meant resolving the
+same passage repeatedly against half-rewritten intermediate states. Both sides
+had appended a dated entry before *Open questions* and both are kept.
+
+The pass removed the one remaining statement of a future — the blockquote
+saying the package was not on PyPI and the registry served v0.6.0 — and put the
+platform wheel first everywhere an install is described, since it now carries
+the extension binary and is the only route where the client and the binary
+arrive matched. The registry wording was rewritten to hold true whether or not
+the descriptor update has landed yet: `LOAD gpudb` gives the explicit `gpu_*`
+functions in any client, and `FORCE INSTALL` / `UPDATE EXTENSIONS` is what
+fetches a newer build. The macOS floor is stated as 15.0 with the reason it is
+claimed and 14.0 is not, and Linux gained the requirements that are easy to
+discover the hard way: `libgomp.so.1` at load time, a glibc 2.34 userland, and
+that a registry binary there is CPU-only.
+
+No measured number was touched in this pass. Every captured transcript in the
+shell and Python guides, the coverage and gate tables, and the suite counts were
+left for the second pass to re-take on the release build — the `.memory` captures
+in particular, since the shell now prints a physical resident total and an
+`allocated:` line the old captures predate.
+
+## 2026-09-20 — The docs on release day, second pass: the numbers
+
+Every measured figure and every captured transcript in the public documents was
+re-taken on the release build (commit `98b19c2`, clean rebuild at the 15.0
+deployment target, DuckDB 1.5.5, default memory budget) and the summaries moved
+to it. The four TPC-H coverage runs, the three gates and the suite counts are
+now one dated section in `BENCHMARK.md`; nothing earlier was edited or removed,
+so the older runs stay as the record of the builds that produced them.
+
+Two things the re-measurement changed rather than confirmed. **Both entry points
+are now reported separately** — `execute()` and `sql()` are different code paths
+and they do not measure the same, so a single range across both was hiding which
+was which. And **two rows are below 1.0×**: TPC-H Q11 at SF10 on Metal (1.06×
+through `execute()`, 0.92× through `sql()`, and 1.06× / 0.89× in two immediate
+re-runs) and TPC-H Q1 on the RTX 4090. Both are printed as straddles, in the
+summary tables as well as in `BENCHMARK.md`, because a range that quietly
+started at 1.3× was the kind of number this project exists not to publish.
+
+The shell showcase was re-captured from one pty session at a 1-minute load
+average of 1.16 and reads 22.1 ms on DuckDB against 14.4 ms on the GPU — 1.53×,
+where the previous capture read 14.9 against 8.7. The nine GPU runs of that one
+statement spread from 10.0 to 14.8 ms with nothing changed between them, so the
+guides now print the spread and tell the reader to expect their own numbers. The
+"asked by name" operator table was *not* re-measured; it now says so, and names
+the release each row was taken at.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -5355,26 +5424,37 @@ Python 3.8 that ships with it.
   output-bound and the bounds decline it (2026-09-19 entry, with the numbers).
   What would change that is a cheaper way to return a million-group result, not
   a rewrite.
-- **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
+- **`FULL` joins, and `SEMI` / `ANTI` join syntax** (the `EXISTS` / `IN`
+  *forms* are answered — §4.18 lowers them to predicate lanes — and `RIGHT`
+  and many-to-many joins are answered from an upload of the join's result);
+  subqueries in the select list and in
   HAVING; subqueries over other subqueries (Q2, Q20). Q22 is answered: the row
   floor now counts the table its lane reads (2026-09-19 entry, §4.23). Q16
   combines `count(DISTINCT)` with a `NOT IN` subquery over tables below the row
   floor, and the forced run measures 0.08x at SF1 and 0.02x at SF10, so the
   pair bounds that decline it are right. WHERE-term subqueries are done
   (§4.18).
-- **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
-  and as the CPU reference; the CUDA side is to be written against the same
-  interface and then swept with the same gate.
-- **Other client languages**: the join / expression / split lowering lives in
-  the Python wrapper; the pure rewrite function is language-neutral.
+- **CUDA**: the exact, mask, join and multi-payload kernels are written
+  against the same interface, and the path is on by default since 2026-09-20
+  (`GPUDB_CUDA_EXACT=0` turns it off). The gate has been run there — 1630
+  cells on an RTX 4090 Laptop, 0 slower than native, 0 differing — so
+  `_thresholds.TABLE["CUDA"]` stays `METAL` as a measured result. What is open
+  is that this is ONE machine and one scale factor: SF10 on CUDA is not
+  recorded, and TPC-H Q1 straddles 1.0x on that box.
+- **Where the lowering lives**: the join / expression / split lowering is in
+  the Python wrapper. The pure rewrite function is language-neutral and
+  carries no client of its own, so a client in another language would repeat
+  that lowering rather than inherit it.
 - **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
-  TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
-  each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
-  same choice as a template parameter, `docs/CUDA_EXACT_PATH.md` §6).
+  TPC-H queries at SF10 became 22.7 — and on CUDA (2026-09-20, lanes and then
+  the sort cache; both GPUs report `narrow=true`). The wrapper's pre-upload
+  estimate sizes each lane from its DuckDB type and, for a plain column, from
+  that column's own zone-map statistics (2026-09-20).
 - **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel
-  time in `gpu_last_stats`) could re-check at once instead of on the clock.
+  time in `gpu_last_stats`) would re-check at once instead of on the clock;
+  that detector is not written.
 - **The GROUP BY mask stage**: done on Metal (2026-09-18) — one fused
   `gpred_eval` pass per statement instead of one per term, and the counting
   pass's gather kept as a mask in sorted order so the reduce stops re-gathering
@@ -5386,13 +5466,13 @@ Python 3.8 that ships with it.
 - **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
   shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
   they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
-  could be evaluated per GROUP (at most 512 of them) instead of per row, which
-  would let Q12's key lane go too.
+  can be evaluated per GROUP (at most 512 of them) instead of per row, which
+  is what still holds Q12's key lane resident. Neither is measured.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client, and the sweep of
   2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
   is worth a lot up to about 200K groups and nothing at all at 1.5M, where
   moving the rows through the table function alone costs more than native's
-  whole aggregate. So an Arrow-native result path would move the plain-form
-  bounds, and a cheaper table-function hand-off would move the inner ones —
-  they are different problems.
+  whole aggregate. So the two bounds are set by two different hand-offs
+  — the client's for the plain form, the table function's for the inner one —
+  and neither has been measured against a cheaper alternative here.

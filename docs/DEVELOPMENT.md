@@ -11,7 +11,7 @@ cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb
 ./build-linux/bin/gpudb-bench --rows 50000000 --runs 5
 ```
 
-If `nvcc` is missing the build is CPU-only — that's fine for now. Install CUDA toolkit when ready (see `scripts/install_cuda_ubuntu.sh`).
+If `nvcc` is missing the build is CPU-only: everything compiles and the tests run, with the CUDA backend absent. `scripts/install_cuda_ubuntu.sh` installs the toolkit.
 
 ## Quick start (macOS)
 
@@ -58,7 +58,7 @@ git log --oneline       # should match Linux history
 
 ## Two-machine git workflow without a remote
 
-If you want both machines to share commits but skip GitHub for now, you can use either:
+To share commits between the two machines without GitHub, either of these works:
 
 ### Direct SSH push between machines
 ```bash
@@ -95,7 +95,7 @@ git push -u origin main
 That's it. Until you run that command nothing leaves your machines.
 
 ## Branch / commit conventions
-See [CLAUDE.md](../CLAUDE.md). Short version:
+Short version:
 - Never commit to `main` directly (well — first commit excepted). Use `feat/cuda-*`, `feat/metal-*`, `feat/core-*`, `chore/*`.
 - Conventional commit messages: `feat(cuda): add radix sort kernel`, `fix(cpu): handle empty input`.
 - Test before committing: `./scripts/build.sh && ./build-*/test/test_gpudb`.

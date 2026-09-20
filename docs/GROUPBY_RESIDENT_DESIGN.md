@@ -243,11 +243,27 @@ DuckDB's pipeline ordering — the SQL suite uses `-- setup:` statements
   byte radix regression, tiny, and runs placed exactly on the 64-chunk /
   256-block boundaries the Metal kernels use).
 
-## Deferred (v0.7)
+## Outside this design
 
-Composite keys (pack into one BIGINT for now), `GROUP BY` over join results
-as a fused op, resident f64 min/max, and transparent execution: plain
-`GROUP BY` SQL rewritten before DuckDB plans it, through DuckDB's own
-`json_serialize_sql` / `json_deserialize_sql` and a pure C-API scalar in the
-extension, driven by a client wrapper — no C++ extension API.
-The v0.7 design is in `TRANSPARENT_DESIGN.md`.
+Four things sat outside the v0.6 functions this document describes. Where each
+of them stands:
+
+- **Composite keys** — shipped in v0.7. Up to three integer / `DATE` /
+  `TIMESTAMP` keys are packed into one 64-bit key at upload and unpacked in the
+  rewritten select list; four to eight keys, or any `VARCHAR` / `DECIMAL`
+  component, use a hashed tuple with a dictionary (`TRANSPARENT_DESIGN.md`
+  §4.4, §4.15).
+- **`GROUP BY` over a join result** — shipped in v0.7. An inner equi-join onto
+  a unique key is materialised on the device as a new exact set
+  (`gpu_join_materialize`, §4.8); other INNER / LEFT / RIGHT and many-to-many
+  joins are answered from an upload of the join's result (§4.13).
+- **Transparent execution** — shipped in v0.7: a statement is rewritten before
+  DuckDB plans it, through DuckDB's own `json_serialize_sql` and the pure
+  C-API scalar `gpu_rewrite_ast`, driven by the `gpudb` shell or
+  `gpudb.connect()`. No C++ extension API. The design is
+  `TRANSPARENT_DESIGN.md`.
+- **Resident f64 `min` / `max` over a GROUP BY** — stays on DuckDB. The v0.7
+  exact path answers `min` / `max` / `count` over `DOUBLE` exactly (§4.7), but
+  `sum` and `avg` over `DOUBLE` or `FLOAT` are never rewritten, because native
+  computes them order-dependently and "the same as native" is not definable for
+  them.

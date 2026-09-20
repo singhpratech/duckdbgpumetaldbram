@@ -1,8 +1,10 @@
-# Resident columns — the v0.8 storage design
+# Resident columns — the storage design
 
-Status: design 2026-09-18; stage A merged (#123), stage B merged (#124), stage C
-merged (#125); the group-id lane of §7 built 2026-09-18 (this PR, Metal); stage
-D next. Companion to
+Status: designed 2026-09-18 and shipped in v0.7 — stage A merged (#123), stage B
+merged (#124), stage C merged (#125), the group-id lane of §7 built 2026-09-18
+(Metal). Stage D (a join result read through index vectors instead of copied)
+is designed and measured in §8; the indexed read is not wired into SQL, and
+the section says so where it says so. Companion to
 `docs/TRANSPARENT_DESIGN.md` (the rewrite, the rules, the thresholds), which it
 does not change: rule 1 (never slower than native) and rule 2 (never a
 different answer) are enforced by the same gate and the same tests.
@@ -148,7 +150,7 @@ single-table and join-base lanes are 35 shared columns, 11.4 GiB (`lineitem`
 33.5 GiB of join results — 44.9 GiB. The saving on this workload is 0.6 GiB:
 its sets barely overlapped in lanes. What is still uploaded per statement is
 join *results* — the uploaded joins DuckDB evaluates for the shapes the
-device join does not plan yet (composite keys, cross-table expressions, keys
+device join does not plan (composite keys, cross-table expressions, keys
 from several tables) and the device join's own materialised results. That is
 stage D, three quarters of the memory.
 
@@ -236,8 +238,8 @@ min/max are not plain integers, keeps its type's width. It stays an UPPER bound,
 which is what the admission rule needs, and the wrapper test that asserts the
 estimate never falls below what `gpu_residents()` / `gpu_store_columns()` report
 covers a narrow-typed table (INTEGER key, DATE, SMALLINT) as well as a BIGINT
-one. On a backend without narrow lanes — CUDA, the CPU reference — every lane is
-charged 8 as before. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
+one. On a backend without narrow lanes — the CPU reference — every lane is
+charged 8 as before; both GPU backends report `narrow_lanes()` true. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
 §4.12) is charged no sort cache.
 
 ## 7. The group-id lane — a second derived structure
@@ -559,11 +561,11 @@ widths, F64 NaN / ±inf / −0.0, NULL lane cells, NULL index cells as payload
 and as key, the chained three-step composition, and an out-of-range index
 (refused, not read).
 
-**Not yet built.** The extension's `gpu_join_index()` and a join set that owns
-index vectors; the `gpu_residents()` reporting columns; the wrapper emitting
-index steps. Until those land nothing in SQL takes the indexed path, and the
-measured behaviour of every query is today's — which, given the table above,
-is also the right order to do it in.
+**Not built.** There is no `gpu_join_index()` in the extension, no join set
+that owns index vectors, no reporting columns for one in `gpu_residents()`,
+and the wrapper emits no index steps. Nothing in SQL takes the indexed path,
+so the measured behaviour of every query is what the rest of this document
+describes.
 
 ## 9. Shedding — a derived structure a column stops needing
 

@@ -1120,7 +1120,7 @@ hybrid planner already detects this regime and would dispatch CPU
 correctly if invoked — the extension just doesn't use the planner yet.
 
 Estimate: 1-2 days of work in `src/extension/gpu_sum_extension.cpp`
-(Linux Claude's lane). Filed as a next-step.
+(the Linux instance's lane). Filed as a next-step.
 
 ### What this changes for "release"
 
@@ -1137,7 +1137,7 @@ the hardware ceiling story and document the path to extending it.
 
 ---
 
-## 2026-05-09 (night, macOS) — Hybrid planner v1 (GOAL.md item 7)
+## 2026-05-09 (night, macOS) — Hybrid planner v1 (goal 7 of the May 2026 charter)
 
 Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GB unified
 memory). macOS 15.x, MSL 3.2. Code state: `feat/core-hybrid-planner`,
@@ -1185,7 +1185,7 @@ well enough to pick the right backend deterministically".
 The same rule shape is safe on CUDA — the CUDA-specific BENCHMARK.md
 numbers (12–22× wins at 1M+ groups, 9× HOT SUM) are strictly stronger
 than Metal so the same conservative thresholds remain correct. We will
-re-tune per-backend when Linux Claude lands online statistics.
+re-tune per-backend when the Linux instance lands online statistics.
 
 ### Sweep — `gpudb-groupby-bench --backend sweep --runs 3`
 
@@ -1225,7 +1225,7 @@ dependent and "always GPU" naively loses on this hardware.
 
 ### What this milestone proves
 
-GOAL.md item 7 is satisfied: the hybrid CPU/GPU planner is wired into
+Goal 7 of the May 2026 charter is satisfied: the hybrid CPU/GPU planner is wired into
 `gpudb-bench` and `gpudb-groupby-bench` via `--backend hybrid` (single-
 call) and `--backend sweep` (the table above). Decisions are exposed via
 `HybridAggregator::last_decision()` so the DuckDB extension and any
@@ -1239,7 +1239,7 @@ Hardware: Apple M4 Max, ~64 GiB unified memory, macOS 15.x, MSL 3.2.
 Code state: latest main (after PR #5 radix GROUP BY merged).
 Single-thread CPU `std::unordered_map` baseline. Median of 5 runs.
 
-This is the comprehensive TPC-H bench that GOAL.md item 5 + 9 calls for —
+This is the comprehensive TPC-H bench that goals 5 and 9 of the May 2026 charter call for —
 **same workloads CUDA shipped on, run on Metal, with the SQL extension
 also verified end-to-end on macOS**.
 
@@ -1295,7 +1295,7 @@ Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, AppleClang 21.0.0.
 Code state: `feat/core-window-functions`. New `WindowAggregator` interface,
 CPU reference, Metal scaffold, and `gpudb-window-bench`.
 
-This is **GOAL.md item 8** — the operator Sirius (CIDR 2026 GPU OLAP paper)
+This is **goal 8 of the May 2026 charter** — the operator Sirius (CIDR 2026 GPU OLAP paper)
 explicitly lacks. The v1 ships the interface and the CPU reference; the Metal
 scaffold reports `backend()==METAL` but delegates to the CPU implementation.
 Honest reporting: `device_name()` says "Metal scaffold — ROW_NUMBER delegates
@@ -1351,7 +1351,7 @@ cmake --build build-macos -j
 
 ## 2026-05-09 (night) — Multi-agg fusion (sum+min+max+count one pass)
 
-The wedge: most analytical queries compute several aggregates over the same
+The shape that pays: most analytical queries compute several aggregates over the same
 column (`SELECT SUM(x), MIN(x), MAX(x), COUNT(x) FROM t`). Calling
 `sum_i64`, `min_i64`, `max_i64` separately reads the column from DRAM
 **three times**. The new `agg_all_i64` operator reads it ONCE and computes
@@ -1410,7 +1410,7 @@ existing `sum_i64` / `sum_partials_i64` pair.
 Even before considering GPU vs CPU, the planner should always fuse
 multi-agg patterns when they target the same column. This is a free
 ~3× on Metal and ~2× on CPU regardless of which backend wins the
-overall query. CUDA implementation is stubbed (throws) — Linux Claude
+overall query. CUDA implementation is stubbed (throws) — the Linux instance
 to pick that up; the kernel pattern is identical to Metal so it should
 land in a single PR.
 ## 2026-05-09 (consolidated) — 4-column comparison: CPU/CUDA Linux vs CPU/Metal Mac
@@ -1576,7 +1576,7 @@ that would require HBM-class memory the M-series doesn't have.
 - HBM raw kernel speed: CUDA wins per-op
 - Ratio over CPU: both decisively beat single-thread CPU; CUDA wins more because its kernel is faster
 
-**The unique-in-the-world artifact GOAL.md asks for:** Metal numbers
+**The artifact the May 2026 charter asks for:** Metal numbers
 that compete with CUDA on real workloads. Achieved.
 
 ### "10× over CPU" — where it's reachable
@@ -1658,9 +1658,9 @@ Metal kernel-only throughput hits **27–29 GiB/s** at low cardinality
 scatter) is what's between us and the hardware ceiling, and is the next
 targeting opportunity.
 
-### What this milestone proves (per GOAL.md)
+### What this milestone proves (against the May 2026 charter)
 
-GOAL.md item 5 deliverable: "**Once Metal SUM and GROUP BY post numbers
+Goal 5 of the May 2026 charter: "**Once Metal SUM and GROUP BY post numbers
 in BENCHMARK.md alongside CUDA, the dual-backend story becomes real —
 that's the unique-in-the-world artifact that makes this project
 defensible.**"
@@ -1746,7 +1746,7 @@ hash table fits in L2/L3 and is cache-resident; at high group counts
 (1M+) it loses cache locality and falls off a cliff (1355 ms at 100M ×
 1M is roughly 7× slower than 100M × 100).
 
-That asymmetry is the wedge: Metal wins decisively where it actually
+That asymmetry is the shape that pays: Metal wins decisively where it actually
 matters for OLAP — high-cardinality GROUP BY (the very regime where
 CPU's hash table breaks down).
 
@@ -1759,7 +1759,7 @@ radix passes for constant bytes. For uniformly-distributed keys in
 rest can be skipped (just swap pointers). Expected: 4–8× kernel speedup
 at low cardinality, which would flip these regimes.
 
-That's a small, contained change to land in the next PR.
+That is a small, contained change.
 
 ---
 
@@ -1857,7 +1857,7 @@ live in a single command buffer and the wall converges to the kernel
 time. Filed as the next ticket; the GROUP BY architecture this PR ships
 is correct and modular enough to drop in.
 
-### What this milestone proves (per GOAL.md)
+### What this milestone proves (against the May 2026 charter)
 
 > "Reproducing the CUDA numbers in BENCHMARK.md on Apple Silicon, with a
 > working Metal implementation of: ... GROUP BY hash aggregate"
@@ -1922,7 +1922,7 @@ This is the canonical CUDA benchmark (CUDA shipped 4.8× on the same
 workload). Metal at this code quality loses 2.2× — bitonic sort on 6M
 rows pays ~210 dispatches × ~30 µs of launch overhead even with the two-
 tier optimization, plus the host segment-reduce. The fix is GPU-resident
-radix sort (next PR); see the postmortem in the next section.
+radix sort; see the postmortem in the next section.
 
 ### Scale sweep — synthetic int64 GROUP BY, 1 M-cardinality keys
 
@@ -2032,7 +2032,7 @@ this PR.
 
 ### What this milestone proves
 
-GOAL.md item 5 is satisfied: **real GROUP BY on Apple Silicon GPU, no CPU
+Goal 5 of the May 2026 charter is satisfied: **real GROUP BY on Apple Silicon GPU, no CPU
 fallback, correctness verified, and a regime where the GPU wins** — which
 is what makes the dual-backend story land. The Metal-GROUP-BY-wins row
 (1M rows × 1M groups, 2.1× over CPU) is the macOS analog of the CUDA
@@ -2040,7 +2040,7 @@ hash-table 12–22× wins at high cardinality from the section below: GPU
 GROUP BY's value is in the random-access-bound regime where CPU caches
 collapse.
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **GPU-resident radix sort with on-device scan** — eliminates the host
    scan + commit/wait overhead that gates the prototype. Expected to push
@@ -2052,7 +2052,7 @@ collapse.
 
 ### What this milestone proves
 
-GOAL.md item 5 is satisfied: real GROUP BY on Apple Silicon GPU, no CPU
+Goal 5 of the May 2026 charter is satisfied: real GROUP BY on Apple Silicon GPU, no CPU
 fallback, correctness verified, **and a regime where the GPU wins** —
 which is what makes the dual-backend story land. The Metal-GROUP-BY-wins
 row (1M rows × 1M groups, 2.0× over CPU) is the macOS analog of the CUDA
@@ -2060,7 +2060,7 @@ hash-table 12–22× wins at high cardinality from the section below: GPU
 GROUP BY's value is in the random-access-bound regime where CPU caches
 collapse.
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **Replace bitonic with radix sort** — 8-bit buckets × 8 passes for
    64-bit keys, ~25 total dispatches. Expected to flip the 16M case and
@@ -2212,7 +2212,7 @@ exactly the macOS analog of the Metal bitonic-GROUP-BY's 2.1× win at the
    Anyone evaluating GPU OLAP must have an answer for this — ours is "keep
    the column resident; the API supports it."
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **Stream + overlap.** Use multiple CUDA streams to overlap PCIe transfer
    with kernel execution. Should hide ~30–50% of the cold-mode transfer cost.
@@ -2485,7 +2485,7 @@ cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb
 
 ---
 
-## 2026-05-09 (post-launch verification) — TPC-H SF1 CUDA GROUP BY re-bench
+## 2026-05-09 (re-verified) — TPC-H SF1 CUDA GROUP BY re-bench
 
 Triggered while reviewing community-extensions PR #1898. The README had
 listed "GROUP BY 6M TPC-H lineitem | 81.7 ms | 16.9 ms | 4.8× over CPU"
@@ -3617,7 +3617,7 @@ bound and none differing, exit 0. The `global` form is now swept over single
 tables as well as joins — 74 rows, of which the 8 single-table ones decline on
 the threshold at SF1 and the 66 over joins run 1.02× to 75×.
 
-## v0.8 — the direct, row-order grouped reduce, Metal, SF10 (2026-09-18)
+## v0.7 — the direct, row-order grouped reduce, Metal, SF10 (2026-09-18)
 
 A GROUP BY key with few distinct values gets a dense group-id lane derived from
 its sort cache (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) and the exact operators
@@ -3915,7 +3915,7 @@ scratch needs are not cold any more. The prewarm stays because it costs nothing
 the direct path allocates no row-sized scratch at all.
 
 
-## v0.8 — what the direct reduce costs before its first row, Metal (2026-09-18)
+## v0.7 — what the direct reduce costs before its first row, Metal (2026-09-18)
 
 The section above measured one row count, 60M, and concluded there was no
 crossover. That was wrong, and the way it was wrong is worth keeping: a pass
@@ -4152,7 +4152,7 @@ are and the run-time measured rule 1 keeps deciding these shapes. The only
 rows below 1.0× in that sweep are the global-aggregate form at SF1, which its
 own rule (`rows × (1 + terms) ≥ 60M`) already declines.
 
-## v0.8 — shedding what the direct reduce made unnecessary, Metal, SF10 (2026-09-18)
+## v0.7 — shedding what the direct reduce made unnecessary, Metal, SF10 (2026-09-18)
 
 A key column with a group-id lane releases its sort cache, and a lane that is a
 GROUP BY key and nothing else releases the lane too (`key[row] =
@@ -4212,7 +4212,7 @@ column per structure and never twice, and `--joins none`, `--no-single` and
 `--exprs` alone find none. The gate is still exit 0 with every rewritten cell at
 or above the bound.
 
-## v0.8 — the WHERE stage of the sort path in one pass, Metal, SF10 (2026-09-18)
+## v0.7 — the WHERE stage of the sort path in one pass, Metal, SF10 (2026-09-18)
 
 `gbx_mask_i64` was one kernel dispatch per predicate over the rows, each of them
 reading a byte of the mask and writing one back in order to look at a single
@@ -4355,7 +4355,7 @@ the machine, on the final code: 782 cells, 509 rewritten and at or above the
 bound, 273 declined by a threshold, 0 slower, 0 differing, exit 0. No threshold
 changed.
 
-## v0.8 stage D1 — a lane read through an index vector, Metal, SF1 + SF10 (2026-09-19)
+## v0.7 stage D1 — a lane read through an index vector, Metal, SF1 + SF10 (2026-09-19)
 
 **Hardware / build:** Apple M4 Max (unified memory), macOS 25.6, `./scripts/build.sh`
 (`build-macos`, CPU + Metal), DuckDB via `gpudb.connect()` with `threads = 1`.
@@ -5082,6 +5082,122 @@ v0.6 function set (no exact forms). Everything in this section requires a local
 build with a CUDA toolchain; none of it is reachable from the published
 extension.
 
+## TPC-H coverage, the whole 22 through the transparent path — Metal, SF1 + SF10 (2026-09-19)
+
+The headline figures the README quotes (SF1 17 of 22, SF10 19 of 22, 0 rows
+differing) come from these two runs, recorded here so they can be found and
+repeated.
+
+**Conditions**, as the runs' own headers record them: Apple M4 Max,
+`compiled=cpu,metal runtime=metal exact=true join=true global=true
+narrow=true device_memory=55662788608 store=true`, thresholds **on**, **N=5**
+(hot loop, minimum of N; a rewritten query is warmed first), measured
+2026-09-19. `scripts/tpch_coverage.py` connects with `residency="eager"` and
+`read_only=True`, so every table a query reads is **resident before it is
+timed** and the upload cost is outside the comparison — this is the
+steady-state number for a workload that asks the same shapes repeatedly, not
+a cold-start number. Each query's rows are compared with native's, ordered,
+and the `identical` column is that comparison.
+
+**Two conditions the run did not print:** the DuckDB version it used, and the
+memory budget the SF10 run was given. What is recorded is that SF10 holds
+18.7 GiB resident, which does not fit the 16 GiB the default budget works out
+to on this machine, so the budget had been raised; by how much the run did not
+print. The repro command below therefore passes a budget explicitly.
+
+```bash
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf1/tpch.duckdb
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb \
+    --memory-budget 200GB
+```
+
+**Later (2026-09-20, the memory-budget work):** the raised budget is no longer
+needed. Once a refusal was remembered and the budget compared with the physical
+resident total rather than with a sum that double-counted shared store columns,
+the same SF10 run gives **19 of 22 on the device, 0 rows differing, and no
+`memory` declines at the DEFAULT budget** — so the second command above is the
+first one with `--db data/tpch_sf10/tpch.duckdb` and nothing else. A run also
+prints more than this one could: an `error`, `memory` or `not_resident` row now
+carries the wrapper's own sentence beside the reason code.
+
+### Scale factor 1 — 17 of 22 on the device, 0 rows differing
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---:|---:|---:|
+| Q1 | GPU (plain) | 12.1 | 3.2 | 3.83× |
+| Q2 | native (threshold) | 4.6 | — | — |
+| Q3 | GPU (plain) | 6.6 | 2.2 | 3.06× |
+| Q4 | GPU (plain) | 7.3 | 0.8 | 9.37× |
+| Q5 | GPU (plain) | 6.8 | 1.1 | 6.08× |
+| Q6 | native (threshold) | 1.9 | — | — |
+| Q7 | GPU (plain) | 7.4 | 2.1 | 3.55× |
+| Q8 | GPU (projected) | 7.3 | 1.4 | 5.18× |
+| Q9 | GPU (plain) | 18.5 | 1.4 | 13.61× |
+| Q10 | GPU (topk) | 18.0 | 2.9 | 6.30× |
+| Q11 | native (threshold) | 2.8 | — | — |
+| Q12 | GPU (plain) | 6.1 | 1.6 | 3.78× |
+| Q13 | GPU (nested) | 18.6 | 1.7 | 11.23× |
+| Q14 | GPU (projected) | 5.1 | 1.9 | 2.73× |
+| Q15 | GPU (nested) | 3.1 | 2.2 | 1.43× |
+| Q16 | native (threshold) | 12.2 | — | — |
+| Q17 | GPU (projected) | 6.1 | 1.2 | 5.20× |
+| Q18 | GPU (plain) | 13.3 | 1.5 | 8.98× |
+| Q19 | GPU (projected) | 10.3 | 1.4 | 7.11× |
+| Q20 | native (shape) | 7.7 | — | — |
+| Q21 | GPU (plain) | 21.4 | 2.9 | 7.28× |
+| Q22 | GPU (plain) | 8.0 | 1.1 | 7.58× |
+
+### Scale factor 10 — 19 of 22 on the device, 0 rows differing
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---:|---:|---:|
+| Q1 | GPU (plain) | 109.9 | 14.4 | 7.61× |
+| Q2 | native (shape) | 17.6 | — | — |
+| Q3 | GPU (plain) | 45.8 | 13.6 | 3.38× |
+| Q4 | GPU (plain) | 44.1 | 2.6 | 17.10× |
+| Q5 | GPU (plain) | 46.7 | 0.9 | 52.88× |
+| Q6 | GPU (projected) | 14.1 | 5.9 | 2.39× |
+| Q7 | GPU (plain) | 47.0 | 10.9 | 4.30× |
+| Q8 | GPU (projected) | 66.7 | 7.8 | 8.54× |
+| Q9 | GPU (plain) | 145.0 | 5.6 | 26.13× |
+| Q10 | GPU (topk) | 77.4 | 13.9 | 5.57× |
+| Q11 | GPU (nested) | 10.4 | 6.6 | 1.57× |
+| Q12 | GPU (plain) | 39.3 | 10.3 | 3.80× |
+| Q13 | GPU (nested) | 157.3 | 13.6 | 11.56× |
+| Q14 | GPU (projected) | 29.0 | 4.3 | 6.68× |
+| Q15 | GPU (nested) | 20.4 | 15.3 | 1.34× |
+| Q16 | native (threshold) | 37.6 | — | — |
+| Q17 | GPU (projected) | 49.3 | 3.2 | 15.61× |
+| Q18 | GPU (plain) | 101.7 | 8.8 | 11.53× |
+| Q19 | GPU (projected) | 64.6 | 4.2 | 15.33× |
+| Q20 | native (shape) | 34.9 | — | — |
+| Q21 | GPU (plain) | 159.4 | 21.4 | 7.45× |
+| Q22 | GPU (plain) | 27.1 | 0.7 | 36.89× |
+
+**Why the five that stay, stay.** Q20 at both scale factors, and Q2 at SF10, hold a
+correlated subquery whose inner statement does not bind on its own (`Binder
+Error: Referenced column "ps_partkey" / "p_partkey" not found`), so there is
+nothing to hand the device. At SF1 Q2 declines on a size bound before it gets
+that far. So does Q6, on a bound of its own: it has no GROUP BY at all, and an
+aggregate without one over a single table needs 16M rows — its decline reads
+`6001215 rows < 16000000 for an aggregate without GROUP BY`. Q16's inner
+`GROUP BY` declines on its own threshold; forced, it measures 0.08× at SF1 and
+0.02× at SF10, so the bound is right. Q11 at SF1 is below the measured size floors, and both
+it and Q6 clear them at SF10, where Q6 runs 2.39× and Q11 1.57×.
+
+**Q5's 0.9 ms** at SF10 is the largest ratio in the table and the one most
+worth reading carefully: the statement's whole answer comes off an
+already-resident upload of the join's result, so the 52.9× compares native
+doing the join against the device not having to. The upload that put it there
+is not in the 0.9 ms; it is the steady-state cost of the tenth identical ask,
+not the first.
+
+**Earlier entries in this file record 15 of 22 (SF1) and 16–17 of 22 (SF10)**
+as the coverage on the code of 2026-09-18. The difference is the work landed
+since: the row floor counting the table a lane reads (Q22), the inner-statement
+bounds (Q13, Q15), and the CTE handling (Q15). Those entries are kept as
+written — this is the run on the current code, not a correction of them.
+
 ## agg_all on CUDA — the fused reduce, RTX 4090, 50M rows (2026-09-20)
 
 `agg_all_i64` (SUM + MIN + MAX + COUNT in one pass) had been a throwing stub on
@@ -5398,3 +5514,179 @@ TPC-H **Q1 straddles 1.0×** on this box: 0.97× on `--path execute` and 1.03× 
 The measured rule handles it per process. It is the one shape to re-check if a
 CUDA-specific table is ever reconsidered.
 
+## 2026-09-20 — the release build
+
+**Hardware / build:** Apple M4 Max (Metal), macOS 26.6.2, commit `98b19c2`, a
+clean rebuild at the 15.0 deployment target, DuckDB 1.5.5, Python 3.13.9,
+**default memory budget**, thresholds on, N=5, every row compared with native
+before any time was counted. `gpu_build_info()`:
+`compiled=cpu,metal runtime=metal exact=true join=true global=true narrow=true
+device_memory=55662788608 store=true rebuilds=0/0 device='Apple M4 Max' avgf=53`.
+
+This is the run the README, the release notes, the registry descriptor and
+`KNOWN_ISSUES.md` quote for v0.7.0. Earlier sections stay as they are: they are
+the record of other builds on other days, and nothing here replaces them.
+
+| | queries on the device | rows differing | speed-up on those queries |
+|---|---|---|---|
+| SF1, `--path execute` | 17 of 22 | 0 | 1.52× (Q15) – 15.32× (Q9) |
+| SF1, `--path sql` | 17 of 22 | 0 | 1.37× (Q15) – 9.49× (Q13) |
+| SF10, `--path execute` | 19 of 22 | 0 | 1.06× (Q11) – 48.10× (Q5) |
+| SF10, `--path sql` | 19 of 22 | 0 | 0.92× (Q11) – 26.39× (Q5) |
+
+Declines: at SF1 **Q2, Q6, Q11, Q16** (threshold) and **Q20** (shape); at SF10
+**Q16** (threshold) and **Q2, Q20** (shape). Q6 is above its bound at SF10 and
+below it at SF1, which is the size threshold doing its job.
+
+### The losing row, printed as one
+
+**Q11 at SF10 straddles parity.** It is a 6–7 ms statement — small enough that
+the decision is close and the machine's state decides it. Through `execute()`
+it measured **1.06×**; through `sql()` it measured **0.92×** in this run, and
+**1.06×** and **0.89×** in two immediate re-runs of the same build. So it is
+reported as a straddle, not as a win: the per-process measured rule is what
+settles it on any given machine, the same way TPC-H Q1 straddles 1.0× on the
+RTX 4090 (see *the CUDA exact path on by default*). No other rewritten row in
+this run is below 1.0× at either scale factor.
+
+**SF1, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.7 | 3.2 | 3.98× | True | |
+| Q2 | native (threshold) | 4.3 | — | — | — |  |
+| Q3 | GPU (plain) | 5.9 | 2.1 | 2.80× | True | |
+| Q4 | GPU (plain) | 6.0 | 0.6 | 10.79× | True | |
+| Q5 | GPU (plain) | 6.8 | 1.1 | 5.97× | True | |
+| Q6 | native (threshold) | 1.8 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 6.8 | 2.0 | 3.39× | True | |
+| Q8 | GPU (projected) | 6.0 | 1.5 | 4.10× | True | |
+| Q9 | GPU (plain) | 18.1 | 1.2 | 15.32× | True | |
+| Q10 | GPU (topk) | 13.0 | 3.8 | 3.46× | True | |
+| Q11 | native (threshold) | 2.6 | — | — | — |  |
+| Q12 | GPU (plain) | 5.1 | 1.6 | 3.29× | True | |
+| Q13 | GPU (nested) | 18.0 | 1.7 | 10.41× | True | |
+| Q14 | GPU (projected) | 5.3 | 1.4 | 3.90× | True | |
+| Q15 | GPU (nested) | 3.2 | 2.1 | 1.52× | True | |
+| Q16 | native (threshold) | 11.9 | — | — | — |  |
+| Q17 | GPU (projected) | 4.6 | 1.4 | 3.32× | True | |
+| Q18 | GPU (plain) | 13.9 | 1.5 | 9.51× | True | |
+| Q19 | GPU (projected) | 10.0 | 1.4 | 6.98× | True | |
+| Q20 | native (shape) | 7.3 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 20.0 | 3.2 | 6.16× | True | |
+| Q22 | GPU (plain) | 8.0 | 1.1 | 7.38× | True | |
+
+**SF1, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.2 | 3.6 | 3.38× | True | |
+| Q2 | native (threshold) | 4.4 | — | — | — |  |
+| Q3 | GPU (plain) | 6.1 | 2.9 | 2.11× | True | |
+| Q4 | GPU (plain) | 6.1 | 1.5 | 4.00× | True | |
+| Q5 | GPU (plain) | 6.5 | 1.7 | 3.71× | True | |
+| Q6 | native (threshold) | 1.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 7.0 | 3.2 | 2.18× | True | |
+| Q8 | GPU (projected) | 6.3 | 2.0 | 3.16× | True | |
+| Q9 | GPU (plain) | 18.1 | 2.1 | 8.49× | True | |
+| Q10 | GPU (topk) | 13.2 | 4.2 | 3.14× | True | |
+| Q11 | native (threshold) | 2.6 | — | — | — |  |
+| Q12 | GPU (plain) | 5.2 | 1.9 | 2.78× | True | |
+| Q13 | GPU (nested) | 18.1 | 1.9 | 9.49× | True | |
+| Q14 | GPU (projected) | 5.5 | 1.7 | 3.18× | True | |
+| Q15 | GPU (nested) | 3.3 | 2.4 | 1.37× | True | |
+| Q16 | native (threshold) | 12.7 | — | — | — |  |
+| Q17 | GPU (projected) | 5.0 | 1.5 | 3.39× | True | |
+| Q18 | GPU (plain) | 14.1 | 1.9 | 7.28× | True | |
+| Q19 | GPU (projected) | 10.2 | 1.7 | 5.97× | True | |
+| Q20 | native (shape) | 7.5 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 20.0 | 6.5 | 3.09× | True | |
+| Q22 | GPU (plain) | 8.5 | 1.5 | 5.78× | True | |
+
+**SF10, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 109.5 | 14.3 | 7.63× | True | |
+| Q2 | native (shape) | 16.8 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 43.0 | 13.9 | 3.10× | True | |
+| Q4 | GPU (plain) | 43.6 | 2.5 | 17.12× | True | |
+| Q5 | GPU (plain) | 39.1 | 0.8 | 48.10× | True | |
+| Q6 | GPU (projected) | 14.0 | 5.9 | 2.39× | True | |
+| Q7 | GPU (plain) | 35.8 | 11.0 | 3.27× | True | |
+| Q8 | GPU (projected) | 35.7 | 7.9 | 4.51× | True | |
+| Q9 | GPU (plain) | 112.4 | 5.5 | 20.33× | True | |
+| Q10 | GPU (topk) | 76.8 | 14.0 | 5.49× | True | |
+| Q11 | GPU (nested) | 6.2 | 5.9 | 1.06× | True | |
+| Q12 | GPU (plain) | 40.2 | 10.4 | 3.88× | True | |
+| Q13 | GPU (nested) | 147.8 | 13.6 | 10.84× | True | |
+| Q14 | GPU (projected) | 29.1 | 4.3 | 6.74× | True | |
+| Q15 | GPU (nested) | 20.5 | 15.3 | 1.34× | True | |
+| Q16 | native (threshold) | 34.8 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 37.5 | 3.2 | 11.61× | True | |
+| Q18 | GPU (plain) | 111.7 | 9.1 | 12.33× | True | |
+| Q19 | GPU (projected) | 63.4 | 4.2 | 15.24× | True | |
+| Q20 | native (shape) | 32.6 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 138.9 | 21.7 | 6.40× | True | |
+| Q22 | GPU (plain) | 26.2 | 1.5 | 17.32× | True | |
+
+**SF10, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 110.8 | 15.0 | 7.40× | True | |
+| Q2 | native (shape) | 17.1 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 43.3 | 14.8 | 2.93× | True | |
+| Q4 | GPU (plain) | 44.1 | 3.7 | 11.78× | True | |
+| Q5 | GPU (plain) | 39.9 | 1.5 | 26.39× | True | |
+| Q6 | GPU (projected) | 14.9 | 6.1 | 2.44× | True | |
+| Q7 | GPU (plain) | 36.7 | 11.7 | 3.14× | True | |
+| Q8 | GPU (projected) | 38.4 | 8.6 | 4.47× | True | |
+| Q9 | GPU (plain) | 127.6 | 6.7 | 19.05× | True | |
+| Q10 | GPU (topk) | 83.3 | 15.3 | 5.45× | True | |
+| Q11 | GPU (nested) | 6.6 | 7.2 | 0.92× | True | |
+| Q12 | GPU (plain) | 46.9 | 10.7 | 4.39× | True | |
+| Q13 | GPU (nested) | 161.5 | 13.9 | 11.59× | True | |
+| Q14 | GPU (projected) | 31.9 | 4.8 | 6.57× | True | |
+| Q15 | GPU (nested) | 22.2 | 15.9 | 1.40× | True | |
+| Q16 | native (threshold) | 36.1 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 42.9 | 3.7 | 11.60× | True | |
+| Q18 | GPU (plain) | 121.7 | 9.5 | 12.75× | True | |
+| Q19 | GPU (projected) | 67.6 | 4.6 | 14.65× | True | |
+| Q20 | native (shape) | 34.7 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 145.0 | 22.4 | 6.48× | True | |
+| Q22 | GPU (plain) | 27.7 | 1.9 | 14.54× | True | |
+
+### Gates
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor
+--path auto` on this M4 Max, 668 s wall (the RTX 4090's own run of the same gate
+is recorded by that machine, in its own section):
+
+| | cells |
+|---|---|
+| rewritten and PASS | **970** — 0 slower than native, 0 differing, min **1.04×**, max **55.2×** |
+| declined (threshold) | 495 |
+| declined after the first run (threshold) | 77 |
+| declined (shape) | 72 |
+| declined (not_found) | 16 |
+| **total** | **1630** |
+
+`scripts/wrapper_residency_gate.py`: pass, **0 failing rows**, 118 s.
+
+`scripts/budget_gate.py`, 256 MiB budget, 169 templates: **PASS — 169
+statements, 0 differing, 0 errors, resident never above the budget.** Physical
+resident 91.6–231.8 MiB at every sample, 1 eviction with **wasted 0**, 10
+refusals, at most 1 upload attempt for any one set, reasons
+`{rewritten: 17, threshold: 142, memory: 10}`, RSS 70 → 979 MiB, device memory
+peaked at 511.4 MiB.
+
+### Suites on this build
+
+| Suite | Result |
+|---|---|
+| `test_gpudb` (unit, CPU + Metal) | **3056 / 3056** |
+| `run_sql_tests.sh` | **225 passing, 0 failing**, 46 expected failures, 1 skipped |
+| `test_wrapper.py` | **1267 checks, 0 skipped, 0 failing** — identical under DuckDB 1.4.5 and 1.5.5 |
+| `test_residency_policy.py` | **131 checks, 0 failing** — both DuckDB versions |
+| `test_shell.py` | **77 / 0 skipped** under DuckDB 1.4.5; **76 / 1 skipped** under 1.5.5 (the skip is a throwaway virtualenv that cannot import duckdb, so the entry point cannot start) |

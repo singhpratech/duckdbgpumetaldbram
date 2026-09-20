@@ -1,8 +1,13 @@
 # Release readiness — DuckDB Community Extensions submission
 
-This document tracks what's needed to ship `gpudb_duckdb` to
-[duckdb/community-extensions](https://github.com/duckdb/community-extensions),
-the official catalog. It's the Goal-MD-item-9 punch list.
+> **Historical.** This was the punch list for the first submission to
+> [duckdb/community-extensions](https://github.com/duckdb/community-extensions),
+> written on 2026-05-09 and closed out when PR #1898 merged and
+> `INSTALL gpudb FROM community` went live. Every blocker below is resolved. It
+> is kept as the record of what the first submission needed; for how the
+> extension is built and tested now, read `docs/DEVELOPMENT.md`,
+> `docs/MACOS_EXTENSION_BUILD.md` and `docs/CI_RECIPES.md`, and for what ships
+> in each release, the README's Release history.
 
 Last validated: 2026-05-09 on Apple M4 Max + macOS 15.x (Darwin 25.4.0).
 
@@ -21,7 +26,7 @@ Last validated: 2026-05-09 on Apple M4 Max + macOS 15.x (Darwin 25.4.0).
 ### DuckDB extension (`gpudb_duckdb`)
 - ✅ Static `libgpudb_ext.a` builds on macOS
 - ✅ Pre-built DuckDB libs auto-fetched via `./scripts/get_duckdb_libs.sh`
-- ✅ `gpu_sum`, `gpu_min`, `gpu_max` aggregates registered via DuckDB C API (per Linux Claude's PR #1)
+- ✅ `gpu_sum`, `gpu_min`, `gpu_max` aggregates registered via DuckDB C API (per the Linux machine's PR #1)
 
 ### Benchmarks
 - ✅ TPC-H SF1 generated and benched on Metal (`./scripts/gen_tpch.sh`)
@@ -29,11 +34,9 @@ Last validated: 2026-05-09 on Apple M4 Max + macOS 15.x (Darwin 25.4.0).
 - ✅ Headline win documented: Metal SUM 1B HOT 5.28× over single-thread CPU, GROUP BY peak 4.89× at 500M × 1M groups, TPC-H GROUP BY ties CUDA wall
 
 ### Docs
-- ✅ `GOAL.md` — project commitments, ownership table
 - ✅ `BENCHMARK.md` — append-only reproducible numbers
 - ✅ `docs/BENCHMARK_PLAN.md` — comparison framework (operators × scales × scenarios × backends)
 - ✅ `docs/ARCHITECTURE.md`, `docs/DATASETS.md`, `docs/DEVELOPMENT.md`
-- ✅ `CLAUDE.md` — coordination rules for parallel Claude Code instances
 
 ---
 
@@ -63,7 +66,7 @@ target_link_libraries(gpudb_ext PUBLIC
 )
 ```
 
-This is documented in [MACOS_EXTENSION_BUILD.md](docs/MACOS_EXTENSION_BUILD.md). Resolved for current builds.
+This is documented in [MACOS_EXTENSION_BUILD.md](MACOS_EXTENSION_BUILD.md). Resolved for current builds.
 
 ### 2. CI workflow is disabled
 
@@ -78,8 +81,8 @@ Need to re-enable before publishing. Currently waiting for repo to go public. Th
 ### 4. SQL test coverage
 
 `test/sql/gpu_sum.test` exists for `gpu_sum`. Need similar `.test` files for:
-- `gpu_min` ← (Linux Claude added)
-- `gpu_max` ← (Linux Claude added)
+- `gpu_min` ← (added on the Linux machine)
+- `gpu_max` ← (added on the Linux machine)
 - NULL handling regression test
 - TPC-H Q1 / Q3 SQL (uses gpu_sum on lineitem)
 
@@ -92,7 +95,9 @@ Each community extension needs a `description.yml` with:
 - license
 - supported platforms
 
-Not yet present in the repo. Template available at https://github.com/duckdb/community-extensions/tree/main/extensions
+The repository's copy is `docs/COMMUNITY_EXTENSION_DESCRIPTION.yml`, a mirror
+of what the registry serves. The template is at
+https://github.com/duckdb/community-extensions/tree/main/extensions
 
 ### 6. Multi-platform CI matrix
 

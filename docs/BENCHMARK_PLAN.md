@@ -20,10 +20,10 @@ We use these because reviewers will ask for them:
 
 | Suite | What it is | Why it matters | Status |
 |---|---|---|---|
-| **TPC-H** | 22 SQL queries on 8-table snowflake schema, multiple SFs | THE canonical analytical SQL benchmark. CUDA path already runs SF1 lineitem aggregations. | SF1 generated; SF10 next |
-| **TPC-DS** | 99 queries on 17-table snowflake, more complex (CTEs, windows) | Modern decision-support; tests window functions and complex joins | Future (post hash-join) |
-| **ClickBench** | 43 queries on real Yandex.Metrica web traffic (~14 GiB hits.parquet) | Modern OLAP leaderboard, lots of GROUP BY at varying cardinalities | Wired once DuckDB extension is fully end-to-end |
-| **SSB (Star Schema Benchmark)** | Denormalized TPC-H, 13 queries | Dense aggregations + star joins; the workload `cuDF` paper uses | Planned |
+| **TPC-H** | 22 SQL queries on 8-table snowflake schema, multiple SFs | THE canonical analytical SQL benchmark. | In use: SF1 through SF100; `scripts/tpch_coverage.py` runs all 22 through DuckDB and through the transparent path and compares every row |
+| **TPC-DS** | 99 queries on 17-table snowflake, more complex (CTEs, windows) | Modern decision-support; tests window functions and complex joins | Not run |
+| **ClickBench** | 43 queries on real Yandex.Metrica web traffic (~14 GiB hits.parquet) | Modern OLAP leaderboard, lots of GROUP BY at varying cardinalities | Not run |
+| **SSB (Star Schema Benchmark)** | Denormalized TPC-H, 13 queries | Dense aggregations + star joins; the workload `cuDF` paper uses | Not run |
 
 Both CUDA and Metal numbers go in the **same** BENCHMARK.md table for each
 TPC-H query so the comparison is apples-to-apples.
@@ -50,7 +50,7 @@ real query (TPC-H or ClickBench).
 
 **Status:** in flight on `feat/metal-multiagg`.
 
-### 2.3 GROUP BY (the wedge)
+### 2.3 GROUP BY (the shape that pays)
 - `SUM(value) GROUP BY key` — i64 keys, i64 values
 - Future: multi-column group keys, multiple aggregates per group, COUNT DISTINCT
 
@@ -62,7 +62,7 @@ real query (TPC-H or ClickBench).
 
 **Status:** shipped on CUDA and Metal. Metal uses adaptive global slot-lock (small build) plus partitioned TG hash radix join (4.9× wall vs CPU @ 1M×10M M4). SQL: `gpu_inner_join`.
 
-### 2.5 Window functions (the GOAL.md item 8 differentiator)
+### 2.5 Window functions
 - `RANK()`, `ROW_NUMBER()` over partition
 - `LAG`, `LEAD` with offset
 - Sliding-window aggregates
@@ -87,8 +87,8 @@ real query (TPC-H or ClickBench).
 | **Mid N** (10M-100M rows) | TPC-H SF1-SF10 lineitem-class | Mix of bandwidth + setup | Metal wins on cardinality regimes |
 | **Huge N** (1B+ rows) | Data lake / warehouse | Sustained bandwidth | Metal closes gap to CUDA (UMA) |
 | **Low cardinality GROUP BY** (≤ 1K groups) | DAU, status counts | CPU cache locality | CPU often wins; Metal pulls even with min-max trick |
-| **High cardinality GROUP BY** (~rows distinct) | Per-user stats, transaction IDs | Memory latency | **Metal's wedge** — both Metal and CUDA win 3-22× |
-| **Multi-op same column** | "give me sum, min, max, count of price" | I/O efficiency | **Metal's wedge** with multi-agg fusion |
+| **High cardinality GROUP BY** (~rows distinct) | Per-user stats, transaction IDs | Memory latency | **Metal's strongest shape** — both Metal and CUDA win 3-22× |
+| **Multi-op same column** | "give me sum, min, max, count of price" | I/O efficiency | **Metal's strongest shape** with multi-agg fusion |
 | **Star join + agg** | TPC-H Q1, Q5, Q19; SSB | Hash join + group-by | Both Metal and CUDA needed |
 
 ---
@@ -139,7 +139,7 @@ Where we lose, we **say so in BENCHMARK.md** and explain why. Honesty buys credi
 ## 7. How to add a new operator to the comparison
 
 1. Decide its category in §2.
-2. Implement on CPU first (always), then Metal, then CUDA (Linux Claude).
+2. Implement on CPU first (always), then Metal, then CUDA (the Linux machine).
 3. Pick the scenarios from §3 it should be benched against.
 4. Add a section to `BENCHMARK.md` with the matrix from §4.
 5. Add the canonical SQL to TPC-H/ClickBench bindings if applicable.
@@ -153,8 +153,8 @@ Where we lose, we **say so in BENCHMARK.md** and explain why. Honesty buys credi
 |---|:-:|:-:|:-:|---|---|
 | SUM/MIN/MAX i64 | ✅ | ✅ | ✅ | Q1 (SUM(l_quantity)) | "Metal SUM at scale" |
 | SUM f64 | ✅ | ✅ | host fallback | Q1 (SUM(l_extendedprice)) | same |
-| `agg_all_i64` (multi-agg) | 🔜 | — | 🔜 (`feat/metal-multiagg`) | derived from Q1 | (incoming) |
+| `agg_all_i64` (multi-agg) | ✅ | ✅ | ✅ | derived from Q1 | "Multi-agg fusion" |
 | GROUP BY hash | ✅ | ✅ | ✅ (radix sort) | Q1 GROUP BY l_returnflag | "Metal GROUP BY" / matrix |
 | Hash join probe | ✅ | ✅ | ✅ adaptive + partitioned TG hash | Q3, Q5, Q12 | Metal hash join (2026-07-07) |
-| Window functions | — | — | — | Q8 (window) — future | — |
-| DuckDB extension wrapper | — | — | scaffold + `gpu_sum`, `gpu_min`, `gpu_max` (Linux-built; macOS validation: `feat/ext-macos-validate`) | All TPC-H | (when end-to-end) |
+| Window functions | ✅ | — | ✅ | Q8 (window) | "Window functions: ROW_NUMBER" |
+| DuckDB extension wrapper | ✅ | ✅ | ✅ | All TPC-H | "v0.7 TPC-H coverage map" |
