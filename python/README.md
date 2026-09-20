@@ -11,13 +11,21 @@ names and types are identical either way.
 
 ## Install
 
-There are **two pieces**. This package is the wrapper — the `gpudb` command and
-`gpudb.connect()`. The GPU code itself is a DuckDB extension, and `pip` does not
-install it.
-
 ```bash
 pip install duckdb-gpudb        # the distribution is duckdb-gpudb; the import is gpudb
 ```
+
+There are **two pieces**: this package is the wrapper — the `gpudb` command and
+`gpudb.connect()` — and the GPU code itself is a DuckDB extension. On **Apple
+Silicon (macOS 15 or later)** and **x86-64 Linux (glibc 2.34 or newer, e.g.
+Ubuntu 22.04 and later)** the wheel carries both: the v0.7.0 extension binary
+travels inside the package, so that one line is the whole install. No `INSTALL`,
+no build, no environment variable. One binary, and it has been run under both
+DuckDB 1.4.5 and 1.5.5.
+
+Anywhere else `pip` installs the pure-Python wheel and the extension comes from
+DuckDB's own install:
+
 ```sql
 INSTALL gpudb FROM community;   -- in any DuckDB >= 1.5.5 client
 LOAD gpudb;
@@ -25,19 +33,23 @@ LOAD gpudb;
 
 The wrapper looks for the extension in this order: an explicit `extension=`
 path, the `GPUDB_EXTENSION_PATH` environment variable, a `build-macos/` or
-`build-linux/` directory next to a source checkout, and finally the extension
-DuckDB itself has installed. If it finds none — or finds one older than this
-client — `con.extension_note` says so in one sentence and every statement runs
-on DuckDB.
+`build-linux/` directory next to a source checkout, the copy bundled in this
+package, and finally the extension DuckDB itself has installed. A checkout's
+own build comes before the bundled copy deliberately — someone who has just
+built the extension is testing that binary. If it finds none — or finds one
+older than this client — `con.extension_note` says so in one sentence and every
+statement runs on DuckDB.
 
-**Requires** Python >= 3.9 and the `duckdb` module >= 1.4. The registry builds
-gpudb separately for each DuckDB version from 1.5.5 on; a binary from the project's releases
-page needs only DuckDB >= 1.2, because the loadable extension is built against
-the stable C API v1.2.0. Apple silicon for the Metal backend, an NVIDIA GPU for
-the CUDA one; plain SQL runs on the GPU by default on both, and
-`GPUDB_CUDA_EXACT=0` turns the CUDA path off without a rebuild. On Linux, a
-binary installed from the community registry may report `compiled=cpu` and
-carry no CUDA at all — `SELECT gpu_build_info();` says which one you have.
+**Requires** Python >= 3.9 and the `duckdb` module >= 1.4. A bundled or
+downloaded binary needs only DuckDB >= 1.2, because the loadable extension is
+built against the stable C API v1.2.0; the registry builds gpudb separately for
+each DuckDB version from 1.5.5 on. Apple silicon for the Metal backend, an
+NVIDIA GPU for the CUDA one; plain SQL runs on the GPU by default on both, and
+`GPUDB_CUDA_EXACT=0` turns the CUDA path off without a rebuild. On Linux the
+extension needs `libgomp.so.1` at load time (`apt install libgomp1`), which the
+wheel bundles and a registry install does not; a binary installed from the
+community registry there reports `compiled=cpu` and carries no CUDA at all —
+`SELECT gpu_build_info();` says which one you have.
 
 ## The `gpudb` shell
 

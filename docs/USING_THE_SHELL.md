@@ -15,11 +15,12 @@ gpudb
 ```
 
 and read the `backend:` and `transparent:` lines of the banner. `backend:
-none — the extension is not loaded` means the extension is missing: install
-it into DuckDB with `INSTALL gpudb FROM community;`, or point
-`GPUDB_EXTENSION_PATH` at a binary you built ([Installing, in
-full](INSTALL.md)). `transparent: available` means both pieces are
-in place.
+none — the extension is not loaded` means the extension is missing. On Apple
+Silicon and x86-64 Linux `pip install duckdb-gpudb` brings one with it, so this
+usually means a platform whose wheel carries no binary: install it into DuckDB
+with `INSTALL gpudb FROM community;`, or point `GPUDB_EXTENSION_PATH` at a
+binary you built ([Installing, in full](INSTALL.md)). `transparent: available`
+means both pieces are in place.
 
 Then run a statement over a table of at least a million rows and read the
 footer. `GPU (…)` is the GPU; `DuckDB (not_resident: …)` means it is on its
@@ -307,11 +308,19 @@ A set that does not fit is not uploaded, its statements keep running on DuckDB,
 and it is not asked again until something that could change the answer changes.
 [When GPU memory is full](INSTALL.md#when-gpu-memory-is-full) has the rest.
 
-The `resident:` line adds up the sets, and a set is a view over shared store
-columns — so where several sets read the same column it is counted once per
-set. The `.residents` table above is the physical picture (each column once);
-from Python, `con.memory()["bytes"]` is that total and is what the budget is
-actually compared with.
+The `resident:` line is the **physical** total — every store column counted
+once, plus whatever each set holds of its own — and it is the number the budget
+is compared with. It is deliberately not the sum of the per-set `bytes` that
+`.residents` prints: a set is a view over shared store columns and reports what
+its own lanes cost, so adding those up counts a shared column once per set that
+reads it (measured on one session: 4.5× the physical figure). From Python the
+same number is `con.memory()["bytes"]`.
+
+An `allocated:` line appears under it when the backend can say what the
+**driver** thinks this process holds. It is larger than `resident:` by the
+backend's own machinery and by any in-flight operator's working memory — and
+that difference is exactly what the budget does not account for. Where no
+backend can answer the line is absent, which is not the same fact as zero.
 
 ## Uploading by hand
 
