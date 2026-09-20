@@ -5414,6 +5414,100 @@ statement spread from 10.0 to 14.8 ms with nothing changed between them, so the
 guides now print the spread and tell the reader to expect their own numbers. The
 "asked by name" operator table was *not* re-measured; it now says so, and names
 the release each row was taken at.
+## 2026-09-20 — A threshold that was really a claim about the backend
+
+The release gate exited 1. One cell of 1631 came in at 0.93×: `l_returnflag`,
+no WHERE, plain, native 3.4 ms against rewritten 3.7 ms. Run it again, same
+flags, and the gate exited 1 with **two** cells below parity — different ones,
+and the first now passing at 1.74×.
+
+I wrote that up as a straddle inside the measurement's own spread. That was
+wrong, and the way it was wrong is the point of this entry: two runs disagreed,
+and I explained the disagreement instead of measuring the thing both runs were
+sampling. Retracted in full.
+
+What is actually there, from timing the pieces of the rewritten plan:
+
+    native original          2.78 ms
+    full rewritten plan      6.32 ms
+    rewritten WITHOUT guard  6.07 ms      (so the row-count guard is not it)
+    the gpu_assert_rows guard   0.11 ms
+    gpu_groupby_exact_resident alone   7.60 ms
+
+The device side is a solid 6–8 ms against native's 2.8. The two gate runs
+disagreed because the gate sometimes times the shape before the continuous
+measured rule declines it and sometimes after — a mixture, not a wobble. The
+per-run trace says it plainly: run 0 uploads (115 ms), runs 1 and 2 are
+rewritten at 7.2 and 10.5 ms, and from run 3 the rule has declined it and every
+run is native at ~3.0 ms.
+
+Then the scaling, which is what names the cause:
+
+    key             groups    device    native
+    l_returnflag         3    7.57 ms   2.67 ms
+    l_shipmode           7    6.20      2.71
+    l_suppkey       10,000    8.51     21.67
+    l_partkey      200,000  141.39    209.17
+
+**The device cost is a floor set by the row count, not the group count** — 3
+groups and 10,000 groups cost the same — while native goes the other way,
+getting cheaper as groups get fewer. They cross somewhere in the hundreds. The
+CUDA exact GROUP BY has one algorithm, the sort path, and it reads all six
+million rows into a sort however few groups come out.
+
+So why was the statement rewritten at all, when `min_groups` is 1000? Because
+of this, in `_thresholds.decide`:
+
+    few_ok = string_key and (not has_where or (...))
+    if est_groups < t.min_groups and not (few_ok and form == "plain"):
+        return False, ...
+
+A VARCHAR key is exempt from `min_groups` with no WHERE. And that exemption is
+not a constant — it is a **claim about the backend**: native hashes a string on
+every row, the device does not, so three groups is still worth rewriting. Metal
+earns it with the direct grouped reduce (RESIDENT_COLUMNS_DESIGN §7), where few
+distinct values get a dense group-id lane and one row-order pass. CUDA has no
+such path, so on CUDA the claim is simply false. `CUDA = METAL` inherited the
+exemption without the algorithm that makes it true.
+
+Measured with `--no-thresholds`, plain form, no WHERE, 6,001,215 rows, all four
+few-group VARCHAR keys of `lineitem` (`l_returnflag`, `l_linestatus`,
+`l_shipmode`, `l_shipinstruct`):
+
+    payloads   native         device          ratio
+    1          2.7 – 2.9 ms   5.7 – 6.2 ms    0.45 – 0.47x
+    3          4.1 – 4.5 ms   18.6 – 18.7 ms  0.22 – 0.24x
+    5          5.4 – 6.0 ms   31.1 – 31.2 ms  0.17 – 0.19x
+
+Twelve cells, twelve losses, deepening with payloads because each payload is
+another full pass. Nothing ambiguous anywhere in it.
+
+The fix in this commit is a guardrail, not a cure: `string_key_few_groups` is a
+field of `Thresholds`, False on CUDA, and the four keys now decline on the
+threshold instead of losing a run first. TPC-H Q1 groups by two VARCHAR keys
+with six groups, so it declines too and SF1 coverage goes from 17 of 22 to 16 —
+which is the truer number, because Q1 was measuring 0.96× and 0.98× and we were
+counting a loss as a query answered on the device.
+
+The cure is the direct grouped reduce on CUDA, which is not in this commit.
+Until it exists, the flag stays False; when it exists, re-run the sweep above
+and let the numbers decide.
+
+Two things to carry.
+
+**A capability is not a constant.** Every other number in `_thresholds` is a
+measured bound that a different machine might want to move. This one encoded
+"the backend has an algorithm", and sharing the table shared a lie. When CUDA
+was pointed at Metal's table the note said the gate had "found nothing that
+wants a different constant" — true, and beside the point, because what differed
+was not a constant.
+
+**The continuous measured rule was the only thing catching it, and it catches
+late.** It declined the shape after one or two slow runs, every time, in every
+process — which is why this never showed up as a wrong answer or a user
+complaint, and why it survived a flip, a gate and a release candidate. A
+guardrail that works costs one slow execution per process per shape; that is
+cheap enough to hide a hole for weeks.
 
 ## Open questions
 

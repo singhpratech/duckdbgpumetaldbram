@@ -249,6 +249,7 @@ def run():
         extension_lookup_checks()
         extension_version_checks()
         extension_age_checks()
+        few_group_string_key_checks()
         return report()
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
@@ -2427,6 +2428,7 @@ def run():
     extension_lookup_checks()
     extension_version_checks()
     extension_age_checks()
+    few_group_string_key_checks()
     rewrite_error_checks()
     budget_checks()
     return report()
@@ -3224,6 +3226,59 @@ def extension_version_checks():
     else:
         skip("no extension loaded: the current-extension half of the age check")
     con.close()
+
+
+def few_group_string_key_checks():
+    """The VARCHAR few-group exemption is a backend capability, not a constant.
+
+    `_thresholds` lets a VARCHAR key past `min_groups` with no WHERE because
+    native hashes a string on every row while the device does not. That is true
+    of a backend which answers few distinct values with one row-order pass over
+    a group-id lane (Metal's direct grouped reduce) and false of one whose exact
+    GROUP BY always sorts (CUDA today): there the device reads every row into a
+    sort per payload however few groups come out, and measured 0.17-0.47x over
+    twelve cells at SF1. So Metal keeps the exemption and CUDA does not.
+
+    Nothing here touches a device — it asks the decision function directly, so
+    it runs and means the same on every machine.
+    """
+    import dataclasses
+    from gpudb import _thresholds as _th
+
+    print("== the VARCHAR few-group exemption is per backend, not a constant")
+
+    differing = [f for f in _th.METAL.__dataclass_fields__
+                 if getattr(_th.METAL, f) != getattr(_th.CUDA, f)]
+    check(differing == ["string_key_few_groups"],
+          f"CUDA's table differs from Metal's in exactly the exemption flag ({differing})")
+    check(_th.METAL.string_key_few_groups and not _th.CUDA.string_key_few_groups,
+          "Metal keeps the exemption, CUDA does not")
+
+    # The shape the exemption exists for: a 3-group VARCHAR key, no WHERE, the
+    # plain form — far below min_groups, so nothing else would admit it.
+    shape = dict(form="plain", est_groups=3, selectivity=None, has_where=False,
+                 string_key=True, rows=6_001_215)
+    ok_metal, why_metal = _th.decide("METAL", **shape)
+    ok_cuda,  why_cuda  = _th.decide("CUDA",  **shape)
+    check(ok_metal, f"METAL rewrites the few-group VARCHAR key ({why_metal})")
+    check(not ok_cuda and "groups" in why_cuda,
+          f"CUDA declines it, and the reason names the group count ({why_cuda!r})")
+
+    # The flag is the only thing deciding it: give CUDA's table the exemption
+    # back and the same statement is admitted again. This is what keeps the
+    # check honest if min_groups ever moves.
+    saved = dict(_th.TABLE)
+    try:
+        _th.TABLE["CUDA"] = dataclasses.replace(_th.CUDA, string_key_few_groups=True)
+        ok_again, _ = _th.decide("CUDA", **shape)
+        check(ok_again, "with the exemption restored, CUDA admits the same statement")
+    finally:
+        _th.TABLE.clear(); _th.TABLE.update(saved)
+
+    # An INTEGER key of the same size was never exempt on either backend.
+    for backend in ("METAL", "CUDA"):
+        ok_int, _ = _th.decide(backend, **{**shape, "string_key": False})
+        check(not ok_int, f"{backend}: a 3-group INTEGER key is declined, as before")
 
 
 def extension_age_checks():
