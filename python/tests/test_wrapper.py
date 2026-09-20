@@ -61,7 +61,11 @@ def drop_avg_decimal(con, cases, names, where):
     form for a parity case to compare. The decline itself is covered on both
     platforms by the dedicated end-to-end section, so nothing goes unchecked
     here — these cases simply have no second engine to check against."""
-    if getattr(con, "_avg_float_bits", 53) == 53:
+    # An extension that provides gpu_avg_decimal derives the column in C++, in
+    # long double, on every platform — so the shape is rewritten everywhere and
+    # there is nothing platform-dependent left to drop. Only an older
+    # extension, which has to derive it in SQL, still declines it off arm64.
+    if getattr(con, "_has_avg_decimal", False) or getattr(con, "_avg_float_bits", 53) == 53:
         return
     for n in names:
         cases.pop(n, None)
@@ -683,16 +687,27 @@ def run():
             "sum_decimal": "SELECT k, sum(amt) FROM ab GROUP BY k ORDER BY k",
             "minmax_decimal": "SELECT k, min(amt), max(amt) FROM ab GROUP BY k ORDER BY k",
         }
+        native_dec = getattr(con, "_has_avg_decimal", False)
         avg_bits(con, 64)
         for name, sql in list(acases.items()):
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
             lr = con.last_rewrite()
-            check(not lr["rewritten"] and lr["reason"] == "shape"
-                  and "long double" in (lr["detail"] or ""),
-                  f"avgf=64 {name}: declined, reason=shape, detail names long double "
-                  f"({lr['reason']}: {str(lr['detail'])[:60]})")
-            check(got == want, f"avgf=64 {name}: DuckDB answers, and the rows are native's")
+            if native_dec:
+                # gpu_avg_decimal finalises the column in C++ the way native
+                # does, so a 64-bit long double is no longer a reason to
+                # decline — and the rows have to match on THIS host, which is
+                # the whole point of deriving it there.
+                check(lr["rewritten"],
+                      f"avgf=64 {name}: rewritten — the column is derived in C++ "
+                      f"({lr['reason']}: {str(lr['detail'])[:50]})")
+                check(got == want, f"avgf=64 {name}: rows identical to native ({len(want)} rows)")
+            else:
+                check(not lr["rewritten"] and lr["reason"] == "shape"
+                      and "long double" in (lr["detail"] or ""),
+                      f"avgf=64 {name}: declined, reason=shape, detail names long double "
+                      f"({lr['reason']}: {str(lr['detail'])[:60]})")
+                check(got == want, f"avgf=64 {name}: DuckDB answers, and the rows are native's")
         for name, sql in ucases.items():
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
@@ -717,9 +732,9 @@ def run():
             lr = con.last_rewrite()
             check(lr["rewritten"], f"avgf=53 {name}: rewritten ({lr['reason']}: "
                                    f"{str(lr['detail'])[:60]})")
-            if host_avgf == 53:
+            if native_dec or host_avgf == 53:
                 check(got == want, f"avgf=53 {name}: rows identical to native ({len(want)} rows)")
-        if host_avgf != 53:
+        if not native_dec and host_avgf != 53:
             skip(f"avgf=53 rows-identical ({len(acases) + len(ucases)} shapes): this host's "
                  f"long double is {host_avgf} bits, so pretending the extension reported 53 "
                  f"changes which path runs but not what native computes — the derivation "

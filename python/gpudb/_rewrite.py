@@ -101,6 +101,10 @@ class Plan:
     vals: List[str] = field(default_factory=list)
     val_types: Dict[str, str] = field(default_factory=dict)
     scales: Dict[str, int] = field(default_factory=dict)
+    # The loaded extension provides gpu_avg_decimal (below): avg over a DECIMAL
+    # payload is finalised in C++ the way native does it, so the shape needs no
+    # decline and the SQL derivation is not used.
+    native_avg_decimal: bool = False
     having_pay: int = 0
     topk_pay: int = 0
     # §4.12: the statement has no GROUP BY. The split hands the matcher a
@@ -612,14 +616,20 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
 
 
 def _check_avg_decimal(plan: Plan, avg_float_bits: int) -> None:
-    """avg over a DECIMAL payload is derived in SQL (_avg_decimal_expr) as
-    double(unscaled sum) / (count * 10^s). Native finalises an average as a
-    quotient in long double, so that expression reproduces native only where
-    long double IS double. On x86-64 (64-bit mantissa) it differs: measured at
-    70 of 401 groups on a DECIMAL(18,2) payload. Returning a different answer
-    is rule 2, so the shape is declined until the column is derived in C++
-    (native_avg_decimal). avg_float_bits == 0 means the extension does not
-    report the width, which is "not proven", not "fine".
+    """avg over a DECIMAL payload needs native's own finalisation: the exact
+    unscaled 128-bit sum divided, in long double, by count * 10^s.
+
+    An extension that provides gpu_avg_decimal does exactly that in C++, on
+    every platform, so there is nothing to decline — that is the path taken
+    whenever the function is there (measured on x86-64: the SQL derivation
+    differs from native on 85 of 401 groups, the C++ scalar on 0).
+
+    Without it the column has to be derived in SQL as
+    double(unscaled sum) / (count * 10^s), which is native's expression only
+    where long double IS double. On x86-64 (64-bit mantissa) it differs, and
+    returning a different answer is rule 2 — so an older extension still
+    declines the shape rather than guessing. avg_float_bits == 0 means the
+    extension does not report the width, which is "not proven", not "fine".
 
     Called at the END of check_types, once plan.scales is filled: a plan that
     comes from the matcher carries no scales of its own (they are read off
@@ -629,7 +639,7 @@ def _check_avg_decimal(plan: Plan, avg_float_bits: int) -> None:
     HAVING over an avg that is not selected (plan.having, rendered by
     _render_exact's extra_pred through the same _agg_expr). ORDER BY reaches
     an avg only through an output name, and the top-k push refuses avg."""
-    if avg_float_bits == 53:
+    if plan.native_avg_decimal or avg_float_bits == 53:
         return
     pays = {o.pay for o in plan.outputs if o.kind == "avg"}
     if plan.having is not None and plan.having[0] == "avg":
@@ -795,12 +805,21 @@ def _native_type_of(plan: Plan, kind: str, pay: int = 0) -> str:
 
 
 def _avg_decimal_expr(plan: Plan, pay: int, scale: int) -> str:
-    """avg over a DECIMAL(p, s) payload exactly as native computes it:
-    double(unscaled sum) / (count * 10^s) — ONE division by the scaled count
-    (verified against native; (sum / count) / 10^s and (sum / 10^s) / count
-    each differ from it on 20-30% of groups)."""
-    return (f'(CAST(r."{_agg_col(plan, "sum", pay)}" AS DOUBLE) / '
-            f'(r."{_agg_col(plan, "count", pay)}" * {10 ** scale}))')
+    """avg over a DECIMAL(p, s) payload exactly as native computes it: the
+    exact unscaled 128-bit sum over count * 10^s, as ONE division by the
+    scaled count ((sum / count) / 10^s and (sum / 10^s) / count each differ
+    from native on 20-30% of groups).
+
+    gpu_avg_decimal does that division in `long double` in C++, which is what
+    native does and what SQL cannot express — SQL has no 80-bit type, so the
+    CAST form below rounds differently on x86-64 once a group's unscaled sum
+    passes 2^53. The SQL form is kept only for an extension too old to provide
+    the function, and _check_avg_decimal declines the shape there rather than
+    letting it answer."""
+    sum_col, cnt_col = _agg_col(plan, "sum", pay), _agg_col(plan, "count", pay)
+    if plan.native_avg_decimal:
+        return f'gpu_avg_decimal(r."{sum_col}", r."{cnt_col}", {scale})'
+    return f'(CAST(r."{sum_col}" AS DOUBLE) / (r."{cnt_col}" * {10 ** scale}))' 
 
 
 def _agg_expr(plan: Plan, kind: str, pay: int, native_type: str) -> str:

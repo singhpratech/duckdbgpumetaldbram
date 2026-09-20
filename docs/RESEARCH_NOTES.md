@@ -3561,6 +3561,83 @@ cluster — and 5 skips. On arm64 nothing changes at all: the helper returns
 early when the reported width is already 53, so no case is dropped and the
 row-equality half still runs.
 
+## 2026-09-20 — The column SQL could not compute
+
+avg over a DECIMAL payload had been declined since the guard was made to fire:
+native finalises an average as a quotient in `long double`, and the wrapper was
+deriving the column in SQL as `CAST(sum AS DOUBLE) / (count * 10^s)`. That is
+native's formula only where `long double` IS double. On x86-64 it is the
+80-bit type, and the two differ once a group's unscaled sum passes 2^53 —
+measured at 982 of 5000 groups with default settings.
+
+The important part is that no SQL expression fixes it. SQL has no 80-bit type.
+Every candidate rearrangement was tried and each is wrong in its own way —
+`(sum/count)/10^s` and `(sum/10^s)/count` differ from native on 20-30% of
+groups even in exact arithmetic, because native divides once by the scaled
+count. The shape was not declined for want of a better expression; it was
+declined because the target arithmetic is not expressible in the language the
+rewrite emits.
+
+So the derivation moved into C++, where the type exists.
+
+### The seam was already there
+
+The first design sketched threading the payload's DECIMAL scale through the
+table functions, so the extension could fill its `avg` column correctly. That
+meant a new parameter on eight signatures, or the scale carried in the identity
+tag's `extra` field and stored per lane on the resident set — about two hundred
+lines across shared C++ and Python, and a per-lane scale vector because one set
+can be aggregated on different payload lanes by different statements.
+
+None of it was necessary, because the exact GROUP BY already returns the sum as
+a **HUGEINT**. The full 128-bit unscaled sum was in SQL the whole time; the
+only thing missing was a function to divide it the way native does. One scalar:
+
+    gpu_avg_decimal(sum HUGEINT, count BIGINT, scale BIGINT) -> DOUBLE
+
+built on `native_avg_decimal()`, which had been sitting in native_avg.hpp
+since the first avg fix with no caller. Forty lines instead of two hundred, no
+signature changed, no tag changed, no per-lane bookkeeping — and it works for
+the single-payload, multi-payload and global forms at once, because all three
+expose that same HUGEINT column.
+
+Verified directly in SQL against native over 401 groups: the old derivation
+differs on 85, the scalar on 0.
+
+### Two renderers, and only one of them was the one running
+
+The first attempt changed `_avg_decimal_expr` in the Python wrapper, and the
+rewritten statement came back still carrying `CAST(r.sum AS DOUBLE) / ...`.
+The tell was the quoting: the Python renderer emits `r."sum"`, and the
+statement had `r.sum`. The wrapper has two renderers — a C++ one behind
+`gpu_rewrite_ast` and a Python reference implementation — and prefers the C++
+one when the extension provides it. The Python edit was correct and was simply
+not the code that ran.
+
+Both now emit the function, and the suite's own scalar-vs-python agreement
+check is what keeps them honest: it compares rows, names, types and form
+between the two engines on every case.
+
+### What it dissolved
+
+The platform gating added a day earlier — dropping avg-over-DECIMAL parity
+cases on x86 and skipping a row-equality assertion that could not hold there —
+is now inert, because the platform difference is gone. The guard is kept for an
+extension too old to provide the function, and the tests gate on the function's
+presence rather than on the host. The wrapper suite goes from 1112 checks with
+5 skips to **1154 checks with none**: forty-two assertions that had been
+platform-dependent now simply run.
+
+### And one number that is not a win
+
+Q1 returns to the device, and lands at parity: 0.96x, 0.99x, 0.97x, 1.02x over
+four runs. Coverage is 17 of 22 with 0 rows differing, but Q1 is no longer
+clearly above native the way it was at 1.09x before any of this. It is printed
+as measured and no threshold is touched here — whether a statement that hovers
+at 1.0x should be rewritten at all is the per-backend threshold question, and
+that belongs to its own change with its own measurements, not to a correctness
+fix that happens to have made the row eligible again.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
