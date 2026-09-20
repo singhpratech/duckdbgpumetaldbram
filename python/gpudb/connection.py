@@ -229,6 +229,21 @@ class Decision:
     lazy_sightings: int = 0
     timing_checked: bool = False
     measured_declined: bool = False      # sent native by a measurement, not by the thresholds
+    # The same measured state, for the `sql()` path ALONE (§9.1). That path pays for
+    # guards `execute()` does not — a lazy relation is read after the call has
+    # returned, so the statement's own guards have to run on a side cursor
+    # inside it — so its rewritten cost is its own and it may decline a
+    # template `execute()` keeps. What it does NOT need of its own is a native
+    # time: DuckDB answers the same statement either way, so `native_ms` is
+    # shared. The other direction is not symmetric and needs no field: a
+    # template that loses on `execute()` loses on `sql()` too, since `sql()`
+    # costs what `execute()` costs plus the guards, so an eager decline
+    # (`measured_declined`) declines both paths.
+    lazy_ms: List[float] = field(default_factory=list)
+    lazy_declined: bool = False
+    lazy_why: str = ""
+    lazy_next_check_at: float = 0.0
+    lazy_guard_ms: float = 0.0           # what the guards cost the last time this template ran through sql()
     # §4.23: an output-size bound declined it, and the SAME bounds would admit
     # it if its groups were consumed inside DuckDB instead of by the client —
     # so it is worth measuring what the statement around it returns
@@ -308,6 +323,12 @@ class Connection:
         self._tx_open = False
         self._last = LastRewrite()
         self._cache: Dict[Tuple[str, str], Decision] = {}
+        # §4.24: rendered statements whose pushed top-k was found NOT to tie,
+        # against the resident data as it stands. Kept on the family's root so
+        # a write through any cursor drops every member's verdict at once.
+        self._ties_ok: Dict[str, bool] = {}
+        self._lazy = False               # this call is sql()'s, not execute()'s
+        self._guard_ms = 0.0             # ... and what its side-cursor guards cost it
         self._unique_cache: Dict[Tuple[int, str], bool] = {}     # (table oid, column) -> unique among non-NULLs
         self._nested_cache: Dict[Tuple[str, str], Any] = {}      # exact statement text -> nested plan | False
         self._flat_cache: Dict[str, str] = {}                    # statement text -> the same with SPJ derived tables folded in
@@ -625,18 +646,29 @@ class Connection:
         best = min(d.rewritten_ms[-3:])
         self._decide_measured(d, best, native)
 
-    def _decide_measured(self, d: "Decision", best: float, native: float) -> None:
+    def _decide_measured(self, d: "Decision", best: float, native: float,
+                         lazy: bool = False) -> None:
         """The comparison itself, shared by the two ways it is reached: the
         user's own timed run (execute) and the pair of side-cursor probes
-        sql() has to use. Slower or even means native from here on."""
-        if best >= native:
-            self._log(f"threshold: measured {best:.2f} ms rewritten vs {native:.2f} ms native — "
-                      f"template declined (re-measured in {_REMEASURE_S:.0f} s)")
-            d.rewritten = False
-            d.reason = "threshold"
-            d.measured_declined = True
-            d.why = (f"measured {best:.2f} ms rewritten vs {native:.2f} ms native "
-                     f"(re-measured in {_REMEASURE_S:.0f} s)")
+        sql() has to use. Slower or even means native from here on.
+
+        `lazy` says the times compared are the `sql()` path's — the statement
+        plus the guards that path runs on side cursors — and the decline is
+        recorded against that path alone. `execute()`, which pays none of
+        them, keeps deciding on its own numbers."""
+        if best < native:
+            return
+        where = " through sql()" if lazy else ""
+        why = (f"measured {best:.2f} ms rewritten{where} vs {native:.2f} ms native "
+               f"(re-measured in {_REMEASURE_S:.0f} s)")
+        self._log(f"threshold: {why} — template declined{where}")
+        if lazy:
+            d.lazy_declined, d.lazy_why = True, why
+            return
+        d.rewritten = False
+        d.reason = "threshold"
+        d.measured_declined = True
+        d.why = why
 
     def _note_timing_lazy(self, query) -> None:
         """Rule 1, measured, for `sql()`. `sql()` hands back a relation before
@@ -655,7 +687,27 @@ class Connection:
         after its third rewritten run, so this measures one after its third
         sighting. A statement asked once is never made three times as slow to
         answer a question about a template that is not coming back — and the
-        thresholds, which cost nothing, have already decided that one."""
+        thresholds, which cost nothing, have already decided that one.
+
+        **What is timed is the PATH, not the statement.** A lazy relation
+        makes the wrapper run the statement's own guards on side cursors
+        inside this call (`_guard_now`: the staleness guard always, the §4.24
+        tie guard on the first sighting of a pushed top-k against this data),
+        and the user pays for them. So the rewritten cost compared here is the
+        side-cursor probe of the statement PLUS what those guards cost this
+        call, and the verdict is recorded against the `sql()` path alone
+        (`Decision.lazy_*`). A template that wins through `execute()` and
+        loses through `sql()` is therefore declined where it loses and kept
+        where it wins, which is the only reading of rule 1 that is about what
+        a user pays. Before this the probe timed the statement alone, and a
+        top-k whose guard cost as much again as the statement measured 8 ms
+        against native's 15 and was kept while the caller paid 17
+        (docs/RESEARCH_NOTES.md, 2026-09-20).
+
+        The statement's own probe is still shared with `execute()`, and so is
+        the verdict it supports: a template whose STATEMENT is not faster than
+        native is slower on both paths, so it is declined on both, exactly as
+        before. Only the part `sql()` pays alone is recorded alone."""
         d = getattr(self, "_timing_decision", None)
         if d is None or not getattr(self, "_thresholds", True) or self._last.fallback:
             return
@@ -666,34 +718,55 @@ class Connection:
             rewritten_sql = self._last.sql or ""
             if not d.probe_sql:
                 d.probe_sql = rewritten_sql
+            d.lazy_guard_ms = self._guard_ms
             d.lazy_sightings += 1
-            if d.lazy_sightings < _LAZY_SIGHTINGS and not d.timing_checked:
+            # Three sightings on THIS path before it is measured, even when
+            # `execute()` has already measured the template: the first sighting
+            # through `sql()` is the one that pays the §4.24 tie guard in full
+            # (it is the call that asks the device), and measuring there would
+            # charge a repeat caller a cost only the first call has. By the
+            # third the guard is a dict lookup, which is what the fourth call
+            # and every call after it pays.
+            if d.lazy_sightings < _LAZY_SIGHTINGS:
                 return
-        elif d.measured_declined and d.probe_sql:
+        elif (d.lazy_declined or d.measured_declined) and d.probe_sql:
             rewritten_sql = d.probe_sql
         else:
             return
-        if now < d.next_check_at:
+        if now < d.lazy_next_check_at:
             return
         if not rewritten_sql:
             return
-        d.next_check_at = now + _REMEASURE_S
+        d.lazy_next_check_at = d.next_check_at = now + _REMEASURE_S
         probe = self._probe_ms(rewritten_sql, None)
         if probe is None:
             return
         native = self._probe_ms(query, None)
         if native is None:
             return
+        # what the guards of THIS path cost when the template last ran through
+        # it — a declined template runs none, and would pay them again the
+        # moment it came back, so the last measured cost is what it is
+        # re-measured with
+        here = probe + d.lazy_guard_ms
         d.rewritten_ms.append(probe)
         del d.rewritten_ms[:-5]
+        d.lazy_ms.append(here)
+        del d.lazy_ms[:-5]
         d.native_ms = native
         d.timing_checked = True
         if self._last.rewritten:
-            self._decide_measured(d, probe, native)
-        elif probe < native:
+            self._decide_measured(d, probe, native)                # the statement: both paths
+            self._decide_measured(d, here, native, lazy=True)      # ... plus this path's guards
+            return
+        if d.measured_declined and probe < native:
             self._log(f"threshold: measured {probe:.2f} ms rewritten vs {native:.2f} ms native — "
                       f"template rewritten again")
             d.rewritten, d.reason, d.measured_declined, d.why = True, "", False, ""
+        if d.lazy_declined and here < native:
+            self._log(f"threshold: measured {here:.2f} ms rewritten through sql() vs "
+                      f"{native:.2f} ms native — template rewritten again on that path")
+            d.lazy_declined, d.lazy_why = False, ""
 
     # ---- what a resident set is worth (§5.5) ----
     def _speedup(self) -> float:
@@ -773,6 +846,7 @@ class Connection:
             return None
 
     def execute(self, query, parameters=None):
+        self._lazy = False
         sql = self._route(query, parameters)
         self._manager.statement_begin()
         try:
@@ -835,39 +909,80 @@ class Connection:
         is close the window completely: a write that commits between this
         check and the caller's first fetch still reaches the relation's own
         guard. `execute()` on the same statement is the way back from that,
-        and it is what `_shell.Shell.recover` does."""
+        and it is what `_shell.Shell.recover` does.
+
+        What it costs the caller is left in `_guard_ms`, so that rule 1 can
+        measure the path the user is actually on (§9.1) rather than the
+        statement alone."""
+        self._guard_ms = 0.0
         if not self._last.rewritten:
             return
-        # A pushed top-k carries its own tie guard (_rewrite.ties_qualify), and
-        # inside execute() that guard raising is enough: the wrapper answers
-        # natively in the `except` around the statement. A relation is read
-        # after sql() has returned, so the guard has to run HERE instead, where
-        # `_on_ties` and the native re-run still are. Ahead of the staleness
-        # guard below, and not behind the decision check after it: a nested
-        # rewrite (§4.14) has no single decision to read and still carries the
-        # clause, and running the statement runs its own row guards anyway.
-        #
-        # It costs a second device top-k for this one statement — the same
-        # bargain the staleness guard strikes, and the price of a lazy
-        # relation. execute() pays nothing but the (k + 1)-th row.
-        if _rewrite.TIES_MARKER in (self._last.sql or ""):
-            cur = self._raw.cursor()
-            t0 = time.perf_counter()
-            try:
-                cur.execute(self._last.sql).fetchall()
-            finally:
-                # what it cost, whether it stopped at a tie or not: `sql()` has
-                # it ready for _note_ties_loss and never times it twice
-                self._ties_device_ms = (time.perf_counter() - t0) * 1000.0
-                cur.close()
-        d = getattr(self, "_last_decision", None)
-        if d is None or d.plan is None:
+        t0 = time.perf_counter()
+        try:
+            d = getattr(self, "_last_decision", None)
+            if d is not None and d.plan is not None:
+                cur = self._raw.cursor()
+                try:
+                    cur.execute(_rewrite.guard_statement(d.plan, d.fqn, d.tag)).fetchall()
+                finally:
+                    cur.close()
+            self._ties_guard()
+        finally:
+            self._guard_ms = (time.perf_counter() - t0) * 1000.0
+
+    # §4.24: the rendered statements whose top-k was found not to tie. Small,
+    # and emptied rather than aged: the entries are per rendered text, so a
+    # session that keeps asking new questions is the session that needs none of
+    # the old answers.
+    _TIES_OK_MAX = 64
+
+    def _ties_guard(self) -> None:
+        """The tie guard of a pushed top-k (`_rewrite.ties_qualify`), for the
+        one caller that cannot let it raise where it stands.
+
+        Inside `execute()` the guard raising is enough: the wrapper answers
+        natively in the `except` around the statement. A relation is read after
+        `sql()` has returned, so it has to run HERE, where `_on_ties` and the
+        native re-run still are — and for a pushed top-k the device pass IS the
+        statement, so running it twice is the whole cost of the statement
+        twice. That is what this caches.
+
+        Whether the first k ordering values tie is a function of two things and
+        nothing else: the rendered statement (its tag, its lanes, its literals,
+        its k) and the data the resident set holds. Both are fixed here — the
+        text is the cache key, and the device computes the top-k from the
+        resident set, not from the table — so the verdict cannot change while
+        neither does. The set is what every rewritten statement already trusts,
+        and this trusts exactly as much: the entry is dropped wherever the sets
+        are (`_invalidate_all`: any write, DDL, SET, ATTACH or foreign write
+        the wrapper sees; `_on_stale`: the row count moved under the set;
+        `_on_rewrite_error`), and the statement's own `gpu_assert_rows` guard
+        has run immediately above this, so a row count that no longer matches
+        the set has raised before the verdict is read. A tie verdict is not
+        cached at all: it raises, and `_note_ties_loss` declines the template
+        by measurement (§4.24), which is a stronger answer than a cache entry.
+
+        Cost from the second call on: one dict lookup instead of one device
+        pass (SF1 `l_partkey` top-5: 8.6 ms → 0.001 ms)."""
+        sql = self._last.sql or ""
+        if _rewrite.TIES_MARKER not in sql:
+            return
+        root = self._parent or self
+        self._ties_device_ms = 0.0
+        if sql in root._ties_ok:
             return
         cur = self._raw.cursor()
+        t0 = time.perf_counter()
         try:
-            cur.execute(_rewrite.guard_statement(d.plan, d.fqn, d.tag)).fetchall()
+            cur.execute(sql).fetchall()
         finally:
+            # what it cost, whether it stopped at a tie or not: `sql()` has
+            # it ready for _note_ties_loss and never times it twice
+            self._ties_device_ms = (time.perf_counter() - t0) * 1000.0
             cur.close()
+        if len(root._ties_ok) >= self._TIES_OK_MAX:
+            root._ties_ok.clear()
+        root._ties_ok[sql] = True
 
     def _on_ties(self, e: Exception) -> None:
         """The rewritten statement stopped at a tie: two of the first k rows
@@ -970,6 +1085,7 @@ class Connection:
         sets are re-noted as stale so a healthy upload can replace them)."""
         self._last.fallback = True
         self._drop_plans()
+        (self._parent or self)._ties_ok.clear()   # §4.24: whatever the sets are now, nothing was verified against them
         self._last.error = str(e)[:300]
         # the decision was taken before the statement ran, so its sentence is
         # re-read now that the statement's own answer is known
@@ -1037,7 +1153,16 @@ class Connection:
 
           * rule 1 is measured from side cursors on both sides here, because
             the statement has not run when this call returns
-            (`_note_timing_lazy`);
+            (`_note_timing_lazy`) — and it is measured on what THIS path
+            costs, the statement plus the guards below, so a template that
+            loses here is declined here and kept on `execute()` if it wins
+            there (`Decision.lazy_*`);
+          * the statement's own guards run ahead of the relation
+            (`_guard_now`), because a raise after this call has returned is
+            outside the wrapper. The staleness guard is a `count(*)`; the
+            §4.24 tie guard of a pushed top-k is the device pass itself, so
+            its verdict is remembered per rendered statement for as long as
+            the resident sets stand (`_ties_guard`);
           * the operator's output size (`_check_output_size`) is read after a
             run, so it is left to the first `execute()` of the same template;
             the decision keeps `output_checked` False until then.
@@ -1049,6 +1174,7 @@ class Connection:
         # DuckDB's own `params` kwarg: a parameterised statement is one the
         # rewrite may not touch, exactly as in execute().
         parameters = kw.get("params")
+        self._lazy = True
         sql = self._route(query, parameters)
         self._manager.statement_begin()
         try:
@@ -1154,6 +1280,7 @@ class Connection:
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
         self._drop_plans()
+        (self._parent or self)._ties_ok.clear()   # §4.24: the set is being rebuilt from data that moved
         self._last.detail = ("the data moved under the resident set, so DuckDB answered "
                              "the original and the set is being rebuilt")
         tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
@@ -1188,6 +1315,7 @@ class Connection:
         self._manager.invalidate(None)
         self._drop_plans()
         self._cache.clear()
+        (self._parent or self)._ties_ok.clear()   # §4.24: the data may tie now where it did not
         self._nested_cache.clear()
         self._flat_cache.clear()
         self._unique_cache.clear()
@@ -1875,6 +2003,14 @@ class Connection:
             d = v
         self._detail_decision = d
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
+        if d.rewritten and d.lazy_declined and self._lazy:
+            # §9.1: this template was measured slower than native ON THIS PATH —
+            # `sql()` pays for guards `execute()` does not. The decision object
+            # is one; the verdict is per path, so `execute()` keeps it.
+            self._last.reason = "threshold"
+            self._last.detail = d.lazy_why
+            self._timing_decision = d       # ... and it is re-measured on this path like any other
+            return None
         if not d.rewritten:
             self._last.reason = d.reason
             if d.measured_declined:

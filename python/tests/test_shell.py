@@ -271,6 +271,9 @@ def run():
     if installed is not None:
         check(installed, "the console script `gpudb` resolves after an install")
 
+    print("== a pushed top-k costs one device pass per statement")
+    topk_one_pass(gpu)
+
     print("== a bounded way out")
     bounded_close()
 
@@ -282,6 +285,92 @@ def run():
         print(f"{len(SKIPS)} skipped")
     print(f"{len(FAILS)} failures" if FAILS else "all shell tests passed")
     return 1 if FAILS else 0
+
+
+class _CountingCursor:
+    """A side cursor that records every statement run on it."""
+
+    def __init__(self, cur, log):
+        self._cur, self._log = cur, log
+
+    def execute(self, sql, *a, **kw):
+        self._log.append(sql)
+        return self._cur.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _CountingRaw:
+    """A stand-in for `Connection._raw` that counts what the wrapper runs on
+    SIDE CURSORS. Everything else is the real connection's."""
+
+    def __init__(self, raw):
+        self._real = raw
+        self.side = []
+
+    def cursor(self):
+        return _CountingCursor(self._real.cursor(), self.side)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def device_passes(self) -> int:
+        n = sum(1 for s in self.side if "GPUDB_TIES" in s)
+        del self.side[:]
+        return n
+
+
+# 150K groups (above `topk_min_groups`) over 2M rows, every group's sum
+# distinct from every other's, so the top 5 are in no doubt and the pushed
+# top-k is never declined for a tie.
+TOPK_SETUP = "CREATE TABLE tk AS SELECT (i%150000)::BIGINT k, i::BIGINT v FROM range(2000000) r(i)"
+TOPK_Q = "SELECT k, sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 5"
+
+
+def topk_one_pass(gpu):
+    """A pushed top-k in the shell costs ONE device pass per statement (§4.24).
+
+    The shell's statement path is the wrapper's `sql()` (`Shell.statement`
+    calls `self.con.sql(sql)`), a lazy relation, so the tie guard of a pushed
+    top-k has to run on a side cursor inside the call — and for that shape the
+    device pass IS the statement. Before the guard's verdict was remembered,
+    every top-k in the shell therefore ran the statement twice: 17 ms where
+    `execute()` paid 8 and native 15 (docs/RESEARCH_NOTES.md, 2026-09-20).
+
+    What is asserted is a COUNT of device passes and never a time — a count
+    cannot flake. A count can only be seen from inside the process, so this is
+    the one shell test that drives the `Shell` object directly rather than the
+    subprocess; the statement path it takes is the shell's own."""
+    if not gpu:
+        skip("a pushed top-k in the shell — this build has no exact GPU path")
+        return
+    import io
+    from gpudb import _shell
+    sh = _shell.Shell(residency="eager", timer=True, out=io.StringIO(), err=io.StringIO())
+    try:
+        sh.statement(TOPK_SETUP)
+        counted = _CountingRaw(sh.con._raw)
+        sh.con._raw = counted
+        sh.statement(TOPK_Q)
+        lr = sh.con.last_rewrite()
+        if not lr["rewritten"] or lr["form"] != "topk":
+            skip(f"a pushed top-k in the shell — not pushed here "
+                 f"(rewritten={lr['rewritten']}, form={lr['form']!r}, reason={lr['reason']!r})")
+            return
+        first = counted.device_passes()
+        check(first == 1,
+              f"the shell's first top-k asks the device once for the tie guard ({first})")
+        sh.statement(TOPK_Q)
+        again = counted.device_passes()
+        check(again == 0,
+              f"the second one runs no guard pass — one device pass for the statement ({again})")
+        check(sh.con.last_rewrite()["rewritten"] and sh.con.last_rewrite()["form"] == "topk",
+              "... and it is still the pushed top-k that answered")
+        out = sh.out.getvalue()
+        check("GPU (topk" in out, f"the footer says the device answered it\n       {footers(out)}")
+    finally:
+        sh.close()
 
 
 def bounded_close():

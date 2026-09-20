@@ -4537,6 +4537,194 @@ statements native, floor 16384 of a 131072 default, a 3.31 ms window against
 the 1.03 ms a floor segment needs). Two machines whose segment costs differ by
 four times, asserting the same property.
 
+## 2026-09-20 — Both doors, or neither: a guard that only one entrance pays
+
+The tie guard (#164, the entry above it) is right and it shipped a regression.
+On TPC-H SF1, `SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY
+l_partkey ORDER BY qty DESC LIMIT 5`, warm and resident, medians of nine
+interleaved runs in one process:
+
+| path | native | transparent | |
+|---|---|---|---|
+| `execute()`, the wrapper at 465e9a8 (before #164) | 17.5 ms | 8.4 ms | 2.08× |
+| `sql()`, the wrapper at 465e9a8 | 17.5 ms | 8.5 ms | 2.07× |
+| `execute()`, main after #164 | 17.7 ms | 8.5 ms | 2.08× |
+| **`sql()`, main after #164** | **17.7 ms** | **17.1 ms** | **1.03×** |
+
+`sql()` is the path the `gpudb` shell takes, so that last row is what a person
+at the shell got. In the shell itself, the same statement ten times in one
+process, `--readonly --residency eager --timer`, footers after the first
+(which uploads) and the third (which is the rule-1 measurement):
+
+| shell, the statement's own footer | |
+|---|---|
+| `--no-gpu` (DuckDB answers it) | 17.8–18.4 ms |
+| the wrapper at 465e9a8 | 5.7–6.0 ms |
+| **main after #164** | **16.5–17.3 ms** |
+| this branch | 5.5–5.9 ms |
+
+A statement that had been three times as fast as DuckDB was now the same
+speed. (The shell's process is quiet, so the device runs in the fast of the
+two modes of §9.1 — 5.7 ms rather than the 8.5 ms the benchmark script above
+measures while interleaving native runs. Both tables are internally
+consistent; neither number transfers to the other.)
+
+The mechanism is not subtle once seen. `sql()` hands back a lazy relation,
+which is read after the call has returned — where a raise cannot be answered —
+so the statement's own guards run on a side cursor *inside* the call. That
+bargain was already struck for the staleness guard, which is a `count(*)` and
+costs 0.05 ms. #164 put a second guard beside it, and for a pushed top-k the
+guard is the statement: the device pass is 8.2 of the 8.9 ms. Every top-k
+through `sql()` paid for itself twice, tie or no tie.
+
+### Why nothing saw it
+
+**The measured rule times the statement, and the user pays for the path.**
+`_note_timing_lazy` probed the rewritten form on a side cursor — 8 ms — against
+native — 15 ms — and kept the template, while the caller paid 17. The number it
+compared was true and it was about something the user does not buy.
+
+**The gate drives `execute()`.** `scripts/transparent_gate.py` was green on the
+commit that shipped this, because every cell it measures goes through
+`con.execute()`. So does `tpch_coverage.py`. The wrapper has two entry points,
+both public, and the whole gate exercised one.
+
+That is the lesson worth keeping, and it is not about ties: **a rule or a gate
+that measures one entry point proves nothing about the other.** The cost that
+appeared here appeared *only* on the path nothing measured, which is exactly
+where such a cost can appear — nobody adds an expensive guard to the path that
+is being watched.
+
+### What was measured before choosing
+
+Three ways out, in the order they were tried:
+
+**(c) Make the guard cheaper than a device pass.** Asking the device only for
+the k + 1 ordering values is the same kernel work: the pre-#164 form (device
+top-k, no QUALIFY, no k+1 row) measures 8.15 ms of the full form's 8.88. There
+is nothing under the pass to remove. Rejected on the measurement.
+
+**(b) Reuse the guard run's rows.** A pushed top-k returns k rows; the side
+cursor already has the answer. Two ways to hand back a relation over them
+without pandas or pyarrow, both of which work on a read-only connection: a
+`VALUES` list with explicit casts (0.13 ms to build and read, column names and
+types identical — `['l_partkey', 'qty']`, `['BIGINT', 'DECIMAL(38,2)']`) and a
+`CREATE TEMP TABLE … AS` (0.095 ms over the materialised rows). Both were left
+on the shelf, for the same reason in two forms: the `VALUES` path would make
+every value the user reads a SQL literal this wrapper rendered and cast back —
+a new way to be wrong about a BLOB, an INTERVAL, a nested type — and the temp
+table puts a row in the user's catalog whose lifetime is the lifetime of a lazy
+relation nobody can see. Rule 2 says the rows are DuckDB's; neither of these
+hands back rows that came out of the user's statement untouched. What they buy,
+after (a), is the *first* call of a data version, once.
+
+**(a) Remember the verdict.** Whether the first k ordering values tie is a
+function of two things and nothing else: the rendered statement — its tag, its
+lanes, its literals, its k — and the data the resident set holds. The device
+computes the top-k from the set, not from the table. So the verdict cannot
+change while neither does, and the entry (`Connection._ties_ok`, keyed by the
+rendered text, on the family's root so any cursor's write clears it) is dropped
+exactly where the sets are: `_invalidate_all` — any write, DDL, `SET`, `ATTACH`
+or foreign write the wrapper sees — `_on_stale`, and `_on_rewrite_error`. The
+staleness guard now runs *before* it rather than after, so a row count that no
+longer matches the set has already raised when the verdict is read. A *tie*
+verdict is never cached: it raises, and `_note_ties_loss` declines the template
+by measurement, which is a stronger answer than a cache entry.
+
+Chosen, alone. It is the only one of the three that is a proof rather than a
+trade, and it is the cheapest: one dict lookup where there was a device pass.
+
+| | before | after |
+|---|---|---|
+| `execute()` | 8.5 ms | 8.6 ms |
+| `sql()`, first call of a data version | 17.1 ms | 17.0 ms |
+| `sql()`, from the second call on | 17.1 ms | **8.7 ms** |
+| native, same session | 17.7 ms | 17.8 ms |
+| the shell, second statement on | 17.0 ms | **5.7 ms** |
+
+### The rule now measures the path
+
+The verdict a measurement produces is now recorded against the path it was
+measured on. One `Decision` still holds one template — the plan, the residency,
+the output-size bound are the template's and are shared — but `lazy_ms`,
+`lazy_declined` and `lazy_next_check_at` hold what `sql()` costs and what that
+costs it. The path did **not** go into the cache key: splitting the decision
+would have decided, uploaded and bounded each template twice, and the §4.23
+output-size check only ever runs from `execute()`, so a `sql()`-keyed decision
+would never have been output-bounded at all.
+
+The asymmetry is the point, and it is not symmetric: `sql()` costs what
+`execute()` costs *plus* its guards, so a template that loses on `execute()`
+loses on both and is declined on both (unchanged), while a template that loses
+only through `sql()` is declined only there. The probe of the statement itself
+is still shared, so the two paths still learn from each other's measurements.
+`last_rewrite()['detail']` says which: `measured 260.17 ms rewritten through
+sql() vs 10.00 ms native`.
+
+One detail the new gate rows found immediately, which is the sort of thing a
+gate is for: the measurement must not fire on a template's FIRST sighting
+through `sql()`, even when `execute()` has already measured it and
+`timing_checked` is set. That first sighting is the one that asks the device —
+it is the call that fills the cache — so measuring there charges a repeat
+caller a cost only the first call has, and the `l_partkey` top-k was declined
+on the `sql()` path at 2.15× on `execute()`. Three sightings on the path
+before it is measured, by which time the guard is a dict lookup, which is what
+the fourth call and every call after it pays. With that, the same cell reads
+2.15× through `execute()` and 2.12× through `sql()`.
+
+The suite tests it with a guard made expensive on purpose — a quarter second of
+real `time.sleep` in `_ties_guard`, with the statement's and native's times
+stubbed so that the statement wins by construction — and asserts the template
+is declined for `sql()` and kept for `execute()`. Everything else is asserted
+as a **count of device passes**, never a time: a counting stand-in for
+`Connection._raw` records what runs on side cursors, and `gpu_last_stats()`
+confirms from outside that the second `sql()` call moves nothing on the device
+until the caller's own fetch.
+
+### The gate knocks on both doors
+
+`transparent_gate.py` takes `--path execute|sql|both|auto`, and both sides of a
+cell go through the same one. The default is `auto`: `execute()` everywhere,
+plus `sql()` for the top-k forms — the shapes whose guard is a device pass —
+which costs about a minute of the gate's twelve. `--path both` forces every
+form through both. `tpch_coverage.py` takes `--path execute|sql` (it prints one
+row per query, so `both` would be a second table, not a wider one).
+`wrapper_residency_gate.py` stays on `execute()` and says so: every statement
+it times is a *declined* one, where `sql()` adds a relation object and no
+guard, and the question it asks — what a background upload does to an
+interactive session — is not about the entry point.
+
+### And the +3 ms that was not there
+
+The brief also reported `execute()` going from ~5 ms to 8.2 ms on this shape
+after #164, which would have meant the k + 1 row and the two windows cost 3 ms.
+They do not. Round-robin over five variants of the rewritten statement, so that
+none of them owns the device's clock state (medians of nine, SF1):
+
+| form | median | min |
+|---|---|---|
+| as rendered: device k + 1, `QUALIFY` with `error()` | 8.88 ms | 6.30 |
+| device k + 1, no `QUALIFY` | 8.41 ms | 5.80 |
+| device k + 1, `QUALIFY` on the windows, no `error()` | 7.91 ms | 5.60 |
+| device k, `QUALIFY` | 8.15 ms | 5.77 |
+| device k, no `QUALIFY` — what 465e9a8 rendered | 8.15 ms | 5.70 |
+| native | 17.52 ms | 17.40 |
+
+Paired round by round, the guard costs **+0.39 ms**, and the `error()` CASE
+costs nothing a plan could avoid (the variant without it is inside the same
+spread). The 5 ms figure is this machine's fast mode and the 8 ms its slow one
+— the two modes of a short kernel, §9.1, 2026-09-18: the first one or two runs
+of every batch above land at 5.7–6.4 ms and the rest at 8.1–9.3. The control
+that settles it: the *pre-#164 wrapper*, run today on this machine against the
+same data, measures `execute()` at 8.42 ms. Nothing regressed; native moved the
+same way (14.7 ms when the brief was written, 17.5 here), which is the tell
+that the machine and not the code was different.
+
+A number quoted from another session is a number from another machine state.
+The honest comparison is the one run round-robin in a single process, and it is
+what the table above is.
+
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

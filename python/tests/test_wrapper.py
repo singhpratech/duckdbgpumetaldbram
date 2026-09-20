@@ -2233,11 +2233,18 @@ def run():
               f"sql(): the measured rule-1 check fires on the third sighting "
               f"({None if d is None else (d.timing_checked, d.native_ms, d.rewritten_ms)})")
         # the verdict is the comparison's, and it is the SAME decision execute() uses
+        # the STATEMENT's own probe is shared: a template whose rewritten form
+        # is not faster than native loses on both paths, so execute() inherits
+        # that verdict. What sql() pays on top (its side-cursor guards) is
+        # recorded against the sql() path alone — `lazy_ms` / `lazy_declined`.
+        check(d.lazy_ms and d.lazy_ms[-1] >= d.rewritten_ms[-1],
+              f"sql(): the path's own time is the statement's plus its guards "
+              f"({d.rewritten_ms[-1:]}, {d.lazy_ms[-1:]})")
         verdict = "threshold" if min(d.rewritten_ms) >= d.native_ms else "rewritten"
         con.execute(q).fetchall()
         now = "rewritten" if con.last_rewrite()["rewritten"] else con.last_rewrite()["reason"]
         check(now == verdict,
-              f"sql(): execute() inherits the verdict sql() measured ({now} vs {verdict})")
+              f"sql(): execute() inherits the verdict sql() measured of the statement ({now} vs {verdict})")
         # a declined template comes back through sql() the same way it does through execute()
         d.rewritten, d.reason, d.measured_declined, d.why = False, "threshold", True, "x"
         d.probe_sql = d.probe_sql or ""
@@ -2246,7 +2253,7 @@ def run():
             try:
                 calls = []
                 con._probe_ms = lambda s, p: (calls.append(s), 1.0 if s == d.probe_sql else 9.0)[1]
-                d.next_check_at = 0.0
+                d.next_check_at = d.lazy_next_check_at = 0.0
                 con.sql(q).fetchall()
                 check(d.rewritten and not d.measured_declined and len(calls) == 2,
                       f"sql(): a declined template that re-measures faster is rewritten again "
@@ -2573,7 +2580,282 @@ def ties_checks():
         py.close()
     con.close()
     ties_rule1()
+    ties_sql_cost()
+    ties_sql_invalidation()
+    ties_rule1_path()
     ties_tpch()
+
+
+class _CountingCursor:
+    """A side cursor that records every statement run on it."""
+
+    def __init__(self, cur, log):
+        self._cur, self._log = cur, log
+
+    def execute(self, sql, *a, **kw):
+        self._log.append(sql)
+        return self._cur.execute(sql, *a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._cur, name)
+
+
+class _CountingRaw:
+    """A stand-in for `Connection._raw` that counts what the wrapper runs on
+    SIDE CURSORS — which is where a lazy relation's guards run. Everything
+    else is the real connection's, untouched."""
+
+    def __init__(self, raw):
+        self._real = raw
+        self.side = []
+
+    def cursor(self):
+        return _CountingCursor(self._real.cursor(), self.side)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def device_passes(self) -> int:
+        """Side-cursor statements that run the device top-k — the tie guard
+        (§4.24). The staleness guard is a `count(*)` and is not one."""
+        n = sum(1 for s in self.side if "GPUDB_TIES" in s)
+        del self.side[:]
+        return n
+
+
+def stats_line(con) -> str:
+    return con._raw.execute("SELECT gpu_last_stats()").fetchone()[0] or ""
+
+
+def ties_sql_cost():
+    """What a pushed top-k costs through `sql()` (§4.24 + §3.3).
+
+    `sql()` hands back a lazy relation, so the tie guard cannot raise inside
+    the statement — it runs on a side cursor first. For a pushed top-k the
+    device pass IS the statement, so that guard used to cost the whole
+    statement a second time, on every call: `l_partkey` top-5 at SF1 went from
+    8.5 ms through `execute()` to 17.1 ms through `sql()`, slower than the
+    14.7 ms native (docs/RESEARCH_NOTES.md, 2026-09-20). The verdict is a
+    function of the rendered statement and the resident set, so it is
+    remembered for as long as both stand.
+
+    Counted, never timed: the assertion is how many device passes ran."""
+    print("== top-k ties through sql(): the guard's verdict is remembered (§4.24)")
+    con = fresh()
+    if not has_device(con):
+        skip("top-k ties through sql() — needs a GPU backend")
+        con.close()
+        return
+    con.execute(TIES_SETUP)
+    q = "SELECT k, sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 5"
+    want = ties_native(q)
+    counted = _CountingRaw(con._raw)
+    con._raw = counted
+    rows1 = con.sql(q).fetchall()
+    lr = con.last_rewrite()
+    if not lr["rewritten"]:
+        skip(f"top-k ties through sql() — this build declined the shape ({lr['reason']})")
+        con.close()
+        return
+    check(counted.device_passes() == 1,
+          "sql()/cost: the first call runs the tie guard once")
+    # the second call: no device pass inside sql() at all, and gpu_last_stats()
+    # proves it from outside — nothing on the device moved between the call and
+    # the caller's own fetch.
+    before = stats_line(con)
+    rel = con.sql(q)
+    during = stats_line(con)
+    rows2 = rel.fetchall()
+    check(counted.device_passes() == 0,
+          "sql()/cost: the second call runs no device pass of its own")
+    check(during == before,
+          "sql()/cost: gpu_last_stats() is untouched by the second call — the guard did not run")
+    check(stats_line(con) != before,
+          "sql()/cost: ... and the ONE pass that did run is the caller's own fetch")
+    check(rows1 == rows2 == want, "sql()/cost: the rows are native's, both times")
+    # a different k is a different statement and is asked about on its own
+    con.sql(q.replace("LIMIT 5", "LIMIT 4")).fetchall()
+    check(counted.device_passes() == 1,
+          "sql()/cost: another LIMIT is another rendered statement and gets its own verdict")
+    con.sql(q.replace("LIMIT 5", "LIMIT 4")).fetchall()
+    check(counted.device_passes() == 0, "sql()/cost: ... remembered from its second call on")
+    con.sql(q).fetchall()
+    check(counted.device_passes() == 0, "sql()/cost: and the first k is still remembered")
+    con.close()
+
+
+def ties_sql_invalidation():
+    """When the remembered verdict is dropped.
+
+    It is a function of the rendered statement and of the data the RESIDENT
+    SET holds, so it has to go wherever the set does. Every way that can
+    happen gets a check: a write the wrapper sees, a write it does not (the
+    row-count guard), a foreign write to the file, and the transparent switch.
+    An INSERT that creates a tie after a `no tie` has been cached must be
+    caught on the very next call."""
+    print("== top-k ties through sql(): what drops the remembered verdict")
+    con = fresh()
+    if not has_device(con):
+        skip("top-k ties through sql(), invalidation — needs a GPU backend")
+        con.close()
+        return
+    con.execute(TIES_SETUP)
+    q = "SELECT k, sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 5"
+    boundary = "INSERT INTO tk VALUES (494, 600)"      # the 5th and 6th rows tie
+    counted = _CountingRaw(con._raw)
+    con._raw = counted
+    con.sql(q).fetchall()
+    con.sql(q).fetchall()
+    if not con.last_rewrite()["rewritten"]:
+        skip("top-k ties through sql(), invalidation — this build declined the shape")
+        con.close()
+        return
+    counted.device_passes()
+    # 1. a write through the wrapper: the decision cache goes and the verdict with it
+    con.execute(boundary)
+    rows = con.sql(q).fetchall()
+    lr = con.last_rewrite()
+    check(counted.device_passes() == 1,
+          "sql()/inval: an INSERT makes the next call ask the device again")
+    check(not lr["rewritten"] and lr["reason"] == "ties",
+          f"sql()/inval: ... and the tie the INSERT created is caught (reason={lr['reason']})")
+    check([r[1] for r in rows] == [r[1] for r in ties_native(q, boundary)],
+          "sql()/inval: DuckDB answered it")
+    # 2. the transparent switch: a write while the path is off still invalidates
+    con.execute("DELETE FROM tk WHERE k = 494 AND v = 600")
+    con.sql(q).fetchall(); con.sql(q).fetchall()
+    counted.device_passes()
+    con.transparent = False
+    con.execute(boundary)
+    con.transparent = True
+    rows = con.sql(q).fetchall()
+    check(counted.device_passes() == 1 and con.last_rewrite()["reason"] == "ties",
+          f"sql()/inval: a write while .gpu was off is still caught when it comes back "
+          f"({con.last_rewrite()['reason']})")
+    con.execute("DELETE FROM tk WHERE k = 494 AND v = 600")
+    # 3. a write the wrapper never sees: the statement's own row-count guard
+    con.sql(q).fetchall(); con.sql(q).fetchall()
+    counted.device_passes()
+    counted._real.execute(boundary)                    # straight past the wrapper
+    rows = con.sql(q).fetchall()
+    check(sorted(str(r) for r in rows) == sorted(str(r) for r in ties_native(q, boundary))
+          or [r[1] for r in rows] == [r[1] for r in ties_native(q, boundary)],
+          "sql()/inval: a write behind the wrapper's back still answers with native's rows")
+    lr = con.last_rewrite()
+    check(lr["fallback"] or not lr["rewritten"],
+          f"sql()/inval: ... the row-count guard stopped the rewritten form "
+          f"(fallback={lr['fallback']}, reason={lr['reason']})")
+    rows = con.sql(q).fetchall()
+    check(con.last_rewrite()["reason"] == "ties" or not con.last_rewrite()["rewritten"],
+          f"sql()/inval: and the rebuilt set is asked about the tie afresh "
+          f"(reason={con.last_rewrite()['reason']})")
+    con.close()
+
+    # 4. a foreign write to a file-backed database (§5.9)
+    import tempfile as _tf
+    fdb = os.path.join(_tf.mkdtemp(), "ties.duckdb")
+    con = gpudb.connect(fdb, residency="eager", floor_rows=0, thresholds=False)
+    try:
+        if not has_device(con):
+            return
+        con.execute(TIES_SETUP)
+        counted = _CountingRaw(con._raw)
+        con._raw = counted
+        con.sql(q).fetchall(); con.sql(q).fetchall()
+        if not con.last_rewrite()["rewritten"]:
+            skip("top-k ties through sql(), foreign write — this build declined the shape")
+            return
+        counted.device_passes()
+        other = counted._real.cursor()
+        other.execute("UPDATE tk SET v = v + 600 WHERE k = 494 AND rowid = "
+                      "(SELECT min(rowid) FROM tk WHERE k = 494)")
+        rows = con.sql(q).fetchall()
+        check(not con.last_rewrite()["rewritten"],
+              f"sql()/inval: a foreign in-place write drops the sets "
+              f"(reason={con.last_rewrite()['reason']})")
+        rows = con.sql(q).fetchall()
+        lr = con.last_rewrite()
+        check(counted.device_passes() >= 1,
+              "sql()/inval: ... and the rebuilt set is asked about the tie again")
+        check(lr["reason"] == "ties" or not lr["rewritten"]
+              or rows == con._raw.execute(q).fetchall(),
+              f"sql()/inval: the answer after a foreign write is DuckDB's own (reason={lr['reason']})")
+    finally:
+        con.close()
+
+
+def ties_rule1_path():
+    """Rule 1, measured, is about the path the user is on (§9.1).
+
+    `sql()` runs guards `execute()` does not, so the two paths can cost
+    different things for one template, and the measured rule has to compare
+    what THIS path costs against native. A guard made expensive on purpose
+    (the honest way to test it: no timing threshold, a decline that cannot be
+    a coincidence) must decline the template for `sql()` and leave
+    `execute()`, which pays none of it, alone.
+
+    The guard's cost here is REAL — a quarter of a second of it — while the
+    statement's own time and native's are stubbed on `_probe_ms`. So the check
+    is about the mechanism rather than about which of the two machine modes
+    (§9.1) the device happens to be in: the statement wins by construction,
+    2 ms against 10 ms, and only what this path adds can decline it."""
+    print("== rule 1 measures the path: a guard that costs more than native declines sql() only")
+    from gpudb import connection as _cn
+    con = fresh(thresholds=True)
+    if not has_device(con):
+        skip("rule 1 per path — needs a GPU backend")
+        con.close()
+        return
+    con.execute(RULE1_SETUP)
+    q = "SELECT k, sum(v) AS s FROM tr GROUP BY k ORDER BY s DESC LIMIT 5"
+    want = ties_native(q, setup=RULE1_SETUP)
+    con.sql(q).fetchall()
+    if not con.last_rewrite()["rewritten"]:
+        skip("rule 1 per path — this build declined the shape before the device saw it")
+        con.close()
+        return
+    saved_probe = con._probe_ms
+    con._ties_guard = lambda: time.sleep(0.25)             # a quarter second of "guard", every call
+    con._probe_ms = lambda s, p: 10.0 if s == q else 2.0   # the statement wins; the path does not
+    try:
+        for _ in range(_cn._LAZY_SIGHTINGS):
+            rows = con.sql(q).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "threshold",
+              f"rule1/path: the template is declined through sql() (reason={lr['reason']})")
+        check("through sql()" in (lr["detail"] or ""),
+              f"rule1/path: ... and the detail names the path ({(lr['detail'] or '')[:80]})")
+        check(rows == want or [r[1] for r in rows] == [r[1] for r in want],
+              "rule1/path: the rows are native's either way")
+        d = next((x for x in con._cache.values() if x.lazy_declined), None)
+        check(d is not None and not d.measured_declined,
+              "rule1/path: the statement itself was not declined — only this path was")
+        if d is not None:
+            check(d.lazy_ms and d.rewritten_ms and d.lazy_ms[-1] > d.rewritten_ms[-1] + 200.0,
+                  f"rule1/path: the path's measured time carries the guard, the statement's does not "
+                  f"({d.rewritten_ms[-1:]}, {d.lazy_ms[-1:]})")
+            got = con.execute(q).fetchall()
+            check(con.last_rewrite()["rewritten"],
+                  f"rule1/path: execute(), which pays no such guard, keeps the template "
+                  f"(reason={con.last_rewrite()['reason']})")
+            check(got == want or [r[1] for r in got] == [r[1] for r in want],
+                  "rule1/path: and its rows are native's too")
+            # the decline is not for ever: with the guard back to what it costs,
+            # the next window brings the template back on this path too
+            con.__dict__.pop("_ties_guard", None)
+            d.lazy_next_check_at = d.lazy_guard_ms = 0.0
+            con.sql(q).fetchall()                 # this one re-measures; the next one is rewritten
+            check(not d.lazy_declined, "rule1/path: the re-measure lifts the decline")
+            rows = con.sql(q).fetchall()
+            check(con.last_rewrite()["rewritten"],
+                  f"rule1/path: and the template comes back on sql() "
+                  f"(reason={con.last_rewrite()['reason']})")
+            check(rows == want or [r[1] for r in rows] == [r[1] for r in want],
+                  "rule1/path: with native's rows again")
+    finally:
+        con.__dict__.pop("_ties_guard", None)
+        con._probe_ms = saved_probe
+    con.close()
 
 
 # 150K groups of two rows each: sum(v) = 2k, distinct for every group, and
