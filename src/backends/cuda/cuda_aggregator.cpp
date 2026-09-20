@@ -174,18 +174,21 @@ public:
     // as if they were data, which no operator wants.
     void prepare() override {
         cudaStream_t s = own_stream();
-        if (null_count_ > 0 && dtype_ == Dtype::I64) ensure_exact_cache(s);
-        else                                          ensure_sort_cache(s);
+        if (dtype_ == Dtype::I64 && (null_count_ > 0 || width_ != 8)) ensure_exact_cache(s);
+        else                                                          ensure_sort_cache(s);
     }
     bool prepared() const noexcept override {
         if (rows_ == 0) return true;
-        if (null_count_ > 0 && dtype_ == Dtype::I64)
+        if (dtype_ == Dtype::I64 && (null_count_ > 0 || width_ != 8))
             return d_ex_sorted_.load(std::memory_order_acquire) != nullptr;
         return d_sorted_.load(std::memory_order_acquire) != nullptr;
     }
     std::size_t resident_bytes() const noexcept override {
         std::size_t b = bytes_;
-        if (d_sorted_.load(std::memory_order_acquire))    b += bytes_ + rows_ * sizeof(std::int64_t);
+        // the caches still hold i64 keys and i64 row ids (narrowing them is
+        // the next step of stage C), so they are sized from rows, not bytes_
+        if (d_sorted_.load(std::memory_order_acquire))
+            b += 2 * rows_ * sizeof(std::int64_t);
         if (d_ex_sorted_.load(std::memory_order_acquire)) b += 2 * rows_ * sizeof(std::int64_t);
         if (d_valid_) b += ((rows_ + 63) / 64) * sizeof(unsigned long long);
         return b;
@@ -198,6 +201,12 @@ public:
     // exact column back on the fast path: valid_bits() returns nullptr, which
     // every kernel reads as "every row is valid" and skips the load entirely.
     std::size_t null_count() const noexcept override { return null_count_; }
+
+    // Stage C (docs/RESIDENT_COLUMNS_DESIGN.md §6): a lane's storage width in
+    // bytes. Backend-private — dtype() still says I64 and every value read out
+    // is an i64; this is only how many bytes each one occupies. 8 until the
+    // upload narrows it.
+    int width() const noexcept { return width_; }
     const unsigned long long* valid_bits() const noexcept { return d_valid_; }
     unsigned long long*       valid_bits_mutable() noexcept { return d_valid_; }
 
@@ -214,13 +223,48 @@ public:
     }
 
     void finish_exact_upload() {
-        if (!d_valid_) { null_count_ = 0; return; }
         cudaStream_t s = own_stream();
-        std::size_t nulls = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_count(d_valid_, rows_, &nulls, s),
-                         "exact upload null count");
-        null_count_ = nulls;
-        if (nulls == 0) { cudaFree(d_valid_); d_valid_ = nullptr; }
+        if (d_valid_) {
+            std::size_t nulls = 0;
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_count(d_valid_, rows_, &nulls, s),
+                             "exact upload null count");
+            null_count_ = nulls;
+            if (nulls == 0) { cudaFree(d_valid_); d_valid_ = nullptr; }
+        } else {
+            null_count_ = 0;
+        }
+        narrow_lane();
+    }
+
+    // Stage C: pack the lane down to the narrowest signed width its values
+    // fit. The lane arrived at 8 bytes because the width is not known until
+    // every cell has been seen; one reduce over it gives the range, and a
+    // second pass packs. A NULL cell holds 0, which fits every width, so
+    // nothing has to exclude it.
+    //
+    // Only I64 lanes narrow: an F64 lane's bits are not a signed integer and
+    // a DOUBLE has no narrower exact form here.
+    void narrow_lane() {
+        if (dtype_ != Dtype::I64 || rows_ == 0 || !dptr_ || width_ != 8) return;
+        cudaStream_t s = own_stream();
+        int w = 8;
+        GPUDB_CUDA_CHECK(gpudb_cuda_lane_width(static_cast<const std::int64_t*>(dptr_), rows_,
+                                               &w, s),
+                         "lane width");
+        if (w >= 8) return;
+        void* packed = nullptr;
+        const std::size_t nb = rows_ * static_cast<std::size_t>(w);
+        // A failure here is not fatal: the lane stays at 8 bytes and every
+        // reader keeps working, because the width travels with the pointer.
+        if (cudaMalloc(&packed, nb) != cudaSuccess) return;
+        cudaError_t e = gpudb_cuda_lane_pack(static_cast<const std::int64_t*>(dptr_), rows_,
+                                             packed, w, s);
+        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e != cudaSuccess) { cudaFree(packed); return; }
+        cudaFree(dptr_);
+        dptr_  = packed;
+        bytes_ = nb;
+        width_ = w;
     }
 
     // The sort cache over the VALID keys: sorted keys and the row each came
@@ -230,7 +274,12 @@ public:
     void ensure_exact_cache(cudaStream_t s) const {
         if (dtype_ != Dtype::I64)
             throw std::runtime_error("CUDA exact GROUP BY: keys must be an i64 column");
-        if (null_count_ == 0) { ensure_sort_cache(s); return; }
+        // With no NULLs AND a full-width lane the v0.5 cache is the exact
+        // cache — every row is valid and the permutation covers all of them,
+        // so the two never coexist. A NARROWED lane cannot use it: that
+        // builder reads the values as raw int64, which is exactly what a
+        // packed lane stops being.
+        if (null_count_ == 0 && width_ == 8) { ensure_sort_cache(s); return; }
         if (rows_ == 0 || d_ex_sorted_.load(std::memory_order_acquire)) return;
         std::lock_guard<std::mutex> lock(cache_mu_);
         if (d_ex_sorted_.load(std::memory_order_relaxed)) return;   // lost the race: built
@@ -241,7 +290,7 @@ public:
         cudaError_t e = cudaMalloc(&perm, rows_ * sizeof(std::int64_t));
         if (e != cudaSuccess) { cudaFree(sorted); cuda_throw(e, "cudaMalloc exact cache (perm)"); }
         std::size_t n_valid = 0;
-        e = gpudb_cuda_exact_sort(static_cast<const std::int64_t*>(dptr_), d_valid_, rows_,
+        e = gpudb_cuda_exact_sort(dptr_, width_, d_valid_, rows_,
                                   static_cast<std::int64_t*>(sorted),
                                   static_cast<std::int64_t*>(perm), &n_valid, s);
         if (e == cudaSuccess) e = cudaStreamSynchronize(s);
@@ -254,17 +303,17 @@ public:
         d_ex_sorted_.store(sorted, std::memory_order_release);
     }
     const std::int64_t* exact_sorted() const noexcept {
-        return null_count_ == 0
+        return (null_count_ == 0 && width_ == 8)
                    ? sorted_keys()
                    : static_cast<const std::int64_t*>(d_ex_sorted_.load(std::memory_order_acquire));
     }
     const std::int64_t* exact_perm() const noexcept {
-        return null_count_ == 0
+        return (null_count_ == 0 && width_ == 8)
                    ? perm()
                    : static_cast<const std::int64_t*>(d_ex_perm_.load(std::memory_order_acquire));
     }
     std::size_t exact_valid_rows() const noexcept {
-        return null_count_ == 0 ? rows_ : n_valid_;
+        return (null_count_ == 0 && width_ == 8) ? rows_ : n_valid_;
     }
 
     // Build-side join cache: keys sorted + original-index permutation, built
@@ -282,6 +331,9 @@ public:
     // F64 sorts through order-preserving u64 keys (NaN greatest) and stores
     // the sorted doubles in the same slot.
     void ensure_sort_cache(cudaStream_t s) const {
+        if (width_ != 8)
+            throw std::runtime_error(
+                "CUDA sort cache: this lane is stored narrow; the exact cache reads it");
         if (rows_ == 0 || d_sorted_.load(std::memory_order_acquire)) return;
         std::lock_guard<std::mutex> lock(cache_mu_);
         if (d_sorted_.load(std::memory_order_relaxed)) return;   // lost the race: built
@@ -342,6 +394,7 @@ private:
     mutable std::size_t         n_valid_  = 0;
     unsigned long long*         d_valid_  = nullptr;
     std::size_t                 null_count_ = 0;
+    int                         width_ = 8;
     mutable cudaStream_t        own_stream_ = nullptr;
     mutable std::mutex          cache_mu_;   // guards cache build + own_stream_ creation
     std::size_t rows_  = 0;
@@ -362,6 +415,10 @@ public:
         // (backend_notes.hpp): the interface is frozen, so a backend that
         // wants to be named says so here rather than growing a field.
         set_device_name(props_.name);
+        // backend_notes.hpp: how wide a lane of ours is stored, which
+        // gpu_store_columns() reports. The frozen interface has no field for
+        // it because the width is backend-private (stage C).
+        register_lane_width_reporter(&CudaAggregator::lane_width_note);
     }
 
     ~CudaAggregator() override {
@@ -805,6 +862,11 @@ public:
     // upload_rows_exact PUTS the columns, and a resident column is
     // single-homed, so a set on this device cannot fall back to the CPU
     // reference for any operator.
+    // Stage C: every I64 lane of an exact set is stored at the narrowest
+    // signed width its values fit. The sort cache is not narrowed yet, so
+    // this reports what it says on the tin — lane storage — and nothing more.
+    bool narrow_lanes() const noexcept override { return true; }
+
     bool exact_supported() const noexcept override {
         static const bool on = [] {
             const char* e = std::getenv("GPUDB_CUDA_EXACT");
@@ -891,7 +953,7 @@ public:
                         gpudb_cuda_exact_scatter_lane(
                             st, sp.rows, n_lanes, l,
                             has_bits ? bt + l * max_words : nullptr, sp.valid_bit,
-                            static_cast<std::int64_t*>(cols[l]->device_ptr()),
+                            cols[l]->device_ptr(), cols[l]->width(),
                             cols[l]->valid_bits_mutable(), d0, s),
                         "exact upload scatter");
                 }
@@ -961,8 +1023,7 @@ public:
                         st, sp.rows,
                         sp.key_valid ? bt : nullptr,
                         sp.val_valid ? bt + max_words : nullptr, /*valid_bit=*/0,
-                        static_cast<std::int64_t*>(k->device_ptr()),
-                        static_cast<std::int64_t*>(v->device_ptr()),
+                        k->device_ptr(), k->width(), v->device_ptr(), v->width(),
                         k->valid_bits_mutable(), v->valid_bits_mutable(), dst, s),
                     "exact pair scatter");
                 GPUDB_CUDA_CHECK(cudaEventRecord(ev.e[b], s), "exact pair staging record");
@@ -1009,7 +1070,8 @@ public:
         if (n_pays == 0 && n_preds == 0)
             throw std::runtime_error(std::string(op) + ": neither a payload nor a predicate");
 
-        std::vector<const std::int64_t*>       pay_data(n_pays, nullptr);
+        std::vector<const void*>               pay_data(n_pays, nullptr);
+        std::vector<int>                       pay_width(n_pays, 8);
         std::vector<const unsigned long long*> pay_valid(n_pays, nullptr);
         std::size_t rows = 0;
         bool        have_rows = false;
@@ -1022,7 +1084,8 @@ public:
             if (!have_rows) { rows = c.rows(); have_rows = true; }
             else if (c.rows() != rows)
                 throw std::runtime_error(std::string(op) + ": payload row counts differ");
-            pay_data[p]  = static_cast<const std::int64_t*>(c.device_ptr());
+            pay_data[p]  = c.device_ptr();
+            pay_width[p] = c.width();
             pay_valid[p] = c.valid_bits();
         }
 
@@ -1068,7 +1131,8 @@ public:
             for (std::size_t q = 0; q < n_preds; ++q) {
                 const auto& pc = static_cast<const CudaResidentColumn&>(*preds[q].col);
                 auto& d  = h_preds[q];
-                d.data   = static_cast<const std::int64_t*>(pc.device_ptr());
+                d.data   = pc.device_ptr();
+                d.width  = pc.width();
                 d.valid  = pc.valid_bits();
                 d.list   = d_lists.p ? d_lists.p + off[q] : nullptr;
                 d.value  = preds[q].value;
@@ -1086,7 +1150,8 @@ public:
         std::vector<gpudb::cuda_exact::ExactTuple> tup(n_pays ? n_pays : 1);
         std::int64_t count_star = 0;
         GPUDB_CUDA_CHECK(gpudb_cuda_exact_global(d_preds.p, static_cast<int>(n_preds), rows,
-                                                 pay_data.data(), pay_valid.data(),
+                                                 pay_data.data(), pay_width.data(),
+                                                 pay_valid.data(),
                                                  static_cast<int>(n_pays), tup.data(),
                                                  &count_star, stream_),
                          "global masked aggregate");
@@ -1156,7 +1221,7 @@ public:
         std::size_t n1 = 0, n2 = 0;
         GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_probe(
                              bk.exact_sorted(), bk.exact_perm(), n_bvalid,
-                             static_cast<const std::int64_t*>(pk.device_ptr()), pk.valid_bits(), n,
+                             pk.device_ptr(), pk.width(), pk.valid_bits(), n,
                              kc.valid_bits(), out[0].from_build ? 1 : 0,
                              d_match.p, d_cls.p, &n1, &n2, stream_),
                          "join probe");
@@ -1170,9 +1235,9 @@ public:
             auto col = std::make_unique<CudaResidentColumn>(rows_out, sc.dtype());
             col->ensure_valid_bitmap();      // returns with the fill complete
             GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_gather(
-                                 static_cast<const std::int64_t*>(sc.device_ptr()), sc.valid_bits(),
+                                 sc.device_ptr(), sc.width(), sc.valid_bits(),
                                  out[l].from_build ? 1 : 0, d_match.p, d_cls.p, d_pos.p, n,
-                                 static_cast<std::int64_t*>(col->device_ptr()),
+                                 col->device_ptr(), col->width(),
                                  col->valid_bits_mutable(), stream_),
                              "join lane gather");
             GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "join lane sync");
@@ -1389,7 +1454,8 @@ private:
                     throw std::runtime_error(
                         std::string(op) + ": predicate column row count differs from the keys");
                 auto& q  = h_preds[p];
-                q.data   = static_cast<const std::int64_t*>(pc.device_ptr());
+                q.data   = pc.device_ptr();
+                q.width  = pc.width();
                 q.valid  = pc.valid_bits();
                 q.list   = d_lists.p ? d_lists.p + off[p] : nullptr;
                 q.value  = preds[p].value;
@@ -1426,17 +1492,17 @@ private:
             use_perm   = sel_perm.p;
         }
 
-        const std::int64_t*       vptr   = v ? static_cast<const std::int64_t*>(v->device_ptr())
-                                             : nullptr;
+        const void*               vptr   = v ? v->device_ptr() : nullptr;
         const unsigned long long* vvalid = v ? v->valid_bits() : nullptr;
         const int                 has_v  = v ? 1 : 0;
+        const int                 vwidth = v ? v->width() : 8;
 
         std::size_t runs = 0;
         GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, n_sel, &runs, stream_),
                          "exact run count");
         gpudb::cuda_exact::ExactTuple nullg{};
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_group(k.valid_bits(), mask, rows, vptr, vvalid,
-                                                     has_v, &nullg, stream_),
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_group(k.valid_bits(), mask, rows, vptr, vwidth,
+                                                     vvalid, has_v, &nullg, stream_),
                          "exact null-key group");
         const bool        has_null_group = nullg.cnt_star > 0;
         const std::size_t groups         = runs + (has_null_group ? 1 : 0);
@@ -1451,7 +1517,7 @@ private:
         DeviceOut<std::int64_t> d_mn(runs, "exact out min");
         DeviceOut<std::int64_t> d_mx(runs, "exact out max");
         std::size_t got = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, use_perm, n_sel, vptr, vvalid, has_v,
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, use_perm, n_sel, vptr, vwidth, vvalid, has_v,
                                                  d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
                                                  d_mn.p, d_mx.p, &got, stream_),
                          "exact reduce_by_key");
@@ -1801,6 +1867,13 @@ private:
     // (only the exact uploads produce one) instead of reading NULL rows as
     // data — those cells hold a zero that is not a value. Word for word the
     // CPU reference's guard, because the SQL layer surfaces it verbatim.
+    // Answers for CUDA columns and 0 for anything else, so the order the
+    // reporters are installed in does not matter.
+    static unsigned lane_width_note(const ResidentColumn& col) {
+        const auto* c = dynamic_cast<const CudaResidentColumn*>(&col);
+        return c ? static_cast<unsigned>(c->width()) : 0u;
+    }
+
     static const CudaResidentColumn& check_i64(const ResidentColumn& c) {
         const auto& r = check_i64_nullable(c);
         if (r.null_count() != 0)

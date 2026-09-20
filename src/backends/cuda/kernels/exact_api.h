@@ -37,14 +37,16 @@ namespace cuda_exact {
 // both sides through the same total order the host uses (predicate_mask.hpp),
 // so host and device agree bit for bit.
 struct DevPred {
-    const std::int64_t*       data  = nullptr;   // the lane's values
+    const void*               data  = nullptr;   // the lane's values, at `width` bytes each
     const unsigned long long* valid = nullptr;   // its validity bitmap, or nullptr
     const std::int64_t*       list  = nullptr;   // In: n_list constants, on the device
     std::int64_t              value = 0;
     int                       n_list = 0;
     int                       op = 0;
     int                       is_f64 = 0;
-    int                       pad = 0;
+    // Stage C: the lane's storage width in bytes (1, 2, 4 or 8). An F64 lane
+    // is always 8 — only signed integers narrow.
+    int                       width = 8;
 };
 
 // The per-group tuple, and the one group the NULL keys form.
@@ -75,7 +77,8 @@ cudaError_t gpudb_cuda_exact_scatter_lane(const std::int64_t* d_src, std::size_t
                                           std::size_t n_lanes, std::size_t lane,
                                           const unsigned long long* d_src_valid,
                                           std::size_t valid_bit,
-                                          std::int64_t* d_dst, unsigned long long* d_dst_valid,
+                                          void* d_dst, int dst_width,
+                                          unsigned long long* d_dst_valid,
                                           std::size_t dst_row, cudaStream_t s);
 
 // The same for an interleaved (key, payload) span: lane 0 and lane 1 of a
@@ -85,10 +88,22 @@ cudaError_t gpudb_cuda_exact_scatter_pair(const std::int64_t* d_kv, std::size_t 
                                           const unsigned long long* d_key_valid,
                                           const unsigned long long* d_val_valid,
                                           std::size_t valid_bit,
-                                          std::int64_t* d_keys, std::int64_t* d_vals,
+                                          void* d_keys, int key_width,
+                                          void* d_vals, int val_width,
                                           unsigned long long* d_key_bits,
                                           unsigned long long* d_val_bits,
                                           std::size_t dst_row, cudaStream_t s);
+
+// Stage C: the narrowest signed width (1, 2, 4 or 8 bytes) that holds every
+// cell of an I64 lane still stored at 8. NULL cells are stored as 0, which
+// fits any width, so they need no exclusion. A lane of zero rows takes 1.
+cudaError_t gpudb_cuda_lane_width(const std::int64_t* d_vals, std::size_t rows,
+                                  int* h_width, cudaStream_t s);
+
+// Pack an I64 lane down to `width` bytes per cell, in place of a separate
+// buffer the caller owns.
+cudaError_t gpudb_cuda_lane_pack(const std::int64_t* d_src, std::size_t rows,
+                                 void* d_dst, int width, cudaStream_t s);
 
 // NULL cells in [0, rows) of a bitmap.
 cudaError_t gpudb_cuda_exact_null_count(const unsigned long long* d_valid, std::size_t rows,
@@ -97,7 +112,8 @@ cudaError_t gpudb_cuda_exact_null_count(const unsigned long long* d_valid, std::
 // The exact sort cache: the VALID keys ascending (`d_sorted`) and the row id
 // each came from (`d_perm`), both sized for `rows` and filled to *h_n_valid.
 // A nullptr bitmap means every row is valid.
-cudaError_t gpudb_cuda_exact_sort(const std::int64_t* d_keys, const unsigned long long* d_valid,
+cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
+                                  const unsigned long long* d_valid,
                                   std::size_t rows, std::int64_t* d_sorted, std::int64_t* d_perm,
                                   std::size_t* h_n_valid, cudaStream_t s);
 
@@ -122,7 +138,7 @@ cudaError_t gpudb_cuda_exact_run_count(const std::int64_t* d_sorted, std::size_t
 // over the payloads of the rows in that run. `d_vals` / `d_vvalid` may be
 // null (has_vals == 0: the keys-only form, where count(payload) is count(*)).
 cudaError_t gpudb_cuda_exact_reduce(const std::int64_t* d_sorted, const std::int64_t* d_perm,
-                                    std::size_t n_sel, const std::int64_t* d_vals,
+                                    std::size_t n_sel, const void* d_vals, int val_width,
                                     const unsigned long long* d_vvalid, int has_vals,
                                     std::int64_t* d_keys_out, std::int64_t* d_lo, std::int64_t* d_hi,
                                     std::int64_t* d_cnt_v, std::int64_t* d_cnt_star,
@@ -136,7 +152,7 @@ cudaError_t gpudb_cuda_exact_reduce(const std::int64_t* d_sorted, const std::int
 // payload (and, with no payload at all, the whole answer).
 cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, int n_preds,
                                     std::size_t rows,
-                                    const std::int64_t* const* d_vals,
+                                    const void* const* d_vals, const int* h_widths,
                                     const unsigned long long* const* d_vvalid,
                                     int n_pays,
                                     gpudb::cuda_exact::ExactTuple* h_out,
@@ -155,7 +171,8 @@ cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, i
 // what decides class 1 vs class 2, exactly as the reference's kc.valid(krow).
 cudaError_t gpudb_cuda_join_mat_probe(const std::int64_t* d_bsorted, const std::int64_t* d_bperm,
                                       std::size_t n_bvalid,
-                                      const std::int64_t* d_pkeys, const unsigned long long* d_pvalid,
+                                      const void* d_pkeys, int pkey_width,
+                                      const unsigned long long* d_pvalid,
                                       std::size_t rows_probe,
                                       const unsigned long long* d_keylane_valid, int key_from_build,
                                       std::uint32_t* d_match, unsigned char* d_cls,
@@ -169,11 +186,13 @@ cudaError_t gpudb_cuda_join_mat_positions(const unsigned char* d_cls, std::size_
 
 // One output lane: dst[pos[i]] = src[from_build ? match[i] : i] for every
 // classified probe row, with the source cell's validity carried across.
-cudaError_t gpudb_cuda_join_mat_gather(const std::int64_t* d_src, const unsigned long long* d_src_valid,
+cudaError_t gpudb_cuda_join_mat_gather(const void* d_src, int src_width,
+                                       const unsigned long long* d_src_valid,
                                        int from_build, const std::uint32_t* d_match,
                                        const unsigned char* d_cls, const std::uint32_t* d_pos,
                                        std::size_t rows_probe,
-                                       std::int64_t* d_dst, unsigned long long* d_dst_valid,
+                                       void* d_dst, int dst_width,
+                                       unsigned long long* d_dst_valid,
                                        cudaStream_t s);
 
 // The NULL-key group: the same tuple over every row whose KEY is NULL and
@@ -181,7 +200,7 @@ cudaError_t gpudb_cuda_join_mat_gather(const std::int64_t* d_src, const unsigned
 // group does not exist and the host appends nothing.
 cudaError_t gpudb_cuda_exact_null_group(const unsigned long long* d_kvalid,
                                         const unsigned char* d_mask, std::size_t rows,
-                                        const std::int64_t* d_vals,
+                                        const void* d_vals, int val_width,
                                         const unsigned long long* d_vvalid, int has_vals,
                                         gpudb::cuda_exact::ExactTuple* h_out, cudaStream_t s);
 
