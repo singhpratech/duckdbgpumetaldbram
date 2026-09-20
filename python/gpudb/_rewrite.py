@@ -520,24 +520,6 @@ def decimal_scale(t: str) -> Optional[Tuple[int, int]]:
 def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
                 avg_float_bits: int = 0) -> None:
     plan.exact = exact
-    # avg over a DECIMAL payload is derived in SQL (_avg_decimal_expr) as
-    # double(unscaled sum) / (count * 10^s). Native finalises an average as a
-    # quotient in long double, so that expression reproduces native only where
-    # long double IS double. On x86-64 (64-bit mantissa) it differs: measured at
-    # 70 of 401 groups on a DECIMAL(18,2) payload. Returning a different answer
-    # is rule 2, so the shape is declined until the column is derived in C++
-    # (native_avg_decimal). avg_float_bits == 0 means the extension does not
-    # report the width, which is "not proven", not "fine".
-    if avg_float_bits != 53:
-        for o in plan.outputs:
-            if o.kind != "avg":
-                continue
-            col = plan.vals[o.pay] if getattr(plan, "vals", None) else plan.val
-            if plan.scales.get(col, plan.scale):
-                raise Decline("shape",
-                              "avg over DECIMAL is finalised by DuckDB in long double, "
-                              "which SQL cannot reproduce on this platform "
-                              f"(mantissa {avg_float_bits or 'unknown'} bits, needs 53)")
     if not exact and plan.uses_exact_only():
         raise Decline("shape", "WHERE / min / max / avg need the exact path (backend without it)")
     if not exact and any(o.kind == "count" for o in plan.outputs):
@@ -626,6 +608,39 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
         plan.val_types[vc] = vt
         if i == 0:
             plan.scale, plan.val_type = plan.scales[vc], vt
+    _check_avg_decimal(plan, avg_float_bits)
+
+
+def _check_avg_decimal(plan: Plan, avg_float_bits: int) -> None:
+    """avg over a DECIMAL payload is derived in SQL (_avg_decimal_expr) as
+    double(unscaled sum) / (count * 10^s). Native finalises an average as a
+    quotient in long double, so that expression reproduces native only where
+    long double IS double. On x86-64 (64-bit mantissa) it differs: measured at
+    70 of 401 groups on a DECIMAL(18,2) payload. Returning a different answer
+    is rule 2, so the shape is declined until the column is derived in C++
+    (native_avg_decimal). avg_float_bits == 0 means the extension does not
+    report the width, which is "not proven", not "fine".
+
+    Called at the END of check_types, once plan.scales is filled: a plan that
+    comes from the matcher carries no scales of its own (they are read off
+    `columns` by the payload loop above), so a check placed before that loop
+    reads 0 for every payload and never fires. Every avg the rendered
+    statement can derive is covered: the select list (plan.outputs) and a
+    HAVING over an avg that is not selected (plan.having, rendered by
+    _render_exact's extra_pred through the same _agg_expr). ORDER BY reaches
+    an avg only through an output name, and the top-k push refuses avg."""
+    if avg_float_bits == 53:
+        return
+    pays = {o.pay for o in plan.outputs if o.kind == "avg"}
+    if plan.having is not None and plan.having[0] == "avg":
+        pays.add(plan.having_pay)
+    for pay in pays:
+        col = plan.vals[pay] if pay < len(plan.vals) else plan.val
+        if col is not None and plan.scales.get(col, plan.scale):
+            raise Decline("shape",
+                          "avg over DECIMAL is finalised by DuckDB in long double, "
+                          "which SQL cannot reproduce on this platform "
+                          f"(mantissa {avg_float_bits or 'unknown'} bits, needs 53)")
 
 
 def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:

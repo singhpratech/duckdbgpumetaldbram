@@ -3349,6 +3349,83 @@ text-level guard the suite passes under both 1.4.5 and 1.5.5. Acceptance runs on
 the Mac now use both versions.
 
 
+## 2026-09-20 — A guard that was green on a fixture and dead on the path
+
+The 2026-09-19 entry above left `avg` over a DECIMAL payload as an open
+decision: the wrapper derives it in SQL as `double(unscaled sum) / (count *
+10^s)`, which is native's own expression only where `long double` IS `double`
+(arm64, 53-bit mantissa), and differs on x86-64 (64-bit). PR #149 took the
+decline: `_rewrite.check_types` refuses any `avg` over a DECIMAL payload unless
+the extension reports `avgf=53` in `gpu_build_info()`, and `avg_float_bits == 0`
+— an extension too old to report the width — counts as "not proven", not
+"fine". A unit check went in with it and passed.
+
+The guard never ran. It tested `plan.scales.get(col, plan.scale)` near the top
+of `check_types`, and `plan.scales` / `plan.scale` are filled by the payload
+loop *further down in the same function*, which reads each payload's type off
+`columns`. A plan that comes from the matcher arrives with `scales == {}` and
+`scale == 0`, so the condition was false for every statement a user can write.
+The unit check passed because it hand-built a `Plan` with its scales already
+filled — the one state no real plan is ever in at that point.
+
+It surfaced on the x86 box: TPC-H Q1 was rewritten there, on a build reporting
+`avgf=64`, where it should have declined. Measured on that machine on main,
+default thresholds, `residency="eager"`: `SELECT k, avg(amt) FROM d GROUP BY k`
+over a `DECIMAL(18,2)` payload, 4M rows, 5000 groups — rewritten, and **982 of
+5000 groups differ from native** (e.g. `5101177250496.538` against
+`5101177250496.537`); `sum` / `count` / `min` / `max` differ in 0.
+
+The condition is sharper than "x86". The two expressions agree until a group's
+unscaled 128-bit sum passes 2^53, beyond which the double quotient and the
+80-bit one round apart. That is why Q1 at SF1 *looked* identical — its group
+sums are small enough — and why a test over small values would pass for the
+wrong reason. The reproducer therefore builds values around 1e13 so the widest
+group sum is ~4.1e17 unscaled, and it ships as `scripts/avg_decimal_parity.py`
+with a `--force-avg-bits` switch so either platform can be simulated on the
+other.
+
+**The fix** moves the check to the end of `check_types`, after the loop that
+fills `plan.scales`, as `_check_avg_decimal`. It also widens it: the old loop
+looked only at `plan.outputs`, and an `avg` that appears *only* in `HAVING`
+(`… GROUP BY k HAVING avg(d) > 5`) is not an output — it is `plan.having`, and
+`_render_exact` renders it through the same `_agg_expr`, so it reached
+`_avg_decimal_expr` untouched. `ORDER BY` can only name an `avg` that is an
+output, and the top-k push refuses `avg`, so those two are covered by the
+outputs. `check_types` has exactly one caller, so with both sources checked
+there is no second way in: verified end to end that all of single payload,
+several payloads, a computed DECIMAL lane (§4.10), `HAVING avg`, the global
+aggregate (§4.12), a join payload (§4.8), the post-aggregate split (§4.11),
+`WHERE`, top-k, `FILTER`, `GROUP BY ALL`, a view, a CTE and a derived table now
+decline at 64 and are rewritten at 53.
+
+**The general lesson**, which is why this is written down rather than just
+fixed: a test that asserts "not rewritten" asserts almost nothing — a threshold,
+a `nulls` gate or a plain shape mismatch satisfies it too. A decline check must
+assert the REASON and the DETAIL. And a guard test must go through the real
+path: `connect().execute()` with the width forced and the caches dropped, not a
+hand-built plan handed to the function. The new section in
+`python/tests/test_wrapper.py` does both, over data whose group sums pass 2^53,
+and the old fixture check stays with a comment saying what it does and does not
+prove. (Its `columns` argument had to be corrected too: it claimed a
+`DECIMAL(18,2)` payload while the plan said scale 0, an inconsistency only a
+hand-built plan can have.)
+
+**What x86 users get until `native_avg_decimal` lands.** Simulated on the Mac by
+forcing the reported width to 64 and running `scripts/tpch_coverage.py` over
+SF1: coverage goes from 17 of 22 to **16 of 22**, and the single query that
+moves off the device is **Q1**, with `shape: avg over DECIMAL is finalised by
+DuckDB in long double …`. Nothing else in TPC-H declines for this reason — Q17's
+`avg` sits inside a correlated subquery DuckDB evaluates itself, and Q14 and
+Q19 are ratios of sums. On the Mac itself nothing changes: SF1 stays 17 of 22,
+0 rows differing, Q1 on the GPU at 3.9×, because Metal reports `avgf=53`.
+
+The before / after proof on real x86 hardware is owed by the Linux instance:
+`scripts/avg_decimal_parity.py` on main (expected: rewritten, ~982 of 5000
+groups differing) and on this branch (expected: declined, 0 differing). The
+permanent fix stays what the 2026-09-19 entry named — derive the column in C++
+with `native_avg_decimal`, which has no 53-bit ceiling — after which the guard
+becomes unnecessary rather than merely correct.
+
 ## 2026-09-20 — CI runs the wrapper suite, and what a machine without a GPU can prove
 
 **What was not covered.** `python/tests/test_wrapper.py` is the only suite that
@@ -3417,6 +3494,7 @@ reachable in principle and pipelines failing case by case — a suite that is
 neither the CPU leg's clean skip nor the real device leg's parity run, and
 flaky in between. A device parity run needs real hardware, which CI does not
 have on either platform.
+
 
 
 ## Open questions
