@@ -54,6 +54,28 @@ the data on every execution, and because the fallback is a genuine loss (a
 device pass plus DuckDB's own run) the template is measured-declined like any
 other losing template, with the tie named in `detail`.
 
+Through `sql()` — the path the `gpudb` shell takes — that guard cannot be a
+clause of the statement: a lazy relation is read after the call has returned,
+where a raise could not be answered, so the guard runs on a side cursor inside
+the call, and for a pushed top-k the side cursor IS the device pass. **The
+verdict is therefore remembered** (#170), per rendered statement, and dropped
+wherever the resident sets are — any write, DDL, `SET`, `ATTACH` or foreign
+write the wrapper sees, a row count that moved under the set, a rewrite that
+raised. One device pass per data version instead of one per call: the shape went
+from 17.1 ms back to 8.7 ms through `sql()`, and in the shell to 5.7 ms against
+17.8 ms native. A *tie* verdict is never cached — it raises, and the template is
+measured-declined, which is the stronger answer.
+
+**The measured rule times the path** (#170). `execute()` and `sql()` reach the
+same templates, but `sql()` pays for its guards inside the call, so what is
+compared against native is what a caller on that path actually pays. A template
+that loses only through `sql()` is declined there alone; one whose statement
+loses is declined on both, since `sql()` costs what `execute()` costs plus the
+guards. `scripts/transparent_gate.py` takes `--path execute|sql|both|auto` and
+`scripts/tpch_coverage.py` takes `--path execute|sql`: a gate that measures one
+entry point proves nothing about the other, which is how this cost reached a
+release branch at all.
+
 ## The statement rewrite
 
 - **`gpu_rewrite_ast`** (#86) — a pure C++ scalar over DuckDB's own
@@ -181,6 +203,24 @@ other losing template, with the tie named in `detail`.
   rather than skipped, so `ready` means uploaded *and* prepared.
   `GPUDB_UPLOAD_QUIET_MS`, `GPUDB_UPLOAD_QUIET_MAX_S` and
   `GPUDB_RESIDENCY_TRACE` are the controls ([ENVIRONMENT.md](ENVIRONMENT.md)).
+- **A segment priced from measurement, and a session that says when none fits**
+  (#169) — a segment has a fixed cost no smaller segment escapes: the
+  statement's own parse and bind, and DuckDB's scan set-up over every row group
+  of the table (measured 0.40 ms for 8,192 rows on an M4 Max against 2.6 ms for
+  524,288; about 1.5 ms on an x86 box). The floor the size halves down to is now
+  the smallest size whose predicted total for the table stays within reach of
+  the total at the default size, fitted to the segments that landed *here* —
+  which derives 32,768 rows on the x86 curve, where the old constant sat, and
+  65,536 on the M4 Max. Pricing a halving takes two landed sizes, so until there
+  are two the size halves on the yield rule alone down to the old constant of
+  1/32 of the default, and starvation is declared there. At the floor a session
+  whose windows still ask for something smaller is **starved** and says so:
+  `progress()` reports `starved` with `window_ms`, `fixed_ms`, `per_row_us` and
+  `floor_rows`. Nothing is forced — the set stays off the device and every
+  statement keeps its native answer. Two measured cuts to the fixed cost came
+  with it: the segment statement is `PREPARE`d once per session (0.50 → 0.40 ms
+  for an 8,192-row segment), and the idle wait now wakes when the idle test can
+  first pass rather than a whole `idle_ms` later.
 - **Writes from any connection** (#120, #137) — the database file and its
   write-ahead log are stat'ed before every rewritten statement (2–3 µs), so a
   committed write from a connection the wrapper does not own is noticed; the
@@ -239,18 +279,21 @@ full licence text so GitHub detects it (#89).
 
 ## Tests, CI and packaging
 
-- `python/tests/test_wrapper.py`: 1206 checks, 0 skipped, green under DuckDB
+- `python/tests/test_wrapper.py`: 1238 checks, 0 skipped, green under DuckDB
   1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
   backend without the exact path; #159 and #160 replaced its host gating with a
   probe for the function that decides; #164 added the reported tie and its
-  fallbacks). On the RTX 4090 box the same suite collects one check more,
-  because the `avg`-over-`DECIMAL` section branches on the host's `long
-  double` — the counts each come from their own machine — and carries 4
-  failures, all of them segmented-upload cases unrelated to the exact path and
-  written down in `BENCHMARK.md` (#161).
-- `python/tests/test_residency_policy.py`: 85 checks, 0 failing — the residency
-  policy on a clock the test drives, so the yield rule and the quiet-window
-  bound are asserted directly rather than raced against a real machine (#167).
+  fallbacks; #170 asserts the remembered verdict as a count of device passes
+  rather than as a time). The RTX 4090 box collects a different number, because
+  the `avg`-over-`DECIMAL` section branches on the host's `long double` — the
+  counts each come from their own machine — and it used to carry 4 failures,
+  all of them segmented-upload cases unrelated to the exact path (#161). Once
+  #169 priced a segment from what each machine measures, that box came back
+  fully green: **1209 of 1209** at the time it was run.
+- `python/tests/test_residency_policy.py`: 105 checks, 0 failing — the residency
+  policy on a clock the test drives, so the yield rule, the quiet-window bound
+  and the measured segment floor are asserted directly rather than raced against
+  a real machine (#167, #169).
 - `test_gpudb`: 750 / 750 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
   #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block.
 - `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
@@ -258,6 +301,10 @@ full licence text so GitHub detects it (#89).
   `test/sql/`.
 - `scripts/tpch_coverage.py`: SF1 17 of 22, SF10 19 of 22, 0 rows differing, on
   the M4 Max.
+- `scripts/transparent_gate.py` now drives both entry points (#170). The top-k
+  and plain subset was re-run at SF1 through `execute()` and through `sql()`:
+  every row at or above its bound and identical either way, with the `l_partkey`
+  top-k reading 2.15× through `execute()` and 2.12× through `sql()`.
 - The SQL suite now runs on Linux with the DuckDB libs pinned (#151), and the
   wrapper suite runs against the built extension in CI (#158).
 - sqllogic coverage for the exact surface and a guard against an older

@@ -1384,7 +1384,7 @@ boundary and a tie *inside* the top k, where the row set is right and the order
 is not. The wrapper answers the user's original statement on DuckDB when it sees
 that marker, with `reason = "ties"`.
 
-Four properties worth stating, because each was a decision:
+Five properties worth stating, because each was a decision:
 
 - **It is decided against the data, per execution**, not cached as a shape. The
   decline follows the *literals*: `LIMIT 4` and `LIMIT 5` share a template and
@@ -1400,10 +1400,27 @@ Four properties worth stating, because each was a decision:
 - **With no tie it costs one extra row** and two window functions sharing one
   specification over k + 1 rows — measured at `LIMIT 3` on the reviewer's
   statement, best of 30 each, 7.21 ms with the guard against 7.35 ms without,
-  inside the noise, against 9.5 ms native. `execute()` pays nothing else;
-  `sql()` returns a lazy relation that is read after the call has returned,
-  where a raise could not be answered natively, so the guard runs once on a side
-  cursor first (`_guard_now`) — one extra device top-k on that path.
+  inside the noise, against 9.5 ms native. `execute()` pays nothing else.
+- **Through `sql()` the verdict is remembered**, because there the guard is not
+  a clause of the statement. A lazy relation is read after the call has
+  returned, where a raise could not be answered natively, so the guard runs on a
+  side cursor inside the call (`_guard_now`) — and for a pushed top-k that side
+  cursor IS the device pass, not a cheap `count(*)` like the staleness guard
+  beside it. Paid per call it doubles the shape. So the answer is cached instead
+  (`_ties_guard`, keyed by the rendered statement, on the family's root): whether
+  the first k ordering values tie is a function of that rendered text — tag,
+  lanes, literals, k — and of the data the resident set holds, and the device
+  computes the top-k from the set rather than from the table, so neither can
+  move without the sets being dropped. The entry is therefore dropped exactly
+  where they are: `_invalidate_all` (any write, DDL, `SET`, `ATTACH` or foreign
+  write the wrapper sees, from any cursor of the family), `_on_stale` and
+  `_on_rewrite_error`; and the statement's own `gpu_assert_rows` guard now runs
+  immediately *before* the verdict is read, so a row count that no longer
+  matches the set has already raised. A *tie* verdict is never cached — it
+  raises, and the template is measured-declined, which is the stronger answer.
+  One device pass per data version instead of one per call; from the second call
+  on the guard is a dict lookup and `sql()` costs what `execute()` costs.
+  §3.3 has the path-measured rule that goes with it.
 - **An `ORDER BY` that is already total** (`ORDER BY qty DESC, k`) is not pushed
   as a top-k at all and keeps the device.
 
