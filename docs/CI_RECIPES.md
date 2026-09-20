@@ -152,10 +152,11 @@ This repository's own `linux (cpu-only build + tests)` job goes further than
 the smoke above: it builds without CUDA, runs the unit suite and the smoke
 benchmarks, imports the Python wrapper and runs the shell and residency-policy
 tests that need no extension, then fetches the pinned pre-built DuckDB libs,
-builds the loadable extension and `gpudb-sql`, and runs the whole
-`test/sql/*.test` suite on the CPU backend — so a change that breaks SQL-level
-behaviour is caught on x86-64 and not only on the macOS runner. See
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+builds the loadable extension and `gpudb-sql`, runs the whole
+`test/sql/*.test` suite on the CPU backend, and runs the Python wrapper suite
+against that built extension — so a change that breaks SQL-level or
+transparent-path behaviour is caught on x86-64 and not only on the macOS
+runner. See [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
 
 ## 3. Docker
 
