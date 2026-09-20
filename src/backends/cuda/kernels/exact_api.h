@@ -64,6 +64,19 @@ struct ExactTuple {
 
 extern "C" {
 
+// What the last CUB call that could not get its working memory needed, and
+// how much the device had free at that moment. Both 0 when nothing has been
+// refused. An operator that runs out of SCRATCH is a different event from a
+// set that will not fit, and the caller can only tell them apart — and decide
+// whether to evict or to refuse the template — if it is told the sizes.
+void gpudb_cuda_last_scratch(std::size_t* need_bytes, std::size_t* free_bytes);
+
+// Test hooks: reserve all but `leave_bytes` of the device so an allocation
+// refusal can be forced deterministically, and give it back.
+std::size_t gpudb_cuda_debug_free_bytes();
+void*       gpudb_cuda_debug_reserve(std::size_t leave_bytes);
+void        gpudb_cuda_debug_release(void* p);
+
 // Set every bit of a validity bitmap covering `rows` rows (the upload starts
 // all-valid and clears a bit per NULL, as the CPU reference does).
 cudaError_t gpudb_cuda_exact_fill_valid(unsigned long long* d_bits, std::size_t rows, cudaStream_t s);

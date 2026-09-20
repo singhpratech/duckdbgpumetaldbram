@@ -4725,6 +4725,70 @@ The honest comparison is the one run round-robin in a single process, and it is
 what the table above is.
 
 
+## 2026-09-20 — What an out-of-memory error should say
+
+A long transparent-gate run on the 4090 produced fourteen cells reported as
+`declined (error)` with nothing else. Finding out what they were took three
+rounds, and each round killed a theory rather than adding one.
+
+Printing the detail killed the first: the text was "the row floor counted the
+1500000 rows of orders...", a THRESHOLD note, not an error. Hooking the generic
+`except Exception` in `_decide_body` killed the second — it never fired across
+27 errors, so it was not a decision failure either. Reading every site that
+sets `reason="error"` found it: an EXECUTION fallback that mutates the cached
+decision to `reason="error"` without clearing `why`, so the reported cause was
+the previous successful run's admit note.
+
+With a print at that site the real exceptions appeared: nine device
+out-of-memory failures, and twenty-four "columns are resident on different
+backends" errors following the first OOM by about two hundred lines of log.
+
+### The measurement that settled it, and the two that did not
+
+Sampling `nvidia-smi` through a whole run showed device memory climbing
+monotonically to 15807 MiB of 16376 and staying there. That is the fact. Two
+things reported on the way there were not.
+
+I said a failed upload left ~74 MiB of residue and that repeats leaked ~12 MiB
+each. Both were artefacts: every "repeat" used a different key, so each created
+a new resident set. Re-run with the statement held identical, memory is flat
+after the first attempt. And the ~50 MiB that remained turned out to be two
+correctly uploaded store columns — `l_partkey` and `l_extendedprice`, 46 MiB at
+width 4 — which the store is supposed to keep. I had been watching the card
+instead of the store, so a successful upload looked like wreckage.
+
+That is the fourth measurement artefact in this port, and they share a shape:
+something varied between the two numbers that I had not meant to vary. The
+discipline that catches it is not "measure more carefully" but "before
+reporting, name what differs between the two runs" — the noisy segment curve
+(sample count), the doubled `resident_bytes` (an edit that appended instead of
+replacing), the unordered GROUP BY comparison (row order), and this one.
+
+### What was actually wrong
+
+A unit test that reserves all but 48 MiB of the card and attempts an oversized
+upload four times shows free memory unchanged: the backend frees everything it
+touched on a refusal. The real defect is one level up — a set whose UPLOAD
+succeeded but whose QUERY ran out of working memory is left in state
+`uploaded`, never reaches `ready`, and is declined `not_resident` for the rest
+of the session, holding 46 MiB it will never use.
+
+### The message
+
+An allocation refusal is the one failure a caller can act on, and only if it is
+told the size. `out of memory` is not a decision anyone can make. It now reads:
+
+    CUDA exact reduce_by_key failed: out of memory
+    (needs 274 MiB of working memory, 186 MiB free)
+
+CUB's temp storage is knowable before the launch — the size query is the first
+half of its two-call protocol — and `DevBuf::alloc` records the same for direct
+allocations, so both paths can say what they wanted. The wrapper parses that
+shape to choose between evicting the difference and refusing the template,
+which makes the message part of an interface rather than a diagnostic. It is
+documented as such beside `cuda_throw`, because the next person to improve the
+wording would otherwise break a caller they cannot see.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
