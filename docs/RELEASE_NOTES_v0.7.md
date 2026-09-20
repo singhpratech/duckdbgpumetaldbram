@@ -154,8 +154,9 @@ order-dependently — the shape is never rewritten.
 - `python/tests/test_wrapper.py`: 1157 checks, 0 skipped, green under DuckDB
   1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
   backend without the exact path; #159 and #160 replaced its host gating with a
-  probe for the function that decides). On the x86-64 box it carries 4
-  long-standing failures in the segmented-upload cases, unchanged by this work.
+  probe for the function that decides). On the RTX 4090 box the same suite is
+  1154 ok with 4 failures, all in the segmented-upload cases and all unrelated
+  to the exact path — measured and written down in `BENCHMARK.md` (#161).
 - `test_gpudb`: 711 / 711 checks on CPU + CUDA (RTX 4090 Laptop).
 - `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
   RTX 4090; 45 `expected_fail` guardrail cases across the 18 files in
@@ -186,14 +187,16 @@ reason for each, and `KNOWN_ISSUES.md` has the rest.
 |---|---|---|---|
 | Plain SQL on the GPU | yes | opt-in: `GPUDB_CUDA_EXACT=1` | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
-| From the community registry | yes | `SELECT gpu_build_info();` says what a given binary carries | yes |
+| From the community registry | yes | the v0.6.0 Linux binary reports `compiled=cpu`; `gpu_build_info()` answers it for any binary | yes |
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
-#154). On an RTX 4090 with the path enabled, the unit suite is 711 / 711 and
-the SQL suite 224 passing, 0 failing. It stays opt-in in this release for one
-reason: `scripts/transparent_gate.py` has not been swept on that machine, so a
-CUDA build would be deciding with Metal's thresholds — and rule 1 is a
-measurement, not an assumption.
+#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 711 / 711,
+the SQL suite 224 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the
+device with 0 rows differing — the same coverage and the same five declines as
+Metal (#161). It stays opt-in in this release for one reason:
+`scripts/transparent_gate.py` has not been swept on that machine, so a CUDA
+build would be deciding with Metal's thresholds — and rule 1 is a measurement,
+not an assumption.
 
 ## Credits
 

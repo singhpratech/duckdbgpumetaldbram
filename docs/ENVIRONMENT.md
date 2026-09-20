@@ -73,7 +73,7 @@ Read by the shell scripts and CMake, never by the extension at run time.
 | `GPUDB_REQUIRE_CUDA` | unset | `1` makes configure fail loudly instead of silently falling back to CPU. |
 | `GPUDB_NO_METAL` | unset | `1` configures with `-DGPUDB_ENABLE_METAL=OFF`. |
 | `DUCKDB_C_API_VERSION` | `v1.2.0` | The C API version the loadable extension is packaged against. |
-| `DUCKDB_VERSION` | `v1.5.5` | Which DuckDB release `scripts/get_duckdb_libs.sh` downloads (`latest` is accepted). |
+| `DUCKDB_VERSION` | `v1.5.5` | Which DuckDB release `scripts/get_duckdb_libs.sh` fetches (`latest` is accepted). |
 | `CUDAARCHS` | `75;80;86;89;90` | Standard CMake variable; when unset **or set but empty** the project falls back to that list. |
 | `GPUDB_SQL_TIMEOUT_SECS` | `30` | Per-query timeout in the SQL suite. |
 

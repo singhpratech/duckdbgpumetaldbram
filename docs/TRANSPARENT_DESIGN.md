@@ -1968,7 +1968,7 @@ same database — the extension stays free of threads and hidden connections
   sets, no rewrite).
 
 ### 5.6 Concurrency — prerequisite of the background path
-Before milestone 0b, `gpu_resident.cpp` took the global mutex inside
+Before the residency work described here, `gpu_resident.cpp` took the global mutex inside
 `upload_update` and `upload_combine` (DuckDB's per-thread aggregate
 callbacks) and incremented one process-wide atomic (the host pool-cap
 accounting) **per row** from every scan thread. Measured on SF10: Q18-inner
@@ -1994,7 +1994,7 @@ each mattered for footprint (host peak 2.8 GB → 0.9 GB, finalize
   zero, so LRU can never free a column mid-query.
 
 This is shared-extension plus CUDA-backend work carried as one
-`feat/core-*` PR from the Linux instance (milestone 0b, #84); the Metal
+`feat/core-*` PR from the Linux machine (#84); the Metal
 backend implements `prepare()` and the interleaved pair upload on its side
 (#85).
 
@@ -2200,8 +2200,8 @@ Findings update this document before implementation. Status 2026-09-03:
 item 1 done (every construct and rejection serialized and round-tripped;
 fields recorded in §2; the `HAVING` literal `300.5` arrives as
 `DECIMAL(4,1)` value `3005`, confirming the rescale in §6); item 2 done for
-the evaluation-order and cost questions (§5.4) — the C-API scalar itself is
-milestone 0b; item 3 done for classification (§5.2) and resolution sources
+the evaluation-order and cost questions (§5.4) — the C-API scalar itself came
+with the registry work; item 3 done for classification (§5.2) and resolution sources
 (§5.1), open for the wrapper's cache and transaction handling until the
 wrapper exists; item 4 done (§4.2).
 

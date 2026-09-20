@@ -144,11 +144,12 @@ docs:
       sum / avg over DOUBLE or FLOAT are answered by DuckDB. sum(DOUBLE)
       is by design: native's own result depends on the order the values
       are added, so "the same as native" is not definable for it.
-    * Whether a Linux binary from this registry carries CUDA depends on
-      the toolchain its build machine had. SELECT gpu_build_info(); says
-      which backends the binary in front of you carries (compiled=) and
-      which one it chose (runtime=). A CPU-only binary offers the same
-      gpu_* functions and returns the same results, with backend=CPU.
+    * The Linux binary this registry serves today reports compiled=cpu:
+      it offers the same gpu_* functions and returns the same results,
+      with backend=CPU. SELECT gpu_build_info(); says which backends any
+      given binary carries (compiled=) and which one it chose (runtime=).
+      A CUDA build is available from the project's releases and from
+      source.
     * On CUDA hardware, ordinary SQL is rewritten onto the GPU only with
       GPUDB_CUDA_EXACT=1. Every operator is implemented there; what has
       not been done is running the threshold sweep on NVIDIA hardware,

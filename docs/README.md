@@ -71,6 +71,7 @@ Entries are in date order in the file; this groups them by question.
 
 **Kernels**
 - Raw performance first: where a statement's time goes
+- SF10, and "what is the gap?"
 - One group is not a GROUP BY (the global masked aggregate)
 - Few keys do not need a sort: the direct grouped reduce
 - The WHERE that read the mask ten times (the fused mask)
@@ -83,8 +84,15 @@ Entries are in date order in the file; this groups them by question.
 - The end-of-file that arrived while nobody was reading, and the Ctrl-C that had nobody to wake — two pty races that turned out to be stock Python's
 - The other build path, unexercised since the rewriting began
 - The SQL suite now runs on x86-64, and the DuckDB libs are pinned
+- The documents still described a layout we had dropped
+- A guard that was green on a fixture and dead on the path
+- CI runs the wrapper suite, and what a machine without a GPU can prove
+- A test that pretended to be the other machine
+- The column SQL could not compute (`avg` over `DECIMAL`, derived in C++)
 
-The journal ends with **Open questions** — what is not answered yet.
+The journal ends with **Open questions** — the shapes the current design does
+not answer, each with the measurement that says why. It is a record of where
+the edges are, not a plan.
 
 ## Reference documents
 
@@ -94,6 +102,7 @@ The journal ends with **Open questions** — what is not answered yet.
 | [GROUPBY_RESIDENT_DESIGN.md](GROUPBY_RESIDENT_DESIGN.md) | The explicit `gpu_*` SQL functions and the resident GROUP BY |
 | [WINDOW_FUNCTIONS_DESIGN.md](WINDOW_FUNCTIONS_DESIGN.md) | Window functions — a design note; they are not implemented |
 | [CUDA_EXACT_PATH.md](CUDA_EXACT_PATH.md) | The interface contract for the exact path, and the tests that prove it on every backend |
+| [ENVIRONMENT.md](ENVIRONMENT.md) | Every environment variable the code honours, one line each |
 | [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md) · [DATASETS.md](DATASETS.md) | How the benchmarks are run and on what data |
 | [DEVELOPMENT.md](DEVELOPMENT.md) · [MACOS_EXTENSION_BUILD.md](MACOS_EXTENSION_BUILD.md) · [CI_RECIPES.md](CI_RECIPES.md) | Building, testing, CI |
 | [RELEASE_NOTES_v0.7.md](RELEASE_NOTES_v0.7.md) | What v0.7 ships, by theme |
@@ -105,9 +114,12 @@ Every table names its command. The common ones:
 
 ```bash
 SF=1 ./scripts/gen_tpch.sh                                  # data
-./scripts/build.sh                                          # extension + tools
-python3 scripts/tpch_coverage.py                            # the 22 TPC-H queries: who answers, how fast, identical?
-python3 scripts/transparent_gate.py --subqueries --exprs    # the sweep behind the thresholds (about an hour)
+./scripts/get_duckdb_libs.sh && ./scripts/build.sh          # extension + tools
+PYTHONPATH=python python3 scripts/tpch_coverage.py          # the 22 TPC-H queries: who answers, how fast, identical?
+PYTHONPATH=python python3 scripts/tpch_coverage.py \
+    --db data/tpch_sf10/tpch.duckdb --memory-budget 200GB   # ... at SF10, which needs the budget raised
+PYTHONPATH=python python3 scripts/transparent_gate.py \
+    --subqueries --exprs                                    # the sweep behind the thresholds (about an hour)
 ```
 
 Measurements are on an Apple M4 Max (Metal) unless an entry says otherwise.

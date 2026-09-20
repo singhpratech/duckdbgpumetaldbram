@@ -7,7 +7,7 @@
 > here is a commitment that they will be built.
 
 Window functions are the operator class **Sirius (CIDR 2026 GPU OLAP
-paper) does not cover**. This doc is the Metal-specific algorithm playbook
+paper) does not cover**. This doc is the Metal-specific algorithm notes
 so the v1 scaffold (PR pending from `feat/core-window-functions`) can be
 followed by real kernels in 1-2 PRs instead of guessing.
 

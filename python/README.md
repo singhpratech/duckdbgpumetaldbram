@@ -1,119 +1,114 @@
 # gpudb — plain DuckDB SQL on the GPU
 
+Ordinary DuckDB SQL, unchanged: statements the GPU answers faster are answered
+on the device, everything else runs on DuckDB exactly as before, and the rows,
+names and types are identical either way.
+
+## Install
+
+There are **two pieces**. This package is the wrapper — the `gpudb` command and
+`gpudb.connect()`. The GPU code itself is a DuckDB extension, and `pip` does not
+install it.
+
 ```bash
 pip install duckdb-gpudb        # the distribution is duckdb-gpudb; the import is gpudb
 ```
-
-```python
-import gpudb
-con = gpudb.connect("my.duckdb")          # same surface as duckdb.connect
-con.execute("SELECT k, sum(v) FROM t GROUP BY k").fetchall()
+```sql
+INSTALL gpudb FROM community;   -- in any DuckDB >= 1.5.5 client
+LOAD gpudb;
 ```
 
-Ordinary DuckDB SQL, unchanged: statements the GPU answers faster are answered
-on the device, everything else runs on DuckDB exactly as before, and the rows,
-names and types are identical either way. `con.last_rewrite()` says what
-happened to the last statement.
+The wrapper looks for the extension in this order: an explicit `extension=`
+path, the `GPUDB_EXTENSION_PATH` environment variable, a `build-macos/` or
+`build-linux/` directory next to a source checkout, and finally the extension
+DuckDB itself has installed. If it finds none — or finds one older than this
+client — `con.extension_note` says so in one sentence and every statement runs
+on DuckDB.
 
-The wrapper needs the `gpudb` DuckDB extension. It looks, in order, for an
-explicit `extension=` path, the `GPUDB_EXTENSION_PATH` environment variable, a
-local build next to a source checkout, and finally the extension installed in
-DuckDB itself (`INSTALL gpudb FROM community; LOAD gpudb;`).
-
-`connect()` takes `database`, `read_only` and `config` as `duckdb.connect`
-does, plus `extension=` (an explicit path to the `.duckdb_extension`),
-`transparent=` (default `True`), `residency=` (`background` | `eager` |
-`manual`), `floor_rows=` (default 1,000,000), `idle_ms=` (default 20.0),
-`thresholds=` (default `True`; `False` rewrites every exact shape regardless of
-the predicted win — for parity testing only), `memory_budget=` (bytes or
-`"16GB"`; `0` / `"unlimited"` removes the cap) and `log=` (a callable that
-receives the wrapper's decisions as text).
-
-`con.last_rewrite()` returns `rewritten`, `reason`, `detail`, `form`, `tag`,
-`sql`, `statement`, `engine`, `round_trip_ms`, `fallback` and `error`.
-`con.memory()` returns `budget`, `evictions`, `evictions_wasted` and `sets`.
-`con.extension_note` is empty while the loaded extension can serve the client,
-and one sentence saying why not otherwise.
-
-Design, limits and measurements: `docs/TRANSPARENT_DESIGN.md`,
-`KNOWN_ISSUES.md` and `BENCHMARK.md` in the repository.
+**Requires** Python >= 3.9 and the `duckdb` module >= 1.4. The community
+registry publishes gpudb for DuckDB 1.5.5; a binary from the project's releases
+page needs only DuckDB >= 1.2, because the loadable extension is built against
+the stable C API v1.2.0. Apple silicon for the Metal backend; on NVIDIA
+hardware the path is opt-in behind `GPUDB_CUDA_EXACT=1`.
 
 ## The `gpudb` shell
 
+The first way in, and the one that shows its work. This is one session on an
+M4 Max over TPC-H SF1, opened read-only (the three `[gpudb] registered …` lines
+are the extension announcing itself on stderr as DuckDB loads it):
+
 ```
-$ gpudb my.duckdb
+$ gpudb data/tpch_sf1/tpch.duckdb --readonly
+[gpudb] registered gpu_inner_join + gpu_join_rows_resident
+[gpudb] registered gpu_groupby_{sum,sum_f64,count,exact}_resident[_having|_topk] + gpu_topk_resident[_f64]
+[gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates + resident-column functions (gpu_upload, gpu_*_resident) (backend=Metal)
 gpudb 0.7.0
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
-database:     my.duckdb
+database:     data/tpch_sf1/tpch.duckdb
 Enter .help for usage.
 
-gpudb> SELECT k, sum(v) FROM t GROUP BY k ORDER BY k LIMIT 3;
-┌───────┬───────────┐
-│   k   │  sum(v)   │
-│ int64 │  int128   │
-├───────┼───────────┤
-│     0 │ 398000000 │
-│     1 │ 398000200 │
-│     2 │ 398000400 │
-└───────┴───────────┘
+gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+┌───────────┬───────────────┐
+│ l_partkey │      qty      │
+│   int64   │ decimal(38,2) │
+├───────────┼───────────────┤
+│    125009 │       1642.00 │
+│    140633 │       1562.00 │
+│     49981 │       1553.00 │
+│    149443 │       1537.00 │
+│     10426 │       1513.00 │
+└───────────┴───────────────┘
 
-GPU (plain: the resident GROUP BY) · 3.3 ms
+DuckDB (not_resident: the resident set is not ready yet) · 24.3 ms
 ```
 
-The same shell runs a script or a single statement:
-`gpudb my.duckdb -c "SELECT …"`, `gpudb -f script.sql`, `gpudb < script.sql`,
-`python -m gpudb`. Options: `--readonly`, `--no-gpu`, `--residency`,
-`--memory-budget`, `--timer` / `--no-timer`, `--debug`, `--version`,
-`--help`. A statement
-that fails ends a `-c` / `-f` / piped run with a non-zero exit code; at the
-terminal the session keeps going.
+The first ask is on DuckDB on purpose: the columns are uploaded in short
+row-id segments taken only while the connection is idle, so an upload never
+runs a long scan beside a query you are waiting for. Ten seconds later, the
+same statement, nine runs each way in the same session:
 
-There is a shell because the transparent path cannot live in the extension.
-DuckDB's stable C extension API — the one the loadable extension uses on
-purpose, so that one binary keeps working across DuckDB versions — has no hook
-that sees a statement before it is planned. `LOAD gpudb` in the stock `duckdb`
-CLI therefore gives the explicit `gpu_*` functions and nothing more; ordinary
-SQL is answered on the device only through a client that can look at the
-statement first. This shell is that client: it splits statements with DuckDB's
-own tokenizer, hands each one to `gpudb.connect()`, and prints the result with
-DuckDB's own box renderer.
+```
+gpudb> .gpu off
+GPU path off — statements go straight to DuckDB.
+… DuckDB · 25.9, 18.6, 16.2, 15.1, 15.0, 15.0, 15.0, 14.9, 15.1 ms
+gpudb> .gpu on
+GPU path on — residency: background.
+… GPU (topk: the resident GROUP BY) · 12.8, 34.0, 5.0, 5.0, 4.9, 4.8, 5.1, 4.7, 4.7 ms
+```
+
+Median 15.1 ms against 5.0 ms — 3.0×, with both series printed whole so the
+warm-up runs and the one outlier are visible.
 
 The banner's `backend:` line names the runtime, the device as the driver
 reports it, and the device memory the budget plans against; a build without a
-GPU backend names no device.
+GPU backend names no device, and `transparent:` says what is missing instead.
 
-The dim line under each result says where the statement ran, why, and how long
-it took — all of it from `con.last_rewrite()`, which carries both a short
-`reason` code and a `detail` sentence explaining it:
+### Options and dot-commands
 
-```
-GPU (plain: the resident GROUP BY) · 3.3 ms
-GPU (topk: a key join materialised on the device) · 8.1 ms
-DuckDB (threshold: 7 groups < 1000) · 5.0 ms
-DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
-DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
-DuckDB (off: the transparent path is off on this connection) · 12.0 ms
+```bash
+gpudb my.duckdb -c "SELECT …"     # one statement
+gpudb -f script.sql               # a file (or: gpudb < script.sql)
+python -m gpudb                   # the same entry point
 ```
 
-The footer is on at a terminal, off in `-c` / `-f` / piped output unless
-`--timer` is given, and colour follows `NO_COLOR` and whether the output is a
-terminal. `.gpu` prints the whole record, `detail` included.
+| Option | |
+|---|---|
+| `-c SQL` | run a statement and exit, repeatable |
+| `-f FILE`, `--file FILE` | run a file and exit, repeatable; `-c` and `-f` run in the order given |
+| `--readonly`, `--read-only` | open read-only |
+| `--no-gpu` | every statement on DuckDB |
+| `--residency background\|eager\|manual` | when tables become resident (default `background`) |
+| `--memory-budget SIZE` | e.g. `16GB`, or `unlimited` |
+| `--timer` / `--no-timer` | force the footer line on or off |
+| `--debug` | show tracebacks instead of one-line errors |
+| `--version` | the gpudb and duckdb versions |
+| `-h`, `--help` | the same list, from the program |
 
-`.residents` prints two tables: the wrapper's resident SETS — what a statement
-is waiting on — and, under them, the COLUMNS those sets are views over, with
-the rows each one holds and the width it is stored at. A lane is kept at the
-narrowest signed width its values fit, so a column of small integers costs one
-or two bytes a row rather than eight, and the table says which:
-
-```
-table  column  dtype  rows       width  bytes     state
-t      k       I64    2,000,000  2 B    15.3 MiB  ready
-t      v       I64    2,000,000  4 B    7.6 MiB   ready
-```
-
-Dot-commands, kept small on purpose — this is not an emulation of the DuckDB
-CLI:
+A statement that fails ends a `-c` / `-f` / piped run with a non-zero exit
+code; at the terminal the session keeps going. The footer is on at a terminal
+and off in scripted output unless `--timer` says otherwise; colour follows
+`NO_COLOR` and whether the output is a terminal.
 
 | | |
 |---|---|
@@ -131,3 +126,106 @@ CLI:
 Statements may span lines and end at `;`; Ctrl-C stops the running statement
 (or clears what you were typing) and Ctrl-D leaves. History is kept in
 `~/.gpudb_history` when the Python build has `readline`.
+
+`.residents` prints two tables: the resident SETS — what a statement is waiting
+on — and, under them, the COLUMNS those sets are views over. A lane is kept at
+the narrowest signed width its values fit, so a column of small integers costs
+one or two bytes a row rather than eight, and the table says which. Same
+session as above:
+
+```
+gpudb> .residents
+table          columns               state  bytes     estimated  worth
+main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  1.08
+1 set · 80.1 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
+
+table     column      dtype  rows       width  bytes     state
+lineitem  l_partkey   I64    6,001,215  4 B    68.7 MiB  ready
+lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
+2 resident columns · width is the bytes a row of the lane is stored at · `-` where the backend does not say
+```
+
+`worth` is the DuckDB time a set saves per second of wall time, per GiB it
+holds — what the memory budget compares when it has to choose. On a column
+line, `state` means something narrower: whether *that lane* has a sort cache.
+Only a key lane ever needs one, so a payload lane reads `preparing` and stays
+there; the set's own state is what a statement waits on.
+
+There is a shell because the transparent path cannot live in the extension.
+DuckDB's stable C extension API — the one the loadable extension uses on
+purpose, so that one binary keeps working across DuckDB versions — has no hook
+that sees a statement before it is planned. `LOAD gpudb` in the stock `duckdb`
+CLI therefore gives the explicit `gpu_*` functions and nothing more. This shell
+is a client that can look first: it splits statements with DuckDB's own
+tokenizer, hands each one to `gpudb.connect()`, and prints the result with
+DuckDB's own box renderer.
+
+## Python
+
+```python
+import gpudb
+con = gpudb.connect("my.duckdb")          # same surface as duckdb.connect
+con.execute("SELECT k, sum(v) FROM t GROUP BY k").fetchall()
+con.last_rewrite()                        # what happened to that statement
+```
+
+`connect()` takes `database`, `read_only` and `config` as `duckdb.connect`
+does, plus `extension=` (an explicit path to the `.duckdb_extension`),
+`transparent=` (default `True`), `residency=` (`background` | `eager` |
+`manual`), `floor_rows=` (default 1,000,000), `idle_ms=` (default 20.0),
+`thresholds=` (default `True`; `False` rewrites every exact shape regardless of
+the predicted win — for parity testing only), `memory_budget=` (bytes or
+`"16GB"`; `0` / `"unlimited"` removes the cap) and `log=` (a callable that
+receives the wrapper's decisions as text).
+
+Anything the wrapper does not define itself is delegated to the underlying
+`duckdb.DuckDBPyConnection`. What it does define:
+
+| | |
+|---|---|
+| `con.last_rewrite()` | `rewritten`, `reason`, `detail`, `form`, `tag`, `sql`, `statement`, `engine`, `round_trip_ms`, `fallback`, `error` |
+| `con.memory()` | `budget`, `evictions`, `evictions_wasted`, `sets` |
+| `con.residents()` | `{identity tag: state}` — `missing`, `pending`, `uploading`, `ready`, `stale`, `failed` |
+| `con.store_columns()` | one dict per resident column: `table`, `column`, `dtype`, `rows`, `width`, `bytes`, `prepared` |
+| `con.transparent` | readable and settable; `False` leaves every statement on DuckDB without dropping anything |
+| `con.residency` | read-only: the mode passed to `connect()` |
+| `con.cursor()` / `con.duplicate()` | another connection sharing the resident sets, with its own `last_rewrite()` |
+| `con.interrupt()` | DuckDB's interrupt, on this connection's handle only |
+| `con.extension_note` | empty while the loaded extension can serve the client; one sentence saying why not otherwise |
+
+Give each thread its own `con.cursor()`: `last_rewrite()` is one record per
+connection object, so two threads sharing one connection overwrite each other's.
+
+## Why a statement did not go to the GPU
+
+The footer and `last_rewrite()["reason"]` carry a short code; `detail` is the
+sentence behind it.
+
+| Reason | What it means |
+|---|---|
+| `not_resident` | the columns are not on the device yet — the background uploader is working on it |
+| `threshold` | a measured bound says DuckDB is faster for this shape and size, **or** this machine measured it slower and the template went back to DuckDB |
+| `shape` | not a shape the rewrite expresses: a window function, `median`, `ROLLUP`, a set operation, a subquery in the select list |
+| `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, because native's own answer depends on the order the values are added |
+| `backend` | this build has no GPU backend to rewrite for, or the installed extension is older than this client |
+| `memory` | the set does not fit the device-memory budget; it is refused before the upload |
+| `transaction` | a `BEGIN` is open, so the resident sets cannot be trusted |
+| `params` | the statement takes prepared-statement parameters |
+| `multi` | more than one statement in the call |
+| `too_long` | the statement is longer than the 16 KB the wrapper parses |
+| `error` | the rewritten statement raised and DuckDB answered the original — the text is in `error` |
+| `off` / `manual` | the path is off (`.gpu off`, `--no-gpu`, `transparent=False`), or residency is `manual` and this set was not uploaded by hand |
+| `nulls` `overflow` `decimal` `collation` `view` `temp` `ambiguous` `not_found` | a narrower refusal, each with its own sentence in `detail` |
+
+```
+GPU (plain: the resident GROUP BY) · 3.3 ms
+GPU (topk: a key join materialised on the device) · 8.1 ms
+DuckDB (threshold: 7 groups < 1000) · 5.0 ms
+DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
+DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
+DuckDB (off: the transparent path is off on this connection) · 12.0 ms
+```
+
+Design, limits and measurements: `docs/TRANSPARENT_DESIGN.md`,
+`docs/ENVIRONMENT.md`, `KNOWN_ISSUES.md` and `BENCHMARK.md` in the
+[repository](https://github.com/singhpratech/duckdbgpumetaldbram).

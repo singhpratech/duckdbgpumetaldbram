@@ -561,11 +561,11 @@ widths, F64 NaN / ±inf / −0.0, NULL lane cells, NULL index cells as payload
 and as key, the chained three-step composition, and an out-of-range index
 (refused, not read).
 
-**Not yet built.** The extension's `gpu_join_index()` and a join set that owns
-index vectors; the `gpu_residents()` reporting columns; the wrapper emitting
-index steps. Until those land nothing in SQL takes the indexed path, and the
-measured behaviour of every query is today's — which, given the table above,
-is also the right order to do it in.
+**Not built.** There is no `gpu_join_index()` in the extension, no join set
+that owns index vectors, no reporting columns for one in `gpu_residents()`,
+and the wrapper emits no index steps. Nothing in SQL takes the indexed path,
+so the measured behaviour of every query is what the rest of this document
+describes.
 
 ## 9. Shedding — a derived structure a column stops needing
 
