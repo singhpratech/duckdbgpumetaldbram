@@ -71,6 +71,21 @@ if(UNIX AND NOT APPLE)
     # build environment's headers, so release assets are built on the oldest
     # supported userland (Ubuntu 22.04, glibc 2.35).
     target_link_options(gpudb_duckdb PRIVATE -static-libstdc++ -static-libgcc)
+    # OpenMP stays dynamic (libgomp.so.1), and a minimal userland does not have
+    # it — LOAD then fails with "libgomp.so.1: cannot open shared object file".
+    # The Python wheel ships a copy beside the extension, so give the artifact
+    # a $ORIGIN search path. RUNPATH, not RPATH (--enable-new-dtags), because
+    # RUNPATH is consulted after LD_LIBRARY_PATH and only for this object's own
+    # dependencies: a process that already has libgomp.so.1 mapped — numpy,
+    # torch, any OpenMP-linked wheel — keeps using that one, since the loader
+    # matches on soname before it searches any path at all.
+    # Harmless for the bare release asset: $ORIGIN holds no libgomp there, so
+    # the search falls through to the system path exactly as before.
+    set_target_properties(gpudb_duckdb PROPERTIES
+        BUILD_WITH_INSTALL_RPATH ON
+        INSTALL_RPATH "$ORIGIN"
+        INSTALL_RPATH_USE_LINK_PATH OFF)
+    target_link_options(gpudb_duckdb PRIVATE "LINKER:--enable-new-dtags")
 endif()
 
 # Output naming / location.
