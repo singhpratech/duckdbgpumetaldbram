@@ -103,12 +103,17 @@ public:
         if (n == 0) return r;
 
         const std::int64_t empty = gpudb_cuda_groupby_empty_sentinel();
-        // Defensive: refuse if user data contains the sentinel.
-        // (Cheap to check on host; protects correctness.)
+        // Refuse the sentinel in user data rather than mis-group it. This is a
+        // property of the open-addressing table, not a gap waiting to be
+        // filled: the slot array needs one value to mean "empty", and any
+        // choice collides with some key. The exact GROUP BY sorts instead of
+        // hashing, has no sentinel, and accepts the whole int64 range
+        // (test_aggregator.cpp covers both ends).
         for (std::size_t i = 0; i < n; ++i) {
             if (keys[i] == empty)
                 throw std::runtime_error(
-                    "key INT64_MIN clashes with empty sentinel; not yet supported");
+                    "key INT64_MIN is this hash table's empty slot marker and cannot be "
+                    "grouped by it; the exact GROUP BY accepts it");
         }
 
         const std::uint32_t cap = pick_capacity(n, expected_groups);
