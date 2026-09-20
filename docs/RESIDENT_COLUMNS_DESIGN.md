@@ -223,7 +223,16 @@ before the upload; the column's DuckDB type bounds it, and that is what
 SMALLINT 2, INTEGER / DATE 4, everything else — BIGINT, DECIMAL images, computed
 lanes, string hashes — 8, plus the validity bit per row and lane, plus the key
 lane's sort cache (the key's width and a u32 row id per row) when that lane is
-the one being uploaded, plus one row-sized scratch lane. It stays an UPPER bound,
+the one being uploaded, plus one row-sized scratch lane. Since 2026-09-20 the
+type is not the only bound: for a lane that is a plain column the wrapper also
+reads the column's min and max from DuckDB's own zone-map statistics
+(`SELECT stats(col) FROM t LIMIT 1`, metadata, once per template) and takes the
+narrower of the two. The type alone was a poor bound — an `INTEGER` key holding
+0-999 is stored at two bytes, a `BIGINT` payload holding 0-96 at one — and the
+estimate came out 2.4x the truth, which is what the admission rule compares, so
+it refused sets that fit. Statistics are BOUNDS, loose if anything, which is the
+direction an upper bound needs; a lane whose statistics cannot be read, or whose
+min/max are not plain integers, keeps its type's width. It stays an UPPER bound,
 which is what the admission rule needs, and the wrapper test that asserts the
 estimate never falls below what `gpu_residents()` / `gpu_store_columns()` report
 covers a narrow-typed table (INTEGER key, DATE, SMALLINT) as well as a BIGINT
