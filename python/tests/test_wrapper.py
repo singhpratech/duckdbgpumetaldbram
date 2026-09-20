@@ -507,6 +507,11 @@ def run():
     # and the shape is declined unless that says 53. Driven through check_types
     # directly so both answers are exercised on any platform — end to end only
     # one of them would ever be reachable.
+    #
+    # NOTE: these five checks prove the FUNCTION, not the PATH. They hand
+    # check_types a Plan whose scales are already filled, which no plan from
+    # the matcher ever is — so they stayed green while the guard itself was
+    # dead on every real statement (see the end-to-end section below).
     from gpudb import _rewrite as _rw
 
     def _plan(kind, scale):
@@ -520,9 +525,11 @@ def run():
         return p
 
     def _declines(kind, scale, bits):
+        # `columns` says what the payload really is: check_types reads the
+        # scales off it, so the fixture's own p.scale must agree with it.
+        cols = {"k": "BIGINT", "v": "DECIMAL(18,2)" if scale else "BIGINT"}
         try:
-            _rw.check_types(_plan(kind, scale), {"k": "BIGINT", "v": "DECIMAL(18,2)"},
-                            exact=True, avg_float_bits=bits)
+            _rw.check_types(_plan(kind, scale), cols, exact=True, avg_float_bits=bits)
             return False
         except _rw.Decline:
             return True
@@ -532,6 +539,96 @@ def run():
     check(_declines("avg", 2, 0), "avg(DECIMAL) declined when the extension does not report avgf")
     check(not _declines("avg", 0, 64), "avg over an integer payload is unaffected")
     check(not _declines("sum", 2, 64), "sum over DECIMAL is unaffected")
+
+    # ---- the same guard through the REAL path (every avg(DECIMAL) shape) ----
+    # The checks above went green on a hand-built Plan while the guard was dead
+    # on every statement a user can write: it read plan.scales BEFORE the loop
+    # in check_types that fills them, so it saw 0 for every payload and never
+    # fired. On an x86 box (avgf=64) TPC-H Q1 was rewritten where it should have
+    # declined. These go through connect().execute() with _avg_float_bits forced
+    # and assert the REASON and the DETAIL, not merely "not rewritten" — a
+    # threshold or a nulls decline would satisfy that too, and that ambiguity is
+    # how the bug hid. The data is shaped so the answers would actually differ if
+    # the guard were dead: the difference only appears once a group's unscaled
+    # 128-bit sum passes 2^53, which is why Q1 at SF1 looked like it matched.
+    print("== avg over DECIMAL: the long double guard, end to end")
+    con = fresh()
+    if not getattr(con, "_exact", False):
+        skip("avg(DECIMAL) guard end to end: this backend has no exact path, "
+             "so no avg shape is rewritten at either width")
+    else:
+        con.execute("""
+        CREATE TABLE ab AS
+            SELECT (i % 2000)::BIGINT AS k,
+                   (((i * 7919) % 99991) * 10000000000 / 100.0 + (i % 997))::DECIMAL(18,2) AS amt,
+                   (((i * 7919) % 99991) * 100000000)::DECIMAL(15,2) AS m,
+                   (i % 97)::BIGINT AS v,
+                   (i % 40)::INTEGER AS did
+            FROM range(400000) r(i);
+        CREATE TABLE ad (did INTEGER PRIMARY KEY, tier INTEGER);
+        INSERT INTO ad SELECT i, (i % 7)::INTEGER FROM range(40) r(i);
+        """)
+        widest = con._raw.execute(
+            "SELECT max(s) FROM (SELECT abs(sum(amt) * 100) AS s FROM ab GROUP BY k)").fetchone()[0]
+        check(float(widest) > 2.0 ** 53,
+              f"avg guard: the widest group sum is {widest} unscaled, past 2^53 "
+              "(below it the SQL derivation and native agree even on x86)")
+
+        def avg_bits(c, bits):
+            """Force the reported long double width and drop everything decided
+            under the old one: the per-template decision cache, the nested /
+            folded caches, the prepared plans and the measurement state."""
+            c._avg_float_bits = bits
+            c._invalidate_all("SET")
+            c._split_cache.clear()
+            c._timing_decision = None
+
+        acases = {
+            "single":    "SELECT k, avg(amt) FROM ab GROUP BY k ORDER BY k",
+            "two_pay":   "SELECT k, sum(v), avg(amt) FROM ab GROUP BY k ORDER BY k",
+            "computed":  "SELECT k, avg(m * 2) FROM ab GROUP BY k ORDER BY k",
+            "having":    "SELECT k, sum(amt) FROM ab GROUP BY k HAVING avg(amt) > 5000000000000 ORDER BY k",
+            "global":    "SELECT avg(amt), count(*) FROM ab",
+            "join":      "SELECT tier, avg(amt) FROM ab JOIN ad ON ab.did = ad.did GROUP BY tier ORDER BY tier",
+            "post_agg":  "SELECT k, avg(amt) * 2 AS twice FROM ab GROUP BY k ORDER BY k",
+            "where":     "SELECT k, avg(amt) FROM ab WHERE v > 3 GROUP BY k ORDER BY k",
+            "topk":      "SELECT k, avg(amt) AS a FROM ab GROUP BY k ORDER BY a DESC, k LIMIT 5",
+        }
+        # unaffected by the guard: the derivation is only used for a DECIMAL payload
+        ucases = {
+            "avg_bigint":  "SELECT k, avg(v) FROM ab GROUP BY k ORDER BY k",
+            "sum_decimal": "SELECT k, sum(amt) FROM ab GROUP BY k ORDER BY k",
+            "minmax_decimal": "SELECT k, min(amt), max(amt) FROM ab GROUP BY k ORDER BY k",
+        }
+        avg_bits(con, 64)
+        for name, sql in list(acases.items()):
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            check(not lr["rewritten"] and lr["reason"] == "shape"
+                  and "long double" in (lr["detail"] or ""),
+                  f"avgf=64 {name}: declined, reason=shape, detail names long double "
+                  f"({lr['reason']}: {str(lr['detail'])[:60]})")
+            check(got == want, f"avgf=64 {name}: DuckDB answers, and the rows are native's")
+        for name, sql in ucases.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            check(lr["rewritten"], f"avgf=64 {name}: still rewritten ({lr['reason']}: "
+                                   f"{str(lr['detail'])[:60]})")
+            check(got == want, f"avgf=64 {name}: rows identical to native")
+        # 53 bits: long double IS double, the derivation is native's own
+        # expression, and every shape above is back on the device — including
+        # the groups whose unscaled sum is past 2^53.
+        avg_bits(con, 53)
+        for name, sql in list(acases.items()) + list(ucases.items()):
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            check(lr["rewritten"], f"avgf=53 {name}: rewritten ({lr['reason']}: "
+                                   f"{str(lr['detail'])[:60]})")
+            check(got == want, f"avgf=53 {name}: rows identical to native ({len(want)} rows)")
+    con.close()
 
     # ---- computed lanes (§4.10): expressions as payloads, keys and predicates ----
     print("== computed lanes")
