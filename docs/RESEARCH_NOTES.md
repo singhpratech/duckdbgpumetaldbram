@@ -5383,11 +5383,37 @@ claimed and 14.0 is not, and Linux gained the requirements that are easy to
 discover the hard way: `libgomp.so.1` at load time, a glibc 2.34 userland, and
 that a registry binary there is CPU-only.
 
-No measured number was touched. Every captured transcript in the shell and
-Python guides, the coverage and gate tables, and the suite counts are unchanged
-and are the second pass's work, to be re-taken on the release build — the `.memory`
-captures in particular, since the shell now prints a physical resident total and
-an `allocated:` line the old captures predate.
+No measured number was touched in this pass. Every captured transcript in the
+shell and Python guides, the coverage and gate tables, and the suite counts were
+left for the second pass to re-take on the release build — the `.memory` captures
+in particular, since the shell now prints a physical resident total and an
+`allocated:` line the old captures predate.
+
+## 2026-09-20 — The docs on release day, second pass: the numbers
+
+Every measured figure and every captured transcript in the public documents was
+re-taken on the release build (commit `98b19c2`, clean rebuild at the 15.0
+deployment target, DuckDB 1.5.5, default memory budget) and the summaries moved
+to it. The four TPC-H coverage runs, the three gates and the suite counts are
+now one dated section in `BENCHMARK.md`; nothing earlier was edited or removed,
+so the older runs stay as the record of the builds that produced them.
+
+Two things the re-measurement changed rather than confirmed. **Both entry points
+are now reported separately** — `execute()` and `sql()` are different code paths
+and they do not measure the same, so a single range across both was hiding which
+was which. And **two rows are below 1.0×**: TPC-H Q11 at SF10 on Metal (1.06×
+through `execute()`, 0.92× through `sql()`, and 1.06× / 0.89× in two immediate
+re-runs) and TPC-H Q1 on the RTX 4090. Both are printed as straddles, in the
+summary tables as well as in `BENCHMARK.md`, because a range that quietly
+started at 1.3× was the kind of number this project exists not to publish.
+
+The shell showcase was re-captured from one pty session at a 1-minute load
+average of 1.16 and reads 22.1 ms on DuckDB against 14.4 ms on the GPU — 1.53×,
+where the previous capture read 14.9 against 8.7. The nine GPU runs of that one
+statement spread from 10.0 to 14.8 ms with nothing changed between them, so the
+guides now print the spread and tell the reader to expect their own numbers. The
+"asked by name" operator table was *not* re-measured; it now says so, and names
+the release each row was taken at.
 
 ## Open questions
 
