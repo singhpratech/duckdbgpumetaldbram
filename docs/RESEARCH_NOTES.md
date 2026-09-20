@@ -5135,18 +5135,21 @@ measured rule is currently handling per process.
   pair bounds that decline it are right. WHERE-term subqueries are done
   (§4.18).
 - **CUDA**: the exact, mask, join and multi-payload kernels are written
-  against the same interface, and the path is opt-in behind
-  `GPUDB_CUDA_EXACT=1`. What is open is the gate: every threshold in
-  `_thresholds.py` was swept on Metal, and `scripts/transparent_gate.py` has
-  not been run on the RTX 4090.
+  against the same interface, and the path is on by default since 2026-09-20
+  (`GPUDB_CUDA_EXACT=0` turns it off). The gate has been run there — 1630
+  cells on an RTX 4090 Laptop, 0 slower than native, 0 differing — so
+  `_thresholds.TABLE["CUDA"]` stays `METAL` as a measured result. What is open
+  is that this is ONE machine and one scale factor: SF10 on CUDA is not
+  recorded, and TPC-H Q1 straddles 1.0x on that box.
 - **Where the lowering lives**: the join / expression / split lowering is in
   the Python wrapper. The pure rewrite function is language-neutral and
   carries no client of its own, so a client in another language would repeat
   that lowering rather than inherit it.
 - **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
-  TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
-  each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
-  same choice as a template parameter, `docs/CUDA_EXACT_PATH.md` §6).
+  TPC-H queries at SF10 became 22.7 — and on CUDA (2026-09-20, lanes and then
+  the sort cache; both GPUs report `narrow=true`). The wrapper's pre-upload
+  estimate sizes each lane from its DuckDB type and, for a plain column, from
+  that column's own zone-map statistics (2026-09-20).
 - **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel

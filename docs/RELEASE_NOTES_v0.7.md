@@ -321,10 +321,11 @@ full licence text so GitHub detects it (#89).
   failures, all of them segmented-upload cases unrelated to the exact path
   (#161); once #169 priced a segment from what each machine measures, it came
   back fully green.
-- `python/tests/test_residency_policy.py`: 105 checks, 0 failing — the residency
-  policy on a clock the test drives, so the yield rule, the quiet-window bound
-  and the measured segment floor are asserted directly rather than raced against
-  a real machine (#167, #169).
+- `python/tests/test_residency_policy.py`: 0 failing — the residency policy on a
+  clock the test drives, so the yield rule, the quiet-window bound, the measured
+  segment floor and the remembered refusal are asserted directly rather than
+  raced against a real machine (#167, #169, #172). Its check count, like the
+  wrapper suite's, is taken per machine and re-counted on the release build.
 - `test_gpudb`: 752 / 752 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
   #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block,
   and #171 added the forced-refusal case.

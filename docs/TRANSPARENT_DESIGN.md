@@ -2485,6 +2485,24 @@ ready shortly after the pass ends instead of in the middle of it, and the
 session's wall time grows from ~4.7 s to ~11.7 s. The row is judged exactly as
 before — the tolerance, the statistic and the shapes did not move.
 
+**`scripts/budget_gate.py` (2026-09-20)** is the third gate, and the one §5.5
+points at: a long eager session over 169 distinct templates under a budget too
+small for them. Its assertions are listed under §5.5; what matters here is that
+it is a different question from the two above. `transparent_gate.py` asks
+whether a rewritten statement is faster and identical; this one asks whether
+the engine stays inside the memory it was given while answering the same
+statements correctly. It runs in `local_check.sh` (56 s at SF1), and
+`--refuse-mb N` makes the Metal backend turn an exact upload down so the
+device-refusal paths are exercised on a machine with memory to spare.
+
+One thing `transparent_gate.py` no longer does is run without a budget.
+Its `--memory-budget` default was `unlimited`, which meant the one long eager
+session anybody runs was the one session with no cap: on a 16 GiB card a full
+run climbed to 15.8 GiB and then measured a degraded machine, which is how two
+cells came to read as losses that were nothing of the kind. The default is now
+the wrapper's own — what ships, and therefore what a gate has to measure — and
+`unlimited` stays available for seeing every shape the engine accepts.
+
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
 test`) on Linux plus the registry-smoke workflow. The registry's Linux

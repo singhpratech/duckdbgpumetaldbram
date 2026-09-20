@@ -741,8 +741,8 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 Each row names the machine that took it. The unit and SQL rows are the RTX
 4090's, run there when the CUDA path was turned on by default; `test_gpudb` and
 the SQL suite on the M4 Max run in CI on every push and were not re-run by hand
-here, and the Mac's wrapper count above was taken before the memory-budget work
-added its cases, so it is re-counted on the release build. The x86-64 box used
+here, and the Mac's two check counts above were taken before the memory-budget
+work added its cases, so both are re-counted on the release build. The x86-64 box used
 to carry four failures in the segmented-upload cases — the background uploader
 never found a quiet window under that test's statement cadence — and once a
 segment was priced from what each machine measures rather than from a constant,
