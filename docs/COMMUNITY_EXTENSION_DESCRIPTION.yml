@@ -1,19 +1,6 @@
-# Mirror of the description.yml submitted to duckdb/community-extensions.
-#
-# The LIVE descriptor is the one in the registry repository; this file is the
-# copy kept with the source so the two can be diffed. Before opening a registry
-# PR, check `excluded_platforms`, `requires_toolchains` and the `build:` field
-# against the live descriptor rather than against this mirror.
-#   Schema reference:
-#     https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
-#
-# `repo.ref` is filled with the release tag's commit when the PR is opened.
-#
-# RE-RUN before submitting: the measured TPC-H table inside `extended_description`
-# and the hello_world block are re-measured and re-run on the release build.
-# CUDA-DEFAULT: the platform table says a CUDA build comes from the releases or
-# from source. If CUDA ships on by default, that row and the `known_limitations`
-# wording about the CPU-only registry binary are the two places to change.
+# gpudb's entry for the DuckDB community-extensions registry, kept beside the
+# source so it can be diffed against the descriptor the registry serves.
+# Schema: https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
 
 extension:
   name: gpudb
@@ -22,7 +9,8 @@ extension:
   language: C++
   build: cmake
   license: Apache-2.0
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64_rtools;windows_amd64_mingw"
+  requires_toolchains: "python3;cuda"
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_rtools;windows_amd64_mingw"
   maintainers:
     - singhpratech
 
@@ -66,21 +54,36 @@ docs:
        (128-bit sums on the device). Anything DuckDB itself computes order-dependently —
        `sum(DOUBLE)` — is never rewritten.
 
-    ### Two ways in
+    ### Three ways in
 
-    **Transparent — Python or the `gpudb` shell.**
+    The first two need the Python package as well as this extension:
+    `pip install duckdb-gpudb`.
+
+    **1. The `gpudb` shell** — a SQL shell whose footer says, under every result,
+    where the statement ran and why.
+
+        $ gpudb my.duckdb
+        gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem
+               GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+        ...
+        GPU (topk: the resident GROUP BY) - 5.0 ms
+
+    **2. Python — `gpudb.connect()`** — the same decision, for applications and
+    notebooks.
 
         import gpudb
         con = gpudb.connect("my.duckdb")        # same surface as duckdb.connect()
-        con.sql("SELECT l_returnflag, sum(l_quantity), avg(l_extendedprice) "
-                "FROM lineitem WHERE l_shipdate <= DATE '1998-09-02' GROUP BY 1")
+        con.sql("SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem "
+                "GROUP BY l_partkey ORDER BY qty DESC LIMIT 5")
         con.last_rewrite()                      # what ran where, and why
 
     Tables become resident in the background, in short segments taken only while the
     connection is idle. A memory budget decides what stays on the device by measured
     value; what does not fit simply runs on DuckDB.
 
-    **Explicit — any DuckDB client, including the CLI.** `gpu_upload` / `gpu_upload_pair`
+    **3. Explicit `gpu_*` functions — any DuckDB client, including the CLI.**
+    This is the only route that needs no wrapper, because DuckDB's stable C API has no
+    hook that sees a statement before it is planned. `gpu_upload` / `gpu_upload_pair`
     make columns resident once; `gpu_sum_resident`, `gpu_groupby_sum_resident`
     (`_having`, `_topk`), `gpu_topk_resident`, `gpu_inner_join` and the exact
     `gpu_groupby_exact_*` family read them from GPU memory. `gpu_last_stats()` reports
@@ -119,7 +122,7 @@ docs:
     | Platform | From this registry |
     |---|---|
     | macOS, Apple Silicon | Metal GPU |
-    | Linux x86_64 / arm64 | CPU fallback — same SQL surface, same answers. A CUDA build is available from the project's releases and from source |
+    | Linux x86_64 / arm64 | `SELECT gpu_build_info();` says which backends the binary you received carries and which one it chose. Where it is CPU-only, the SQL surface and the answers are the same. A CUDA build is also available from the project's releases and from source |
     | No GPU | CPU fallback |
 
     The extension is written in C++ and touches DuckDB through its stable C API only
@@ -129,7 +132,9 @@ docs:
     Source, benchmarks and issues: https://github.com/singhpratech/duckdbgpumetaldbram
 
   hardware_requirements: |
-    NVIDIA CUDA: any GPU with sm_75 or later. Driver 525+ recommended.
+    NVIDIA CUDA: any GPU with sm_75 or later (Turing and newer). The driver
+    a binary needs follows the CUDA toolkit it was built with: a CUDA 13
+    build needs R580 or newer, a CUDA 12.x build reaches the GPU on R525+.
     Apple Metal: any Apple Silicon Mac (M1 or later). macOS 13+ for
     int64 atomics; macOS 15+ for MSL 3.2.
     Falls back to CPU otherwise.
@@ -139,10 +144,15 @@ docs:
       sum / avg over DOUBLE or FLOAT are answered by DuckDB. sum(DOUBLE)
       is by design: native's own result depends on the order the values
       are added, so "the same as native" is not definable for it.
-    * The Linux binary built by the community CI is CPU-only (the build
-      machines carry no CUDA toolchain): every gpu_* function works and
-      returns the same results, and gpu_build_info() / gpu_last_stats()
-      report backend=CPU.
+    * Whether a Linux binary from this registry carries CUDA depends on
+      the toolchain its build machine had. SELECT gpu_build_info(); says
+      which backends the binary in front of you carries (compiled=) and
+      which one it chose (runtime=). A CPU-only binary offers the same
+      gpu_* functions and returns the same results, with backend=CPU.
+    * On CUDA hardware, ordinary SQL is rewritten onto the GPU only with
+      GPUDB_CUDA_EXACT=1. Every operator is implemented there; what has
+      not been done is running the threshold sweep on NVIDIA hardware,
+      and the thresholds are what rule 1 rests on.
     * Ordinary SQL is answered on the device only through a client that
       sees the statement before DuckDB plans it — the project's `gpudb`
       shell or its Python wrapper. LOAD gpudb in the stock CLI gives the
@@ -152,8 +162,3 @@ docs:
       size thresholds leave those statements with it.
     * Whole-column min / max on a stored table stays a native win —
       DuckDB answers it from zonemap statistics without scanning.
-
-# When submitting, also check the CONTRIBUTING fields against the live descriptor:
-# - maintainers: [@singhpratech]
-# - vcpkg dependencies: none
-# - test paths: test/sql/*.test, test/sqllogic/*.test

@@ -4,8 +4,8 @@
 reference, on Metal and on CUDA (#152, #153, #154): exact `GROUP BY`, the
 `WHERE` mask, the global masked aggregate and the materialised join. On the
 RTX 4090 Laptop the unit suite is 711 / 711 and the SQL suite 224 / 0 with the
-path on, and `scripts/tpch_coverage.py` answers 17 of 22 TPC-H queries at SF1
-on the device with 0 rows differing from native.
+path on. TPC-H coverage on CUDA is not recorded here yet — the coverage
+figures quoted elsewhere in this repository are the M4 Max's.
 
 It is **opt-in in v0.7**: `GPUDB_CUDA_EXACT=1` makes the CUDA backend report
 `exact_supported()`, and with it `global_supported()` and `join_supported()`,
@@ -125,13 +125,14 @@ is being added.
   table function, including its guardrails), `test/sql/gpu_groupby_exact*.test`,
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
-- `python/tests/test_wrapper.py` — 1158 checks through `gpudb.connect()`: parity
+- `python/tests/test_wrapper.py` — 1157 checks through `gpudb.connect()`: parity
   against native DuckDB for every shape, staleness, background residency, the
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
-- `scripts/tpch_coverage.py` — the 22 TPC-H queries, SF1: expect 17 of 22 on the
-  device with identical rows (Metal, and CUDA with the path on);
-  `--db data/tpch_sf10/tpch.duckdb` (with `GPUDB_MEMORY_BUDGET_MB=200000`) 19 of 22 on Metal.
+- `scripts/tpch_coverage.py` — the 22 TPC-H queries. On Metal, SF1 gives 17 of
+  22 on the device with identical rows and `--db data/tpch_sf10/tpch.duckdb
+  --memory-budget 200GB` gives 19 of 22. Running it on CUDA with the path on is
+  what would make the same statement sayable there.
 
 ## 4. Rule 1 on CUDA: measure, then set the thresholds
 

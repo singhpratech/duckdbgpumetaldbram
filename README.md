@@ -41,9 +41,10 @@ else runs on DuckDB, untouched, at its usual speed. Same rows, same column
 names, same column types, either way. No hints, no schema changes, nothing to
 call.
 
-On TPC-H at SF10 that is **19 of 22 queries on the device, 0 rows differing, up
-to 52.9× on an M4 Max** <!-- RE-RUN -->; 17 of 22 at SF1. The three that stay
-are declined on purpose, and this README says which and why.
+On TPC-H at SF10 that is **19 of 22 queries on the device, 0 rows differing,
+up to 52.9× on an M4 Max** — warm, with the tables already resident — and
+17 of 22 at SF1. The ones that stay are declined on purpose, and this README
+says which and why.
 
 **Nothing you use today goes away.** `gpu_upload`, `gpu_upload_pair`, the
 `gpu_*_resident` scalars, the fused joins, the resident GROUP BY and top-k table
@@ -691,7 +692,7 @@ TPC-H Q1 over the very same two keys runs on the GPU is the next section.
 
 ### Explicit `gpu_*` functions — any DuckDB client, including the CLI
 
-The 64 `gpu_*` functions are unchanged in v0.7 and need no wrapper. This is
+The 65 `gpu_*` functions are unchanged in v0.7 (bar one addition, `gpu_avg_decimal`) and need no wrapper. This is
 also the only route from the stock `duckdb` CLI, because DuckDB's stable C
 extension API — the one the loadable extension uses on purpose, so that one
 binary keeps working across DuckDB versions — has no hook that sees a statement
@@ -704,6 +705,9 @@ LOAD gpudb;
 SELECT gpu_build_info();
 -- compiled=cpu,metal runtime=metal exact=true join=true global=true narrow=true
 --   device_memory=55662788608 store=true rebuilds=0/0 device='Apple M4 Max'
+--   avgf=53
+-- (avgf is the mantissa bits of the host's long double, which is what native
+--  finalises an avg in; 53 on arm64, 64 on x86-64)
 
 CREATE TABLE sales AS
   SELECT (range % 1000)::BIGINT AS store, (range * 7 % 10007)::BIGINT AS amount
@@ -723,14 +727,19 @@ under [The resident model in 20 seconds](#the-resident-model-in-20-seconds).
 
 ### Measured — TPC-H, every row compared with native
 
-<!-- RE-RUN: the whole of this section is re-measured on the release build -->
-
 Apple M4 Max, Metal backend (the backend reports 51.8 GiB of device memory) ·
-DuckDB v1.5.x · warm, minimum of 5 runs, statement against statement in one
-process · measured 2026-09-19. These numbers are from one machine; yours will
-differ.
-`python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb` reproduces
-the tables.
+warm, minimum of 5 runs, statement against statement in one process, with
+every table the query reads **already resident** · measured 2026-09-19. These
+numbers are from one machine; yours will differ. The conditions, the five
+queries that stay and what each run did not record are in
+[BENCHMARK.md](BENCHMARK.md) under *TPC-H coverage, the whole 22 through the
+transparent path*.
+
+```bash
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf1/tpch.duckdb
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb \\
+    --memory-budget 200GB      # SF10 holds 18.7 GiB; the default budget is smaller
+```
 
 | | Queries answered on the GPU | Rows differing | Speed-up on those queries |
 |---|---|---|---|
@@ -1135,13 +1144,15 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 
 Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
 The registry binary carries the **full Metal backend on Apple Silicon**. On
-Linux the registry binary is **CPU-only** — the community build machines have
-no CUDA toolchain, so every `gpu_*` function works and returns the same
-results, but `gpu_last_stats()` will say `backend=CPU`. For the CUDA backend
-on Linux use the release binary (Option B; statically linked CUDA runtime,
-needs only a driver) or build from source with `nvcc`. Check any binary with
-`SELECT gpu_build_info();`.
-The registry serves the **v0.7.0** build, with all 64 `gpu_*` functions: the
+Linux, whether the binary you get carries CUDA depends on the toolchain the
+community build machines had when it was built, and **`SELECT
+gpu_build_info();` is the answer for the binary in front of you**:
+`compiled=cpu,cuda` against `compiled=cpu`, and `runtime=` for the backend it
+actually chose. If it is CPU-only, every `gpu_*` function still works and
+returns the same results — `gpu_last_stats()` says `backend=CPU` — and for
+the CUDA backend you want the release binary (Option B; statically linked
+CUDA runtime, needs only a driver) or a build from source with `nvcc`.
+The registry serves the **v0.7.0** build, with all 65 `gpu_*` functions: the
 streaming aggregates, the full resident-column surface (`gpu_upload`,
 `gpu_sum_resident`, `gpu_residents`, `gpu_build_info`, …), the GPU join
 functions (`gpu_upload_pair`, `gpu_join_*_resident`, `gpu_join_rows_resident`,
@@ -1149,8 +1160,7 @@ functions (`gpu_upload_pair`, `gpu_join_*_resident`, `gpu_join_rows_resident`,
 (`gpu_groupby_*_resident`, `gpu_topk_resident`) and the exact family the
 transparent path uses (`gpu_upload_*_exact`, `gpu_groupby_exact_*`,
 `gpu_agg_exact_global`, `gpu_rewrite_ast`). Installed an earlier version?
-`UPDATE EXTENSIONS;` pulls the latest. <!-- RE-RUN: this sentence goes live
-with the registry PR; until it merges the registry still serves v0.6.0. -->
+`UPDATE EXTENSIONS;` pulls the latest.
 
 The transparent path is not reached by `LOAD gpudb` alone — that gives the
 explicit functions. For plain SQL on the GPU, use the `gpudb` shell or
@@ -1306,15 +1316,21 @@ PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # the transpa
 PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-H queries
 ```
 
-Measured on an Apple M4 Max on this commit <!-- RE-RUN -->:
+| Suite | Result | Where |
+|---|---|---|
+| `test_wrapper.py` — the transparent path | 1157 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
+| `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing | M4 Max |
+| `test_gpudb` — unit checks | 711 / 711 | RTX 4090 Laptop, CPU + CUDA |
+| `run_sql_tests.sh` | 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` | RTX 4090 Laptop |
+| `run_sql_tests.sh` guardrails | 45 `expected_fail` cases across the 18 files in `test/sql/` | — |
 
-| Suite | Result |
-|---|---|
-| `test_gpudb` (CPU + Metal) | 3026 / 3026 checks |
-| `run_sql_tests.sh` | 224 passing cases, 45 expected-fail guardrails |
-| `test_wrapper.py` | 1158 checks, green under DuckDB 1.4.5 and 1.5.5 |
-| `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing |
-| `test_gpudb` (CPU + CUDA, RTX 4090 Laptop) | 711 / 711 checks; SQL suite 224 / 0 with the exact path on |
+The wrapper and coverage rows were re-measured on the M4 Max on this commit;
+the unit and SQL rows are the RTX 4090's, which is where they were last run
+against this code. `test_gpudb` and the SQL suite on the M4 Max run in CI on
+every push and were not re-run by hand here. On the x86-64 box the wrapper
+suite carries **4 long-standing failures** in the segmented-upload cases,
+unchanged by any recent work and recorded as such in the commit that landed
+`gpu_avg_decimal`; they do not appear on Apple silicon.
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query

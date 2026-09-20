@@ -232,7 +232,7 @@ cd duckdbgpumetaldbram
 ./scripts/get_duckdb_libs.sh
 ./scripts/build.sh
 ./scripts/local_check.sh        # builds + cpp tests + smoke benchmarks
-./build-macos/test/test_gpudb   # (or build-linux/) unit tests: 3026 checks on CPU + Metal, 2026-09-19
+./build-macos/test/test_gpudb   # (or build-linux/) unit tests across the backends the build carries
                                 # (711 on CPU + CUDA on the RTX 4090 Laptop)
 ./scripts/run_sql_tests.sh      # 224 passing cases, 45 expected failures
                                 # (the `-- expected_fail:` cases, which assert that misuse is rejected)
@@ -242,7 +242,7 @@ cd duckdbgpumetaldbram
 For the transparent path (the Python wrapper and the `gpudb` shell):
 
 ```bash
-PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # 1158 checks: parity against native
+PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # 1157 checks: parity against native
                                 # DuckDB for every shape, staleness, background residency, the memory
                                 # budget, error fallback — needs the extension built (above).
                                 # Green under DuckDB 1.4.5 and 1.5.5

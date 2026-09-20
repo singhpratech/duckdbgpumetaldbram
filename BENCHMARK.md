@@ -5082,6 +5082,112 @@ v0.6 function set (no exact forms). Everything in this section requires a local
 build with a CUDA toolchain; none of it is reachable from the published
 extension.
 
+## TPC-H coverage, the whole 22 through the transparent path — Metal, SF1 + SF10 (2026-09-19)
+
+The headline figures the README quotes (SF1 17 of 22, SF10 19 of 22, 0 rows
+differing) come from these two runs, recorded here so they can be found and
+repeated.
+
+**Conditions**, as the runs' own headers record them: Apple M4 Max,
+`compiled=cpu,metal runtime=metal exact=true join=true global=true
+narrow=true device_memory=55662788608 store=true`, thresholds **on**, **N=5**
+(hot loop, minimum of N; a rewritten query is warmed first), measured
+2026-09-19. `scripts/tpch_coverage.py` connects with `residency="eager"` and
+`read_only=True`, so every table a query reads is **resident before it is
+timed** and the upload cost is outside the comparison — this is the
+steady-state number for a workload that asks the same shapes repeatedly, not
+a cold-start number. Each query's rows are compared with native's, ordered,
+and the `identical` column is that comparison.
+
+**Not recorded by the run, and not reconstructed here:** the DuckDB version
+each run used, and the memory budget the SF10 run was given. SF10 holds
+18.7 GiB resident, which is above the 16 GiB the default budget works out to
+on this machine, so that run must have raised it; the repro command below
+therefore passes a budget explicitly.
+
+```bash
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf1/tpch.duckdb
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb \
+    --memory-budget 200GB
+```
+
+### Scale factor 1 — 17 of 22 on the device, 0 rows differing
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---:|---:|---:|
+| Q1 | GPU (plain) | 12.1 | 3.2 | 3.83× |
+| Q2 | native (threshold) | 4.6 | — | — |
+| Q3 | GPU (plain) | 6.6 | 2.2 | 3.06× |
+| Q4 | GPU (plain) | 7.3 | 0.8 | 9.37× |
+| Q5 | GPU (plain) | 6.8 | 1.1 | 6.08× |
+| Q6 | native (threshold) | 1.9 | — | — |
+| Q7 | GPU (plain) | 7.4 | 2.1 | 3.55× |
+| Q8 | GPU (projected) | 7.3 | 1.4 | 5.18× |
+| Q9 | GPU (plain) | 18.5 | 1.4 | 13.61× |
+| Q10 | GPU (topk) | 18.0 | 2.9 | 6.30× |
+| Q11 | native (threshold) | 2.8 | — | — |
+| Q12 | GPU (plain) | 6.1 | 1.6 | 3.78× |
+| Q13 | GPU (nested) | 18.6 | 1.7 | 11.23× |
+| Q14 | GPU (projected) | 5.1 | 1.9 | 2.73× |
+| Q15 | GPU (nested) | 3.1 | 2.2 | 1.43× |
+| Q16 | native (threshold) | 12.2 | — | — |
+| Q17 | GPU (projected) | 6.1 | 1.2 | 5.20× |
+| Q18 | GPU (plain) | 13.3 | 1.5 | 8.98× |
+| Q19 | GPU (projected) | 10.3 | 1.4 | 7.11× |
+| Q20 | native (shape) | 7.7 | — | — |
+| Q21 | GPU (plain) | 21.4 | 2.9 | 7.28× |
+| Q22 | GPU (plain) | 8.0 | 1.1 | 7.58× |
+
+### Scale factor 10 — 19 of 22 on the device, 0 rows differing
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---:|---:|---:|
+| Q1 | GPU (plain) | 109.9 | 14.4 | 7.61× |
+| Q2 | native (shape) | 17.6 | — | — |
+| Q3 | GPU (plain) | 45.8 | 13.6 | 3.38× |
+| Q4 | GPU (plain) | 44.1 | 2.6 | 17.10× |
+| Q5 | GPU (plain) | 46.7 | 0.9 | 52.88× |
+| Q6 | GPU (projected) | 14.1 | 5.9 | 2.39× |
+| Q7 | GPU (plain) | 47.0 | 10.9 | 4.30× |
+| Q8 | GPU (projected) | 66.7 | 7.8 | 8.54× |
+| Q9 | GPU (plain) | 145.0 | 5.6 | 26.13× |
+| Q10 | GPU (topk) | 77.4 | 13.9 | 5.57× |
+| Q11 | GPU (nested) | 10.4 | 6.6 | 1.57× |
+| Q12 | GPU (plain) | 39.3 | 10.3 | 3.80× |
+| Q13 | GPU (nested) | 157.3 | 13.6 | 11.56× |
+| Q14 | GPU (projected) | 29.0 | 4.3 | 6.68× |
+| Q15 | GPU (nested) | 20.4 | 15.3 | 1.34× |
+| Q16 | native (threshold) | 37.6 | — | — |
+| Q17 | GPU (projected) | 49.3 | 3.2 | 15.61× |
+| Q18 | GPU (plain) | 101.7 | 8.8 | 11.53× |
+| Q19 | GPU (projected) | 64.6 | 4.2 | 15.33× |
+| Q20 | native (shape) | 34.9 | — | — |
+| Q21 | GPU (plain) | 159.4 | 21.4 | 7.45× |
+| Q22 | GPU (plain) | 27.1 | 0.7 | 36.89× |
+
+**Why the five that stay, stay.** Q20 at both scale factors, and Q2 at SF10, hold a
+correlated subquery whose inner statement does not bind on its own (`Binder
+Error: Referenced column "ps_partkey" / "p_partkey" not found`), so there is
+nothing to hand the device. At SF1 Q2 declines on a size bound before it gets
+that far, and so does Q6 — whose note names its inner GROUP BY's own
+threshold. Q16's inner
+`GROUP BY` declines on its own threshold; forced, it measures 0.08× at SF1 and
+0.02× at SF10, so the bound is right. Q11 at SF1 is below the measured size floors, and both
+it and Q6 clear them at SF10, where Q6 runs 2.39× and Q11 1.57×.
+
+**Q5's 0.9 ms** at SF10 is the largest ratio in the table and the one most
+worth reading carefully: the statement's whole answer comes off an
+already-resident upload of the join's result, so the 52.9× compares native
+doing the join against the device not having to. The upload that put it there
+is not in the 0.9 ms; it is the steady-state cost of the tenth identical ask,
+not the first.
+
+**Earlier entries in this file record 15 of 22 (SF1) and 16–17 of 22 (SF10)**
+as the coverage on the code of 2026-09-18. The difference is the work landed
+since: the row floor counting the table a lane reads (Q22), the inner-statement
+bounds (Q13, Q15), and the CTE handling (Q15). Those entries are kept as
+written — this is the run on the current code, not a correction of them.
+
 ## agg_all on CUDA — the fused reduce, RTX 4090, 50M rows (2026-09-20)
 
 `agg_all_i64` (SUM + MIN + MAX + COUNT in one pass) had been a throwing stub on

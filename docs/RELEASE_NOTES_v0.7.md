@@ -12,8 +12,9 @@ the resident GROUP BY and top-k table functions. The loadable extension still
 touches DuckDB through the stable C API only (the C_STRUCT ABI): it links no
 libduckdb, includes no DuckDB C++ headers and does no plan surgery.
 
-**Measured** on an Apple M4 Max (Metal), TPC-H, every row compared with
-native <!-- RE-RUN -->:
+**Measured** on an Apple M4 Max (Metal), TPC-H, warm, with every table the
+query reads already resident, minimum of 5 runs, every row compared with
+native (conditions and the per-query tables: `BENCHMARK.md`):
 
 | | Queries on the GPU | Rows differing | Speed-up on those queries |
 |---|---|---|---|
@@ -150,13 +151,17 @@ order-dependently — the shape is never rewritten.
 
 ## Tests, CI and packaging
 
-- `test_gpudb`: 3026 / 3026 checks on CPU + Metal; 711 / 711 on CPU + CUDA.
-- `run_sql_tests.sh`: 224 passing cases and 45 expected-fail guardrails, on
-  Metal and on CUDA with the exact path on.
-- `python/tests/test_wrapper.py`: 1158 checks, green under DuckDB 1.4.5 and
-  1.5.5 (#150 makes the suite run to the end on a backend without the exact
-  path).
-- `scripts/tpch_coverage.py`: SF1 17 of 22, SF10 19 of 22, 0 rows differing.
+- `python/tests/test_wrapper.py`: 1157 checks, 0 skipped, green under DuckDB
+  1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
+  backend without the exact path; #159 and #160 replaced its host gating with a
+  probe for the function that decides). On the x86-64 box it carries 4
+  long-standing failures in the segmented-upload cases, unchanged by this work.
+- `test_gpudb`: 711 / 711 checks on CPU + CUDA (RTX 4090 Laptop).
+- `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
+  RTX 4090; 45 `expected_fail` guardrail cases across the 18 files in
+  `test/sql/`.
+- `scripts/tpch_coverage.py`: SF1 17 of 22, SF10 19 of 22, 0 rows differing, on
+  the M4 Max.
 - The SQL suite now runs on Linux with the DuckDB libs pinned (#151), and the
   wrapper suite runs against the built extension in CI (#158).
 - sqllogic coverage for the exact surface and a guard against an older
@@ -181,16 +186,13 @@ reason for each, and `KNOWN_ISSUES.md` has the rest.
 |---|---|---|---|
 | Plain SQL on the GPU | yes | opt-in: `GPUDB_CUDA_EXACT=1` | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
-| From the community registry | yes | the registry's Linux binary is CPU-only | yes |
-
-<!-- CUDA-DEFAULT: the CUDA row and the paragraph below are the conservative
-     (opt-in) statement. If CUDA ships on by default, change the cell to "yes"
-     and replace the paragraph with the measured CUDA coverage table. -->
+| From the community registry | yes | `SELECT gpu_build_info();` says what a given binary carries | yes |
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
-#154), and the suites and the TPC-H coverage pass there. It stays opt-in in
-this release because `scripts/transparent_gate.py` has not been swept on that
-machine, so a CUDA build would be using Metal's thresholds — and rule 1 is a
+#154). On an RTX 4090 with the path enabled, the unit suite is 711 / 711 and
+the SQL suite 224 passing, 0 failing. It stays opt-in in this release for one
+reason: `scripts/transparent_gate.py` has not been swept on that machine, so a
+CUDA build would be deciding with Metal's thresholds — and rule 1 is a
 measurement, not an assumption.
 
 ## Credits
