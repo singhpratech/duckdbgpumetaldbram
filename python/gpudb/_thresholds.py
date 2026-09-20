@@ -83,19 +83,25 @@ another output column on both sides and the plain form's margin shrinks to
 1.01–1.09× (one 0.93× at 10K groups under a three-term WHERE), 1.00–1.08× at
 100K groups over a join                               → multi_plain_max_groups,
 multi_join_plain_max_groups; the plain form under a WHERE runs native
-CUDA uses this Metal-measured table, and that is a measured result rather
-than a placeholder: the full transparent gate was run on an RTX 4090 Laptop
-(sm_89) on 2026-09-20 — 1630 cells, exit 0, 0 slower than native, 0 differing,
-minimum ratio 1.07x — with the exact path on and the wrapper's own memory
-budget. The table survived it, so no CUDA-specific constant is justified.
+CUDA uses every CONSTANT in this Metal-measured table, and that is a measured
+result rather than a placeholder: the full transparent gate was run on an RTX
+4090 Laptop (sm_89) on 2026-09-20 — 1631 cells, 0 differing, with the exact
+path on and the wrapper's own memory budget. No CUDA-specific number is
+justified by it.
 
 Two cells DID lose on an earlier run of the same gate (0.96x and 0.97x) and
-were the reason a CUDA table was drafted. Both were artefacts of that run
+were the reason a CUDA table was first drafted. Both were artefacts of that run
 having no memory budget: the card filled to 15.8 GiB of 16.4 and the slow cell
 measured 100.2 ms rewritten, against 4.1 ms once the budget was in place. A
-gate measures the system it runs on. The one shape still worth re-checking if
-a CUDA table is ever reconsidered is TPC-H Q1, which straddles 1.0x on that
-box (0.95-1.04x); the measured rule handles it per process.
+gate measures the system it runs on, and no constant was written on that
+evidence — correctly.
+
+What CUDA does not take from this table is the VARCHAR few-group exemption,
+and TPC-H Q1 is the statement that made it visible: it straddled 1.0x on that
+box (0.95-1.04x) and the straddle was read as noise for as long as nobody
+asked where the milliseconds went. They went into a sort of the whole column.
+See "The one thing CUDA does not inherit" below; the exemption is a
+capability, the constants are numbers, and only the numbers are shared.
 
 The direct grouped reduce (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) did not
 move any of these, and the measurement says why. Inside the backend, a key with
@@ -220,9 +226,47 @@ the floor. Lifting only the floor, everything else shipping, it measures
 10.17-10.62x at SF1. The floor now counts the largest table the statement's
 answer depends on, lanes included — which is the argument the join bounds
 already make ("native runs a join whatever the FROM says").
+
+The one thing CUDA does not inherit (2026-09-20, SF1, RTX 4090)
+---------------------------------------------------------------
+Every CONSTANT above still holds on CUDA. The VARCHAR few-group exemption does
+not, and the difference is instructive: that exemption is not a number, it is a
+claim about what the backend does. It reads "a key with three distinct values
+is worth rewriting even though it is far below min_groups, because native has
+to hash a string on every row and the device does not". Metal earns it with the
+direct grouped reduce (RESIDENT_COLUMNS_DESIGN §7): few distinct values get a
+dense group-id lane and one row-order pass. CUDA has no such path — its exact
+GROUP BY always sorts — so it reads every row into a sort per payload no matter
+how few groups come out, and the claim is simply false there.
+
+Measured, `--no-thresholds`, plain form, no WHERE, 6,001,215 rows, the four
+few-group VARCHAR keys of `lineitem` (`l_returnflag`, `l_linestatus`,
+`l_shipmode`, `l_shipinstruct`):
+
+    payloads   native         device        ratio
+    1          2.7 – 2.9 ms   5.7 – 6.2 ms  0.45 – 0.47x
+    3          4.1 – 4.5 ms   18.6 – 18.7   0.22 – 0.24x
+    5          5.4 – 6.0 ms   31.1 – 31.2   0.17 – 0.19x
+
+Twelve cells, twelve losses, and the loss deepens with payloads because each
+payload is another full pass. The device cost is a floor set by the row count,
+not by the group count: the same table function answers 3 groups in 7.6 ms and
+10,000 groups in 8.5 ms, while native goes the other way — 2.7 ms at 3 groups,
+21.7 ms at 10,000. That crossing is the whole shape of it, and `min_groups`
+already sits above the crossover. The exemption was the only rule letting these
+statements through.
+
+So `string_key_few_groups` is False on CUDA. It is not a tuned constant and it
+should not become one: CUDA's exact GROUP BY has one path, the sort, and this
+flag describes that. It is tied to the algorithm, so if a backend answers a
+few-group key without reading the column into a sort, re-run the sweep above
+and let the numbers set the flag for it.
+
+The continuous measured rule (connection._note_timing) is what caught these
+before the flag existed, and it catches them one slow execution late.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Tuple
 
 
@@ -251,6 +295,11 @@ class Thresholds:
     # when at least this many payloads are computed expressions and at least this much survives
     string_key_min_selectivity: float = 0.5
     string_key_min_computed_payloads: int = 2
+    # ... and whether that exemption applies at all. It is not a preference: it
+    # says the backend answers a few-group key without reading every row into a
+    # sort. A backend whose exact GROUP BY always sorts pays a full pass per
+    # payload no matter how few groups come out, and loses the shape outright.
+    string_key_few_groups: bool = True
     # count(DISTINCT x): (key, x) pairs the device returns for DuckDB to re-aggregate
     reagg_max_pairs: int = 100_000
     reagg_max_pairs_where: int = 20_000
@@ -285,9 +334,12 @@ METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_
                    plain_min_selectivity=0.5,
                    having_min_selectivity=0.3, having_min_selectivity_big=0.2,
                    topk_min_groups=100_000, topk_min_selectivity=0.8)
-# Deliberately the same object: see the note at the top of this file. The gate
-# has been run on CUDA and found nothing that wants a different constant.
-CUDA = METAL
+# CUDA shares every CONSTANT with Metal — the gate has been run on it and found
+# none that wants a different number. It does not share the VARCHAR few-group
+# exemption, because that one is not a number: it is a claim about the backend's
+# algorithm, and the claim is false here. See "The one thing CUDA does not
+# inherit" at the top of this file.
+CUDA = replace(METAL, string_key_few_groups=False)
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 
@@ -402,10 +454,11 @@ def decide(backend: str, form: str, est_groups: Optional[int], selectivity: Opti
         return True, ""
     # (count(DISTINCT) beside one expression payload keeps its win there: 1.26–1.84x, 0 of 8 below 1.0x —
     # native builds a second hash table for the DISTINCT)
-    few_ok = string_key and (not has_where or ((computed_payloads >= t.string_key_min_computed_payloads
-                                                or (reaggregated and computed_payloads >= 1))
-                                               and selectivity is not None
-                                               and selectivity >= t.string_key_min_selectivity))
+    few_ok = (t.string_key_few_groups and string_key
+              and (not has_where or ((computed_payloads >= t.string_key_min_computed_payloads
+                                      or (reaggregated and computed_payloads >= 1))
+                                     and selectivity is not None
+                                     and selectivity >= t.string_key_min_selectivity)))
     # (plain form only: with three groups HAVING / top-k save nothing and measured 0.98–1.07x)
     if est_groups < t.min_groups and not (few_ok and form == "plain"):
         return False, f"{est_groups} groups < {t.min_groups}"
