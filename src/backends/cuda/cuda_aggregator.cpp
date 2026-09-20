@@ -1,6 +1,7 @@
 // cuda_aggregator.cpp — host-side wrapper that owns CUDA buffers, streams,
 // events, and translates from the abstract Aggregator interface to the
-// extern-C kernel launchers in sum_kernel.cu.
+// extern-C kernel launchers in kernels/*.cu (sum, groupby, groupby_resident,
+// hashjoin, join and exact).
 //
 // Linux-only file. Do NOT include from the macOS build.
 
@@ -739,21 +740,23 @@ public:
                                             max_groups, filter, t0);
     }
 
-    // ---- v0.7 milestone 3: the exact path (§4.1, §4.2, §4.6) ----
+    // ---- v0.7: the exact path (§4.1, §4.2, §4.6, §4.8, §4.12) ----
     // Whether the transparent rewrite may target this backend for an exact
-    // statement. The exact path is now COMPLETE — upload, GROUP BY, the global
-    // aggregate and the materialised key join all run here — but the default
-    // stays opt-in behind GPUDB_CUDA_EXACT=1 until the wrapper-level evidence
-    // exists on a CUDA box.
+    // statement. The exact path is COMPLETE — upload, GROUP BY, the global
+    // aggregate and the materialised key join all run here — and the
+    // wrapper-level evidence now exists on this box (BENCHMARK.md, the dated
+    // RTX 4090 section): the wrapper suite and scripts/tpch_coverage.py have
+    // both been run against a CUDA exact backend, 17 of 22 TPC-H SF1 queries
+    // on the device with 0 rows differing from native.
     //
-    // The distinction that keeps this flag off is worth keeping in view: the
-    // SQL suite proves the TABLE FUNCTIONS, and it is green. What flipping this
-    // on additionally does is make the Python wrapper start rewriting plain SQL
-    // statements here, and only python/tests/test_wrapper.py and
-    // scripts/tpch_coverage.py prove a rewritten statement returns native's
-    // rows. Neither has ever run against a CUDA exact backend. A runtime rule-1
-    // check would catch a slow template; nothing at runtime catches a different
-    // answer, so that evidence has to come first.
+    // The default is still opt-in behind GPUDB_CUDA_EXACT=1 only because
+    // flipping it is its own change: it is one line, it costs nothing to hold,
+    // and the distinction it turns on is worth stating. The SQL suite proves
+    // the TABLE FUNCTIONS. Flipping this additionally makes the Python wrapper
+    // rewrite plain SQL STATEMENTS here, and only test_wrapper.py and
+    // tpch_coverage.py prove a rewritten statement returns native's rows — a
+    // runtime rule-1 check would catch a slow template, but nothing at runtime
+    // catches a different answer.
     //
     // The flag is also not only a capability answer: it decides where
     // upload_rows_exact PUTS the columns, and a resident column is

@@ -1,4 +1,6 @@
-// exact_kernel.cu — the device side of the v0.7 exact GROUP BY (§4.1/§4.2).
+// exact_kernel.cu — the device side of the whole v0.7 exact path: the exact
+// GROUP BY (§4.1/§4.2), its WHERE mask (§4.6), the global masked aggregate
+// (§4.12) and the materialised key join (§4.8).
 //
 // Every entry point declared in exact_api.h is implemented here, and every one
 // of them mirrors a line of the CPU reference (cpu_aggregator.cpp
