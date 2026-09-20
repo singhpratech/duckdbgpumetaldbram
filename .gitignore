@@ -97,3 +97,9 @@ duckdb_unittest_tempdir/
 
 # Private working notes — never committed (strategy, drafts, plans)
 .private/
+
+# pip packaging output. The extension binary the platform wheel carries is
+# copied into python/gpudb/_ext/ by scripts/build_wheels.sh and taken out
+# again; it is a build product and is never committed.
+python/gpudb/_ext/
+python/dist/

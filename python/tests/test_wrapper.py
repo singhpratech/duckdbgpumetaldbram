@@ -246,6 +246,8 @@ def run():
                 "thresholds: the row floor, inner-statement bounds and measured rule 1"):
             skip(f"{what} — needs a GPU backend, and this extension reports runtime=CPU")
         con.close()
+        extension_lookup_checks()
+        extension_version_checks()
         extension_age_checks()
         return report()
     for name, sql in cases.items():
@@ -2422,6 +2424,8 @@ def run():
     con.close()
 
     ties_checks()
+    extension_lookup_checks()
+    extension_version_checks()
     extension_age_checks()
     rewrite_error_checks()
     budget_checks()
@@ -3107,6 +3111,119 @@ def ties_tpch():
               "tpch/ties: LIMIT 3 is above the tie and still runs on the device")
     finally:
         con.close()
+
+
+def extension_lookup_checks():
+    """Where `_find_extension` looks, and in what order.
+
+    Nothing here touches the network, installs anything, or connects: the
+    order is decided from directory contents, so temporary directories and one
+    patched module global are enough. The bundled copy exists only inside a
+    platform wheel (`gpudb/_ext/`, put there by scripts/build_wheels.sh); a
+    source checkout has an empty one or none at all.
+    """
+    import tempfile
+    from gpudb import connection as _conn
+
+    print("== where the extension is looked for")
+
+    def with_layout(build=None, bundled=None, env=None, explicit=None):
+        """Run _find_extension against a fabricated package layout.
+
+        `build` / `bundled` say whether a `.duckdb_extension` file exists in a
+        checkout's build directory and in the package's `_ext/`. The package
+        directory is faked by pointing the module's `__file__` at a temporary
+        tree of the same shape (<root>/python/gpudb/, <root>/build-macos/...).
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            pkg = os.path.join(tmp, "python", "gpudb")
+            os.makedirs(pkg)
+            built = os.path.join(tmp, "build-macos", "src", "extension")
+            os.makedirs(built)
+            ext_dir = os.path.join(pkg, "_ext")
+            os.makedirs(ext_dir)
+            paths = {}
+            if build:
+                paths["build"] = os.path.join(built, "gpudb.osx_arm64.duckdb_extension")
+            if bundled:
+                paths["bundled"] = os.path.join(ext_dir, "gpudb.osx_arm64.duckdb_extension")
+            for p in paths.values():
+                open(p, "w").close()
+            real_file, real_env = _conn.__file__, os.environ.get(_conn.GPUDB_EXTENSION_ENV)
+            _conn.__file__ = os.path.join(pkg, "connection.py")
+            if env is None:
+                os.environ.pop(_conn.GPUDB_EXTENSION_ENV, None)
+            else:
+                os.environ[_conn.GPUDB_EXTENSION_ENV] = env
+            try:
+                return _conn._find_extension(explicit), paths
+            finally:
+                _conn.__file__ = real_file
+                os.environ.pop(_conn.GPUDB_EXTENSION_ENV, None)
+                if real_env is not None:
+                    os.environ[_conn.GPUDB_EXTENSION_ENV] = real_env
+
+    got, paths = with_layout(bundled=True)
+    check(got == paths["bundled"],
+          f"the bundled _ext/ copy is found when there is no local build ({got})")
+
+    got, paths = with_layout(build=True, bundled=True)
+    check(got == paths["build"],
+          f"a checkout's own build wins over a bundled copy ({got})")
+
+    got, _ = with_layout(build=True, bundled=True, env="/somewhere/else.duckdb_extension")
+    check(got == "/somewhere/else.duckdb_extension",
+          f"{_conn.GPUDB_EXTENSION_ENV} wins over both ({got})")
+
+    got, _ = with_layout(build=True, bundled=True, env="/somewhere/else.duckdb_extension",
+                         explicit="/an/explicit/one.duckdb_extension")
+    check(got == "/an/explicit/one.duckdb_extension",
+          f"an explicit extension= wins over everything ({got})")
+
+    got, _ = with_layout()
+    check(got is None,
+          f"with neither, nothing is returned and connect() falls back to LOAD gpudb ({got})")
+
+
+def extension_version_checks():
+    """This client's version, and what counts as an extension too old for it.
+
+    The guard is a catalogue check, not a version comparison: `_probe_extension`
+    asks whether every name in REQUIRED_FUNCTIONS is registered. What pins the
+    ages apart is therefore the CONTENT of that tuple — it has to name
+    functions that arrived after the version the community registry currently
+    serves, or a registry build predating this client would read as current.
+    """
+    from gpudb import connection as _conn
+
+    print("== this client's version and the extension it requires")
+    check(gpudb.__version__ == "0.7.0", f"the wrapper reports its version ({gpudb.__version__})")
+
+    # Names this client calls that a v0.6.0 extension does not register: the
+    # exact GROUP BY, the global masked aggregate and the materialised key join
+    # are all v0.7 work. Any one of them absent makes _probe_extension say
+    # "older than this client".
+    after_v060 = ("gpu_groupby_exact_resident", "gpu_agg_exact_global", "gpu_join_materialize")
+    check(all(f in _conn.REQUIRED_FUNCTIONS for f in after_v060),
+          "REQUIRED_FUNCTIONS names functions added after v0.6.0, so the registry's "
+          f"v0.6.0 build reads as older ({[f for f in after_v060 if f not in _conn.REQUIRED_FUNCTIONS]})")
+
+    con = fresh()
+    if con._backend or con.extension_note == "":
+        check(con.extension_note == "" and not con._missing_functions(),
+              f"the extension built from this tree is current for this client "
+              f"({con.extension_note[:60]})")
+        row = con.execute(
+            "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'gpudb'"
+        ).fetchall()
+        if row and row[0][0]:
+            check(row[0][0] == "v0.7.0",
+                  f"the loaded extension stamps this release's version ({row[0][0]})")
+        else:
+            skip("the loaded extension's version: DuckDB reports none for it here")
+    else:
+        skip("no extension loaded: the current-extension half of the age check")
+    con.close()
 
 
 def extension_age_checks():
