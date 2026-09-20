@@ -30,8 +30,9 @@ SELECT gpu_last_stats();                                      -- proof: which pr
 --   wall_ms=9.702 kernel_ms=9.533 transfer_ms=0.000
 ```
 
-Apache-2.0 · v0.7.0 · Linux + macOS · DuckDB ≥ 1.5.5 from the community registry
-(release binaries need only the v1.2.0 C API)
+Apache-2.0 · v0.7.0 · macOS 15+ on Apple silicon · x86-64 Linux, glibc 2.34+ ·
+DuckDB ≥ 1.5.5 from the community registry (a release binary or the pip wheel
+needs only the v1.2.0 C API)
 
 ---
 
@@ -105,9 +106,9 @@ wheel is both in one install. [How to tell it is
 working](docs/USING_THE_SHELL.md#how-to-tell-it-is-working) is two commands that
 say which piece is missing when one is.
 
-One session on an M4 Max over TPC-H SF1, opened read-only. The first ask lands
-on DuckDB while the columns go to the device in idle segments; the next one is
-on the GPU:
+One session on an M4 Max over TPC-H SF1, opened read-only, on the release build
+of 2026-09-20. The first ask lands on DuckDB while the columns go to the device
+in idle segments; the next one is on the GPU:
 
 ```
 gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
@@ -119,17 +120,19 @@ gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey
 …
 └───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 24.1 ms
+DuckDB (not_resident: the resident set is not ready yet) · 25.7 ms
 …
-GPU (topk: the resident GROUP BY) · 39.2 ms
+GPU (topk: the resident GROUP BY) · 38.8 ms
 ```
 
-Nine more runs of it each way, same session, same connection: **median 14.9 ms
-with the path off against 8.7 ms with it on**, both series printed whole so the
-warm-ups and the wrapper's own measuring run stay visible. The whole session —
-the banner, every reason code the footer prints, `.gpu` / `.residents` /
-`.memory`, and those eighteen runs — is in the shell guide, with what a
-different machine state does to the ratio.
+Nine more runs of it each way, same session, same connection: **median 22.1 ms
+with the path off against 14.4 ms with it on — 1.53×**, both series printed
+whole so the warm-ups and the wrapper's own measuring run stay visible. This is
+a 6M-row statement that takes tens of milliseconds either way, and on Apple
+silicon it is sensitive to what else the machine is doing: that is why the
+wrapper measures in your process instead of trusting a published ratio. The
+whole session — the banner, every reason code the footer prints, `.gpu` /
+`.residents` / `.memory`, and those eighteen runs — is in the shell guide.
 
 **Nothing you use goes away.** `gpu_upload`, `gpu_upload_pair`, the
 `gpu_*_resident` scalars, the fused joins, the resident GROUP BY and top-k table
@@ -158,11 +161,28 @@ client, with the same names and the same results.
 native before any time was counted, with every table the query reads **already
 resident**. These numbers are from two machines; yours will differ.
 
-| TPC-H | Machine | Queries answered on the GPU | Rows differing | Speed-up on those queries |
-|---|---|---:|---:|---:|
-| SF1 (6M-row `lineitem`) | MacBook M4 Max · Metal | 17 of 22 | 0 | 1.4× – 13.6× |
-| SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | 19 of 22 | 0 | 1.3× – 52.9× |
-| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | 17 of 22 | 0 | 0.95× – 23.3× |
+Every row is from the **release build of 2026-09-20**, at the default memory
+budget, N=5. A statement can reach the GPU two ways and both are timed
+separately, because they are different code paths: `execute()`, and `sql()` —
+the lazy-relation path the `gpudb` shell takes.
+
+| TPC-H | Machine | Asked through | On the GPU | Rows differing | Speed-up on those queries |
+|---|---|---|---:|---:|---:|
+| SF1 (6M-row `lineitem`) | MacBook M4 Max · Metal | `execute()` | 17 of 22 | 0 | 1.52× (Q15) – 15.32× (Q9) |
+| SF1 (6M-row `lineitem`) | MacBook M4 Max · Metal | `sql()` | 17 of 22 | 0 | 1.37× (Q15) – 9.49× (Q13) |
+| SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | `execute()` | 19 of 22 | 0 | 1.06× (Q11) – 48.10× (Q5) |
+| SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | `sql()` | 19 of 22 | 0 | 0.92× (Q11) – 26.39× (Q5) |
+| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `execute()` | 17 of 22 | 0 | 0.96× (Q1) – 21.40× |
+| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `sql()` | 17 of 22 | 0 | 0.98× (Q1) – 13.30× |
+
+**Two rows in that table are below 1.0×, and they are printed rather than
+dropped.** On Metal, **Q11 at SF10 straddles parity**: a 6–7 ms statement, 1.06×
+through `execute()` and 0.92× through `sql()` in the timed run, 1.06× and 0.89×
+in two immediate re-runs of the same build. On CUDA, **Q1 straddles parity** the
+same way, at 0.96× and 0.98× here. Both are exactly the case the per-process
+measured rule exists to settle: it times the template against native in your own
+process and hands it back to DuckDB where it loses. Nothing else rewritten in
+this run is below 1.0× at either scale factor.
 
 The queries that stay on DuckDB are declined on purpose, and which ones stay
 depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
@@ -171,32 +191,36 @@ does not bind on its own, so there is nothing to hand the device — and Q16's
 inner `GROUP BY` declines on its own threshold; forced past it, Q16 measures
 0.02–0.08×. **At SF1, five**: those three, and Q6 and Q11, which sit
 below the measured size floors at 6M rows (Q2 declines on a size floor there
-too, before its shape is ever looked at). Each of them runs on DuckDB
-unchanged, at DuckDB's speed. The SF10 row is measured at the **default memory
-budget** — nothing has to be raised for those 19 queries.
+too, before its shape is ever looked at). The CUDA box declines the same five at
+SF1. Each of them runs on DuckDB unchanged, at DuckDB's speed.
 
-The CUDA row's low end is one query: **Q1 sits at parity on that box** and has
-measured either side of 1.0× across runs of the same build, which is exactly
-the case the measured rule decides per process. The thresholds both GPUs use
-are the Metal-measured ones, verified on one CUDA machine rather than measured
-for every GPU — the gate that verified them is the 1630-cell run named above.
+The thresholds both GPUs use are the Metal-measured ones, verified on one CUDA
+machine rather than measured for every GPU — the gate that verified them is the
+1630-cell run named above.
 
-Query by query at both scale factors, the exact conditions and what each run
-did not record: [BENCHMARK.md](BENCHMARK.md), *TPC-H coverage, the whole 22
-through the transparent path* and *the transparent path on CUDA*; the commands
-that take both runs again are in the [reading guide](docs/README.md#reproducing-a-number).
+Query by query at both scale factors, with the four per-query tables and the
+exact conditions: [BENCHMARK.md](BENCHMARK.md), *the release build* (2026-09-20)
+for Metal and *the transparent path on CUDA* for the RTX 4090; the commands that
+take both runs again are in the [reading guide](docs/README.md#reproducing-a-number).
 
 ### The operators underneath
 
 The explicit `gpu_*` surface, measured on its own — this is where the ratios
 above come from.
 
+**These rows are asked by name — `gpu_upload_pair`, `gpu_groupby_*_resident`,
+the fused joins — not in plain SQL, and they are not from today's run.** Each
+was measured when its operator shipped: the resident GROUP BY and top-k rows at
+**v0.6.0** (2026-08-28), the join rows at **v0.5.0** (2026-08-22), the streaming
+`SUM` rows at **v0.4.0**. They are reproduced here unchanged, and each one's
+dated section in [BENCHMARK.md](BENCHMARK.md) has the conditions and the
+reproduction. The plain-SQL table above is the one taken on the release build.
+
 TPC-H `lineitem`, warm cache, every result verified equal to native before
 timing counted. GROUP BY rows: statement against statement inside the same
 embedded DuckDB v1.5.2 process, after the one-time upload and sort; aggregate
 and join rows: DuckDB CLI (v1.5.5 for CUDA, v1.5.2 for the Metal joins),
-5-run medians. Full grid + reproduction:
-**[BENCHMARK.md](BENCHMARK.md)**.
+5-run medians.
 
 | TPC-H | Workload | Hardware | Native | gpudb | |
 |---|---|---|---:|---:|:---|
@@ -240,8 +264,11 @@ does not pay. `DOUBLE` sums filter on the host on Metal (1.4–2.6×). Low-cardi
 **native win on Metal** (0.56–0.65× at SF10–SF50, a tie at SF1) and stays in the table. All in
 [BENCHMARK.md](BENCHMARK.md) and [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 
-Every row in this section is re-measured on the release commit, on the machine
-named in it: the Metal rows on the M4 Max, the CUDA rows on the RTX 4090.
+Each row names the machine it was taken on — the Metal rows on the M4 Max, the
+CUDA rows on the RTX 4090 — and the release it was measured at. The plain-SQL
+coverage and the gates above were re-run on the v0.7.0 release build of
+2026-09-20; these operator rows were not, and are the numbers their own releases
+recorded.
 
 ## Three ways in
 
@@ -305,7 +332,7 @@ SELECT * FROM gpu_groupby_sum_resident_topk('sales_by_store', 5, 'desc');
 
 SELECT gpu_last_stats();
 -- op=groupby_sum_resident_topk backend=Metal reason=Hot_GpuAlwaysWins
---   rows_in=10000000 groups=1000 rows_out=5 wall_ms=39.551 kernel_ms=15.834 transfer_ms=0.000
+--   rows_in=10000000 groups=1000 rows_out=5 wall_ms=39.568 kernel_ms=17.752 transfer_ms=0.000
 ```
 
 The full surface, the identity-tag rules and the one footgun are further down
@@ -412,7 +439,8 @@ by form](KNOWN_ISSUES.md#the-size-bounds-form-by-form).
   at all or under a `WHERE` that keeps at least half the rows with at least two
   computed-expression payloads, because native hashes the strings and evaluates
   the expressions on every row. That is why TPC-H Q1 (two `VARCHAR` keys, eight
-  aggregates over expressions, 98% of rows kept) is on the GPU at 3.8× while
+  aggregates over expressions, 98% of rows kept) is on the GPU at 3.98× at SF1
+  and 7.63× at SF10 (release build, `execute()`) while
   the plain `sum` and `count(*)` over the *same* two keys — the second
   statement of [the run end to end](docs/USING_PYTHON.md#a-run-end-to-end) —
   declines at `6 groups < 1000`: column payloads, no expressions, no exemption.
@@ -749,26 +777,30 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 
 | Suite | Result | Where |
 |---|---|---|
-| `test_wrapper.py` — the transparent path | 1238 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
-| `test_residency_policy.py` — the residency policy, on a driven clock | 105 checks, 0 failing | M4 Max |
+| `test_gpudb` — unit checks | 3056 / 3056 | M4 Max, CPU + Metal |
+| `run_sql_tests.sh` | 225 passing, 0 failing, 46 expected failures, 1 skipped | M4 Max |
+| `test_wrapper.py` — the transparent path | 1267 checks, 0 skipped, 0 failing — the same count under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
+| `test_residency_policy.py` — the residency policy, on a driven clock | 131 checks, 0 failing, both DuckDB versions | M4 Max |
+| `test_shell.py` — the `gpudb` shell on a pty | 77 checks, 0 skipped under DuckDB 1.4.5; 76 with 1 skipped under 1.5.5 | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22 at the default budget, 0 rows differing | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, 0 rows differing, through `--path execute` and `--path sql` alike | RTX 4090 Laptop |
 | `test_wrapper.py` — the transparent path | 1258 checks, 0 skipped, 0 failing | RTX 4090 Laptop |
 | `test_gpudb` — unit checks | 752 / 752 | RTX 4090 Laptop, CPU + CUDA |
 | `run_sql_tests.sh` | 225 passing, 0 failing | RTX 4090 Laptop |
-| `run_sql_tests.sh` guardrails | 45 `expected_fail` cases across the 18 files in `test/sql/` | — |
+| `run_sql_tests.sh` guardrails | 48 `expected_fail` directives across the 18 files in `test/sql/`; 46 of them reached on Metal | — |
 | `budget_gate.py` — the memory budget under pressure | PASS: 169 statements, 0 rows differing, 0 errors, resident never above the budget | M4 Max and RTX 4090 Laptop |
 
-Each row names the machine that took it. The unit and SQL rows are the RTX
-4090's, run there when the CUDA path was turned on by default; `test_gpudb` and
-the SQL suite on the M4 Max run in CI on every push and were not re-run by hand
-here, and the Mac's two check counts above were taken before the memory-budget
-work added its cases, so both are re-counted on the release build. The x86-64 box used
-to carry four failures in the segmented-upload cases — the background uploader
-never found a quiet window under that test's statement cadence — and once a
-segment was priced from what each machine measures rather than from a constant,
-that box came back fully green. The check count differs between the two boxes
-because the `avg`-over-`DECIMAL` section branches on the host's `long double`.
+Each row names the machine that took it. The M4 Max rows were re-counted on the
+v0.7.0 release build of 2026-09-20; the RTX 4090 rows are that machine's, taken
+when the CUDA path was turned on by default. `test_shell.py`'s one skip under
+DuckDB 1.5.5 is a throwaway virtualenv that cannot import `duckdb`, so the
+console entry point cannot start there — it is announced rather than counted as
+a pass. The x86-64 box used to carry four failures in the segmented-upload
+cases — the background uploader never found a quiet window under that test's
+statement cadence — and once a segment was priced from what each machine
+measures rather than from a constant, that box came back fully green. The
+wrapper check count differs between the two boxes because the
+`avg`-over-`DECIMAL` section branches on the host's `long double`.
 
 The SQL suite lives in `test/sql/*.test` — plain SQL with `-- expect:` lines,
 reported per query as PASS / FAIL / GUARDRAIL / SKIP; `test/sqllogic/` is a
