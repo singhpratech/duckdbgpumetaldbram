@@ -1577,16 +1577,75 @@ same database — the extension stays free of threads and hidden connections
   2026-09-20, 2 of 69 attempts landed against a 2.5 ms mean window and a
   4.9 ms segment, where this machine lands 58 of 95. So the manager counts
   the last 8 attempts and halves `segment_rows` when **1 or fewer** of them
-  landed, doubling it back when 7 or more do, down to 1/32 of the 8 MiB
-  default and no further. The threshold is deliberately that low: this
-  machine's yield of 0.6 falls to 3-or-fewer in 8 about 17% of the time, so
-  a 3-of-8 rule made the size oscillate here for nothing (58 segments
-  became 75–81 under load), where 1-of-8 trips 0.9% of the time on a yield
-  of 0.6 and at once on the starving box's 0.03. It is a starvation guard,
-  not a tuning knob. Both bounds are hard: the divisor stops at 32, and a
-  landed segment is progress that is never undone, so a session terminates
-  at the floor however crowded the connection is. A pinned `segment_rows`
-  (a test, a sweep) is never adapted.
+  landed, doubling it back when 7 or more do. The threshold is deliberately
+  that low: this machine's yield of 0.6 falls to 3-or-fewer in 8 about 17%
+  of the time, so a 3-of-8 rule made the size oscillate here for nothing (58
+  segments became 75–81 under load), where 1-of-8 trips 0.9% of the time on
+  a yield of 0.6 and at once on the starving box's 0.03. It is a starvation
+  guard, not a tuning knob. A landed segment is progress that is never
+  undone, so a session terminates at the floor however crowded the
+  connection is, and a pinned `segment_rows` (a test, a sweep) is never
+  adapted.
+- **How small is worth going is the machine's answer, not a constant.** A
+  segment has a FIXED cost no smaller segment escapes: the statement's own
+  parse and bind, and DuckDB's set-up of a scan over every row group of the
+  table. Measured through the manager on 2026-09-20 over a 2M-row table —
+  M4 Max, 8192-row segments at 0.40 ms against 2.6 ms for 524288-row ones,
+  so the table costs 98 ms of scanning in small pieces and 10 ms in default
+  ones; on the x86 box, ~1.5 ms fixed and 1.75 ms for 8192 rows against
+  11.6 ms for 500000. Halving the size therefore adds a whole fixed cost per
+  pair of segments, and below some size it buys almost nothing: 245
+  attempts of 1.75 ms each is not progress over 4 of 11.6. So the floor is
+  **the smallest size whose predicted total for this table stays within 4×
+  of the total at the default size**, priced from the segments that actually
+  landed here (the fastest per size — a segment that ran beside a statement
+  read slower than it is, and the quantity wanted is the work, not the
+  contention). Where a segment's cost really is `fixed + rows × per_row`
+  that is exactly the size at which the two parts are equal. An untried
+  halving is priced at the least it could be worth (a quarter off), which
+  lets the size fall three halvings below the last measured one before the
+  budget stops it, measuring each size on the way; a table is never cut into
+  more than 2048 pieces; and until a segment has landed at the default size
+  at all — pricing a halving needs TWO of them, one being the default — the
+  floor is the old constant, 1/32 of the 8 MiB default, and the size goes on
+  halving on the yield rule alone until it gets there. That matters because a
+  connection starved from its first statement never collects a second size:
+  measured on the x86 box, one segment of nine landed, the model stayed empty
+  and a floor derived from that single point would stop the shrinking at the
+  size already in use, with the window it was measuring (4.0 ms) twice what a
+  segment an eighth that size costs there. The unpriced path is therefore
+  exactly what it was before any of this was measured — bounded at five
+  halvings, no retry loop, 1/32 still a floor — and starvation is reported
+  there. Given the whole curve the priced rule derives 32768 rows on the x86
+  box, where that constant happened to sit, and 65536 on the M4 Max. The
+  measured window has one say of its own, in the direction it can be trusted:
+  a connection plainly leaving several times what the cheapest segment cost
+  here lets those blind halvings through a priced floor as well. It only ever
+  ALLOWS — never forces a segment, never goes below the constant, never
+  overrides a size that is landing.
+- **A connection that leaves no window is told so, not ground finer.** When
+  the yield asks for a smaller segment and the floor refuses, the manager
+  records that the session is STARVED and `progress()` reports it with the
+  numbers it was judged on: the window the workload has been leaving
+  (measured from how long interrupted segments got to run), what a segment
+  costs here, and where the floor is. Nothing is forced: the set does not
+  become resident, every statement keeps its native answer and its native
+  speed, and `KNOWN_ISSUES.md` carries the honest limit with the two things
+  a user can do about it (`residency='eager'`, or a pause in the workload).
+  Forcing one segment per second through the interrupt would buy progress at
+  a user statement's expense, which is rule 1's line; it is measured in
+  `docs/RESEARCH_NOTES.md` (2026-09-20) and not taken.
+- **The segment statement is planned once per session.** The session
+  `PREPARE`s it and then sends only the row range (`EXECUTE seg(a, b)`),
+  which takes the parse and bind out of every segment: measured on an M4
+  Max, 0.50 → 0.40 ms for an 8192-row segment and 0.93 → 0.81 ms for a
+  13-lane one, about a tenth of a small segment. The range stays a literal
+  because the plan then still prunes row groups by it — the wrapper's
+  parameter path measured *slower* than the literal one (497 µs against
+  368). An engine that will not take the `PREPARE` gets the statement
+  rendered per segment as before; the rows read, and their order, are the
+  same either way, which `rows_seen == rows` and the wrapper suite's
+  tiling check are what prove.
 - **Quiet period and rate cap.** No upload session starts within 2 s of the
   last invalidation of that table, and no more than one session per table
   per 30 s (wrapper settings). A write-heavy session therefore runs native

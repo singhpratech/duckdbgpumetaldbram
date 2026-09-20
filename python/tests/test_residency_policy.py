@@ -14,7 +14,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from gpudb._residency import (CONTENTION_MIN_SAMPLES, CONTENTION_SEGMENTS,   # noqa: E402
                               MEMORY_ERROR, NATIVE_USE_WEIGHT,
-                              ResidencyManager, SEG_SCALE_MAX, SEG_YIELD_WINDOW,
+                              ResidencyManager, SEG_SCALE_MAX, SEG_TOTAL_MAX_RATIO,
+                              SEG_WINDOW_SAMPLES, SEG_YIELD_WINDOW,
                               YOUNG_OVERRIDE_RATIO)
 
 MiB = 1 << 20
@@ -621,6 +622,188 @@ def backoff():   # noqa: C901
         fixed.note_segment(False)
     check(fixed.segment_rows_for(stf) == 4096,
           "segments: an explicit segment_rows (a test, a sweep) is never adapted")
+
+    print("== back-off: the floor is the machine's, not a constant")
+    # A segment costs `fixed + rows x per_row` and the fixed part is paid once
+    # per segment however few rows it asks for, so halving the size adds a
+    # whole fixed part per pair. The floor is where the total for the table
+    # reaches SEG_TOTAL_MAX_RATIO of what it is at the default size. Costs are
+    # injected here, so the arithmetic is checked and nothing sleeps.
+    def costed(fixed_ms, per_row_us, rows, sizes, **kw):
+        """A manager whose set has landed one segment of each of `sizes`,
+        priced by a cost model the test chooses."""
+        m = manager(Clock(), Device(Clock()), None, idle_ms=20.0, **kw)
+        st = offer(m, "seg", 1 * MiB)
+        st.table_rows = rows
+        for r in sizes:
+            m.note_segment(True, st, rows=r, ms=fixed_ms + r * per_row_us / 1000.0)
+        m._seg_landed = []
+        return m, st
+
+    m, st = costed(1.5, 0.02, 2_000_000, [])
+    base = st.segment_rows_default
+    check(m.segment_floor_rows(st) == base // SEG_SCALE_MAX,
+          f"floor: with nothing measured it is the constant backstop, 1/{SEG_SCALE_MAX} of the "
+          f"default ({m.segment_floor_rows(st)} rows of {base})")
+    # the x86 box's curve, measured 2026-09-20: 1.5 ms fixed, 0.02 us/row
+    m, st = costed(1.5, 0.02, 2_000_000, [base])
+    blind = m.segment_floor_rows(st)
+    check(blind == base // SEG_SCALE_MAX,
+          f"floor: ONE landed size prices nothing — a halving needs two — so the floor is still "
+          f"the constant backstop and the size keeps halving on the yield alone ({blind} rows "
+          f"of {base})")
+    m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2])
+    check(m.segment_floor_rows(st) == base // 16,
+          f"floor: the second landed size is what hands over to the measured floor, and an "
+          f"untried halving is then priced at the least it could be worth — three of them below "
+          f"the smallest size measured ({m.segment_floor_rows(st)} rows of {base})")
+    m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2, base // 4, base // 8, base // 16])
+    check(m.segment_floor_rows(st) == base // 32,
+          f"floor: with the sizes measured, that curve's floor is 1/32 of the default "
+          f"({m.segment_floor_rows(st)} rows) — where the constant used to sit, now derived")
+    # a machine with a tenth of the fixed cost can afford a smaller segment
+    m2, st2 = costed(0.15, 0.02, 2_000_000, [base, base // 2, base // 4, base // 8,
+                                             base // 16, base // 32, base // 64])
+    check(m2.segment_floor_rows(st2) < m.segment_floor_rows(st),
+          f"floor: a machine whose fixed cost is ten times smaller goes further down "
+          f"({m2.segment_floor_rows(st2)} rows against {m.segment_floor_rows(st)})")
+    # ... and one whose segments are all fixed cost cannot go anywhere
+    m3, st3 = costed(3.0, 0.0001, 2_000_000, [base, base // 2, base // 4])
+    check(m3.segment_floor_rows(st3) == base // 4,
+          f"floor: where a segment is all fixed cost, each halving simply doubles the total, so "
+          f"the budget of {SEG_TOTAL_MAX_RATIO:.0f}x allows exactly two of them "
+          f"({m3.segment_floor_rows(st3)} rows of {base})")
+    check(m.segment_floor_rows(st) >= -(-2_000_000 // 2048),
+          "floor: and a table is never cut into more than 2048 pieces whatever the costs say")
+    # ... on the blind path too: a table big enough that 1/32 of the default
+    # segment would be more than 2048 pieces
+    big = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    stbig = offer(big, "seg", 1 * MiB)
+    stbig.table_rows = 256 * base            # 1/32 of the default would be 8192 pieces
+    check(big.segment_floor_rows(stbig) == -(-stbig.table_rows // 2048) > base // SEG_SCALE_MAX,
+          f"floor: the 2048-piece cap binds on the unpriced path as well, above the constant "
+          f"backstop ({big.segment_floor_rows(stbig)} rows of a {base} default over "
+          f"{stbig.table_rows} rows)")
+    # the window only ever ALLOWS: a connection leaving several times what the
+    # cheapest segment cost lets the blind halvings through the measured floor
+    m, st = costed(3.0, 0.0001, 2_000_000, [base, base // 2, base // 4])
+    tight = m.segment_floor_rows(st)
+    for _ in range(4):
+        m.note_segment(False, st, window_ms=0.1)    # a window far under any segment
+    check(m.segment_floor_rows(st) == tight,
+          f"floor: a window smaller than any segment changes nothing ({m.segment_floor_rows(st)})")
+    for _ in range(SEG_WINDOW_SAMPLES):
+        m.note_segment(False, st, window_ms=100.0)  # ... and one far above every segment
+    check(m.segment_floor_rows(st) == base // SEG_SCALE_MAX < tight,
+          f"floor: a window several times the cheapest segment measured is evidence the size is "
+          f"not the reason, so the blind halvings are allowed through — down to the backstop and "
+          f"no further ({m.segment_floor_rows(st)} rows, the priced floor was {tight})")
+
+    print("== back-off: at the floor it reports starvation instead of grinding")
+    # starved from the very first statement: nothing lands, so nothing can be
+    # priced, and the size must still walk all the way down to the backstop
+    # before the manager calls it starvation (the x86 box, 2026-09-20: one
+    # segment of nine landed and the floor collapsed to the size in use)
+    cold = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    stc = offer(cold, "seg", 1 * MiB)
+    stc.table_rows = 2_000_000
+    for _ in range(SEG_YIELD_WINDOW * (SEG_SCALE_MAX + 4)):
+        cold.note_segment(False, stc, window_ms=4.0)
+    check(cold.segment_rows_for(stc) == base // SEG_SCALE_MAX and cold.starved(),
+          f"starvation: a session that starves from its first statement reaches the backstop "
+          f"({cold.segment_rows_for(stc)} rows of {base}) and only reports starved there")
+    cold.note_segment(True, stc, rows=base // SEG_SCALE_MAX, ms=1.6)
+    cold.note_segment(True, stc, rows=base // SEG_SCALE_MAX, ms=1.6)
+    check(not cold.starved() and cold.segment_cost_model(stc) is None,
+          "starvation: a segment that lands clears it, and one size is still not a model")
+    m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2, base // 4, base // 8, base // 16])
+    floor = m.segment_floor_rows(st)
+    check(not m.starved(), "starvation: a session that is landing segments is not starving")
+    for _ in range(SEG_YIELD_WINDOW * 12):
+        m.note_segment(False, st, window_ms=0.3)
+    check(m.segment_rows_for(st) == floor and m.starved(),
+          f"starvation: nothing lands, the size walks down to the floor and stops there "
+          f"({m.segment_rows_for(st)} rows, floor {floor}), and the manager says it is starving")
+    check(abs(m.window_seen_ms() - 0.3) < 1e-9,
+          f"starvation: and what window it measured while getting there ({m.window_seen_ms()} ms)")
+    for _ in range(SEG_YIELD_WINDOW):
+        m.note_segment(True, st, rows=floor, ms=0.4)
+    check(not m.starved(),
+          "starvation: and it is not starving any more the moment segments land again")
+    before = m.segment_rows_for(st)
+    for _ in range(SEG_YIELD_WINDOW * 4):
+        m.note_segment(True, st, rows=m.segment_rows_for(st), ms=0.4)
+    check(m.segment_rows_for(st) > before,
+          f"starvation: the halvings are given back as the yield recovers "
+          f"({m.segment_rows_for(st)} rows, was {before})")
+
+    print("== the segment statement: planned once, and every row still read exactly once")
+    # The session hands DuckDB the segment statement once (PREPARE) and then
+    # only the row range (EXECUTE), which is worth about a tenth of a small
+    # segment on an M4 Max. What must not change is which rows are read, so
+    # that is what is checked here: the ranges tile [0, rows) with no gap and
+    # no overlap, in both the prepared form and the fallback.
+    class SegCur:
+        """A cursor that plays a table of `rows` rows, recording every
+        statement. `no_prepare` makes PREPARE fail the way an engine that
+        would not take it does."""
+
+        def __init__(self, rows, no_prepare=False):
+            self.rows, self.no_prepare, self.calls = rows, no_prepare, []
+            self.last = []
+
+        def execute(self, sql, params=None):
+            self.calls.append(sql)
+            if sql.startswith("PREPARE") and self.no_prepare:
+                raise RuntimeError("Parser Error: this engine would not take that")
+            if sql.startswith("SELECT max(rowid)"):
+                self.last = [(self.rows - 1,)]
+            elif "gpu_upload_finish" in sql:
+                self.last = [(self.rows,)]
+            else:
+                self.last = [(1,)]
+            return self
+
+        def fetchall(self):
+            return self.last
+
+        def ranges(self):
+            out = []
+            for c in self.calls:
+                if c.startswith("EXECUTE "):
+                    a, b = c[c.index("(") + 1:c.rindex(")")].split(",")
+                    out.append((int(a), int(b)))
+                elif " WHERE rowid >= " in c and not c.startswith("PREPARE"):
+                    a = int(c.split(" WHERE rowid >= ")[1].split(" AND ")[0])
+                    out.append((a, int(c.split(" rowid < ")[1])))
+            return out
+
+    def session(rows, seg, no_prepare=False):
+        m = manager(Clock(), Device(Clock()), None, idle_ms=0.0, segment_rows=seg)
+        st = offer(m, "seg", 1 * MiB)
+        st.fqn, st.upload_sql = "tbl", "SELECT gpu_upload_pair_exact('seg', k, v) FROM tbl AS gpu_o"
+        st.state = "uploading"
+        cur = SegCur(rows, no_prepare)
+        return m, st, cur, m._session(cur, st, st.epoch)
+
+    def tiles(rs, rows, seg):
+        want = [(a, a + seg) for a in range(0, rows, seg)]
+        return rs == want
+
+    m, st, cur, out = session(250_000, 100_000)
+    preps = [c for c in cur.calls if c.startswith("PREPARE")]
+    execs = [c for c in cur.calls if c.startswith("EXECUTE ")]
+    check(out == "ready" and len(preps) == 1 and len(execs) == 3
+          and tiles(cur.ranges(), 250_000, 100_000) and st.rows_seen == 250_000,
+          f"segment statement: one PREPARE and {len(execs)} EXECUTEs tiling [0, 250000) "
+          f"exactly once ({cur.ranges()}), rows_seen {st.rows_seen}")
+    check(any(c.startswith("DEALLOCATE") for c in cur.calls),
+          "segment statement: and the plan is given back at the end of the session")
+    m, st, cur, out = session(250_000, 100_000, no_prepare=True)
+    check(out == "ready" and not [c for c in cur.calls if c.startswith("EXECUTE ")]
+          and tiles(cur.ranges(), 250_000, 100_000) and st.rows_seen == 250_000,
+          f"segment statement: an engine that will not PREPARE gets the statement rendered per "
+          f"segment, over the same ranges ({cur.ranges()})")
 
     print("== back-off: an interrupted sort cache is retried, not skipped")
     # `ready` means uploaded AND prepared. A skipped sort cache left the set

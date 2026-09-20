@@ -543,6 +543,7 @@ def run():
 
     print("== segmented upload (0c): progress kept across interrupts; a write mid-session discards it")
     import random
+    import statistics as _stats
     con = fresh(residency="background", idle_ms=5)
     con._manager.quiet_s = 0.2
     con.execute("CREATE TABLE big AS SELECT (range % 1000)::INTEGER AS k, range::BIGINT AS v FROM range(2000000)")
@@ -551,18 +552,46 @@ def run():
     con.execute(qb).fetchall()
     tag = con.last_rewrite()["tag"]
     check(tag and not con.last_rewrite()["rewritten"], "big: first sighting native, upload scheduled")
-    # interactive cadence while the session runs: short statements with 0-10 ms gaps
-    # The manager only uses idle windows and backs off (doubling, capped) after
-    # each interrupted segment, so time-to-ready under this cadence is not the
-    # property under test — completion without intruding is. Generous budget.
+    # What a segment of this table COSTS on this machine, measured here rather
+    # than assumed: a few segments with nothing racing them. The cost is host
+    # work (a scan, a bind, DuckDB's set-up over the table's row groups) and it
+    # is a different number of milliseconds on every machine — 1.6 ms for
+    # 100000 rows on an M4 Max, 2.9 ms on the x86 box (2026-09-20). Everything
+    # below is expressed in terms of it, so the section asserts a property the
+    # mechanism can satisfy anywhere rather than one machine's timing.
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 60:
+        pr = con._manager.progress()[tag]
+        if len(pr["seg_ms"]) >= 4 or pr["state"] == "ready":
+            break
+        time.sleep(0.001)
+    pr = con._manager.progress()[tag]
+    seg_cost = _stats.median(pr["seg_ms"]) if pr["seg_ms"] else 0.0
+    idle_ms = con._manager.idle_ms
+    check(seg_cost > 0.0 and pr["segments"] >= 1,
+          f"big: a segment of 100000 rows costs {seg_cost:.2f} ms here "
+          f"({pr['segments']} segments landed unraced)")
+    # A cadence whose gaps a segment CAN fit into: the manager waits idle_ms
+    # before it starts one and the segment then needs seg_cost, so a gap of
+    # 4 x (idle_ms + seg_cost) is on average two segments wide and leaves room
+    # for one about three times out of four. The budget is derived the same
+    # way — segments left x 12 gaps each — and floored at 30 s so a loaded
+    # machine is not timed out by its own noise.
+    gap_hi = 4.0 * (idle_ms + seg_cost) / 1000.0
+    left = max(1, pr["planned"] - pr["segments"])
+    budget = max(30.0, left * 12.0 * (idle_ms + seg_cost) / 1000.0)
     t0 = time.monotonic()
     n_stmts = 0
-    while not con._manager.is_ready(tag) and time.monotonic() - t0 < 180:
+    while not con._manager.is_ready(tag) and time.monotonic() - t0 < budget:
         con.execute("SELECT count(*) FROM big WHERE v = 3").fetchall()
         n_stmts += 1
-        time.sleep(random.uniform(0, 0.01))
+        time.sleep(random.uniform(0, gap_hi))
+    took = time.monotonic() - t0
     pr = con._manager.progress()[tag]
-    check(pr["state"] == "ready", f"big: session finished while statements flowed ({n_stmts} statements, {pr})")
+    check(pr["state"] == "ready",
+          f"big: with gaps of up to {gap_hi * 1000:.1f} ms — four times the {idle_ms:.0f} ms idle "
+          f"wait plus a {seg_cost:.2f} ms segment — the session finished in {took:.1f} s of a "
+          f"{budget:.0f} s budget, while {n_stmts} statements flowed ({pr['interrupts']} interrupts)")
     check(pr["segments"] == pr["planned"] == 20, f"big: all planned segments landed: {pr['segments']}/{pr['planned']}")
     seen = con._raw.execute("SELECT rows_seen, rows, state FROM gpu_residents() WHERE name = ?", [tag]).fetchone()
     check(seen == (2000000, 2000000, "ready"), f"big: extension saw every row exactly once: {seen}")
@@ -596,6 +625,95 @@ def run():
           f"big: re-uploaded after the write, answer correct ({pr['segments']} segments)")
     seen = con._raw.execute("SELECT rows_seen FROM gpu_residents() WHERE name = ?", [tag]).fetchone()
     check(seen == (2000000,), f"big: rows_seen after re-upload: {seen}")
+
+    # ---- STARVED: a cadence that leaves no window at all ----
+    # The other half of the property, labelled as what it is. The gaps here are
+    # the idle wait plus a tenth of a segment, so no segment of any size the
+    # manager will take can fit one. What must then be true is not that the
+    # upload finishes — it cannot — but that nothing is forced: no segment is
+    # pushed through beside a statement, every statement is answered by DuckDB
+    # with native's rows, the size walks down to its measured floor and stops
+    # there, and the manager SAYS it is starved instead of grinding finer.
+    con._manager.segment_rows = None                 # unpinned: the size may adapt
+    # A smaller default segment for this case only. The mechanism is scale-free
+    # — what decides everything is a segment's cost against the gap the
+    # workload leaves — and at 1 MiB the walk down to the floor takes eight
+    # attempts per halving of a 0.6 ms segment rather than of a 3 ms one, i.e.
+    # seconds rather than most of a minute.
+    from gpudb import _residency as _res
+    seg_bytes = _res.SEGMENT_BYTES
+    _res.SEGMENT_BYTES = 1 << 20
+    try:
+        con.execute("CREATE TABLE big2 AS SELECT (range % 997)::INTEGER AS k, range::BIGINT AS v FROM range(2000000)")
+        q2 = "SELECT k, sum(v) FROM big2 GROUP BY k"
+        nat2 = con._raw.execute(q2).fetchall()
+        probe2 = "SELECT count(*) FROM big2 WHERE v = 3"
+        nat_probe = con._raw.execute(probe2).fetchall()
+        con.execute(q2).fetchall()
+        tag2 = con.last_rewrite()["tag"]
+        default2 = con._manager.get(tag2).segment_rows_default
+        # one segment while the connection is still quiet, so the cost of a
+        # default-sized segment is measured — that is what the floor is judged
+        # against — and then the crowd arrives and nothing fits any more
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 60 and not con._manager.progress()[tag2]["seg_ms"]:
+            time.sleep(0.001)
+        pr2 = con._manager.progress()[tag2]
+        cost2 = pr2["seg_ms"][0] if pr2["seg_ms"] else seg_cost
+        # gaps of the idle wait plus a tenth of a segment: the idle test passes
+        # promptly (it is what the manager asks for) and what is left over is
+        # far below the cost of any segment it will take. This is the shape the
+        # x86 box's wrapper run was in on 2026-09-20 — segments starting at
+        # 5.1-9.9 ms of idle with about 2.5 ms of window against a 2.9 ms
+        # segment — with the margin widened so the case is the same everywhere.
+        gap = (idle_ms + min(0.2, 0.1 * cost2)) / 1000.0
+        t0, n2, lat, wrong = time.monotonic(), 0, [], 0
+        while time.monotonic() - t0 < 60.0:
+            t1 = time.monotonic()
+            rows = con.execute(probe2).fetchall()
+            lat.append((time.monotonic() - t1) * 1000.0)
+            wrong += (rows != nat_probe)
+            n2 += 1
+            pr2 = con._manager.progress()[tag2]
+            if pr2["starved"] and pr2["segment_rows"] == pr2["floor_rows"]:
+                break                                # the property is there; no need to wait it out
+            time.sleep(gap)
+        pr2 = con._manager.progress()[tag2]
+        p50 = _stats.median(lat)
+        p99 = sorted(lat)[min(len(lat) - 1, int(len(lat) * 0.99))]
+        at_floor = pr2["segment_rows"] >= pr2["floor_rows"]
+        check(pr2["interrupts"] > 0 and wrong == 0 and at_floor,
+              f"big starved: gaps of {gap * 1000:.2f} ms against a {cost2:.2f} ms segment — the "
+              f"upload took only what the gaps gave it ({pr2['segments']} of {pr2['planned']} "
+              f"segments, {pr2['interrupts']} interrupts, state {pr2['state']}), all {n2} "
+              f"statements kept native's rows (latency p50 {p50:.2f} ms, p99 {p99:.2f} ms), and "
+              f"the segment never went under the {pr2['floor_rows']}-row floor this machine's own "
+              f"segment cost puts it at ({pr2['segment_rows']} rows of a {default2} default)")
+        # Which of the two ends this cadence reaches is the machine's to decide,
+        # and both are correct behaviour: either no segment fits at all, the
+        # size walks down to the floor and the manager SAYS it is starving
+        # rather than grinding finer — or this machine's interrupt latency
+        # leaves real windows after all, some segments land in them, and what
+        # lands is whole. What must never happen is a segment forced through,
+        # a wrong answer, or a size below the floor.
+        got2 = con.execute(q2).fetchall()
+        starving = (pr2["starved"] and pr2["segment_rows"] == pr2["floor_rows"]
+                    and pr2["state"] in ("uploading", "pending")
+                    and got2 == nat2 and not con.last_rewrite()["rewritten"])
+        finished = (pr2["state"] == "ready" and got2 == nat2
+                    and con._raw.execute("SELECT rows_seen FROM gpu_residents() WHERE name = ?",
+                                         [tag2]).fetchone() == (2000000,))
+        which = ("no segment fitted, so the size stopped at the floor and the manager reports "
+                 "starved; the set is not resident and the answer is native" if starving else
+                 "the gaps turned out to be real after all: the set landed, whole and correct"
+                 if finished else "neither: see the numbers")
+        floor_cost = con._manager._cost_at(con._manager.segment_costs(con._manager.get(tag2)),
+                                           pr2["floor_rows"])
+        check(starving or finished,
+              f"big starved: {which} (window measured {pr2['window_ms']} ms, a floor segment "
+              f"would need {floor_cost:.2f} ms, state {pr2['state']}, starved={pr2['starved']})")
+    finally:
+        _res.SEGMENT_BYTES = seg_bytes
     con.close()
 
     # ---- avg over DECIMAL is declined where SQL cannot reproduce native (rule 2) ----

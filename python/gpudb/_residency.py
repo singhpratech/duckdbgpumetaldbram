@@ -108,7 +108,58 @@ SEG_YIELD_WINDOW = 8             # attempts a decision is taken over
 # rule is for. It is a starvation guard, not a tuning knob.
 SEG_YIELD_LOW = 0.125
 SEG_YIELD_HIGH = 0.875           # 7 of 8 or more land -> give the halving back
-SEG_SCALE_MAX = 32               # ... down to 1/32 of the 8 MiB segment (256 KiB), the floor
+SEG_SCALE_MAX = 32               # 1/32 of the 8 MiB segment: the floor while nothing is measured
+
+# ---- ... and how small is worth going, which the machine has to say ----
+# A segment has a FIXED cost no smaller segment escapes: the statement's own
+# parse and bind, and DuckDB's scan set-up over every row group of the table.
+# Measured through this manager on an M4 Max over a 2M-row table (2026-09-20,
+# docs/RESEARCH_NOTES.md): 0.40 ms for a segment of 8192 rows against 2.6 ms
+# for one of 524288 — a sixty-fourth of the rows for a sixth of the time, so
+# the same table costs 98 ms of scanning in small pieces where it costs 10 ms
+# in default ones. So a halving is judged on the TOTAL work it adds, and the
+# shrinking stops at the smallest size whose total for this table stays within
+# SEG_TOTAL_MAX_RATIO of the default's (`_segment_floor_locked`). Where a
+# segment really does cost `fixed + rows x per_row` that is the same size at
+# which the two parts are equal. A connection that leaves no window even at
+# the floor is STARVED rather than ground finer: the set does not become
+# resident, every statement keeps its native answer, and progress() says so
+# (`starved`, with the window and the segment cost it was judged on).
+#
+# How much more total scanning the background upload may do to fit a workload
+# that leaves small gaps, against what the table costs at the default size.
+# Four, because that is what the two machines' measured curves say the useful
+# range is worth: on the x86 box the table costs 46 ms in default segments and
+# 152 ms in 32768-row ones (3.3x) — which is where the constant floor of
+# 1/SEG_SCALE_MAX happened to sit, now derived instead of assumed — and 427 ms
+# at 8192 rows, which buys a segment only 30% cheaper to attempt. On the M4 Max
+# the same budget stops at 65536 rows. Raising it trades background CPU for a
+# chance at residency under a tighter cadence; nothing else changes.
+SEG_TOTAL_MAX_RATIO = 4.0
+# What an UNTRIED halving is assumed to buy, until a segment of that size has
+# landed and said. A halving that buys less than a quarter of the cost is not
+# worth taking at all, so an untried one is priced at exactly that: the most it
+# could be worth without being refused outright. With the budget above it lets
+# the size fall three halvings below the last measured one before the total
+# stops it — and every size it passes through is measured on the way, so the
+# machine's real curve takes over from this guess within a few segments.
+SEG_BLIND_GAIN = 0.75
+SEG_COST_SAMPLES = 8             # landed segments kept per size, for the fit
+SEG_WINDOW_SAMPLES = 16          # recent windows the workload left, for the report
+SEG_MAX_SEGMENTS = 2048          # ... and a table is never cut into more pieces than this
+# Pricing a halving takes TWO landed sizes. A connection that starves from the
+# first statement never gets them — measured on the x86 box (2026-09-20): one
+# segment landed of nine, the model stayed empty, and a floor derived from a
+# single point stopped the shrinking at the size it was already using while the
+# window it was measuring (4.0 ms) was twice what a segment of an eighth that
+# size costs there. So with fewer than two sizes measured the size keeps
+# halving on the yield rule alone, down to the constant backstop and no
+# further — exactly what this did before any of it was measured, so it cannot
+# be worse — and STARVED is declared there rather than three halvings earlier.
+# The window can also let those blind halvings through once a model exists: a
+# connection leaving several times what the cheapest segment measured is not
+# refusing because of the size. It only ever allows.
+SEG_WINDOW_MARGIN = 1.5
 
 # ---- what a resident set is WORTH (§5.5, value-aware residency) ----
 # A set's value is a decaying rate: the milliseconds it saves per second of
@@ -167,6 +218,10 @@ class SetState:
     quiet_wait_ms: float = 0.0
     quiet_forced: int = 0
     segment_rows_used: int = 0      # the size the yield settled on for the last session
+    table_rows: int = 0             # max(rowid) + 1, from the session's bounds statement
+    # what a landed segment of each size COST this set, in ms — the two ends of
+    # it are the fixed part and the per-row part of a segment on this machine
+    seg_cost: Dict[int, List[float]] = field(default_factory=dict)
     finish_window: tuple = (0.0, 0.0)  # time.monotonic() start/end of the last gpu_upload_finish call
     # a DERIVED set (a materialised join, §4.8): no table scan of its own —
     # once every set in `deps` is ready, `steps` (gpu_join_materialize calls)
@@ -279,6 +334,15 @@ class ResidencyManager:
         # (landed or interrupted) it is decided from
         self._seg_scale = 1
         self._seg_landed: List[bool] = []
+        # the windows the workload actually left, in ms: for an interrupted
+        # attempt, how long it ran before the statement arrived. What a segment
+        # has to fit into, measured rather than assumed.
+        self._seg_windows: List[float] = []
+        # the yield asked for a smaller segment and the measured floor refused:
+        # this connection leaves no window a segment of any worthwhile size
+        # fits (see `_segment_floor_locked`)
+        self._seg_starved = False
+        self._plan_seq = 0               # names the session's PREPAREd segment statement
         # the quiet window a step an interrupt cannot stop asks for on a
         # contended machine; 0 turns the mechanism off (GPUDB_UPLOAD_QUIET_MS)
         self.quiet_ms = _env_float("GPUDB_UPLOAD_QUIET_MS", HEAVY_QUIET_MS)
@@ -431,6 +495,7 @@ class ResidencyManager:
         with self._lock:
             cores = (statistics.median(self._seg_cores)
                      if len(self._seg_cores) >= CONTENTION_MIN_SAMPLES else 0.0)
+            window = statistics.median(self._seg_windows) if self._seg_windows else 0.0
             return {t: {"state": s.state, "segments": s.segments, "planned": s.segments_planned,
                         "rows_seen": s.rows_seen, "interrupts": s.interrupts,
                         "attempts": s.attempts, "session_ms": round(s.session_ms, 1),
@@ -446,8 +511,19 @@ class ResidencyManager:
                         # segment_rows_for would take the lock this holds)
                         "segment_rows": (s.segment_rows_used or int(self.segment_rows or 0)
                                          or max(1, s.segment_rows_default // self._seg_scale)),
-                        "seg_scale": self._seg_scale}
-                    for t, s in self._sets.items()}
+                        "seg_scale": self._seg_scale,
+                        # §5.5 the segment that fits: what a segment of this set
+                        # costs here (fixed part and per-row part, fitted to the
+                        # segments that landed), the smallest size still worth
+                        # taking, the window this workload has been leaving, and
+                        # whether the two have stopped meeting
+                        "fixed_ms": round(model[0], 3) if model else 0.0,
+                        "per_row_us": round(model[1] * 1000.0, 4) if model else 0.0,
+                        "floor_rows": self._segment_floor_locked(s),
+                        "window_ms": round(window, 2),
+                        "starved": self._seg_starved}
+                    for t, s, model in ((t, s, self.segment_cost_model(s))
+                                        for t, s in self._sets.items())}
 
     # ---- value: what a set is worth (§5.5) ----
     def _decay_locked(self, s: SetState, now: float) -> None:
@@ -1049,10 +1125,16 @@ class ResidencyManager:
             now = time.monotonic()
             if now >= not_before and self._in_flight == 0 and self._idle_ms() >= idle_ms:
                 return True
-            wait_s = max(0.002, idle_ms / 1000.0)
-            if now < not_before:
-                wait_s = max(wait_s, not_before - now)
-            self._cv.wait(timeout=wait_s)
+            # Wake when the test could FIRST pass — idle_ms after the last
+            # statement, or `not_before`, whichever is later — and not a whole
+            # idle_ms from here, which is what this waited before 2026-09-20.
+            # The window a segment then has is the whole of the gap the
+            # workload leaves minus idle_ms, rather than that minus up to
+            # 2 x idle_ms: on the x86 box segments were starting at 5.1-9.9 ms
+            # of idle against a threshold of 5 (median 5.26), and the gap they
+            # were competing for is itself only a few ms.
+            target = max(not_before, self._last_activity + idle_ms / 1000.0)
+            self._cv.wait(timeout=min(max(target - now, 0.0005), 0.05))
 
     def _trace_line(self, msg: str) -> None:
         if self._trace:
@@ -1091,7 +1173,8 @@ class ResidencyManager:
         seen = self.cores_seen()
         return 0.0 < seen < CONTENDED_CORES_FRACTION * self._cpus
 
-    def note_segment(self, landed: bool) -> int:
+    def note_segment(self, landed: bool, s: Optional[SetState] = None, *,
+                     rows: int = 0, ms: float = 0.0, window_ms: float = 0.0) -> int:
         """One segment attempt ended. Returns the divisor the next segment
         should use: the size follows the YIELD, not the clock, because what
         decides whether a segment lands is its cost against the window the
@@ -1099,35 +1182,231 @@ class ResidencyManager:
         the outcome is. A halving is given back as readily as it is taken, so
         a session that is only briefly crowded does not stay small.
 
-        Both bounds are hard: the divisor never passes SEG_SCALE_MAX, and a
-        landed segment is progress that is never undone, so a session
-        terminates at the floor however busy the connection is."""
+        What the attempt MEASURED comes in with it: `ms` is what a landed
+        segment of `rows` rows cost (the pair of sizes behind the fit of the
+        fixed and per-row parts), `window_ms` is how long an interrupted one
+        ran before the statement arrived, which is the window the workload is
+        leaving. Both are optional — with neither, the floor is the constant
+        backstop and the rule is exactly what it was.
+
+        Both bounds are hard: a halving that is not worth taking is refused
+        (`segment_floor_rows`, and the set is then reported STARVED rather
+        than ground finer), and a landed segment is progress that is never
+        undone, so a session terminates at the floor however busy the
+        connection is."""
         if self.segment_rows:
             return 1                     # the size is pinned; there is nothing to decide
         with self._lock:
+            if landed and s is not None and rows > 0 and ms > 0.0:
+                xs = s.seg_cost.setdefault(int(rows), [])
+                xs.append(float(ms))
+                del xs[:-SEG_COST_SAMPLES]
+            if not landed and window_ms > 0.0:
+                self._seg_windows.append(float(window_ms))
+                del self._seg_windows[:-SEG_WINDOW_SAMPLES]
             self._seg_landed.append(bool(landed))
             if len(self._seg_landed) < SEG_YIELD_WINDOW:
                 return self._seg_scale
             yld = sum(self._seg_landed) / float(len(self._seg_landed))
-            if yld <= SEG_YIELD_LOW and self._seg_scale < SEG_SCALE_MAX:
-                self._seg_scale *= 2
-                self._seg_landed = []
+            if yld <= SEG_YIELD_LOW:
+                base = s.segment_rows_default if s is not None else 0
+                floor = self._segment_floor_locked(s)
+                nxt = max(1, base // (self._seg_scale * 2)) if base else 0
+                if base and nxt < floor:
+                    # smaller would not be meaningfully cheaper, so it would not
+                    # land either: this connection leaves no window, and saying
+                    # so is more use than grinding the segment finer
+                    self._seg_starved = True
+                    del self._seg_landed[:-SEG_YIELD_WINDOW]
+                elif not base and self._seg_scale >= SEG_SCALE_MAX:
+                    self._seg_starved = True
+                    del self._seg_landed[:-SEG_YIELD_WINDOW]
+                else:
+                    self._seg_scale *= 2
+                    self._seg_landed = []
+                    self._seg_starved = False
             elif yld >= SEG_YIELD_HIGH and self._seg_scale > 1:
                 self._seg_scale //= 2
                 self._seg_landed = []
+                self._seg_starved = False
             else:
                 del self._seg_landed[:-SEG_YIELD_WINDOW]
+                if yld > SEG_YIELD_LOW:
+                    self._seg_starved = False
             return self._seg_scale
+
+    @staticmethod
+    def segment_costs(s: SetState) -> List[Tuple[int, float]]:
+        """What a segment of each size COSTS this set here, ascending by size:
+        the FASTEST of the segments of that size that landed.
+
+        The fastest and not the median because the quantity wanted is the work
+        a segment is, not what the machine was doing beside it: a segment that
+        lands while a user statement is being answered on the other cores is
+        descheduled part of the time and reads slower than it is (measured
+        under the wrapper suite's starved cadence: 16384 rows timed at 2.1 ms
+        where the same segment unraced costs 0.55). Interrupted attempts are
+        not in it at all — they were cut short and say nothing about cost."""
+        pts, top = [], 0.0
+        for r, xs in sorted(s.seg_cost.items()):
+            if not xs:
+                continue
+            # ... and never less than a smaller segment: a bigger one reads
+            # everything it reads, so an inversion is noise, not a measurement
+            top = max(top, min(xs))
+            pts.append((r, top))
+        return pts
+
+    @classmethod
+    def segment_cost_model(cls, s: SetState) -> Optional[Tuple[float, float]]:
+        """(fixed ms, ms per row) near the SMALL end of the measured sizes, or
+        None while fewer than two sizes have landed.
+
+        Near the small end, and not over the whole range, because the curve is
+        not a straight line: a segment large enough to span several row groups
+        is scanned in parallel and costs far less per row than a small one
+        (measured on an M4 Max: 0.0051 us/row at 524288 rows against 0.0488 at
+        8192). The two parts of the cost are only meaningful locally, and the
+        place the floor cares about is the bottom."""
+        pts = cls.segment_costs(s)
+        if len(pts) < 2:
+            return None
+        (r0, t0), (r1, t1) = pts[0], pts[1]
+        slope = (t1 - t0) / float(r1 - r0)
+        if slope <= 0.0:
+            return None
+        return max(0.0, t0 - r0 * slope), slope
+
+    @staticmethod
+    def _cost_at(pts: List[Tuple[int, float]], r: int) -> float:
+        """What a segment of `r` rows costs, from the sizes that landed: the
+        measurement where there is one, else the nearest ones carried along
+        their local slope. A size below everything measured is never priced
+        under SEG_BLIND_GAIN per halving of the smallest measurement — the
+        fixed part is what a smaller segment cannot escape, and pricing it away
+        is the one error that would let the size run off to nothing."""
+        d = dict(pts)
+        if r in d:
+            return d[r]
+        if r < pts[0][0]:
+            r0, t0 = pts[0]
+            steps = max(1, int(math.ceil(math.log(r0 / float(max(1, r)), 2))))
+            blind = t0 * (SEG_BLIND_GAIN ** steps)
+            if len(pts) < 2:
+                return blind
+            r1, t1 = pts[1]
+            slope = max(0.0, (t1 - t0) / float(r1 - r0))
+            return max(blind, t0 - (r0 - r) * slope)
+        if len(pts) == 1:
+            r0, t0 = pts[0]
+            return t0 * (r / float(r0))
+        if r > pts[-1][0]:
+            (r0, t0), (r1, t1) = pts[-2], pts[-1]
+            slope = max(0.0, (t1 - t0) / float(r1 - r0))
+            return t1 + (r - r1) * slope
+        lo = max(p for p in pts if p[0] <= r)
+        hi = min(p for p in pts if p[0] >= r)
+        if hi[0] == lo[0]:
+            return lo[1]
+        return lo[1] + (r - lo[0]) / float(hi[0] - lo[0]) * (hi[1] - lo[1])
+
+    def _segment_floor_locked(self, s: Optional[SetState]) -> int:
+        """The smallest segment still worth taking for this set, in rows.
+        Caller holds the lock.
+
+        What a halving costs is TOTAL work: the fixed part of a segment — the
+        statement's own bind and DuckDB's scan set-up over the table's row
+        groups — is paid once per segment however few rows it asks for, so
+        halving the size adds a whole fixed part per pair of segments. The
+        floor is therefore the smallest size whose predicted total for this
+        table stays within SEG_TOTAL_MAX_RATIO of the total at the default
+        size, priced from the segments that actually landed here. Measured on
+        an M4 Max over a 2M-row table (2026-09-20): 2.6 ms per 524288-row
+        segment and 0.4 ms per 8192-row one, i.e. 10 ms for the table at the
+        default and 98 ms in 8192-row pieces — ten times the work for a
+        segment that is only 6x cheaper to attempt. Where the cost really is
+        `fixed + rows x per_row` this is exactly the size at which the two
+        parts are equal, which is the same statement in other words.
+
+        Pricing a halving takes TWO landed sizes (and one of them the default,
+        or the reference is an extrapolation across the part of the curve that
+        bends). Until then the floor is the constant backstop, 1/SEG_SCALE_MAX
+        of the default — what this was before any of it was measured, so a
+        connection that starves from its first statement keeps halving on the
+        yield rule alone and reports STARVED at that backstop rather than
+        wherever a single measurement happened to leave it. A table is never
+        cut into more than SEG_MAX_SEGMENTS pieces on any of these paths."""
+        if s is None:
+            return 0
+        base = s.segment_rows_default
+        rows = float(s.table_rows or base)
+        hard = max(1, -(-int(rows) // SEG_MAX_SEGMENTS))
+        blind = min(base, max(hard, max(1, base // SEG_SCALE_MAX)))
+        pts = self.segment_costs(s)
+        at_base = dict(pts).get(base, 0.0)
+        if len(pts) < 2 or at_base <= 0.0:
+            return blind
+        budget = SEG_TOTAL_MAX_RATIO * (rows / base) * at_base
+        floor = r = base
+        while r // 2 >= hard:
+            r //= 2
+            if (rows / r) * self._cost_at(pts, r) > budget:
+                break
+            floor = r
+        floor = min(base, max(1, floor))
+        # ... and the window has the last word in the one direction it can be
+        # trusted in: if the connection is plainly leaving more time than the
+        # cheapest segment ever cost here, a smaller one may well fit and the
+        # blind halvings are let through after all. It only ever ALLOWS; it
+        # never forces a segment, never goes below the constant backstop, and
+        # never overrides a size that is landing.
+        if floor > blind and self._window_allows_smaller_locked(pts):
+            return blind
+        return floor
+
+    def _window_allows_smaller_locked(self, pts: List[Tuple[int, float]]) -> bool:
+        """Is the measured window evidence that a smaller segment would fit?
+        Caller holds the lock.
+
+        The window is how long an interrupted segment got to run before the
+        statement arrived, so it is an upper bound on what this connection
+        leaves — it includes the latency of honouring the interrupt. Compared
+        against the cheapest segment ever measured here, it is still worth
+        something: a window several times that cost, with nothing landing,
+        says the size is not yet the reason."""
+        if not self._seg_windows or not pts:
+            return False
+        cheapest = min(t for _r, t in pts)
+        return (cheapest > 0.0
+                and statistics.median(self._seg_windows) > SEG_WINDOW_MARGIN * cheapest)
+
+    def segment_floor_rows(self, s: SetState) -> int:
+        with self._lock:
+            return self._segment_floor_locked(s)
+
+    def window_seen_ms(self) -> float:
+        """The median window this connection has been leaving between its
+        statements, from the interrupted attempts; 0.0 when none was seen."""
+        with self._lock:
+            return statistics.median(self._seg_windows) if self._seg_windows else 0.0
+
+    def starved(self) -> bool:
+        """The yield asked for a smaller segment and the floor refused: no
+        segment worth taking fits this connection's gaps. Correct and never
+        slower — the set is simply not becoming resident (KNOWN_ISSUES.md)."""
+        with self._lock:
+            return self._seg_starved
 
     def segment_rows_for(self, s: SetState) -> int:
         """Rows in the next segment of this set: its own 8 MiB worth, divided
-        by what the yield has settled on. An explicit `segment_rows` (a test,
-        a sweep) is taken as given and never adapted."""
+        by what the yield has settled on, never below the measured floor. An
+        explicit `segment_rows` (a test, a sweep) is taken as given and never
+        adapted."""
         if self.segment_rows:
             return int(self.segment_rows)
         with self._lock:
-            scale = self._seg_scale
-        return max(1, s.segment_rows_default // scale)
+            rows = max(1, s.segment_rows_default // self._seg_scale)
+            return max(rows, self._segment_floor_locked(s))
 
     def quiet_want_ms(self, need_ms: float, waited_s: float) -> float:
         """The idle stretch a step an interrupt cannot stop still insists on,
@@ -1243,9 +1522,52 @@ class ResidencyManager:
                     break
         return {"open": False}
 
-    def _abort(self, cur, s: SetState) -> None:
+    def _abort(self, cur, s: SetState, plan: str = "") -> None:
         try:
             cur.execute("SELECT gpu_upload_abort(?)", [s.session_name]).fetchall()
+        except Exception:
+            pass
+        self._deallocate(cur, plan)
+
+    def _prepare_segment(self, cur, s: SetState) -> str:
+        """Hand the segment statement to the database ONCE for the session and
+        keep only its row range per segment, or "" when that cannot be done and
+        the segment statement is rendered in full each time (what this did
+        before 2026-09-20).
+
+        A segment's cost has a fixed part that no smaller segment escapes, and
+        part of it is the statement's own parse and bind — measured on an M4
+        Max over a 13-lane upload, 121 us of a 935 us segment, and 35-50 us of
+        a 2-lane one. A PREPARE is where DuckDB keeps a plan, so the session
+        makes one and EXECUTEs it; the row range stays a literal, which is what
+        lets the scan go on pruning row groups by it (the wrapper's parameter
+        path is measurably SLOWER than the literal one — 497 us against 368 —
+        so it is not used here).
+
+        Everything else about the statement is unchanged, so the rows it reads
+        and the order it reads them in are unchanged: the accounting checks
+        (rows_seen == rows, every row exactly once) are what prove that."""
+        if "$" in s.upload_sql:
+            return ""                     # a $ in the text would be read as a parameter
+        with self._lock:
+            self._plan_seq += 1
+            name = f"gpudb_seg_{self._plan_seq}"
+        try:
+            self._run(cur, s, f"PREPARE {name} AS {s.upload_sql} "
+                              f"WHERE rowid >= $1 AND rowid < $2")
+            return name
+        except Exception as e:
+            # an interrupt, an older engine, a shape PREPARE will not take: the
+            # session simply renders each segment, which costs the parse back
+            self._trace_line(f"{s.tag}: the segment statement was not prepared "
+                             f"({str(e)[:80]}); rendering each segment instead")
+            return ""
+
+    def _deallocate(self, cur, plan: str) -> None:
+        if not plan:
+            return
+        try:
+            cur.execute(f"DEALLOCATE {plan}").fetchall()
         except Exception:
             pass
 
@@ -1303,13 +1625,16 @@ class ResidencyManager:
             s.segments_planned = planned
             s.rows_seen = 0
             s.seg_ms = []
+            s.table_rows = int(max_rowid) + 1
             s.quiet_waits = s.quiet_forced = 0
             s.quiet_wait_ms = 0.0
-        # 2. begin
+        # 2. begin, and hand the segment statement's PLAN to the database once
+        #    for the whole session rather than per segment
         try:
             self._run(cur, s, "SELECT gpu_upload_begin(?)", [s.session_name])
         except Exception as e:
             return "pending" if _is_interrupt(str(e)) else self._fail(s, e)
+        plan = self._prepare_segment(cur, s)
         # 3. segments, each only in an idle window
         a, done, consecutive_interrupts, not_before = 0, 0, 0, 0.0
         while a <= max_rowid:
@@ -1317,18 +1642,20 @@ class ResidencyManager:
             with self._cv:
                 ok = self._wait_idle(s, epoch, idle_ms, not_before)
             if not ok:
-                self._abort(cur, s)
+                self._abort(cur, s, plan)
                 return "closed" if self._closed else "stale"
             b = a + seg_rows
-            seg_sql = f"{s.upload_sql} WHERE rowid >= {a} AND rowid < {b}"
-            cores = 0.0
+            seg_sql = (f"EXECUTE {plan}({a}, {b})" if plan else
+                       f"{s.upload_sql} WHERE rowid >= {a} AND rowid < {b}")
+            cores, scan_ms = 0.0, 0.0
             try:
                 t_seg, c_seg = time.monotonic(), time.process_time()
                 self._run(cur, s, seg_sql)
                 landed = True
                 wall = time.monotonic() - t_seg
+                scan_ms = wall * 1000.0
                 with self._lock:
-                    s.seg_ms.append(wall * 1000.0)
+                    s.seg_ms.append(scan_ms)
                 # nothing of ours ran beside this one (a statement that arrives
                 # interrupts, and an interrupted segment does not land here), so
                 # the CPU it burned per wall second is the machine's answer to
@@ -1340,12 +1667,15 @@ class ResidencyManager:
                         self.note_cores(cores)
             except Exception as e:
                 if not _is_interrupt(str(e)):
-                    self._abort(cur, s)
+                    self._abort(cur, s, plan)
                     return self._fail(s, e)
+                # how long the segment got before the statement arrived: the
+                # window this workload is leaving, measured rather than assumed
+                window = (time.monotonic() - t_seg) * 1000.0
                 # interrupted: did the segment land before the interrupt was seen?
                 st = self._session_status(cur, s)
                 if not st.get("open") or st.get("invalidated"):
-                    self._abort(cur, s)
+                    self._abort(cur, s, plan)
                     return "stale"
                 landed = int(st.get("segments", 0)) == done + 1
                 consecutive_interrupts += 1
@@ -1354,15 +1684,21 @@ class ResidencyManager:
                 not_before = time.monotonic() + pause / 1000.0
                 with self._lock:
                     s.interrupts += 1
-            self.note_segment(landed)
+            self.note_segment(landed, s, rows=seg_rows, ms=scan_ms,
+                              window_ms=(0.0 if landed else window))
             if self._trace:
+                starving = ("" if not self.starved() else
+                            f"; starved: no segment above the floor of "
+                            f"{self.segment_floor_rows(s)} rows fits the "
+                            f"{self.window_seen_ms():.1f} ms this connection leaves")
                 self._trace_line(
                     f"{s.tag} segment {done}/{planned} rows [{a},{b}) ({seg_rows} rows): waited "
                     f"{(t_seg - t_want) * 1000.0:.1f} ms for an idle window, scan "
                     f"{(time.monotonic() - t_seg) * 1000.0:.1f} ms on {cores:.1f} of "
                     f"{self._cpus:.0f} cores, "
                     f"{'landed' if landed else 'interrupted'}"
-                    f"{'' if landed else f' (consecutive {consecutive_interrupts}, pausing {pause:.0f} ms)'}")
+                    f"{'' if landed else f' (consecutive {consecutive_interrupts}, pausing {pause:.0f} ms)'}"
+                    f"{starving}")
             if landed:
                 a, done = b, done + 1
                 consecutive_interrupts, not_before = 0, 0.0
@@ -1377,6 +1713,7 @@ class ResidencyManager:
                 s.segment_rows_used = seg_rows
                 s.segments_planned = done + (left + seg_rows - 1) // seg_rows
                 planned = s.segments_planned
+        self._deallocate(cur, plan)      # every segment is in; the plan has no more use
         # 4. finish: device copy + prepare + publish (one scalar call; an
         #    interrupt arriving during it is only seen after it returns, so on
         #    a machine whose cores are taken it waits for a quiet connection)
