@@ -5614,6 +5614,43 @@ interface has always had a place for —
 `Aggregator::groupby_exact_masked_multi` exists to be overridden so a backend
 can share the mask and the grouping, and CUDA does not override it.
 
+## 2026-09-20 — The docs on release day, third pass: the CUDA record settles
+
+The two entries above moved the CUDA numbers twice in one day — once when the
+few-group exemption was turned off and TPC-H SF1 coverage went 17 → 16, once
+when the direct grouped reduce put it back at 17 with every query a win. The
+public documents had been written against the run before both, so this pass
+brought them to the final record: README, the release notes, `docs/INSTALL.md`,
+`docs/CUDA_EXACT_PATH.md`, the registry descriptor and `KNOWN_ISSUES.md`.
+
+Three things the pass had to be careful about.
+
+**"17 of 22" is two different facts.** It is the Metal SF1 figure and, again,
+the CUDA SF1 figure, and for one day it was the CUDA figure minus one. A
+find-and-replace would have been wrong in every file that carries both. The
+coverage table was edited row by row.
+
+**The losing rows shrank from two to one, and that is a claim that has to stay
+auditable.** Q11 at SF10 on Metal through `sql()` is still below 1.0×, with its
+re-run figures. Q1 on CUDA is not, any more — so the README says in one sentence
+that it first measured 0.96× / 0.98×, what the cause was and what it measures
+now, and `BENCHMARK.md` keeps the rest. A number that improves is still a number
+that moved, and deleting the old one would make the record unreadable a month
+from now.
+
+**The thresholds sentence was the one carrying the misconception.** Several
+documents said CUDA takes Metal's table because no constant differed — true, and
+beside the point, as the first of today's two entries worked out. They now say
+what the table actually contains: measured constants, plus one rule that rests
+on a backend capability, which both backends have. The sentences claiming CUDA's
+exact `GROUP BY` only ever sorts are gone, because it does not.
+
+One honest line was added rather than removed: a `WHERE` that matches nothing
+costs the device 0.76 ms against native's 0.21, because DuckDB skips the table
+through its zone maps. It is in `KNOWN_ISSUES.md` and in the release notes'
+"what stays on DuckDB" list, with the note that the measured rule is what hands
+it back, after one run.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
@@ -5636,10 +5673,11 @@ can share the mask and the grouping, and CUDA does not override it.
 - **CUDA**: the exact, mask, join and multi-payload kernels are written
   against the same interface, and the path is on by default since 2026-09-20
   (`GPUDB_CUDA_EXACT=0` turns it off). The gate has been run there — 1630
-  cells on an RTX 4090 Laptop, 0 slower than native, 0 differing — so
+  cells on an RTX 4090 Laptop before the switch, then 1631 cells on the release
+  build with 1014 rewritten and passing, 0 below 1.0x and 0 differing — so
   `_thresholds.TABLE["CUDA"]` stays `METAL` as a measured result. What is open
   is that this is ONE machine and one scale factor: SF10 on CUDA is not
-  recorded, and TPC-H Q1 straddles 1.0x on that box.
+  recorded.
 - **Where the lowering lives**: the join / expression / split lowering is in
   the Python wrapper. The pure rewrite function is language-neutral and
   carries no client of its own, so a client in another language would repeat
@@ -5664,7 +5702,11 @@ can share the mask and the grouping, and CUDA does not override it.
   host.
 - **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
   shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
-  they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
+  they held 23.5. CUDA has the reduce since 2026-09-20, by a different route:
+  it keeps no group-id lane, reading instead against the distinct keys its sort
+  cache already holds, so the shedding does not follow from it and CUDA sheds
+  nothing. What is open there is the shedding, and whether a WHERE on the
+  GROUP BY key
   can be evaluated per GROUP (at most 512 of them) instead of per row, which
   is what still holds Q12's key lane resident. Neither is measured.
 - **Output cost**: for large results the statement is bound by moving rows

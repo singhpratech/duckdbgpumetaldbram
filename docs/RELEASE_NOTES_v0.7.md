@@ -183,6 +183,15 @@ release branch at all.
   leaving the PCIe link idle for each kernel and the GPU idle for each copy. A
   buffer each, and an event instead of a barrier: 18.67 ms down to **12.75 ms**
   over 2M rows in 996 spans, 32% off the upload. Both exact uploads take it.
+- **A direct grouped reduce on CUDA** (#179) — its own answer to the shape
+  #127 gave Apple Silicon Metal, for keys with at most 256 distinct values.
+  The sort path reads each payload through the sort permutation, one random
+  8-byte load per row, so 3 groups cost what 10,000 did (7.57 ms against
+  8.51 over 6M rows). The direct path reads keys and payload in row order
+  against the column's distinct keys — no sort, no permutation, no gather —
+  and the mask compaction that path never reads is now decided away before it
+  runs. One payload with no `WHERE`: 6.1 ms to **1.10 ms**; TPC-H Q1: 19.5–29.2
+  ms to **5.21 ms** against native's 10.91. Same rows, same order.
 
 ## Residency and memory
 
@@ -352,10 +361,11 @@ full licence text so GitHub detects it (#89).
   raced against a real machine (#167, #169, #172). Its check count, like the
   wrapper suite's, is taken per machine and re-counted on the release build.
 - `test_gpudb`: **3056 / 3056** checks on CPU + Metal (M4 Max, release build);
-  752 / 752 on CPU + CUDA (RTX 4090 Laptop) — 711 before #163 gave CUDA a fused
-  `agg_all` and the suite stopped skipping that block, and #171 added the
-  forced-refusal case. In a container with no device the CUDA-only device checks
-  are skipped and the binary reports 402 / 402 (#174).
+  **774 / 774** on CPU + CUDA (RTX 4090 Laptop) — 711 before #163 gave CUDA a
+  fused `agg_all` and the suite stopped skipping that block, #171 added the
+  forced-refusal case, and #179 added 22 for the direct grouped reduce. In a
+  container with no device the CUDA-only device checks are skipped and the
+  binary reported 402 / 402 when that was measured (#174).
 - `run_sql_tests.sh`: **225 passing, 0 failing** on both machines — 46
   expected-failure guardrail cases reached on Metal and 1 skipped, out of 48
   `expected_fail` directives across the 18 files in `test/sql/`.
@@ -444,6 +454,11 @@ one is answered — by DuckDB, at DuckDB's speed. A bare `SELECT count(*) FROM t
 is on this list too and now says why it is: DuckDB answers it from the table's
 own row count without reading a column, and the device plan needs a column to
 build its constant key from (#164 fixed the sentence, not the decision).
+A `WHERE` that matches **nothing** belongs here too: DuckDB skips the table
+through its zone maps and answers in 0.21 ms where the device still scans six
+million rows to find nothing, at 0.76 ms (measured on the RTX 4090 Laptop,
+2026-09-20). No estimate tells the wrapper that native will skip, so the
+per-process measured rule is what hands it back, after one run.
 `docs/TRANSPARENT_DESIGN.md` §10 gives the reason for each, and
 `KNOWN_ISSUES.md` has the rest.
 
@@ -465,29 +480,32 @@ driver at all the extension still loads and falls back to the CPU backend.
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
 #154) and the path is **on by default** there (#168). On an RTX 4090 Laptop the
-unit suite is 752 / 752, the SQL suite 225 passing and 0 failing, the wrapper
-suite 1258 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the device
-with 0 rows differing through both entry points — 0.96×–21.40× through
-`execute()`, 0.98×–13.30× through `sql()`, Q1 the low end of each and a straddle
-of parity there. The same coverage and the same five declines as Metal (#161,
+unit suite is **774 / 774**, the SQL suite 225 passing and 0 failing, the wrapper
+suite passing, and TPC-H at SF1 is **17 of 22 on the device**
+with 0 rows differing through both entry points, every one faster than native:
+1.21× (Q15) – 31.44× (Q9) through `execute()` and 1.66× (Q15) – 16.27× (Q9)
+through `sql()`, with Q1 at 1.99× and 2.07×.
+The same coverage and the same five declines as Metal (#161,
 #168). What turned it on was the evidence the flip
 had been waiting for: the full gate on that box, at the wrapper's own memory
 budget, ran **1630 cells with 0 slower than native and 0 differing**, minimum
 ratio 1.07× — a dated result, taken before the switch.
 
-Re-run on the **release build**, that gate on the same card is **1631 cells,
-1013 rewritten and passing, 616 declined on a threshold, 0 differing — and one
-cell below parity**: a three-group `GROUP BY l_returnflag` with no `WHERE` over
-a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten, **0.93×**. That
-is the TPC-H Q1 shape, already reported above as straddling parity on this card,
-and run on its own the measured rule handed it back to DuckDB after its first
-run on all three attempts. Passing ratios ran 1.00×–406.70×, peak device memory
-2365 MiB. `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild.
+The same gate on the **release build** of that card is **1631 cells, 1014
+rewritten and passing, 616 declined on a threshold, 0 below 1.0×, 0 differing,
+exit 0**, passing ratios 1.01×–487.26×, wall 21m38s. Getting there took one
+correction, which `BENCHMARK.md` records in full: on the first release-build run
+TPC-H Q1 measured 0.96× and 0.98×, because CUDA's exact `GROUP BY` answered a
+key with few distinct values by sorting the whole column. #178 declined that
+shape on a threshold; #179 gave CUDA a direct grouped reduce for such keys, the
+family measured 1.16×–5.72× over 72 cells, and the threshold went back on. Peak
+device memory over the gate was 8485 MiB against the 7972 MiB default budget —
+the budget bounds resident sets, not an operator's working memory.
+`GPUDB_CUDA_EXACT=0` turns the path off again without a rebuild.
 
-Two caveats stay: the thresholds are the Metal-measured ones **verified on one
+One caveat stays: the thresholds are the Metal-measured ones **verified on one
 CUDA machine** rather than measured for every GPU (`_thresholds.TABLE["CUDA"]`
-is still `METAL`, and says so as a dated measured fact), and TPC-H Q1 sits at
-parity on that box — the per-process measured rule is what decides it. And the
+is still `METAL`, and says so as a dated measured fact). And the
 path needs a binary that carries CUDA at all: a Linux binary from the community
 registry may report `compiled=cpu`, in which case CUDA comes from a release
 binary or a source build. `SELECT gpu_build_info();` is what tells them apart.

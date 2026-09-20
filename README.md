@@ -64,12 +64,11 @@ changes, nothing to call.
 
 This path is **on by default on both GPUs** — Apple Silicon Metal and NVIDIA
 CUDA. It was turned on for CUDA once the measurement was there: the full gate on
-an RTX 4090 Laptop, run **before the switch**, was 1630 cells with 0 slower than
-native and 0 differing. Re-run on the **release build**, the same gate on that
-card is 1631 cells, 0 differing, with **one cell below parity** — a three-group
-`GROUP BY` over a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten,
-0.93×; run on its own it is handed back to DuckDB by the measured rule after its
-first run. `GPUDB_CUDA_EXACT=0` turns the CUDA path off again without a rebuild
+an RTX 4090 Laptop, run **before the switch** on 2026-09-20, was 1630 cells with
+0 slower than native and 0 differing. The same gate on the **release build** of
+that card, later the same day, is **1631 cells — 1014 rewritten and passing, 0
+below 1.0×, 0 differing, exit 0** ([BENCHMARK.md](BENCHMARK.md) carries the runs
+in between). `GPUDB_CUDA_EXACT=0` turns the CUDA path off again without a rebuild
 ([Platforms and install](docs/INSTALL.md#platforms-and-install) has the detail,
 including what a registry install on Linux gives you).
 
@@ -176,17 +175,19 @@ the lazy-relation path the `gpudb` shell takes.
 | SF1 (6M-row `lineitem`) | MacBook M4 Max · Metal | `sql()` | 17 of 22 | 0 | 1.37× (Q15) – 9.49× (Q13) |
 | SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | `execute()` | 19 of 22 | 0 | 1.06× (Q11) – 48.10× (Q5) |
 | SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | `sql()` | 19 of 22 | 0 | 0.92× (Q11) – 26.39× (Q5) |
-| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `execute()` | 17 of 22 | 0 | 0.96× (Q1) – 21.40× |
-| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `sql()` | 17 of 22 | 0 | 0.98× (Q1) – 13.30× |
+| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `execute()` | 17 of 22 | 0 | 1.21× (Q15) – 31.44× (Q9) |
+| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `sql()` | 17 of 22 | 0 | 1.66× (Q15) – 16.27× (Q9) |
 
-**Two rows in that table are below 1.0×, and they are printed rather than
-dropped.** On Metal, **Q11 at SF10 straddles parity**: a 6–7 ms statement, 1.06×
-through `execute()` and 0.92× through `sql()` in the timed run, 1.06× and 0.89×
-in two immediate re-runs of the same build. On CUDA, **Q1 straddles parity** the
-same way, at 0.96× and 0.98× here. Both are exactly the case the per-process
+**One row in that table is below 1.0×, and it is printed rather than dropped.**
+On Metal, **Q11 at SF10 straddles parity**: a 6–7 ms statement, 1.06× through
+`execute()` and 0.92× through `sql()` in the timed run, 1.06× and 0.89× in two
+immediate re-runs of the same build. It is exactly the case the per-process
 measured rule exists to settle: it times the template against native in your own
-process and hands it back to DuckDB where it loses. No other query in these
-coverage runs is below 1.0×, at either scale factor, on either card.
+process and hands it back to DuckDB where it loses. Nothing on the CUDA card is
+below 1.0× in these coverage runs — TPC-H Q1 first measured 0.96× and 0.98×
+there on the release build, the cause was found (a few-group key was being
+answered by sorting the whole column), CUDA got a direct grouped reduce for such
+keys, and Q1 now measures 1.99× through `execute()` and 2.07× through `sql()`.
 
 The queries that stay on DuckDB are declined on purpose, and which ones stay
 depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
@@ -198,16 +199,18 @@ below the measured size floors at 6M rows (Q2 declines on a size floor there
 too, before its shape is ever looked at). The CUDA box declines the same five at
 SF1. Each of them runs on DuckDB unchanged, at DuckDB's speed.
 
-The thresholds both GPUs use are the Metal-measured ones, verified on one CUDA
-machine rather than measured for every GPU — the 1630-cell gate run on that card
-before the CUDA path was switched on. Its re-run on the release build is
-described above: 0 differing, and one gate cell at 0.93× that the measured rule
-declines on its own.
+Both GPUs read **one measured thresholds table** — the Metal-measured one,
+verified on one CUDA machine rather than measured for every GPU by the gate runs
+described above. One rule in it is not a constant but a statement about the
+backend: a key with few distinct values is rewritten only where the backend can
+answer it without reading the whole column into a sort. Apple Silicon Metal and
+NVIDIA CUDA both have such a path, so both take the rule.
 
 Query by query at both scale factors, with the four per-query tables and the
 exact conditions: [BENCHMARK.md](BENCHMARK.md), *the release build* (2026-09-20)
-for Metal and *the transparent path on CUDA* for the RTX 4090; the commands that
-take both runs again are in the [reading guide](docs/README.md#reproducing-a-number).
+for Metal and *the direct grouped reduce on CUDA* for the RTX 4090; the
+commands that take both runs again are in the
+[reading guide](docs/README.md#reproducing-a-number).
 
 ### The operators underneath
 
@@ -791,7 +794,7 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 | `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22 at the default budget, 0 rows differing | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, 0 rows differing, through `--path execute` and `--path sql` alike | RTX 4090 Laptop |
 | `test_wrapper.py` — the transparent path | 1258 checks, 0 skipped, 0 failing | RTX 4090 Laptop |
-| `test_gpudb` — unit checks | 752 / 752 | RTX 4090 Laptop, CPU + CUDA |
+| `test_gpudb` — unit checks | 774 / 774 | RTX 4090 Laptop, CPU + CUDA |
 | `run_sql_tests.sh` | 225 passing, 0 failing | RTX 4090 Laptop |
 | `run_sql_tests.sh` guardrails | 48 `expected_fail` directives across the 18 files in `test/sql/`; 46 of them reached on Metal | — |
 | `budget_gate.py` — the memory budget under pressure | PASS: 169 statements, 0 rows differing, 0 errors, resident never above the budget | M4 Max and RTX 4090 Laptop |

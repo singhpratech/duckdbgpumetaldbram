@@ -157,34 +157,38 @@ and the library's licence alongside, so a `pip` install needs nothing installed
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
 join — and the path is **on by default**. On an RTX 4090 Laptop the unit suite
-is **752 / 752** (402 / 402 in a container with no device, where the CUDA-only
-device checks are skipped), the SQL suite **225 passing, 0 failing**, the
-wrapper suite passing, and TPC-H at SF1 is **17 of 22 queries on the device, 0
-rows differing from native** through both entry points — 0.96×–21.40× through
-`execute()` and 0.98×–13.30× through `sql()`, the low end of each being Q1,
-which straddles parity there. That is the same coverage and the same five
-declines as Metal at that scale factor: Q2, Q6, Q11, Q16 on a threshold and Q20
-on its shape ([BENCHMARK.md](../BENCHMARK.md), *the CUDA exact path on by
-default*).
+is **774 / 774** (402 / 402 when that was measured in a container with no
+device, where the CUDA-only device checks are skipped), the SQL suite **225
+passing, 0 failing**, the wrapper suite passing, and TPC-H at SF1 is **17 of 22
+queries on the device, 0 rows differing from native** through both entry points,
+every one of them faster than native — 1.21× (Q15) – 31.44× (Q9) through
+`execute()` and 1.66× (Q15) – 16.27× (Q9) through `sql()`. That is the same
+coverage and the same five declines as Metal at that scale factor: Q2, Q6, Q11,
+Q16 on a threshold and Q20 on its shape ([BENCHMARK.md](../BENCHMARK.md), *the
+direct grouped reduce on CUDA*).
 
 What turned it on was a measurement: the full gate on that box, at the
 wrapper's own memory budget, ran **1630 cells with 0 slower than native and 0
 differing**, minimum ratio 1.07×. That is a dated result, taken before the
-switch.
+switch on 2026-09-20.
 
-The same gate on the **release build** of that card is **1631 cells, 1013 of
-them rewritten and passing, 616 declined on a threshold, 0 differing — and one
-cell below parity**: a three-group `GROUP BY l_returnflag` with no `WHERE` over
-a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten, **0.93×**. It is
-the TPC-H Q1 shape, the one already known to straddle parity on this card. Run
-on its own, the measured rule declined it after its first run on all three
-attempts — which is the rule working, not a gap in it.
+The same gate on the **release build** of that card, later the same day, is
+**1631 cells, 1014 of them rewritten and passing, 616 declined on a threshold,
+0 below 1.0×, 0 differing, exit 0**, ratios 1.01×–487.26× over a 21m38s wall.
+Getting there took one correction: the first release-build run had TPC-H Q1 at
+0.96× and 0.98×, because CUDA's exact `GROUP BY` answered a key with few
+distinct values by sorting the whole column; it now has a direct grouped reduce
+for those keys and Q1 measures 1.99× and 2.07×. `BENCHMARK.md` carries every
+run in between.
 
-Two caveats are worth carrying. The thresholds the wrapper decides with are the
+Peak device memory over that gate was **8485 MiB against the 7972 MiB default
+budget**, and that is expected rather than a breach: the budget bounds what
+*resident sets* may hold, not the working memory an operator allocates for the
+duration of one call.
+
+One caveat is worth carrying: the thresholds the wrapper decides with are the
 Metal-measured ones, **verified on one CUDA machine** rather than measured for
-every GPU. And TPC-H Q1 sits at parity on that box — it has measured either side
-of 1.0× across runs of the same build — which is the case the per-process
-measured rule exists to settle.
+every GPU.
 `GPUDB_CUDA_EXACT=0` turns the path off without a rebuild, leaving a CUDA
 machine the explicit `gpu_*` functions and plain SQL on DuckDB: correct, with
 no speed-up.
