@@ -256,11 +256,14 @@ not by the group count: the same table function answers 3 groups in 7.6 ms and
 already sits above the crossover. The exemption was the only rule letting these
 statements through.
 
-So `string_key_few_groups` is False on CUDA. This is not a tuned constant and
-it should not become one: when CUDA grows the direct grouped reduce, re-run
-the sweep above and turn it back on if the numbers say so. Until then the
-continuous measured rule (connection._note_timing) was the only thing catching
-these, and it catches them one slow execution late.
+So `string_key_few_groups` is False on CUDA. It is not a tuned constant and it
+should not become one: CUDA's exact GROUP BY has one path, the sort, and this
+flag describes that. It is tied to the algorithm, so if a backend answers a
+few-group key without reading the column into a sort, re-run the sweep above
+and let the numbers set the flag for it.
+
+The continuous measured rule (connection._note_timing) is what caught these
+before the flag existed, and it catches them one slow execution late.
 """
 from __future__ import annotations
 from dataclasses import dataclass, replace

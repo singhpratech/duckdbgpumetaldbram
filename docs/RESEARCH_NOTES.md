@@ -5482,16 +5482,17 @@ few-group VARCHAR keys of `lineitem` (`l_returnflag`, `l_linestatus`,
 Twelve cells, twelve losses, deepening with payloads because each payload is
 another full pass. Nothing ambiguous anywhere in it.
 
-The fix in this commit is a guardrail, not a cure: `string_key_few_groups` is a
-field of `Thresholds`, False on CUDA, and the four keys now decline on the
-threshold instead of losing a run first. TPC-H Q1 groups by two VARCHAR keys
-with six groups, so it declines too and SF1 coverage goes from 17 of 22 to 16 —
-which is the truer number, because Q1 was measuring 0.96× and 0.98× and we were
-counting a loss as a query answered on the device.
+What this commit does is keep the rewrite away from the shape:
+`string_key_few_groups` is a field of `Thresholds`, False on CUDA, and the four
+keys decline on the threshold instead of losing a run first. TPC-H Q1 groups by
+two VARCHAR keys with six groups, so it declines too and SF1 coverage goes from
+17 of 22 to 16 — which is the truer number, because Q1 was measuring 0.96× and
+0.98× and a loss was being counted as a query answered on the device.
 
-The cure is the direct grouped reduce on CUDA, which is not in this commit.
-Until it exists, the flag stays False; when it exists, re-run the sweep above
-and let the numbers decide.
+The flag describes the algorithm, not a preference. CUDA's exact GROUP BY has
+one path and it sorts; that is what makes the exemption false there. A backend
+that answers a few-group key without reading the column into a sort earns the
+exemption back, on the numbers from this sweep and not otherwise.
 
 Two things to carry.
 
