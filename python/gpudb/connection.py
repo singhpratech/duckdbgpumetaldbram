@@ -45,9 +45,14 @@ REQUIRED_FUNCTIONS = (
     "gpu_join_materialize", "gpu_rewrite_ast",
 )
 
+# The community registry builds one extension per DuckDB version and installs
+# it under that version's own directory (~/.duckdb/extensions/v<version>/...),
+# so an INSTALL only produces a file THIS client can load when it is run from
+# the same DuckDB version as the `duckdb` module here. (Checked: from DuckDB
+# 1.4.5 the same statement is a 404 while 1.5.5 installs.)
 _NO_EXTENSION = ("the gpudb extension is not loaded on this connection — install it with "
-                 "`INSTALL gpudb FROM community` in DuckDB, or point GPUDB_EXTENSION_PATH "
-                 "at a built one")
+                 "`INSTALL gpudb FROM community` run on the same DuckDB version as this "
+                 "client's `duckdb` module, or point GPUDB_EXTENSION_PATH at a built one")
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 # an aggregate without GROUP BY (§4.12). Over a join it was always worth
 # parsing; over a SINGLE table it is worth parsing since the global masked
@@ -433,10 +438,17 @@ class Connection:
             # extension at all: every statement on DuckDB, and `detail` saying
             # which functions are absent.
             self._backend = ""
+            # A plain `INSTALL` does nothing when a copy is already installed —
+            # it keeps the file it finds, which is the old one. `FORCE INSTALL`
+            # fetches the current build (measured: the installed file changes
+            # only under FORCE); `UPDATE EXTENSIONS` is the same thing for every
+            # installed extension at once. Neither reaches a process that has
+            # already loaded the old copy, so the advice ends in a restart.
             self._backend_note = (
                 "the loaded gpudb extension is older than this client: it does not provide "
                 + (", ".join(missing[:3]) + (" and %d more" % (len(missing) - 3) if len(missing) > 3 else ""))
-                + " — reinstall it with `INSTALL gpudb FROM community; LOAD gpudb;`")
+                + " — update it with `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), "
+                  "then start a new session")
             return
         self._backend_note = ""
         m = re.search(r"runtime=(\w+)", info)

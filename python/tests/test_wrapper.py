@@ -2309,6 +2309,11 @@ def extension_age_checks():
         note = con.extension_note
         check("older than this client" in note and "gpu_function_from_a_later_version" in note,
               f"old extension: extension_note names the missing function ({note[:80]}...)")
+        # a plain INSTALL keeps an already-installed copy, so the advice has to
+        # be FORCE INSTALL / UPDATE EXTENSIONS and a restart, not `INSTALL`
+        check("FORCE INSTALL gpudb FROM community" in note and "new session" in note
+              and "`INSTALL gpudb" not in note,
+              f"old extension: the advice actually replaces the old copy ({note[-90:]})")
         rows = con.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
         want, _ = native("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
         last = con.last_rewrite()
@@ -2329,6 +2334,10 @@ def extension_age_checks():
     bare.execute(SETUP)
     check(bare._backend == "" and "is not loaded" in bare.extension_note,
           f"no extension: extension_note says it is not loaded ({bare.extension_note[:60]}...)")
+    # the registry builds one extension per DuckDB version and installs it under
+    # that version's directory, so the INSTALL has to be run from this module's
+    check("same DuckDB version" in bare.extension_note,
+          "no extension: the note says which DuckDB the INSTALL must run on")
     rows = bare.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
     want, _ = native("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k")
     check(rows == want, "no extension: DuckDB answers, and the rows are native's")
