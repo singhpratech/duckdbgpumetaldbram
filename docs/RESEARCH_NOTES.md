@@ -4296,6 +4296,217 @@ settling on 28000, and narrowing it is a different change over a different set
 of kernels.
 
 
+## 2026-09-20 — What a segment costs before it reads anything
+
+The back-off entry above ends on a machine that will not upload: on the x86 box,
+under the wrapper suite's `big:` cadence, four or five of twenty segments land
+in 180 s and the rest are interrupted. The adaptive size does exactly what it
+was built to do — 1048576 rows at t=0, then 524288 at 3 s, 262144 at 11 s,
+131072 at 19 s, 65536 at 27 s, 32768 at 35 s, which is 1/32 of the default and
+the floor — and then stays there for 145 s, landing almost nothing. So the
+question was not whether the rule fires. It was whether the floor it stops at
+means anything.
+
+It did not. It was a constant, and what it should have been is a property of
+the machine.
+
+### The curve
+
+The x86 box first (measured there, with an ample window so nothing races):
+
+    segment_rows  segments  seg_ms p50  us/row
+         8192       245       1.75     0.214
+        32768        62       2.50     0.076
+       100000        20       2.90     0.029
+       262144         8       8.20     0.031
+       500000         4      11.60     0.023
+
+i.e. about **1.5 ms of fixed cost** before a segment reads a row, and 0.02 us a
+row after that. Against a mean window of 2.5 ms, a 32768-row segment at 2.50 ms
+is a coin flip that mostly loses — and a segment small enough to fit reliably
+would be about 8192 rows, which still costs 1.75 ms, because five sixths of
+that is the fixed part. Below it there is nothing left to save.
+
+The same measurement on an M4 Max, through the real manager (`seg_ms` as the
+session itself recorded it, 2M-row table, nothing racing):
+
+    segment_rows  segments  before p50  after p50   us/row (after)
+         8192        244       0.500      0.400        0.0488
+        32768         61       0.800      0.800        0.0244
+       100000         20       1.600      1.500        0.0150
+       262144          7       2.400      2.300        0.0088
+       524288          3       2.600      2.700        0.0051
+
+("before" and "after" are the cut below, alternated in one process so drift
+cannot favour either.) The fixed part here is about **0.4 ms**, a quarter of the
+x86 box's. The x86 figure has to be re-measured there after this change; I
+cannot run it.
+
+The curve is not a straight line, and that turned out to matter more than the
+intercept. Per row, a 524288-row segment costs a tenth of what an 8192-row one
+costs. DuckDB parallelises a table scan by row group (122,880 rows), so a
+segment spanning several of them is read by the whole machine and a small one by
+one thread; any two-point fit of `fixed + rows x per_row` over a wide range of
+sizes says something untrue about the middle.
+
+### Where the fixed part goes
+
+Timed separately on an M4 Max, DuckDB 1.4.5, segments over a 2M-row table:
+
+    SELECT 1, fresh string                      56 us   the client round trip alone
+    segment statement, WHERE false              85 us   parse + bind, no scan at all
+    segment statement, 0 rows (range past end) 233 us   ... plus the scan's set-up
+    segment statement, 8192 rows               368 us
+    gpu_upload_status(?)                       117 us   (only after an interrupt)
+    SELECT max(rowid)                          310 us   (once per session)
+
+The interesting line is the third. A rowid range past the end of the table reads
+nothing, and it still costs 150 us more than the same statement with `WHERE
+false`, which DuckDB prunes at bind time. That difference scales with the
+**table**, not the segment:
+
+    table rows   row groups   0-row segment
+       200000        2          141 us
+      2000000       17          232 us
+     20000000      163          448 us
+
+About 2 us per row group of set-up that a rowid filter does not save. A segment
+is therefore never free, it gets less free as the table grows, and the cost is
+DuckDB's scan initialisation rather than anything the wrapper does. (The python
+pieces #167 added are noise by comparison: `time.process_time()` is 0.3 us, a
+lock cycle 0.1 us, the segment's f-string 0.2 us.)
+
+### What could be cut
+
+Two things, and both are small — which is itself the finding.
+
+**The plan.** The session used to render the whole segment statement as a fresh
+string per segment; now it `PREPARE`s it once and sends `EXECUTE seg(a, b)`.
+Measured: 0.50 -> 0.40 ms for an 8192-row segment of a 2-lane set, 0.93 -> 0.81
+for a 13-lane one, 2.60 -> 2.55 at 524288 rows. About a tenth of a small
+segment; more for a wide upload statement, because the parse is proportional to
+the text. The row range stays a *literal* — passing it as a parameter through
+the DuckDB Python client measured **slower** than rendering it (497 us against
+368 at 8192 rows; even `SELECT ?` costs twice what `SELECT 1` does) — and a
+literal range is what lets the plan go on pruning row groups. An engine that
+will not take the PREPARE gets the old rendering; the ranges it reads are the
+same either way, which the new tiling check and `rows_seen == rows` pin.
+
+**The wait.** `_wait_idle` woke up a whole `idle_ms` after each spurious wake
+rather than at the moment the idle test could first pass, so a segment that
+could have started at 5.0 ms of idle started at 5.1-9.9 ms (median 5.26,
+measured on the x86 box). It now sleeps until `last_activity + idle_ms`. On an
+idle connection this changes nothing; under a racing cadence it hands the
+segment the whole of the gap instead of the gap minus up to another idle_ms.
+
+What could NOT be cut is the 2 us per row group, which is DuckDB's, and the
+~85 us of parse and bind that the PREPARE only partly removes. A segment of a
+table of any size costs a few hundred microseconds on this machine and about a
+millisecond and a half on the other one, and no arrangement of the Python side
+changes that.
+
+### So the floor is measured, not chosen
+
+A halving of `segment_rows` adds a whole fixed cost per pair of segments. The
+rule is now: **the floor is the smallest size whose predicted total for this
+table stays within 4x of the total at the default size**, priced from the
+segments that landed here. On the x86 box's curve that derives 32768 rows —
+exactly where the constant sat, now for a reason — and on the M4 Max 65536. The
+budget of 4x is the one number chosen rather than measured, and it is chosen so
+that both machines' useful range is inside it: at 8192 rows the x86 box would
+scan the table nine times over for a segment 30% cheaper to attempt.
+
+Those two figures are what the rule derives when it has seen the whole curve. A
+session being starved outright has only the sizes it managed to land, so it
+stops three halvings below the last size it measured and reports starvation
+there rather than walking on down a curve it has not seen. That is the
+conservative direction — the alternative is the grinding this change exists to
+stop — but it does mean the x86 box's starved session will stop above 32768
+until an idle moment lets it measure further down.
+
+Three details that took a measurement each:
+
+- **Price a size by the FASTEST segment of that size, not the median.** A
+  segment that lands while a statement is being answered on the other cores is
+  descheduled and reads slower than it is — 16384 rows timed at 2.1 ms under the
+  starved cadence against 0.55 unraced. The quantity wanted is the work, not the
+  contention, and the minimum of the recent samples is the closest estimate of
+  it. A measured curve is also forced to be monotonic in size: an inversion is
+  noise.
+- **An untried halving is priced at the least it could be worth**, a quarter off.
+  Anything more optimistic (extrapolating the local slope, which is steep at the
+  small end) let the size run three or four halvings past where the measurements
+  would have stopped it; anything more pessimistic (assuming a smaller segment
+  costs what the current one does) stopped it at the first step. At 0.75 per
+  halving the size may fall three steps below the last measured size, measuring
+  each one on the way, and the machine's own curve takes over within a few
+  segments.
+- **The reference is the default size's own measurement.** Extrapolating what a
+  default-sized segment would have cost, from measurements taken at a quarter of
+  that size, produced a budget 30 times too large on one run — the local slope at
+  the small end says a 524288-row segment should take 93 ms where it takes 3.
+  When no segment has landed at the default size, the floor stays the old
+  constant.
+
+### And when no size fits
+
+At the floor, if the yield still asks for something smaller, the session is
+**starved**: it says so in `progress()` — with the window it has been measuring
+(how long interrupted segments got to run before the statement arrived), what a
+segment costs here, and where the floor is — instead of grinding the segment
+finer for nothing. Nothing is forced. The set does not become resident, every
+statement is answered by DuckDB at native speed, and `KNOWN_ISSUES.md` carries
+the limit with the two ways out: `residency='eager'`, or a pause in the
+workload.
+
+### The option not taken, priced
+
+Letting one segment per second ignore the interrupt was measured with a patch
+that is not committed (M4 Max, 2M-row table, a cadence leaving ~0.2 ms after the
+idle wait, 40 s per arm, alternated):
+
+    force=off  26/42 and 46/70 segments, starved   p50 1.20-1.21 ms  p99 2.51-2.59 ms
+    force=on   57/57 and 51/51 segments, finished  p50 1.54-1.98 ms  p99 4.25-4.72 ms
+
+A second pair of runs tagged the statements that actually overlapped a forced
+segment:
+
+    23 of 4,488 statements met one   p50 1.57 ms  p99 2.70  max 2.70
+    21 of 4,424 statements met one   p50 1.51 ms  p99 2.44  max 2.44
+
+against p50 1.49-1.59 ms and p99 2.68-4.03 for the statements that did not. The
+overlap itself is nearly free, because not interrupting a segment does not block
+the statement — the two run on different connections and different cores.
+
+The upload finishes instead of starving. The price is not mainly paid by the
+statements that actually meet a forced segment — only 21 to 23 of about 4,200 did
+— it is paid by every statement in the run, because a session that keeps
+completing segments keeps scanning beside them. p99 roughly doubles for the
+duration. That is rule 1's line, and it is the owner's call rather than mine, so
+the code does not do it.
+
+### The test that asserted a machine
+
+The wrapper suite's `big:` section asserted that 20 of 20 segments land within
+180 s at a fixed 0-10 ms cadence with a pinned segment size. That is a property
+of the M4 Max, not of the mechanism; on the x86 box it is red. It now measures
+this machine's segment cost first — a few segments with nothing racing them —
+and drives a cadence whose gaps are `4 x (idle_ms + that cost)`, with a budget
+derived the same way. Every correctness assertion is unchanged: all planned
+segments land, `rows_seen == rows == 2000000`, the rewritten answer equals
+native's, a write mid-session drops the session and the set re-uploads whole.
+
+A second case, labelled starved, drives gaps of `idle_ms + a tenth of a
+segment` — the idle test passes promptly and nothing is left over, which is the
+shape the x86 box was in — and asserts what the mechanism can promise anywhere:
+every statement keeps native's rows, interrupts are counted, the size never goes
+below the floor this machine's cost puts it at, and either the manager reports
+starvation at that floor with the set still not resident, or this machine's
+interrupt latency left real windows after all and what landed is whole. On the
+M4 Max the first branch is what happens (three runs: 6, 10 and 6 segments of
+81, 47 and 88, always starved, statements at p50 1.55 ms / p99 2.8 ms), and the
+whole section takes 29 s instead of up to 180.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
