@@ -3791,6 +3791,58 @@ Removing the skip took the unit suite from 711 to 730 checks, all passing.
 Those nineteen were not new tests: they were tests that already existed and had
 been running on two backends out of three.
 
+## 2026-09-20 — The lane got smaller and the cache did not
+
+Stage C on CUDA: every I64 lane of an exact set is stored at the narrowest
+signed width its values fit. On TPC-H SF1 that is 85.8 MiB of lanes against
+206.0 MiB, 58% less, with `l_linenumber` — a column whose values are 1..7 —
+going from 8 bytes a row to 1.
+
+Two things are worth keeping from building it.
+
+### A uniform, not a template
+
+Metal passes the width as a uniform and branches inside a load helper. The
+CUDA reflex is to template each kernel on the width so there is no branch at
+all, and that is wrong here for a specific reason: several kernels read two or
+three lanes at once — a key, a payload, a predicate — and templating would need
+4^2 or 4^3 instantiations of each. The uniform is warp-uniform, so it costs a
+predicted branch rather than divergence, and it keeps the two backends the
+same shape, which is worth something on a project where the second backend is
+how bugs get found.
+
+### The optimisation that quietly became a bug
+
+`ensure_exact_cache` had a fast path: with no NULLs, the v0.5 sort cache IS the
+exact cache, so it delegated. That was true and is now conditional, because the
+v0.5 builder reads the column as raw `int64_t` — which is exactly what a packed
+lane stops being. The first run after narrowing was 707 of 711, with
+`sort_by_key failed: invalid argument`.
+
+The fast path was correct when written and became wrong when a property it
+silently depended on stopped holding. It is the same shape as the hybrid
+planner choosing placement by "did the GPU throw?", and the same shape as a
+guard testing for a serializer value that stopped being emitted. Three times
+now: a condition that was equivalent to the thing it stood for, until it
+wasn't. What makes them findable is that each one had a test that exercised the
+combination — here, a join over a column with no NULLs whose values happen to
+be small.
+
+### The number that moved the problem rather than solving it
+
+`l_suppkey`: an 11.45 MiB lane and a 91.6 MiB sort cache. Before narrowing, the
+lane and the cache were 45.8 and 91.6 — the cache was twice the lane and that
+felt proportionate. Now it is eight times, and the cache is plainly the thing
+to fix next.
+
+That is worth saying out loud because it is easy to report "58% less" and stop.
+The lanes really are 58% smaller; the resident footprint is not, because the
+derived structure that was always the larger half did not move. `narrow_lanes()`
+reports true, and it means lane storage and nothing else — the flag's own
+documentation says so, which is lucky rather than clever. Keys at the lane's
+width and a u32 permutation take that 91.6 MiB to ~34.3 MiB, and that is the
+next change.
+
 ## 2026-09-20 — The tie at the k-th row, and what native actually does with one
 
 A reviewer found a rule-2 break on TPC-H SF1:
@@ -3981,6 +4033,7 @@ LIMIT shapes, are `GPU (plain)`: both carry a second `ORDER BY` key
 group by an order that is total, and the rows are native's. The shape that
 does hit the decline is the reviewer's, where a small integer quantity is
 summed over few rows per group and collisions are common.
+
 
 ## Open questions
 

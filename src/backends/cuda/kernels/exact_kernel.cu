@@ -55,6 +55,32 @@ constexpr i64 kI64Min = -0x7fffffffffffffffLL - 1;
 enum : int { kEQ = 0, kNE = 1, kLT = 2, kLE = 3, kGT = 4, kGE = 5,
              kIsNull = 6, kIsNotNull = 7, kIn = 8 };
 
+// ---- narrow lane storage (docs/RESIDENT_COLUMNS_DESIGN.md stage C) ----
+// A lane's storage width is backend-private: the interface still says I64,
+// and every value read out of one is an i64. `w` is 1, 2, 4 or 8 bytes and is
+// the same for every thread of a launch, so the switch is warp-uniform and
+// costs a predicted branch rather than divergence.
+//
+// A uniform was chosen over templating each kernel on the width because
+// several kernels read two or three lanes at once (a key, a payload, a
+// predicate), and templating would need 4^2 or 4^3 instantiations of each.
+__host__ __device__ __forceinline__ i64 ldw(const void* __restrict__ p, int w, std::size_t i) {
+    switch (w) {
+        case 1: return static_cast<const std::int8_t*>(p)[i];
+        case 2: return static_cast<const std::int16_t*>(p)[i];
+        case 4: return static_cast<const std::int32_t*>(p)[i];
+        default: return static_cast<const i64*>(p)[i];
+    }
+}
+__host__ __device__ __forceinline__ void stw(void* __restrict__ p, int w, std::size_t i, i64 v) {
+    switch (w) {
+        case 1: static_cast<std::int8_t*>(p)[i]  = static_cast<std::int8_t>(v);  break;
+        case 2: static_cast<std::int16_t*>(p)[i] = static_cast<std::int16_t>(v); break;
+        case 4: static_cast<std::int32_t*>(p)[i] = static_cast<std::int32_t>(v); break;
+        default: static_cast<i64*>(p)[i] = v; break;
+    }
+}
+
 // Row i is valid iff bit i % 64 of word i / 64 is set; a null bitmap means
 // every row is valid (DuckDB's layout, and the CPU reference's `bit` lambda).
 __host__ __device__ __forceinline__ bool bit_at(const u64* m, std::size_t i) {
@@ -143,17 +169,18 @@ __host__ __device__ __forceinline__ ETup etup_of_value(i64 x) {
 // the payload and its bitmap are indexed by (the exact path keeps every column
 // in input order; only the key's permutation moves).
 struct RowTuple {
-    const i64* perm;
-    const i64* vals;
-    const u64* vvalid;
-    int        has_vals;
+    const i64*  perm;
+    const void* vals;
+    const u64*  vvalid;
+    int         has_vals;
+    int         vwidth;
     __host__ __device__ __forceinline__ ETup operator()(std::size_t i) const {
         ETup t = etup_identity();
         t.cnt_star = 1;
         if (!has_vals) { t.cnt_v = 1; return t; }   // reference: cnt_v = cnt_star, mn/mx untouched
         const std::size_t row = static_cast<std::size_t>(perm[i]);
         if (!bit_at(vvalid, row)) return t;         // NULL payload: counts in count(*) only
-        return etup_of_value(vals[row]);
+        return etup_of_value(ldw(vals, vwidth, row));
     }
 };
 
@@ -163,9 +190,10 @@ struct RowTuple {
 struct NullKeyTuple {
     const u64*           kvalid;
     const unsigned char* mask;
-    const i64*           vals;
+    const void*          vals;
     const u64*           vvalid;
     int                  has_vals;
+    int                  vwidth;
     __host__ __device__ __forceinline__ ETup operator()(std::size_t i) const {
         ETup t = etup_identity();
         if (bit_at(kvalid, i)) return t;            // key is present: a different group
@@ -173,7 +201,7 @@ struct NullKeyTuple {
         t.cnt_star = 1;
         if (!has_vals) { t.cnt_v = 1; return t; }
         if (!bit_at(vvalid, i)) return t;
-        return etup_of_value(vals[i]);
+        return etup_of_value(ldw(vals, vwidth, i));
     }
 };
 
@@ -183,14 +211,15 @@ struct NullKeyTuple {
 // use for.
 struct GlobalTuple {
     const unsigned char* mask;
-    const i64*           vals;
+    const void*          vals;
     const u64*           vvalid;
+    int                  vwidth;
     __host__ __device__ __forceinline__ ETup operator()(std::size_t i) const {
         ETup t = etup_identity();
         if (mask && !mask[i]) return t;
         t.cnt_star = 1;
         if (!bit_at(vvalid, i)) return t;   // NULL payload: in count(*) only
-        return etup_of_value(vals[i]);
+        return etup_of_value(ldw(vals, vwidth, i));
     }
 };
 
@@ -201,6 +230,30 @@ struct MaskOne {
         return (!mask || mask[i]) ? 1ull : 0ull;
     }
 };
+
+// Stage C: the range of a lane, as a monoid CUB can reduce.
+struct MinMax { i64 mn; i64 mx; };
+struct MinMaxOp {
+    __host__ __device__ __forceinline__ MinMax operator()(const MinMax& a, const MinMax& b) const {
+        MinMax r;
+        r.mn = a.mn < b.mn ? a.mn : b.mn;
+        r.mx = a.mx > b.mx ? a.mx : b.mx;
+        return r;
+    }
+};
+struct LoadMinMax {
+    const i64* vals;
+    __host__ __device__ __forceinline__ MinMax operator()(std::size_t i) const {
+        MinMax r; r.mn = vals[i]; r.mx = vals[i]; return r;
+    }
+};
+
+__global__ void lane_pack_kernel(const i64* __restrict__ src, std::size_t rows,
+                                 void* __restrict__ dst, int width) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows; i += stride) stw(dst, width, i, src[i]);
+}
 
 // Valid bits of word w, with the bits past `rows` masked off — the tail word
 // is filled with ones at upload, so counting it whole would under-report NULLs.
@@ -240,36 +293,37 @@ __global__ void fill_valid_kernel(u64* __restrict__ bits, std::size_t words) {
 // rows of one span — and two different spans landing at different dst_row —
 // can share a 64-bit word of the destination bitmap.
 __device__ __forceinline__ void put_cell(bool ok, i64 value, std::size_t d,
-                                         i64* dst, u64* dst_valid) {
-    dst[d] = ok ? value : 0;
+                                         void* dst, int width, u64* dst_valid) {
+    stw(dst, width, d, ok ? value : 0);
     if (!ok && dst_valid) atomicAnd(&dst_valid[d >> 6], ~(1ull << (d & 63)));
 }
 
 __global__ void scatter_lane_kernel(const i64* __restrict__ src, std::size_t rows,
                                     std::size_t n_lanes, std::size_t lane,
                                     const u64* __restrict__ src_valid, std::size_t valid_bit,
-                                    i64* __restrict__ dst, u64* __restrict__ dst_valid,
-                                    std::size_t dst_row) {
+                                    void* __restrict__ dst, int dst_width,
+                                    u64* __restrict__ dst_valid, std::size_t dst_row) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t j = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          j < rows; j += stride) {
         const bool ok = bit_at(src_valid, valid_bit + j);
-        put_cell(ok, src[j * n_lanes + lane], dst_row + j, dst, dst_valid);
+        put_cell(ok, src[j * n_lanes + lane], dst_row + j, dst, dst_width, dst_valid);
     }
 }
 
 __global__ void scatter_pair_kernel(const i64* __restrict__ kv, std::size_t rows,
                                     const u64* __restrict__ key_valid,
                                     const u64* __restrict__ val_valid, std::size_t valid_bit,
-                                    i64* __restrict__ keys, i64* __restrict__ vals,
+                                    void* __restrict__ keys, int key_width,
+                                    void* __restrict__ vals, int val_width,
                                     u64* __restrict__ key_bits, u64* __restrict__ val_bits,
                                     std::size_t dst_row) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t j = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          j < rows; j += stride) {
         const std::size_t d = dst_row + j;
-        put_cell(bit_at(key_valid, valid_bit + j), kv[2 * j],     d, keys, key_bits);
-        put_cell(bit_at(val_valid, valid_bit + j), kv[2 * j + 1], d, vals, val_bits);
+        put_cell(bit_at(key_valid, valid_bit + j), kv[2 * j],     d, keys, key_width, key_bits);
+        put_cell(bit_at(val_valid, valid_bit + j), kv[2 * j + 1], d, vals, val_width, val_bits);
     }
 }
 
@@ -289,7 +343,7 @@ __global__ void mask_kernel(const gpudb::cuda_exact::DevPred* __restrict__ preds
             if (q.op == kIsNull)    { ok = !v; continue; }
             if (q.op == kIsNotNull) { ok =  v; continue; }
             if (!v) { ok = false; break; }            // NULL fails every comparison and In
-            const i64 raw = q.data[i];
+            const i64 raw = ldw(q.data, q.width, i);
             if (q.is_f64) {
                 const u64 a = f64_order_key_bits(raw);
                 if (q.op == kIn) {
@@ -331,11 +385,12 @@ __global__ void flags_from_mask_kernel(const i64* __restrict__ perm, std::size_t
          i < n; i += stride) flags[i] = mask[perm[i]];
 }
 
-__global__ void gather_order_keys_kernel(const i64* __restrict__ keys, const i64* __restrict__ perm,
+__global__ void gather_order_keys_kernel(const void* __restrict__ keys, int kwidth,
+                                         const i64* __restrict__ perm,
                                          std::size_t n, u64* __restrict__ out) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < n; i += stride) out[i] = key_to_u64(keys[perm[i]]);
+         i < n; i += stride) out[i] = key_to_u64(ldw(keys, kwidth, perm[i]));
 }
 
 __global__ void unmap_order_keys_kernel(const u64* __restrict__ in, std::size_t n,
@@ -381,8 +436,8 @@ __device__ __forceinline__ std::size_t dev_lower_bound(const i64* __restrict__ a
 
 __global__ void join_probe_kernel(const i64* __restrict__ bsorted, const i64* __restrict__ bperm,
                                   std::size_t n_bvalid,
-                                  const i64* __restrict__ pkeys, const u64* __restrict__ pvalid,
-                                  std::size_t rows_probe,
+                                  const void* __restrict__ pkeys, int pkey_width,
+                                  const u64* __restrict__ pvalid, std::size_t rows_probe,
                                   const u64* __restrict__ keylane_valid, int key_from_build,
                                   std::uint32_t* __restrict__ match,
                                   unsigned char* __restrict__ cls) {
@@ -393,7 +448,7 @@ __global__ void join_probe_kernel(const i64* __restrict__ bsorted, const i64* __
         cls[i]   = 0;
         if (!bit_at(pvalid, i)) continue;              // NULL probe key never matches
         if (!n_bvalid) continue;
-        const i64 k = pkeys[i];
+        const i64 k = ldw(pkeys, pkey_width, i);
         const std::size_t at = dev_lower_bound(bsorted, n_bvalid, k);
         if (at >= n_bvalid || bsorted[at] != k) continue;
         const std::size_t brow = static_cast<std::size_t>(bperm[at]);
@@ -428,17 +483,19 @@ __global__ void join_positions_kernel(const unsigned char* __restrict__ cls, std
     }
 }
 
-__global__ void join_gather_kernel(const i64* __restrict__ src, const u64* __restrict__ src_valid,
+__global__ void join_gather_kernel(const void* __restrict__ src, int src_width,
+                                   const u64* __restrict__ src_valid,
                                    int from_build, const std::uint32_t* __restrict__ match,
                                    const unsigned char* __restrict__ cls,
                                    const std::uint32_t* __restrict__ pos, std::size_t rows_probe,
-                                   i64* __restrict__ dst, u64* __restrict__ dst_valid) {
+                                   void* __restrict__ dst, int dst_width,
+                                   u64* __restrict__ dst_valid) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < rows_probe; i += stride) {
         if (!cls[i]) continue;                          // unmatched probe row: absent (inner join)
         const std::size_t srow = from_build ? static_cast<std::size_t>(match[i]) : i;
-        put_cell(bit_at(src_valid, srow), src[srow], pos[i], dst, dst_valid);
+        put_cell(bit_at(src_valid, srow), ldw(src, src_width, srow), pos[i], dst, dst_width, dst_valid);
     }
 }
 
@@ -466,25 +523,59 @@ cudaError_t gpudb_cuda_exact_fill_valid(u64* d_bits, std::size_t rows, cudaStrea
 cudaError_t gpudb_cuda_exact_scatter_lane(const i64* d_src, std::size_t rows,
                                           std::size_t n_lanes, std::size_t lane,
                                           const u64* d_src_valid, std::size_t valid_bit,
-                                          i64* d_dst, u64* d_dst_valid,
+                                          void* d_dst, int dst_width, u64* d_dst_valid,
                                           std::size_t dst_row, cudaStream_t s) {
     if (!rows) return cudaSuccess;
     scatter_lane_kernel<<<grid_for(rows), kBlock, 0, s>>>(d_src, rows, n_lanes, lane,
                                                           d_src_valid, valid_bit,
-                                                          d_dst, d_dst_valid, dst_row);
+                                                          d_dst, dst_width, d_dst_valid, dst_row);
     return cudaGetLastError();
 }
 
 cudaError_t gpudb_cuda_exact_scatter_pair(const i64* d_kv, std::size_t rows,
                                           const u64* d_key_valid, const u64* d_val_valid,
                                           std::size_t valid_bit,
-                                          i64* d_keys, i64* d_vals,
+                                          void* d_keys, int key_width,
+                                          void* d_vals, int val_width,
                                           u64* d_key_bits, u64* d_val_bits,
                                           std::size_t dst_row, cudaStream_t s) {
     if (!rows) return cudaSuccess;
     scatter_pair_kernel<<<grid_for(rows), kBlock, 0, s>>>(d_kv, rows, d_key_valid, d_val_valid,
-                                                           valid_bit, d_keys, d_vals,
+                                                           valid_bit, d_keys, key_width,
+                                                           d_vals, val_width,
                                                            d_key_bits, d_val_bits, dst_row);
+    return cudaGetLastError();
+}
+
+cudaError_t gpudb_cuda_lane_width(const i64* d_vals, std::size_t rows,
+                                  int* h_width, cudaStream_t s) {
+    *h_width = 1;
+    if (!rows) return cudaSuccess;
+    DevBuf out;
+    cudaError_t e = out.alloc(sizeof(MinMax));
+    if (e != cudaSuccess) return e;
+    thrust::counting_iterator<std::size_t> it(0);
+    auto vals = thrust::make_transform_iterator(it, LoadMinMax{d_vals});
+    MinMax init; init.mn = kI64Max; init.mx = kI64Min;
+    e = with_temp([&](void* tmp, std::size_t& b) {
+        return cub::DeviceReduce::Reduce(tmp, b, vals, static_cast<MinMax*>(out.p),
+                                         static_cast<int>(rows), MinMaxOp(), init, s);
+    });
+    if (e != cudaSuccess) return e;
+    MinMax r{};
+    if ((e = fetch(out.p, &r, s)) != cudaSuccess) return e;
+    // boundaries inclusive, as the design specifies
+    if (r.mn >= -128LL && r.mx <= 127LL)                        *h_width = 1;
+    else if (r.mn >= -32768LL && r.mx <= 32767LL)               *h_width = 2;
+    else if (r.mn >= -2147483648LL && r.mx <= 2147483647LL)     *h_width = 4;
+    else                                                         *h_width = 8;
+    return cudaSuccess;
+}
+
+cudaError_t gpudb_cuda_lane_pack(const i64* d_src, std::size_t rows,
+                                 void* d_dst, int width, cudaStream_t s) {
+    if (!rows) return cudaSuccess;
+    lane_pack_kernel<<<grid_for(rows), kBlock, 0, s>>>(d_src, rows, d_dst, width);
     return cudaGetLastError();
 }
 
@@ -508,7 +599,8 @@ cudaError_t gpudb_cuda_exact_null_count(const u64* d_valid, std::size_t rows,
 
 // The sort cache over the VALID rows. Two steps: compact the valid row ids
 // into d_perm, then sort (order-key, row id) pairs by the key.
-cudaError_t gpudb_cuda_exact_sort(const i64* d_keys, const u64* d_valid, std::size_t rows,
+cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
+                                  const u64* d_valid, std::size_t rows,
                                   i64* d_sorted, i64* d_perm,
                                   std::size_t* h_n_valid, cudaStream_t s) {
     *h_n_valid = 0;
@@ -543,7 +635,7 @@ cudaError_t gpudb_cuda_exact_sort(const i64* d_keys, const u64* d_valid, std::si
     DevBuf uk;
     if ((e = uk.alloc(n_valid * sizeof(u64))) != cudaSuccess) return e;
     gather_order_keys_kernel<<<grid_for(n_valid), kBlock, 0, s>>>(
-        d_keys, d_perm, n_valid, static_cast<u64*>(uk.p));
+        d_keys, key_width, d_perm, n_valid, static_cast<u64*>(uk.p));
     if ((e = cudaGetLastError()) != cudaSuccess) return e;
     if ((e = gpudb_cuda_ops::sort_pairs_u64(static_cast<u64*>(uk.p), d_perm, n_valid, s))
         != cudaSuccess) return e;
@@ -624,7 +716,8 @@ cudaError_t gpudb_cuda_exact_run_count(const i64* d_sorted, std::size_t n,
 }
 
 cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std::size_t n_sel,
-                                    const i64* d_vals, const u64* d_vvalid, int has_vals,
+                                    const void* d_vals, int val_width,
+                                    const u64* d_vvalid, int has_vals,
                                     i64* d_keys_out, i64* d_lo, i64* d_hi,
                                     i64* d_cnt_v, i64* d_cnt_star, i64* d_mn, i64* d_mx,
                                     std::size_t* h_runs, cudaStream_t s) {
@@ -636,7 +729,8 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
     if ((e = num.alloc(sizeof(int))) != cudaSuccess) return e;
 
     thrust::counting_iterator<std::size_t> it(0);
-    auto vals = thrust::make_transform_iterator(it, RowTuple{d_perm, d_vals, d_vvalid, has_vals});
+    auto vals = thrust::make_transform_iterator(
+        it, RowTuple{d_perm, d_vals, d_vvalid, has_vals, val_width});
 
     // One run per distinct key: the keys arrive sorted, so equal keys are
     // adjacent and ReduceByKey's runs ARE the groups.
@@ -662,7 +756,7 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
 
 cudaError_t gpudb_cuda_join_mat_probe(const i64* d_bsorted, const i64* d_bperm,
                                       std::size_t n_bvalid,
-                                      const i64* d_pkeys, const u64* d_pvalid,
+                                      const void* d_pkeys, int pkey_width, const u64* d_pvalid,
                                       std::size_t rows_probe,
                                       const u64* d_keylane_valid, int key_from_build,
                                       std::uint32_t* d_match, unsigned char* d_cls,
@@ -670,7 +764,7 @@ cudaError_t gpudb_cuda_join_mat_probe(const i64* d_bsorted, const i64* d_bperm,
     *h_n1 = 0; *h_n2 = 0;
     if (!rows_probe) return cudaSuccess;
     join_probe_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
-        d_bsorted, d_bperm, n_bvalid, d_pkeys, d_pvalid, rows_probe,
+        d_bsorted, d_bperm, n_bvalid, d_pkeys, pkey_width, d_pvalid, rows_probe,
         d_keylane_valid, key_from_build, d_match, d_cls);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
@@ -720,19 +814,23 @@ cudaError_t gpudb_cuda_join_mat_positions(const unsigned char* d_cls, std::size_
     return cudaStreamSynchronize(s);           // s1 / s2 die on return
 }
 
-cudaError_t gpudb_cuda_join_mat_gather(const i64* d_src, const u64* d_src_valid, int from_build,
+cudaError_t gpudb_cuda_join_mat_gather(const void* d_src, int src_width,
+                                       const u64* d_src_valid, int from_build,
                                        const std::uint32_t* d_match, const unsigned char* d_cls,
                                        const std::uint32_t* d_pos, std::size_t rows_probe,
-                                       i64* d_dst, u64* d_dst_valid, cudaStream_t s) {
+                                       void* d_dst, int dst_width, u64* d_dst_valid,
+                                       cudaStream_t s) {
     if (!rows_probe) return cudaSuccess;
     join_gather_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
-        d_src, d_src_valid, from_build, d_match, d_cls, d_pos, rows_probe, d_dst, d_dst_valid);
+        d_src, src_width, d_src_valid, from_build, d_match, d_cls, d_pos, rows_probe,
+        d_dst, dst_width, d_dst_valid);
     return cudaGetLastError();
 }
 
 cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, int n_preds,
                                     std::size_t rows,
-                                    const i64* const* d_vals, const u64* const* d_vvalid,
+                                    const void* const* d_vals, const int* h_widths,
+                                    const u64* const* d_vvalid,
                                     int n_pays, gpudb::cuda_exact::ExactTuple* h_out,
                                     std::int64_t* h_count_star, cudaStream_t s) {
     *h_count_star = 0;
@@ -756,7 +854,8 @@ cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, i
     if ((e = out.alloc(sizeof(ETup))) != cudaSuccess) return e;
     thrust::counting_iterator<std::size_t> it(0);
     for (int p = 0; p < n_pays; ++p) {
-        auto vals = thrust::make_transform_iterator(it, GlobalTuple{mask, d_vals[p], d_vvalid[p]});
+        auto vals = thrust::make_transform_iterator(
+            it, GlobalTuple{mask, d_vals[p], d_vvalid[p], h_widths[p]});
         e = with_temp([&](void* tmp, std::size_t& b) {
             return cub::DeviceReduce::Reduce(tmp, b, vals, static_cast<ETup*>(out.p),
                                              static_cast<int>(rows), AddExact(), etup_identity(), s);
@@ -791,7 +890,7 @@ cudaError_t gpudb_cuda_exact_global(const gpudb::cuda_exact::DevPred* d_preds, i
 }
 
 cudaError_t gpudb_cuda_exact_null_group(const u64* d_kvalid, const unsigned char* d_mask,
-                                        std::size_t rows, const i64* d_vals,
+                                        std::size_t rows, const void* d_vals, int val_width,
                                         const u64* d_vvalid, int has_vals,
                                         gpudb::cuda_exact::ExactTuple* h_out, cudaStream_t s) {
     *h_out = gpudb::cuda_exact::ExactTuple{};
@@ -802,7 +901,7 @@ cudaError_t gpudb_cuda_exact_null_group(const u64* d_kvalid, const unsigned char
 
     thrust::counting_iterator<std::size_t> it(0);
     auto vals = thrust::make_transform_iterator(
-        it, NullKeyTuple{d_kvalid, d_mask, d_vals, d_vvalid, has_vals});
+        it, NullKeyTuple{d_kvalid, d_mask, d_vals, d_vvalid, has_vals, val_width});
     e = with_temp([&](void* tmp, std::size_t& b) {
         return cub::DeviceReduce::Reduce(tmp, b, vals, static_cast<ETup*>(out.p),
                                          static_cast<int>(rows), AddExact(), etup_identity(), s);
