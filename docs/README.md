@@ -48,6 +48,7 @@ Entries are in date order in the file; this groups them by question.
 - A view is not a thing you can remember
 - A guard that tested for a value the serializer never emits
 - A formula verified bit-exact on one architecture and wrong on the other
+- The tie at the k-th row, and what native actually does with one — twenty plain-DuckDB runs of one `ORDER BY … LIMIT 5`, and the three different row sets they returned
 
 **Deciding when the GPU should answer**
 - The gate: thresholds come from measurements
@@ -77,6 +78,9 @@ Entries are in date order in the file; this groups them by question.
 - The index that had nowhere to be bound (stage D, measured and not wired into SQL)
 - What a column stops needing
 - Least recently used knows when, not what for (value-aware residency)
+- The lane got smaller and the cache did not — narrow lanes on CUDA, and the derived structure that had not followed them
+- The number went the wrong way — narrowing the CUDA exact sort cache, and the double count the A/B caught
+- It was never the segments — what a background upload actually costs a statement, and the back-off that followed from measuring it
 
 **Kernels**
 - Raw performance first: where a statement's time goes

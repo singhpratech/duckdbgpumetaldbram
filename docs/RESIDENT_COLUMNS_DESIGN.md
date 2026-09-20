@@ -238,8 +238,8 @@ min/max are not plain integers, keeps its type's width. It stays an UPPER bound,
 which is what the admission rule needs, and the wrapper test that asserts the
 estimate never falls below what `gpu_residents()` / `gpu_store_columns()` report
 covers a narrow-typed table (INTEGER key, DATE, SMALLINT) as well as a BIGINT
-one. On a backend without narrow lanes — CUDA, the CPU reference — every lane is
-charged 8 as before. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
+one. On a backend without narrow lanes — the CPU reference — every lane is
+charged 8 as before; both GPU backends report `narrow_lanes()` true. A set with no key at all (`docs/TRANSPARENT_DESIGN.md`
 §4.12) is charged no sort cache.
 
 ## 7. The group-id lane — a second derived structure

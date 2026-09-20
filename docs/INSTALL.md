@@ -96,7 +96,7 @@ built with CUDA 12.x reaches the GPU on R525+.
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
 join. On an RTX 4090 Laptop with the path enabled the unit suite is
-**730 / 730**, the SQL suite **224 passing, 0 failing**, and TPC-H at SF1 is
+**750 / 750**, the SQL suite **224 passing, 0 failing**, and TPC-H at SF1 is
 **17 of 22 queries on the device, 0 rows differing from native** — the same
 coverage and the same five declines as Metal at that scale factor
 ([BENCHMARK.md](../BENCHMARK.md), *the transparent path on CUDA*).
@@ -173,8 +173,8 @@ compiled with CUDA and which backend it picked at runtime.
 
 | What you see | What it is |
 |---|---|
-| `backend: none — the extension is not loaded` | No extension found. Run `INSTALL gpudb FROM community; LOAD gpudb;` in DuckDB, or set `GPUDB_EXTENSION_PATH`. |
-| `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. `INSTALL` alone will not replace it — use `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then `LOAD gpudb;`. |
+| `backend: none — the extension is not loaded` in the banner, and `transparent: a plain DuckDB shell — every statement goes straight to DuckDB` under it | No extension this connection can load. `con.extension_note` (and `last_rewrite()["detail"]`) spells it out: *install it with `INSTALL gpudb FROM community` run on the same DuckDB version as this client's `duckdb` module, or point `GPUDB_EXTENSION_PATH` at a built one.* The registry builds gpudb separately for each DuckDB version and installs it under that version's own directory, so an `INSTALL` run from a different version leaves nothing this one will find. |
+| `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. The message ends with the advice that works: *update it with `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then start a new session.* A plain `INSTALL` does nothing when a copy is already installed — it keeps the file it finds — and neither form reaches a process that has already loaded the old one, which is why it ends in a new session. |
 | `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
 | `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build, or a CUDA build without `GPUDB_CUDA_EXACT=1`. |
 | Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |

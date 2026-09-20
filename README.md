@@ -303,6 +303,13 @@ must agree on ordered rows, names and `typeof()` of every column; each rewrite
 is also checked against the original statement text with `DESCRIBE` before it is
 used. Where "the same as native" is not definable — `sum(DOUBLE)`, which DuckDB
 itself computes in an order-dependent way — the shape is simply never rewritten.
+An `ORDER BY <aggregate> LIMIT k` whose ordering values tie inside the first *k*
+rows goes back to DuckDB for the same reason (`reason == "ties"`): native has no
+tie order of its own there, and plain DuckDB above one thread returned 3
+different row sets — and up to 6 different orderings — over 20 runs of one such
+statement. The device is asked for one row past the limit and stops itself when
+it sees the tie, so that is decided against the data on every execution rather
+than guessed from the shape.
 
 ## What runs on the GPU, and what stays on DuckDB
 
@@ -396,6 +403,14 @@ while your connection is idle, so an upload never runs a long scan beside a
 query. A table's columns live in one per-table store, each lane kept at the
 narrowest signed width its values fit — the 22 TPC-H queries at SF10 hold
 18.7 GiB where they held 44.9 before narrow lanes and shedding.
+
+An upload has two steps an interrupt cannot stop — the copy to the device and
+the sort cache built after it — and on a machine whose cores are already taken
+those two wait for a quiet moment rather than run beside your statements; the
+wait is bounded at 20 seconds per step, after which the step runs anyway, so
+residency is delayed on a busy machine and never withheld. Segments also adapt
+their size when they rarely fit the window a workload leaves between its
+statements.
 
 The memory budget defaults to a quarter of unified memory on Apple silicon and
 half of device memory on a discrete GPU (`memory_budget=`, or
@@ -671,10 +686,11 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 
 | Suite | Result | Where |
 |---|---|---|
-| `test_wrapper.py` — the transparent path | 1157 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
+| `test_wrapper.py` — the transparent path | 1206 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
+| `test_residency_policy.py` — the residency policy, on a driven clock | 85 checks, 0 failing | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing | M4 Max |
 | `tpch_coverage.py` with `GPUDB_CUDA_EXACT=1` | SF1 17 of 22 on the device, 0 rows differing | RTX 4090 Laptop |
-| `test_gpudb` — unit checks | 730 / 730 | RTX 4090 Laptop, CPU + CUDA |
+| `test_gpudb` — unit checks | 750 / 750 | RTX 4090 Laptop, CPU + CUDA |
 | `run_sql_tests.sh` | 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` | RTX 4090 Laptop |
 | `run_sql_tests.sh` guardrails | 45 `expected_fail` cases across the 18 files in `test/sql/` | — |
 

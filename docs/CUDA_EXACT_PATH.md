@@ -3,7 +3,7 @@
 **Status 2026-09-19: implemented.** Every method below exists on the CPU
 reference, on Metal and on CUDA (#152, #153, #154): exact `GROUP BY`, the
 `WHERE` mask, the global masked aggregate and the materialised join. On the
-RTX 4090 Laptop the unit suite is 730 / 730, the SQL suite 224 / 0 with the
+RTX 4090 Laptop the unit suite is 750 / 750, the SQL suite 224 / 0 with the
 path on, and `scripts/tpch_coverage.py` answers 17 of 22 TPC-H queries at SF1
 on the device with 0 rows differing from native — the same coverage and the
 same five declines as Metal at that scale factor (`BENCHMARK.md`, *the
@@ -36,7 +36,7 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 | `groupby_exact_masked_multi(keys, pays, n_pays, filter_payload, preds, n_preds, cap, filter)` | several payloads in ONE pass; `MultiPayload::columns` bits select what to produce per payload | the base-class default in `src/backends/backend_factory.cpp` — one `groupby_exact_masked_resident` pass per payload, merged and cross-checked — so this method comes for free on CUDA as soon as the masked single-payload op works; fusing it is a later optimisation | fused: mask / selection / run starts once, reduce per payload |
 | `aggregate_exact_masked(pays, n_pays, preds, n_preds)` | **optional, added 2026-09-18 (§4.12)**: aggregates without GROUP BY under a WHERE — one fused pass over the rows in storage order, no key, no sort cache, no permutation. Returns `GlobalAggResult`: per payload the exact 128-bit sum, `count(payload)`, min and max, plus one `count_star` of the surviving rows. Semantics are one group of `groupby_exact_masked_multi`; `n_pays` may be 0 (`count(*)` only) and `n_preds` may be 0. `global_supported()` is its rule-1 gate, defaulting to false — the CUDA backend builds and answers unchanged until it overrides both | `cpu_aggregator.cpp` (the reference) | `metal_aggregator.mm` + `gagg_masked_i64` in `kernels/sum.metal`: one lane table bound per distinct lane (payloads and predicate columns share slots, 12 of them), per-thread accumulators indexed `[group * n_pays + payload]`, threadgroup tree reduce, host merge |
 | the direct grouped reduce | **backend-private, optional, added 2026-09-18; built on Metal only** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7): a key with few distinct values gets a dense group-id lane derived from its sort cache (`gid[row]` = the rank of the row's key among the distinct valid keys ascending, a NULL key taking the reserved last id) and the exact operators answer with ONE row-order pass over it — the whole WHERE per row, every payload folded into `acc[gid]`, no mask buffer, no run starts, no permutation, no gather. **Nothing in `gpu_backend.hpp` changes**: same methods, same results, same order, same NULL-key group last, same absent-when-emptied groups, HAVING / top-k on the host over the group rows through `apply_group_filter_host`. The tests are the parity block in `test_aggregator.cpp` (every exact form, both algorithms, keys either side of the id-lane's limits) — CUDA gets them free. The one thing to report is which algorithm ran: `gpudb::exact_path_note()` (`src/include/exact_path_note.hpp`), printed by `gpu_last_stats()` as `path=…` | not implemented (the reference is always the sort path) | `metal_aggregator.mm` + `gdir_*` in `kernels/sum.metal`. CUDA has 64-bit atomics and `atomicCAS`, which Apple GPUs do not, so the accumulator design does NOT transfer: Metal replicates a slab of 32-bit atomics per threadgroup and carries the 128-bit sums by hand. A CUDA port should use shared-memory 64-bit atomics (or `cub::BlockReduce` per group) and will have a different crossover — measure it, do not copy the numbers. The admission rule Metal needs (`groups >= 3` and `rows x (payloads + WHERE terms) >= 6M`) exists because a threadgroup clears and folds its accumulator slab whatever the rows: sweep ROWS as well as groups, or the fixed cost hides at the top of the range. And gate the path on the DEVICE before asking it to compile anything: a kernel that will not build is a fallback, not an error — Metal marks the path unavailable for the aggregator's lifetime, keeps the compiler's text and answers through the sort path — but a fallback after the fact is not always enough. On a virtualised Apple GPU ("Apple Paravirtual device", a hosted macOS runner) ONE refused pipeline build left that process's Metal compiler unusable: kernels that had built moments before then failed too. So a backend must not ask an unsuitable device to compile an optional kernel at all; it decides from the device's identity and capabilities first, once, before any state the path would leave behind exists |
-| `narrow_lanes()` | **optional**: does this backend store an exact I64 lane at the narrowest signed width its values fit (`docs/RESIDENT_COLUMNS_DESIGN.md` §6)? Storage width stays backend-private; the flag exists because the wrapper's PRE-upload memory estimate sizes lanes from their DuckDB type when it is true and charges 8 bytes a lane when it is false. Defaults to false, which is correct for a CUDA backend that stores 8-byte lanes | false | true |
+| `narrow_lanes()` | **optional**: does this backend store an exact I64 lane at the narrowest signed width its values fit (`docs/RESIDENT_COLUMNS_DESIGN.md` §6)? Storage width stays backend-private; the flag exists because the wrapper's PRE-upload memory estimate sizes lanes from their DuckDB type when it is true and charges 8 bytes a lane when it is false. Defaults to false, which is correct for any backend that stores 8-byte lanes; both GPU backends now report true | false | true |
 | `join_materialize(probe_key, build_key, lanes, n)` | inner join onto a UNIQUE build key; returns row-aligned lanes (probe or build side), NULL-key rows dropped; `join_supported()` gates it | `cpu_aggregator.cpp` | sort-merge (Metal has no 64-bit atomic CAS); CUDA should use open-addressing with `atomicCAS` as `join_kernel.cu` already does for the v0.6 join |
 | `device_memory_bytes()` | total device memory in bytes (`cudaMemGetInfo` total); reported by `gpu_build_info()`, sets the wrapper's default budget to half of it | 0 | `recommendedMaxWorkingSetSize` |
 | `exact_supported()`, `join_supported()` | return true only when the above are complete — these are rule-1 gates: a backend that claims support and throws makes statements fall back at run time | — | — |
@@ -176,7 +176,8 @@ that stays allocated.
 A backend is free to store an I64 lane narrower than 8 bytes and widen on load,
 and `resident_bytes()` is what tells the budget it did.
 
-Metal does it this way, and CUDA should mirror it:
+Both backends now do it this way — Metal first, CUDA after it — and the shape
+is the same on each:
 
 - the width is chosen in the upload, from the lane's min and max over its valid
   cells (NULL cells hold 0, which fits any width) — the per-span copy already
@@ -188,8 +189,12 @@ Metal does it this way, and CUDA should mirror it:
   pass belongs in the de-interleave or on the device after the copy;
 - F64 lanes stay 8, and so do string-hash lanes (the min/max rule lands them
   there by itself);
-- the sort cache keeps the key's width and holds u32 row ids (Metal already
-  refuses a column above 2^32 rows; CUDA should decide its own cap);
+- the sort cache keeps the key's width and holds u32 row ids — both backends
+  refuse a column above 2^32 rows, so eight bytes for a row id was always more
+  than the cache could use. On CUDA the exact cache is therefore no longer
+  shared with the v0.5 one for a NULL-free 8-byte lane: the two formats no
+  longer coincide, and `prepare()` builds the one the column will be used with.
+  The v0.6 `gpu_upload_pair` path's cache is still i64 + i64 on CUDA;
 - a join's output lanes keep their source lanes' widths — a gather cannot widen
   a lane's range;
 - every kernel that reads a lane, a sorted key or a permutation entry takes the

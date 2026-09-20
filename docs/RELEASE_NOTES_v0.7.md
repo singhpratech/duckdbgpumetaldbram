@@ -42,6 +42,18 @@ checked against the original text with `DESCRIBE`. Where "the same as native"
 is not definable — `sum(DOUBLE)`, which DuckDB itself computes
 order-dependently — the shape is never rewritten.
 
+**Ties in a pushed top-k go back to DuckDB** (#164). An `ORDER BY <aggregate>
+LIMIT k` whose ordering values tie inside the first *k* rows has no single
+native answer: plain DuckDB above one thread returned 3 different row sets, and
+up to 6 different orderings, over 20 runs of one such statement on TPC-H SF1,
+and is deterministic only at `threads=1`. The rewritten statement therefore asks
+the device for one row past the limit and carries a guard that stops it when
+`rank()` and `row_number()` disagree at or above rank *k*; the wrapper then
+answers the original on DuckDB with `reason == "ties"`. It is decided against
+the data on every execution, and because the fallback is a genuine loss (a
+device pass plus DuckDB's own run) the template is measured-declined like any
+other losing template, with the tie named in `detail`.
+
 ## The statement rewrite
 
 - **`gpu_rewrite_ast`** (#86) — a pure C++ scalar over DuckDB's own
@@ -119,6 +131,17 @@ order-dependently — the shape is never rewritten.
   bandwidth. The same fusion on 20 CPU threads is 1.16×, which is the contrast
   worth keeping: fusing pays in proportion to how much of the time was spent
   moving bytes.
+- **Narrow lanes on CUDA** (#165) — the exact path's I64 lanes are stored at the
+  narrowest signed width their values fit on NVIDIA hardware too, which is what
+  `gpu_build_info()` now reports as `narrow=true` there: 58% off the lanes at
+  TPC-H SF1 on an RTX 4090 Laptop, with the widths chosen in the upload and every
+  kernel reading through one helper.
+- **The CUDA exact sort cache, narrowed** (#166) — its companion. The exact
+  sort cache held an i64 key and an i64 row id; it now holds the key at the
+  lane's width and the row id as u32, which is the layout Apple Silicon Metal
+  has had since the lane narrowing landed there. 44% off the derived structures
+  and 31% off the resident total at SF1 (257.5 MiB to 177.4), lanes untouched.
+  The v0.6 `gpu_upload_pair` path's cache is still i64 + i64 on CUDA.
 - **The CUDA exact upload, double-buffered** (#162) — one staging buffer with a
   stream synchronise after every span serialised the copy against the kernel,
   leaving the PCIe link idle for each kernel and the GPU idle for each copy. A
@@ -141,6 +164,23 @@ order-dependently — the shape is never rewritten.
   it.
 - **Uploads that do not disturb a query** — short idle row-id segments through
   the extension's upload sessions (#91), carrying exact segments (#95).
+- **An upload that steps back on a busy machine** (#167) — measured per
+  statement, the cost a background upload imposes is not the segments (a
+  statement that lands on one is not slower than the control, and the interrupt
+  is honoured in 0.27 ms median with 8 of 16 cores busy) but the two steps an
+  interrupt cannot stop: the device copy and the sort cache built after it. The
+  session now measures for free how many cores it is being given — CPU seconds
+  per wall second of a completed segment scan — and on a contended machine those
+  two steps wait for a quiet connection first. The window asked for decays to the
+  ordinary idle threshold over 20 seconds, so a step takes the best gap offered
+  and runs unconditionally at the end: residency is delayed on a busy machine,
+  never withheld, and an idle machine takes exactly the old path. A segment's
+  size also follows its yield, halving when almost none of the recent attempts
+  land and doubling back when almost all do, for the box where the segment does
+  not fit the window the workload leaves. An interrupted sort cache is retried
+  rather than skipped, so `ready` means uploaded *and* prepared.
+  `GPUDB_UPLOAD_QUIET_MS`, `GPUDB_UPLOAD_QUIET_MAX_S` and
+  `GPUDB_RESIDENCY_TRACE` are the controls ([ENVIRONMENT.md](ENVIRONMENT.md)).
 - **Writes from any connection** (#120, #137) — the database file and its
   write-ahead log are stat'ed before every rewritten statement (2–3 µs), so a
   committed write from a connection the wrapper does not own is noticed; the
@@ -160,7 +200,11 @@ same resident columns:
 1. **The `gpudb` shell** (#138) — plain DuckDB SQL from a terminal, DuckDB's own
    box renderer, and a footer under each result saying where the statement ran
    and why. `.gpu`, `.gpu on|off`, `.residents`, `.memory`, `.timer`, `.read`,
-   `.open`, `.tables`, `.schema`, `.version`.
+   `.open`, `.tables`, `.schema`, `.version`. `.open` with no argument works in
+   a `--readonly` session as well (the in-memory database it opens is
+   read-write; a named file keeps the session's read-only setting), and `.gpu`
+   prints every time as a time — `4.172 ms`, not seventeen digits — with its
+   labels in one column (#164).
 2. **Python — `gpudb.connect()`** — the same decision from an application, a
    notebook or a pipeline. **`last_rewrite()["detail"]`** (#140) gives the
    decision in a sentence next to the reason code, `sql()` decides on
@@ -184,7 +228,10 @@ LOAD gpudb;
 
 To replace an extension DuckDB already has, `INSTALL` alone is not enough:
 `FORCE INSTALL gpudb FROM community;`, or `UPDATE EXTENSIONS;`. The wrapper
-upgrades with `pip install -U duckdb-gpudb`.
+upgrades with `pip install -U duckdb-gpudb`. A wrapper that finds an extension
+older than itself says exactly that and gives exactly that advice, ending in a
+new session, since neither form reaches a process that has already loaded the
+old copy (#164).
 
 **Distribution name `duckdb-gpudb`** (#136), import name `gpudb`;
 Apache-2.0 in the package metadata to match the repository (#133), and the
@@ -192,14 +239,19 @@ full licence text so GitHub detects it (#89).
 
 ## Tests, CI and packaging
 
-- `python/tests/test_wrapper.py`: 1157 checks, 0 skipped, green under DuckDB
+- `python/tests/test_wrapper.py`: 1206 checks, 0 skipped, green under DuckDB
   1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
   backend without the exact path; #159 and #160 replaced its host gating with a
-  probe for the function that decides). On the RTX 4090 box the same suite
-  collects 1158 checks and runs 1154 ok with 4 failures — the counts each come
-  from their own machine — the four being segmented-upload cases, all unrelated
-  to the exact path and written down in `BENCHMARK.md` (#161).
-- `test_gpudb`: 730 / 730 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
+  probe for the function that decides; #164 added the reported tie and its
+  fallbacks). On the RTX 4090 box the same suite collects one check more,
+  because the `avg`-over-`DECIMAL` section branches on the host's `long
+  double` — the counts each come from their own machine — and carries 4
+  failures, all of them segmented-upload cases unrelated to the exact path and
+  written down in `BENCHMARK.md` (#161).
+- `python/tests/test_residency_policy.py`: 85 checks, 0 failing — the residency
+  policy on a clock the test drives, so the yield rule and the quiet-window
+  bound are asserted directly rather than raced against a real machine (#167).
+- `test_gpudb`: 750 / 750 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
   #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block.
 - `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
   RTX 4090; 45 `expected_fail` guardrail cases across the 18 files in
@@ -210,7 +262,8 @@ full licence text so GitHub detects it (#89).
   wrapper suite runs against the built extension in CI (#158).
 - sqllogic coverage for the exact surface and a guard against an older
   extension (#148); parity and residency scripts default to the platform's
-  build directory (#141); the residency gate measures native shapes (#156).
+  build directory (#141); the residency gate measures native shapes (#156); the
+  libduckdb fetch is retried when the connection is reset (#164).
 
 ## What stays on DuckDB
 
@@ -221,9 +274,14 @@ above);
 prepared-statement parameters; statements inside an explicit transaction;
 `WITH RECURSIVE` and `AS MATERIALIZED` CTEs; `ROLLUP` / `CUBE` /
 `GROUPING SETS` / `QUALIFY` / `DISTINCT ON`; a set operation as the whole
-statement; and any shape the measured bounds decline. Each one is answered —
-by DuckDB, at DuckDB's speed. `docs/TRANSPARENT_DESIGN.md` §10 gives the
-reason for each, and `KNOWN_ISSUES.md` has the rest.
+statement; a pushed `ORDER BY … LIMIT k` whose ordering values tie inside the
+first *k* rows (`ties`, above); and any shape the measured bounds decline. Each
+one is answered — by DuckDB, at DuckDB's speed. A bare `SELECT count(*) FROM t`
+is on this list too and now says why it is: DuckDB answers it from the table's
+own row count without reading a column, and the device plan needs a column to
+build its constant key from (#164 fixed the sentence, not the decision).
+`docs/TRANSPARENT_DESIGN.md` §10 gives the reason for each, and
+`KNOWN_ISSUES.md` has the rest.
 
 ## Platforms
 
@@ -234,7 +292,7 @@ reason for each, and `KNOWN_ISSUES.md` has the rest.
 | From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `gpu_build_info()` answers it for whichever binary is in front of you | yes |
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
-#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 730 / 730,
+#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 750 / 750,
 the SQL suite 224 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the
 device with 0 rows differing — the same coverage and the same five declines as
 Metal (#161). It stays opt-in in this release for one reason:
