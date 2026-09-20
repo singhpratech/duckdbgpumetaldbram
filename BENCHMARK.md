@@ -5099,8 +5099,8 @@ steady-state number for a workload that asks the same shapes repeatedly, not
 a cold-start number. Each query's rows are compared with native's, ordered,
 and the `identical` column is that comparison.
 
-**Not recorded by the run, and not reconstructed here:** the DuckDB version
-each run used, and the memory budget the SF10 run was given. SF10 holds
+**Two conditions the run did not print:** the DuckDB version it used, and the
+memory budget the SF10 run was given. SF10 holds
 18.7 GiB resident, which is above the 16 GiB the default budget works out to
 on this machine, so that run must have raised it; the repro command below
 therefore passes a budget explicitly.

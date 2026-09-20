@@ -3,7 +3,7 @@
 **Status 2026-09-19: implemented.** Every method below exists on the CPU
 reference, on Metal and on CUDA (#152, #153, #154): exact `GROUP BY`, the
 `WHERE` mask, the global masked aggregate and the materialised join. On the
-RTX 4090 Laptop the unit suite is 711 / 711, the SQL suite 224 / 0 with the
+RTX 4090 Laptop the unit suite is 730 / 730, the SQL suite 224 / 0 with the
 path on, and `scripts/tpch_coverage.py` answers 17 of 22 TPC-H queries at SF1
 on the device with 0 rows differing from native — the same coverage and the
 same five declines as Metal at that scale factor (`BENCHMARK.md`, *the

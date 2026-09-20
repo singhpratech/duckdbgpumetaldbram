@@ -91,6 +91,7 @@ Entries are in date order in the file; this groups them by question.
 - The column SQL could not compute (`avg` over `DECIMAL`, derived in C++)
 - Measurements that existed only in review (the CUDA numbers put into the repository)
 - A hypothesis that was wrong, and a 32% win that was real (the CUDA exact upload, double-buffered)
+- Three passes into one, and a ratio that checks itself (the fused `agg_all` on CUDA)
 
 The journal ends with **Open questions** — the shapes the current design does
 not answer, each with the measurement that says why. It is a record of where

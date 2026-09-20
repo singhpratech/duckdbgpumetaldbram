@@ -46,7 +46,7 @@ up to 52.9× on an M4 Max** — warm, with the tables already resident — and
 17 of 22 at SF1. The ones that stay are declined on purpose, and this README
 says which and why.
 
-**Nothing you use today goes away.** `gpu_upload`, `gpu_upload_pair`, the
+**Nothing you use goes away.** `gpu_upload`, `gpu_upload_pair`, the
 `gpu_*_resident` scalars, the fused joins, the resident GROUP BY and top-k table
 functions all work in v0.7 exactly as they did in v0.5 / v0.6, from any DuckDB
 client, with the same names and the same results.
@@ -488,7 +488,7 @@ the whole of what it adds. Everything else is DuckDB's.
 
 #### Threads and several connections
 
-What the code guarantees, and no more:
+Four guarantees, each of them tested:
 
 - **One `Connection` per thread.** `last_rewrite()` is a single record per
   connection object, so two threads sharing one connection overwrite each
@@ -597,8 +597,8 @@ residents: {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': 'ready'}
 memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': {'state': 'ready', 'est_bytes': 217609579, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}}
 ```
 
-Three statements, three different outcomes — a win, a size threshold, and a
-shape with no kernel behind it. `6 groups` in the second is the wrapper's
+Three statements, three outcomes — a win, a size threshold, and a shape with
+no kernel behind it. `6 groups` in the second is the wrapper's
 *estimate* of the key's distinct count (three return flags × two line
 statuses); the statement actually returns four rows, and a statement is
 decided before it runs, on the estimate. Why that estimate declines here while
@@ -643,9 +643,10 @@ common way to end up with a shell that works but never uses the GPU.
    ```
 
    The `duckdb` module `pip` pulls in (or the one you already have) must be a
-   version the registry publishes a gpudb build for — today that is **1.5.5
-   only**. A newer `duckdb` will load fine and simply find no gpudb to
-   install; pin it with `pip install "duckdb==1.5.5"` if you need to.
+   version the registry publishes a gpudb build for: **the registry builds
+   gpudb for DuckDB ≥ 1.5.5**. A `duckdb` outside that range loads fine and
+   simply finds no gpudb to install — `INSTALL gpudb FROM community` on DuckDB
+   1.4.5 is a 404. Pin it with `pip install "duckdb==1.5.5"` if you need to.
 
 **Route 2 — from a checkout.** Three steps; the first is the one that is easy
 to miss, because `scripts/build.sh` only builds the loadable extension when
@@ -997,21 +998,21 @@ them.
 |---|---|---|---|
 | Plain SQL on the GPU, through the shell or `gpudb.connect()` | yes | opt-in, see below | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
-| From the community registry | yes | the v0.6.0 Linux binary the registry serves today reports `compiled=cpu` — `gpu_build_info()` is what answers this for any binary | yes |
+| From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `SELECT gpu_build_info();` is what answers this for whichever binary is in front of you | yes |
 
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
 join. On an RTX 4090 Laptop with the path enabled the unit suite is
-**711 / 711**, the SQL suite **224 passing, 0 failing**, and TPC-H at SF1 is
+**730 / 730**, the SQL suite **224 passing, 0 failing**, and TPC-H at SF1 is
 **17 of 22 queries on the device, 0 rows differing from native** — the same
 coverage and the same five declines as Metal at that scale factor
 ([BENCHMARK.md](BENCHMARK.md), *the transparent path on CUDA*).
 
 It is **opt-in** in this release: set `GPUDB_CUDA_EXACT=1` to let the CUDA
-backend answer plain SQL. The reason is one thing and not a doubt about the
-kernels: every threshold the wrapper decides with was measured on Metal, and
-the gate that measures them (`scripts/transparent_gate.py`) has not yet been
-run on CUDA hardware. Rule 1 says never slower, and an unswept table is not
+backend answer plain SQL. One thing makes it opt-in, and it is not the
+kernels. Every threshold the wrapper decides with was measured on Metal, and
+the gate that measures them (`scripts/transparent_gate.py`) has not been run on
+CUDA hardware. Rule 1 says never slower, and an unswept table is not
 evidence for it — TPC-H Q1 straddling 1.0× on that box is exactly the kind of
 row a sweep is for. Without the flag a CUDA machine gets the explicit `gpu_*`
 functions and leaves plain SQL to DuckDB — correct, with no speed-up.
@@ -1049,9 +1050,9 @@ what lost, and why each decision was taken:
 
 ## What you'd use it for
 
-gpudb is for workloads that **ask the same aggregate questions of the same big data, over and over**. Upload a column to GPU memory once; every query after runs at memory-bandwidth speed with zero transfer.
+These are the shapes the explicit `gpu_*` surface was built for: **the same aggregate questions asked of the same big data, over and over**. Upload a column to GPU memory once, and every query after it runs at memory-bandwidth speed with no transfer. The numbers below are measured; the losing shapes are in the same tables.
 
-- **📊 Dashboards & monitoring** — a metrics dashboard re-runs `SUM`s every few seconds. Resident columns turn a 99 ms scan into 10 ms (measured, 600M rows). Refresh every 5 s and the one-time upload pays for itself inside 10 minutes — then every refresh is 4–25× cheaper, forever.
+- **📊 Dashboards & monitoring** — a metrics dashboard re-runs `SUM`s every few seconds. Resident columns turn a 99 ms scan into 10 ms (measured, 600M rows). Refresh every 5 s and the one-time upload pays for itself inside 10 minutes — then every refresh is 4–25× cheaper for as long as the column stays resident.
 - **🔬 Notebook exploration** — an analyst slicing data re-aggregates on every idea. Upload at the top of the notebook; the whole session runs GPU-speed. On a Mac this is capability that exists nowhere else: no other SQL engine uses the Apple Silicon GPU.
 - **⚡ Serving APIs** — endpoints answering "total X for Y" thousands of times a day. The resident column is a cache that never goes stale-wrong: exact answers, 5–25× lower latency, re-upload in seconds when data refreshes.
 - **📈 High-cardinality GROUP BY / top-k** — "quantity per order", "spend per customer", "top 10 by amount" over tens of millions of keys, re-asked as the data is explored. `gpu_groupby_sum_resident` returns `(key, sum, count)` rows (`gpu_groupby_count_resident` returns `(key, count)`) from a cached device sort, and the `_having(name, cmp, threshold)` / `_topk(name, k, order)` forms evaluate `HAVING` and `ORDER BY sum LIMIT k` **on the device** so only the survivors come back: **5.4–6.1× (Metal)** on TPC-H Q18's inner query at SF10–SF50, 6–8× on `HAVING count(*) >= 7`, 3.6–4.1× on the top-10 groups by sum — statement time vs statement time, same process. On CUDA the same device-side HAVING is **13–24× (SF50) / 17× (SF10)** and the top-10 groups 13–17×, because the 1.8 GB result copy over PCIe simply no longer happens. Returning all 15M–75M groups is 2.3–2.9× (Metal) / 1.5× end-to-end on CUDA (~32× on-device, PCIe-bound). Low-cardinality GROUP BY stays a native win on Metal (measured, kept in the table).
@@ -1203,17 +1204,16 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 -- -> 499999500000
 ```
 
-Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags needed.
-The registry binary carries the **full Metal backend on Apple Silicon**. The
-Linux binary the registry serves today (v0.6.0) reports `compiled=cpu` —
-checked from a clean `HOME` with the stock DuckDB 1.5.5 client — so every
-`gpu_*` function works and returns the same results, with `gpu_last_stats()`
-saying `backend=CPU`. **`SELECT gpu_build_info();` is the answer for whichever
-binary is in front of you**: `compiled=` lists what it was built with and
-`runtime=` the backend it chose. For the CUDA backend take the release binary
-(Option B; statically linked CUDA runtime, needs only a driver) or build from
-source with `nvcc`.
-The registry serves the **v0.7.0** build, with all 65 `gpu_*` functions: the
+Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags
+needed — that is the range the registry builds gpudb for. The registry binary
+carries the **full Metal backend on Apple Silicon**. A registry Linux binary
+may report `compiled=cpu`, in which case every `gpu_*` function works and
+returns the same results, with `gpu_last_stats()` saying `backend=CPU`.
+**`SELECT gpu_build_info();` is the answer for whichever binary is in front of
+you**: `compiled=` lists what it was built with and `runtime=` the backend it
+chose. For the CUDA backend take the release binary (Option B; statically
+linked CUDA runtime, needs only a driver) or build from source with `nvcc`.
+The v0.7.0 build carries all 65 `gpu_*` functions: the
 streaming aggregates, the full resident-column surface (`gpu_upload`,
 `gpu_sum_resident`, `gpu_residents`, `gpu_build_info`, …), the GPU join
 functions (`gpu_upload_pair`, `gpu_join_*_resident`, `gpu_join_rows_resident`,
@@ -1382,7 +1382,7 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 | `test_wrapper.py` — the transparent path | 1157 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing | M4 Max |
 | `tpch_coverage.py` with `GPUDB_CUDA_EXACT=1` | SF1 17 of 22 on the device, 0 rows differing | RTX 4090 Laptop |
-| `test_gpudb` — unit checks | 711 / 711 | RTX 4090 Laptop, CPU + CUDA |
+| `test_gpudb` — unit checks | 730 / 730 | RTX 4090 Laptop, CPU + CUDA |
 | `run_sql_tests.sh` | 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` | RTX 4090 Laptop |
 | `run_sql_tests.sh` guardrails | 45 `expected_fail` cases across the 18 files in `test/sql/` | — |
 

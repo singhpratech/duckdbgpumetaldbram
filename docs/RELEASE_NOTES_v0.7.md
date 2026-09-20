@@ -111,6 +111,19 @@ order-dependently — the shape is never rewritten.
   lane once the direct path has made them unnecessary.
 - **Statement overhead** (#132) — a cached plan per rendered statement and a
   leaner per-statement path in the extension.
+- **The fused reduce on CUDA** (#163) — `agg_all_i64` (SUM + MIN + MAX + COUNT
+  in one pass) had been a throwing stub on CUDA since v0.1 while CPU and Metal
+  implemented it. The fused kernel reads the column once instead of three
+  times: 2.150 ms of kernel time down to **0.719 ms** over 50M int64 rows on an
+  RTX 4090 Laptop, 517.8 GiB/s — about 90% of that part's theoretical
+  bandwidth. The same fusion on 20 CPU threads is 1.16×, which is the contrast
+  worth keeping: fusing pays in proportion to how much of the time was spent
+  moving bytes.
+- **The CUDA exact upload, double-buffered** (#162) — one staging buffer with a
+  stream synchronise after every span serialised the copy against the kernel,
+  leaving the PCIe link idle for each kernel and the GPU idle for each copy. A
+  buffer each, and an event instead of a barrier: 18.67 ms down to **12.75 ms**
+  over 2M rows in 996 spans, 32% off the upload. Both exact uploads take it.
 
 ## Residency and memory
 
@@ -135,9 +148,9 @@ order-dependently — the shape is never rewritten.
 - **Inner-statement bounds** (#144) — a `GROUP BY` whose groups DuckDB consumes
   itself, rather than the client, is decided by a different rule; measured, with
   the reduction ratio as the condition.
-- **Joins as index vectors** (#142) — the mechanism and what it costs to read a
-  lane through an index, measured. It is not wired into SQL, and nothing claims
-  it is.
+- **Joins as index vectors** (#142) — the mechanism, and what it costs to read
+  a lane through an index, measured. No SQL path takes it: every query's
+  behaviour is what the rest of these notes describe.
 
 ## Using it
 
@@ -185,7 +198,8 @@ full licence text so GitHub detects it (#89).
   probe for the function that decides). On the RTX 4090 box the same suite is
   1154 ok with 4 failures, all in the segmented-upload cases and all unrelated
   to the exact path — measured and written down in `BENCHMARK.md` (#161).
-- `test_gpudb`: 711 / 711 checks on CPU + CUDA (RTX 4090 Laptop).
+- `test_gpudb`: 730 / 730 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
+  #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block.
 - `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
   RTX 4090; 45 `expected_fail` guardrail cases across the 18 files in
   `test/sql/`.
@@ -216,10 +230,10 @@ reason for each, and `KNOWN_ISSUES.md` has the rest.
 |---|---|---|---|
 | Plain SQL on the GPU | yes | opt-in: `GPUDB_CUDA_EXACT=1` | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
-| From the community registry | yes | the v0.6.0 Linux binary reports `compiled=cpu`; `gpu_build_info()` answers it for any binary | yes |
+| From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `gpu_build_info()` answers it for whichever binary is in front of you | yes |
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
-#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 711 / 711,
+#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 730 / 730,
 the SQL suite 224 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the
 device with 0 rows differing — the same coverage and the same five declines as
 Metal (#161). It stays opt-in in this release for one reason:
