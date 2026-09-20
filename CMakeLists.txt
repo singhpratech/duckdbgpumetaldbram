@@ -15,20 +15,26 @@ cmake_minimum_required(VERSION 3.20)
 # platform tag is read from the binary, and it decides where the wheel
 # can be installed at all.
 #
-# 14.0 is the lowest target this source compiles at with no
-# unguarded-availability warnings. Below it, MTLLanguageVersion3_1
-# (macOS 14.0) in the shader-compile paths and MTLGPUFamilyMetal3
-# (macOS 13.0) in the aggregator are reached without a guard, and a
-# guard there would need a fallback language version that does not
-# exist in this code — so the floor rises to the API instead of
-# inventing one.
+# 15.0 is the floor of the binary the registry has been serving, so it
+# is the one floor this project has evidence for.
 #
-# This is a COMPILE-TIME claim: the availability checking says no symbol
-# newer than the target is reached unguarded. It is not a test on macOS
-# 14; no such machine is available here.
+# It is not the lowest that COMPILES: 14.0 also builds with no
+# unguarded-availability warnings. But the shader-compile paths choose
+# their Metal language version at run time — 3.2 on macOS 15 or newer,
+# 3.1 below — and that 3.1 branch has never executed anywhere, because
+# every machine this has run on is 15 or newer. A target of 14.0 would
+# ship that branch on the compiler's word alone. Lower still (11.0) does
+# not even compile cleanly: MTLLanguageVersion3_1 (macOS 14.0) in the
+# shader-compile paths and MTLGPUFamilyMetal3 (macOS 13.0) in the
+# aggregator are then reached unguarded, and guarding them would need a
+# fallback language version this code does not have.
+#
+# So: 15.0 is claimed because a 15.0 binary has shipped and run. 14.0 is
+# not claimed, and nothing here was tested on a macOS older than the one
+# it was built on — no such machine is available.
 if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET
          AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING
         "Minimum macOS version the produced binaries declare")
 endif()
 

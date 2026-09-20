@@ -5230,7 +5230,7 @@ that is when the compiler is probed and the value baked into the toolchain —
 and only when neither `CMAKE_OSX_DEPLOYMENT_TARGET` nor the
 `MACOSX_DEPLOYMENT_TARGET` environment variable already says otherwise.
 
-Choosing the value is a compile question. Building the library with
+Choosing the value is partly a compile question. Building the library with
 `-Wunguarded-availability-new -Wunguarded-availability`:
 
 * **11.0** — four warnings in three files. `MTLLanguageVersion3_1` (macOS 14.0)
@@ -5244,17 +5244,24 @@ Choosing the value is a compile question. Building the library with
 * **14.0** — zero availability warnings.
 * **15.0** — zero availability warnings.
 
-So the floor is **14.0**: the lowest target the source compiles at without an
-invented fallback, and one version below what the registry's binary already
-demands. The packaged extension and the dylib now both report `minos 14.0`, and
-the wheel tag follows on its own — `macosx_14_0_arm64`.
+Two targets are clean, so the compiler does not decide between them.
 
-**What that claim rests on, exactly:** compile-time availability checking at
-target 14.0, which says no symbol newer than macOS 14 is reached without a
-guard; and the fact that the registry has been serving a 15.0 binary, so 14.0
-is not a regression for anyone. It does **not** rest on a test run on macOS 14.
-No machine older than 26 is available here, and none of the suites below were
-run on one.
+The floor is **15.0**, and 14.0 was deliberately not taken.
+
+Compiling cleanly is not the same as having run. The shader-compile paths pick
+their Metal language version at run time — 3.2 on macOS 15 or newer, 3.1 below
+— and that 3.1 branch has never executed on any machine, because every machine
+gpudb has run on is 15 or newer. A 14.0 target would ship it on the compiler's
+word. 15.0, by contrast, is the floor of the binary the community registry has
+been serving: it has shipped, and it has run.
+
+So the claim is narrow and it is stated as such. **15.0 is claimed because a
+15.0 binary has shipped and run.** 14.0 compiles without a single availability
+warning and is not claimed. Nothing here was tested on a macOS older than the
+one it was built on; no such machine is available.
+
+The packaged extension and the dylib now both report `minos 15.0`, and the
+wheel tag follows on its own — `macosx_15_0_arm64`.
 
 ### What the deployment target does not change
 
@@ -5277,11 +5284,11 @@ The default comes from the runtime Metal framework, not from the target, so
 lowering the floor does not move the generated code. Nothing was changed about
 the shader language version, deliberately.
 
-The suites agree: 3056 / 3056 unit checks, 225 SQL pass / 0 fail, the wrapper
-and shell suites clean under DuckDB 1.5.5, the budget gate PASS at 169
-statements with 0 differing, and TPC-H SF1 coverage unchanged at 17 of 22 on
-the device, 0 differing, ratios 1.44x to 12.59x against the 1.4x-13.6x on
-record.
+The suites agree, on a clean rebuild at the 15.0 target: 3056 / 3056 unit
+checks, 225 SQL pass / 0 fail, the wrapper and shell suites clean under DuckDB
+1.5.5, the budget gate PASS at 169 statements with 0 differing, and TPC-H SF1
+coverage unchanged at 17 of 22 on the device, 0 differing, ratios 1.44x to
+12.59x against the 1.4x-13.6x on record.
 
 ## Open questions
 
