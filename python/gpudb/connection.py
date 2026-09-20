@@ -1586,10 +1586,13 @@ class Connection:
             return sql
         try:
             tree = self._serialize(sql)
-            if _ctes.inline(tree, self._function_ok) is None:   # cheap structural test first
+            # `AS MATERIALIZED` has to be read off the TEXT: json_serialize_sql
+            # does not round-trip the hint (see _ctes), so the tree cannot say.
+            blocked = _ctes.materialized_names(sql)
+            if _ctes.inline(tree, self._function_ok, blocked) is None:   # cheap structural test first
                 return sql
             want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
-            out = _ctes.inline(tree, self._function_ok, [w[0] for w in want])
+            out = _ctes.inline(tree, self._function_ok, blocked, [w[0] for w in want])
             if out is None:
                 return sql
             cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
@@ -1668,6 +1671,20 @@ class Connection:
         around it returns that many rows — part of the cache key, because the
         same text decides differently where its groups go somewhere else."""
         self._last = LastRewrite(statement=sql)
+        # `AS MATERIALIZED` asks for exactly ONE evaluation of the body, and
+        # json_serialize_sql does not round-trip the hint: on DuckDB 1.5.5
+        # `AS MATERIALIZED`, `AS NOT MATERIALIZED` and a plain CTE all
+        # serialize to CTE_MATERIALIZE_DEFAULT and deserialize to a plain
+        # `WITH r AS (...)`. So no rewritten form can carry the instruction,
+        # and a statement that gives it is left to DuckDB whole rather than
+        # rewritten into something that quietly ignores it. (Inner statements
+        # come from deserialized trees and never contain the word, so this
+        # costs them nothing.)
+        if _ctes.materialized_names(sql):
+            self._last.reason = "shape"
+            self._last.detail = ("a CTE is declared AS MATERIALIZED, which the rewrite "
+                                 "cannot preserve (json_serialize_sql drops the hint)")
+            return None
         sql = self._folded(sql)
         t0 = time.perf_counter()
         template, literals = self._normalise(sql)

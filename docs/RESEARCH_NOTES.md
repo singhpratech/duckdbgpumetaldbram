@@ -3270,6 +3270,84 @@ several times their usual scan time, which it already records in `seg_ms`) and
 back off, or whether §9.3's "run it last and alone" is the whole answer. The
 gate is not the place to decide it — it now reports the effect instead of
 hiding it inside a mixture.
+## 2026-09-19 — A guard that tested for a value the serializer never emits
+
+`_ctes.py` says in its docstring that `AS MATERIALIZED` is left alone, because
+the hint asks for exactly one evaluation of the body and splicing it into
+several references would undo that. The code implements exactly that:
+
+    if key and value.get("materialized") != "CTE_MATERIALIZE_ALWAYS" \
+            and _projects_and_joins(body) and ok_functions(body):
+
+The guard is correct, and it had never once fired. On DuckDB 1.5.5,
+`json_serialize_sql` does not round-trip the hint — `AS MATERIALIZED`,
+`AS NOT MATERIALIZED` and a plain CTE all serialize to
+`materialized: CTE_MATERIALIZE_DEFAULT`:
+
+    WITH r AS MATERIALIZED (SELECT 1 AS a) SELECT a FROM r
+      round-trips to -> WITH r AS (SELECT 1 AS a)SELECT a FROM r
+    WITH r AS NOT MATERIALIZED (SELECT 1 AS a) SELECT a FROM r
+      round-trips to -> WITH r AS (SELECT 1 AS a)SELECT a FROM r
+
+`CTE_MATERIALIZE_ALWAYS` is a value the wrapper can never see, so the test was
+dead code in the literal sense: a branch whose condition is constant, in a
+module whose docstring promised the opposite behaviour.
+
+### How it stayed hidden, and what found it
+
+The wrapper suite has a check for precisely this — `cte decline materialized`
+asserts the statement runs native. It passed for as long as the backend under
+test declined the statement for some OTHER reason. On a CUDA box before the
+exact path, the reason was `shape`: the backend could not do the exact GROUP BY
+at all, so nothing reached the CTE logic. The check was green because the
+statement was declined twice over, and only one of those declines was the one
+being tested.
+
+Implementing the exact path removed the outer decline. The moment CUDA could
+answer the statement, the dead guard stopped being covered by an accident, and
+the check failed. It is worth being precise about what that means: the bug was
+not introduced by the CUDA work, and it is not CUDA-specific. It is in shared
+Python, it applies to every backend, and the CUDA work only removed the thing
+that was hiding it.
+
+That is the second time in this port that finishing an operator surfaced a
+latent bug in shared code rather than in the operator — the first was the
+hybrid planner choosing placement by "did the GPU throw?". Both had the same
+shape: a rule that was correct while every backend was uniformly capable, and
+silently wrong the moment one became partially capable. A test suite that only
+ever runs against uniformly-capable backends cannot see either.
+
+### The fix, and why it is at the statement level
+
+The hint cannot be recovered from the tree, so it has to be read from the
+statement TEXT before serialization. Blocking the splice alone turned out not
+to be enough: with the CTE left in the `WITH`, a later pass still flattened the
+statement into a plain resident GROUP BY, reaching `form='plain'` by a
+different route. So the guard is at the top of the rewrite instead — a
+statement that declares any `AS MATERIALIZED` CTE is left to DuckDB whole.
+
+`AS NOT MATERIALIZED` asks for inlining, which is what the rewrite does anyway,
+so it is deliberately not matched and stays eligible. Comments and string
+literals are blanked before matching, so a statement containing the word in its
+data is not declined for its data.
+
+The honest limitation: this is a regex over SQL text, and the right fix is for
+the serializer to carry the field. Text matching is what is available today,
+and it errs toward declining, which is the safe direction.
+
+**Checked on the second machine (M4 Max, Metal), same day.** The serializer's
+behaviour is a difference between DuckDB versions, not something that never
+worked: on 1.4.5 `json_serialize_sql` carries the hint (`CTE_MATERIALIZE_ALWAYS`
+/ `_NEVER` / `_DEFAULT` for the three forms), on 1.5.5 all three come back
+`CTE_MATERIALIZE_DEFAULT`. Every wrapper run on the Mac until now used its only
+interpreter with the module, Python 3.9 with DuckDB 1.4.5, so the tree-level
+test was live there and the check was green for the right reason — on a version
+the registry does not serve. Run under 1.5.5 for the first time, main's wrapper
+suite had exactly one failure, this one (`cte decline materialized: runs
+native`), with the full exact path present: not a CUDA matter at all. With the
+text-level guard the suite passes under both 1.4.5 and 1.5.5. Acceptance runs on
+the Mac now use both versions.
+
 
 ## Open questions
 
