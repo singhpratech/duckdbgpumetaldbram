@@ -224,7 +224,7 @@ SELECT (SELECT bool_and(on_gpu IS NULL OR on_gpu) FROM gpu_store_columns()) AS n
 -- machine with memory to spare.
 -- requires_backend: metal
 -- env: GPUDB_METAL_UPLOAD_REFUSE_MB=1
+-- expected_fail: GPUDB_DEVICE_UPLOAD_REFUSED
 -- setup: CREATE TABLE t AS SELECT (i % 100)::INTEGER AS k, i::BIGINT AS v FROM range(300000) r(i)
 -- setup: SET VARIABLE oid = (SELECT table_oid FROM duckdb_tables() WHERE table_name = 't')
 SELECT gpu_upload_columns('gpudb:v1:memory:main:t:' || getvariable('oid') || ':k,v:store', rowid, [k::BIGINT, v], []::DOUBLE[], []::VARCHAR[]) FROM t;
--- expected_fail: the device refused the upload; a host-placed exact set is not offered in its place
