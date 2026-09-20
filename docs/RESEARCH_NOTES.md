@@ -3427,6 +3427,70 @@ with `native_avg_decimal`, which has no 53-bit ceiling — after which the guard
 becomes unnecessary rather than merely correct.
 
 
+## 2026-09-19 — A test that pretended to be the other machine
+
+The avg(DECIMAL) guard landed and main's wrapper suite went from 4 failures to
+27 on x86-64. None of them were the guard being wrong. All of them were
+expectations that had been written on a machine where the guard does not fire.
+
+Two classes, and the second is the interesting one.
+
+**Stale parity expectations (18 checks).** `avg_decimal`, `avg_decimal_nulls`,
+`avg_decimal_having`, `avg_decimal_order`, `avg_decimal_expr`,
+`post-agg avg_decimal_inside`, `global single_decimal`, `spelling avg_filter`
+all assert that avg over a DECIMAL column IS rewritten. On x86 it is now
+correctly declined, so they fail. They passed on main before only because the
+guard was dead. These are dropped where the platform declines them, with a
+visible skip naming each case, and the dedicated end-to-end section still
+covers the decline itself on both platforms.
+
+**A test that cannot hold on this hardware (5 checks).** The new section ends
+with:
+
+    avg_bits(con, 53)
+    for name, sql in ...:
+        check(lr["rewritten"], ...)
+        check(got == want, f"avgf=53 {name}: rows identical to native")
+
+`avg_bits(con, 53)` forces the wrapper to believe the extension reported a
+53-bit mantissa. That changes which path the wrapper CHOOSES. It does not
+change what the machine COMPUTES. On x86-64 DuckDB still finalises native's
+average in the 80-bit type while the SQL derivation computes in 64-bit double,
+so the two differ — on exactly the groups past 2^53 that the fixture is built
+to contain, since the section's own first assertion is that the widest unscaled
+sum is past 2^53.
+
+So the block asserts something false by construction on x86. It passed on arm64
+because forcing 53 there is a no-op: long double already IS double, and the
+simulation and the hardware agree.
+
+That is the distinction worth keeping: a flag that stands for a platform fact
+can be forced, and doing so simulates the DECISION but never the ARITHMETIC.
+The decision half is checkable everywhere and stays checked on both platforms.
+The row-equality half is only checkable where the fact is really true, and now
+runs only there, with a skip on other hosts that says why rather than passing
+quietly.
+
+### Why none of this was visible from the machine that wrote it
+
+The guard fires only where `long double` is wider than `double`. The Mac is
+arm64, where it is not. So every check that the guard changes was, on that
+machine, a check the guard does not touch — and the suite was green for the
+same reason the bug had been invisible for weeks. Merging on that green is what
+put 27 failures on main.
+
+Third time today the same shape has appeared: a check passing for a reason
+other than the one under test. The `MATERIALIZED` guard tested a value the
+serializer had stopped emitting. The avg(DECIMAL) guard read a field before the
+loop that fills it. Now a parity assertion simulated a platform it was not
+running on. In each case the green came from somewhere other than the property
+being asserted, and in each case only the second machine could tell.
+
+After: 1112 checks, 4 failures on x86 — the pre-existing segmented-upload
+cluster — and 5 skips. On arm64 nothing changes at all: the helper returns
+early when the reported width is already 53, so no case is dropped and the
+row-equality half still runs.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
