@@ -5774,3 +5774,113 @@ The device cost is a floor set by the row count; native's falls as groups get
 fewer. They cross in the hundreds, and `min_groups = 1000` already sits above
 the crossing.
 
+
+## v0.7 — the direct grouped reduce on CUDA, RTX 4090, SF1 (2026-09-20)
+
+The section above ends with `string_key_few_groups` False on CUDA, keeping the
+rewrite away from few-group VARCHAR keys because the device took 6–8 ms where
+DuckDB took 2.7. This is what that was, and what it measures now.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds on,
+`data/tpch_sf1/tpch.duckdb`, default memory budget 8,359,084,032 B (7972 MiB).
+No environment variable set.
+
+### Where the time was
+
+The sort path reads the payload *through* the sort permutation: one random
+8-byte load per row, per payload. The group count barely entered into it —
+
+| key | groups | device | native |
+|---|---|---|---|
+| `l_returnflag` | 3 | 7.57 ms | 2.67 ms |
+| `l_shipmode` | 7 | 6.20 ms | 2.71 ms |
+| `l_suppkey` | 10,000 | 8.51 ms | 21.67 ms |
+| `l_partkey` | 200,000 | 141.39 ms | 209.17 ms |
+
+— 3 groups and 10,000 groups cost the same, because the cost was the gather.
+
+A second cost only showed up once the first was gone. One statement, one
+payload, at four selectivities:
+
+| WHERE | kept | device |
+|---|---|---|
+| none | 100% | 1.10 ms |
+| `l_shipdate <= 1998-09-02` | 98% | 3.78 ms |
+| `l_shipdate <= 1993-01-01` | 9% | 3.07 ms |
+| `l_orderkey < 0` | **0%** | **2.73 ms** |
+
+A predicate keeping *nothing* still cost 2.73 ms against 1.10. That is
+`select_sorted` rewriting the sorted keys and the permutation over the whole
+column — which the sort path needs and the direct path never reads.
+
+### After both
+
+| case | sort path | direct | + no compaction | native |
+|---|---|---|---|---|
+| 1 payload, no WHERE | 6.1 ms | 1.10 ms | 1.10 ms | 2.36 ms |
+| 1 payload, Q1's WHERE | — | 3.78 ms | **1.12 ms** | 3.61 ms |
+| 8 payloads, Q1's WHERE | — | 18.15 ms | **5.71 ms** | 8.92 ms |
+| **TPC-H Q1** | 19.5–29.2 ms | ~15 ms | **5.21 ms** | 10.91 ms |
+
+The few-group family — four VARCHAR keys × six WHEREs × 1/3/5 payloads, 72
+cells — measures **1.16× to 5.72×**, against 0.17–0.47× before. Larger group
+counts are untouched: 10,000 groups 8.78 ms against 8.51, 200,000 groups
+141.8 against 141.4.
+
+### Suites, on the tree that merges
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **774 / 774** (752 before, 22 new) |
+| SQL suite | **225 pass / 0 fail**, 45 guardrail, 2 skip |
+| `test_wrapper.py` | all pass |
+| `test_residency_policy.py` | all pass |
+| `test_shell.py` | all pass, 2 skipped |
+| `scripts/budget_gate.py` | **PASS** — 169 statements, 0 differing, 0 errors, resident never above the budget; evictions 2 (wasted 0), refusals 9, RSS 179 → 655 MiB |
+
+### TPC-H SF1
+
+| path | on device | differing | ratio range | narrowest | widest |
+|---|---|---|---|---|---|
+| `--path execute` | **17 of 22** | **0** | 1.21× – 31.44× | Q15 | Q9 |
+| `--path sql` | **17 of 22** | **0** | 1.66× – 16.27× | Q15 | Q9 |
+
+Q1 is 1.99× / 2.07× — it declined under the guardrail, and the guardrail was
+the right call while the device was slower. Seventeen on the device with every
+one a win, rather than sixteen with a loser counted in.
+
+### The transparent gate
+
+`--subqueries --exprs --ctes --inner --lane-floor --path auto`, default budget.
+
+| | #178 (guardrail) | with the direct reduce |
+|---|---|---|
+| cells | 1631 | 1631 |
+| PASS | 999 | **1014** |
+| declined (threshold) | 631 | **616** |
+| **below 1.0×** | 0 | **0** |
+| **differing** | 0 | **0** |
+| ratio range of PASS | 1.05× – 452.62× | **1.01× – 487.26×** |
+| wall | 21m24s | 21m38s |
+| exit | 0 | **0** |
+
+Fifteen cells that declined now run on the device and pass; nothing that
+passed stopped. Peak device memory 8485 MiB against the 7972 MiB budget — the
+same ~8.4 GiB plateau as the runs before it, and for the same reason: the
+budget accounts for resident sets, not operator working memory.
+
+### The row that still loses
+
+| statement | device | native | |
+|---|---|---|---|
+| `l_returnflag`, `WHERE l_orderkey < 0`, 1 payload | 0.76 ms | **0.21 ms** | **0.28×** |
+
+A predicate that matches nothing. DuckDB skips the table through its zone maps
+and answers in a fifth of a millisecond; the device still scans six million
+rows to find nothing there. It is not in the gate — the gate's most selective
+WHERE keeps 3%, where the device wins 1.90–2.32× — and no threshold is
+proposed for it: the wrapper sees an estimate and cannot know native will skip,
+and any selectivity floor low enough to catch this would decline the 3–9% cells
+that win 2–6×. The measured rule declines it after one run. A zone-map
+equivalent on the device is what would fix it.

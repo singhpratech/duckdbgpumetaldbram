@@ -3233,11 +3233,13 @@ def few_group_string_key_checks():
 
     `_thresholds` lets a VARCHAR key past `min_groups` with no WHERE because
     native hashes a string on every row while the device does not. That is true
-    of a backend which answers few distinct values with one row-order pass over
-    a group-id lane (Metal's direct grouped reduce) and false of one whose exact
-    GROUP BY always sorts (CUDA today): there the device reads every row into a
-    sort per payload however few groups come out, and measured 0.17-0.47x over
-    twelve cells at SF1. So Metal keeps the exemption and CUDA does not.
+    of a backend which answers few distinct values without reading the whole
+    column into a sort. CUDA did not, for one day, and the shape measured
+    0.17-0.47x there; with the direct grouped reduce, and the mask compaction
+    dropped from the path that never reads it, the same family measures
+    1.16-5.72x over 72 cells. So the flag is True on both tables again, and
+    what this pins is the LINK: the exemption follows the capability flag and
+    not something else drifting.
 
     Nothing here touches a device — it asks the decision function directly, so
     it runs and means the same on every machine.
@@ -3245,33 +3247,30 @@ def few_group_string_key_checks():
     import dataclasses
     from gpudb import _thresholds as _th
 
-    print("== the VARCHAR few-group exemption is per backend, not a constant")
+    print("== the VARCHAR few-group exemption follows the backend's capability")
 
     differing = [f for f in _th.METAL.__dataclass_fields__
                  if getattr(_th.METAL, f) != getattr(_th.CUDA, f)]
-    check(differing == ["string_key_few_groups"],
-          f"CUDA's table differs from Metal's in exactly the exemption flag ({differing})")
-    check(_th.METAL.string_key_few_groups and not _th.CUDA.string_key_few_groups,
-          "Metal keeps the exemption, CUDA does not")
+    check(differing == [],
+          f"both backends have the capability, so the two tables agree ({differing})")
 
     # The shape the exemption exists for: a 3-group VARCHAR key, no WHERE, the
     # plain form — far below min_groups, so nothing else would admit it.
     shape = dict(form="plain", est_groups=3, selectivity=None, has_where=False,
                  string_key=True, rows=6_001_215)
-    ok_metal, why_metal = _th.decide("METAL", **shape)
-    ok_cuda,  why_cuda  = _th.decide("CUDA",  **shape)
-    check(ok_metal, f"METAL rewrites the few-group VARCHAR key ({why_metal})")
-    check(not ok_cuda and "groups" in why_cuda,
-          f"CUDA declines it, and the reason names the group count ({why_cuda!r})")
+    for backend in ("METAL", "CUDA"):
+        ok, why = _th.decide(backend, **shape)
+        check(ok, f"{backend} rewrites the few-group VARCHAR key ({why})")
 
-    # The flag is the only thing deciding it: give CUDA's table the exemption
-    # back and the same statement is admitted again. This is what keeps the
-    # check honest if min_groups ever moves.
+    # And the flag is what decides it, not min_groups drifting underneath:
+    # take the capability away from a copy of the table and the same statement
+    # declines, naming the group count.
     saved = dict(_th.TABLE)
     try:
-        _th.TABLE["CUDA"] = dataclasses.replace(_th.CUDA, string_key_few_groups=True)
-        ok_again, _ = _th.decide("CUDA", **shape)
-        check(ok_again, "with the exemption restored, CUDA admits the same statement")
+        _th.TABLE["CUDA"] = dataclasses.replace(_th.CUDA, string_key_few_groups=False)
+        ok_off, why_off = _th.decide("CUDA", **shape)
+        check(not ok_off and "groups" in why_off,
+              f"without the capability the same statement declines ({why_off!r})")
     finally:
         _th.TABLE.clear(); _th.TABLE.update(saved)
 

@@ -295,6 +295,16 @@ struct IsRunStart {
     }
 };
 
+// A narrow lane read as the i64 it represents, for the CUB passes that want a
+// plain sequence of keys rather than the storage behind them.
+struct ReadKey {
+    const void* a;
+    int         w;
+    __host__ __device__ __forceinline__ i64 operator()(std::size_t i) const {
+        return ldw(a, w, i);
+    }
+};
+
 // ---- element-wise kernels -------------------------------------------------
 
 __global__ void fill_valid_kernel(u64* __restrict__ bits, std::size_t words) {
@@ -542,6 +552,140 @@ cudaError_t fetch(const void* d_src, T* h_dst, cudaStream_t s) {
     cudaError_t e = cudaMemcpyAsync(h_dst, d_src, sizeof(T), cudaMemcpyDeviceToHost, s);
     if (e != cudaSuccess) return e;
     return cudaStreamSynchronize(s);
+}
+
+// ---- the direct grouped reduce ------------------------------------------
+// Why it exists: the sort path reads the payload THROUGH the permutation, one
+// random gather per row per payload. On 6M rows that is the whole cost of a
+// few-group statement, and it repeats per payload — 3 groups measured 7.6 ms
+// and 10,000 groups 8.5 ms over the same column, because the grouping was
+// never the expensive part. Reading keys and payload in row order turns those
+// gathers into streaming loads.
+//
+// The accumulators live in shared memory and are REPLICATED. With three
+// groups one copy would have every thread in the block updating three
+// addresses; `reps` private copies divide that contention, and the block folds
+// them together once, over G cells, at the end.
+constexpr int kDirectSmemBudget = 32 * 1024;   // shared bytes per block
+constexpr int kDirectTupleBytes = 6 * 8;       // lo, hi, cnt_v, cnt_star, mn, mx
+constexpr int kDirectMaxGroups  = 256;
+constexpr int kDirectMaxReps    = 32;
+
+// Where x sits among the n ascending distinct keys. x IS one of them — it came
+// out of this column — so the lower bound is the rank.
+__device__ __forceinline__ int dev_rank(const i64* __restrict__ keys, int n, i64 x) {
+    int lo = 0, hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (keys[mid] < x) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+
+__global__ void direct_init_kernel(const i64* __restrict__ distinct, int G,
+                                   i64* __restrict__ keys_out,
+                                   u64* __restrict__ glo, i64* __restrict__ ghi,
+                                   i64* __restrict__ gcv, i64* __restrict__ gcs,
+                                   i64* __restrict__ gmn, i64* __restrict__ gmx) {
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < G;
+         g += gridDim.x * blockDim.x) {
+        keys_out[g] = distinct[g];
+        glo[g] = 0ull; ghi[g] = 0; gcv[g] = 0; gcs[g] = 0;
+        gmn[g] = kI64Max; gmx[g] = kI64Min;
+    }
+}
+
+__global__ void direct_reduce_kernel(const void* __restrict__ keys, int kw,
+                                     const u64* __restrict__ kvalid,
+                                     std::size_t rows,
+                                     const unsigned char* __restrict__ rowmask,
+                                     const void* __restrict__ vals, int vw,
+                                     const u64* __restrict__ vvalid, int has_vals,
+                                     const i64* __restrict__ distinct, int G, int reps,
+                                     u64* __restrict__ glo, i64* __restrict__ ghi,
+                                     i64* __restrict__ gcv, i64* __restrict__ gcs,
+                                     i64* __restrict__ gmn, i64* __restrict__ gmx) {
+    extern __shared__ unsigned char smem[];
+    i64* const skeys = reinterpret_cast<i64*>(smem);
+    u64* const slo   = reinterpret_cast<u64*>(skeys + G);
+    i64* const shi   = reinterpret_cast<i64*>(slo + static_cast<std::size_t>(reps) * G);
+    i64* const scv   = shi + static_cast<std::size_t>(reps) * G;
+    i64* const scs   = scv + static_cast<std::size_t>(reps) * G;
+    i64* const smn   = scs + static_cast<std::size_t>(reps) * G;
+    i64* const smx   = smn + static_cast<std::size_t>(reps) * G;
+
+    for (int i = threadIdx.x; i < G; i += blockDim.x) skeys[i] = distinct[i];
+    for (int i = threadIdx.x; i < reps * G; i += blockDim.x) {
+        slo[i] = 0ull; shi[i] = 0; scv[i] = 0; scs[i] = 0;
+        smn[i] = kI64Max; smx[i] = kI64Min;
+    }
+    __syncthreads();
+
+    const int base = ((reps == 1) ? 0 : static_cast<int>(threadIdx.x & (reps - 1))) * G;
+
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows; i += stride) {
+        if (rowmask && !rowmask[i]) continue;
+        if (!bit_at(kvalid, i)) continue;     // NULL keys belong to the null group
+        const int g = base + dev_rank(skeys, G, ldw(keys, kw, i));
+
+        atomicAdd(reinterpret_cast<unsigned long long*>(&scs[g]), 1ull);
+        if (!has_vals) {
+            // Keys-only: the reference sets cnt_v = cnt_star and never touches
+            // min/max, so neither does this.
+            atomicAdd(reinterpret_cast<unsigned long long*>(&scv[g]), 1ull);
+            continue;
+        }
+        if (!bit_at(vvalid, i)) continue;     // a NULL payload contributes the identity
+        const i64 x = ldw(vals, vw, i);
+        const u64 old = atomicAdd(&slo[g], static_cast<u64>(x));
+        const i64 hi_contrib = (x < 0 ? -1 : 0)
+                             + static_cast<i64>((old + static_cast<u64>(x)) < old ? 1 : 0);
+        atomicAdd(reinterpret_cast<unsigned long long*>(&shi[g]),
+                  static_cast<unsigned long long>(hi_contrib));
+        atomicAdd(reinterpret_cast<unsigned long long*>(&scv[g]), 1ull);
+        atomicMin(reinterpret_cast<long long*>(&smn[g]), static_cast<long long>(x));
+        atomicMax(reinterpret_cast<long long*>(&smx[g]), static_cast<long long>(x));
+    }
+    __syncthreads();
+
+    // Fold the replicas, then merge once per group. The 128-bit add is the
+    // same carry add as AddExact — associative and commutative mod 2^128 — so
+    // the order the blocks arrive in changes no bit of the answer.
+    for (int g = threadIdx.x; g < G; g += blockDim.x) {
+        u64 lo = 0ull; i64 hi = 0, cv = 0, cs = 0, mn = kI64Max, mx = kI64Min;
+        for (int r = 0; r < reps; ++r) {
+            const int k = r * G + g;
+            const u64 prev = lo;
+            lo += slo[k];
+            hi += shi[k] + static_cast<i64>(lo < prev ? 1 : 0);
+            cv += scv[k]; cs += scs[k];
+            if (smn[k] < mn) mn = smn[k];
+            if (smx[k] > mx) mx = smx[k];
+        }
+        if (cs == 0) continue;
+        const u64 old = atomicAdd(&glo[g], lo);
+        atomicAdd(reinterpret_cast<unsigned long long*>(&ghi[g]),
+                  static_cast<unsigned long long>(hi + static_cast<i64>((old + lo) < old ? 1 : 0)));
+        atomicAdd(reinterpret_cast<unsigned long long*>(&gcv[g]),
+                  static_cast<unsigned long long>(cv));
+        atomicAdd(reinterpret_cast<unsigned long long*>(&gcs[g]),
+                  static_cast<unsigned long long>(cs));
+        if (cv) {
+            atomicMin(reinterpret_cast<long long*>(&gmn[g]), static_cast<long long>(mn));
+            atomicMax(reinterpret_cast<long long*>(&gmx[g]), static_cast<long long>(mx));
+        }
+    }
+}
+
+// The contract's empty-payload case — the same line finalize_kernel applies.
+__global__ void direct_finalize_kernel(int G, const i64* __restrict__ gcv,
+                                       i64* __restrict__ gmn, i64* __restrict__ gmx) {
+    for (int g = blockIdx.x * blockDim.x + threadIdx.x; g < G;
+         g += gridDim.x * blockDim.x) {
+        if (!gcv[g]) { gmn[g] = 0; gmx[g] = 0; }
+    }
 }
 
 }  // namespace
@@ -903,6 +1047,77 @@ cudaError_t gpudb_cuda_join_mat_gather(const void* d_src, int src_width,
     join_gather_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
         d_src, src_width, d_src_valid, from_build, d_match, d_cls, d_pos, rows_probe,
         d_dst, dst_width, d_dst_valid);
+    return cudaGetLastError();
+}
+
+int gpudb_cuda_exact_direct_max_groups(void) { return kDirectMaxGroups; }
+
+cudaError_t gpudb_cuda_exact_distinct(const void* d_sorted, int key_width, std::size_t n,
+                                      i64* d_out, std::size_t cap,
+                                      std::size_t* h_groups, cudaStream_t s) {
+    *h_groups = 0;
+    if (!n) return cudaSuccess;
+    // CUB's select takes the item count as an int here; a column past that is
+    // far past the group counts this path serves, so say so and let the caller
+    // keep the sort path.
+    if (n > static_cast<std::size_t>(0x7fffffff)) return cudaErrorInvalidValue;
+
+    // Count first. Unique would otherwise need an output buffer the size of
+    // the whole column, which is the allocation this path exists to avoid.
+    std::size_t runs = 0;
+    cudaError_t e = gpudb_cuda_exact_run_count(d_sorted, key_width, n, &runs, s);
+    if (e != cudaSuccess) return e;
+    *h_groups = runs;
+    if (runs > cap) return cudaSuccess;          // too many groups: nothing written
+
+    DevBuf num;
+    if ((e = num.alloc(sizeof(int))) != cudaSuccess) return e;
+    thrust::counting_iterator<std::size_t> it(0);
+    auto keys = thrust::make_transform_iterator(it, ReadKey{d_sorted, key_width});
+    return with_temp([&](void* tmp, std::size_t& bytes) {
+        return cub::DeviceSelect::Unique(tmp, bytes, keys, d_out,
+                                         static_cast<int*>(num.p),
+                                         static_cast<int>(n), s);
+    });
+}
+
+cudaError_t gpudb_cuda_exact_direct(const void* d_keys, int key_width,
+                                    const unsigned long long* d_kvalid,
+                                    std::size_t rows, const unsigned char* d_rowmask,
+                                    const void* d_vals, int val_width,
+                                    const unsigned long long* d_vvalid, int has_vals,
+                                    const i64* d_distinct, int n_groups,
+                                    i64* d_keys_out, i64* d_lo, i64* d_hi,
+                                    i64* d_cnt_v, i64* d_cnt_star,
+                                    i64* d_mn, i64* d_mx, cudaStream_t s) {
+    if (n_groups <= 0 || n_groups > kDirectMaxGroups) return cudaErrorInvalidValue;
+
+    // Replicas: as many as the shared budget affords, a power of two so the
+    // thread's copy is an AND rather than a modulo.
+    const int avail = kDirectSmemBudget - n_groups * static_cast<int>(sizeof(i64));
+    int reps = avail / (n_groups * kDirectTupleBytes);
+    if (reps > kDirectMaxReps) reps = kDirectMaxReps;
+    if (reps < 1) reps = 1;
+    while (reps & (reps - 1)) reps &= reps - 1;
+    const std::size_t smem = static_cast<std::size_t>(n_groups) * sizeof(i64)
+                           + static_cast<std::size_t>(reps) * n_groups * kDirectTupleBytes;
+
+    auto* glo = reinterpret_cast<u64*>(d_lo);
+    direct_init_kernel<<<grid_for(static_cast<std::size_t>(n_groups)), kBlock, 0, s>>>(
+        d_distinct, n_groups, d_keys_out, glo, d_hi, d_cnt_v, d_cnt_star, d_mn, d_mx);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    if (!rows) return cudaSuccess;
+
+    direct_reduce_kernel<<<grid_for(rows), kBlock, smem, s>>>(
+        d_keys, key_width, d_kvalid, rows, d_rowmask,
+        d_vals, val_width, d_vvalid, has_vals,
+        d_distinct, n_groups, reps,
+        glo, d_hi, d_cnt_v, d_cnt_star, d_mn, d_mx);
+    if ((e = cudaGetLastError()) != cudaSuccess) return e;
+
+    direct_finalize_kernel<<<grid_for(static_cast<std::size_t>(n_groups)), kBlock, 0, s>>>(
+        n_groups, d_cnt_v, d_mn, d_mx);
     return cudaGetLastError();
 }
 

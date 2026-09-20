@@ -160,6 +160,51 @@ cudaError_t gpudb_cuda_exact_reduce(const void* d_sorted, int key_width,
                                     std::int64_t* d_mn, std::int64_t* d_mx,
                                     std::size_t* h_runs, cudaStream_t s);
 
+// The distinct keys of an ascending-sorted array, ascending, into a caller
+// buffer of at least `cap` cells. *h_groups is the count; when it exceeds
+// `cap` nothing is written and the caller knows the key has too many groups
+// for the direct path. Built once per column, beside the sort cache.
+cudaError_t gpudb_cuda_exact_distinct(const void* d_sorted, int key_width, std::size_t n,
+                                      std::int64_t* d_out, std::size_t cap,
+                                      std::size_t* h_groups, cudaStream_t s);
+
+// ---- the direct grouped reduce -------------------------------------------
+// The same answer as gpudb_cuda_exact_reduce, by a different route, for a key
+// with FEW distinct values. The sort path reads the payload THROUGH the sort
+// permutation: one random 8-byte gather per row per payload, which is what a
+// few-group statement spends its time on (measured on this box: 3 groups
+// 7.6 ms and 10,000 groups 8.5 ms over the same 6M rows — the cost is the
+// gather, not the grouping, and it repeats per payload). This reads keys and
+// payload in ROW order, maps each key to its rank in `d_distinct`, and
+// accumulates into replicated shared-memory tuples. No sort, no permutation,
+// no random access.
+//
+// `d_distinct` holds n_groups ascending distinct keys (gpudb_cuda_exact_distinct)
+// and the output keeps that order — which is the order the sort path emits, so
+// this changes no answer and no row order. Groups the mask leaves empty come
+// back with cnt_star == 0 for the caller to drop, exactly as the sort path
+// would never have produced them.
+//
+// `d_rowmask` is one byte per row (the fused mask kernel's output) or null.
+// NULL keys are not touched here: they are one group of their own and
+// gpudb_cuda_exact_null_group still owns them.
+cudaError_t gpudb_cuda_exact_direct(const void* d_keys, int key_width,
+                                    const unsigned long long* d_kvalid,
+                                    std::size_t rows, const unsigned char* d_rowmask,
+                                    const void* d_vals, int val_width,
+                                    const unsigned long long* d_vvalid, int has_vals,
+                                    const std::int64_t* d_distinct, int n_groups,
+                                    std::int64_t* d_keys_out, std::int64_t* d_lo, std::int64_t* d_hi,
+                                    std::int64_t* d_cnt_v, std::int64_t* d_cnt_star,
+                                    std::int64_t* d_mn, std::int64_t* d_mx,
+                                    cudaStream_t s);
+
+// The widest group count the direct path will serve. Its accumulators live in
+// shared memory, replicated so that a three-group key does not serialise every
+// thread onto three addresses, so the bound is a shared-memory budget — see
+// kDirectSmemBudget in exact_kernel.cu.
+int gpudb_cuda_exact_direct_max_groups(void);
+
 // v0.7 §4.12: the global masked aggregate — no key, no sort, no permutation,
 // which is the shape this operator exists for. One tuple per payload over the
 // rows that pass the mask. `d_vals` / `d_vvalid` are HOST arrays of n_pays
