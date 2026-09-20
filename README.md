@@ -714,17 +714,20 @@ instead of beside it:
 2. **No migration.** `LOAD` for the explicit functions, one wrapper for plain SQL. Your tables, your clients, your queries.
 3. **A decision, not a mode.** The CPU answers where the CPU wins — low cardinality, small tables, selective filters — and the measurement that says so is published, losing rows included.
 
-Where that sits against the other GPU query engines, on the axes that are
-checkable from their own documentation:
+Where that sits against the other GPU query engines, on axes that are checkable
+from their own documentation (checked 2026-09-20; the sources are under the
+table):
 
 | | Sirius | cuDF / RAPIDS | HeavyDB | gpudb |
-|---|:-:|:-:|:-:|:-:|
-| Apple Silicon (Metal) backend | no | no | no | **yes** |
-| Runs as a DuckDB extension (no migration) | yes | no | no | **yes** |
-| CUDA backend | yes | yes | yes | yes |
-| Falls back to the CPU per statement, on a measurement | partial | no | no | **yes** |
-| Window functions on the GPU | no | partial | yes | no — they run on DuckDB |
+|---|---|---|---|---|
+| Runs on an Apple Silicon GPU | no — requires an NVIDIA GPU, compute capability 7.5+ | no — requires an NVIDIA GPU, compute capability 7.0+ | no — NVIDIA GPUs; CPU-only on x86, Power and ARM | **yes — Metal** |
+| Runs as a DuckDB extension | yes — loaded into DuckDB, statements intercepted by an optimizer hook | no — a CUDA C++ and Python dataframe library | no — a standalone SQL engine | **yes — loaded into DuckDB; a client rewrites the statement before DuckDB plans it, over the stable C API** |
+| CUDA backend | yes | yes | yes | yes — the exact path behind `GPUDB_CUDA_EXACT=1` |
+| What sends work back to the CPU | operators it does not support | an operation cuDF does not implement, or one that raises | operations that cannot run on GPU, and steps needing more memory than the GPU has | **a per-statement speed measurement**, re-taken on your own machine, as well as the shapes it does not express |
+| SQL window functions on the GPU | not in its published supported-operator list | not applicable — a dataframe library; it documents a rolling-window API | supported in SQL; the documentation states they are computed in CPU mode | no — they run on DuckDB |
 | Apache-2.0 | yes | yes | yes | yes |
+
+**Sources.** Sirius: [README](https://github.com/sirius-db/sirius) (requirements, supported operators, `LOAD … sirius.duckdb_extension`, CPU fallback). cuDF / RAPIDS: [README](https://github.com/rapidsai/cudf), [system requirements](https://docs.nvidia.com/datascience/install/), [how `cudf.pandas` falls back](https://docs.nvidia.com/cudf/latest/cudf_pandas/how-it-works/), [`DataFrame.rolling`](https://docs.nvidia.com/cudf/latest/cudf/api_docs/api/cudf.DataFrame.rolling/index.html). HeavyDB: [README](https://github.com/heavyai/heavydb), [window functions](https://docs.nvidia.com/heavyai/sql/data-manipulation-dml/window-functions), [configuration parameters](https://docs.nvidia.com/heavyai/installation-and-configuration/config-parameters/configuration-parameters-for-heavydb). gpudb's own cells are the coverage table above and the code behind it.
 
 [BENCHMARK.md](BENCHMARK.md) has the reproducible numbers behind our column.
 
