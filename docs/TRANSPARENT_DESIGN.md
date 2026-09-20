@@ -1415,6 +1415,75 @@ same database — the extension stays free of threads and hidden connections
   the set being `ready` in `gpu_residents()`, not treated as a lost session.
   A session that never goes idle never uploads and runs native throughout
   — rule 1 holds, the win is simply not there yet.
+- **The two steps an interrupt cannot stop, and the back-off that hides
+  them.** A session has exactly two of them: `gpu_upload_finish` (the device
+  copy, 107–142 ms for a lineitem-sized set at SF10) and the sort cache
+  built after it (146–171 ms). Measured on 2026-09-20 they are the *whole*
+  of the upload's p99 cost to a user statement: statements that arrive
+  during a SEGMENT are not slower than the manual control on either an idle
+  or a loaded machine (the interrupt does its job — 0.27 ms median, 0.58 ms
+  p99 to be honoured with 8 of 16 cores busy), and statements that arrive
+  inside those two calls are, but only when the cores are oversubscribed.
+  On an idle machine they cost nothing at all (in-window statements
+  measured *faster* than the control, because the upload's own work holds
+  the clocks up). So the session asks the machine, for free, how many cores
+  it is being given — CPU seconds per wall second of a completed segment
+  scan, two clock reads per segment, 10.1 of 16 idle against 6.5 of 16 with
+  8 cores busy — and calls the machine contended below half of
+  `os.cpu_count()`. Only a segment DuckDB actually parallelised may vote:
+  DuckDB parallelises a table scan by row group (122,880 rows), and a
+  segment below four of them is serial by construction — measured, the
+  wrapper suite's 100K-row segments report 2.6 cores of 16 with nothing
+  else on the machine, at 1.4 ms and at 5 ms alike. Without that rule every
+  hot loop over a small table read as a contended machine. With no votes
+  the estimate is empty and the manager behaves exactly as it did before
+  this mechanism existed. On a contended machine, and only there, a step an
+  interrupt cannot stop waits for a genuinely quiet connection: an idle
+  stretch of 400 ms (the longer of the two steps, with margin). That window
+  **decays linearly to the ordinary idle threshold over 20 s**, so the step
+  takes the best gap the connection offers in the meantime and, if the
+  connection never offers one, runs unconditionally at the end of it. That
+  decay is the whole worst case: **readiness is delayed by at most 20 s per
+  such step plus the interrupt back-off its retries pay (about 5 s), and
+  never withheld.** An idle machine takes the old path exactly (the
+  estimate says free, the wait is the 20 ms idle threshold), which is why
+  time-to-ready there does not move. While a step waits, the session's host
+  buffer stays allocated, which is what `GPUDB_UPLOAD_POOL_MAX_MB` already
+  caps. `residency='eager'` is untouched: the caller asked for the upload,
+  so it runs beside nothing and waits for nothing.
+- **An interrupted sort cache is retried, not skipped.** `ready` means
+  uploaded *and prepared*, and an interrupt used to end the post-upload
+  loop silently, leaving a set that claimed to be prepared and was not. It
+  showed twice: the first statement to use the set paid the sort, and the
+  set had no row in `gpu_residents()` at all — a store-backed set is a VIEW
+  the extension synthesises only when something acquires it, and during a
+  session the sort cache is what acquires it. Measured under the wrapper
+  suite's cadence with 8 of 16 cores busy, that happened in 3 of 40 runs
+  (and in 1 of 15 in a second batch); with the retry, 0 of 25. The retry is
+  safe because `prepare()` is idempotent, it shares one quiet deadline
+  across its attempts so the bound above still holds, and after 8
+  interrupted attempts it gives up, says so in the log and leaves the cache
+  to the first statement that needs it — the columns are resident either
+  way, and no answer ever depended on the cache.
+- **Segment size follows the yield, not the clock.** A segment's cost is
+  host work — lanes × rows, plus validity bitmaps — so one `segment_rows` is
+  a different number of milliseconds on different machines and for
+  different sets, while the window a workload leaves between its statements
+  is whatever it is. When the two do not fit, nearly every attempt is
+  interrupted and the session makes no progress: measured on the x86 box on
+  2026-09-20, 2 of 69 attempts landed against a 2.5 ms mean window and a
+  4.9 ms segment, where this machine lands 58 of 95. So the manager counts
+  the last 8 attempts and halves `segment_rows` when **1 or fewer** of them
+  landed, doubling it back when 7 or more do, down to 1/32 of the 8 MiB
+  default and no further. The threshold is deliberately that low: this
+  machine's yield of 0.6 falls to 3-or-fewer in 8 about 17% of the time, so
+  a 3-of-8 rule made the size oscillate here for nothing (58 segments
+  became 75–81 under load), where 1-of-8 trips 0.9% of the time on a yield
+  of 0.6 and at once on the starving box's 0.03. It is a starvation guard,
+  not a tuning knob. Both bounds are hard: the divisor stops at 32, and a
+  landed segment is progress that is never undone, so a session terminates
+  at the floor however crowded the connection is. A pinned `segment_rows`
+  (a test, a sweep) is never adapted.
 - **Quiet period and rate cap.** No upload session starts within 2 s of the
   last invalidation of that table, and no more than one session per table
   per 30 s (wrapper settings). A write-heavy session therefore runs native
@@ -2040,6 +2109,19 @@ p99 B) / thresh`, losing above `max(p99 A, p99 B) / thresh`, and
 re-measuring in between — a row fails only on a loss that survived the
 re-measurement, and INCONCLUSIVE (exit 3) says the machine never held still
 enough to resolve the margin. `--dump` keeps every latency.
+
+Extended 2026-09-20 with the state the §5.5 back-off decides from, because a
+row that passes for the wrong reason is worth no more than a row that fails.
+The background pass now prints, per round, how many cores its segment scans
+were given (and therefore whether the machine read as contended), how many
+steps an interrupt cannot stop had to wait for a quiet connection, how long
+they waited in total, and how many of them ran at the 20 s deadline; and when
+the set is not ready by the end of the pass, how long after the last statement
+it became ready. **That last number is the price**: on a machine with 8 of 16
+cores busy the gate's own cadence never offers the window, so the set goes
+ready shortly after the pass ends instead of in the middle of it, and the
+session's wall time grows from ~4.7 s to ~11.7 s. The row is judged exactly as
+before — the tolerance, the statistic and the shapes did not move.
 
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make

@@ -12,8 +12,10 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from gpudb._residency import (MEMORY_ERROR, NATIVE_USE_WEIGHT,      # noqa: E402
-                              ResidencyManager, YOUNG_OVERRIDE_RATIO)
+from gpudb._residency import (CONTENTION_MIN_SAMPLES, CONTENTION_SEGMENTS,   # noqa: E402
+                              MEMORY_ERROR, NATIVE_USE_WEIGHT,
+                              ResidencyManager, SEG_SCALE_MAX, SEG_YIELD_WINDOW,
+                              YOUNG_OVERRIDE_RATIO)
 
 MiB = 1 << 20
 FAILS = []
@@ -506,9 +508,183 @@ def run():  # noqa: C901
     check(not upload(mgr, dev, "big") and "the budget is" in mgr.get("big").error,
           f"budget: no value makes a set fit a budget smaller than itself ({mgr.get('big').error[:80]})")
 
+    backoff()
+
     print()
     print(f"{len(FAILS)} failures" if FAILS else "all residency policy tests passed")
     return 1 if FAILS else 0
+
+
+def backoff():   # noqa: C901
+    """§5.5 back-off: the state machine that holds a step an interrupt cannot
+    stop back while the machine's cores are taken. Driven entirely by injected
+    segment timings and an elapsed-seconds argument — nothing sleeps here, and
+    nothing about the decision depends on a real clock."""
+    print("== back-off: the contention estimate is the cores a segment scan got")
+    clock = Clock()
+    mgr = manager(clock, Device(clock), None, idle_ms=20.0)
+    ncpu = mgr._cpus
+    check(not mgr.contended(), "back-off: nothing measured yet reads as a free machine")
+    mgr.note_cores(0.4 * ncpu)
+    mgr.note_cores(0.4 * ncpu)
+    check(not mgr.contended(),
+          f"back-off: {CONTENTION_MIN_SAMPLES} samples are needed before anything is claimed "
+          f"(2 slow ones still read free)")
+    mgr.note_cores(0.4 * ncpu)
+    check(mgr.contended(), "back-off: three segments that got 40% of the machine mean CONTENDED")
+
+    print("== back-off: it recovers, and the estimate is the recent segments only")
+    for _ in range(CONTENTION_SEGMENTS):
+        mgr.note_cores(0.9 * ncpu)
+    check(not mgr.contended(),
+          f"back-off: {CONTENTION_SEGMENTS} fast segments push the slow ones out of the window "
+          f"and the machine reads free again")
+    check(abs(mgr.cores_seen() - 0.9 * ncpu) < 1e-6,
+          f"back-off: the estimate is the median of the window ({mgr.cores_seen():.2f})")
+    for _ in range(CONTENTION_SEGMENTS):
+        mgr.note_cores(0.3 * ncpu)
+    check(mgr.contended(), "back-off: and it goes back to CONTENDED when the cores go away again")
+    check(len(mgr._seg_cores) == CONTENTION_SEGMENTS,
+          f"back-off: the window never grows past {CONTENTION_SEGMENTS} samples "
+          f"({len(mgr._seg_cores)})")
+
+    print("== back-off: a median, not a mean — one slow segment does not trip it")
+    mgr2 = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    for c in (0.9, 0.9, 0.01, 0.9, 0.9):
+        mgr2.note_cores(c * ncpu)
+    check(not mgr2.contended(),
+          "back-off: one stalled segment among four good ones does not claim contention")
+
+    print("== back-off: the window asked for decays to idle_ms, and that is the bound")
+    w0 = mgr.quiet_want_ms(400.0, 0.0)
+    half = mgr.quiet_want_ms(400.0, mgr.quiet_max_s / 2.0)
+    end = mgr.quiet_want_ms(400.0, mgr.quiet_max_s)
+    after = mgr.quiet_want_ms(400.0, mgr.quiet_max_s * 10.0)
+    check(abs(w0 - 400.0) < 1e-6, f"back-off: it asks for the whole window at first ({w0:.0f} ms)")
+    check(400.0 > half > mgr.idle_ms, f"back-off: and less of it as it waits ({half:.0f} ms at half the bound)")
+    check(abs(end - mgr.idle_ms) < 1e-6,
+          f"back-off: at the deadline it asks no more than a segment does ({end:.0f} ms)")
+    check(abs(after - mgr.idle_ms) < 1e-6,
+          "back-off: and never less than that however long it waits — the step runs, "
+          "so a permanently busy connection is delayed by at most quiet_max_s per step, not forever")
+    prev = 1e9
+    for i in range(41):
+        want = mgr.quiet_want_ms(400.0, mgr.quiet_max_s * i / 40.0)
+        if want > prev + 1e-9:
+            check(False, f"back-off: the window asked for must never grow ({want} after {prev})")
+            break
+        prev = want
+    else:
+        check(True, "back-off: the window asked for falls monotonically to the bound")
+
+    print("== back-off: the segment size follows the yield, with a floor")
+    mgr3 = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    st = offer(mgr3, "seg", 1 * MiB)
+    base = st.segment_rows_default
+    check(mgr3.segment_rows_for(st) == base,
+          f"segments: a session starts at the 8 MiB default ({base} rows)")
+    for _ in range(SEG_YIELD_WINDOW):        # nothing lands: the window is too small for it
+        mgr3.note_segment(False)
+    check(mgr3.segment_rows_for(st) == base // 2,
+          f"segments: a window where nothing landed halves the segment "
+          f"({mgr3.segment_rows_for(st)} rows)")
+    for _ in range(SEG_YIELD_WINDOW * SEG_SCALE_MAX):
+        mgr3.note_segment(False)
+    check(mgr3.segment_rows_for(st) == base // SEG_SCALE_MAX,
+          f"segments: and it stops at 1/{SEG_SCALE_MAX} of it however long that goes on "
+          f"({mgr3.segment_rows_for(st)} rows) — the floor is what bounds the worst case")
+    for _ in range(SEG_YIELD_WINDOW * 8):    # the crowd goes away
+        mgr3.note_segment(True)
+    check(mgr3.segment_rows_for(st) == base,
+          f"segments: segments that land give the halvings back, all the way to the default "
+          f"({mgr3.segment_rows_for(st)} rows)")
+    mgr3._seg_landed = []
+    for i in range(SEG_YIELD_WINDOW * 4):    # 5 of 8: neither bad enough nor good enough
+        mgr3.note_segment(i % 8 < 5)
+    check(mgr3.segment_rows_for(st) == base,
+          "segments: a yield in between leaves the size where it is (this machine lands "
+          "58 of 95 and must not start shrinking)")
+    mgr3._seg_landed = []
+    for i in range(SEG_YIELD_WINDOW * 4):    # 2 of 8: bad, but not starvation
+        mgr3.note_segment(i % 8 < 2)
+    check(mgr3.segment_rows_for(st) == base,
+          "segments: and so does a poor-but-progressing yield — the rule is a starvation "
+          "guard, not a tuning knob")
+    mgr3._seg_landed = []
+    for i in range(SEG_YIELD_WINDOW):        # 1 of 8: starving
+        mgr3.note_segment(i % 8 < 1)
+    check(mgr3.segment_rows_for(st) == base // 2,
+          f"segments: 1 of 8 is starvation and halves it ({mgr3.segment_rows_for(st)} rows)")
+    fixed = manager(Clock(), Device(Clock()), None, idle_ms=20.0, segment_rows=4096)
+    stf = offer(fixed, "seg", 1 * MiB)
+    for _ in range(SEG_YIELD_WINDOW * 4):
+        fixed.note_segment(False)
+    check(fixed.segment_rows_for(stf) == 4096,
+          "segments: an explicit segment_rows (a test, a sweep) is never adapted")
+
+    print("== back-off: an interrupted sort cache is retried, not skipped")
+    # `ready` means uploaded AND prepared. A skipped sort cache left the set
+    # with no row in gpu_residents() at all (a store-backed set is a view the
+    # extension synthesises when something acquires it, and the cache is what
+    # acquires it during the session) — 3 of 40 runs under the `big:` cadence
+    # with 8 of 16 cores busy, 2026-09-20. The pauses are set to zero here so
+    # the retry ladder costs the test nothing.
+    import gpudb._residency as _res
+    saved_pause = _res.RETRY_PAUSE_MS
+    _res.RETRY_PAUSE_MS = 0.0
+    try:
+        class Cur:
+            """A cursor whose first `fail` statements are interrupted."""
+            def __init__(self, fail, then=None):
+                self.fail, self.then, self.calls = fail, then, []
+
+            def execute(self, sql, params=None):
+                self.calls.append(sql)
+                if len(self.calls) <= self.fail:
+                    raise RuntimeError("INTERRUPT Error: Interrupted!")
+                if self.then:
+                    raise RuntimeError(self.then)
+                return self
+
+            def fetchall(self):
+                return []
+
+        def step(cur):
+            m = manager(Clock(), Device(Clock()), None, idle_ms=0.0)
+            st2 = offer(m, "post", 1 * MiB)
+            st2.state = "uploading"
+            st2.store_key, st2.store_lanes = "store", ["k"]
+            return m, st2, m._post_step(cur, st2, st2.epoch, "PREPARE CACHE")
+
+        cur = Cur(2)
+        _m, _st, bad = step(cur)
+        check(bad == "" and len(cur.calls) == 3,
+              f"sort cache: two interrupts are retried and the third attempt lands "
+              f"({len(cur.calls)} attempts, outcome {bad!r})")
+        cur = Cur(_res.POST_MAX_ATTEMPTS + 5)
+        _m, _st, bad = step(cur)
+        check(bad == "" and len(cur.calls) == _res.POST_MAX_ATTEMPTS,
+              f"sort cache: it gives up after {_res.POST_MAX_ATTEMPTS} attempts rather than "
+              f"retrying forever, and the set is still resident ({len(cur.calls)} attempts)")
+        cur = Cur(0, then="Binder Error: no such column")
+        _m, _st, bad = step(cur)
+        check(bad == "failed", f"sort cache: a real error still fails the session ({bad!r})")
+        cur = Cur(0, then="no resident column k")
+        _m, _st, bad = step(cur)
+        check(bad == "recheck",
+              f"sort cache: lanes that left the store under it ask for a re-sighting ({bad!r})")
+    finally:
+        _res.RETRY_PAUSE_MS = saved_pause
+
+    print("== back-off: it is off when it cannot help, and off when it is turned off")
+    quiet0 = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    quiet0.quiet_ms = 0.0
+    for _ in range(CONTENTION_SEGMENTS):
+        quiet0.note_cores(0.1 * ncpu)
+    check(not quiet0.contended(),
+          "back-off: GPUDB_UPLOAD_QUIET_MS=0 turns the mechanism off on any machine")
+    check(abs(mgr.quiet_want_ms(mgr.idle_ms, 0.0) - mgr.idle_ms) < 1e-6,
+          "back-off: a step that asks for no more than idle_ms is the ordinary idle wait")
 
 
 if __name__ == "__main__":

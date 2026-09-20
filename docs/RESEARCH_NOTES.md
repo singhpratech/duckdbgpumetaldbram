@@ -3348,6 +3348,210 @@ native`), with the full exact path present: not a CUDA matter at all. With the
 text-level guard the suite passes under both 1.4.5 and 1.5.5. Acceptance runs on
 the Mac now use both versions.
 
+## 2026-09-20 — It was never the segments
+
+**Question.** The open decision left by "The gate whose native shapes had
+stopped being native" (2026-09-19): under eight busy loops the residency
+gate loses during the upload window and only there — `point_lookup` 0.39×,
+`small_scan` 0.75× while the session runs, 0.94× / 1.01× after it is ready,
+medians unmoved. The reading offered there was that the oversubscribed
+machine delays the scanning thread so the interrupt is not honoured in the
+~0.5 ms the design assumes. The owner asked for the back-off. Measure first.
+
+**The interpretation is wrong.** Instrumented per statement (which segment
+was in flight when it arrived, when that segment actually stopped), SF10, 8
+of 16 cores busy with `yes > /dev/null`, `point_lookup`, 400 statements at
+0–50 ms gaps:
+
+| | idle | 8 busy cores |
+|---|---|---|
+| control (residency manual), p99 | 1.85 / 1.93 ms | 0.46 / 0.71 ms |
+| background pass, p99 | 1.86 ms | 1.14 ms (during the upload 1.67) |
+| statements that ARRIVED during a segment | med 0.59, p99 1.38 | med 0.41, **p99 0.60** |
+| interrupt latency (arrival → segment stops) | med 0.43, p99 2.45 | **med 0.27, p99 0.58** |
+| statements that arrived inside `gpu_upload_finish` | med 0.54, max 0.75 | **med 0.96, p99 2.12** |
+| segment scan wall time | med 6.4 ms | med 7.1 ms |
+
+The interrupt is honoured *faster* on the loaded machine (0.27 ms median,
+0.58 ms p99) than on the idle one, and the statements that land on a segment
+are the FASTEST group in the run — below both controls. The segment scan
+itself barely notices the load (6.4 → 7.1 ms), which also kills the back-off
+signal the previous entry proposed: `seg_ms` does not discriminate.
+
+What does the damage is the two steps of a session that an interrupt cannot
+stop — `gpu_upload_finish` (107–142 ms) and the sort cache built after it
+(146–171 ms). Excluding just those windows, the loaded background pass's
+`small_scan` p99 is 17.75 ms against controls of 19.13 / 17.11 — a pass.
+Including them it is 21.98 ms — the loss. Nine to twelve statements of 400
+land inside them, which at p99 over 400 samples is exactly the region the
+statistic reads.
+
+And the effect is load-dependent in a way that is worth stating precisely:
+the in-window statements cost 0.54 ms idle and 0.96 ms loaded — not a large
+absolute change. What changes by 5× is the CONTROL (1.34 → 0.27 ms median):
+the busy machine boosts its cores, every other statement gets faster, and
+the ones stuck behind the device copy do not. On an idle machine those
+statements are actually the fastest in the run, because the upload's own
+work is what holds the clocks up. So there is nothing to fix on an idle
+machine, and fixing it there would cost time-to-ready for nothing.
+
+**The signal, after three that failed.** A mechanism that must be a no-op on
+an idle machine needs to know whether the machine is busy, cheaply and at
+once. Three candidates were measured and rejected: `os.getloadavg()[0]`
+takes ~60 s to climb from 3.5 to 8.4 and its idle baseline on a working
+machine (1.3–5.6) overlaps the loaded one; `ru_nivcsw` moves the wrong way
+(45.6k/s idle against 22.0k/s loaded — macOS counts something else);
+`seg_ms` and the interrupt latency, as above, do not separate at all. What
+does separate, measured on the segment scans the uploader already runs, is
+**CPU seconds per wall second** — how many cores the machine is actually
+giving the process: **10.1 of 16 idle against 6.5 of 16 with 8 cores busy,
+the idle median above the loaded maximum (7.1)**. Two `time.process_time()`
+calls per segment. Only completed segments count: a statement that arrives
+interrupts, so a landed segment is one that ran alone.
+
+The first version of that signal had a false positive worth writing down,
+because it is the kind that looks like a machine fact and is really a
+statement fact. Run against the wrapper suite's `big:` set (100K-row
+segments) on an idle machine it read **2.6 of 16 cores** and declared
+contention, and the back-off then held that session for 50–66 s instead of
+2–3 s. The cause is not the machine: DuckDB parallelises a table scan by
+ROW GROUP (122,880 rows), and a 100K-row segment is less than one, so the
+scan is serial by construction — 2.6 cores at 1.4 ms and at 5 ms alike, a
+segment length rule would not have caught it. A segment therefore votes
+only when it spans at least four row groups. With no votes the estimate is
+empty and the manager behaves exactly as before, which is what the `big:`
+section now measures (`cores 0.0`, `0 quiet waits`, session 15 s under
+1.5.5).
+
+**The mechanism.** On a machine whose segment scans get less than half of
+`os.cpu_count()`, and only there, a step an interrupt cannot stop first
+waits for a genuinely quiet connection — an idle stretch of 400 ms, the
+longer of the two steps with margin. That window decays linearly to the
+ordinary 20 ms idle threshold over 20 s, so the step takes the best gap the
+connection offers on the way and, if the connection never offers one, runs
+unconditionally at the end. **The bound is that decay: at most 20 s of delay
+per such step, 40 s for a single-table set, and readiness is never
+withheld.** The segments are left exactly as they were, because the
+measurement says they were never the problem.
+
+**A defect found on the way, and it was not the one suspected.** Two other
+sessions reported the wrapper suite's `big: extension saw every row exactly
+once` failing once each under load, with the two checks before it passing —
+the shape of a double-counted or a dropped segment, which would be a rule-2
+correctness bug. Looped on its own under 8 busy cores it reproduces: 3 of 40
+runs, then 1 of 15. It is neither. At the failing instant
+`gpu_store_columns()` holds **both lanes at exactly 2,000,000 rows**, the
+rewritten statement returns native's rows, and `gpu_residents()` is
+**empty** — the tuple is `None`, not a wrong count. A store-backed set is a
+VIEW the extension synthesises when something ACQUIRES it, and during a
+session the thing that acquires it is the sort cache; an interrupted sort
+cache used to end the post-upload loop silently, so the set went `ready`
+with the cache unbuilt and no registry row at all. Read once by the next
+statement it appears — as `uploaded`, not `ready`, which would have failed
+the same assertion a second way. So: not a correctness bug (no duplicated
+and no missing rows in 105 instrumented sessions, every answer identical to
+native), but a real break of §5.5's "ready means uploaded AND prepared".
+The post-upload step is now retried while it is interrupted, under one
+shared quiet deadline, giving up after 8 attempts with a log line rather
+than a false claim. **0 of 25 runs under the same load after the fix.**
+
+**Before and after, ten gate runs each.** `scripts/wrapper_residency_gate.py`
+at SF10, unchanged tolerance, statistic and shapes.
+
+**8 of 16 cores busy** (`yes > /dev/null` ×8), 10 runs with the back-off,
+6 without it, same session, same load, rows = shapes × runs:
+
+| shape | back-off OFF | back-off ON |
+|---|---|---|
+| `q18_native` | 6 pass, median 0.97× | 10 pass, median 0.96× |
+| `small_scan` | 2 pass, **3 FAIL**, median 0.82× (min 0.75×) | **10 pass**, median 0.99× |
+| `point_lookup` | **5 FAIL**, median **0.43×** (min 0.38×) | 9 FAIL / 1 inconclusive, median **0.79×** |
+| the machine read | contended in 35 of 35 passes (6.4 of 16 cores) | contended in 50 of 50 (6.4 of 16) |
+| set ready | during the pass in 31 of 35 passes, median 4.8 s in | after the pass in 50 of 50, median **0.57 s after the last statement** |
+
+**Idle machine**, 10 runs without, 6 with (18 rows), plus a same-state A/B
+of 5 runs each alternating on/off on the shape that moves most:
+
+| | back-off OFF | back-off ON |
+|---|---|---|
+| rows | 28 pass, 0 FAIL, 2 inconclusive | **18 pass, 0 FAIL, 0 inconclusive** |
+| medians | 0.93× / 0.96× / 1.02× | 0.97× / 0.97× / 0.99× |
+| back-off engaged | — | 3 of 20 passes |
+| A/B, `point_lookup`, 5 runs each | free in 3, ready 9.7–12.3 s into the pass; contended in 2, ready 0.4–1.1 s after it (sessions 12.7–13.5 s) | free in 3, ready 7.9–8.8 s into the pass; contended in 2, ready 0.5–0.7 s after it (sessions 12.8–13.1 s) |
+
+That last row is the one that answers the idle question, and it answers it
+by refusing the easy reading. Whether the set is ready during the pass or
+just after it tracks **the cores the machine happened to give the segments**,
+not whether the back-off is on: with the mechanism disabled the session is
+equally likely to run past the end of the pass, in the same machine state,
+for the same underlying reason. Idle time-to-ready is unchanged.
+
+**What is left, and it is not the steps any more.** `point_lookup` still
+loses, at 0.79× instead of 0.43×. In those runs the gate's own line says the
+back-off did its job: `CONTENDED`, `0 step(s) waited` during the pass, ready
+567 ms after the last statement — no device step ran while the statements
+flowed. The residual is p99 0.5 ms against a control of 0.4/0.4: **0.1 ms on
+a 0.4 ms statement**, where the gate's 10% tolerance is 0.04 ms. What is
+left in the background pass at that resolution is the segment scans
+themselves (58 of them, 6.8 ms each, ~30 interrupts, each honoured in about
+0.27 ms) and the mere existence of a worker thread — a thread with the
+worker's wake pattern and NO DuckDB work at all measured p99 0.68 ms against
+controls of 0.46/0.71 ms in the diagnosis above. Deferring the segments too
+is the one thing that would remove it, and it is the thing §5.5 already
+refuses: a session that never uploads is not rule 1, it is no feature. So
+the shape is reported as it measures.
+
+**The price, printed.** Loaded, the gate's own cadence never offers a 400 ms
+window, so the two steps wait for the pass to end. Time-to-ready goes from a
+median of 4.8 s into the pass to 0.57 s after it, i.e. from ~4.8 s to ~12 s
+for the `point_lookup` cadence and to 23 s for the `q18_native` one whose
+statements are 90 ms each: **the set becomes resident 2.5× later, and in
+exchange no statement of the run pays for it.** No step hit the 20 s
+deadline in any of the 50 loaded passes — the connection always went quiet
+first, when the pass ended. The gate now prints all of it: cores seen,
+steps that waited, the total wait, how many ran at the deadline, and how
+long after the last statement the set went ready.
+
+**A second mechanism, for a problem this machine does not have.** The x86
+box reported the opposite failure on the same code: at the wrapper suite's
+`big:` cadence (~133 statements/s, ~2.5 ms of usable window per gap) it
+lands 2 of 69 segment attempts where this machine lands 58 of 95, because
+its exact segment costs 4.9 ms against this one's 2.3–5.5 — three buffered
+lanes plus validity where the older path had two and none. Nothing crosses
+PCIe during a segment (the device copy happens once, at finish), so it is
+host cost, in shared code. The yield is the thing both boxes can measure:
+`segment_rows` now halves when **1 or fewer** of the last 8 attempts landed
+and doubles back when 7 or more do, floored at 1/32 of the 8 MiB default.
+The first threshold tried was 3 of 8 and it was wrong: at this machine's
+yield of 0.6 a window of 8 falls to 3-or-fewer 17% of the time, and the
+size oscillated under load for nothing (58 segments became 75–81). At 1 of
+8 a yield of 0.6 trips 0.9% of the time and the starving box's 0.03 trips
+at once. On this machine the size never leaves the default in any run
+measured here — it is there for the box where the segment does not fit the
+window. Bounded twice over: the divisor stops at 32, and a landed segment
+is progress that is never undone.
+
+**What did not work, kept here so it is not tried again.** A quiet
+requirement applied unconditionally: it costs the same time-to-ready on an
+idle machine as on a busy one, because the gate's cadence (and any hot
+loop) leaves no 400 ms gap either way — which is precisely the ~10% budget
+the idle side had. Backing off on slow segments, the shape the previous
+entry proposed: the segments are not slow (6.4 → 7.1 ms) and the statements
+that hit them are not slow either. Capping the uploader's DuckDB threads:
+`threads` is a global setting in DuckDB, so it would cap the user's
+statements too — and the steps that do the damage are single scalar calls
+with no DuckDB parallelism to cap. Finer-grained segments for this problem:
+the interrupt already makes a segment's length irrelevant to the statement
+that lands on it.
+
+**Left open.** The wrapper suite's `big:` section asserts a
+machine-dependent property (the segmented upload lands within a 180 s
+budget at that cadence). A deterministic formulation would drive the
+manager's clock and its cursor from the test rather than racing a real one —
+assert the yield rule and the bound directly, as
+`test_residency_policy.py` now does, and leave the timed one as a smoke
+test with a generous budget. Not changed here.
+
 
 ## Open questions
 

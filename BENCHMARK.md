@@ -4978,3 +4978,35 @@ far below the budget, so no cell in this gate reaches the admission rule at
 all; it is here to show that nothing else moved. The plan-then-execute change
 that followed touches only `_make_room`'s contended path, which that gate
 never reaches, so it was not re-run for it.
+
+## The residency back-off on a machine whose cores are taken (2026-09-20)
+
+SF10, M4 Max, Metal, `scripts/wrapper_residency_gate.py` with its tolerance,
+statistic and shapes unchanged. "Loaded" is eight `yes > /dev/null` busy
+loops on a 16-core machine; "back-off OFF" is the same build with
+`GPUDB_UPLOAD_QUIET_MS=0`, so the two columns differ only in the mechanism.
+Rows are shapes × runs; the ratio is the pooled `min(p99 manual A, B) /
+p99 background` the gate reports, median over the runs.
+
+| | back-off OFF | back-off ON |
+|---|---|---|
+| **loaded**, `q18_native` | 6 pass, 0.97× | 10 pass, 0.96× |
+| **loaded**, `small_scan` | 2 pass, **3 FAIL**, 0.82× (min 0.75×) | **10 pass**, 0.99× |
+| **loaded**, `point_lookup` | **5 FAIL**, 0.43× (min 0.38×) | 9 FAIL / 1 inconclusive, 0.79× |
+| **loaded**, time to ready | ready during the pass in 31 of 35 passes, median 4.8 s in | ready after the pass in 50 of 50, median 0.57 s after the last statement (~12 s for the point-lookup cadence, 23 s for the Q18 one) |
+| **idle**, all three shapes | 28 pass, 0 FAIL, 2 inconclusive (10 runs) | 18 pass, 0 FAIL, 0 inconclusive (6 runs) |
+| **idle**, time to ready | A/B, 5 runs each, alternating: ready 9.7–12.3 s into the pass when the machine read free, after it when it did not | the same, 7.9–8.8 s in when free, after it when not — indistinguishable |
+
+The machine read as contended in 50 of 50 loaded passes (6.4 of 16 cores to a
+segment scan) and in 3 of 20 idle ones (9.7 of 16 typical). No step reached
+the 20 s deadline in any loaded pass. The `point_lookup` residual is 0.1 ms
+of p99 against a 0.4 ms control — the segment scans and the worker thread
+itself, not the device steps, which by then ran only after the last
+statement; see the 2026-09-20 entry in docs/RESEARCH_NOTES.md.
+
+`python/tests/test_wrapper.py` passes under DuckDB 1.4.5 and 1.5.5,
+`python/tests/test_shell.py` and `python/tests/test_residency_policy.py` pass
+(the latter 85 checks, 27 of them new for the back-off state machine). The wrapper
+suite's `big:` section is untouched by both mechanisms — its 100K-row
+segments are below one DuckDB row group, so they never vote on contention
+(`cores 0.0`, `0 quiet waits`) and its pinned `segment_rows` is never adapted.
