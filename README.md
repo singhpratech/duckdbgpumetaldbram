@@ -76,6 +76,7 @@ gpudb my.duckdb                   # a shell whose footer says where each stateme
 ```
 ```
 gpudb> SELECT l_partkey, sum(l_quantity) FROM lineitem GROUP BY l_partkey;
+                                  -- plain SQL; the footer says where it ran
 ```
 
 `pip install duckdb-gpudb` is the shortest way to plain SQL on the GPU, because
