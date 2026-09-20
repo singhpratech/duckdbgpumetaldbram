@@ -449,9 +449,10 @@ under [The resident model in 20 seconds](#the-resident-model-in-20-seconds).
 
 <!-- RE-RUN: the whole of this section is re-measured on the release build -->
 
-Apple M4 Max, 64 GiB unified memory, Metal backend · DuckDB v1.5.x · warm,
-minimum of 5 runs, statement against statement in one process · measured
-2026-09-19. These numbers are from one machine; yours will differ.
+Apple M4 Max, Metal backend (the backend reports 51.8 GiB of device memory) ·
+DuckDB v1.5.x · warm, minimum of 5 runs, statement against statement in one
+process · measured 2026-09-19. These numbers are from one machine; yours will
+differ.
 `python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb` reproduces
 the tables.
 

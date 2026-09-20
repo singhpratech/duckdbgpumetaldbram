@@ -68,7 +68,7 @@ target_link_libraries(gpudb_ext PUBLIC
 )
 ```
 
-This is documented in [MACOS_EXTENSION_BUILD.md](docs/MACOS_EXTENSION_BUILD.md). Resolved for current builds.
+This is documented in [MACOS_EXTENSION_BUILD.md](MACOS_EXTENSION_BUILD.md). Resolved for current builds.
 
 ### 2. CI workflow is disabled
 
