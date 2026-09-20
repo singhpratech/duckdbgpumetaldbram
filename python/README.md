@@ -213,6 +213,7 @@ sentence behind it.
 | `threshold` | a measured bound says DuckDB is faster for this shape and size, **or** this machine measured it slower and the template went back to DuckDB |
 | `shape` | not a shape the rewrite expresses: a window function, `median`, `ROLLUP`, a set operation, a subquery in the select list |
 | `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, because native's own answer depends on the order the values are added |
+| `ties` | a pushed `ORDER BY … LIMIT k` found two of the first *k* rows equal on the ordering value — which rows come back, and in what order, is DuckDB's to choose, and it answered the original. Decided against the data on every execution; a tie that keeps happening shows as `threshold` with the tie named in `detail`, until the 60-second re-measure |
 | `backend` | this build has no GPU backend to rewrite for, or the installed extension is older than this client |
 | `memory` | the set does not fit the device-memory budget; it is refused before the upload |
 | `transaction` | a `BEGIN` is open, so the resident sets cannot be trusted |
@@ -229,6 +230,7 @@ GPU (topk: a key join materialised on the device) · 8.1 ms
 DuckDB (threshold: 7 groups < 1000) · 5.0 ms
 DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
 DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
+DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 47.1 ms
 DuckDB (off: the transparent path is off on this connection) · 12.0 ms
 ```
 

@@ -153,6 +153,7 @@ The reason codes you will actually meet:
 | `threshold` | a measured bound says DuckDB is faster for this shape and size (`6001215 rows < 16000000 for an aggregate without GROUP BY`), **or** this machine measured it slower: `measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)` |
 | `shape` | not a shape the rewrite expresses: a window function, `median`, `ROLLUP`, a set operation, a subquery in the select list |
 | `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, by design (see [the two rules](../README.md#the-two-rules)) |
+| `ties` | a pushed `ORDER BY … LIMIT k` found two of the first *k* rows equal on the ordering value, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original |
 | `backend` | this build has no GPU backend to rewrite for (a CPU-only binary), or the installed extension is older than the client |
 | `memory` | the set does not fit the device-memory budget; it is refused before the upload |
 | `transaction` | a `BEGIN` is open, so the resident sets cannot be trusted |
@@ -163,7 +164,42 @@ The reason codes you will actually meet:
 Ten more codes name a smaller refusal precisely where `shape` would only say
 "no": `nulls`, `overflow`, `decimal`, `collation`, `too_long`, `multi`,
 `view`, `temp`, `ambiguous`, `not_found`. Each is a `reason` of its own, with
-its own sentence in `detail`.
+its own sentence in `detail`. Twenty-two codes in all.
+
+`ties` is the one of them decided against the data rather than the statement,
+and it is worth seeing once. Three orders in TPC-H SF1 share the fourth-and-fifth
+place quantity, so the top five is not one answer:
+
+```
+gpudb> SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5;
+┌────────────┬───────────────┐
+│ l_orderkey │      qty      │
+│   int64    │ decimal(38,2) │
+├────────────┼───────────────┤
+│    4806726 │        328.00 │
+│    2199712 │        327.00 │
+│    4722021 │        323.00 │
+│    1263015 │        320.00 │
+│    4702759 │        320.00 │
+└────────────┴───────────────┘
+
+DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 47.1 ms
+```
+
+Plain DuckDB does not have one answer here either — above one thread it returns
+different row sets run to run — so there is nothing for the device to reproduce,
+and the statement is handed back. A tie that keeps happening is also a cost: the
+device pass is paid and then DuckDB answers anyway, so the template is declined
+by the same measured rule that declines any losing template, and the next run of
+it reads
+
+```
+DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the device pass costs 33.70 ms on top of whatever native costs, so the template is native from here (re-measured in 60 s)) · 11.6 ms
+```
+
+until the 60-second re-measure finds the tie gone. A `LIMIT` below the tie, or an
+`ORDER BY` that is already total (`ORDER BY qty DESC, l_orderkey`), keeps the
+device.
 
 ## Look underneath
 
@@ -172,14 +208,14 @@ actually ran:
 
 ```
 gpudb> .gpu
-statement:    SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
-rewritten:    True
-form:         topk
-tag:          gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity
-sql:          SELECT "key" AS l_partkey, (CAST(sum AS DECIMAL(36,0)) * 0.01) AS qty FROM gpu_groupby_exact_resident_topk('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', 'sum', 5, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', count_star()) AS ok FROM tpch.main.lineitem) AS gd WHERE gd.ok ORDER BY qty DESC LIMIT 5
-round_trip_ms:0.06245900294743478
-engine:       scalar
-detail:       the resident GROUP BY
+statement:     SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
+rewritten:     True
+form:          topk
+tag:           gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity
+sql:           SELECT "key" AS l_partkey, (CAST(sum AS DECIMAL(36,0)) * 0.01) AS qty FROM gpu_groupby_exact_resident_topk('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', 'sum', 6, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', count_star()) AS ok FROM tpch.main.lineitem) AS gd WHERE gd.ok QUALIFY CASE  WHEN (((rank() OVER (ORDER BY qty DESC) = row_number() OVER (ORDER BY qty DESC)) OR (rank() OVER (ORDER BY qty DESC) > 5))) THEN (CAST('t' AS BOOLEAN)) ELSE "error"('GPUDB_TIES: the first 5 rows are not ordered uniquely by qty') END ORDER BY qty DESC LIMIT 5
+round_trip_ms: 0.007 ms
+engine:        scalar
+detail:        the resident GROUP BY
 ```
 
 - `form` is which device shape answered: `plain`, `having`, `topk`,
@@ -187,6 +223,10 @@ detail:       the resident GROUP BY
 - `tag` is the **identity tag** of the resident set it used —
   `gpudb:v1:<catalog>:<schema>:<table>:<oid>:<columns>`. Two statements that
   need the same columns of the same table name the same tag and share one copy.
+- The `LIMIT 5` above asks the device for **6** rows, and the `QUALIFY` is the
+  tie guard: it compares `rank()` with `row_number()` over those rows and raises
+  `GPUDB_TIES` if any of the first five is not uniquely ordered, which is what
+  turns into the `ties` footer. It costs one extra row when nothing ties.
 - `round_trip_ms` is the wrapper's own overhead: parse, decide, render. Not
   the statement's time, which the footer prints.
 - `engine` says who produced the rewritten SQL — `scalar` for the extension's
@@ -314,10 +354,15 @@ transparent path, not an emulation of the DuckDB CLI (no `.mode`, `.output`,
 | `.residents` | the resident sets, then the columns behind them |
 | `.memory` | the device-memory budget and what holds it |
 | `.timer on\|off` | the footer line |
-| `.read FILE`, `.open [DATABASE]` | run a file; open another database |
+| `.read FILE`, `.open [DATABASE]` | run a file; open another database (no argument: a fresh in-memory one) |
 | `.tables`, `.schema [TABLE]` | plain SQL underneath (`SHOW TABLES`, `DESCRIBE`) |
 | `.version` | gpudb and duckdb versions |
 | `.quit`, `.exit` | leave |
+
+`.open` with no argument works in a `--readonly` session as well: the in-memory
+database it opens is read-write, because there is nothing on disk to protect,
+while `.open` on a *named* file in such a session keeps the read-only setting
+the session was started with.
 
 Statements may span lines and end at `;`. **Ctrl-C** stops the running
 statement, or clears what you were typing; **Ctrl-D** at a waiting prompt

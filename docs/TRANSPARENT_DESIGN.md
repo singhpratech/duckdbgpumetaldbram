@@ -1366,6 +1366,55 @@ tables a subquery lane reads included, and says so in the detail. TPC-H Q22 is
 the case: 150,000 `customer` rows at SF1 over a `NOT EXISTS` on 1,500,000
 `orders` rows.
 
+### 4.24 A tie in a pushed top-k
+
+`ORDER BY <aggregate> LIMIT k` is not a total order, and where it ties DuckDB
+has no answer of its own to reproduce: plain DuckDB — no extension, no wrapper
+— returned 3 different row *sets*, and up to 6 different orderings, over 20
+runs of one such statement on TPC-H SF1, on 1.4.5 and 1.5.5 alike, and was
+deterministic only at `threads=1`. The summary and the measurement are in §2
+under *Ties*; this is where the mechanism lives.
+
+The rewritten statement asks the device for **k + 1** rows and carries a
+`QUALIFY` that raises `GPUDB_TIES` when `rank()` and `row_number()` disagree at
+or above rank k. Those two differ on exactly the second and later member of a
+group of equal values, and the `rank() > k` arm excludes the rows past the k-th
+that no `LIMIT k` returns — so one clause covers both a tie at the k-th/(k+1)-th
+boundary and a tie *inside* the top k, where the row set is right and the order
+is not. The wrapper answers the user's original statement on DuckDB when it sees
+that marker, with `reason = "ties"`.
+
+Four properties worth stating, because each was a decision:
+
+- **It is decided against the data, per execution**, not cached as a shape. The
+  decline follows the *literals*: `LIMIT 4` and `LIMIT 5` share a template and
+  not a fate, so a k below the tie keeps the device.
+- **The fallback is still a loss**, and §9.1 has to hear about it — the
+  statement paid a device pass and then DuckDB's own run. So the template is
+  measured-declined exactly as any losing template is (same reason code, same
+  window), with the tie named in `detail`; otherwise a dashboard's top-10 over
+  a coarse measure would tie on every execution and be permanently slower than
+  native with nothing looking at the arithmetic. Coming back is the ordinary
+  declined-template path: while the tie is there the re-measure probe raises and
+  the template stays native, and a write clears the decision outright.
+- **With no tie it costs one extra row** and two window functions sharing one
+  specification over k + 1 rows — measured at `LIMIT 3` on the reviewer's
+  statement, best of 30 each, 7.21 ms with the guard against 7.35 ms without,
+  inside the noise, against 9.5 ms native. `execute()` pays nothing else;
+  `sql()` returns a lazy relation that is read after the call has returned,
+  where a raise could not be answered natively, so the guard runs once on a side
+  cursor first (`_guard_now`) — one extra device top-k on that path.
+- **An `ORDER BY` that is already total** (`ORDER BY qty DESC, k`) is not pushed
+  as a top-k at all and keeps the device.
+
+Not covered: a `LIMIT` whose top-k is not pushed — a `HAVING` beside it, an
+`avg` or a temporal ordering value, `ORDER BY count(*)` over a v0.6 sum set —
+hands every group to DuckDB, which does the `ORDER BY … LIMIT` itself. That is
+the same multiset native sorts, so the tie is DuckDB's either way, but its
+top-N depends on the order its input arrives in and the device's group order is
+not the hash aggregate's, so at `threads=1` such a tie can still land
+differently.
+
 ## 5. Automatic residency (piece C)
 
 No pin call. The **wrapper** keeps a residency manager per connection
