@@ -33,6 +33,23 @@ def skip(msg):
     print("  skip", msg)
 
 
+def has_device(con):
+    """True when the transparent path can run at all on this machine.
+
+    The wrapper declines every statement with reason "backend" when the
+    extension's runtime is CPU (`Connection._rewrite_select`): the CPU
+    resident path is a single-threaded sort per call, slower than native, so
+    rule 1 forbids lowering onto it (docs/TRANSPARENT_DESIGN.md §7). That is
+    a property of the machine, not a gap in the build, so a check that asserts
+    a rewrite is announced as a skip there rather than run and failed.
+
+    `_exact` is NOT the right gate for this: the CPU backend is the reference
+    implementation of every exact operator, so `gpu_build_info()` on a
+    CPU-only build reports exact=true, join=true, global=true, store=true.
+    """
+    return con._backend not in ("", "CPU")
+
+
 def native(sql):
     c = duckdb.connect()
     c.execute(SETUP)
@@ -73,8 +90,10 @@ def same(a, b):
 def run():
     print("== rewrite + parity")
     con = fresh()
-    if con._backend in ("", "CPU"):
-        print("no GPU backend; only the never-rewrite path can be tested here")
+    if not has_device(con):
+        print(f"backend {con._backend or 'none'}: the wrapper never rewrites on a CPU "
+              "runtime, so only the never-rewrite path can be tested here — the corpus "
+              "below runs, and every statement must come back declined and native")
     elif not getattr(con, "_exact", False):
         # A GPU backend that has not implemented the v0.7 exact path declines
         # every rewritable shape with reason "shape", so most checks below
@@ -162,6 +181,45 @@ def run():
                      "two_keys", "two_keys_where", "three_keys_topk",
                      "str_key", "str_key_pred", "str_mixed", "str_pred"):
             cases.pop(name)
+    if not has_device(con):
+        # Everything between here and the extension-age section at the end of
+        # run() asserts a rewrite, and on a CPU runtime there is never one to
+        # assert: the wrapper declines before it even looks at the statement.
+        # Those checks are announced as skips below — not silently, and not as
+        # failures, since no build could make them pass on this machine.
+        #
+        # What a CPU runtime does prove is the never-rewrite path: the same
+        # corpus goes through the whole client (classification, splitting,
+        # name resolution, the template cache, the decline) and every
+        # statement must come back with native's rows and the right reason.
+        # This is what a hosted CI runner runs.
+        for name, sql in cases.items():
+            if name == "explain":
+                continue                      # a plan, not rows: nothing to compare
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            nat, _ = native(sql)
+            check(not lr["rewritten"] and lr["reason"] == "backend",
+                  f"{name}: declined on a CPU runtime (reason={lr['reason']})")
+            check(same(got, nat), f"{name}: rows identical to native ({len(got)} rows)")
+        for what in (
+                "rewrite and parity: every shape the engine accepts, against native's "
+                "rows, names and types",
+                "the scalar renderer against the reference renderer",
+                "rejections, catalog shadowing and their decline reasons",
+                "writes, invalidation and the in-statement row guard",
+                "cached plans: every event that re-decides one",
+                "residency: eager, background and segmented uploads, eviction, the "
+                "memory budget, view-backed sets and store_columns()",
+                "computed lanes, expressions over aggregates, subquery lanes, folded "
+                "derived tables, CTEs, nested rewriting, aggregate spellings, "
+                "shorthand, DISTINCT forms and views",
+                "key joins",
+                "thresholds: the row floor, inner-statement bounds and measured rule 1"):
+            skip(f"{what} — needs a GPU backend, and this extension reports runtime=CPU")
+        con.close()
+        extension_age_checks()
+        return report()
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
         lr = con.last_rewrite()
@@ -2156,12 +2214,23 @@ def run():
               f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
     con.close()
 
-    # ---- the client and the extension can be different ages -----------------
-    # The pip package and the loadable extension are installed separately
-    # (PyPI / `INSTALL gpudb FROM community`), so a client can meet an older
-    # extension than the one it was written against. That must read as a plain
-    # DuckDB connection with a sentence saying why, never as a statement
-    # naming a function the catalogue does not have.
+    extension_age_checks()
+    return report()
+
+
+def extension_age_checks():
+    """The client and the extension can be different ages.
+
+    The pip package and the loadable extension are installed separately
+    (PyPI / `INSTALL gpudb FROM community`), so a client can meet an older
+    extension than the one it was written against. That must read as a plain
+    DuckDB connection with a sentence saying why, never as a statement
+    naming a function the catalogue does not have.
+
+    Nothing here needs a device: it runs on every backend, CPU included, and
+    the REQUIRED_FUNCTIONS pin is the one check that catches the client and
+    the built extension drifting apart.
+    """
     from gpudb import connection as _conn
 
     con = fresh()
@@ -2208,6 +2277,8 @@ def run():
           "no extension: last_rewrite()['detail'] says it too")
     bare.close()
 
+
+def report():
     print()
     if SKIPS:
         print(f"{len(SKIPS)} skipped (this backend cannot reach them):")

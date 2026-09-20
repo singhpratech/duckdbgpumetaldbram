@@ -3426,6 +3426,76 @@ permanent fix stays what the 2026-09-19 entry named — derive the column in C++
 with `native_avg_decimal`, which has no 53-bit ceiling — after which the guard
 becomes unnecessary rather than merely correct.
 
+## 2026-09-20 — CI runs the wrapper suite, and what a machine without a GPU can prove
+
+**What was not covered.** `python/tests/test_wrapper.py` is the only suite that
+puts a REWRITTEN statement and native's next to each other and compares the
+rows; every other suite runs statements written by hand. No CI job ran it
+against a built extension. The SQL suite went into the Linux job on 2026-09-19
+(above), but it exercises the `gpu_*` functions directly, not the client that
+composes calls to them. Both bugs found that week lived in that gap: the CTE
+`AS MATERIALIZED` hint the rewrite dropped under DuckDB 1.5.5 (the serializer
+carries it on 1.4.5, and 1.4.5 was the only interpreter with the module on the
+Mac), and the `avg`-over-DECIMAL guard that was green on a hand-built fixture
+and dead on every real statement.
+
+**What it covers now.** The Linux job, after the SQL suite, installs the pip
+`duckdb` module at exactly the version of the libs it fetched and runs the
+wrapper suite against the extension it just built, through
+`GPUDB_EXTENSION_PATH` (the wrapper sets `allow_unsigned_extensions` itself
+when the path is explicit, so the unsigned local build loads). The version is
+read from `scripts/get_duckdb_libs.sh --print-version`, a new flag that prints
+the tag the script would fetch and exits — the pin stays in one place, which
+matters because the client renders through DuckDB's own
+`json_serialize_sql` / `json_deserialize_sql` and that output is a property of
+the version. A `.duckdb_extension` built against the C_STRUCT ABI loads into
+the pip module of the matching version: verified here with the osx_arm64 build
+under pip duckdb 1.5.5.
+
+**The CPU-backend counts.** A hosted runner has no GPU, so the extension
+reports `runtime=cpu` — and the wrapper never rewrites there, by design: the
+CPU resident path is a single-threaded sort per call, slower than native, so
+rule 1 forbids lowering onto it and `Connection._rewrite_select` declines with
+reason `backend` before it looks at the statement. Run as written, the suite
+did not merely fail on such a machine, it stopped: 75 ok, 202 failures, 0 skips,
+and then an AttributeError in "writes and invalidation", where a decline leaves
+no tag to look up — about a sixth of the way through.
+
+Note that `_exact` is not the gate for this. The CPU backend is the reference
+implementation of every exact operator, so `gpu_build_info()` on a CPU-only
+build says `exact=true join=true global=true store=true avgf=53`; a dozen
+sections gated on `_exact` therefore ran and failed. The suite now asks
+`has_device(con)` — `_backend not in ("", "CPU")` — announces the nine areas
+that need a device through its existing `skip()`, and in their place runs the
+never-rewrite path over the same corpus: 61 statements, each of which must come
+back declined for reason `backend` and with native's rows (122 of the 133
+checks; the other 11 are the extension-age section, which never needed a
+device). Nothing was
+downgraded from a failure to a skip. **CPU backend: 133 ok, 0 failures, 9 skips,
+identical under pip duckdb 1.5.5 and 1.4.5.**
+
+**What still needs a machine with a GPU.** Everything the suite exists for:
+every parity check against native, the scalar renderer against the reference
+renderer, decline reasons other than `backend`, writes and the in-statement row
+guard, cached plans, residency and segmented uploads, computed lanes,
+expressions over aggregates, subquery lanes, CTEs, nested rewriting, joins,
+thresholds and measured rule 1. Neither of the two bugs above would have been
+caught by the CPU leg — both needed a rewrite to happen. What the CPU leg does
+catch is a class that had no owner at all: the client and the extension drifting
+apart (`REQUIRED_FUNCTIONS` is pinned against the built binary), the loadable
+extension failing to load into the pip module of the served DuckDB version, an
+import or packaging break, and any statement in the corpus that stops returning
+native's rows when the wrapper declines it. The parity checks remain the Mac's
+and, once the CUDA exact path is on, the Linux box's to run before a release.
+
+The macOS job was left alone. Its runner has a paravirtual GPU: several Metal
+pipelines refuse to build there, so the backend would be Metal with `exact`
+reachable in principle and pipelines failing case by case — a suite that is
+neither the CPU leg's clean skip nor the real device leg's parity run, and
+flaky in between. A device parity run needs real hardware, which CI does not
+have on either platform.
+
+
 
 ## Open questions
 
