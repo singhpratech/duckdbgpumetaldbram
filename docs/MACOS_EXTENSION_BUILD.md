@@ -34,6 +34,10 @@ purposes. They do not interfere with each other:
    artifact lands at `build/release/gpudb.duckdb_extension` (staged copy at
    `build/release/extension/gpudb/gpudb.duckdb_extension`). CUDA is off in this
    path (phase 2); Metal stays auto-on for the `osx_arm64` job.
+   This path requires a **git checkout**, not just the sources: the version in
+   the extension's metadata footer comes from `git describe`, and built from an
+   unpacked tarball that error text lands in the footer and the binary will not
+   load at all. `make configure` refuses up front and says so.
 
 The vendored DuckDB C API headers used by path 2 live in
 `third_party/duckdb_capi/` (committed); `extension-ci-tools` is a git submodule.

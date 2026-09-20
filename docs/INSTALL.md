@@ -13,22 +13,34 @@ Two routes, both of which end with the extension inside DuckDB and the wrapper
 on your `PATH`. Installing one piece without the other is the single most
 common way to end up with a shell that works but never uses the GPU.
 
-**Route 1 — the registry extension plus the pip wrapper.**
+**Route 1 — `pip`, which on a supported platform is the whole install.**
 
-1. Install the extension into DuckDB, from any DuckDB ≥ 1.5.5 client:
-   ```sql
-   INSTALL gpudb FROM community;
-   LOAD gpudb;
-   ```
-   It is signed; no flags.
-2. Install the wrapper:
-   ```bash
-   pip install duckdb-gpudb          # installs the `gpudb` command and the gpudb module
-   ```
+```bash
+pip install duckdb-gpudb          # the `gpudb` command, the gpudb module, and the extension
+```
 
-   The `duckdb` module `pip` pulls in (or the one you already have) must be a
-   version the registry publishes a gpudb build for — **Supported versions**,
-   at the end of this section, says which and how to pin it.
+On **Apple Silicon, macOS 15 or later** and on **x86-64 Linux with glibc 2.34
+or newer** (Ubuntu 22.04 and later) `pip` installs a platform wheel that carries
+the v0.7.0 extension binary inside the package, in `gpudb/_ext/`. Nothing else
+is needed: no `INSTALL`, no build, no `GPUDB_EXTENSION_PATH`. One binary, and it
+has been shown loading under both DuckDB 1.4.5 and 1.5.5 from a clean install —
+which is what building against the stable C API buys.
+
+On any other platform `pip` installs the `py3-none-any` wheel, which carries no
+binary, and the extension has to come from DuckDB itself:
+
+```sql
+INSTALL gpudb FROM community;     -- in any DuckDB ≥ 1.5.5 client
+LOAD gpudb;
+```
+
+It is signed; no flags. That is also the route for any DuckDB client that wants
+the explicit `gpu_*` functions without the wrapper. The `duckdb` module `pip`
+pulls in (or the one you already have) must then be a version the registry
+publishes a gpudb build for — **Supported versions**, at the end of this
+section, says which and how to pin it — and `FORCE INSTALL gpudb FROM
+community;` or `UPDATE EXTENSIONS;` is what replaces an already-installed copy
+with the newest the registry has.
 
 **Route 2 — from a checkout.** Three steps; the first is the one that is easy
 to miss, because `scripts/build.sh` only builds the loadable extension when
@@ -58,32 +70,72 @@ somewhere else, point it at the file:
 export GPUDB_EXTENSION_PATH=/path/to/build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
 ```
 
-**The lookup order**, whichever route you took: an explicit
-`gpudb.connect(extension="…")`, then `GPUDB_EXTENSION_PATH`, then a
-`build-macos/` / `build-linux/` beside a source checkout, then whatever
-DuckDB itself has installed. If nothing usable is found — or what is found is
-older than the client — the banner's `transparent:` line says so,
-`con.extension_note` carries the same sentence, and every statement simply
-runs on DuckDB.
+**The lookup order**, whichever route you took:
+
+1. an explicit `gpudb.connect(extension="…")`,
+2. `GPUDB_EXTENSION_PATH`,
+3. a `build-macos/` / `build-linux/` beside a source checkout,
+4. the copy bundled in the installed package (`gpudb/_ext/`, present only in a
+   platform wheel),
+5. whatever DuckDB itself has installed — `LOAD gpudb`.
+
+A checkout's own build comes *before* the bundled copy on purpose: someone who
+has just built the extension is testing that binary, and an installed wheel
+shadowing it silently would be the worst kind of wrong. `LOAD gpudb` is last
+because it is the only entry that can hand back something older than the
+client. If nothing usable is found — or what is found is older than the client
+— the banner's `transparent:` line says so, `con.extension_note` carries the
+same sentence, and every statement simply runs on DuckDB.
 
 **Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 — the
-wrapper's own requirements, and they are *not* the same as route 1's. The
-registry builds gpudb separately for each DuckDB version from 1.5.5 on, so a
-`duckdb` module that satisfies `pip` can still be a version the registry has
-nothing to install for: on DuckDB 1.4.5, `INSTALL gpudb FROM community` is a
-404. Pin it with `pip install "duckdb==1.5.5"` if you are taking route 1. A
-binary from the releases page needs only DuckDB ≥ 1.2, because the loadable
-extension is built against the stable C API v1.2.0.
+wrapper's own requirements, and they are *not* the same as the registry's. A
+bundled or downloaded binary needs only DuckDB ≥ 1.2, because the loadable
+extension is built against the stable C API v1.2.0; the wheel's copy has been
+run under both 1.4.5 and 1.5.5. The registry, by contrast, builds gpudb
+separately for each DuckDB version from 1.5.5 on, so a `duckdb` module that
+satisfies `pip` can still be a version the registry has nothing to install for:
+on DuckDB 1.4.5, `INSTALL gpudb FROM community` is a 404. Pin it with `pip
+install "duckdb==1.5.5"` if the extension is coming from the registry.
 
-macOS: **macOS 14 or later on Apple silicon** (Metal shading language 3.1;
-3.2 is used on macOS 15 and later). The binary asks the OS at run time and
-compiles its shaders as MSL 3.2 where that is available, MSL 3.1 below
-(`src/backends/metal/metal_groupby.mm`). Building needs the macOS 15 SDK,
-which is where `MTLLanguageVersion3_2` comes from (CI builds on `macos-15`).
-Linux with CUDA: see the [CUDA
-requirements](#cuda-requirements-build-from-source-on-linux) table — the short
-version is that a binary built with CUDA 13 needs an R580+ driver, and one
-built with CUDA 12.x reaches the GPU on R525+.
+**macOS: 15.0 or later, on Apple silicon.** That is the floor the shipped
+binaries declare (Mach-O `minos 15.0`), and it is the floor of the binary the
+community registry has been serving, so it is the one this project has evidence
+for: a 15.0 binary has shipped and has run. A lower target compiles — 14.0
+builds with no unguarded-availability warnings — but the shader-compile paths
+pick their Metal language version at run time (MSL 3.2 on macOS 15 and later,
+MSL 3.1 below, `src/backends/metal/metal_groupby.mm`) and that 3.1 branch has
+never executed anywhere, because every machine gpudb has run on is 15 or newer.
+Nothing here was tested on a macOS older than the one that built it. Building
+needs the macOS 15 SDK, which is where `MTLLanguageVersion3_2` comes from (CI
+builds on `macos-15`).
+
+**Linux: x86-64, glibc 2.34 or newer** — the release binary and the platform
+wheel are built on Ubuntu 22.04, so Ubuntu 20.04 and other older userlands are
+not supported. The extension links libstdc++ and libgcc statically, so it
+carries no `GLIBCXX_`/`CXXABI_` symbol-version floor from the build machine, and
+the CUDA runtime is linked statically too — the only driver-side dependency is
+`libcuda.so`. For the GPU it needs an **NVIDIA driver R525 or newer** and a card
+in the **sm_75 – sm_90** range (see the [CUDA
+requirements](#cuda-requirements-build-from-source-on-linux) table; a binary
+built with CUDA 13 needs R580+, one built with CUDA 12.x reaches the GPU on
+R525+). On a machine with no NVIDIA driver at all it still loads and falls back
+to the CPU backend cleanly. An extension installed from the community registry
+on Linux is a **CPU-only build** — it reports `compiled=cpu` — so for the CUDA
+backend take the release binary or build from source.
+
+**Linux also needs `libgomp.so.1` at load time.** The extension links OpenMP
+dynamically, so the shared library has to be on the machine:
+
+```bash
+apt install libgomp1     # Debian / Ubuntu
+dnf install libgomp      # Fedora / RHEL
+```
+
+It is already present on most desktop, CI and notebook images. In a minimal
+container it is not, and `LOAD` then fails with `libgomp.so.1: cannot open
+shared object file`. This applies to both the community-extensions build and the
+binary on the GitHub release page. The Python wheel bundles its own copy and
+needs nothing installed.
 
 ## Platforms and install
 
@@ -183,6 +235,7 @@ compiled with CUDA and which backend it picked at runtime.
 |---|---|
 | `backend: none — the extension is not loaded` in the banner, and `transparent: a plain DuckDB shell — every statement goes straight to DuckDB` under it | No extension this connection can load. `con.extension_note` (and `last_rewrite()["detail"]`) spells it out: *install it with `INSTALL gpudb FROM community` run on the same DuckDB version as this client's `duckdb` module, or point `GPUDB_EXTENSION_PATH` at a built one.* The registry builds gpudb separately for each DuckDB version and installs it under that version's own directory, so an `INSTALL` run from a different version leaves nothing this one will find. |
 | `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. The message ends with the advice that works: *update it with `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then start a new session.* A plain `INSTALL` does nothing when a copy is already installed — it keeps the file it finds — and neither form reaches a process that has already loaded the old one, which is why it ends in a new session. |
+| `libgomp.so.1: cannot open shared object file` on Linux | The OpenMP runtime the extension links dynamically is not on the machine — usually a minimal container. `apt install libgomp1` (Debian/Ubuntu) or `dnf install libgomp` (Fedora/RHEL). The Python wheel bundles its own copy and never hits this. |
 | `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
 | `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build (a registry Linux binary can be one), or a CUDA build started with `GPUDB_CUDA_EXACT=0`. |
 | Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |
