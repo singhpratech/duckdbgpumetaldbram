@@ -16,13 +16,35 @@ namespace gpudb_cuda_ops {
 using u64 = unsigned long long;
 using i64 = std::int64_t;
 
+// How much device memory the last refused allocation wanted, and how much the
+// device had. A CUB call's temp storage is knowable BEFORE the launch — the
+// size query is the first half of the two-call protocol below — so an
+// operator that cannot fit can say what it needed instead of surfacing a bare
+// "out of memory" that tells the caller nothing it can act on.
+//
+// Written only on the failing path, read by the host wrapper when it formats
+// the error, so a stale value is never read as a fresh one.
+inline std::size_t& last_scratch_need() { static thread_local std::size_t v = 0; return v; }
+inline std::size_t& last_scratch_free() { static thread_local std::size_t v = 0; return v; }
+
 struct DevBuf {
     void* p = nullptr;
     std::size_t bytes = 0;
     cudaError_t alloc(std::size_t b) {
         release();
         bytes = b;
-        return b ? cudaMalloc(&p, b) : cudaSuccess;
+        if (!b) return cudaSuccess;
+        const cudaError_t e = cudaMalloc(&p, b);
+        if (e == cudaErrorMemoryAllocation) {
+            // Record what was wanted before the caller unwinds: the size is
+            // the only part of an allocation refusal anyone can act on.
+            std::size_t freeb = 0, totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) freeb = 0;
+            last_scratch_need() = b;
+            last_scratch_free() = freeb;
+            cudaGetLastError();            // handled here, not a sticky fault
+        }
+        return e;
     }
     void release() { if (p) { (void)cudaFree(p); p = nullptr; } bytes = 0; }
     ~DevBuf() { release(); }
@@ -38,7 +60,16 @@ cudaError_t with_temp(F&& call) {
     cudaError_t e = call(static_cast<void*>(nullptr), bytes);
     if (e != cudaSuccess) return e;
     DevBuf tmp;
-    if ((e = tmp.alloc(bytes ? bytes : 1)) != cudaSuccess) return e;
+    if ((e = tmp.alloc(bytes ? bytes : 1)) != cudaSuccess) {
+        if (e == cudaErrorMemoryAllocation) {
+            std::size_t freeb = 0, totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) freeb = 0;
+            last_scratch_need() = bytes;
+            last_scratch_free() = freeb;
+            cudaGetLastError();            // clear the sticky flag: this is handled
+        }
+        return e;
+    }
     return call(tmp.p, bytes);
 }
 

@@ -2098,6 +2098,61 @@ void test_hybrid_groupby() {
 #if GPUDB_HAVE_CUDA && defined(__linux__)
 extern "C" int gpudb_cuda_debug_fault_inject(void* stream);   // cudaError_t; 0 == success
 
+// ---- an exact upload that cannot fit must leave the device as it found it ----
+// The wrapper's memory policy is built on "a failed upload leaves no residue":
+// it has to be able to refuse a set, free what it touched, and carry on. This
+// forces the refusal deterministically by reserving all but a sliver of the
+// card, then checks that free memory comes back — once, and again over
+// repeats, because a bounded leak and an unbounded one look the same after a
+// single attempt.
+extern "C" std::size_t gpudb_cuda_debug_free_bytes();
+extern "C" void*       gpudb_cuda_debug_reserve(std::size_t leave_bytes);
+extern "C" void        gpudb_cuda_debug_release(void* p);
+
+void test_cuda_failed_upload_leaves_nothing() {
+    std::printf("  a refused exact upload frees what it touched:\n");
+    auto agg = gpudb::make_aggregator(gpudb::Backend::CUDA);
+
+    // a set far larger than the sliver left free below
+    const std::size_t N = 4'000'000;
+    std::vector<std::int64_t> lanes(N * 2);
+    for (std::size_t i = 0; i < N; ++i) { lanes[2 * i] = static_cast<std::int64_t>(i % 1000);
+                                          lanes[2 * i + 1] = static_cast<std::int64_t>(i); }
+    gpudb::Aggregator::RowSpan sp{};
+    sp.lanes = lanes.data(); sp.rows = N; sp.n_lanes = 2; sp.valid = nullptr;
+    const gpudb::Dtype dts[2] = { gpudb::Dtype::I64, gpudb::Dtype::I64 };
+
+    void* hold = gpudb_cuda_debug_reserve(48ull << 20);       // leave ~48 MiB
+    if (!hold) {                       // could not corner the device; say so rather than pass
+        std::printf("    SKIP (could not reserve the device)\n");
+        return;
+    }
+    const std::size_t free_before = gpudb_cuda_debug_free_bytes();
+    int refused = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        try {
+            auto cols = agg->upload_rows_exact(&sp, 1, dts, 2);
+            (void)cols;                                        // it fitted after all
+        } catch (const std::exception&) {
+            ++refused;
+        }
+    }
+    const std::size_t free_after = gpudb_cuda_debug_free_bytes();
+    gpudb_cuda_debug_release(hold);
+
+    EXPECT(refused == 4);                                      // every attempt refused
+    // Allow one CUDA allocation granule of slack; a retained set would be
+    // megabytes, and a growing one would be four times that.
+    const std::size_t slack = 4ull << 20;
+    EXPECT(free_after + slack >= free_before);
+    if (free_after + slack < free_before) {
+        std::printf("    free memory fell from %zu MiB to %zu MiB over %d refusals\n",
+                    free_before >> 20, free_after >> 20, refused);
+    }
+    std::printf("    ok (%d refusals, free %zu -> %zu MiB)\n",
+                refused, free_before >> 20, free_after >> 20);
+}
+
 // A device fault (illegal address) is sticky: the context is dead for the
 // rest of the process. The contract is that it reaches SQL as an error, not
 // as an abort — Thrust temporaries used to throw from a destructor on the
@@ -4205,6 +4260,7 @@ int main(int argc, char** argv) {
 
 #if GPUDB_HAVE_CUDA
     test_backend(gpudb::Backend::CUDA);
+    test_cuda_failed_upload_leaves_nothing();
 #endif
 #if GPUDB_HAVE_METAL
     test_backend(gpudb::Backend::METAL);

@@ -548,6 +548,36 @@ cudaError_t fetch(const void* d_src, T* h_dst, cudaStream_t s) {
 
 extern "C" {
 
+// ---- test hooks (docs: the upload-failure test) ----
+// Reserving most of the card is how a test forces an allocation refusal
+// deterministically; the alternative is filling it with real sets, which is
+// slow and depends on how much else is running.
+std::size_t gpudb_cuda_debug_free_bytes() {
+    std::size_t freeb = 0, totalb = 0;
+    if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return 0;
+    return freeb;
+}
+
+void* gpudb_cuda_debug_reserve(std::size_t leave_bytes) {
+    std::size_t freeb = 0, totalb = 0;
+    if (cudaMemGetInfo(&freeb, &totalb) != cudaSuccess) return nullptr;
+    std::size_t want = freeb > leave_bytes ? freeb - leave_bytes : 0;
+    void* p = nullptr;
+    const std::size_t step = 64ull << 20;
+    while (want > step && cudaMalloc(&p, want) != cudaSuccess) want -= step;
+    cudaGetLastError();                    // the failed attempts are expected
+    return want > step ? p : nullptr;
+}
+
+void gpudb_cuda_debug_release(void* p) {
+    if (p) cudaFree(p);
+}
+
+void gpudb_cuda_last_scratch(std::size_t* need_bytes, std::size_t* free_bytes) {
+    if (need_bytes) *need_bytes = gpudb_cuda_ops::last_scratch_need();
+    if (free_bytes) *free_bytes = gpudb_cuda_ops::last_scratch_free();
+}
+
 cudaError_t gpudb_cuda_exact_fill_valid(u64* d_bits, std::size_t rows, cudaStream_t s) {
     const std::size_t words = (rows + 63) / 64;
     if (!words) return cudaSuccess;
