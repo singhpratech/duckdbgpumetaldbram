@@ -111,6 +111,11 @@ docs:
     |---|---|---|---|
     | Apple M4 Max (Metal), SF1 | 17 of 22 | 0 | 1.4x - 13.6x |
     | Apple M4 Max (Metal), SF10 | 19 of 22 | 0 | 1.3x - 52.9x |
+    | RTX 4090 Laptop (CUDA), SF1 | 17 of 22 | 0 | 0.95x - 23.3x |
+
+    Plain SQL runs on the GPU by default on both backends. The CUDA row's low end is
+    one query, TPC-H Q1, which sits at parity on that machine and which the
+    per-process measured rule declines where it loses.
 
     The remaining queries are declined on purpose (correlated subqueries, or shapes
     where DuckDB was measured faster) and run on DuckDB unchanged. Every measurement,
@@ -159,10 +164,13 @@ docs:
       given binary carries (compiled=) and which one it chose (runtime=).
       A CUDA build is available from the project's releases and from
       source.
-    * On CUDA hardware, ordinary SQL is rewritten onto the GPU only with
-      GPUDB_CUDA_EXACT=1. Every operator is implemented there; what has
-      not been done is running the threshold sweep on NVIDIA hardware,
-      and the thresholds are what rule 1 rests on.
+    * On CUDA hardware, ordinary SQL is rewritten onto the GPU by
+      default, and GPUDB_CUDA_EXACT=0 turns that off without a rebuild.
+      The thresholds it decides with were measured on Apple Silicon and
+      verified on one NVIDIA machine (an RTX 4090 Laptop: 1630 gate
+      cells, none slower than native, none differing), not measured for
+      every GPU. TPC-H Q1 sits at parity on that machine, and the
+      per-process measured rule is what decides such a statement.
     * Ordinary SQL is answered on the device only through a client that
       sees the statement before DuckDB plans it — the project's `gpudb`
       shell or its Python wrapper. LOAD gpudb in the stock CLI gives the

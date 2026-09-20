@@ -163,10 +163,10 @@ The reason codes you will actually meet:
 | `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, by design (see [the two rules](../README.md#the-two-rules)) |
 | `ties` | a pushed `ORDER BY … LIMIT k` found two of the first *k* rows equal on the ordering value, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original |
 | `backend` | this build has no GPU backend to rewrite for (a CPU-only binary), or the installed extension is older than the client |
-| `memory` | the set does not fit the device-memory budget; it is refused before the upload |
+| `memory` | the set does not fit — either the budget's own arithmetic (`900 MiB resident + about 300 MiB needed > 1024 MiB`) or the device turning the upload down, which reads the same way to you and is named in the sentence. Refused **before** the upload, and the refusal is remembered: the same statement asked again does not cost another attempt until the data, the budget or the resident population changes |
 | `transaction` | a `BEGIN` is open, so the resident sets cannot be trusted |
 | `params` | the statement takes prepared-statement parameters |
-| `error` | the rewritten statement raised and DuckDB answered the original — the text is in `.gpu` |
+| `error` | the rewritten statement raised and DuckDB answered the original. The footer carries the exception's own first line, not the sentence that had admitted the statement, and `.gpu` has the rest. When what it ran out of was device *working* memory, the sets are refused too and the budget keeps that much headroom from then on |
 | `off` / `manual` | the path is off (`.gpu off`, `--no-gpu`), or residency is `manual` |
 
 Ten more codes name a smaller refusal precisely where `shape` would only say
@@ -303,8 +303,15 @@ residency:     background
 ```
 
 Raise or lower it with `--memory-budget 16GB` (`unlimited` removes the cap).
-A set that does not fit is not uploaded, and its statements keep running on
-DuckDB. [When GPU memory is full](INSTALL.md#when-gpu-memory-is-full) has the rest.
+A set that does not fit is not uploaded, its statements keep running on DuckDB,
+and it is not asked again until something that could change the answer changes.
+[When GPU memory is full](INSTALL.md#when-gpu-memory-is-full) has the rest.
+
+The `resident:` line adds up the sets, and a set is a view over shared store
+columns — so where several sets read the same column it is counted once per
+set. The `.residents` table above is the physical picture (each column once);
+from Python, `con.memory()["bytes"]` is that total and is what the budget is
+actually compared with.
 
 ## Uploading by hand
 

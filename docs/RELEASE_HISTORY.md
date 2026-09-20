@@ -14,7 +14,8 @@ What shipped in each release, newest first.
   `min` / `max` / `avg`, native NULL semantics, 128-bit sums, `DECIMAL` as
   scaled integers, up to eight payloads in one device pass; a fused `WHERE`
   mask; an aggregate with no `GROUP BY` in one pass; device `HAVING` and top-k.
-  CPU reference, Metal, and CUDA (opt-in, `GPUDB_CUDA_EXACT=1`).
+  CPU reference, Metal and CUDA — on by default on both GPUs, with
+  `GPUDB_CUDA_EXACT=0` as the way to turn the CUDA path off.
 - [x] **Keys that real SQL uses** — integer, `DATE`, `TIMESTAMP`, `DECIMAL` and
   `VARCHAR` keys; one to eight of them, up to three packed into a 64-bit key and
   a hashed tuple with a dictionary above that; `GROUP BY ALL`, ordinals,

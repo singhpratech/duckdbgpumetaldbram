@@ -184,6 +184,36 @@ release branch at all.
   by measured value per byte rather than by recency. A refused candidate costs
   nothing, and `memory()["evictions_wasted"]` counts that rather than assuming
   it.
+- **The budget counts what is there, and a refusal is remembered** (#172) — the
+  number the budget is compared with is now the physical total, every store
+  column once plus what sets own (`con.memory()["bytes"]`, beside
+  `device_allocated`, what the driver says the process holds). The per-set
+  figures are ranking quantities and are not summable — a store-backed set is a
+  view over shared columns, and summing them measured 4.4× the truth. The
+  pre-upload estimate narrows each plain column's lane from DuckDB's own
+  zone-map statistics instead of charging it the width of its type, which was
+  2.4× the truth and refused sets that fit. A refusal is now remembered, keyed
+  on the things that could change the answer, so a statement whose set cannot
+  fit costs **one** upload attempt rather than one per statement. An upload the
+  device refuses **fails** (`GPUDB_DEVICE_UPLOAD_REFUSED`) instead of landing on
+  the CPU reference, so a set is never half-placed or answered from host memory,
+  and `gpu_store_columns()` gained `on_gpu` as the second line of that defence.
+  An execution failure for device memory becomes a refusal plus a learned
+  headroom — where the backend reports what it needed against what was free, the
+  budget holds the difference back from then on — and the fallback now reports
+  the real exception's first line in `last_rewrite()["detail"]`. New gate:
+  `scripts/budget_gate.py` (56 s, in `local_check.sh`), which asserts at every
+  sample that physical resident stays under the budget, that no lane is on the
+  host, that no set is uploaded twice, and that every row equals native's.
+  Measured after it: **TPC-H SF10 is 19 of 22 at the default budget**, with no
+  `memory` declines — the raised budget the earlier runs used is no longer
+  needed.
+- **An operator that cannot get working memory says how much it wanted** (#171)
+  — on CUDA, `out of memory (needs N MiB of working memory, M MiB free)`, with
+  a forced-refusal unit test behind it. CUDA also reports its device memory, so
+  the wrapper's budget there is derived from the card rather than from host RAM.
+  `scripts/vram_sampler.sh` samples device memory while a long run proceeds,
+  which is how a plateau is told from a climb.
 - **Uploads that do not disturb a query** — short idle row-id segments through
   the extension's upload sessions (#91), carrying exact segments (#95).
 - **An upload that steps back on a busy machine** (#167) — measured per
@@ -279,28 +309,33 @@ full licence text so GitHub detects it (#89).
 
 ## Tests, CI and packaging
 
-- `python/tests/test_wrapper.py`: 1238 checks, 0 skipped, green under DuckDB
-  1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
-  backend without the exact path; #159 and #160 replaced its host gating with a
-  probe for the function that decides; #164 added the reported tie and its
-  fallbacks; #170 asserts the remembered verdict as a count of device passes
-  rather than as a time). The RTX 4090 box collects a different number, because
-  the `avg`-over-`DECIMAL` section branches on the host's `long double` — the
-  counts each come from their own machine — and it used to carry 4 failures,
-  all of them segmented-upload cases unrelated to the exact path (#161). Once
-  #169 priced a segment from what each machine measures, that box came back
-  fully green: **1209 of 1209** at the time it was run.
+- `python/tests/test_wrapper.py`: green under DuckDB 1.4.5 and under 1.5.5 on
+  an M4 Max, and **1258 of 1258** on the RTX 4090 Laptop (#150 makes the suite
+  run to the end on a backend without the exact path; #159 and #160 replaced its
+  host gating with a probe for the function that decides; #164 added the
+  reported tie and its fallbacks; #170 asserts the remembered verdict as a count
+  of device passes rather than as a time; #171 and #172 added the refusal,
+  placement and accounting cases). The two boxes collect different counts,
+  because the `avg`-over-`DECIMAL` section branches on the host's `long double`,
+  so each number is named with its machine. The x86 box used to carry 4
+  failures, all of them segmented-upload cases unrelated to the exact path
+  (#161); once #169 priced a segment from what each machine measures, it came
+  back fully green.
 - `python/tests/test_residency_policy.py`: 105 checks, 0 failing — the residency
   policy on a clock the test drives, so the yield rule, the quiet-window bound
   and the measured segment floor are asserted directly rather than raced against
   a real machine (#167, #169).
-- `test_gpudb`: 750 / 750 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
-  #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block.
-- `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the
-  RTX 4090; 45 `expected_fail` guardrail cases across the 18 files in
-  `test/sql/`.
-- `scripts/tpch_coverage.py`: SF1 17 of 22, SF10 19 of 22, 0 rows differing, on
-  the M4 Max.
+- `test_gpudb`: 752 / 752 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
+  #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block,
+  and #171 added the forced-refusal case.
+- `run_sql_tests.sh`: 225 passing, 0 failing on the RTX 4090 with the default
+  build; 45 `expected_fail` guardrail cases across the 18 files in `test/sql/`.
+- `scripts/tpch_coverage.py`: SF1 17 of 22 and SF10 19 of 22 on the M4 Max,
+  SF1 17 of 22 on the RTX 4090, 0 rows differing anywhere. SF10 runs at the
+  **default** memory budget since #172.
+- `scripts/budget_gate.py` (#172): 169 statements under a budget too small for
+  them — physical resident at or under the budget at every sample, 0 evictions
+  wasted, at most one upload attempt per set, 0 rows differing, 0 errors.
 - `scripts/transparent_gate.py` now drives both entry points (#170). The top-k
   and plain subset was re-run at SF1 through `execute()` and through `sql()`:
   every row at or above its bound and identical either way, with the `l_partkey`
@@ -334,18 +369,27 @@ build its constant key from (#164 fixed the sentence, not the decision).
 
 | | Metal (Apple Silicon) | CUDA (NVIDIA) | No GPU |
 |---|---|---|---|
-| Plain SQL on the GPU | yes | opt-in: `GPUDB_CUDA_EXACT=1` | no — everything runs on DuckDB |
+| Plain SQL on the GPU | yes | yes, on by default — from a binary that carries CUDA | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
 | From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `gpu_build_info()` answers it for whichever binary is in front of you | yes |
 
 Every operator the transparent path needs is implemented on CUDA (#152, #153,
-#154). On an RTX 4090 Laptop with the path enabled, the unit suite is 750 / 750,
-the SQL suite 224 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the
-device with 0 rows differing — the same coverage and the same five declines as
-Metal (#161). It stays opt-in in this release for one reason:
-`scripts/transparent_gate.py` has not been swept on that machine, so a CUDA
-build would be deciding with Metal's thresholds — and rule 1 is a measurement,
-not an assumption.
+#154) and the path is **on by default** there (#168). On an RTX 4090 Laptop the
+unit suite is 752 / 752, the SQL suite 225 passing and 0 failing, the wrapper
+suite 1258 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the device
+with 0 rows differing through both entry points — the same coverage and the same
+five declines as Metal (#161, #168). What turned it on was the evidence the flip
+had been waiting for: the full gate on that box, at the wrapper's own memory
+budget, ran **1630 cells with 0 slower than native and 0 differing**, minimum
+ratio 1.07×. `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild.
+
+Two caveats stay: the thresholds are the Metal-measured ones **verified on one
+CUDA machine** rather than measured for every GPU (`_thresholds.TABLE["CUDA"]`
+is still `METAL`, and says so as a dated measured fact), and TPC-H Q1 sits at
+parity on that box — the per-process measured rule is what decides it. And the
+path needs a binary that carries CUDA at all: a Linux binary from the community
+registry may report `compiled=cpu`, in which case CUDA comes from a release
+binary or a source build. `SELECT gpu_build_info();` is what tells them apart.
 
 ## Credits
 

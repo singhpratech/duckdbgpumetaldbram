@@ -84,10 +84,22 @@ same condition that keeps the floor at the constant.
 `round_trip_ms`, `fallback` and `error` — the same fields the shell's `.gpu`
 prints, described in [the shell guide](USING_THE_SHELL.md#look-underneath).
 
-`con.memory()` returns `budget`, `evictions`, `evictions_wasted` (evictions
-made for a candidate that was then declined — it is counted rather than
-assumed, and measures 0) and `sets`, each with its state, the size the wrapper
-expected, the size the extension reports, and what the set is worth.
+`con.memory()` returns:
+
+| key | what it is |
+|---|---|
+| `bytes` | what is **physically** resident: every store column counted once, plus every set that holds columns of its own. This is the number the budget is compared with. `None` when the extension could not be asked. |
+| `device_allocated` | what the **driver** says this process holds, where a backend can report it (`gpu_build_info()`'s `device_allocated=`); `None` where none can — an absent answer, not zero. It is larger than `bytes` by the backend's own machinery and by any in-flight operator's working memory, which is exactly what the budget does not account for. |
+| `budget` | the cap, in bytes; `None` when there is none. |
+| `evictions`, `evictions_wasted` | evictions made, and of those the ones made for a candidate that was then declined — counted rather than assumed, and measures 0. |
+| `refusals`, `refusals_held` | sets refused, and upload attempts not made because a refusal was still standing. |
+| `sets` | per resident set: `state`, `est_bytes` (what the wrapper expected), `bytes` (what the extension reports), `error`, `uses`, and what the set is worth — `value`, the milliseconds it saves per second of wall time, and `density`, the same per GiB it holds, which is the quantity admission and eviction compare. |
+
+**Do not sum the per-set `bytes`.** They are ranking quantities. A store-backed
+set is a view over shared columns and reports what its lanes cost, so adding
+them up counts a column once per set that reads it — measured at 4.4× the
+physical truth on one SF1 run. `bytes` at the top level is the physical total.
+
 `con.extension_note` is empty while the loaded extension can serve the client,
 and one sentence saying why not otherwise.
 
@@ -99,7 +111,7 @@ the whole of what it adds. Everything else is DuckDB's.
 | | |
 |---|---|
 | `con.residents()` | `{identity tag: state}` for every set the wrapper is managing. State is `missing`, `pending`, `uploading`, `ready`, `stale` or `failed`. |
-| `con.store_columns()` | one dict per resident column — `table`, `column`, `dtype`, `rows`, `width` (bytes a row of the lane is stored at), `bytes`, `prepared`. This is what the shell's `.residents` prints underneath. Returns `[]` when no usable extension is loaded. |
+| `con.store_columns()` | one dict per resident column — `table`, `column`, `dtype`, `rows`, `width` (bytes a row of the lane is stored at), `bytes`, `prepared`, and `on_gpu`: whether the lane is on the device at all, `None` where no backend could say (an absent answer, not "on the host") and on an extension too old to report it. These bytes are the physical ones — a column appears once however many sets read it — so this is the list that may be summed, and `memory()["bytes"]` is that sum. This is what the shell's `.residents` prints underneath. Returns `[]` when no usable extension is loaded. |
 | `con.transparent` | readable and settable. `con.transparent = False` leaves every statement on DuckDB from then on; `True` puts it back. Nothing is dropped either way — resident sets and decisions survive the round trip, which is what makes it usable as an A/B switch. `reason == "off"` is what a statement that would otherwise have been *decided* reports; one that never reaches the decision — `SELECT 1`, or an aggregate over a table below the row floor — still reports `shape` or `threshold`. |
 | `con.residency` | read-only: `"background"`, `"eager"` or `"manual"`, as passed to `connect()`. To change it, open another connection. |
 | `con.interrupt()` | DuckDB's own interrupt, on this connection's handle. It stops the statement running on **this** connection; a `cursor()` has its own handle and is not affected. |
@@ -196,6 +208,10 @@ extension_note: ''
 residents: {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': 'ready'}
 memory: {'budget': 17179869184, 'evictions': 0, 'evictions_wasted': 0, 'sets': {'gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity': {'state': 'ready', 'est_bytes': 217609579, 'bytes': 84017010, 'error': '', 'value': 0.0, 'uses': 1, 'density': 0.0}}}
 ```
+
+This session was captured before `con.memory()` gained `bytes`,
+`device_allocated`, `refusals` and `refusals_held`; the table above is the
+current set of keys, and the per-set figures are unchanged.
 
 Three statements, three outcomes — a win, a size threshold, and a shape with
 no kernel behind it. `6 groups` in the second is the wrapper's
