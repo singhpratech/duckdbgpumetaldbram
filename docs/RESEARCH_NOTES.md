@@ -4974,6 +4974,146 @@ line — on that run and on every later run of the same template. The gate and
 `not_resident` row, which is where a reader could previously see only the
 word.
 
+## 2026-09-20 — The flip, and what a gate is actually for
+
+`exact_supported()` returns true by default on CUDA. The transparent rewrite
+now targets this backend for exact statements the way it does Apple Silicon
+Metal, and the v0.7 port is functionally complete on both.
+
+The flag was implemented on 2026-09-19 and flipped a day later. Nothing in the
+kernels changed in between. What changed is that the evidence for flipping it
+came to exist, and the shape of that gap is the thing worth keeping.
+
+### The gate was never about whether the code worked
+
+The SQL suite was green on the exact path from the day it landed — 224 pass, 0
+fail. That proves the TABLE FUNCTIONS. What flipping the flag additionally does
+is let the Python wrapper rewrite plain SQL statements here, and only
+`test_wrapper.py` and `scripts/tpch_coverage.py` prove that a rewritten
+statement returns native's rows. Neither had ever run against a CUDA exact
+backend.
+
+The asymmetry that justified holding: a runtime rule-1 check catches a slow
+template, because slowness is observable while the query runs. Nothing at
+runtime catches a different ANSWER. A wrong row is returned, accepted, and
+never mentioned again. So the evidence for rule 2 has to be collected before
+the flip, and it cost one line to hold and a day to gather.
+
+What that day actually produced, none of which was predicted at the time the
+flag was written:
+
+- avg over DECIMAL was returning wrong answers on x86 with default settings,
+  982 of 5000 groups, because a guard read a field before the loop that fills
+  it. Found by the wrapper suite, which had never run here.
+- `AS MATERIALIZED` was being ignored because DuckDB 1.5.5 stopped serializing
+  the hint — a guard testing for a value that is no longer emitted.
+- The wrapper's own avg tests asserted a property that cannot hold on x86,
+  because forcing a flag simulates the decision and never the arithmetic.
+
+Three rule-2 findings, all in shared code, none of them CUDA's. Every one was
+surfaced by running the suites the gate was waiting for. A gate that had been
+waved through on "the SQL suite is green" would have shipped all three.
+
+### What the flip does not settle
+
+Rule 1 is not established on CUDA. `_thresholds.py` is Metal-measured, and 16
+of the 17 rewritten TPC-H queries being comfortably above 1.0 is a property of
+those queries rather than evidence that the thresholds transfer. Q1 measures
+0.95 in the run recorded beside this entry, having measured 1.04, 0.96, 0.99,
+0.97 and 1.02 on the same build: it straddles parity and this time fell below
+it. It is printed as a losing row.
+
+That is the honest state: rule 2 is measured, rule 1 is assumed from another
+machine's numbers, and per-backend thresholds are the change that turns the
+second into the first.
+
+### Four failures that stay failures
+
+The segmented-upload cluster is unchanged and unrelated — identical with the
+path off. The cause is now a measured curve rather than a suspicion: a
+segment's scan costs ~1.5 ms fixed plus 0.00002 ms a row, against the ~2.5 ms
+window the test's cadence leaves. The adaptive sizing reaches its floor and
+stops, because the floor is a constant that assumes a per-segment cost this
+machine does not have.
+
+They do not gate the flip, and the reason is worth stating rather than assumed:
+the failure mode is "the set never becomes resident, so the statement stays on
+DuckDB". Correct answers, never slower than native, just not accelerated. A
+failure whose worst case is "behaves like the CPU build" is not the same kind
+of thing as a failure that returns a row, and treating them the same would be
+its own error.
+
+## 2026-09-20 — A gate measures the system it runs on
+
+The CUDA exact path is on by default. What is worth recording is not the flip
+but the two runs of the same gate that bracket it.
+
+The first, on 2026-09-20 with the gate's then-default of
+`--memory-budget unlimited`: exit 1, two cells slower than native, twenty-six
+cells reported as `declined (error)`, device memory climbing to 15807 MiB of
+16376 and pinning there. The second, after the budget was enforced: exit 0,
+1011 PASS, nothing slower, nothing differing, no error declines, memory
+plateauing around 8.4 GiB with a peak of 8557 against a 7967 MiB budget.
+
+Same box, same sweeps, same kernels. One configuration flag.
+
+### What I concluded from the first run, and what was actually true
+
+Two cells lost, and I diagnosed both. `l_returnflag` at three groups was
+admitted by the string-key `few_ok` escape that bypasses `min_groups`; the
+escape is a win on Apple Silicon Metal and 0.97x here, so the constant did not
+transfer. `li left orders: l_suppkey` at ten groups went through the `if join:`
+branch, which has only upper bounds and returns before `topk_min_groups` is
+consulted, so join forms had no lower floor at all — and `est_groups` is
+pre-filter, so the estimate said ten thousand where the truth was ten.
+
+Every one of those statements about the code is true. None of them was why
+those cells lost.
+
+The join cell measured 100.2 ms rewritten in the first run and 4.1 ms in the
+second — a factor of twenty-four. It sat at line 1471 of the first log, in the
+stretch where the card was full and allocations were failing. It was never a
+slow template; it was a measurement of a machine that had run out of memory.
+The `l_returnflag` cell is now declined by the measured rule after one
+rewritten run, which is that rule doing exactly its job.
+
+A per-backend CUDA threshold table had been scoped on the strength of those two
+cells. It is not being written. The constants would have been real, the
+measurements behind them reproducible, and the justification would have
+evaporated the moment anyone re-ran the gate correctly — while the table
+remained, defended by a commit message saying it was measured.
+
+### The general form
+
+A benchmark is a measurement of a system in a state. The state is part of the
+result and is almost never recorded next to it. This gate had no memory cap, so
+by the last third of its run it was benchmarking a full card: every number in
+that region describes memory pressure rather than the query shape the row is
+named after. Nothing in the output said so — the cells reported ratios, and a
+ratio looks like a property of the query.
+
+What made it visible was not suspicion of the numbers but an unrelated
+investigation into an error class, which happened to sample device memory over
+time. The trajectory — monotonic to the card limit — is what reframed every
+ratio measured after it. A run that had merely been slow would have looked
+identical in the table.
+
+The cheap defence is to record the state beside the result. This gate now takes
+the wrapper's own budget by default, `scripts/budget_gate.py` asserts the
+plateau directly, and `scripts/vram_sampler.sh` is in the repository so the
+trajectory can be taken alongside any long run. None of those would have caught
+the original problem by themselves; what catches it is asking, before reading a
+table, what the machine was doing while the table was produced.
+
+### What the flip does not settle
+
+The budget accounts for resident sets and not for operator working memory,
+which is why the plateau sits about 7% above the line. Scratch enters the
+budget only after the fact, through the `needs N MiB of working memory, M MiB
+free` message and the N−M headroom the wrapper then holds back. And TPC-H Q1
+straddles 1.0x on this box — 0.97x through `execute`, 1.03x through `sql` — so
+the one shape that might ever justify a CUDA-specific constant is the one the
+measured rule is currently handling per process.
 
 ## Open questions
 

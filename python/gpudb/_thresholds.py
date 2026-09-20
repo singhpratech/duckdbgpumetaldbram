@@ -83,9 +83,19 @@ another output column on both sides and the plain form's margin shrinks to
 1.01–1.09× (one 0.93× at 10K groups under a three-term WHERE), 1.00–1.08× at
 100K groups over a join                               → multi_plain_max_groups,
 multi_join_plain_max_groups; the plain form under a WHERE runs native
-CUDA uses this Metal-measured table until scripts/transparent_gate.py has
-been run on CUDA; the CUDA exact path is implemented and opt-in
-(GPUDB_CUDA_EXACT=1).
+CUDA uses this Metal-measured table, and that is a measured result rather
+than a placeholder: the full transparent gate was run on an RTX 4090 Laptop
+(sm_89) on 2026-09-20 — 1630 cells, exit 0, 0 slower than native, 0 differing,
+minimum ratio 1.07x — with the exact path on and the wrapper's own memory
+budget. The table survived it, so no CUDA-specific constant is justified.
+
+Two cells DID lose on an earlier run of the same gate (0.96x and 0.97x) and
+were the reason a CUDA table was drafted. Both were artefacts of that run
+having no memory budget: the card filled to 15.8 GiB of 16.4 and the slow cell
+measured 100.2 ms rewritten, against 4.1 ms once the budget was in place. A
+gate measures the system it runs on. The one shape still worth re-checking if
+a CUDA table is ever reconsidered is TPC-H Q1, which straddles 1.0x on that
+box (0.95-1.04x); the measured rule handles it per process.
 
 The direct grouped reduce (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) did not
 move any of these, and the measurement says why. Inside the backend, a key with
@@ -275,6 +285,8 @@ METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_
                    plain_min_selectivity=0.5,
                    having_min_selectivity=0.3, having_min_selectivity_big=0.2,
                    topk_min_groups=100_000, topk_min_selectivity=0.8)
+# Deliberately the same object: see the note at the top of this file. The gate
+# has been run on CUDA and found nothing that wants a different constant.
 CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 

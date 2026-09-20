@@ -5243,3 +5243,158 @@ the v0.6 cache is a separate change over a different set of kernels.
 unit 750/750; SQL 224 pass / 0 fail with `GPUDB_CUDA_EXACT=1` and 223/1 with it
 off; wrapper 4 failures, the same pre-existing segmented-upload cluster.
 
+## v0.7 — the CUDA exact path on by default, RTX 4090, SF1 (2026-09-20)
+
+`exact_supported()` now returns true without an environment variable, so the
+transparent rewrite targets this backend for exact statements the way it does
+Apple Silicon Metal. This section is the evidence the flip waited for.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds on, N=9,
+`data/tpch_sf1/tpch.duckdb`. No environment variable set — this is the default
+build.
+
+`gpu_build_info()`: `compiled=cpu,cuda runtime=cuda exact=true join=true
+global=true narrow=true device_memory=0 store=true rebuilds=0/0
+device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **750 / 750** |
+| SQL suite, default | **224 pass / 0 fail**, 45 guardrail, 0 skip |
+| SQL suite, `GPUDB_CUDA_EXACT=0` | 223 / 1 — q11 asserts `global=true`, correct for a disabled path |
+| wrapper (`test_wrapper.py`) | **1202 ok / 4 fail / 0 skip** |
+| TPC-H SF1 | **17 of 22 on the device, 0 rows differing from native** |
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---|---|---|
+| Q1  | GPU (plain)     | 10.3 | 10.9 | **0.95×** |
+| Q3  | GPU (plain)     | 10.8 | 3.5  | 3.11× |
+| Q4  | GPU (plain)     | 11.3 | 1.2  | 9.28× |
+| Q5  | GPU (plain)     | 10.6 | 0.8  | 12.87× |
+| Q7  | GPU (plain)     | 12.5 | 3.5  | 3.56× |
+| Q8  | GPU (projected) | 10.3 | 3.6  | 2.86× |
+| Q9  | GPU (plain)     | 38.2 | 3.5  | 10.94× |
+| Q10 | GPU (topk)      | 21.9 | 4.1  | 5.37× |
+| Q12 | GPU (plain)     | 8.0  | 5.3  | 1.51× |
+| Q13 | GPU (nested)    | 31.7 | 5.2  | 6.06× |
+| Q14 | GPU (projected) | 8.5  | 0.6  | 15.27× |
+| Q15 | GPU (nested)    | 5.7  | 3.0  | 1.88× |
+| Q17 | GPU (projected) | 8.3  | 0.5  | 15.72× |
+| Q18 | GPU (plain)     | 31.7 | 3.0  | 10.46× |
+| Q19 | GPU (projected) | 14.9 | 0.6  | 23.27× |
+| Q21 | GPU (plain)     | 35.9 | 4.1  | 8.81× |
+| Q22 | GPU (plain)     | 13.7 | 0.8  | 17.45× |
+
+Q2, Q6, Q11 and Q16 decline on thresholds; Q20 declines on shape (it does not
+bind on its own). The same five as Metal at SF1.
+
+### Q1 is a losing row, printed as one
+
+**0.95× — slower than native.** It has measured 1.04, 0.96, 0.99, 0.97 and 1.02
+on earlier runs of the same build, so it straddles 1.0 and this run fell on the
+low side. It is not noise being reported as a win: the honest description is
+that Q1 is at parity and sometimes below it.
+
+Rule 1 says never slower than native, and a statement that hovers at 1.0 is
+exactly the case the thresholds exist to decline. `python/gpudb/_thresholds.py`
+is Metal-measured; nothing in it has been measured on CUDA, so the fact that 16
+of the 17 rewritten queries are comfortably above 1.0 is a property of those
+queries, not evidence that the thresholds transfer. Per-backend thresholds are
+their own change, and Q1 is the row that will decide whether the CUDA set needs
+a floor the Metal set does not.
+
+### The four wrapper failures
+
+All four are the segmented background upload (`== segmented upload (0c)`), and
+they are **independent of the exact path** — identical with `GPUDB_CUDA_EXACT=0`
+(5 of 20 segments with the path on, 9 of 20 with it off, ~200 interrupts either
+way). The cause is measured: a segment's scan costs `~1.5 ms + 0.00002 ms/row`
+on this box, against the ~2.5 ms mean window that the test's `U(0,10) ms` sleep
+leaves after `idle_ms = 5`. The adaptive sizing added in #167 reaches its floor
+(seg_scale 32, 32768 rows, 2.50 ms) and stops there, which is still too big.
+
+A fix is in progress on the macOS side: cut the fixed per-segment cost, then
+derive the floor from the measured cost and window rather than a constant. The
+failure mode meanwhile is "the set never becomes resident, so the statement
+stays on DuckDB" — correct answers, never slower than native, just not
+accelerated. That is the safe direction, which is why it does not gate the flip.
+
+## v0.7 — the CUDA exact path on by default, RTX 4090, SF1 (2026-09-20, rerun)
+
+The flip, measured on the tree that merges. Supersedes the earlier default-on
+section: that one was taken before the memory budget was enforced, and the
+difference between the two runs is the most useful thing in this entry.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds on, N=9,
+`data/tpch_sf1/tpch.duckdb`. No environment variable — this is the default.
+
+`gpu_build_info()`: `exact=true join=true global=true narrow=true store=true
+device_memory=16718168064 device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **752 / 752** |
+| SQL suite, default | **225 pass / 0 fail**, 45 guardrail, 2 skip |
+| SQL, `GPUDB_CUDA_EXACT=0` | 223 / 2 — the two assert device capabilities, correct for a disabled path |
+| wrapper (`test_wrapper.py`) | **1258 ok / 0 fail / 0 skip** |
+| TPC-H SF1 `--path execute` | **17 of 22 on the device, 0 differing** |
+| TPC-H SF1 `--path sql` | **17 of 22 on the device, 0 differing** |
+| `scripts/budget_gate.py` | **PASS** — 169 statements, 0 differing, 0 errors, resident never above the budget |
+
+### The two transparent-gate runs, side by side
+
+Same box, same sweeps (`--subqueries --exprs --ctes --inner --lane-floor`).
+The only difference that matters is that the first ran with the gate's old
+default of `--memory-budget unlimited`.
+
+| | unbudgeted | budgeted |
+|---|---|---|
+| exit | 1 | **0** |
+| cells slower than native | 2 | **0** |
+| cells differing | 0 | **0** |
+| `(error)` declines | 26 | **0** |
+| device memory | climbed to 15807 MiB of 16376 and pinned | **plateau ≈ 8.4 GiB, peak 8557 MiB** |
+| minimum ratio | 0.96× | **1.07×** |
+
+The budget is 7967 MiB (half of the card, via `device_memory_bytes()`). The
+peak sits ~7% above that line, and the reason is worth stating rather than
+rounding away: **the budget accounts for resident sets, not for operator
+working memory.** A reduce's temporaries are not in it. The only way scratch
+enters the budget at all is after the fact — an out-of-memory failure reports
+`needs N MiB of working memory, M MiB free`, and the wrapper holds N−M back as
+headroom from then on. So a plateau slightly above the budget is the expected
+shape, not a breach of it.
+
+### The two cells that used to lose
+
+Both were artefacts of the unbudgeted run, and neither was a threshold defect.
+
+| cell | unbudgeted | budgeted |
+|---|---|---|
+| `li left orders: l_suppkey`, EXISTS, topk, 10 groups | native 95.8, rewritten **100.2** ms → 0.96× | native 102.3, rewritten **4.1** ms → **25.19×** |
+| `l_returnflag`, no WHERE, plain, 3 groups | rewritten, 0.97× | **declined (threshold)** after its first run |
+
+The first sat in the region of the log where the card was full and the
+out-of-memory failures were firing: it was not a slow template, it was a
+measurement of a degraded system. The second is the measured rule doing its
+job — one rewritten run, found not worth it, declined thereafter.
+
+A CUDA-specific threshold table was drafted on the strength of those two cells
+and is **not** being written. `_thresholds.TABLE["CUDA"]` stays `METAL`.
+
+### Budget gate
+
+`scripts/budget_gate.py`, 256 MiB budget: physical resident 166–240 MiB at
+every sample, evictions 2 with **wasted 0**, refusals 9, **at most 1 upload
+attempt for any one set**, reasons `{rewritten: 18, threshold: 142, memory: 9}`.
+RSS 178 → 644 MiB. Device memory peaked at 437 MiB across the run.
+
+### The caveat worth carrying
+
+TPC-H **Q1 straddles 1.0×** on this box: 0.97× on `--path execute` and 1.03× on
+`--path sql` in this run, and 0.95–1.04× across earlier runs of the same build.
+The measured rule handles it per process. It is the one shape to re-check if a
+CUDA-specific table is ever reconsidered.
+
