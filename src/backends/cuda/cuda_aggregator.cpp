@@ -117,6 +117,28 @@ namespace {
 [[noreturn]] void cuda_throw(cudaError_t e, const char* what) {
     std::ostringstream os;
     os << "CUDA " << what << " failed: " << cudaGetErrorString(e);
+    // An allocation refusal is the one failure the caller can do something
+    // about — evict, or decline this template — but only if it is told the
+    // size. A bare "out of memory" is not a decision anyone can act on.
+    //
+    // THE SHAPE OF THIS MESSAGE IS DEPENDED ON. The Python wrapper parses
+    //     (needs <N> MiB of working memory, <M> MiB free)
+    // to decide between evicting N-M bytes and refusing the template, and
+    // falls back to a conservative refusal when the parenthesis is absent.
+    // Keep the wording and the units; add to the end if something new is
+    // needed, and do not reorder or re-unit the two numbers.
+    if (e == cudaErrorMemoryAllocation) {
+        std::size_t need = 0, freeb = 0;
+        gpudb_cuda_last_scratch(&need, &freeb);
+        if (need) {
+            os << " (needs " << (need >> 20) << " MiB of working memory, "
+               << (freeb >> 20) << " MiB free)";
+        } else {
+            std::size_t totalb = 0;
+            if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess)
+                os << " (" << (freeb >> 20) << " MiB free of " << (totalb >> 20) << " MiB)";
+        }
+    }
     throw std::runtime_error(os.str());
 }
 
@@ -430,6 +452,17 @@ public:
     }
 
     Backend backend() const noexcept override { return Backend::CUDA; }
+
+    // §5.5: what the wrapper's memory budget sizes itself from. Without this
+    // the budget falls back to min(host/4, 8 GiB) — a number taken from HOST
+    // memory, which has nothing to do with how much this card has. On a box
+    // with more RAM than VRAM that is over-generous, and the first symptom is
+    // an allocation failing inside a query rather than the budget declining
+    // the upload that caused it.
+    std::size_t device_memory_bytes() const noexcept override {
+        return static_cast<std::size_t>(props_.totalGlobalMem);
+    }
+
 
     std::string device_name() const override {
         std::ostringstream os;
