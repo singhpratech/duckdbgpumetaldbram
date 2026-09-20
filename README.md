@@ -794,8 +794,8 @@ Each row names the machine that took it. The M4 Max rows were re-counted on the
 v0.7.0 release build of 2026-09-20; the RTX 4090 rows are that machine's, taken
 when the CUDA path was turned on by default. `test_shell.py`'s one skip under
 DuckDB 1.5.5 is a throwaway virtualenv that cannot import `duckdb`, so the
-console entry point cannot start there — it is announced rather than counted as
-a pass. The x86-64 box used to carry four failures in the segmented-upload
+console entry point cannot start there — the suite names that check rather than
+counting it as a pass. The x86-64 box used to carry four failures in the segmented-upload
 cases — the background uploader never found a quiet window under that test's
 statement cadence — and once a segment was priced from what each machine
 measures rather than from a constant, that box came back fully green. The

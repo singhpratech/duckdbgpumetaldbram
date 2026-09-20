@@ -73,9 +73,11 @@ the call, and for a pushed top-k the side cursor IS the device pass. **The
 verdict is therefore remembered** (#170), per rendered statement, and dropped
 wherever the resident sets are — any write, DDL, `SET`, `ATTACH` or foreign
 write the wrapper sees, a row count that moved under the set, a rewrite that
-raised. One device pass per data version instead of one per call: the shape went
-from 17.1 ms back to 8.7 ms through `sql()`, and in the shell to 5.7 ms against
-17.8 ms native. A *tie* verdict is never cached — it raises, and the template is
+raised. One device pass per data version instead of one per call: measured when
+#170 landed, the shape went from 17.1 ms back to 8.7 ms through `sql()`, and in
+the shell to 5.7 ms against 17.8 ms native. (Those are that change's own
+before-and-after on the machine of the day; what the same statement reads on the
+release build is in the shell guide, and it is not the same machine state.) A *tie* verdict is never cached — it raises, and the template is
 measured-declined, which is the stronger answer.
 
 **The measured rule times the path** (#170). `execute()` and `sql()` reach the
