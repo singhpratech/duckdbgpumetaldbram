@@ -27,7 +27,7 @@ Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
 
 ```
 $ gpudb my.duckdb
-gpudb 0.7.0.dev0
+gpudb 0.7.0
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
 database:     my.duckdb
