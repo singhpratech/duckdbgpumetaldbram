@@ -56,14 +56,14 @@ docs:
 
     ### Three ways in
 
-    This extension, loaded in any DuckDB client, gives the explicit `gpu_*`
-    functions — route 3. The first two routes, the ones that put **plain** SQL on
-    the device, additionally need the Python package, because DuckDB's stable C
-    API has no hook that sees a statement before it is planned:
-    `pip install duckdb-gpudb`. On Apple Silicon (macOS 15 or later) and x86-64
-    Linux (glibc 2.34 or newer) that wheel carries a matching extension binary
-    inside it, so it is the quickest way to plain SQL on the GPU; elsewhere it
-    uses the extension DuckDB has installed from this registry.
+    The first two put **plain** SQL on the device and need the Python package as
+    well as this extension, because DuckDB's stable C API has no hook that sees a
+    statement before it is planned: `pip install duckdb-gpudb`. On Apple Silicon
+    (macOS 15 or later) and x86-64 Linux (glibc 2.34 or newer) that wheel carries
+    a matching extension binary inside it, which is the quickest way to plain SQL
+    on the GPU; elsewhere it uses the extension DuckDB has installed from this
+    registry. The third needs no wrapper: loaded in any DuckDB client, this
+    extension gives the explicit `gpu_*` functions.
 
     **1. The `gpudb` shell** — a SQL shell whose footer says, under every result,
     where the statement ran and why.
