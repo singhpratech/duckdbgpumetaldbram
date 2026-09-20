@@ -79,7 +79,7 @@ Entries are in date order in the file; this groups them by question.
 - A capability flag that was really a placement decision (CUDA)
 
 **Using it**
-- The Python wrapper, and the name it had to be published under — the entry titled "pip install gpudb"; the distribution is `duckdb-gpudb`, the import is `gpudb`
+- The Python wrapper, and the name it had to be published under — the entry keeps the name of the day in its title, "pip install gpudb"; the distribution is `duckdb-gpudb` and the import is `gpudb`
 - A terminal is a client (the `gpudb` shell)
 - The end-of-file that arrived while nobody was reading, and the Ctrl-C that had nobody to wake — two pty races that turned out to be stock Python's
 - The other build path, unexercised since the rewriting began

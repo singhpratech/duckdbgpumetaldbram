@@ -195,9 +195,10 @@ full licence text so GitHub detects it (#89).
 - `python/tests/test_wrapper.py`: 1157 checks, 0 skipped, green under DuckDB
   1.4.5 and under 1.5.5 on an M4 Max (#150 makes the suite run to the end on a
   backend without the exact path; #159 and #160 replaced its host gating with a
-  probe for the function that decides). On the RTX 4090 box the same suite is
-  1154 ok with 4 failures, all in the segmented-upload cases and all unrelated
-  to the exact path — measured and written down in `BENCHMARK.md` (#161).
+  probe for the function that decides). On the RTX 4090 box the same suite
+  collects 1158 checks and runs 1154 ok with 4 failures — the counts each come
+  from their own machine — the four being segmented-upload cases, all unrelated
+  to the exact path and written down in `BENCHMARK.md` (#161).
 - `test_gpudb`: 730 / 730 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
   #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block.
 - `run_sql_tests.sh`: 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` on the

@@ -1759,7 +1759,7 @@ radix passes for constant bytes. For uniformly-distributed keys in
 rest can be skipped (just swap pointers). Expected: 4–8× kernel speedup
 at low cardinality, which would flip these regimes.
 
-That's a small, contained change to land in the next PR.
+That is a small, contained change.
 
 ---
 
@@ -1922,7 +1922,7 @@ This is the canonical CUDA benchmark (CUDA shipped 4.8× on the same
 workload). Metal at this code quality loses 2.2× — bitonic sort on 6M
 rows pays ~210 dispatches × ~30 µs of launch overhead even with the two-
 tier optimization, plus the host segment-reduce. The fix is GPU-resident
-radix sort (next PR); see the postmortem in the next section.
+radix sort; see the postmortem in the next section.
 
 ### Scale sweep — synthetic int64 GROUP BY, 1 M-cardinality keys
 
@@ -5100,10 +5100,10 @@ a cold-start number. Each query's rows are compared with native's, ordered,
 and the `identical` column is that comparison.
 
 **Two conditions the run did not print:** the DuckDB version it used, and the
-memory budget the SF10 run was given. SF10 holds
-18.7 GiB resident, which is above the 16 GiB the default budget works out to
-on this machine, so that run must have raised it; the repro command below
-therefore passes a budget explicitly.
+memory budget the SF10 run was given. What is recorded is that SF10 holds
+18.7 GiB resident, which does not fit the 16 GiB the default budget works out
+to on this machine, so the budget had been raised; by how much the run did not
+print. The repro command below therefore passes a budget explicitly.
 
 ```bash
 PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf1/tpch.duckdb

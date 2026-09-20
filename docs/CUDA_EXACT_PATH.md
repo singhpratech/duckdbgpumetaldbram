@@ -149,10 +149,12 @@ discrete GPU moves results over the bus, so the output-bound limits
 2. Read the break-even per form / selectivity / groups from the table; set the
    `CUDA` `Thresholds` accordingly (docstring in `_thresholds.py` records the
    Metal measurements as the model).
-3. `scripts/transparent_gate.py --subqueries --exprs` must exit 0: nothing below
-   1.0×, nothing differing. Then `scripts/tpch_coverage.py`.
-4. `BENCHMARK.md` gets the CUDA tables next to the Metal ones; the README's
-   comparison table at release is regenerated from both.
+3. `scripts/transparent_gate.py --subqueries --exprs` is what checks the result:
+   it exits 0 only when no rewritten shape came out below 1.0× and no shape
+   returned rows differing from native. `scripts/tpch_coverage.py` is the same
+   comparison over the 22 TPC-H queries, query by query.
+4. `BENCHMARK.md` is where those runs are recorded — the CUDA tables sit beside
+   the Metal ones, and the README's per-query table is written from them.
 
 ## 5. Upload path on a discrete GPU
 

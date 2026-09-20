@@ -6,36 +6,35 @@
 > kernels would map onto the sort primitives the repository already has. Nothing
 > here is a commitment that they will be built.
 
-Window functions are the operator class **Sirius (CIDR 2026 GPU OLAP
-paper) does not cover**. This doc is the Metal-specific algorithm notes
-so the v1 scaffold (PR pending from `feat/core-window-functions`) can be
-followed by real kernels in 1-2 PRs instead of guessing.
+These are the Metal-specific algorithm notes for the window-function
+operator class: how each function would decompose into kernels the
+repository already has.
 
 The hard part isn't the window function itself — it's the data movement.
 Once you have **sorted (key, payload) pairs** the rest is mostly scatter,
-scan, or shift. The radix-sort kernels in `groupby.metal` (landing on
-PR #5) are the workhorse; this doc explains how every window function
-maps onto them.
+scan, or shift. The radix-sort kernels in `groupby.metal` are the
+workhorse; this note explains how every window function maps onto them.
 
 ---
 
-## 0. Common primitives we already have (or will have soon)
+## 0. Common primitives already in the tree
 
-| Primitive | Where | Status |
-|---|---|---|
-| `radix_histogram` (256 buckets) | `groupby.metal` | ✅ on PR #5 |
-| `radix_per_bucket_scan` (on-device exclusive scan) | `groupby.metal` | ✅ on PR #5 |
-| `radix_scatter` (stable, threadgroup-memory-based) | `groupby.metal` | ✅ on PR #5 |
-| `radix_minmax_i64` (active-byte detection) | `groupby.metal` | ✅ on PR #5 |
-| Bitonic sort in tg memory | `groupby.metal` (legacy fallback) | ✅ on main |
-| Per-block prefix sum (Hillis-Steele in tg mem) | inside `radix_per_bucket_scan` | ✅ on PR #5 |
+| Primitive | Where |
+|---|---|
+| `radix_histogram` (256 buckets) | `groupby.metal` |
+| `radix_per_bucket_scan` (on-device exclusive scan) | `groupby.metal` |
+| `radix_scatter` (stable, threadgroup-memory-based) | `groupby.metal` |
+| `radix_minmax_i64` (active-byte detection) | `groupby.metal` |
+| Bitonic sort in tg memory | `groupby.metal` (legacy fallback) |
+| Per-block prefix sum (Hillis-Steele in tg mem) | inside `radix_per_bucket_scan` |
 
-**Action:** before the window kernels can use them, refactor
-`radix_*` from "GROUP BY only" into a generic `radix_sort_pairs_i64(keys,
-payload, n)` helper. This is the unblocking change. Probably ~50 lines of
-factoring in a separate PR (`feat/core-radix-sort-extract`).
+All of them are written against the GROUP BY path's own buffers. A window
+kernel could only call them once they are factored into a generic
+`radix_sort_pairs_i64(keys, payload, n)` helper — on the order of 50 to 100
+lines of factoring in `groupby.metal` and `metal_groupby.mm`, and the
+prerequisite for everything below.
 
-Once that exists, every window function below reduces to: **(1) sort
+Given that helper, every window function below reduces to: **(1) sort
 pairs, (2) walk the sorted output with a per-element rule, (3) scatter
 the result back to original positions**.
 
@@ -178,45 +177,13 @@ can call it.
 
 ---
 
-## 7. Things to NOT implement in v1 (out of scope)
+## 7. Shapes these notes do not cover
 
-- **NTILE** — uncommon, can skip.
+- **NTILE** — uncommon; the same sort plus an arithmetic rule per row.
 - **Range-based windows** (`RANGE BETWEEN ... PRECEDING`) — depends on
   values, not row counts; needs binary search per row. Doable but more
   complex.
-- **FILTER clause** — combine with predicate pushdown work that's not
-  yet started.
-- **Multiple window functions in one query** — needs query-level
-  optimization. Each operator stands alone for now.
-
----
-
-## 8. Concrete next-PR plan
-
-1. **`feat/core-radix-sort-extract`** — refactor `radix_*` kernels into
-   a generic `radix_sort_pairs_i64(device long* keys, device long*
-   payload, uint n)` callable from any operator. ~50-100 lines change in
-   `groupby.metal` + `metal_groupby.mm` to use the extracted helper.
-2. **`feat/metal-window-rank`** — implement ROW_NUMBER and RANK on top
-   of (1). Bench vs CPU at 100M, 500M, 1B int64 inputs.
-3. **`feat/metal-window-lag-lead`** — implement LAG/LEAD with offset.
-4. **`feat/metal-window-partitioned`** — composite-key sort for
-   PARTITION BY, including running totals.
-5. **`feat/core-scan-extract`** — extract a flat `exclusive_scan_i64`
-   from `radix_per_bucket_scan` so sliding-window aggregates can land
-   without duplicating scan code.
-
-Each PR is 1-2 days of focused work. Total: 2-3 sessions to ship a
-defensible window-function story that Sirius doesn't have.
-
----
-
-## 9. The differentiator pitch
-
-> "We're a DuckDB extension with first-class Apple Silicon support. We
-> do GROUP BY 4.89× faster than single-thread CPU at TPC-H scales,
-> SUM 5.28× faster at 1B int64. **And we ship window functions, which
-> Sirius (the strongest GPU OLAP engine) does not.** Same SQL surface;
-> drop in via `LOAD gpudb;`."
-
-When this doc's plan is implemented, that's the pitch.
+- **FILTER clause** — belongs with predicate pushdown, which these notes
+  do not describe.
+- **Multiple window functions in one query** — a query-level question:
+  every algorithm above is written for one operator on its own.

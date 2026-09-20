@@ -47,7 +47,7 @@ curl -fsSL -o data/clickbench/hits.parquet \
     https://datasets.clickhouse.com/hits_compatible/hits.parquet
 ```
 
-ClickBench is mostly used at the SQL level (we'll wire this up once the DuckDB extension is in). For week-1 microbenchmarks of single-column SUM, TPC-H lineitem is sufficient.
+ClickBench is a SQL-level benchmark and nothing in this repository runs it: no script, no harness and no recorded numbers use `hits.parquet`. The measurement record is TPC-H and the synthetic columns above.
 
 ## Format reference: `.gpudb` flat binary
 
@@ -61,6 +61,6 @@ ClickBench is mostly used at the SQL level (we'll wire this up once the DuckDB e
 
 Defined in [`src/include/data_format.hpp`](../src/include/data_format.hpp). Trivial to mmap or stream.
 
-## Why not Parquet directly (yet)
+## Why the standalone tools do not read Parquet
 
-Parquet readers (Apache Arrow C++) add ~100 MB of build dependencies and complicate the CUDA/Metal build matrix. For week 1 we ship the trivial format and convert via DuckDB CLI. Once we wire the DuckDB extension (`-DGPUDB_BUILD_EXT=ON`), Parquet ingest will come for free via DuckDB's reader.
+Parquet readers (Apache Arrow C++) add ~100 MB of build dependencies and complicate the CUDA/Metal build matrix, so the standalone benchmark tools read the flat format above and the DuckDB CLI does the conversion. Inside DuckDB the question does not arise: the extension (`-DGPUDB_BUILD_EXT=ON`) is handed rows by DuckDB, whose own reader opens Parquet.
