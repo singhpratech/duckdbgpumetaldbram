@@ -5307,6 +5307,32 @@ they run in the same session, over the same rows, at DuckDB's speed. Section
 length went from 611 words to 379; no figure was changed, and none was removed
 from BENCHMARK.md or the Numbers card.
 
+## 2026-09-20 — The docs on release day, first pass: text only
+
+The docs branch was brought onto the release build by merge rather than rebase:
+thirteen of its forty-two commits rewrite `python/README.md`, so replaying them
+one at a time against a file main had also edited would have meant resolving the
+same passage repeatedly against half-rewritten intermediate states. Both sides
+had appended a dated entry before *Open questions* and both are kept.
+
+The pass removed the one remaining statement of a future — the blockquote
+saying the package was not on PyPI and the registry served v0.6.0 — and put the
+platform wheel first everywhere an install is described, since it now carries
+the extension binary and is the only route where the client and the binary
+arrive matched. The registry wording was rewritten to hold true whether or not
+the descriptor update has landed yet: `LOAD gpudb` gives the explicit `gpu_*`
+functions in any client, and `FORCE INSTALL` / `UPDATE EXTENSIONS` is what
+fetches a newer build. The macOS floor is stated as 15.0 with the reason it is
+claimed and 14.0 is not, and Linux gained the requirements that are easy to
+discover the hard way: `libgomp.so.1` at load time, a glibc 2.34 userland, and
+that a registry binary there is CPU-only.
+
+No measured number was touched. Every captured transcript in the shell and
+Python guides, the coverage and gate tables, and the suite counts are unchanged
+and are the second pass's work, to be re-taken on the release build — the `.memory`
+captures in particular, since the shell now prints a physical resident total and
+an `allocated:` line the old captures predate.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
