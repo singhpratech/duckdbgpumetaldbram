@@ -26,7 +26,12 @@ or newer** (Ubuntu 22.04 and later) `pip` installs a platform wheel that carries
 the v0.7.0 extension binary inside the package, in `gpudb/_ext/`. Nothing else
 is needed: no `INSTALL`, no build, no `GPUDB_EXTENSION_PATH`. One binary, and it
 has been shown loading under both DuckDB 1.4.5 and 1.5.5 from a clean install —
-which is what building against the stable C API buys.
+which is what building against the stable C API buys. The Linux wheel carries
+the **CUDA-enabled** build (`compiled=cpu,cuda`, static CUDA runtime) and its own
+`libgomp.so.1`, so it needs nothing installed; with an NVIDIA driver R525 or
+newer it uses the GPU, and with no driver at all it falls back to the CPU
+backend cleanly. That is the one route on Linux where `pip` gives you CUDA —
+a registry install there is a CPU-only build.
 
 On any other platform `pip` installs the `py3-none-any` wheel, which carries no
 binary, and the extension has to come from DuckDB itself:
@@ -136,8 +141,10 @@ dnf install libgomp      # Fedora / RHEL
 It is already present on most desktop, CI and notebook images. In a minimal
 container it is not, and `LOAD` then fails with `libgomp.so.1: cannot open
 shared object file`. This applies to both the community-extensions build and the
-binary on the GitHub release page. The Python wheel bundles its own copy and
-needs nothing installed.
+binary on the GitHub release page. The Python wheel **bundles its own
+`libgomp.so.1`** beside the extension, with a `$ORIGIN` runpath pointing at it
+and the library's licence alongside, so a `pip` install needs nothing installed
+— it has been run in a bare `ubuntu:22.04` with no `apt install` at all.
 
 ## Platforms and install
 

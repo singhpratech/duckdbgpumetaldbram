@@ -390,7 +390,12 @@ full licence text so GitHub detects it (#89).
   checkout under test is never shadowed. One binary was shown loading under
   **both DuckDB 1.4.5 and 1.5.5** from a clean install — three virtual
   environments outside the checkout, plain GROUP BY over 2M rows, rows
-  identical to native in each.
+  identical to native in each. The Linux wheel carries the CUDA-enabled build
+  and vendors `libgomp.so.1` beside the extension, with a `$ORIGIN` runpath and
+  the library's licence alongside (#175) — proven in a bare `ubuntu:22.04` with
+  nothing installed — and `build_wheels.sh` refuses to tag a wheel whose objects
+  need a newer glibc than the tag claims (`manylinux_2_34_x86_64`, measured with
+  `objdump -T` on both the extension and the bundled libgomp).
 - **macOS binaries now declare a deployment target of 15.0** (#173). Nothing
   set one before, so a binary inherited the floor of whatever SDK built it — a
   local build came out at `minos 26.0`, installable only on the macOS that

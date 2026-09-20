@@ -21,7 +21,9 @@ Silicon (macOS 15 or later)** and **x86-64 Linux (glibc 2.34 or newer, e.g.
 Ubuntu 22.04 and later)** the wheel carries both: the v0.7.0 extension binary
 travels inside the package, so that one line is the whole install. No `INSTALL`,
 no build, no environment variable. One binary, and it has been run under both
-DuckDB 1.4.5 and 1.5.5.
+DuckDB 1.4.5 and 1.5.5. The Linux wheel carries the CUDA-enabled build and its
+own `libgomp.so.1`, so it needs nothing installed and reaches an NVIDIA GPU with
+a driver R525 or newer, falling back to the CPU backend where there is none.
 
 Anywhere else `pip` installs the pure-Python wheel and the extension comes from
 DuckDB's own install:
