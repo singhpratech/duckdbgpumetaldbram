@@ -198,7 +198,30 @@ cache the artifact:
           ./build-linux/test/test_gpudb
 ```
 
-## 5. Colab / Jupyter
+## 5. Building a Linux binary that loads on older distributions
+
+A Linux extension inherits the floors of the machine it was compiled on, and
+a container image newer than your runners will produce a binary they cannot
+load. The measured facts for this extension:
+
+- A build on Ubuntu 24.04 needs `GLIBCXX_3.4.32` and `GLIBC_2.38`, so it does
+  **not** load on Ubuntu 22.04 hosts (glibc 2.35), Google Colab included.
+- Building in `nvidia/cuda:12.8.1-devel-ubuntu22.04` (glibc 2.35, CUB 2.7.0)
+  with `-DGPUDB_CUDA_STATIC_RUNTIME=ON` and `-static-libstdc++
+  -static-libgcc` brings the floor down to glibc 2.34 with no CXXABI
+  dependency at all, leaving `libgomp.so.1`, `libc.so.6` and
+  `ld-linux-x86-64.so.2` as the only shared objects needed.
+- `libgomp.so.1` is not present on minimal images — `apt install libgomp1`.
+  That floor and the glibc 2.34 one are both stricter than the DuckDB CLI's,
+  so state them beside any Linux asset you publish.
+- CUDA toolkit choice is a driver decision, not a distribution one. A binary
+  built with CUDA 13 needs an R580+ driver; CUDA 12.x minor-version
+  compatibility means a 12.8-built binary reaches the GPU on any R525+
+  driver, which is what Colab's T4 runtime has.
+- Ship SASS for the architectures you care about. A PTX-only fallback does
+  not help a driver older than the toolkit's JIT expects.
+
+## 6. Colab / Jupyter
 
 There is a ready-made notebook at
 [`examples/gpudb_quickstart.ipynb`](../examples/gpudb_quickstart.ipynb) —

@@ -95,7 +95,7 @@ git push -u origin main
 That's it. Until you run that command nothing leaves your machines.
 
 ## Branch / commit conventions
-See [CLAUDE.md](../CLAUDE.md). Short version:
+Short version:
 - Never commit to `main` directly (well — first commit excepted). Use `feat/cuda-*`, `feat/metal-*`, `feat/core-*`, `chore/*`.
 - Conventional commit messages: `feat(cuda): add radix sort kernel`, `fix(cpu): handle empty input`.
 - Test before committing: `./scripts/build.sh && ./build-*/test/test_gpudb`.

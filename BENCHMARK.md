@@ -1120,7 +1120,7 @@ hybrid planner already detects this regime and would dispatch CPU
 correctly if invoked — the extension just doesn't use the planner yet.
 
 Estimate: 1-2 days of work in `src/extension/gpu_sum_extension.cpp`
-(Linux Claude's lane). Filed as a next-step.
+(the Linux instance's lane). Filed as a next-step.
 
 ### What this changes for "release"
 
@@ -1185,7 +1185,7 @@ well enough to pick the right backend deterministically".
 The same rule shape is safe on CUDA — the CUDA-specific BENCHMARK.md
 numbers (12–22× wins at 1M+ groups, 9× HOT SUM) are strictly stronger
 than Metal so the same conservative thresholds remain correct. We will
-re-tune per-backend when Linux Claude lands online statistics.
+re-tune per-backend when the Linux instance lands online statistics.
 
 ### Sweep — `gpudb-groupby-bench --backend sweep --runs 3`
 
@@ -1410,7 +1410,7 @@ existing `sum_i64` / `sum_partials_i64` pair.
 Even before considering GPU vs CPU, the planner should always fuse
 multi-agg patterns when they target the same column. This is a free
 ~3× on Metal and ~2× on CPU regardless of which backend wins the
-overall query. CUDA implementation is stubbed (throws) — Linux Claude
+overall query. CUDA implementation is stubbed (throws) — the Linux instance
 to pick that up; the kernel pattern is identical to Metal so it should
 land in a single PR.
 ## 2026-05-09 (consolidated) — 4-column comparison: CPU/CUDA Linux vs CPU/Metal Mac

@@ -6,9 +6,8 @@
 > kernels would map onto the sort primitives the repository already has. Nothing
 > here is a commitment that they will be built.
 
-Window functions are the operator class GOAL.md item 8 calls out as **the
-gap Sirius (CIDR 2026 GPU OLAP paper) does not cover**. Shipping them is
-a real differentiator. This doc is the Metal-specific algorithm playbook
+Window functions are the operator class **Sirius (CIDR 2026 GPU OLAP
+paper) does not cover**. This doc is the Metal-specific algorithm playbook
 so the v1 scaffold (PR pending from `feat/core-window-functions`) can be
 followed by real kernels in 1-2 PRs instead of guessing.
 

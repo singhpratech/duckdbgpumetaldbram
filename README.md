@@ -791,12 +791,9 @@ an unreferenced `gpu_upload` is pruned by DuckDB's optimizer and never runs.
 Uploads are capped at 4 GB of buffering by default
 (`GPUDB_UPLOAD_POOL_MAX_MB` to raise); the streaming `gpu_sum/min/max`
 aggregates work in any query shape (GROUP BY, windows, FILTER) at native
-parity. The environment overrides the build honours are listed in
-[CLAUDE.md](CLAUDE.md), with the Metal path-selection ones also in
-[docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md) and
-[docs/RESIDENT_COLUMNS_DESIGN.md](docs/RESIDENT_COLUMNS_DESIGN.md). None of
-them changes an answer — only which path runs, how much host memory it may
-use, or what it prints.
+parity. Every environment variable the build honours — one line each — is in
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md). None of them changes an answer:
+they change which path runs, how much memory it may use, or what it prints.
 
 ### GROUP BY / HAVING / top-k on the device (v0.6.0, unchanged in v0.7)
 
@@ -1085,7 +1082,7 @@ the community-CI `make test` path.
 - [x] **Adversarial parity harness for GROUP BY** — `scripts/groupby_parity_check.sh`: 11 scenarios × 7 checks, incl. runs placed exactly on the kernels' 64-chunk / 256-block boundaries; SQL suite gained a `-- setup:` directive so table functions are tested in the documented sequential form.
 - [x] **Metal radix-sort fix** — the sort behind the v0.5 join build cache skipped a byte pass whenever min and max agreed on that byte; wrong for keys between them that differ there (TPC-H returnflag/linestatus packed keys). Fixed, regression scenarios in both parity harnesses; exposure of the v0.5.0 Metal binary stated in [KNOWN_ISSUES.md](KNOWN_ISSUES.md).
 - [x] **Metal device memory is now released** — the Metal host code was built without ARC since v0.1, so every `MTLBuffer` (resident columns, sort caches, scratch) leaked until process exit; `gpu_drop_resident` now actually frees GPU memory.
-- [x] **Pre-release adversarial audit** — 65-agent find/verify pass over the sort, kernels, C-API layer, hybrid planner, SQL semantics vs native (NULLs, overflow, NaN/-0.0), the v0.5 join surface after the sort fix, the CUDA branch (static) and every documentation claim; all confirmed findings fixed or documented in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before the tag.
+- [x] **Pre-release adversarial audit** — a find/verify pass over the sort, kernels, C-API layer, hybrid planner, SQL semantics vs native (NULLs, overflow, NaN/-0.0), the v0.5 join surface after the sort fix, the CUDA branch (static) and every documentation claim; all confirmed findings fixed or documented in [KNOWN_ISSUES.md](KNOWN_ISSUES.md) before the tag.
 - [x] Design: [docs/GROUPBY_RESIDENT_DESIGN.md](docs/GROUPBY_RESIDENT_DESIGN.md).
 
 ### Shipped in v0.5.0
@@ -1138,13 +1135,28 @@ the community-CI `make test` path.
 
 ## Why DuckDB? Why not a new database?
 
-The 2013-2024 GPU-DB graveyard is real. The wedge that *isn't* in the graveyard:
+Because the hard parts — a parser, a planner, a storage format, a type
+system, a client ecosystem — already exist and are good. What is missing is
+the GPU underneath them, and three things follow from putting it there
+instead of beside it:
 
-1. **Apple Silicon backend** — empty field, defining differentiator
-2. **DuckDB-native** — no migration: `LOAD` for the explicit functions, one wrapper for plain SQL
-3. **A decision, not a mode** — the CPU answers where the CPU wins (low cardinality, small tables, selective filters), and the measurement that says so is published
+1. **An Apple Silicon backend.** No other published SQL engine has one.
+2. **No migration.** `LOAD` for the explicit functions, one wrapper for plain SQL. Your tables, your clients, your queries.
+3. **A decision, not a mode.** The CPU answers where the CPU wins — low cardinality, small tables, selective filters — and the measurement that says so is published, losing rows included.
 
-This combination is unique as of May 2026. See [GOAL.md](GOAL.md) for the full positioning and [BENCHMARK.md](BENCHMARK.md) for reproducible numbers.
+Where that sits against the other GPU query engines, on the axes that are
+checkable from their own documentation:
+
+| | Sirius | cuDF / RAPIDS | HeavyDB | gpudb |
+|---|:-:|:-:|:-:|:-:|
+| Apple Silicon (Metal) backend | no | no | no | **yes** |
+| Runs as a DuckDB extension (no migration) | yes | no | no | **yes** |
+| CUDA backend | yes | yes | yes | yes |
+| Falls back to the CPU per statement, on a measurement | partial | no | no | **yes** |
+| Window functions on the GPU | no | partial | yes | no — they run on DuckDB |
+| Apache-2.0 | yes | yes | yes | yes |
+
+[BENCHMARK.md](BENCHMARK.md) has the reproducible numbers behind our column.
 
 ## Credits
 

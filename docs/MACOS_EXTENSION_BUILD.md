@@ -51,7 +51,7 @@ The vendored DuckDB C API headers used by path 2 live in
 | `LOAD '<path>.duckdb_extension'` from DuckDB CLI             | fails, same as Linux (metadata-footer reject) |
 
 The extension is functionally correct on Apple Silicon when consumed
-in-process (the `gpudb-sql` demo path the Linux Claude has been using).
+in-process (the `gpudb-sql` demo path the Linux machine has been using).
 The CLI `LOAD` path is broken on **both** platforms — not a macOS-specific
 gap. It's blocked behind the documented DuckDB extension-template
 integration listed in `scripts/append_extension_footer.py`.
@@ -255,16 +255,15 @@ cmake --build build-macos -j
 #    ./.tools/duckdb -unsigned -c "LOAD '$EXT'; SELECT gpu_sum(...) ..."
 ```
 
-## Suggested follow-ups for the Linux Claude
+## Suggested follow-ups for the Linux machine
 
 1. The `CMAKE_SHARED_LIBRARY_SUFFIX` fix in `src/extension/CMakeLists.txt`
    is landed — keep it when merging other extension work.
 2. When integrating the official DuckDB extension-template (the path
    `scripts/append_extension_footer.py` recommends), build `.duckdb_extension`
    artifacts for both `linux_amd64` and `osx_arm64` so the
-   community-extensions submission ships both platforms day one — the
-   Apple-Silicon angle is the project's stated unique differentiator
-   (`GOAL.md:18`).
+   community-extensions submission ships both platforms day one — no other
+   published SQL engine has an Apple Silicon GPU backend.
 3. A small refresh of the `.so` wording in `src/extension/CMakeLists.txt`
    and the `duckdb_loadable.cpp` header comment to read "loadable
    shared library" or "loadable .so/.dylib" would prevent future

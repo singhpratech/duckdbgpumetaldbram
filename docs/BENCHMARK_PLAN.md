@@ -62,7 +62,7 @@ real query (TPC-H or ClickBench).
 
 **Status:** shipped on CUDA and Metal. Metal uses adaptive global slot-lock (small build) plus partitioned TG hash radix join (4.9× wall vs CPU @ 1M×10M M4). SQL: `gpu_inner_join`.
 
-### 2.5 Window functions (the GOAL.md item 8 differentiator)
+### 2.5 Window functions
 - `RANK()`, `ROW_NUMBER()` over partition
 - `LAG`, `LEAD` with offset
 - Sliding-window aggregates
@@ -139,7 +139,7 @@ Where we lose, we **say so in BENCHMARK.md** and explain why. Honesty buys credi
 ## 7. How to add a new operator to the comparison
 
 1. Decide its category in §2.
-2. Implement on CPU first (always), then Metal, then CUDA (Linux Claude).
+2. Implement on CPU first (always), then Metal, then CUDA (the Linux machine).
 3. Pick the scenarios from §3 it should be benched against.
 4. Add a section to `BENCHMARK.md` with the matrix from §4.
 5. Add the canonical SQL to TPC-H/ClickBench bindings if applicable.
