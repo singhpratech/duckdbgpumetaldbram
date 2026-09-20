@@ -133,6 +133,18 @@ SOURCE_PAYLOAD = {}               # --lane-floor: a FROM table that is not linei
 REVENUE = "l_extendedprice * (1 - l_discount)"
 
 
+def decline_note(lr) -> str:
+    """The reason a cell was not rewritten and, for the reasons that carry
+    one, the sentence behind it. `error`, `memory` and `not_resident` are the
+    three a reader can do nothing with on their own: 'error' does not say what
+    raised, and 'memory' does not say what did not fit against what."""
+    reason = lr.get("reason") or "?"
+    if reason not in ("error", "memory", "not_resident"):
+        return reason
+    first = (lr.get("detail") or "").splitlines()
+    return f"{reason}: {first[0][:160]}" if first and first[0] else reason
+
+
 def build(key: str, where: str, form: str, having_thr: str, source: str = "lineitem", payloads: int = 1) -> str:
     """`payloads` > 1 adds aggregates over further columns (§4.9: one device
     pass per payload column)."""
@@ -263,9 +275,12 @@ def main() -> int:
                          "execute(), sql() (the lazy relation the gpudb shell uses), both, or "
                          "'auto' (default) — both for the top-k forms, execute() elsewhere")
     ap.add_argument("--payloads", type=int, default=1, help="aggregate this many payload columns per statement (1-5)")
-    ap.add_argument("--memory-budget", default="unlimited",
-                    help="device memory budget for the run (§5.5); the gate sweeps more distinct sets than a "
-                         "session ever holds, so the default lifts the cap — pass e.g. 16GB to test the budget")
+    ap.add_argument("--memory-budget", default=None,
+                    help="device memory budget for the run (§5.5). The default is the wrapper's own — what "
+                         "ships, and therefore what the gate has to measure. Pass 'unlimited' to lift the cap "
+                         "and see every shape the engine accepts, knowing no user runs that way; that WAS the "
+                         "default here, and a gate run with the budget switched off is how a budget nobody was "
+                         "enforcing went unnoticed (docs/RESEARCH_NOTES.md, 2026-09-20)")
     ap.add_argument("--no-thresholds", action="store_true",
                     help="rewrite every shape the engine accepts (data collection for the thresholds; "
                          "rows below the bound are reported, the exit code still fails on them)")

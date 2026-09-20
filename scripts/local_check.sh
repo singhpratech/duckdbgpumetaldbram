@@ -118,6 +118,18 @@ if [ "$NO_EXT" = "0" ]; then
             exit 1
         fi
         green "transparent gate OK"
+
+        # §5.5: the device-memory budget under pressure. Every other gate runs
+        # with room to spare, so none of them ever asks the budget to do
+        # anything — which is how a budget that was never enforced shipped
+        # unnoticed (docs/RESEARCH_NOTES.md, 2026-09-20). ~1 minute at SF1.
+        hr "budget gate (SF1, a budget too small for the templates)"
+        if ! python3 scripts/budget_gate.py --db data/tpch_sf1/tpch.duckdb --budget 200MB; then
+            red "budget gate: resident memory went over the budget, an eviction bought nothing, \
+or a statement differed from native"
+            exit 1
+        fi
+        green "budget gate OK"
     fi
 fi
 
