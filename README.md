@@ -51,6 +51,43 @@ says which and why.
 functions all work in v0.7 exactly as they did in v0.5 / v0.6, from any DuckDB
 client, with the same names and the same results.
 
+### Try it in a minute
+
+```bash
+pip install duckdb-gpudb                        # the `gpudb` command and the gpudb module
+gpudb -c "INSTALL gpudb FROM community;"        # the extension, into DuckDB
+gpudb my.duckdb                                 # a shell whose footer says where each statement ran
+```
+
+> **Where this stands today.** The `duckdb-gpudb` package is not on PyPI yet
+> and the community registry serves v0.6.0; both change when v0.7.0 is
+> released. Until then, route 2 — [from a checkout](#installing-in-full) — is
+> the one that works end to end.
+
+There are **two pieces**, and you need both: the *extension*, which is the GPU
+code and lives inside DuckDB, and the *wrapper*, which is the `gpudb` command
+and `gpudb.connect()`. The three lines above install one each. Already have an
+older gpudb extension? `FORCE INSTALL gpudb FROM community;` replaces it.
+[How to tell it is working](#how-to-tell-it-is-working) is two commands that
+say which piece is missing when one is, and [Installing, in
+full](#installing-in-full) has both routes, the lookup order and the supported
+versions.
+
+### What's in this README
+
+| | |
+|---|---|
+| [Three ways in](#three-ways-in) | the shell, Python, and the `gpu_*` functions |
+| [The shell way](#the-shell-way) | install, start it, read the footer, `.gpu` / `.residents` / `.memory` |
+| [The Python way](#the-python-way) | `gpudb.connect()`, every option, a run end to end |
+| [Installing, in full](#installing-in-full) · [Troubleshooting](#troubleshooting) · [Upgrade, uninstall, turning it off](#upgrade-uninstall-and-turning-it-off) · [Reporting a bug](#reporting-a-bug) | both routes, and what to do when it is not doing what you expect |
+| [Explicit `gpu_*` functions](#explicit-gpu_-functions--any-duckdb-client-including-the-cli) | the route that needs no wrapper |
+| [Measured — TPC-H](#measured--tpc-h-every-row-compared-with-native) | 22 queries at SF1 and SF10, query by query |
+| [The two rules](#the-two-rules) · [What runs on the GPU](#what-runs-on-the-gpu-and-what-stays-on-duckdb) · [How it decides](#how-it-decides) | never slower, never different, and the bounds that enforce it |
+| [Residency and the memory budget](#residency-and-the-memory-budget) · [Platforms and install](#platforms-and-install) · [Limits](#limits-and-where-the-gpu-loses) | what lives on the device, and where it loses |
+| [What you'd use it for](#what-youd-use-it-for) · [Numbers](#numbers--measured-not-promised) · [The resident model](#the-resident-model-in-20-seconds) | the explicit surface, with its own measurements |
+| [Quick start](#quick-start) · [Architecture](#architecture) · [Testing](#testing) · [Release history](#release-history) | the four install routes, and the record |
+
 ### Three ways in
 
 | | What it is for |
@@ -62,93 +99,6 @@ client, with the same names and the same results.
 All three talk to the same extension and the same resident columns.
 
 ### The shell way
-
-#### Install it
-
-There are **two pieces**, and you need both: the *extension*, which is the
-GPU code and lives inside DuckDB, and the *wrapper*, which is the `gpudb`
-command and `gpudb.connect()`. `pip` installs the wrapper only. Installing
-one without the other is the single most common way to end up with a shell
-that works but never uses the GPU — [How to tell it is
-working](#how-to-tell-it-is-working) is two commands that say which piece is
-missing.
-
-> **Where this stands today.** The `duckdb-gpudb` package is not on PyPI yet
-> and the community registry serves v0.6.0; both change when v0.7.0 is
-> released. Until then, route 2 — from a checkout — is the one that works end
-> to end.
-
-**Route 1 — the registry extension plus the pip wrapper.**
-
-1. Install the extension into DuckDB, from any DuckDB ≥ 1.5.5 client:
-   ```sql
-   INSTALL gpudb FROM community;
-   LOAD gpudb;
-   ```
-   It is signed; no flags.
-2. Install the wrapper:
-   ```bash
-   pip install duckdb-gpudb          # installs the `gpudb` command and the gpudb module
-   ```
-
-   The `duckdb` module `pip` pulls in (or the one you already have) must be a
-   version the registry publishes a gpudb build for — today that is **1.5.5
-   only**. A newer `duckdb` will load fine and simply find no gpudb to
-   install; pin it with `pip install "duckdb==1.5.5"` if you need to.
-
-**Route 2 — from a checkout.** Three steps; the first is the one that is easy
-to miss, because `scripts/build.sh` only builds the loadable extension when
-DuckDB's own headers are present:
-
-1. Fetch pre-built libduckdb + headers into `third_party/duckdb-libs/`:
-   ```bash
-   ./scripts/get_duckdb_libs.sh
-   ```
-2. Build:
-   ```bash
-   ./scripts/build.sh
-   # → build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
-   #   (or build-linux/…/gpudb.linux_amd64.duckdb_extension)
-   ```
-3. Install the wrapper from the same checkout:
-   ```bash
-   pip install -e python/
-   ```
-
-Step 3 is also how the wrapper finds the extension you just built: it walks up
-from its own `gpudb/` directory and looks for a `build-macos/` or
-`build-linux/` beside the checkout. If you installed the wrapper from
-somewhere else, point it at the file:
-
-```bash
-export GPUDB_EXTENSION_PATH=/path/to/build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
-```
-
-**The lookup order**, whichever route you took: an explicit
-`gpudb.connect(extension="…")`, then `GPUDB_EXTENSION_PATH`, then a
-`build-macos/` / `build-linux/` beside a source checkout, then whatever
-DuckDB itself has installed. If nothing usable is found — or what is found is
-older than the client — the banner's `transparent:` line says so,
-`con.extension_note` carries the same sentence, and every statement simply
-runs on DuckDB.
-
-**Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 — the
-wrapper's own requirements, and they are *not* the same as route 1's. The
-registry builds gpudb for DuckDB ≥ 1.5.5, so a `duckdb` module that satisfies
-`pip` can still be a version the registry has nothing to install for: on
-DuckDB 1.4.5, `INSTALL gpudb FROM community` is a 404. Pin it with `pip install
-"duckdb==1.5.5"` if you are taking route 1. A binary from the releases page
-needs only DuckDB ≥ 1.2, because the loadable extension is built against the
-stable C API v1.2.0.
-
-macOS: an Apple silicon Mac for the Metal backend. Building it needs the
-macOS 15 SDK, which is where `MTLLanguageVersion3_2` comes from (CI builds on
-`macos-15`); the built binary asks the OS at run time and compiles its shaders
-as MSL 3.2 on macOS 15 and later, MSL 3.1 below
-(`src/backends/metal/metal_groupby.mm`). Linux with CUDA: see the [CUDA
-requirements](#cuda-requirements-build-from-source-on-linux) table — the short
-version is that a binary built with CUDA 13 needs an R580+ driver, and one
-built with CUDA 12.x reaches the GPU on R525+.
 
 #### How to tell it is working
 
@@ -172,42 +122,6 @@ exactly which rule.
 From SQL, `SELECT gpu_build_info();` tells you what any binary carries:
 `compiled=` the backends it was built with, `runtime=` the one it picked,
 `exact=true` that it has the operators the transparent path needs.
-
-#### Troubleshooting
-
-| What you see | What it is |
-|---|---|
-| `backend: none — the extension is not loaded` | No extension found. Run `INSTALL gpudb FROM community; LOAD gpudb;` in DuckDB, or set `GPUDB_EXTENSION_PATH`. |
-| `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. `INSTALL` alone will not replace it — use `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then `LOAD gpudb;`. |
-| `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
-| `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build, or a CUDA build without `GPUDB_CUDA_EXACT=1`. |
-| Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |
-| `Catalog Error: … gpu_sum does not exist` | The extension is installed but not loaded in *this* session. `LOAD gpudb;`. |
-
-#### Upgrade, uninstall, and turning it off
-
-```bash
-pip install -U duckdb-gpudb                  # the wrapper
-pip uninstall duckdb-gpudb                   # ... and remove it
-```
-```sql
-FORCE INSTALL gpudb FROM community;          -- replace an installed extension
-UPDATE EXTENSIONS;                           -- or bring every extension up to date
-```
-DuckDB keeps installed extensions under `~/.duckdb/extensions/`; deleting
-gpudb's directory there uninstalls it.
-
-To turn the GPU path off without uninstalling anything: `.gpu off` in the
-shell (`.gpu on` puts it back), `--no-gpu` to start that way, or
-`con.transparent = False` from Python. All three leave a plain DuckDB session
-that answers exactly as it did before.
-
-#### Reporting a bug
-
-[github.com/singhpratech/duckdbgpumetaldbram/issues](https://github.com/singhpratech/duckdbgpumetaldbram/issues).
-The two most useful things to paste are `SELECT gpu_build_info();` and, for a
-statement that went the wrong way, the whole of `.gpu`. A statement that
-returns *different rows* from DuckDB is the bug we most want to hear about.
 
 #### Start it
 
@@ -708,6 +622,120 @@ TPC-H Q1 over the very same two keys runs on the GPU is the next section.
   original statement on DuckDB and leaves that template native afterwards.
 - **Closing.** `con.close()` as usual; `con.cursor()` gives a connection that
   shares the same resident sets and the same decisions.
+
+### Installing, in full
+
+Two routes, both of which end with the extension inside DuckDB and the wrapper
+on your `PATH`. Installing one piece without the other is the single most
+common way to end up with a shell that works but never uses the GPU.
+
+**Route 1 — the registry extension plus the pip wrapper.**
+
+1. Install the extension into DuckDB, from any DuckDB ≥ 1.5.5 client:
+   ```sql
+   INSTALL gpudb FROM community;
+   LOAD gpudb;
+   ```
+   It is signed; no flags.
+2. Install the wrapper:
+   ```bash
+   pip install duckdb-gpudb          # installs the `gpudb` command and the gpudb module
+   ```
+
+   The `duckdb` module `pip` pulls in (or the one you already have) must be a
+   version the registry publishes a gpudb build for — today that is **1.5.5
+   only**. A newer `duckdb` will load fine and simply find no gpudb to
+   install; pin it with `pip install "duckdb==1.5.5"` if you need to.
+
+**Route 2 — from a checkout.** Three steps; the first is the one that is easy
+to miss, because `scripts/build.sh` only builds the loadable extension when
+DuckDB's own headers are present:
+
+1. Fetch pre-built libduckdb + headers into `third_party/duckdb-libs/`:
+   ```bash
+   ./scripts/get_duckdb_libs.sh
+   ```
+2. Build:
+   ```bash
+   ./scripts/build.sh
+   # → build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
+   #   (or build-linux/…/gpudb.linux_amd64.duckdb_extension)
+   ```
+3. Install the wrapper from the same checkout:
+   ```bash
+   pip install -e python/
+   ```
+
+Step 3 is also how the wrapper finds the extension you just built: it walks up
+from its own `gpudb/` directory and looks for a `build-macos/` or
+`build-linux/` beside the checkout. If you installed the wrapper from
+somewhere else, point it at the file:
+
+```bash
+export GPUDB_EXTENSION_PATH=/path/to/build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
+```
+
+**The lookup order**, whichever route you took: an explicit
+`gpudb.connect(extension="…")`, then `GPUDB_EXTENSION_PATH`, then a
+`build-macos/` / `build-linux/` beside a source checkout, then whatever
+DuckDB itself has installed. If nothing usable is found — or what is found is
+older than the client — the banner's `transparent:` line says so,
+`con.extension_note` carries the same sentence, and every statement simply
+runs on DuckDB.
+
+**Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 — the
+wrapper's own requirements, and they are *not* the same as route 1's. The
+registry builds gpudb for DuckDB ≥ 1.5.5, so a `duckdb` module that satisfies
+`pip` can still be a version the registry has nothing to install for: on
+DuckDB 1.4.5, `INSTALL gpudb FROM community` is a 404. Pin it with `pip install
+"duckdb==1.5.5"` if you are taking route 1. A binary from the releases page
+needs only DuckDB ≥ 1.2, because the loadable extension is built against the
+stable C API v1.2.0.
+
+macOS: an Apple silicon Mac for the Metal backend. Building it needs the
+macOS 15 SDK, which is where `MTLLanguageVersion3_2` comes from (CI builds on
+`macos-15`); the built binary asks the OS at run time and compiles its shaders
+as MSL 3.2 on macOS 15 and later, MSL 3.1 below
+(`src/backends/metal/metal_groupby.mm`). Linux with CUDA: see the [CUDA
+requirements](#cuda-requirements-build-from-source-on-linux) table — the short
+version is that a binary built with CUDA 13 needs an R580+ driver, and one
+built with CUDA 12.x reaches the GPU on R525+.
+
+### Troubleshooting
+
+| What you see | What it is |
+|---|---|
+| `backend: none — the extension is not loaded` | No extension found. Run `INSTALL gpudb FROM community; LOAD gpudb;` in DuckDB, or set `GPUDB_EXTENSION_PATH`. |
+| `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. `INSTALL` alone will not replace it — use `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then `LOAD gpudb;`. |
+| `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
+| `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build, or a CUDA build without `GPUDB_CUDA_EXACT=1`. |
+| Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |
+| `Catalog Error: … gpu_sum does not exist` | The extension is installed but not loaded in *this* session. `LOAD gpudb;`. |
+
+### Upgrade, uninstall, and turning it off
+
+```bash
+pip install -U duckdb-gpudb                  # the wrapper
+pip uninstall duckdb-gpudb                   # ... and remove it
+```
+```sql
+FORCE INSTALL gpudb FROM community;          -- replace an installed extension
+UPDATE EXTENSIONS;                           -- or bring every extension up to date
+```
+DuckDB keeps installed extensions under `~/.duckdb/extensions/`; deleting
+gpudb's directory there uninstalls it.
+
+To turn the GPU path off without uninstalling anything: `.gpu off` in the
+shell (`.gpu on` puts it back), `--no-gpu` to start that way, or
+`con.transparent = False` from Python. All three leave a plain DuckDB session
+that answers exactly as it did before.
+
+### Reporting a bug
+
+[github.com/singhpratech/duckdbgpumetaldbram/issues](https://github.com/singhpratech/duckdbgpumetaldbram/issues).
+The two most useful things to paste are `SELECT gpu_build_info();` and, for a
+statement that went the wrong way, the whole of `.gpu`. A statement that
+returns *different rows* from DuckDB is the bug we most want to hear about.
 
 ### Explicit `gpu_*` functions — any DuckDB client, including the CLI
 
