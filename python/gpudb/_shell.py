@@ -593,9 +593,18 @@ class Shell:
             self.buf = outer
 
     def open(self, database: str) -> None:
-        """Another database on a fresh connection; the settings stay."""
+        """Another database on a fresh connection; the settings stay.
+
+        `--readonly` is a promise about the FILES the session was pointed at.
+        An in-memory database is not one of them — it has nothing to protect
+        and DuckDB refuses to open one read-only at all ("Cannot launch
+        in-memory database in read-only mode!"), so `.open` with no argument
+        opens it read-write and every file `.open` names keeps the flag."""
+        opts = dict(self.opts)
+        if database in ("", ":memory:"):
+            opts["read_only"] = False
         try:
-            con = connect(database, log=self._log.append, **self.opts)
+            con = connect(database, log=self._log.append, **opts)
         except duckdb.Error as e:
             self.fail(str(e))
             return

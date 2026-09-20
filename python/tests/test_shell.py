@@ -238,6 +238,18 @@ def run():
               "--readonly refuses a write with DuckDB's own error")
         rc, out, _ = shell("--readonly", db, "-c", "SELECT count(*) AS n FROM r")
         check(rc == 0 and " n " in out, "--readonly still reads")
+        # `.open` with no argument asks for the in-memory database, which
+        # DuckDB refuses to open read-only ("Cannot launch in-memory database
+        # in read-only mode!"). --readonly is a promise about the FILES the
+        # session was pointed at, and an in-memory database is not one of them.
+        rc, out, err = shell("--readonly", db, "-c", ".open", "-c", "CREATE TABLE m(a INTEGER)",
+                             "-c", ".tables")
+        check(rc == 0 and " m " in out and "in-memory" not in err,
+              f"--readonly then `.open`: the in-memory database opens and takes a write ({err[:70]})")
+        # ... and a FILE the same session opens still gets the flag
+        rc, out, err = shell("--readonly", db, "-c", f".open {db}", "-c", "INSERT INTO r VALUES (1)")
+        check(rc == 1 and "read-only" in err.lower(),
+              "--readonly then `.open <file>`: the file is still read-only")
 
     print("== entry points")
     rc, out, _ = shell("--version")
