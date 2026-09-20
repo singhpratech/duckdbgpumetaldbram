@@ -79,11 +79,14 @@ order-dependently — the shape is never rewritten.
   `GROUP BY` in one fused pass: no key, no sort cache, no permutation.
 - **The materialised key join** (#103 core, #154 CUDA) — `gpu_join_materialize`
   and the `gpu_inner_join` table function.
-- **`avg` finalised the way DuckDB finalises it** (#146, #149, #157) — native
-  computes `avg` as a `long double` quotient. Over integers that is exact
-  everywhere. Over `DECIMAL` the host's `long double` is 80-bit on x86-64 and
-  64-bit on arm64, so on x86-64 the shape is declined rather than rounded
-  differently: rule 2 over a speed-up.
+- **`avg` finalised the way DuckDB finalises it** (#146, #149, #157, #160) —
+  native computes `avg` as a `long double` quotient. Over integers that is
+  exact everywhere. Over `DECIMAL` it is not expressible in SQL at all, since
+  the host's `long double` is 80-bit on x86-64 and SQL has no 80-bit type, so
+  the division moved into C++: `gpu_avg_decimal(sum HUGEINT, count BIGINT,
+  scale BIGINT)`. The shape is now rewritten on every platform. An extension
+  too old to provide that function still declines it rather than deriving it
+  in SQL, so the change is additive across version skew.
 
 ## Kernels
 
@@ -162,7 +165,8 @@ order-dependently — the shape is never rewritten.
 
 ## What stays on DuckDB
 
-Window functions; `FULL` joins, semi / anti joins and cross products;
+Window functions; `FULL` joins, `SEMI` / `ANTI` **join syntax** and cross
+products (the `EXISTS` / `IN` *forms* are rewritten — see Joins above);
 `median`, `stddev` and quantiles; `sum` / `avg` over `DOUBLE` or `FLOAT`;
 prepared-statement parameters; statements inside an explicit transaction;
 `WITH RECURSIVE` and `AS MATERIALIZED` CTEs; `ROLLUP` / `CUBE` /

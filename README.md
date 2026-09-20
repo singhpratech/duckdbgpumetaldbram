@@ -64,25 +64,138 @@ All three talk to the same extension and the same resident columns.
 
 #### Install it
 
+There are **two pieces**, and you need both: the *extension*, which is the
+GPU code and lives inside DuckDB, and the *wrapper*, which is the `gpudb`
+command and `gpudb.connect()`. `pip` installs the wrapper only. Installing
+one without the other is the single most common way to end up with a shell
+that works but never uses the GPU — [How to tell it is
+working](#how-to-tell-it-is-working) is two commands that say which piece is
+missing.
+
+> **Where this stands today.** The `duckdb-gpudb` package is not on PyPI yet
+> and the community registry serves v0.6.0; both change when v0.7.0 is
+> released. Until then, route 2 — from a checkout — is the one that works end
+> to end.
+
+**Route 1 — the registry extension plus the pip wrapper.**
+
+1. Install the extension into DuckDB, from any DuckDB ≥ 1.5.5 client:
+   ```sql
+   INSTALL gpudb FROM community;
+   LOAD gpudb;
+   ```
+   It is signed; no flags.
+2. Install the wrapper:
+   ```bash
+   pip install duckdb-gpudb          # installs the `gpudb` command and the gpudb module
+   ```
+
+   The `duckdb` module `pip` pulls in (or the one you already have) must be a
+   version the registry publishes a gpudb build for — today that is **1.5.5
+   only**. A newer `duckdb` will load fine and simply find no gpudb to
+   install; pin it with `pip install "duckdb==1.5.5"` if you need to.
+
+**Route 2 — from a checkout.** Three steps; the first is the one that is easy
+to miss, because `scripts/build.sh` only builds the loadable extension when
+DuckDB's own headers are present:
+
+1. Fetch pre-built libduckdb + headers into `third_party/duckdb-libs/`:
+   ```bash
+   ./scripts/get_duckdb_libs.sh
+   ```
+2. Build:
+   ```bash
+   ./scripts/build.sh      # → build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
+   ```                     #   (or build-linux/…/gpudb.linux_amd64.duckdb_extension)
+3. Install the wrapper from the same checkout:
+   ```bash
+   pip install -e python/
+   ```
+
+Step 3 is also how the wrapper finds the extension you just built: it walks up
+from its own `gpudb/` directory and looks for a `build-macos/` or
+`build-linux/` beside the checkout. If you installed the wrapper from
+somewhere else, point it at the file:
+
 ```bash
-pip install duckdb-gpudb          # installs the `gpudb` command
+export GPUDB_EXTENSION_PATH=/path/to/build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
 ```
 
-From a checkout instead (what this repository's own runs use):
+**The lookup order**, whichever route you took: an explicit
+`gpudb.connect(extension="…")`, then `GPUDB_EXTENSION_PATH`, then a
+`build-macos/` / `build-linux/` beside a source checkout, then whatever
+DuckDB itself has installed. If nothing usable is found — or what is found is
+older than the client — the banner's `transparent:` line says so,
+`con.extension_note` carries the same sentence, and every statement simply
+runs on DuckDB.
 
-```bash
-./scripts/build.sh                # builds the extension into build-macos/ or build-linux/
-pip install -e python/
+**Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 (the
+wrapper's own requirements). The community registry needs DuckDB ≥ 1.5.5; a
+binary from the releases page needs only DuckDB ≥ 1.2, because the loadable
+extension is built against the stable C API v1.2.0. macOS: Apple silicon for
+the Metal backend. Linux with CUDA: see the [CUDA
+requirements](#cuda-requirements-build-from-source-on-linux) table — the short
+version is that a binary built with CUDA 13 needs an R580+ driver, and one
+built with CUDA 12.x reaches the GPU on R525+.
+
+#### How to tell it is working
+
+Two commands, in order. From the shell:
+
+```
+gpudb
 ```
 
-The wrapper looks for the extension in this order: an explicit
-`gpudb.connect(extension="…")`, the `GPUDB_EXTENSION_PATH` environment
-variable, a `build-macos/` or `build-linux/` directory next to a source
-checkout, and finally whatever DuckDB itself has installed
-(`INSTALL gpudb FROM community; LOAD gpudb;`). If nothing usable is found —
-or the installed extension is older than the client — the banner's
-`transparent:` line says so, `con.extension_note` carries the same sentence,
-and every statement simply runs on DuckDB.
+and read the `backend:` and `transparent:` lines of the banner. `backend:
+none — the extension is not loaded` means the extension is missing (route 1
+step 1, or `GPUDB_EXTENSION_PATH`). `transparent: available` means both
+pieces are in place.
+
+Then run a statement over a table of at least a million rows and read the
+footer. `GPU (…)` is the GPU; `DuckDB (not_resident: …)` means it is on its
+way there and the next ask will be; `DuckDB (threshold: …)` or `DuckDB
+(shape: …)` mean the wrapper decided against it on purpose, and `.gpu` says
+exactly which rule.
+
+From SQL, `SELECT gpu_build_info();` tells you what any binary carries:
+`compiled=` the backends it was built with, `runtime=` the one it picked,
+`exact=true` that it has the operators the transparent path needs.
+
+#### Troubleshooting
+
+| What you see | What it is |
+|---|---|
+| `backend: none — the extension is not loaded` | No extension found. Run `INSTALL gpudb FROM community; LOAD gpudb;` in DuckDB, or set `GPUDB_EXTENSION_PATH`. |
+| `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. `INSTALL` alone will not replace it — use `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then `LOAD gpudb;`. |
+| `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
+| `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build, or a CUDA build without `GPUDB_CUDA_EXACT=1`. |
+| Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |
+| `Catalog Error: … gpu_sum does not exist` | The extension is installed but not loaded in *this* session. `LOAD gpudb;`. |
+
+#### Upgrade, uninstall, and turning it off
+
+```bash
+pip install -U duckdb-gpudb                  # the wrapper
+pip uninstall duckdb-gpudb                   # ... and remove it
+```
+```sql
+FORCE INSTALL gpudb FROM community;          -- replace an installed extension
+UPDATE EXTENSIONS;                           -- or bring every extension up to date
+```
+DuckDB keeps installed extensions under `~/.duckdb/extensions/`; deleting
+gpudb's directory there uninstalls it.
+
+To turn the GPU path off without uninstalling anything: `.gpu off` in the
+shell (`.gpu on` puts it back), `--no-gpu` to start that way, or
+`con.transparent = False` from Python. All three leave a plain DuckDB session
+that answers exactly as it did before.
+
+#### Reporting a bug
+
+[github.com/singhpratech/duckdbgpumetaldbram/issues](https://github.com/singhpratech/duckdbgpumetaldbram/issues).
+The two most useful things to paste are `SELECT gpu_build_info();` and, for a
+statement that went the wrong way, the whole of `.gpu`. A statement that
+returns *different rows* from DuckDB is the bug we most want to hear about.
 
 #### Start it
 
@@ -722,8 +835,8 @@ did, at its usual speed. Section numbers point at
 | Feature | Runs on | Note |
 |---|---|---|
 | **Grouping and aggregation** | | |
-| `sum` `count` `count(*)` `min` `max` `avg`, with `GROUP BY` | ✓ GPU | up to eight aggregated columns in one device pass (§4.9) |
-| Aggregates with no `GROUP BY` | ✓ GPU | one fused pass; over a join at any size, over a single table above a measured row and predicate bound (§4.12) |
+| `sum` `count` `count(*)` `min` `max` `avg`, with `GROUP BY` | ✓ GPU | up to eight aggregated columns in one device pass (§4.9). `avg` over `DECIMAL` is finalised by the extension's own `gpu_avg_decimal`, which is how it matches native bit for bit on every platform |
+| Aggregates with no `GROUP BY` | ✓ GPU | one fused pass; over a join at any size, over a single table above a measured row and predicate bound — 16M rows, and rows × predicate terms ≥ 60M (§4.12). A bare `count(*)` over a whole table is never rewritten: DuckDB answers it from the table's own row count |
 | Expressions inside aggregates | ✓ GPU | `sum(price * (1 - discount))`, `sum(CASE …)` (§4.10) |
 | Expressions over aggregates, compound `HAVING` | ✓ GPU | §4.11 |
 | `count(DISTINCT x)` and `DISTINCT` aggregates | ✓ GPU | an inner device `GROUP BY`, with a bound of its own (§4.17) |
@@ -744,12 +857,12 @@ did, at its usual speed. Section numbers point at
 | `sum` / `avg` over `DOUBLE` or `FLOAT` | DuckDB | by design: native `sum(DOUBLE)` depends on the order the values are added, so "the same as native" is not definable. Never rewritten, so rounding can never differ (§4.7). The explicit `gpu_sum` keeps its stated 1e-9 relative tolerance |
 | `UBIGINT` / `HUGEINT` keys | DuckDB | not int64-orderable (§2) |
 | **Joins, subqueries, views, CTEs** | | |
-| `INNER JOIN` on a unique key | ✓ GPU | the fact-to-dimension shape, materialised on the device (§4.8) |
+| `INNER JOIN` on a unique key, and the comma form | ✓ GPU | the fact-to-dimension shape, materialised on the device (§4.8) |
 | `LEFT` / `RIGHT`, many-to-many, `USING`, composite keys | ✓ GPU | answered from an upload of the join's result (§4.13, §4.21) |
 | `EXISTS` / `IN` / a correlated scalar subquery in `WHERE` | ✓ GPU | lowered to a predicate lane DuckDB fills once per row (§4.18) |
 | Derived tables, views, CTEs | ✓ GPU | folded or spliced in first, then checked against the original with `DESCRIBE` (§4.16, §4.20, §4.22) |
 | Aggregation nested inside a statement DuckDB keeps | ✓ GPU | the inner `SELECT` gets its own decision and its own guards (§4.14) |
-| `FULL` join, semi / anti joins, cross products | DuckDB | §2 |
+| `FULL` join, `SEMI` / `ANTI` join **syntax**, cross products | DuckDB | the `EXISTS` / `IN` **forms** above are rewritten; the join keywords are not (§2) |
 | `WITH RECURSIVE`, `AS MATERIALIZED` | DuckDB | left as written (§4.22) |
 | `UNION` / `UNION ALL` as the whole statement | DuckDB | an aggregating `SELECT` inside an arm is still offered to the GPU (§2) |
 | **Session and statement handling** | | |
@@ -801,7 +914,7 @@ Tables become resident in the background, in short row-id segments taken only
 while your connection is idle, so an upload never runs a long scan beside a
 query. A table's columns live in one per-table store, each lane kept at the
 narrowest signed width its values fit — the 22 TPC-H queries at SF10 hold
-22.7 GiB where they held 44.9 before narrow lanes.
+18.7 GiB where they held 44.9 before narrow lanes and shedding.
 
 The memory budget defaults to a quarter of unified memory on Apple silicon and
 half of device memory on a discrete GPU (`memory_budget=`, or
@@ -818,23 +931,26 @@ them.
 |---|---|---|---|
 | Plain SQL on the GPU, through the shell or `gpudb.connect()` | yes | opt-in, see below | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
-| From the community registry | yes | the registry's Linux binary is CPU-only | yes |
-
-<!-- CUDA-DEFAULT: one row + the paragraph below are the conservative (opt-in) statement.
-     If CUDA ships on by default at release, change the CUDA cell above to "yes" and
-     replace the paragraph below with the measured CUDA table. -->
+| From the community registry | yes | yes — `gpu_build_info()` says what a given binary carries | yes |
 
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
-join — and the SQL suite and the TPC-H coverage run there with rows identical to
-native. It is **opt-in** in this release: set `GPUDB_CUDA_EXACT=1` to let the
-CUDA backend answer plain SQL. Without it, a CUDA machine gets the explicit
-`gpu_*` functions and leaves plain SQL to DuckDB — correct, with no speed-up.
+join. On an RTX 4090 with the path enabled the unit suite is **711 / 711** and
+the SQL suite **224 passing, 0 failing**.
 
-`SELECT gpu_build_info();` tells any binary apart. The install routes are in
-[Quick start](#quick-start) below: the community registry, a release binary, or
-a build from source. The Python wrapper and the `gpudb` shell come from
-`pip install duckdb-gpudb`.
+It is **opt-in** in this release: set `GPUDB_CUDA_EXACT=1` to let the CUDA
+backend answer plain SQL. The reason is one thing and not a doubt about the
+kernels: every threshold the wrapper decides with was measured on Metal, and
+the gate that measures them (`scripts/transparent_gate.py`) has not yet been
+run on CUDA hardware. Rule 1 says never slower, and an unswept table is not
+evidence for it. Without the flag a CUDA machine gets the explicit `gpu_*`
+functions and leaves plain SQL to DuckDB — correct, with no speed-up.
+
+`SELECT gpu_build_info();` tells any binary apart: `compiled=` lists the
+backends it was built with and `runtime=` the one it chose. The install routes
+are in [Quick start](#quick-start) below: the community registry, a release
+binary, or a build from source. The Python wrapper and the `gpudb` shell come
+from `pip install duckdb-gpudb`.
 
 ### Honest limits
 
@@ -1070,6 +1186,10 @@ cd duckdbgpumetaldbram
 
 # macOS (Metal): brew install cmake
 
+# fetch pre-built libduckdb + headers into third_party/duckdb-libs/.
+# build.sh only builds the loadable extension when these are present.
+./scripts/get_duckdb_libs.sh
+
 # build (auto-detects CUDA on Linux, Metal on macOS, CPU-only otherwise).
 # Produces a loadable .duckdb_extension with metadata footer attached.
 ./scripts/build.sh
@@ -1236,7 +1356,7 @@ the community-CI `make test` path.
   decision.
 - [x] **A resident column store** — one copy per column in row-id order, each
   lane at the narrowest signed width its values fit (the 22 TPC-H queries at
-  SF10 hold 22.7 GiB where they held 44.9), shared between statements, built in
+  SF10 hold 18.7 GiB where they held 44.9), shared between statements, built in
   idle row-id segments so an upload never runs beside a query you are waiting
   for, admitted by a memory budget that keeps what saves the most DuckDB time
   per byte.

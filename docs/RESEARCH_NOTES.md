@@ -5124,16 +5124,21 @@ measured rule is currently handling per process.
   output-bound and the bounds decline it (2026-09-19 entry, with the numbers).
   What would change that is a cheaper way to return a million-group result, not
   a rewrite.
-- **RIGHT / FULL / semi / anti joins**; subqueries in the select list and in
+- **`FULL` joins, and `SEMI` / `ANTI` join syntax** (the `EXISTS` / `IN`
+  *forms* are answered — §4.18 lowers them to predicate lanes — and `RIGHT`
+  and many-to-many joins are answered from an upload of the join's result);
+  subqueries in the select list and in
   HAVING; subqueries over other subqueries (Q2, Q20). Q22 is answered: the row
   floor now counts the table its lane reads (2026-09-19 entry, §4.23). Q16
   combines `count(DISTINCT)` with a `NOT IN` subquery over tables below the row
   floor, and the forced run measures 0.08x at SF1 and 0.02x at SF10, so the
   pair bounds that decline it are right. WHERE-term subqueries are done
   (§4.18).
-- **CUDA**: the exact, mask, join and multi-payload kernels exist on Metal
-  and as the CPU reference; the CUDA side is to be written against the same
-  interface and then swept with the same gate.
+- **CUDA**: the exact, mask, join and multi-payload kernels are written
+  against the same interface, and the path is opt-in behind
+  `GPUDB_CUDA_EXACT=1`. What is open is the gate: every threshold in
+  `_thresholds.py` was swept on Metal, and `scripts/transparent_gate.py` has
+  not been run on the RTX 4090.
 - **Other client languages**: the join / expression / split lowering lives in
   the Python wrapper; the pure rewrite function is language-neutral.
 - **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
@@ -5143,7 +5148,8 @@ measured rule is currently handling per process.
 - **Two modes of a short kernel**: GPU kernels under ~5 ms run 3× slower
   while other threads of the process keep waking (DuckDB's idle workers do).
   The runtime measured check handles rule 1; a cheaper detector (the kernel
-  time in `gpu_last_stats`) could re-check at once instead of on the clock.
+  time in `gpu_last_stats`) would re-check at once instead of on the clock;
+  that detector is not written.
 - **The GROUP BY mask stage**: done on Metal (2026-09-18) — one fused
   `gpred_eval` pass per statement instead of one per term, and the counting
   pass's gather kept as a mask in sorted order so the reduce stops re-gathering
@@ -5155,13 +5161,13 @@ measured rule is currently handling per process.
 - **Few-group keys without a sort cache**: done (§7 the reduce, §9 the
   shedding, both Metal, 2026-09-18) — at SF10 the 22 queries hold 18.7 GiB where
   they held 23.5. What is open is CUDA, and whether a WHERE on the GROUP BY key
-  could be evaluated per GROUP (at most 512 of them) instead of per row, which
-  would let Q12's key lane go too.
+  can be evaluated per GROUP (at most 512 of them) instead of per row, which
+  is what still holds Q12's key lane resident. Neither is measured.
 - **Output cost**: for large results the statement is bound by moving rows
   through the table-function interface and into the client, and the sweep of
   2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
   is worth a lot up to about 200K groups and nothing at all at 1.5M, where
   moving the rows through the table function alone costs more than native's
-  whole aggregate. So an Arrow-native result path would move the plain-form
-  bounds, and a cheaper table-function hand-off would move the inner ones —
-  they are different problems.
+  whole aggregate. So an Arrow-native result path moves the plain-form
+  bounds and a cheaper table-function hand-off moves the inner ones: two
+  different problems, neither of them measured here.
