@@ -5115,6 +5115,23 @@ straddles 1.0x on this box — 0.97x through `execute`, 1.03x through `sql` — 
 the one shape that might ever justify a CUDA-specific constant is the one the
 measured rule is currently handling per process.
 
+## 2026-09-20 — The use cases were still the v0.6 ones
+
+`README.md`'s *What you'd use it for* still opened on "workloads that ask the
+same aggregate questions of the same big data, over and over" — the resident-column
+framing from v0.6, when a column had to be uploaded by name before anything ran
+on the device. With the shell and `gpudb.connect()` making tables resident on
+their own, that sentence describes where the payoff is largest, not who the
+extension is for; the scope it should state is the analytical SQL already being
+run in DuckDB over big tables. The section was re-scoped accordingly: bullets
+for the one-line client change, the shell, and whole multi-table queries (where
+the TPC-H coverage numbers come from) now sit ahead of the seven workload
+bullets, each cut to a headline figure plus a link, and `**Not for:**` became
+`**What DuckDB keeps answering:**`, since those statements are not refused —
+they run in the same session, over the same rows, at DuckDB's speed. Section
+length went from 611 words to 379; no figure was changed, and none was removed
+from BENCHMARK.md or the Numbers card.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
