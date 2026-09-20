@@ -800,9 +800,10 @@ first run wants a connection, and later runs do not.
 
 The queries that stay on DuckDB are declined on purpose, and which ones stay
 depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
-subquery from inside another subquery, a shape the rewrite does not reach, and
-Q16's inner `GROUP BY` declines on its own threshold — forced past it, Q16
-measures 0.02–0.08×. **At SF1, five**: those three, and Q6 and Q11, which sit
+subquery from inside another subquery — the inner statement is correlated and
+does not bind on its own, so there is nothing to hand the device — and Q16's
+inner `GROUP BY` declines on its own threshold; forced past it, Q16 measures
+0.02–0.08×. **At SF1, five**: those three, and Q6 and Q11, which sit
 below the measured size floors at 6M rows (Q2 declines on a size floor there
 too, before its shape is ever looked at). Each of them runs on DuckDB
 unchanged, at DuckDB's speed.
@@ -1279,7 +1280,7 @@ duckdb -unsigned -c "LOAD '$(pwd)/build-linux/src/extension/gpudb.linux_amd64.du
 |---|---|---|
 | **CUDA Toolkit** | **13.0** (verified: 13.0.88 / CUB 3.0.1, all benchmarks) | Runtime API plus the CUB that ships with the toolkit (`DeviceReduce`, `DeviceSelect`, `DeviceRadixSort`, `DeviceScan` on explicit temp storage; Thrust only for iterators; no cooperative groups). 64-bit item counts need **CUB ≥ 2.1, i.e. CUDA 12.2 or newer**; older 12.x narrows counts to 32-bit (fine below 2^31 rows) and 11.x is not supported. Only 13.0 is tested by us — if you build on 12.x, please open an issue with your `nvcc --version` either way. C++17 host + device. |
 | **NVIDIA driver** | **580.x** (verified) | Any driver that supports your toolkit (NVIDIA's minimum for 13.0 is R580; for 12.x, R525+). Runtime linking: `-DGPUDB_CUDA_STATIC_RUNTIME=ON` (what the registry build in the root `Makefile` uses; off by default in `scripts/build.sh`) bakes `cudart` into the extension, so the only runtime dependency is `libcuda.so` from the driver — and the extension still loads on machines with no GPU/driver, falling back to CPU. |
-| **GPUs** | **sm_75 – sm_90**: Turing (T4, RTX 20xx), Ampere (A100, RTX 30xx), Ada (RTX 40xx, L4/L40), Hopper (H100) | Default fatbin: `75;80;86;89;90`, each with SASS + PTX. Newer parts (Blackwell / RTX 50xx, sm_100+) load via PTX JIT from `compute_90` — should work, not yet measured. **Volta (sm_70) and older are not supported**: CUDA 13 dropped them from `nvcc`. Override with `-DCMAKE_CUDA_ARCHITECTURES=...` or `CUDAARCHS=...` (the Colab notebook builds `CUDAARCHS=75` for its T4). |
+| **GPUs** | **sm_75 – sm_90**: Turing (T4, RTX 20xx), Ampere (A100, RTX 30xx), Ada (RTX 40xx, L4/L40), Hopper (H100) | Default fatbin: `75;80;86;89;90`, each with SASS + PTX. Newer parts (Blackwell / RTX 50xx, sm_100+) load via PTX JIT from `compute_90` — should work; not measured here. **Volta (sm_70) and older are not supported**: CUDA 13 dropped them from `nvcc`. Override with `-DCMAKE_CUDA_ARCHITECTURES=...` or `CUDAARCHS=...` (the Colab notebook builds `CUDAARCHS=75` for its T4). |
 
 Verified configuration: RTX 4090 Laptop (sm_89, 16 GB), CUDA 13.0.88, driver
 580.x, Linux — every CUDA number in this README and BENCHMARK.md comes from

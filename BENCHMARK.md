@@ -5169,8 +5169,9 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duck
 correlated subquery whose inner statement does not bind on its own (`Binder
 Error: Referenced column "ps_partkey" / "p_partkey" not found`), so there is
 nothing to hand the device. At SF1 Q2 declines on a size bound before it gets
-that far, and so does Q6 — whose note names its inner GROUP BY's own
-threshold. Q16's inner
+that far. So does Q6, on a bound of its own: it has no GROUP BY at all, and an
+aggregate without one over a single table needs 16M rows — its decline reads
+`6001215 rows < 16000000 for an aggregate without GROUP BY`. Q16's inner
 `GROUP BY` declines on its own threshold; forced, it measures 0.08× at SF1 and
 0.02× at SF10, so the bound is right. Q11 at SF1 is below the measured size floors, and both
 it and Q6 clear them at SF10, where Q6 runs 2.39× and Q11 1.57×.
