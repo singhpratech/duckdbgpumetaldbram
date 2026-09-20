@@ -790,7 +790,39 @@ an unreferenced `gpu_upload` is pruned by DuckDB's optimizer and never runs.
 Uploads are capped at 4 GB of buffering by default
 (`GPUDB_UPLOAD_POOL_MAX_MB` to raise); the streaming `gpu_sum/min/max`
 aggregates work in any query shape (GROUP BY, windows, FILTER) at native
-parity.
+parity. The environment overrides the build honours are listed in
+[CLAUDE.md](CLAUDE.md), with the Metal path-selection ones also in
+[docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md) and
+[docs/RESIDENT_COLUMNS_DESIGN.md](docs/RESIDENT_COLUMNS_DESIGN.md). None of
+them changes an answer — only which path runs, how much host memory it may
+use, or what it prints.
+
+### GROUP BY / HAVING / top-k on the device (v0.6.0, unchanged in v0.7)
+
+```sql
+-- Upload a (key, payload) pair once; the GPU sorts it once, then every GROUP BY is a
+-- segmented reduce over that order, and HAVING / ORDER BY … LIMIT k run on the device
+-- so only the survivors come back.
+SELECT gpu_upload_pair('l', l_orderkey, l_quantity::BIGINT) FROM lineitem;        -- once
+SELECT * FROM gpu_groupby_sum_resident_having('l', '>', 300);   -- TPC-H Q18 inner: 75M groups → 3,182 rows
+--   SF50: 78 ms vs 462–476 ms native on M4 Max (6×), 42–78 ms vs ~1 s on RTX 4090 (13–24×)
+SELECT * FROM gpu_groupby_sum_resident_topk('l', 10, 'desc');   -- top-10 groups by sum: 4× Metal, 16–17× CUDA
+SELECT key, sum, count FROM gpu_groupby_sum_resident('l');      -- or all 75M groups: 2.8× Metal
+-- statement vs statement in the same process; verified equal to native GROUP BY both ways
+```
+
+### Fused resident joins (v0.5.0, unchanged in v0.7)
+
+```sql
+-- Upload key+payload pairs once; the GPU joins and reduces in one pass against
+-- a cached sorted build side — no join output materialised.
+SELECT gpu_upload_pair('l', l_orderkey, (l_extendedprice*100)::BIGINT) FROM lineitem;  -- once
+SELECT gpu_upload('o', o_orderkey) FROM orders;                                          -- once
+SELECT gpu_join_sum_resident('l.k', 'l.v', 'o');   -- = sum(...) FROM lineitem JOIN orders
+--   SF50: 37 ms vs 429 ms native on M4 Max (11.7×), 27-37 ms vs 998 ms on RTX 4090 (~30×)
+-- inner / left / semi / anti × sum(BIGINT) / sum(DOUBLE) / count — all bit-exact
+-- or within 1e-9 of native, verified by scripts/join_parity_check.sh
+```
 
 ## Why this exists
 
@@ -819,12 +851,20 @@ results, but `gpu_last_stats()` will say `backend=CPU`. For the CUDA backend
 on Linux use the release binary (Option B; statically linked CUDA runtime,
 needs only a driver) or build from source with `nvcc`. Check any binary with
 `SELECT gpu_build_info();`.
-The registry serves the **v0.6.0** build (merged 2026-08-29), including the
-resident GROUP BY / top-k table functions (`gpu_groupby_*_resident`,
-`gpu_topk_resident`), the full resident-column surface (`gpu_upload`, `gpu_sum_resident`, `gpu_build_info`,
-…) and the GPU join functions (`gpu_upload_pair`, `gpu_join_*_resident`,
-`gpu_join_rows_resident`). Installed an earlier version? `UPDATE EXTENSIONS;`
-pulls the latest.
+The registry serves the **v0.7.0** build, with all 64 `gpu_*` functions: the
+streaming aggregates, the full resident-column surface (`gpu_upload`,
+`gpu_sum_resident`, `gpu_residents`, `gpu_build_info`, …), the GPU join
+functions (`gpu_upload_pair`, `gpu_join_*_resident`, `gpu_join_rows_resident`,
+`gpu_inner_join`), the resident GROUP BY / top-k table functions
+(`gpu_groupby_*_resident`, `gpu_topk_resident`) and the exact family the
+transparent path uses (`gpu_upload_*_exact`, `gpu_groupby_exact_*`,
+`gpu_agg_exact_global`, `gpu_rewrite_ast`). Installed an earlier version?
+`UPDATE EXTENSIONS;` pulls the latest. <!-- RE-RUN: this sentence goes live
+with the registry PR; until it merges the registry still serves v0.6.0. -->
+
+The transparent path is not reached by `LOAD gpudb` alone — that gives the
+explicit functions. For plain SQL on the GPU, use the `gpudb` shell or
+`gpudb.connect()` from `pip install duckdb-gpudb` over this same extension.
 
 ### Option B — load a prebuilt release binary
 
@@ -838,9 +878,11 @@ duckdb -unsigned -c "LOAD '/path/to/gpudb.linux_amd64.duckdb_extension'; \
 # -> 499999500000
 ```
 
-Requires DuckDB ≥ 1.2 (C API v1.2.0); release binaries track the latest tag.
-`LOAD` needs `-unsigned` here because release-page binaries are unsigned —
-the community install above doesn't.
+The loadable extension is built against the stable C API v1.2.0, so a release
+binary loads in any DuckDB ≥ 1.2; the community install above is what needs
+≥ 1.5.5, because that is the DuckDB version the registry builds and serves for.
+Release binaries track the latest tag. `LOAD` needs `-unsigned` here because
+release-page binaries are unsigned — the community install above does not.
 
 ### Option C — build from source
 
@@ -960,25 +1002,83 @@ Two SQL paths, by design (v0.4.0):
 
 ## Testing
 ```bash
-./build-linux/test/test_gpudb        # unit checks across the backends present at build time (118 CUDA / 137 Metal)
-./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window / resident / joins
+./build-macos/test/test_gpudb        # unit checks across the backends present at build time
+./scripts/run_sql_tests.sh           # SQL-level suite: gpu_sum / min / max / GROUP BY / window / resident / joins / exact
 ./scripts/join_parity_check.sh       # 11 adversarial join scenarios, native vs gpudb in the same statement
+./scripts/groupby_parity_check.sh    # 11 GROUP BY scenarios, including the ones that must NOT rewrite
 ./scripts/local_check.sh             # everything CI would run, end to end
+
+PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # the transparent path
+PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-H queries
 ```
+
+Measured on an Apple M4 Max on this commit <!-- RE-RUN -->:
+
+| Suite | Result |
+|---|---|
+| `test_gpudb` (CPU + Metal) | 3026 / 3026 checks |
+| `run_sql_tests.sh` | 224 passing cases, 45 expected-fail guardrails |
+| `test_wrapper.py` | 1158 checks, green under DuckDB 1.4.5 and 1.5.5 |
+| `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing |
+| `test_gpudb` (CPU + CUDA, RTX 4090 Laptop) | 711 / 711 checks; SQL suite 224 / 0 with the exact path on |
 
 The SQL test suite lives in `test/sql/*.test`. Each file is plain SQL with
 `-- expect:` lines after each query; the runner reports per-query
-PASS / FAIL / GUARDRAIL / SKIP. As of v0.6.0: 126 queries, 0 failures — 113
-result checks plus 13 GUARDRAIL cases (deliberate misuse such as a `DOUBLE` join
-key or a `NULL` upload name, which the extension must reject with a clear
-error; the suite fails if one of them unexpectedly succeeds) — plus full
-resident-surface coverage in the community-CI sqllogic suite.
+PASS / FAIL / GUARDRAIL / SKIP. The guardrail cases are deliberate misuse — a
+`DOUBLE` join key, a `NULL` upload name — that the extension must reject with a
+clear error; the suite fails if one of them unexpectedly succeeds.
+`test/sqllogic/` is a separate suite in DuckDB's sqllogictest format, run by
+the community-CI `make test` path.
 
 **Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → unit tests → smoke benchmarks → SQL suite → join parity harness). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
-## Roadmap
+## Release history
 
-### Latest — v0.6.0
+### Latest — v0.7.0
+
+- [x] **Plain DuckDB SQL on the GPU** — a statement is rewritten before DuckDB
+  plans it, through DuckDB's own parser and the pure `gpu_rewrite_ast` scalar in
+  the extension, and answered on the device when that is measured faster.
+  Driven by a client that sees the statement first: the `gpudb` shell and
+  `gpudb.connect()` (Python). The loadable extension stays on the stable C API —
+  no C++ extension API, no plan surgery, no per-DuckDB-version binaries.
+- [x] **Exact operators** — `GROUP BY` with `sum` / `count` / `count(*)` /
+  `min` / `max` / `avg`, native NULL semantics, 128-bit sums, `DECIMAL` as
+  scaled integers, up to eight payloads in one device pass; a fused `WHERE`
+  mask; an aggregate with no `GROUP BY` in one pass; device `HAVING` and top-k.
+  CPU reference, Metal, and CUDA (opt-in, `GPUDB_CUDA_EXACT=1`).
+- [x] **Keys that real SQL uses** — integer, `DATE`, `TIMESTAMP`, `DECIMAL` and
+  `VARCHAR` keys; one to eight of them, up to three packed into a 64-bit key and
+  a hashed tuple with a dictionary above that; `GROUP BY ALL`, ordinals,
+  `ORDER BY ALL`, `SELECT DISTINCT`, `FILTER (WHERE …)`, `count_if`,
+  `bool_and` / `bool_or`, expressions inside and over aggregates, compound
+  `HAVING`, `count(DISTINCT x)`.
+- [x] **Joins, subqueries, views, CTEs** — inner equi-joins onto a unique key
+  materialised on the device; other INNER / LEFT / RIGHT and many-to-many joins
+  answered from an upload of the join's result; `EXISTS` / `IN` / correlated
+  scalar subqueries as `WHERE` terms lowered to predicate lanes; derived tables,
+  views and CTEs folded in and checked against the original with `DESCRIBE`;
+  an aggregating `SELECT` nested inside a statement DuckDB keeps gets its own
+  decision.
+- [x] **A resident column store** — one copy per column in row-id order, each
+  lane at the narrowest signed width its values fit (the 22 TPC-H queries at
+  SF10 hold 22.7 GiB where they held 44.9), shared between statements, built in
+  idle row-id segments so an upload never runs beside a query you are waiting
+  for, admitted by a memory budget that keeps what saves the most DuckDB time
+  per byte.
+- [x] **Rule 1 as a running measurement, not only a table** — per-machine
+  re-measurement of each statement template on a side cursor, re-checked every
+  60 seconds, with `last_rewrite()["detail"]` naming the rule in both
+  directions.
+- [x] **The `gpudb` shell and the Python package** — a SQL shell whose footer
+  says where each statement ran and why, `.gpu` / `.residents` / `.memory`, and
+  the `duckdb-gpudb` distribution (import name `gpudb`).
+- [x] Design: [docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md),
+  [docs/RESIDENT_COLUMNS_DESIGN.md](docs/RESIDENT_COLUMNS_DESIGN.md);
+  journal: [docs/RESEARCH_NOTES.md](docs/RESEARCH_NOTES.md);
+  release notes: [docs/RELEASE_NOTES_v0.7.md](docs/RELEASE_NOTES_v0.7.md).
+
+### Shipped in v0.6.0
 - [x] **Resident GROUP BY / top-k from SQL, both backends** — `gpu_groupby_sum_resident` / `gpu_groupby_sum_resident_f64` / `gpu_groupby_count_resident` return `(key, sum, count)` rows sorted by key; `gpu_topk_resident[_f64]` returns `(idx, value)` for `ORDER BY … LIMIT k`. Rides the upload-once model and the same cached device sort the joins use as a build side (one sort serves both). Segmented reduce with no hash table and no atomics on Metal; CUB `reduce_by_key` on CUDA. `_having(name, cmp, threshold)` and `_topk(name, k, order)` forms evaluate `HAVING` / `ORDER BY aggregate LIMIT k` on the device (Metal: block compaction + 8-pass radix select; CUDA: CUB select + 8-pass radix select) so only survivors cross to DuckDB. Verified against native both ways on TPC-H SF1/10/50 — statement time against statement time in the same process: **5.4–6.1× (Metal)** on Q18's inner query with the HAVING on the device, 6–8× on `HAVING count(*) >= 7`, 3.6–4.1× on the top-10 groups by sum; on CUDA the device-side HAVING is **13–24× (SF50) / 17× (SF10)** and the top-10 groups 8–12×; returning all 15M–75M groups is 2.3–2.9× (Metal) and 1.5–2.0× end-to-end on CUDA (~32–47× on-device, bounded by copying 24 bytes per group over PCIe). Honest losing rows kept: low-cardinality GROUP BY on Metal, the first top-k call vs native's zonemap top-k.
 - [x] **Composable results** — the GPU produces the rows, DuckDB does the rest: `SELECT key, sum FROM gpu_groupby_sum_resident('l') WHERE sum > 300 ORDER BY sum DESC LIMIT 10` is plain SQL over a small result.
 - [x] **Adversarial parity harness for GROUP BY** — `scripts/groupby_parity_check.sh`: 11 scenarios × 7 checks, incl. runs placed exactly on the kernels' 64-chunk / 256-block boundaries; SQL suite gained a `-- setup:` directive so table functions are tested in the documented sequential form.
@@ -998,21 +1098,6 @@ resident-surface coverage in the community-CI sqllogic suite.
 - [x] **CUDA-ready community build** — the root Makefile auto-detects nvcc with a statically linked CUDA runtime (no libcuda/libcudart dynamic deps; loads clean on GPU-less machines) so the registry's Linux binary flips to CUDA automatically when the registry's build tooling ships its CUDA toolchain. Also fixed a CMake ordering bug that had every prior CUDA build shipping single-arch fatbins.
 - [x] **Full dual-platform benchmark record** — TPC-H SF1→SF100, six columns, correctness-gated, both backends, in [BENCHMARK.md](BENCHMARK.md).
 - [x] [Community Extensions PR #2503](https://github.com/duckdb/community-extensions/pull/2503) **merged** (2026-08-17) — the registry now serves **v0.4.0**, resident-column surface included.
-
-### In flight
-- [x] **v0.7 milestone 0b — residency prerequisite** (PR): the resident registry keyed per database with identity tags and origin, per-set state (`ready` = uploaded *and* prepared, `stale`, epoch, hits, references), `gpu_residents()`, `gpu_assert_rows()` as the in-statement staleness guard, `gpu_invalidate()`, `gpu_prepare_resident()`; a lock-free `gpu_upload` update path (the one contended atomic it had cost a 60M-row upload 1.8 s → 0.36 s and starved concurrent native queries 3–7×), segmented host buffers with no combine copy, and on CUDA the pair split on the device and uploads on the column's own stream. `scripts/residency_gate.sh` measures a native statement during a concurrent upload against DuckDB's own `list()` as the control. Design: [docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md) §5.3–§5.6.
-- [x] **v0.7 milestone 2 (extension side) — the statement rewriter** (PR): `gpu_rewrite_ast(tree, context)`, a pure scalar over DuckDB's own `json_serialize_sql` tree, turns `SELECT k, sum(v) FROM t GROUP BY k [HAVING sum(v) > c] [ORDER BY sum(v) DESC LIMIT n]` into the resident table function plus the `gpu_assert_rows` guard, with native output names and types (HUGEINT sums, DECIMAL(38,s) for DECIMAL payloads with exactly rescaled thresholds), and returns every other statement unchanged with a reason. Verified three ways (native / rewritten / explicit `gpu_*`, `scripts/rewrite_parity_check.sh`) incl. TPC-H SF1 Q18-inner; 0.045 ms to reject a statement, 0.14 ms to rewrite one. The Python wrapper that drives it (classification, name resolution, template cache, fallback) is the macOS side's PR.
-- [x] **v0.7 milestone 0c — upload sessions** (PR): `gpu_upload_begin(tag)` / segment `gpu_upload_pair`/`gpu_upload` statements append to the open session / `gpu_upload_finish(tag)` → one device copy + `prepare()`, `gpu_upload_abort`, `gpu_upload_status` (JSON). The wrapper uploads a table as short row-id segments (4.7–12.9 ms of scan each at SF10) instead of one multi-second scan, so an upload never blocks a query on another connection; a failed or interrupted segment leaves the session untouched and re-runs. Design: [docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md) §5.5.
-- [ ] **Community packaging phase 2** — `requires_toolchains: "python3;cuda"` registry update (the build side shipped in v0.4.0; the token activates when the registry adopts CUDA-capable ci-tools — `SELECT gpu_build_info();` shows what any given binary carries).
-
-### Next (v0.7.0 — directional)
-- [ ] **Transparent execution** — plain `SELECT k, sum(v) FROM t GROUP BY k` routed to the resident operators without calling `gpu_*` functions, with everything unsupported running native. The loadable extension stays on the stable DuckDB **C API**: the statement is rewritten before DuckDB plans it, using DuckDB's own parser (`json_serialize_sql` → a pure `gpu_rewrite_ast` scalar in the extension → `json_deserialize_sql`), driven by a thin client wrapper (`gpudb.connect()`, Python first). No C++ extension API, no per-DuckDB-version binaries. The v0.6 table functions are the rewrite targets. Design: [docs/TRANSPARENT_DESIGN.md](docs/TRANSPARENT_DESIGN.md). Research journal (what was tried, measured and decided, in order): [docs/RESEARCH_NOTES.md](docs/RESEARCH_NOTES.md).
-- [ ] GROUP BY over join results as a fused op (join multiplicity × payload → segmented reduce); composite join keys
-- [ ] Resident f64 min/max (a small ABI entry)
-
-### Beyond (exploratory)
-- [ ] Window functions on GPU as proper operators (not just aggregate-as-window)
-- [ ] String / regex operators (libcudf-class functionality on Metal where it doesn't exist)
 
 <details>
 <summary><b>Earlier releases</b> (v0.1.0 → v0.3.0 + community-extension milestones)</summary>
@@ -1055,11 +1140,20 @@ resident-surface coverage in the community-CI sqllogic suite.
 The 2013-2024 GPU-DB graveyard is real. The wedge that *isn't* in the graveyard:
 
 1. **Apple Silicon backend** — empty field, defining differentiator
-2. **DuckDB-native** — no migration, just `LOAD`
-3. **Hybrid CPU/GPU planner** — picks CPU when it wins (low cardinality), GPU when it doesn't
-4. **Window functions** — Sirius lacks them; high-value for analytics
+2. **DuckDB-native** — no migration: `LOAD` for the explicit functions, one wrapper for plain SQL
+3. **A decision, not a mode** — the CPU answers where the CPU wins (low cardinality, small tables, selective filters), and the measurement that says so is published
 
 This combination is unique as of May 2026. See [GOAL.md](GOAL.md) for the full positioning and [BENCHMARK.md](BENCHMARK.md) for reproducible numbers.
+
+## Credits
+
+- **Metal hash join, the hybrid join planner and the on-device segment reduce**
+  — contributed by [@lmangani](https://github.com/lmangani) in
+  [PR #43](https://github.com/singhpratech/duckdbgpumetaldbram/pull/43), and the
+  base of the join stack from v0.5.0 onward.
+- The DuckDB team, for a stable C extension API that one binary can keep
+  working against across versions, and for `json_serialize_sql` — the
+  transparent path is built on DuckDB's own parser rather than a second one.
 
 ## Citing
 
