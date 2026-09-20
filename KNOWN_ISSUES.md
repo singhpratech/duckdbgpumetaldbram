@@ -7,7 +7,7 @@ Four surfaces, because a limit almost always belongs to exactly one of them:
 
 | Surface | What it is | Where its limits are |
 |---|---|---|
-| **Explicit functions (`v0.4.0` – `v0.6.0`, unchanged in v0.7)** | `gpu_sum` / `gpu_min` / `gpu_max` and the `gpu_*_resident` surface — uploads, fused joins, GROUP BY / top-k — called by name from SQL. This is what a DuckDB user has today | the v0.3.0 – v0.6.0 tables below |
+| **Explicit functions (`v0.4.0` – `v0.6.0`, unchanged in v0.7)** | `gpu_sum` / `gpu_min` / `gpu_max` and the `gpu_*_resident` surface — uploads, fused joins, GROUP BY / top-k — called by name from SQL. This surface needs nothing but a DuckDB client | the v0.3.0 – v0.6.0 tables below |
 | **The transparent path (v0.7)** | ordinary DuckDB SQL through the `gpudb` shell or the Python wrapper's `gpudb.connect()`: a statement is answered on the device when that is faster and by DuckDB otherwise, with identical rows, names and types | the v0.7 tables below |
 | **CUDA** | the explicit functions, complete; and the exact operators the transparent path needs — exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised join — are implemented. They are **opt-in** in v0.7: without `GPUDB_CUDA_EXACT=1` the backend reports `exact_supported()` / `join_supported()` / `global_supported()` false and the wrapper leaves every statement on DuckDB, which is correct and simply has no speed-up | `docs/CUDA_EXACT_PATH.md` |
 | **The community-registry Linux binary** | built without a CUDA toolchain, so it is CPU-only: every `gpu_*` function works and returns the same results, and `gpu_build_info()` / `gpu_last_stats()` say `backend=CPU`. The registry's macOS binary carries the full Metal backend | `README.md`, `docs/TRANSPARENT_DESIGN.md` §9.4 |
@@ -196,17 +196,25 @@ rows** (default 1,000,000), counting the largest such table, a §4.18 subquery
 lane's included — otherwise the statement declines with *the statement names
 no table at or above the 1000000-row floor*.
 
+"Aggregated columns" below counts **distinct payload columns**, not aggregates:
+`count(*)` reads no column and adds nothing, and several aggregates of the same
+column are one payload — `SELECT l_partkey, sum(l_quantity), count(*) FROM
+lineitem GROUP BY 1` is a one-column statement and rewrites, while
+`sum(l_quantity), sum(l_extendedprice)` on the same key is a two-column one and
+declines with *191008 groups x 2 payload columns returned > 50000* (both
+verified at TPC-H SF1).
+
 Above that floor, the form decides:
 
 | Form | Group floor | Output-size bound | Selectivity, under a `WHERE` |
 |---|---|---|---|
 | **plain** `GROUP BY`, one aggregated column | 1,000 distinct keys (*3 groups < 1000*) | 300,000 groups; 50,000 under a `WHERE` | at least 0.5 (*selectivity 0.13 < 0.5 for the plain form*) |
-| **plain** `GROUP BY`, two to eight aggregated columns | the same 1,000 | 50,000 groups — and under a `WHERE` the form is native whatever the group count | — (the `WHERE` declines it outright) |
+| **plain** `GROUP BY`, two to eight aggregated columns | the same 1,000 | 50,000 groups — and under a `WHERE`, native at 1,000 groups or more (*plain form with 2 payload columns under a `WHERE`*). Below 1,000 groups the multi-column bound is not consulted at all, which is the gap the `VARCHAR` exemption in the bullet below goes through (TPC-H Q1) | — (at 1,000 groups or more the `WHERE` declines it outright) |
 | **`HAVING`** on the device | the same 1,000, with **no `VARCHAR` exemption** — that one is the plain form's | none | at least 0.3, and at least 0.2 from 100,000 groups up |
 | **`ORDER BY … LIMIT k`** (top-k) | 100,000 distinct keys | none | at least **0.8** (*selectivity 0.50 < 0.8 for top-k*) |
 | **over a key join**, or with a subquery lane (§4.18) | **none at all** — native has to run the join whatever the group count, so one group is admitted | plain form: 1,000,000 groups, and above 300,000 the device must also be reading at least 16 rows per group returned; 20,000 groups with two or more aggregated columns. `HAVING`, top-k, and a `LIMIT` that was not pushed as a top-k: none | plain form above 20,000 groups: at least 0.08. `HAVING` and top-k: none |
 | **aggregate with no `GROUP BY`** | — (one group) | — (one row) | — | 
-| **the inner statement** of a nested rewrite (§4.14, §4.23) | the group floor still applies | the output-size bounds are **replaced** when all three hold: the whole statement returns at least 4× fewer rows, the device reads at least 7 rows per group returned, and there are at most 2,000,000 groups | replaced under those same three conditions |
+| **the inner statement** of a nested rewrite (§4.14, §4.23) | the group floor still applies | the output-size bounds are **replaced** — for a statement with ONE aggregated column — when all three hold: the whole statement returns at least 4× fewer rows, the device reads at least 7 rows per group returned, and there are at most 2,000,000 groups. With two to eight aggregated columns the multi-column row above is applied first and decides on its own: `SELECT max(q), max(p) FROM (SELECT l_suppkey, sum(l_quantity) q, sum(l_extendedprice) p FROM lineitem WHERE l_shipdate < DATE '1997-01-01' GROUP BY 1)` declines with *plain form with 2 payload columns under a `WHERE`*, while the same statement with `q` alone is rewritten | replaced under those same three conditions, and only for one aggregated column |
 | **`count(DISTINCT x)`** (§4.17) | the 1,000, with the exemption relaxed: for a `VARCHAR` key, **one** computed-expression payload beside the DISTINCT is enough | 100,000 (key, value) pairs; 20,000 under a `WHERE` | at least 0.05, and then the form's own bound above |
 
 Two bounds do not fit a column:
