@@ -3791,6 +3791,140 @@ Removing the skip took the unit suite from 711 to 730 checks, all passing.
 Those nineteen were not new tests: they were tests that already existed and had
 been running on two backends out of three.
 
+## 2026-09-20 — The tie at the k-th row, and what native actually does with one
+
+A reviewer found a rule-2 break on TPC-H SF1:
+
+```sql
+SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem
+GROUP BY l_orderkey ORDER BY qty DESC LIMIT 5;
+```
+
+Three orders tie at 320.00 for positions 4–5 (1263015, 1544643, 4702759). The
+transparent path (form `topk`, pushed as
+`gpu_groupby_exact_resident_topk(tag,'sum',5,'desc')`) returned 1263015 and
+1544643; the reviewer's native runs returned 4702759 and 1263015, and reported
+the same at `threads` 1, 4 and 16. A user can falsify that with `.gpu off` /
+`.gpu on`, so it had to be fixed.
+
+### First: what IS native's tie order?
+
+The whole question is whether the device can be made to agree. So before
+touching anything, run plain DuckDB — no extension, no wrapper — 20 times per
+thread count, on the same read-only file, and count the distinct answers.
+
+| `threads` | distinct orderings / 20 runs | distinct row SETS |
+|---|---|---|
+| 1 | 1 | 1 |
+| 2 | 4 | 3 |
+| 4 | 6 | 3 |
+| 8 | 6 | 3 |
+| 16 | 5 | 3 |
+
+Identical shape on DuckDB 1.4.5 and 1.5.5. Twenty repeats **on one connection**
+at `threads=16` gave 6 orderings on 1.4.5, and `SET preserve_insertion_order =
+false` changed nothing. Native is deterministic only at `threads=1`.
+
+So the reviewer's "native returns (4702759, 1263015)" was one draw out of six.
+Native does not have a tie order: the hash aggregate's partitions finish in
+whatever order the threads finish them, and the top-N operator sees a different
+input order every run. It is not a function of the data, the insertion order or
+any setting — nothing the device could compute.
+
+That kills the only outcome that would have been better than declining. There
+is no answer to reproduce, so the honest thing is to say so and let DuckDB
+choose, which is what it was going to do anyway.
+
+### The mechanism
+
+Two lines in each renderer (`python/gpudb/_rewrite.py` and the scalar
+`src/extension/gpu_rewrite.cpp`, which must agree):
+
+1. the device is asked for **k + 1** rows, not k — so the k-th / (k+1)-th
+   boundary is inside the rows the statement can see;
+2. the statement carries a `QUALIFY`:
+
+```sql
+QUALIFY CASE WHEN rank() OVER w = row_number() OVER w OR rank() OVER w > k
+             THEN TRUE ELSE error('GPUDB_TIES: …') END   -- w = (ORDER BY <agg> <dir>)
+```
+
+`rank()` and `row_number()` differ on exactly the second and later member of a
+group of equal values, and `rank() > k` excludes the rows past the k-th that no
+`LIMIT k` returns. So it fires on a boundary tie *and* on a tie inside the top
+k, where the row SET is right but the order is not — which is the same defect,
+because `.gpu off` shows a different order.
+
+The wrapper answers the user's original statement on DuckDB when it sees
+`GPUDB_TIES` (`Connection._on_ties`), with `reason = "ties"` and a detail the
+shell prints verbatim:
+`DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose …)`.
+
+Two things that were considered and rejected. **A side-cursor probe before the
+statement** (ask the device for k+1, compare, then run): measured, the device
+top-k *is* the statement — 8.6 ms of a 9.0 ms rewritten run — so probing would
+have doubled every top-k, tie or no tie. **Breaking ties on the group key** in
+the device's top-k: deterministic, but still not native's, so it would have
+turned an intermittent difference into a permanent one.
+
+### Cost
+
+With no tie: one extra row out of the device, and two window functions sharing
+one specification over k + 1 rows. Measured on the reviewer's statement at
+`LIMIT 3` (above SF1's tie), the two forms interleaved, best of 30 each:
+7.35 ms for k rows without the guard, 7.21 ms for k + 1 with it — the
+difference is inside the run-to-run noise, twice, against 9.5 ms native.
+`execute()` pays nothing else. `sql()`
+returns a lazy relation that is read after the call has returned, where a raise
+could not be answered natively, so the guard runs on a side cursor there first
+(`_guard_now`) — one extra device top-k, the same bargain the staleness guard
+already strikes on that path. With a tie: the device pass, then DuckDB's own
+answer; the statement is slower than native by the device pass, and it is
+correct.
+
+The decline is **per execution, never cached**, because a tie is a property of
+the data and not of the shape: an `INSERT` can put one into a template that had
+none, and a `DELETE` can take it away (both directions are in the suite). The
+template stays rewritten, and a run that raised recorded no rewritten time, so
+the measured rule (§9.1) sees nothing from it either.
+
+Untouched: the explicit `gpu_groupby_*_resident_topk` / `gpu_topk_resident`
+table functions, whose documented contract is that the tie order is unspecified
+(KNOWN_ISSUES.md) — a caller who names them has asked for the device's answer.
+Also untouched and not in doubt: an `ORDER BY` that is already total (a second
+key is never pushed as a top-k, so DuckDB sorts every group by a total order),
+and `LIMIT … OFFSET`, which declines earlier on shape.
+
+### What is still open
+
+The guard rides on the push. A `LIMIT` whose top-k is *not* pushed — an
+`ORDER BY` on an aggregate beside a `HAVING`, an `avg` or temporal ordering
+value, `ORDER BY count(*)` over a v0.6 sum set — hands every group to DuckDB
+and lets DuckDB do the `ORDER BY … LIMIT`. That is the same multiset of rows
+native would sort, so the tie is DuckDB's to break both ways, but it is not
+identical: DuckDB's top-N depends on the order its input arrives in, and the
+device's group order is not the hash aggregate's. At `threads=1`, the one
+setting where native is reproducible, such a tie can still land differently.
+
+Covering it needs `rank() > k` over every group returned rather than over
+k + 1 rows — a window sort where today there is a top-N. The clause is already
+written generically enough to do it; what is missing is the measurement that
+says what it costs at 50K and 300K groups, and that belongs to its own change.
+
+### On TPC-H
+
+SF1 coverage is unchanged at 17 of 22 with 0 rows differing
+(`scripts/tpch_coverage.py --n 3`), and no query hits the tie decline.
+
+Only **Q10** is a pushed top-k (`GPU (topk)`, 6.11×): `ORDER BY revenue DESC
+LIMIT 20` over a revenue-like sum, whose top 20 values are distinct, so the
+guard passes and costs it the 21st row. **Q3** and **Q18**, the other two
+LIMIT shapes, are `GPU (plain)`: both carry a second `ORDER BY` key
+(`o_orderdate`), which is never pushed as a top-k at all — DuckDB sorts every
+group by an order that is total, and the rows are native's. The shape that
+does hit the decline is the reviewer's, where a small integer quantity is
+summed over few rows per group and collisions are common.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

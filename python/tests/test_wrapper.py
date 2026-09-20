@@ -2286,8 +2286,212 @@ def run():
               f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
     con.close()
 
+    ties_checks()
     extension_age_checks()
     return report()
+
+
+# One group per k, sum(v) = 600 * k: every group's sum differs from every
+# other's, so a top-k over it has ONE answer and is comparable to native row
+# for row. A tie is then made on purpose, by adding 600 to one group.
+TIES_SETUP = "CREATE TABLE tk AS SELECT (i % 500)::BIGINT AS k, (i % 500)::BIGINT AS v FROM range(300000) r(i);"
+
+
+def ties_native(sql, *inserts):
+    c = duckdb.connect()
+    c.execute(TIES_SETUP)
+    for i in inserts:
+        c.execute(i)
+    rows = c.execute(sql).fetchall()
+    c.close()
+    return rows
+
+
+def tie_is_there(con, sql):
+    """Assert, on DuckDB itself, that the rows this statement chooses from are
+    NOT uniquely ordered — so a check below that expects a tie decline cannot
+    pass because the data quietly lost its tie."""
+    inner = sql.rstrip(" ;")
+    n, distinct = con._raw.execute(
+        f"SELECT count(*), count(DISTINCT s) FROM ({inner}) q").fetchone()
+    return distinct < n
+
+
+def ties_checks():
+    """§4.24: a pushed top-k whose k-th and (k+1)-th rows — or any two rows
+    inside the top k — share the ordering value has no answer to reproduce.
+    Measured on TPC-H SF1, plain DuckDB returns a different set of tied rows
+    from one run to the next at any `threads` above 1, so there is nothing to
+    copy: the statement goes back to DuckDB, with reason 'ties'."""
+    print("== top-k ties: a tie inside the first k rows is DuckDB's to choose (§4.24)")
+    con = fresh()
+    if not has_device(con):
+        skip("top-k ties — needs a GPU backend, and this extension reports runtime=CPU")
+        con.close()
+        return
+    con.execute(TIES_SETUP)
+    q = "SELECT k, sum(v) AS s FROM tk GROUP BY k ORDER BY s {} LIMIT {}"
+
+    # ---- no tie: the push still happens, and the rows are native's ----
+    for d in ("DESC", "ASC"):
+        sql = q.format(d, 5)
+        got = con.execute(sql).fetchall()
+        lr = con.last_rewrite()
+        check(lr["rewritten"] and lr["form"] == "topk",
+              f"ties/none {d}: rewritten as top-k (reason={lr['reason']}, form={lr['form']})")
+        check(got == ties_native(sql), f"ties/none {d}: rows identical to native")
+        check(", 6, " in lr["sql"] or ", 6," in lr["sql"] or " 6, " in lr["sql"],
+              f"ties/none {d}: the device is asked for k + 1 rows")
+    # k larger than the group count: every group comes back, still no tie
+    sql = q.format("DESC", 1000)
+    got = con.execute(sql).fetchall()
+    check(con.last_rewrite()["rewritten"] and got == ties_native(sql) and len(got) == 500,
+          "ties/none: k above the group count is rewritten and returns every group")
+
+    # ---- a tie at the k-th / (k+1)-th boundary ----
+    # group 494's sum becomes group 495's: the 5th and 6th rows of an ORDER BY
+    # s DESC tie, so LIMIT 5 has no single answer but LIMIT 4 still does.
+    boundary = "INSERT INTO tk VALUES (494, 600)"
+    con.execute(boundary)
+    check(tie_is_there(con, "SELECT sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 6"),
+          "ties/boundary: the 5th and 6th rows really do tie (checked on DuckDB)")
+    sql = q.format("DESC", 5)
+    got = con.execute(sql).fetchall()
+    lr = con.last_rewrite()
+    check(not lr["rewritten"] and lr["reason"] == "ties",
+          f"ties/boundary: declined with reason 'ties' (reason={lr['reason']})")
+    check("tie" in lr["detail"] and "5" in lr["detail"],
+          f"ties/boundary: the detail names the tie and the k ({lr['detail'][:90]})")
+    check([r[1] for r in got] == [r[1] for r in ties_native(sql, boundary)],
+          "ties/boundary: DuckDB answered it — the ordering values are native's")
+    sql4 = q.format("DESC", 4)
+    got4 = con.execute(sql4).fetchall()
+    check(con.last_rewrite()["rewritten"] and got4 == ties_native(sql4, boundary),
+          "ties/boundary: the same template at k = 4 is below the tie and still rewritten")
+
+    # ---- an INSERT that puts a tie into a template that had none ----
+    con2 = fresh()
+    con2.execute(TIES_SETUP)
+    got = con2.execute(q.format("DESC", 5)).fetchall()
+    check(con2.last_rewrite()["rewritten"], "ties/insert: the template starts out rewritten")
+    con2.execute(boundary)
+    con2.execute(q.format("DESC", 5)).fetchall()
+    check(con2.last_rewrite()["reason"] == "ties",
+          "ties/insert: the cached template declines once the data ties")
+    # ... and gives the rewrite back when the tie goes away again
+    con2.execute("DELETE FROM tk WHERE k = 494 AND v = 600")
+    con2.execute(q.format("DESC", 5)).fetchall()
+    check(con2.last_rewrite()["rewritten"],
+          "ties/insert: and is rewritten again once the tie is gone (the decline is not cached)")
+    con2.close()
+
+    # ---- a tie INSIDE the top k: the row SET is right, the ORDER is not ----
+    con.execute("DELETE FROM tk WHERE k = 494 AND v = 600")
+    interior = "INSERT INTO tk VALUES (497, 600)"      # sum(497) becomes sum(498)
+    con.execute(interior)
+    check(tie_is_there(con, "SELECT sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 5"),
+          "ties/interior: rows 2 and 3 really do tie (checked on DuckDB)")
+    lr_rows = con.execute(q.format("DESC", 5)).fetchall()
+    check(con.last_rewrite()["reason"] == "ties",
+          f"ties/interior: declined too (reason={con.last_rewrite()['reason']})")
+    check([r[1] for r in lr_rows] == [r[1] for r in ties_native(q.format("DESC", 5), interior)],
+          "ties/interior: DuckDB answered it")
+    got1 = con.execute(q.format("DESC", 1)).fetchall()
+    check(con.last_rewrite()["rewritten"] and got1 == ties_native(q.format("DESC", 1), interior),
+          "ties/interior: LIMIT 1 is above the tie and is still rewritten")
+
+    # ---- an ORDER BY that is already total is never in doubt ----
+    total = "SELECT k, sum(v) AS s FROM tk GROUP BY k ORDER BY s DESC, k LIMIT 5"
+    got = con.execute(total).fetchall()
+    lr = con.last_rewrite()
+    check(lr["rewritten"] and lr["form"] != "topk",
+          f"ties/total: a second ORDER BY key is not pushed as a top-k (form={lr['form']})")
+    check(got == ties_native(total, interior),
+          "ties/total: rows identical to native although the aggregate ties")
+
+    # ---- the relation path: the guard runs before sql() hands the rows back ----
+    rel = con.sql(q.format("DESC", 5))
+    lr = con.last_rewrite()
+    rows = rel.fetchall()
+    check(not lr["rewritten"] and lr["reason"] == "ties",
+          f"ties/sql(): the relation is DuckDB's, not the device's (reason={lr['reason']})")
+    check([r[1] for r in rows] == [r[1] for r in ties_native(q.format("DESC", 5), interior)],
+          "ties/sql(): and reading it raises nothing")
+
+    # ---- the other aggregates a top-k can order by ----
+    for agg, name in (("count(*)", "count_star"), ("min(v)", "min"), ("max(v)", "max")):
+        s = f"SELECT k, {agg} AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 5"
+        got = con.execute(s).fetchall()
+        lr = con.last_rewrite()
+        tied = tie_is_there(con, f"SELECT {agg} AS s FROM tk GROUP BY k ORDER BY s DESC LIMIT 6")
+        if tied:
+            check(lr["reason"] == "ties", f"ties/{name}: a tied top-k is declined (reason={lr['reason']})")
+        else:
+            check(lr["rewritten"] and got == ties_native(s, interior),
+                  f"ties/{name}: no tie, rewritten, rows identical to native")
+
+    # ---- a two-key GROUP BY takes the same route ----
+    two = ("SELECT k, k % 7 AS g, sum(v) AS s FROM tk GROUP BY k, k % 7 "
+           "ORDER BY s DESC LIMIT 5")
+    got = con.execute(two).fetchall()
+    lr = con.last_rewrite()
+    check(lr["reason"] == "ties" or (lr["rewritten"] and got == ties_native(two, interior)),
+          f"ties/two keys: declined for ties or rewritten and identical (reason={lr['reason']})")
+
+    # ---- both renderers say the same thing about the same tie ----
+    if con._has_rewrite_scalar:
+        py = fresh()
+        py._has_rewrite_scalar = False
+        py.execute(TIES_SETUP)
+        py.execute(interior)
+        a = con.execute(q.format("DESC", 5)).fetchall(); la = con.last_rewrite()
+        b = py.execute(q.format("DESC", 5)).fetchall(); lb = py.last_rewrite()
+        check(la["reason"] == lb["reason"] == "ties" and [r[1] for r in a] == [r[1] for r in b],
+              "ties: the scalar renderer and the reference renderer decline the same tie")
+        c1 = py.execute(q.format("DESC", 1)).fetchall(); l1 = py.last_rewrite()
+        c2 = con.execute(q.format("DESC", 1)).fetchall(); l2 = con.last_rewrite()
+        check(l1["rewritten"] and l2["rewritten"] and c1 == c2,
+              "ties: and both rewrite the same tie-free top-k to the same rows")
+        py.close()
+    con.close()
+    ties_tpch()
+
+
+def ties_tpch():
+    """The statement the review reported, on the data it reported it on.
+
+    `SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey
+    ORDER BY qty DESC LIMIT 5` on TPC-H SF1: three orders tie at 320.00 for
+    positions 4 and 5, and the device used to answer with its own two of the
+    three. Skipped where the SF1 database is not on disk (`SF=1
+    ./scripts/gen_tpch.sh`)."""
+    db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                      "data", "tpch_sf1", "tpch.duckdb")
+    db = os.path.abspath(db)
+    if not os.path.exists(db):
+        skip(f"the reported TPC-H top-k tie — {db} is not on disk (SF=1 ./scripts/gen_tpch.sh)")
+        return
+    q = "SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderkey ORDER BY qty DESC LIMIT {}"
+    con = gpudb.connect(db, read_only=True, residency="eager", floor_rows=0, thresholds=False)
+    try:
+        if not has_device(con):
+            skip("the reported TPC-H top-k tie — needs a GPU backend")
+            return
+        n, distinct = con._raw.execute(
+            "SELECT count(*), count(DISTINCT qty) FROM (" + q.format(6) + ") z").fetchone()
+        check(distinct < n, f"tpch/ties: SF1 really does tie at the 5th row ({distinct} of {n} distinct)")
+        rows = con.execute(q.format(5)).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"] and lr["reason"] == "ties",
+              f"tpch/ties: the reported statement is DuckDB's (reason={lr['reason']})")
+        check([r[1] for r in rows] == sorted((r[1] for r in rows), reverse=True) and len(rows) == 5,
+              "tpch/ties: and DuckDB's five rows come back in its own order")
+        # the first three are not in doubt and still run on the device
+        con.execute(q.format(3)).fetchall()
+        check(con.last_rewrite()["rewritten"] and con.last_rewrite()["form"] == "topk",
+              "tpch/ties: LIMIT 3 is above the tie and still runs on the device")
+    finally:
+        con.close()
 
 
 def extension_age_checks():

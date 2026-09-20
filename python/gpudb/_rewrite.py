@@ -38,6 +38,10 @@ _CMP = {
     "COMPARE_EQUAL": "=", "COMPARE_NOTEQUAL": "<>",
 }
 _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
+# A pushed top-k that ends in a tie raises this from inside the rewritten
+# statement; the client answers the user's own statement natively when it sees
+# it (connection.Connection.execute / .sql, reason 'ties'). See ties_qualify().
+TIES_MARKER = "GPUDB_TIES"
 
 
 def _has_colref(e) -> bool:
@@ -497,8 +501,11 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         else:
             raise Decline("shape", f"modifier {t}")
 
-    # top-k push: single ORDER BY on the aggregate, LIMIT, no HAVING, known direction
-    if plan.limit is not None and len(plan.order) == 1 and plan.having is None:
+    # top-k push: single ORDER BY on the aggregate, LIMIT, no HAVING, known
+    # direction. k + 1 rows are asked for (§4.24), so k itself has to leave
+    # room inside the BIGINT the device function takes.
+    if (plan.limit is not None and plan.limit < 2 ** 63 - 1
+            and len(plan.order) == 1 and plan.having is None):
         tgt, direction, nulls = plan.order[0]
         base = tgt.split(":")[0]
         if base in ("sum", "count", "count_star", "min", "max"):
@@ -943,6 +950,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         fn += "_where"
         args.append("'" + prog.replace("'", "''") + "'")
     extra_pred = ""
+    ties = ""                          # the pushed top-k's tie guard (§4.24)
     mfilter = ""                       # gpu_groupby_exact_multi's filter argument
     if plan.form == "having":
         akind, op, lit = plan.having
@@ -962,11 +970,14 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         tgt, direction, _ = plan.order[0]
         d = direction if direction != "ORDER_DEFAULT" else default_order
         dir_word = "desc" if d in ("DESCENDING", "DESC") else "asc"
+        # k + 1 rows, so the tie guard below can see the k-th / (k + 1)-th boundary
+        k1 = plan.limit + 1
         if multi:
-            mfilter = f"topk {plan.topk_pay} {plan.topk_agg} {plan.limit} {dir_word}"
+            mfilter = f"topk {plan.topk_pay} {plan.topk_agg} {k1} {dir_word}"
         else:
             fn += "_topk"
-            args += [f"'{plan.topk_agg}'", str(plan.limit), f"'{dir_word}'"]
+            args += [f"'{plan.topk_agg}'", str(k1), f"'{dir_word}'"]
+        ties = ties_qualify(plan)
     if multi:
         lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
         fn = "gpu_groupby_exact_multi"
@@ -995,23 +1006,61 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
     guard = _guard_sql(plan, fqn, tag)
     sql = f"SELECT {', '.join(cols)} FROM {src}, {guard} WHERE gd.ok{extra_pred}"
-    return sql + _order_limit_sql(plan)
+    return sql + ties + _order_limit_sql(plan)
+
+
+def _order_ref(plan: Plan, tgt: str) -> str:
+    """The rewritten statement's own name for an ORDER BY target."""
+    kind, _, name = tgt.partition(":")
+    if name:
+        return f'"{name}"'
+    return next((f'"{o.name}"' for o in plan.outputs if o.kind == kind),
+                f'r."{ "key" if kind == "key" else kind }"')
+
+
+def _order_suffix(direction: str, nulls: str) -> str:
+    """The direction / NULLS words of one ORDER BY item, left empty where the
+    statement said nothing: DuckDB's `default_order` and `default_null_order`
+    then decide, and they decide the same way for the window ties_qualify()
+    builds as for the ORDER BY beside it."""
+    return ({"ASCENDING": " ASC", "DESCENDING": " DESC"}.get(direction, "")
+            + {"NULLS_FIRST": " NULLS FIRST", "NULLS_LAST": " NULLS LAST"}.get(nulls, ""))
+
+
+def ties_qualify(plan: Plan) -> str:
+    """The tie guard of a PUSHED top-k (§4.24).
+
+    A device top-k picks k rows out of the groups by its own rule when their
+    ordering values are equal, and that rule is not DuckDB's. DuckDB's is not
+    anything either: measured on TPC-H SF1, plain DuckDB returns a different
+    set of tied rows from one run to the next at any `threads` above 1 (see
+    docs/RESEARCH_NOTES.md, 2026-09-20). So a tie has no answer to reproduce —
+    it is DuckDB's to choose, and the statement is handed back to it.
+
+    The device is asked for k + 1 rows so the k-th / (k + 1)-th boundary is
+    visible here, and this clause raises TIES_MARKER when any two of the first
+    k rows share an ordering value — at the boundary or inside the top k, where
+    the SET is right but the ORDER is not. `rank()` and `row_number()` differ
+    exactly on the second and later member of a group of equal values, and
+    `rank() > k` excludes the ones past the k-th row, which no LIMIT k returns.
+    Both windows share one specification, so they cost one pass over the k + 1
+    rows the device returned."""
+    if plan.limit is None or len(plan.order) != 1:
+        return ""
+    tgt, direction, nulls = plan.order[0]
+    w = f"OVER (ORDER BY {_order_ref(plan, tgt)}{_order_suffix(direction, nulls)})"
+    kind, _, name = tgt.partition(":")
+    msg = (f"{TIES_MARKER}: the first {plan.limit} rows are not ordered uniquely "
+           f"by {name or kind}").replace("'", "''")
+    return (f" QUALIFY CASE WHEN rank() {w} = row_number() {w} OR rank() {w} > {plan.limit}"
+            f" THEN TRUE ELSE error('{msg}') END")
 
 
 def _order_limit_sql(plan: Plan) -> str:
     sql = ""
     if plan.order:
-        parts = []
-        for tgt, direction, nulls in plan.order:
-            kind, _, name = tgt.partition(":")
-            if name:
-                ref = f'"{name}"'
-            else:
-                ref = next((f'"{o.name}"' for o in plan.outputs if o.kind == kind),
-                           f'r."{ "key" if kind == "key" else kind }"')
-            d = {"ASCENDING": " ASC", "DESCENDING": " DESC"}.get(direction, "")
-            n = {"NULLS_FIRST": " NULLS FIRST", "NULLS_LAST": " NULLS LAST"}.get(nulls, "")
-            parts.append(ref + d + n)
+        parts = [_order_ref(plan, tgt) + _order_suffix(direction, nulls)
+                 for tgt, direction, nulls in plan.order]
         sql += " ORDER BY " + ", ".join(parts)
     if plan.limit is not None:
         sql += f" LIMIT {plan.limit}"
@@ -1026,6 +1075,7 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
     base = "gpu_groupby_sum_resident" if sum_path else "gpu_groupby_count_resident"
     fn, args = base, [f"'{tag}'"]
     extra_pred = ""                            # HAVING left to the outer statement
+    ties = ""                                  # the pushed top-k's tie guard (§4.24)
     if plan.form == "having":
         akind, op, lit = plan.having
         if akind == "sum":
@@ -1045,7 +1095,8 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
         dir_word = "desc" if d in ("DESCENDING", "DESC") else "asc"
         if tgt.split(":")[0] in (("sum",) if sum_path else ("count", "count_star")):
             fn = base + "_topk"
-            args += [str(plan.limit), f"'{dir_word}'"]
+            args += [str(plan.limit + 1), f"'{dir_word}'"]   # k + 1: the tie guard's boundary row
+            ties = ties_qualify(plan)
         # ORDER BY count on the sum path: plain function, native sort + limit
     cols = []
     for out in plan.outputs:
@@ -1062,7 +1113,7 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
     sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
            f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
            f"WHERE gd.ok{extra_pred}")
-    return sql + _order_limit_sql(plan)
+    return sql + ties + _order_limit_sql(plan)
 
 
 def _q_default(col: str) -> str:

@@ -76,6 +76,9 @@ _MAX_STATEMENT_BYTES = 16 * 1024
 _LITERAL_RE = re.compile(r"""('(?:[^']|'')*')|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)""")
 _WS_RE = re.compile(r"\s+")
 STALE_MARKER = "GPUDB_STALE"
+# ... and what a pushed top-k's tie guard says when it stops (_rewrite.ties_qualify):
+# the k it was rendered for and the column the ORDER BY named.
+_TIES_RE = re.compile(r"GPUDB_TIES: the first (\d+) rows are not ordered uniquely by (.*?)(?:\n|$)")
 # measured rule 1 (§9.1): a template is re-measured against native at most this often — one
 # side-cursor probe per template per interval, the user's own statement never the experiment
 _REMEASURE_S = 60.0
@@ -85,7 +88,12 @@ _REMEASURE_S = 60.0
 _LAZY_SIGHTINGS = 3
 REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "overflow",
            "decimal", "collation", "too_long", "transaction", "view", "temp", "ambiguous",
-           "not_found", "manual", "error", "off", "params", "multi", "memory")
+           "not_found", "manual", "error", "off", "params", "multi", "memory",
+           # 'ties': a pushed top-k found the k-th and (k+1)-th rows — or two
+           # rows inside the top k — equal on the value the ORDER BY names, so
+           # which rows come back, and in what order, is DuckDB's to choose
+           # (_rewrite.ties_qualify). Decided per execution, on the data.
+           "ties")
 
 
 def _host_memory_bytes() -> int:
@@ -783,7 +791,10 @@ class Connection:
                 if self._last.rewritten:
                     self._check_output_size()
             except duckdb.Error as e:
-                if self._last.rewritten and STALE_MARKER in str(e):
+                if self._last.rewritten and _rewrite.TIES_MARKER in str(e):
+                    self._on_ties(e)
+                    self._raw.execute(query, parameters)
+                elif self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
                     self._raw.execute(query, parameters)
                 elif self._last.rewritten and "INTERRUPT" not in str(e).upper():
@@ -821,6 +832,24 @@ class Connection:
         and it is what `_shell.Shell.recover` does."""
         if not self._last.rewritten:
             return
+        # A pushed top-k carries its own tie guard (_rewrite.ties_qualify), and
+        # inside execute() that guard raising is enough: the wrapper answers
+        # natively in the `except` around the statement. A relation is read
+        # after sql() has returned, so the guard has to run HERE instead, where
+        # `_on_ties` and the native re-run still are. Ahead of the staleness
+        # guard below, and not behind the decision check after it: a nested
+        # rewrite (§4.14) has no single decision to read and still carries the
+        # clause, and running the statement runs its own row guards anyway.
+        #
+        # It costs a second device top-k for this one statement — the same
+        # bargain the staleness guard strikes, and the price of a lazy
+        # relation. execute() pays nothing but the (k + 1)-th row.
+        if _rewrite.TIES_MARKER in (self._last.sql or ""):
+            cur = self._raw.cursor()
+            try:
+                cur.execute(self._last.sql).fetchall()
+            finally:
+                cur.close()
         d = getattr(self, "_last_decision", None)
         if d is None or d.plan is None:
             return
@@ -829,6 +858,33 @@ class Connection:
             cur.execute(_rewrite.guard_statement(d.plan, d.fqn, d.tag)).fetchall()
         finally:
             cur.close()
+
+    def _on_ties(self, e: Exception) -> None:
+        """The rewritten statement stopped at a tie: two of the first k rows
+        share the value the ORDER BY names, so which rows a LIMIT returns — and
+        in what order — is DuckDB's to choose. It is given the statement.
+
+        Nothing is remembered. A tie is a property of the DATA, not of the
+        statement's shape: an INSERT can make one appear in a template that had
+        none, or take one away. So the decision stays rewritten and is tested
+        again, against the data, on the next execution — and this run recorded
+        no rewritten time, so the measured rule (§9.1) sees nothing either.
+
+        The k and the column come out of the raised message rather than off the
+        cached decision: a statement whose LIMIT differs from the template's is
+        re-rendered from its own literals, and only the message that was
+        rendered with it knows which k this run asked for."""
+        m = _TIES_RE.search(str(e))
+        k, col = (m.group(1), m.group(2).strip()) if m else ("", "")
+        self._last.rewritten = False
+        self._last.fallback = True
+        self._last.reason = "ties"
+        rows = f"the first {k} rows" if k else "the top rows"
+        on = f" on {col}" if col else ""
+        self._last.detail = (
+            f"two of {rows} tie{on}, so which rows come back — and in what order — is "
+            f"DuckDB's to choose, and DuckDB answered the original")
+        self._log(f"ties: {rows} are not ordered uniquely{on} — DuckDB answered the statement")
 
     def _on_rewrite_error(self, e: Exception) -> None:
         """The rewritten statement failed for a reason that is not staleness:
@@ -934,6 +990,9 @@ class Connection:
                 self._note_value()
                 return rel
             except duckdb.Error as e:
+                if self._last.rewritten and _rewrite.TIES_MARKER in str(e):
+                    self._on_ties(e)
+                    return self._raw.sql(query, **kw)
                 if self._last.rewritten and STALE_MARKER in str(e):
                     self._on_stale(sql)
                     return self._raw.sql(query, **kw)
@@ -1206,6 +1265,7 @@ class Connection:
         "decimal": "a DECIMAL this path does not carry",
         "collation": "a collation other than binary is in force",
         "error": "the rewrite raised while deciding",
+        "ties": "the top rows are not ordered uniquely, so the order is DuckDB's to choose",
     }
 
     def _detail(self) -> str:
