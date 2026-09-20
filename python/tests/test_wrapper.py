@@ -50,6 +50,27 @@ def has_device(con):
     return con._backend not in ("", "CPU")
 
 
+def drop_avg_decimal(con, cases, names, where):
+    """Remove the parity cases that average a DECIMAL column, where this
+    platform declines them.
+
+    avg over DECIMAL is derived in SQL as double(unscaled sum) / (count *
+    10^scale), which is native's own expression only where `long double` IS
+    double. On x86-64 it is the 80-bit type, so the guard in
+    _rewrite._check_avg_decimal() declines the shape and there is no rewritten
+    form for a parity case to compare. The decline itself is covered on both
+    platforms by the dedicated end-to-end section, so nothing goes unchecked
+    here — these cases simply have no second engine to check against."""
+    if getattr(con, "_avg_float_bits", 53) == 53:
+        return
+    for n in names:
+        cases.pop(n, None)
+    skip(f"{where}: avg over DECIMAL is declined where long double is "
+         f"{con._avg_float_bits} bits, not 53 ({', '.join(names)})")
+
+
+
+
 def native(sql):
     c = duckdb.connect()
     c.execute(SETUP)
@@ -175,6 +196,9 @@ def run():
         "str_pred":   "SELECT k, sum(v) FROM t WHERE s = 'delta' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
     }
+    drop_avg_decimal(con, cases,
+                     ["avg_decimal", "avg_decimal_nulls", "avg_decimal_having",
+                      "avg_decimal_order", "avg_decimal_expr"], "group-by parity")
     if not con._exact:
         for name in ("nulls", "min_max_avg", "where_int", "where_mixed", "where_having", "where_topk",
                      "having_eq", "having_avg", "decimal_minmax", "date_key", "date_pred",
@@ -626,6 +650,7 @@ def run():
         CREATE TABLE ad (did INTEGER PRIMARY KEY, tier INTEGER);
         INSERT INTO ad SELECT i, (i % 7)::INTEGER FROM range(40) r(i);
         """)
+        host_avgf = con._avg_float_bits          # before avg_bits() forces anything
         widest = con._raw.execute(
             "SELECT max(s) FROM (SELECT abs(sum(amt) * 100) AS s FROM ab GROUP BY k)").fetchone()[0]
         check(float(widest) > 2.0 ** 53,
@@ -679,13 +704,27 @@ def run():
         # expression, and every shape above is back on the device — including
         # the groups whose unscaled sum is past 2^53.
         avg_bits(con, 53)
+        # Forcing the REPORTED width to 53 changes the wrapper's DECISION. It
+        # does not change this host's arithmetic: on x86-64 DuckDB still
+        # finalises native's avg in the 80-bit type while the SQL derivation
+        # computes in 64-bit double, so the two genuinely differ on exactly the
+        # groups past 2^53 that this fixture is built to contain. The decision
+        # is checked on both platforms; the row equality can only be checked
+        # where long double really IS double.
         for name, sql in list(acases.items()) + list(ucases.items()):
             want = con._raw.execute(sql).fetchall()
             got = con.execute(sql).fetchall()
             lr = con.last_rewrite()
             check(lr["rewritten"], f"avgf=53 {name}: rewritten ({lr['reason']}: "
                                    f"{str(lr['detail'])[:60]})")
-            check(got == want, f"avgf=53 {name}: rows identical to native ({len(want)} rows)")
+            if host_avgf == 53:
+                check(got == want, f"avgf=53 {name}: rows identical to native ({len(want)} rows)")
+        if host_avgf != 53:
+            skip(f"avgf=53 rows-identical ({len(acases) + len(ucases)} shapes): this host's "
+                 f"long double is {host_avgf} bits, so pretending the extension reported 53 "
+                 f"changes which path runs but not what native computes — the derivation "
+                 f"differs from native here by construction, which is the bug the guard exists "
+                 f"for. The decision half of each shape is still checked above.")
     con.close()
 
     # ---- computed lanes (§4.10): expressions as payloads, keys and predicates ----
@@ -799,6 +838,7 @@ def run():
             "two_keys":       "SELECT k, z, sum(a) / count(*) AS m FROM tm GROUP BY k, z ORDER BY k, z",
             "string_key":     "SELECT s, sum(v) * 1.0 / count(*) AS m, upper(s) AS us FROM t GROUP BY s ORDER BY s NULLS LAST",
         }
+        drop_avg_decimal(con, pcases, ["avg_decimal_inside"], "post-aggregate expressions")
         for name, sql in pcases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
@@ -844,6 +884,7 @@ def run():
             "single_having_no": "SELECT sum(v) AS s FROM t WHERE v > 100000 HAVING sum(v) > 1",
             "single_ratio":     "SELECT sum(v) / count(*) AS m, count(*) FROM t WHERE k < 300",
         }
+        drop_avg_decimal(con, sgcases, ["single_decimal"], "global aggregate")
         for name, sql in sgcases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
@@ -856,6 +897,8 @@ def run():
                   f"global {name}: names and types identical")
         # EXCEPT both ways through the rewritten text itself
         for name in ("single_plain", "single_where", "single_decimal", "single_expr"):
+            if name not in sgcases:      # dropped above where this platform declines it
+                continue
             sql = sgcases[name]
             con.execute(sql).fetchall()
             rw = con.last_rewrite()["sql"]
@@ -1215,6 +1258,7 @@ def run():
             "over_join":         None,
         }
         acases.pop("over_join")
+        drop_avg_decimal(con, acases, ["avg_filter"], "aggregate FILTER")
         for name, sql in acases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
