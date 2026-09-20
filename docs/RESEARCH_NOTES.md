@@ -4725,6 +4725,192 @@ The honest comparison is the one run round-robin in a single process, and it is
 what the table above is.
 
 
+## 2026-09-20 — the memory budget nobody was enforcing
+
+The x86 box (RTX 4090 Laptop, 16 GB) ran the full transparent gate and watched
+device memory climb monotonically: 15 MiB → 1.6 GiB at 75 s → 5.1 GiB at 653 s
+→ 8.1 GiB at 870 s → 15.8 of 16.4 GiB at 1159 s, where it stayed. Past that
+point the run produced `CUDA exact where mask failed: out of memory` (7x),
+`CUDA global masked aggregate failed: out of memory` (2x) and 24x `resident
+group by: columns are resident on different backends`. Answers stayed correct
+throughout — every failure falls back to DuckDB — but `con.memory()`
+["evictions"] was **0 in every sample**. That measurement is the other box's;
+everything below is this one's.
+
+### Why it was 0: the gate had switched the budget off
+
+`scripts/transparent_gate.py` defaulted to `--memory-budget unlimited`, and
+`unlimited` parses to 0, which the wrapper turns into "no cap"
+(`Connection.__init__`: `budget or None`). So the release gate — the one
+long-running eager session anybody runs — was the one session with no budget
+at all. Nothing was enforcing anything, and there was nothing for an eviction
+counter to count. The default is now the wrapper's own, which is what ships;
+`unlimited` is still there for a sweep that wants to see every shape the
+engine accepts, with a note saying what it costs to run that way.
+
+### What the accounting actually is (Mac, M4 Max, SF1, eager)
+
+Three different numbers get called "resident bytes", and two of them are
+wrong in opposite directions:
+
+| what is summed | 26 rewritten sets | against the device |
+|---|---|---|
+| per-set `bytes` from `con.memory()["sets"]` | 2143 MiB | **4.4x too much** |
+| `gpu_residents().bytes` alone | 0 MiB | **all of it missing** |
+| distinct `gpu_store_columns().bytes` + non-view sets | 489 MiB | 1:1 |
+
+The first over-counts because a store-backed set is a VIEW over shared
+columns and reports what its lanes cost, so a column read by five sets is
+counted five times. The second is zero because a view owns nothing and
+`gpu_residents()` says so by design (`r.bytes = s->view ? 0 : ...`). The
+third is the physical truth, and it is what `_make_room` was already
+comparing with the budget — so the policy's own arithmetic was right all
+along, and the two diagnostics either side of it were not. `con.memory()`
+now carries `bytes` (the physical total) and `device_allocated` (what the
+driver says the process holds) beside the per-set figures, and the per-set
+figures say in their docstring that they are ranking quantities and must not
+be summed.
+
+Device truth, measured through a new `device_allocated=` field in
+`gpu_build_info()` (Metal's `MTLDevice.currentAllocatedSize`, left as a
+note in `src/include/backend_notes.hpp` so the frozen interface is untouched):
+across a 169-statement eager run the store's bytes grew +381 MiB and the
+driver's figure grew +385 MiB. The two track 1:1. The constant offset — 275
+MiB on this machine — is Metal's own machinery, and the budget does not
+account for it.
+
+### The estimate was 2.4x the truth, and that refused sets that fit
+
+`est_bytes` charged every lane the width of its TYPE, but since stage C a
+lane is stored at the narrowest signed width its values fit. Measured on the
+wrapper's own test table: estimate 6.44 MiB against 2.70 MiB resident,
+because an `INTEGER` key holding 0–999 is stored at two bytes and a `BIGINT`
+payload holding 0–96 at one. The estimate is the admission rule, so it was
+refusing sets that fit. It now narrows each plain-column lane from DuckDB's
+own zone-map statistics (`SELECT stats(col) FROM t LIMIT 1` — metadata,
+0.1–0.4 ms at SF10, once per template), which are bounds and therefore safe
+in the direction an upper bound needs. At SF1 under a 512 MiB budget this
+turned one refusal into an admission: 26 rewritten sets became 27, and 472
+MiB resident became 489 — still inside the budget.
+
+### A failed upload leaked 140 MiB of host memory per attempt
+
+Forcing the Metal backend to refuse an exact upload
+(`GPUDB_METAL_UPLOAD_REFUSE_MB`, added for exactly this) and running ONE
+statement twelve times:
+
+| | attempt 1 | attempt 12 | per attempt |
+|---|---|---|---|
+| live RSS, before | 271 MiB | 1810 MiB | **+140 MiB** |
+| live RSS, after | 272 MiB | 378 MiB | +1.5 MiB, flattening |
+
+`upload_finalize` and its four siblings say "the buffer stays in the pool
+until state_destroy — destroy handles cleanup unconditionally". It does not
+when finalize sets an error. The host segments of a refused upload — the
+largest buffer the extension ever holds, and the one case most likely to be
+retried — were never freed. Each finalize now releases its own state's pool
+entry in the `catch` before raising (`release_state_buf`, idempotent, so a
+destroy that does come finds nothing to do).
+
+### ... and the wrapper asked for it again on every statement
+
+The same run shows `attempts` going 1, 2, 3 … 12: one upload attempt per
+statement, for ever, for a set the device had already refused twelve times.
+The manager now REMEMBERS a refusal, keyed on the four things that could
+change the answer — the set's epoch, the budget, the resident population (a
+counter every eviction and every invalidation moves), and the anti-thrash
+window — with time as the backstop. Fifty executions of a statement whose
+set cannot fit are now **one** upload attempt, every answer native,
+`last_rewrite()` saying `memory` with the sizes each time.
+
+`max_attempts` also stopped being a cliff. Twenty failures used to leave a
+template declining `not_resident` for the life of the connection, long after
+whatever caused them was over; the attempt budget is now given back when the
+refusal lapses, so the cap is a rate limit (one attempt per `rate_s`) rather
+than a death sentence.
+
+### A device refusal must not become a host-resident set
+
+`HybridAggregatorImpl::upload_pair_exact` / `upload_rows_exact` caught the
+device's exception and uploaded to the CPU reference instead. Two things
+follow from that, and both were seen on the x86 box:
+
+* the wrapper rewrites the statement because the set is resident, and answers
+  it from host memory through the CPU reference — which is slower than plain
+  DuckDB, so rule 1 is broken by a fallback nobody asked for;
+* a store is filled by several such calls, so one of them landing on the host
+  leaves a store with lanes on both sides, and the next view that reads one
+  of each refuses with "columns are resident on different backends". In the
+  long gate run the first OOM precedes the first such error by ~200 lines,
+  which is that sequence.
+
+On a backend that says it CAN do the exact path, a device refusal is now
+reported (`GPUDB_DEVICE_UPLOAD_REFUSED`) rather than worked around. A backend
+with no exact path at all still goes to the reference — that branch is only
+entered when the GPU said yes and then could not. As a second line the
+extension reports `on_gpu` per store column (another `backend_notes.hpp`
+note, NULL where nobody can say), and the wrapper drops any lane that landed
+on the host and refuses the set rather than letting a later statement
+discover it.
+
+### Working memory the budget cannot hold
+
+A statement can run out of device memory with its set comfortably resident:
+the exact reduce's scratch, a sort's temporaries. None of that is resident,
+so no budget over resident bytes can see it. Two things now happen instead of
+the same failure on the next statement. The sets are refused, with the
+refusal remembered like any other. And where the backend says how much it
+needed and how much was free — CUDA now prints `out of memory (needs 274 MiB
+of working memory, 186 MiB free)` — the shortfall becomes a headroom the
+budget holds back from then on. It is the device's own measurement of this
+workload, taken at its largest, and a backend that reports no numbers (Metal
+today) leaves it at zero and relies on the refusal alone.
+
+### The gate
+
+`scripts/budget_gate.py`: a long eager session over 169 distinct templates
+under a budget too small for them, asserting at every sample that physical
+resident bytes are at or under the budget, that `evictions_wasted` stays 0,
+that no lane is on the host, that every statement's rows equal plain
+DuckDB's, and that no set is uploaded more than once. The bound is exact
+rather than "the budget plus one upload in flight": the wrapper decides
+before it uploads, so nothing is ever above the line. SF1, 200 MiB budget,
+M4 Max:
+
+| n | ready | refused | resident MiB | evictions | wasted |
+|---|---|---|---|---|---|
+| 20 | 9 | 0 | 97.3 | 0 | 0 |
+| 40 | 1 | 2 | 114.5 | 2 | 0 |
+| 120 | 1 | 11 | 114.5 | 2 | 0 |
+| 169 | 3 | 12 | 180.3 | 2 | 0 |
+
+0 differing, 0 errors, at most 1 upload attempt for any set, 56 s — so it
+runs in `local_check.sh` beside the transparent gate. With `--refuse-mb 8`
+the same 169 statements produce 26 device refusals, nothing resident, and
+`device_allocated` flat at 0.9 MiB: a refused upload leaves nothing behind.
+
+What the table also shows is the honest limit of the value policy under a
+sweep: everything uploaded in the last minute is inside the anti-thrash
+window, and a set that has answered exactly one statement (the one that
+uploaded it, whose time is the upload's and is deliberately not credited as
+a saving) is worth nothing yet. So a sweep of one-shot templates mostly
+REFUSES rather than evicts, which is correct — refusing keeps every answer
+right — but it means the budget's eviction path is exercised by a workload
+that repeats, not by one that never does.
+
+### Two things the wrapper was saying wrongly
+
+A rewritten statement that raised at execution reported `rewritten: True`
+with a `detail` taken from the run that had ADMITTED the template ("the row
+floor counted the 1500000 rows of orders…"), because `_on_rewrite_error` set
+the cached decision's `reason` to `error` without touching its `why`. It now
+reports `rewritten: False`, `fallback: True`, and the exception's own first
+line — on that run and on every later run of the same template. The gate and
+`tpch_coverage.py` print that sentence for every `error`, `memory` and
+`not_resident` row, which is where a reader could previously see only the
+word.
+
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
