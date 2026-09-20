@@ -11,7 +11,7 @@
 # developer flow (unit tests, benchmarks, the embedded gpudb-sql CLI) use
 # ./scripts/build.sh instead; the two paths are independent.
 
-.PHONY: clean clean_all
+.PHONY: clean clean_all check_git_checkout
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -75,7 +75,29 @@ include extension-ci-tools/makefiles/c_api_extensions/c_cpp.Makefile
 # points sqllogictest at our isolated, valid-format directory instead.
 override TEST_RUNNER_BASE = $(TEST_RUNNER) --test-dir test/sqllogic $(EXTRA_EXTENSIONS_PARAM)
 
-configure: venv platform extension_version
+# This build path needs a git checkout, not just the sources. The version
+# stamped into the extension metadata footer comes from `git describe` (the
+# `extension_version` target in base.Makefile). Built from an unpacked tarball
+# that command fails, its error text is written into the footer instead of a
+# version, and the resulting binary cannot be loaded at all — DuckDB reports
+# something like "Unknown ABI type for extension: 't filesystem boundary
+# (GIT_DISCO'". Nothing further along the pipeline notices, so stop here and
+# say why. In a git checkout this target does nothing.
+check_git_checkout:
+	@git -C "$(PROJ_DIR)" rev-parse --git-dir >/dev/null 2>&1 || { \
+	    echo "Makefile: $(PROJ_DIR) is not a git checkout (or git is not installed)."; \
+	    echo "  This build path stamps the extension version from \`git describe\`;"; \
+	    echo "  without a repository the metadata footer would hold git's error text"; \
+	    echo "  and the extension would not load. Build from a \`git clone\` of the"; \
+	    echo "  repository, or use ./scripts/build.sh for the local developer flow."; \
+	    exit 1; \
+	}
+
+configure: check_git_checkout venv platform extension_version
+
+# ... and the same guard directly on the target that reads git, so it holds
+# however the pipeline reaches it.
+extension_version: check_git_checkout
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
 release: build_extension_library_release build_extension_with_metadata_release
