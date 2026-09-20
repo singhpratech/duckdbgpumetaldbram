@@ -333,6 +333,19 @@ def run():
               f"{name}: native, reason={lr['reason']} (expected {reason})")
         check(name == "where_volatile" or sorted(map(str, got)) == sorted(map(str, nat)), f"{name}: answer unchanged")
 
+    # `SELECT count(*) FROM t`: no GROUP BY and no column at all, so §4.12's
+    # constant key — a predicate over a column — has nothing to be built from,
+    # and DuckDB answers it from the table's own row count anyway. A correct
+    # decline; what is checked here is that the DETAIL says the real reason
+    # rather than talking about a GROUP BY the statement does not have.
+    got = con.execute("SELECT count(*) FROM t").fetchall()
+    lr = con.last_rewrite()
+    check(not lr["rewritten"] and got == native("SELECT count(*) FROM t")[0],
+          f"count(*) with no WHERE: native and unchanged (reason={lr['reason']})")
+    check("group by is not one to eight columns" not in lr["detail"]
+          and ("no column" in lr["detail"] or "global" in lr["detail"] or lr["reason"] != "shape"),
+          f"count(*) with no WHERE: the detail says the real reason ({lr['detail'][:100]})")
+
     print("== catalog shadowing")
     con.execute("CREATE TEMP TABLE t2 AS SELECT * FROM t")
     con.execute("SELECT k, sum(v) FROM t2 GROUP BY k").fetchall()

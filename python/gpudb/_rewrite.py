@@ -40,6 +40,16 @@ _CMP = {
 _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
 
 
+def _has_colref(e) -> bool:
+    """Does this subtree name a column at all? (What §4.12's constant key
+    needs: see the no-GROUP-BY decline in match().)"""
+    if isinstance(e, dict):
+        return e.get("class") == "COLUMN_REF" or any(_has_colref(v) for v in e.values())
+    if isinstance(e, list):
+        return any(_has_colref(v) for v in e)
+    return False
+
+
 class Decline(Exception):
     """The statement is not rewritten; .reason is one of the §6 keywords."""
     def __init__(self, reason: str, detail: str = ""):
@@ -290,7 +300,20 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         pass
     groups = node.get("group_expressions") or []
     sets = node.get("group_sets") or []
-    if not 1 <= len(groups) <= 8 or sets != [list(range(len(groups)))]:
+    if not groups:
+        # An aggregate with no GROUP BY reaches here only when §4.12 could not
+        # make a global plan out of it (_split.split). The single group of a
+        # global aggregate is a constant key computed from a COLUMN of the
+        # table ("c IS NULL AND c IS NOT NULL"), so a statement that names no
+        # column has nothing to build it from — `SELECT count(*) FROM t` is
+        # that statement, and DuckDB answers it from the table's own row count
+        # without reading a column at all, which no device pass can beat.
+        raise Decline("shape",
+                      "no GROUP BY, and the statement names no column for the global aggregate "
+                      "to read (count(*) alone is answered from the table's row count)"
+                      if not _has_colref(node) else
+                      "no GROUP BY, and no global-aggregate form for this statement")
+    if len(groups) > 8 or sets != [list(range(len(groups)))]:
         raise Decline("shape", "group by is not one to eight columns")
     keys = [_colref(g) for g in groups]
     if any(k is None for k in keys):
