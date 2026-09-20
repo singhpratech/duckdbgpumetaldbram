@@ -63,11 +63,15 @@ column names, same column types as native, either way. No hints, no schema
 changes, nothing to call.
 
 This path is **on by default on both GPUs** — Apple Silicon Metal and NVIDIA
-CUDA. It was turned on for CUDA once the measurement was there: the full gate
-on an RTX 4090 Laptop ran 1630 cells with **0 slower than native and 0
-differing**. `GPUDB_CUDA_EXACT=0` turns the CUDA path off again without a
-rebuild ([Platforms and install](docs/INSTALL.md#platforms-and-install) has the
-detail, including what a registry install on Linux gives you).
+CUDA. It was turned on for CUDA once the measurement was there: the full gate on
+an RTX 4090 Laptop, run **before the switch**, was 1630 cells with 0 slower than
+native and 0 differing. Re-run on the **release build**, the same gate on that
+card is 1631 cells, 0 differing, with **one cell below parity** — a three-group
+`GROUP BY` over a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten,
+0.93×; run on its own it is handed back to DuckDB by the measured rule after its
+first run. `GPUDB_CUDA_EXACT=0` turns the CUDA path off again without a rebuild
+([Platforms and install](docs/INSTALL.md#platforms-and-install) has the detail,
+including what a registry install on Linux gives you).
 
 ### Try it in a minute
 
@@ -181,8 +185,8 @@ through `execute()` and 0.92× through `sql()` in the timed run, 1.06× and 0.89
 in two immediate re-runs of the same build. On CUDA, **Q1 straddles parity** the
 same way, at 0.96× and 0.98× here. Both are exactly the case the per-process
 measured rule exists to settle: it times the template against native in your own
-process and hands it back to DuckDB where it loses. Nothing else rewritten in
-this run is below 1.0× at either scale factor.
+process and hands it back to DuckDB where it loses. No other query in these
+coverage runs is below 1.0×, at either scale factor, on either card.
 
 The queries that stay on DuckDB are declined on purpose, and which ones stay
 depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
@@ -195,8 +199,10 @@ too, before its shape is ever looked at). The CUDA box declines the same five at
 SF1. Each of them runs on DuckDB unchanged, at DuckDB's speed.
 
 The thresholds both GPUs use are the Metal-measured ones, verified on one CUDA
-machine rather than measured for every GPU — the gate that verified them is the
-1630-cell run named above.
+machine rather than measured for every GPU — the 1630-cell gate run on that card
+before the CUDA path was switched on. Its re-run on the release build is
+described above: 0 differing, and one gate cell at 0.93× that the measured rule
+declines on its own.
 
 Query by query at both scale factors, with the four per-query tables and the
 exact conditions: [BENCHMARK.md](BENCHMARK.md), *the release build* (2026-09-20)

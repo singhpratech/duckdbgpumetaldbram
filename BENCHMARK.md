@@ -5660,7 +5660,8 @@ this run is below 1.0× at either scale factor.
 ### Gates
 
 `scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor
---path auto`, 668 s wall:
+--path auto` on this M4 Max, 668 s wall (the RTX 4090's own run of the same gate
+is recorded by that machine, in its own section):
 
 | | cells |
 |---|---|

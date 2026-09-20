@@ -169,11 +169,22 @@ default*).
 
 What turned it on was a measurement: the full gate on that box, at the
 wrapper's own memory budget, ran **1630 cells with 0 slower than native and 0
-differing**, minimum ratio 1.07×. Two caveats are worth carrying. The
-thresholds the wrapper decides with are the Metal-measured ones, **verified on
-one CUDA machine** rather than measured for every GPU. And TPC-H Q1 sits at
-parity on that box — it has measured either side of 1.0× across runs of the
-same build — which is the case the per-process measured rule exists to settle.
+differing**, minimum ratio 1.07×. That is a dated result, taken before the
+switch.
+
+The same gate on the **release build** of that card is **1631 cells, 1013 of
+them rewritten and passing, 616 declined on a threshold, 0 differing — and one
+cell below parity**: a three-group `GROUP BY l_returnflag` with no `WHERE` over
+a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten, **0.93×**. It is
+the TPC-H Q1 shape, the one already known to straddle parity on this card. Run
+on its own, the measured rule declined it after its first run on all three
+attempts — which is the rule working, not a gap in it.
+
+Two caveats are worth carrying. The thresholds the wrapper decides with are the
+Metal-measured ones, **verified on one CUDA machine** rather than measured for
+every GPU. And TPC-H Q1 sits at parity on that box — it has measured either side
+of 1.0× across runs of the same build — which is the case the per-process
+measured rule exists to settle.
 `GPUDB_CUDA_EXACT=0` turns the path off without a rebuild, leaving a CUDA
 machine the explicit `gpu_*` functions and plain SQL on DuckDB: correct, with
 no speed-up.

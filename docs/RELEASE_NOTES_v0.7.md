@@ -370,9 +370,9 @@ full licence text so GitHub detects it (#89).
   small for them, 0 rows differing, 0 errors; physical resident 91.6–231.8 MiB
   against a 256 MiB budget at every sample, 1 eviction with 0 wasted, 10
   refusals, at most one upload attempt per set.
-- `scripts/transparent_gate.py`, the full sweep on the release build: **1630
-  cells — 970 rewritten and PASS, 0 slower than native, 0 differing**, minimum
-  ratio 1.04×, maximum 55.2×; 495 declined on a threshold, 77 declined after
+- `scripts/transparent_gate.py`, the full sweep on the release build **on the
+  M4 Max (Metal)**: **1630 cells — 970 rewritten and PASS, 0 slower than native,
+  0 differing**, minimum ratio 1.04×, maximum 55.2×; 495 declined on a threshold, 77 declined after
   their first run, 72 on shape, 16 not found. `scripts/wrapper_residency_gate.py`:
   pass, 0 failing rows.
 - `scripts/transparent_gate.py` now drives both entry points (#170). The top-k
@@ -473,7 +473,16 @@ of parity there. The same coverage and the same five declines as Metal (#161,
 #168). What turned it on was the evidence the flip
 had been waiting for: the full gate on that box, at the wrapper's own memory
 budget, ran **1630 cells with 0 slower than native and 0 differing**, minimum
-ratio 1.07×. `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild.
+ratio 1.07× — a dated result, taken before the switch.
+
+Re-run on the **release build**, that gate on the same card is **1631 cells,
+1013 rewritten and passing, 616 declined on a threshold, 0 differing — and one
+cell below parity**: a three-group `GROUP BY l_returnflag` with no `WHERE` over
+a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten, **0.93×**. That
+is the TPC-H Q1 shape, already reported above as straddling parity on this card,
+and run on its own the measured rule handed it back to DuckDB after its first
+run on all three attempts. Passing ratios ran 1.00×–406.70×, peak device memory
+2365 MiB. `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild.
 
 Two caveats stay: the thresholds are the Metal-measured ones **verified on one
 CUDA machine** rather than measured for every GPU (`_thresholds.TABLE["CUDA"]`

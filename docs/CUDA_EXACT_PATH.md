@@ -13,8 +13,12 @@ by default*). SF10 on CUDA is not recorded.
 The path is **on by default**: the CUDA backend reports `exact_supported()`,
 and with it `global_supported()` and `join_supported()`, true without anything
 being set. What turned it on was the evidence rather than the code being
-finished — the full gate on that box ran 1630 cells at the wrapper's own memory
-budget with 0 cells slower than native and 0 differing, minimum ratio 1.07×.
+finished — the full gate on that box, run before the switch, was 1630 cells at
+the wrapper's own memory budget with 0 cells slower than native and 0 differing,
+minimum ratio 1.07×. On the release build the same gate is 1631 cells, 0
+differing, with one cell at 0.93× (a three-group `GROUP BY` over a full
+`lineitem` scan, the TPC-H Q1 shape) that the measured rule declines when the
+shape is run on its own.
 `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild, and that switch
 exists because a column is single-homed: a set resident on the GPU cannot fall
 back to the CPU reference for an operator the GPU lacks, so disabling the path
@@ -150,8 +154,13 @@ silicon (unified memory, no PCIe), and the worry was that a discrete GPU moves
 results over the bus, so the output-bound limits (`plain_max_groups`,
 `reagg_max_pairs`, …) would differ. The gate was then run on the RTX 4090
 Laptop with the exact path on and the wrapper's own memory budget: 1630 cells,
-0 slower than native, 0 differing, minimum ratio 1.07×. Nothing in it asked for
-a different constant, so no CUDA table is written. The one shape to re-check if
+0 slower than native, 0 differing, minimum ratio 1.07×. Re-run on the release
+build it is 1631 cells, 1013 rewritten and passing, 616 declined on a threshold,
+0 differing, with one cell at 0.93× — `GROUP BY l_returnflag`, no `WHERE`, three
+groups over a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten —
+which the measured rule hands back to DuckDB after the first run when the shape
+is run alone. Nothing in either run asked for a different constant, so no CUDA
+table is written. The one shape to re-check if
 that is ever reconsidered is TPC-H Q1, which straddles 1.0× on that box
 (0.95–1.04× across runs of the same build) and which the measured rule decides
 per process. Two cells that did lose, on an earlier run, turned out to be
