@@ -873,36 +873,35 @@ public:
     }
 
     // ---- v0.7: the exact path (§4.1, §4.2, §4.6, §4.8, §4.12) ----
-    // Whether the transparent rewrite may target this backend for an exact
-    // statement. The exact path is COMPLETE — upload, GROUP BY, the global
-    // aggregate and the materialised key join all run here — and the
-    // wrapper-level evidence now exists on this box (BENCHMARK.md, the dated
-    // RTX 4090 section): the wrapper suite and scripts/tpch_coverage.py have
-    // both been run against a CUDA exact backend, 17 of 22 TPC-H SF1 queries
-    // on the device with 0 rows differing from native.
-    //
-    // The default is still opt-in behind GPUDB_CUDA_EXACT=1 only because
-    // flipping it is its own change: it is one line, it costs nothing to hold,
-    // and the distinction it turns on is worth stating. The SQL suite proves
-    // the TABLE FUNCTIONS. Flipping this additionally makes the Python wrapper
-    // rewrite plain SQL STATEMENTS here, and only test_wrapper.py and
-    // tpch_coverage.py prove a rewritten statement returns native's rows — a
-    // runtime rule-1 check would catch a slow template, but nothing at runtime
-    // catches a different answer.
-    //
-    // The flag is also not only a capability answer: it decides where
-    // upload_rows_exact PUTS the columns, and a resident column is
-    // single-homed, so a set on this device cannot fall back to the CPU
-    // reference for any operator.
     // Stage C: every I64 lane of an exact set is stored at the narrowest
-    // signed width its values fit. The sort cache is not narrowed yet, so
-    // this reports what it says on the tin — lane storage — and nothing more.
+    // signed width its values fit, and the exact sort cache holds its keys at
+    // that width with u32 row ids. The flag means lane storage, which is what
+    // this is.
     bool narrow_lanes() const noexcept override { return true; }
 
+    // Whether the transparent rewrite may target this backend for an exact
+    // statement. ON: the exact path is complete — upload, GROUP BY, the
+    // global aggregate and the materialised key join all run here — and the
+    // wrapper-level evidence exists on this box (BENCHMARK.md, the dated
+    // RTX 4090 sections). The SQL suite proves the table functions; the
+    // wrapper suite and scripts/tpch_coverage.py are what prove a REWRITTEN
+    // STATEMENT returns native's rows, and both have been run here.
+    //
+    // The flag is also a placement decision, not only a capability answer: it
+    // decides where upload_rows_exact PUTS the columns, and a resident column
+    // is single-homed, so a set on this device cannot fall back to the CPU
+    // reference for any operator. That is why it stayed off while the path was
+    // partial — claiming it then turned the reference's clean answer into a
+    // thrown error, measured at 19 SQL failures.
+    //
+    // GPUDB_CUDA_EXACT=0 is the kill switch: it puts the whole exact path back
+    // behind the CPU reference without a rebuild. Coarse by necessity — a
+    // single-homed column has no per-operator way back — and that coarseness
+    // is the point of having it at all.
     bool exact_supported() const noexcept override {
         static const bool on = [] {
             const char* e = std::getenv("GPUDB_CUDA_EXACT");
-            return e && e[0] == '1' && e[1] == '\0';
+            return !(e && e[0] == '0' && e[1] == '\0');
         }();
         return on;
     }

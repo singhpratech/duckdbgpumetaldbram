@@ -5243,3 +5243,80 @@ the v0.6 cache is a separate change over a different set of kernels.
 unit 750/750; SQL 224 pass / 0 fail with `GPUDB_CUDA_EXACT=1` and 223/1 with it
 off; wrapper 4 failures, the same pre-existing segmented-upload cluster.
 
+## v0.7 — the CUDA exact path on by default, RTX 4090, SF1 (2026-09-20)
+
+`exact_supported()` now returns true without an environment variable, so the
+transparent rewrite targets this backend for exact statements the way it does
+Apple Silicon Metal. This section is the evidence the flip waited for.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds on, N=9,
+`data/tpch_sf1/tpch.duckdb`. No environment variable set — this is the default
+build.
+
+`gpu_build_info()`: `compiled=cpu,cuda runtime=cuda exact=true join=true
+global=true narrow=true device_memory=0 store=true rebuilds=0/0
+device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **750 / 750** |
+| SQL suite, default | **224 pass / 0 fail**, 45 guardrail, 0 skip |
+| SQL suite, `GPUDB_CUDA_EXACT=0` | 223 / 1 — q11 asserts `global=true`, correct for a disabled path |
+| wrapper (`test_wrapper.py`) | **1202 ok / 4 fail / 0 skip** |
+| TPC-H SF1 | **17 of 22 on the device, 0 rows differing from native** |
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---|---|---|
+| Q1  | GPU (plain)     | 10.3 | 10.9 | **0.95×** |
+| Q3  | GPU (plain)     | 10.8 | 3.5  | 3.11× |
+| Q4  | GPU (plain)     | 11.3 | 1.2  | 9.28× |
+| Q5  | GPU (plain)     | 10.6 | 0.8  | 12.87× |
+| Q7  | GPU (plain)     | 12.5 | 3.5  | 3.56× |
+| Q8  | GPU (projected) | 10.3 | 3.6  | 2.86× |
+| Q9  | GPU (plain)     | 38.2 | 3.5  | 10.94× |
+| Q10 | GPU (topk)      | 21.9 | 4.1  | 5.37× |
+| Q12 | GPU (plain)     | 8.0  | 5.3  | 1.51× |
+| Q13 | GPU (nested)    | 31.7 | 5.2  | 6.06× |
+| Q14 | GPU (projected) | 8.5  | 0.6  | 15.27× |
+| Q15 | GPU (nested)    | 5.7  | 3.0  | 1.88× |
+| Q17 | GPU (projected) | 8.3  | 0.5  | 15.72× |
+| Q18 | GPU (plain)     | 31.7 | 3.0  | 10.46× |
+| Q19 | GPU (projected) | 14.9 | 0.6  | 23.27× |
+| Q21 | GPU (plain)     | 35.9 | 4.1  | 8.81× |
+| Q22 | GPU (plain)     | 13.7 | 0.8  | 17.45× |
+
+Q2, Q6, Q11 and Q16 decline on thresholds; Q20 declines on shape (it does not
+bind on its own). The same five as Metal at SF1.
+
+### Q1 is a losing row, printed as one
+
+**0.95× — slower than native.** It has measured 1.04, 0.96, 0.99, 0.97 and 1.02
+on earlier runs of the same build, so it straddles 1.0 and this run fell on the
+low side. It is not noise being reported as a win: the honest description is
+that Q1 is at parity and sometimes below it.
+
+Rule 1 says never slower than native, and a statement that hovers at 1.0 is
+exactly the case the thresholds exist to decline. `python/gpudb/_thresholds.py`
+is Metal-measured; nothing in it has been measured on CUDA, so the fact that 16
+of the 17 rewritten queries are comfortably above 1.0 is a property of those
+queries, not evidence that the thresholds transfer. Per-backend thresholds are
+their own change, and Q1 is the row that will decide whether the CUDA set needs
+a floor the Metal set does not.
+
+### The four wrapper failures
+
+All four are the segmented background upload (`== segmented upload (0c)`), and
+they are **independent of the exact path** — identical with `GPUDB_CUDA_EXACT=0`
+(5 of 20 segments with the path on, 9 of 20 with it off, ~200 interrupts either
+way). The cause is measured: a segment's scan costs `~1.5 ms + 0.00002 ms/row`
+on this box, against the ~2.5 ms mean window that the test's `U(0,10) ms` sleep
+leaves after `idle_ms = 5`. The adaptive sizing added in #167 reaches its floor
+(seg_scale 32, 32768 rows, 2.50 ms) and stops there, which is still too big.
+
+A fix is in progress on the macOS side: cut the fixed per-segment cost, then
+derive the floor from the measured cost and window rather than a constant. The
+failure mode meanwhile is "the set never becomes resident, so the statement
+stays on DuckDB" — correct answers, never slower than native, just not
+accelerated. That is the safe direction, which is why it does not gate the flip.
+

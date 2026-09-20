@@ -4974,6 +4974,74 @@ line — on that run and on every later run of the same template. The gate and
 `not_resident` row, which is where a reader could previously see only the
 word.
 
+## 2026-09-20 — The flip, and what a gate is actually for
+
+`exact_supported()` returns true by default on CUDA. The transparent rewrite
+now targets this backend for exact statements the way it does Apple Silicon
+Metal, and the v0.7 port is functionally complete on both.
+
+The flag was implemented on 2026-09-19 and flipped a day later. Nothing in the
+kernels changed in between. What changed is that the evidence for flipping it
+came to exist, and the shape of that gap is the thing worth keeping.
+
+### The gate was never about whether the code worked
+
+The SQL suite was green on the exact path from the day it landed — 224 pass, 0
+fail. That proves the TABLE FUNCTIONS. What flipping the flag additionally does
+is let the Python wrapper rewrite plain SQL statements here, and only
+`test_wrapper.py` and `scripts/tpch_coverage.py` prove that a rewritten
+statement returns native's rows. Neither had ever run against a CUDA exact
+backend.
+
+The asymmetry that justified holding: a runtime rule-1 check catches a slow
+template, because slowness is observable while the query runs. Nothing at
+runtime catches a different ANSWER. A wrong row is returned, accepted, and
+never mentioned again. So the evidence for rule 2 has to be collected before
+the flip, and it cost one line to hold and a day to gather.
+
+What that day actually produced, none of which was predicted at the time the
+flag was written:
+
+- avg over DECIMAL was returning wrong answers on x86 with default settings,
+  982 of 5000 groups, because a guard read a field before the loop that fills
+  it. Found by the wrapper suite, which had never run here.
+- `AS MATERIALIZED` was being ignored because DuckDB 1.5.5 stopped serializing
+  the hint — a guard testing for a value that is no longer emitted.
+- The wrapper's own avg tests asserted a property that cannot hold on x86,
+  because forcing a flag simulates the decision and never the arithmetic.
+
+Three rule-2 findings, all in shared code, none of them CUDA's. Every one was
+surfaced by running the suites the gate was waiting for. A gate that had been
+waved through on "the SQL suite is green" would have shipped all three.
+
+### What the flip does not settle
+
+Rule 1 is not established on CUDA. `_thresholds.py` is Metal-measured, and 16
+of the 17 rewritten TPC-H queries being comfortably above 1.0 is a property of
+those queries rather than evidence that the thresholds transfer. Q1 measures
+0.95 in the run recorded beside this entry, having measured 1.04, 0.96, 0.99,
+0.97 and 1.02 on the same build: it straddles parity and this time fell below
+it. It is printed as a losing row.
+
+That is the honest state: rule 2 is measured, rule 1 is assumed from another
+machine's numbers, and per-backend thresholds are the change that turns the
+second into the first.
+
+### Four failures that stay failures
+
+The segmented-upload cluster is unchanged and unrelated — identical with the
+path off. The cause is now a measured curve rather than a suspicion: a
+segment's scan costs ~1.5 ms fixed plus 0.00002 ms a row, against the ~2.5 ms
+window the test's cadence leaves. The adaptive sizing reaches its floor and
+stops, because the floor is a constant that assumes a per-segment cost this
+machine does not have.
+
+They do not gate the flip, and the reason is worth stating rather than assumed:
+the failure mode is "the set never becomes resident, so the statement stays on
+DuckDB". Correct answers, never slower than native, just not accelerated. A
+failure whose worst case is "behaves like the CPU build" is not the same kind
+of thing as a failure that returns a row, and treating them the same would be
+its own error.
 
 ## Open questions
 
