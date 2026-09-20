@@ -150,11 +150,15 @@ needs nothing installed.
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
 join — and the path is **on by default**. On an RTX 4090 Laptop the unit suite
-is **752 / 752**, the SQL suite **225 passing, 0 failing**, the wrapper suite
-**1258 passing, 0 failing**, and TPC-H at SF1 is **17 of 22 queries on the
-device, 0 rows differing from native** — the same coverage and the same five
-declines as Metal at that scale factor ([BENCHMARK.md](../BENCHMARK.md), *the
-CUDA exact path on by default*).
+is **752 / 752** (402 / 402 in a container with no device, where the CUDA-only
+device checks are skipped), the SQL suite **225 passing, 0 failing**, the
+wrapper suite passing, and TPC-H at SF1 is **17 of 22 queries on the device, 0
+rows differing from native** through both entry points — 0.96×–21.40× through
+`execute()` and 0.98×–13.30× through `sql()`, the low end of each being Q1,
+which straddles parity there. That is the same coverage and the same five
+declines as Metal at that scale factor: Q2, Q6, Q11, Q16 on a threshold and Q20
+on its shape ([BENCHMARK.md](../BENCHMARK.md), *the CUDA exact path on by
+default*).
 
 What turned it on was a measurement: the full gate on that box, at the
 wrapper's own memory budget, ran **1630 cells with 0 slower than native and 0
@@ -212,8 +216,8 @@ release-page binaries are unsigned — the community install above does not.
 ```sql
 SELECT gpu_build_info();
 -- compiled=cpu,metal runtime=metal exact=true join=true global=true narrow=true
---   device_memory=55662788608 store=true rebuilds=0/0 device='Apple M4 Max'
---   avgf=53
+--   device_memory=55662788608 device_allocated=901120 store=true rebuilds=0/0
+--   device='Apple M4 Max' avgf=53
 -- (avgf is the mantissa bits of the host's long double, which is what native
 --  finalises an avg in; 53 on arm64, 64 on x86-64)
 ```

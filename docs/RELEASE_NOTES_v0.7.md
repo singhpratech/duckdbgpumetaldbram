@@ -14,15 +14,24 @@ the resident GROUP BY and top-k table functions. The loadable extension still
 touches DuckDB through the stable C API only (the C_STRUCT ABI): it links no
 libduckdb, includes no DuckDB C++ headers and does no plan surgery.
 
-**Measured** on an Apple M4 Max (Metal), TPC-H, warm, with every table the
-query reads already resident, at the default memory budget, minimum of 5 runs,
-every row compared with native (conditions and the per-query tables:
-`BENCHMARK.md`):
+**Measured** on an Apple M4 Max (Metal), macOS 26.6.2, DuckDB 1.5.5, on the
+release build of 2026-09-20: TPC-H, warm, with every table the query reads
+already resident, at the default memory budget, N=5, every row compared with
+native. Both entry points are timed separately because they are different code
+paths (conditions and the four per-query tables: `BENCHMARK.md`, *the release
+build*):
 
-| | Queries on the GPU | Rows differing | Speed-up on those queries |
-|---|---|---|---|
-| SF1 | 17 of 22 | 0 | 1.4× – 13.6× |
-| SF10 | 19 of 22 | 0 | 1.3× – 52.9× |
+| | Asked through | Queries on the GPU | Rows differing | Speed-up on those queries |
+|---|---|---|---|---|
+| SF1 | `execute()` | 17 of 22 | 0 | 1.52× – 15.32× |
+| SF1 | `sql()` | 17 of 22 | 0 | 1.37× – 9.49× |
+| SF10 | `execute()` | 19 of 22 | 0 | 1.06× – 48.10× |
+| SF10 | `sql()` | 19 of 22 | 0 | 0.92× – 26.39× |
+
+**Q11 at SF10 straddles parity and is printed as such**: a 6–7 ms statement, at
+1.06× through `execute()` and 0.92× through `sql()` in the timed run, 1.06× and
+0.89× in two immediate re-runs. The per-process measured rule is what settles
+it. No other rewritten query in the run is below 1.0× at either scale factor.
 
 ---
 
@@ -208,7 +217,8 @@ release branch at all.
   `scripts/budget_gate.py` (56 s, in `local_check.sh`), which asserts at every
   sample that physical resident stays under the budget, that no lane is on the
   host, that no set is uploaded twice, and that every row equals native's.
-  Measured after it: **TPC-H SF10 is 19 of 22 at the default budget**, with no
+  Measured after it, and again on the release build: **TPC-H SF10 is 19 of 22 at
+the default budget**, with no
   `memory` declines — the raised budget the earlier runs used is no longer
   needed.
 - **An operator that cannot get working memory says how much it wanted** (#171)
@@ -320,8 +330,9 @@ full licence text so GitHub detects it (#89).
 
 ## Tests, CI and packaging
 
-- `python/tests/test_wrapper.py`: green under DuckDB 1.4.5 and under 1.5.5 on
-  an M4 Max, and **1258 of 1258** on the RTX 4090 Laptop (#150 makes the suite
+- `python/tests/test_wrapper.py`: **1267 checks, 0 skipped, 0 failing** on an
+  M4 Max on the release build — the same count under DuckDB 1.4.5 and under
+  1.5.5 — and **1258 of 1258** on the RTX 4090 Laptop (#150 makes the suite
   run to the end on a backend without the exact path; #159 and #160 replaced its
   host gating with a probe for the function that decides; #164 added the
   reported tie and its fallbacks; #170 asserts the remembered verdict as a count
@@ -332,22 +343,36 @@ full licence text so GitHub detects it (#89).
   failures, all of them segmented-upload cases unrelated to the exact path
   (#161); once #169 priced a segment from what each machine measures, it came
   back fully green.
-- `python/tests/test_residency_policy.py`: 0 failing — the residency policy on a
+- `python/tests/test_residency_policy.py`: **131 checks, 0 failing** on the
+  release build, under both DuckDB versions — the residency policy on a
   clock the test drives, so the yield rule, the quiet-window bound, the measured
   segment floor and the remembered refusal are asserted directly rather than
   raced against a real machine (#167, #169, #172). Its check count, like the
   wrapper suite's, is taken per machine and re-counted on the release build.
-- `test_gpudb`: 752 / 752 checks on CPU + CUDA (RTX 4090 Laptop) — 711 before
-  #163 gave CUDA a fused `agg_all` and the suite stopped skipping that block,
-  and #171 added the forced-refusal case.
-- `run_sql_tests.sh`: 225 passing, 0 failing on the RTX 4090 with the default
-  build; 45 `expected_fail` guardrail cases across the 18 files in `test/sql/`.
+- `test_gpudb`: **3056 / 3056** checks on CPU + Metal (M4 Max, release build);
+  752 / 752 on CPU + CUDA (RTX 4090 Laptop) — 711 before #163 gave CUDA a fused
+  `agg_all` and the suite stopped skipping that block, and #171 added the
+  forced-refusal case. In a container with no device the CUDA-only device checks
+  are skipped and the binary reports 402 / 402 (#174).
+- `run_sql_tests.sh`: **225 passing, 0 failing** on both machines — 46
+  expected-failure guardrail cases reached on Metal and 1 skipped, out of 48
+  `expected_fail` directives across the 18 files in `test/sql/`.
+- `python/tests/test_shell.py`: **77 checks, 0 skipped** under DuckDB 1.4.5 and
+  **76 with 1 skipped** under 1.5.5 on the release build; the skip is a
+  throwaway virtualenv that cannot import `duckdb`, so the console entry point
+  cannot start there.
 - `scripts/tpch_coverage.py`: SF1 17 of 22 and SF10 19 of 22 on the M4 Max,
-  SF1 17 of 22 on the RTX 4090, 0 rows differing anywhere. SF10 runs at the
-  **default** memory budget since #172.
-- `scripts/budget_gate.py` (#172): 169 statements under a budget too small for
-  them — physical resident at or under the budget at every sample, 0 evictions
-  wasted, at most one upload attempt per set, 0 rows differing, 0 errors.
+  SF1 17 of 22 on the RTX 4090, 0 rows differing anywhere, through `execute()`
+  and `sql()` alike. SF10 runs at the **default** memory budget since #172.
+- `scripts/budget_gate.py` (#172): **PASS — 169 statements** under a budget too
+  small for them, 0 rows differing, 0 errors; physical resident 91.6–231.8 MiB
+  against a 256 MiB budget at every sample, 1 eviction with 0 wasted, 10
+  refusals, at most one upload attempt per set.
+- `scripts/transparent_gate.py`, the full sweep on the release build: **1630
+  cells — 970 rewritten and PASS, 0 slower than native, 0 differing**, minimum
+  ratio 1.04×, maximum 55.2×; 495 declined on a threshold, 77 declined after
+  their first run, 72 on shape, 16 not found. `scripts/wrapper_residency_gate.py`:
+  pass, 0 failing rows.
 - `scripts/transparent_gate.py` now drives both entry points (#170). The top-k
   and plain subset was re-run at SF1 through `execute()` and through `sql()`:
   every row at or above its bound and identical either way, with the `l_partkey`
@@ -435,8 +460,10 @@ Every operator the transparent path needs is implemented on CUDA (#152, #153,
 #154) and the path is **on by default** there (#168). On an RTX 4090 Laptop the
 unit suite is 752 / 752, the SQL suite 225 passing and 0 failing, the wrapper
 suite 1258 passing and 0 failing, and TPC-H at SF1 is 17 of 22 on the device
-with 0 rows differing through both entry points — the same coverage and the same
-five declines as Metal (#161, #168). What turned it on was the evidence the flip
+with 0 rows differing through both entry points — 0.96×–21.40× through
+`execute()`, 0.98×–13.30× through `sql()`, Q1 the low end of each and a straddle
+of parity there. The same coverage and the same five declines as Metal (#161,
+#168). What turned it on was the evidence the flip
 had been waiting for: the full gate on that box, at the wrapper's own memory
 budget, ran **1630 cells with 0 slower than native and 0 differing**, minimum
 ratio 1.07×. `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild.
