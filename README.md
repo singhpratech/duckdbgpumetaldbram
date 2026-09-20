@@ -101,14 +101,17 @@ gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey
 …
 └───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 24.3 ms
+DuckDB (not_resident: the resident set is not ready yet) · 24.1 ms
 …
-GPU (topk: the resident GROUP BY) · 29.8 ms
+GPU (topk: the resident GROUP BY) · 39.2 ms
 ```
 
-The whole session — the banner, every reason code the footer prints, `.gpu` /
-`.residents` / `.memory`, and nine runs each way with the path off and on — is
-in the shell guide.
+Nine more runs of it each way, same session, same connection: **median 14.9 ms
+with the path off against 8.7 ms with it on**, both series printed whole so the
+warm-ups and the wrapper's own measuring run stay visible. The whole session —
+the banner, every reason code the footer prints, `.gpu` / `.residents` /
+`.memory`, and those eighteen runs — is in the shell guide, with what a
+different machine state does to the ratio.
 
 **Nothing you use goes away.** `gpu_upload`, `gpu_upload_pair`, the
 `gpu_*_resident` scalars, the fused joins, the resident GROUP BY and top-k table
@@ -309,7 +312,10 @@ tie order of its own there, and plain DuckDB above one thread returned 3
 different row sets — and up to 6 different orderings — over 20 runs of one such
 statement. The device is asked for one row past the limit and stops itself when
 it sees the tie, so that is decided against the data on every execution rather
-than guessed from the shape.
+than guessed from the shape. Through `sql()` — the path the `gpudb` shell takes
+— the check cannot be a clause of your statement, so the first call of a data
+version asks the device once more and the verdict is then remembered until the
+data changes: one extra device pass per data version, not one per call.
 
 ## What runs on the GPU, and what stays on DuckDB
 
@@ -389,6 +395,12 @@ by form](KNOWN_ISSUES.md#the-size-bounds-form-by-form).
   join whatever the group count, so a join returning one group is rewritten.
 - Then the run-time measurement above overrides the bounds in either direction.
   `last_rewrite()["detail"]` names the rule that decided, in both directions.
+- That measurement times **the path the statement arrived on**. `execute()` and
+  `sql()` — the one the shell uses — reach the same templates, but `sql()` hands
+  back a lazy relation and so pays for its guards inside the call. What is
+  compared against native is therefore what a caller on that path actually pays,
+  and a template that only loses through one door is declined at that door
+  alone.
 - Any error on the rewritten path re-runs the user's original statement on
   DuckDB. An error there can never reach you as a different or a missing answer.
 - Every rewritten statement carries a staleness guard that re-counts the rows of
@@ -410,7 +422,13 @@ those two wait for a quiet moment rather than run beside your statements; the
 wait is bounded at 20 seconds per step, after which the step runs anyway, so
 residency is delayed on a busy machine and never withheld. Segments also adapt
 their size when they rarely fit the window a workload leaves between its
-statements.
+statements, and they are priced from what **this** machine measures: a segment
+has a fixed cost no smaller one escapes, so the size stops halving at the
+smallest one still worth taking here. When even that does not fit the pauses a
+workload leaves, the manager says so — `progress()` reports `starved`, with the
+window it measured and where the floor is — and the statements stay on DuckDB:
+correct and at native speed, simply not resident. `residency="eager"`, or a
+pause long enough for one segment, is the way out.
 
 The memory budget defaults to a quarter of unified memory on Apple silicon and
 half of device memory on a discrete GPU (`memory_budget=`, or
@@ -686,8 +704,8 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 
 | Suite | Result | Where |
 |---|---|---|
-| `test_wrapper.py` — the transparent path | 1206 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
-| `test_residency_policy.py` — the residency policy, on a driven clock | 85 checks, 0 failing | M4 Max |
+| `test_wrapper.py` — the transparent path | 1238 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
+| `test_residency_policy.py` — the residency policy, on a driven clock | 105 checks, 0 failing | M4 Max |
 | `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing | M4 Max |
 | `tpch_coverage.py` with `GPUDB_CUDA_EXACT=1` | SF1 17 of 22 on the device, 0 rows differing | RTX 4090 Laptop |
 | `test_gpudb` — unit checks | 750 / 750 | RTX 4090 Laptop, CPU + CUDA |
@@ -697,12 +715,14 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 The wrapper and coverage rows were re-measured on the M4 Max on this commit;
 the unit and SQL rows are the RTX 4090's, which is where they were last run
 against this code. `test_gpudb` and the SQL suite on the M4 Max run in CI on
-every push and were not re-run by hand here. On the x86-64 box the wrapper
-suite carries **4 failures** in the segmented-upload cases — the background
-uploader never finds a quiet window under that test's statement cadence — with
-the measurements in [BENCHMARK.md](BENCHMARK.md). They are unrelated to the
-exact path (they reproduce with the flag unset) and do not appear on Apple
-silicon.
+every push and were not re-run by hand here. The x86-64 box used to carry four
+failures in the segmented-upload cases — the background uploader never found a
+quiet window under that test's statement cadence — and once a segment was
+priced from what each machine measures rather than from a constant, that box
+came back fully green with the exact path on, **1209 of 1209** at the time it
+was run. The check count differs between the two boxes because the
+`avg`-over-`DECIMAL` section branches on the host's `long double`; the number
+above is the Mac's, on this commit.
 
 The SQL suite lives in `test/sql/*.test` — plain SQL with `-- expect:` lines,
 reported per query as PASS / FAIL / GUARDRAIL / SKIP; `test/sqllogic/` is a

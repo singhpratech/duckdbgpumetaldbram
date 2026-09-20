@@ -42,7 +42,7 @@ python -m gpudb                   # the same entry point
 
 The banner is the machine's answer to "is this actually going to use the GPU".
 Every transcript in this section comes from one session on an M4 Max over
-TPC-H SF1, opened read-only, default settings, DuckDB 1.5.5:
+TPC-H SF1, opened read-only, default settings, DuckDB 1.5.5, 2026-09-20:
 
 ```
 $ gpudb data/tpch_sf1/tpch.duckdb --readonly
@@ -50,9 +50,9 @@ $ gpudb data/tpch_sf1/tpch.duckdb --readonly
 [gpudb] registered gpu_groupby_{sum,sum_f64,count,exact}_resident[_having|_topk] + gpu_topk_resident[_f64]
 [gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates + resident-column functions (gpu_upload, gpu_*_resident) (backend=Metal)
 gpudb 0.7.0
-backend:      Metal · Apple M4 Max · 51.8 GiB device memory
-transparent:  available — every statement goes through the wrapper
-database:     data/tpch_sf1/tpch.duckdb
+backend:       Metal · Apple M4 Max · 51.8 GiB device memory
+transparent:   available — every statement goes through the wrapper
+database:      data/tpch_sf1/tpch.duckdb
 Enter .help for usage.
 ```
 
@@ -82,7 +82,7 @@ gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey
 │     10426 │       1513.00 │
 └───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 24.3 ms
+DuckDB (not_resident: the resident set is not ready yet) · 24.1 ms
 ```
 
 **That first line is not a failure, and it is the one thing worth understanding
@@ -96,7 +96,7 @@ see that it got there:
 ```
 gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
 … the same five rows …
-GPU (topk: the resident GROUP BY) · 29.8 ms
+GPU (topk: the resident GROUP BY) · 39.2 ms
 ```
 
 That run is still the first one through the device pipelines. Nine more of it
@@ -106,25 +106,33 @@ against nine with the path off, same session, same connection, is the A/B:
 gpudb> .gpu off
 GPU path off — statements go straight to DuckDB.
 … 9 runs …
-DuckDB (off: the transparent path is off on this connection) · 25.9, 18.6, 16.2, 15.1, 15.0, 15.0, 15.0, 14.9, 15.1 ms
+DuckDB (off: the transparent path is off on this connection) · 20.7, 17.4, 15.5, 15.1, 14.8, 14.8, 14.9, 14.8, 14.8 ms
 gpudb> .gpu on
 GPU path on — residency: background.
 … 9 runs …
-GPU (topk: the resident GROUP BY) · 12.8, 34.0, 5.0, 5.0, 4.9, 4.8, 5.1, 4.7, 4.7 ms
+GPU (topk: the resident GROUP BY) · 9.6, 32.3, 8.7, 8.7, 8.7, 8.7, 8.5, 8.4, 8.4 ms
 ```
 
-**Median 15.1 ms on DuckDB against 5.0 ms on the GPU — 3.0×.** Both series are
-printed whole on purpose: DuckDB's first two runs are its own warm-up, the
-GPU's first is the pipeline's, and the 34.0 ms is a real outlier on a laptop
-that is doing other things. The 24.3 ms at the top of the section is the
-true cost of asking before the column was there. Those numbers are one
-machine's; the point of the footer is that you can take the same five
-measurements on yours.
+**Median 14.9 ms on DuckDB against 8.7 ms on the GPU — 1.7×.** Both series are
+printed whole on purpose: DuckDB's first three runs are its own warm-up, the
+GPU's first is the pipeline's, and the 32.3 ms is the wrapper measuring this
+template against native on a side cursor, which it does once and then every 60
+seconds. The 24.1 ms at the top of the section is the true cost of asking
+before the column was there.
+
+Those numbers are one machine's *in one state*. A statement this short has two
+speeds on Apple silicon — this same statement reads 5–6 ms on a quiet machine
+and 8–9 ms when other threads are waking, whatever else is running, and the
+journal entry *Two modes of a short kernel* has the experiment that pins it
+down. That is exactly why the wrapper measures in your process rather than
+trusting a published ratio, and why the footer prints a time at all: the five
+measurements above are ones you can take on yours.
 
 If you would rather pay the upload now — a script that knows its workload, or
 a benchmark — start with `--residency eager` and the upload happens inside the
 statement that asked for it (which therefore takes as long as a scan of the
-column, 61 ms for this one at SF1). `--residency manual` never uploads by
+column — 73 ms for this one at SF1, measured by starting the same
+session with `--residency eager`). `--residency manual` never uploads by
 itself; only sets you uploaded by hand are used, and ["Uploading by
 hand"](#uploading-by-hand) is how.
 
@@ -142,7 +150,7 @@ gpudb> SELECT l_returnflag, median(l_quantity) FROM lineitem GROUP BY 1 ORDER BY
 │ R            │              26.00 │
 └──────────────┴────────────────────┘
 
-DuckDB (shape: not a shape the rewrite expresses: select expression) · 52.6 ms
+DuckDB (shape: not a shape the rewrite expresses: select expression) · 46.5 ms
 ```
 
 The reason codes you will actually meet:
@@ -183,7 +191,7 @@ gpudb> SELECT l_orderkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_orderk
 │    4702759 │        320.00 │
 └────────────┴───────────────┘
 
-DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 47.1 ms
+DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 43.8 ms
 ```
 
 Plain DuckDB does not have one answer here either — above one thread it returns
@@ -194,12 +202,24 @@ by the same measured rule that declines any losing template, and the next run of
 it reads
 
 ```
-DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the device pass costs 33.70 ms on top of whatever native costs, so the template is native from here (re-measured in 60 s)) · 11.6 ms
+DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the device pass costs 26.20 ms on top of whatever native costs, so the template is native from here (re-measured in 60 s)) · 25.7 ms
 ```
 
 until the 60-second re-measure finds the tie gone. A `LIMIT` below the tie, or an
 `ORDER BY` that is already total (`ORDER BY qty DESC, l_orderkey`), keeps the
 device.
+
+One thing about that check is particular to this shell. Inside `execute()` it is
+a clause of your own statement and costs a row. The shell goes through `sql()`,
+which hands back a relation read after the call has returned — too late for the
+check to raise there — so it runs on a side cursor inside the call instead, and
+for a pushed top-k that side cursor is the device pass itself. Paid on every
+call it would cost the shape its whole win, so **the verdict is remembered**:
+the first statement of a data version asks the device once more, and every call
+after it reads the answer back until the data changes. Any write, DDL, `SET`,
+`ATTACH` or a foreign write the wrapper notices drops it along with the resident
+sets, and so does a row count that has moved, so a remembered "no tie" can never
+outlive the rows it was taken over.
 
 ## Look underneath
 
@@ -213,7 +233,7 @@ rewritten:     True
 form:          topk
 tag:           gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity
 sql:           SELECT "key" AS l_partkey, (CAST(sum AS DECIMAL(36,0)) * 0.01) AS qty FROM gpu_groupby_exact_resident_topk('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', 'sum', 6, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:tpch:main:lineitem:20631:l_partkey,l_quantity', count_star()) AS ok FROM tpch.main.lineitem) AS gd WHERE gd.ok QUALIFY CASE  WHEN (((rank() OVER (ORDER BY qty DESC) = row_number() OVER (ORDER BY qty DESC)) OR (rank() OVER (ORDER BY qty DESC) > 5))) THEN (CAST('t' AS BOOLEAN)) ELSE "error"('GPUDB_TIES: the first 5 rows are not ordered uniquely by qty') END ORDER BY qty DESC LIMIT 5
-round_trip_ms: 0.007 ms
+round_trip_ms: 0.006 ms
 engine:        scalar
 detail:        the resident GROUP BY
 ```
@@ -241,7 +261,7 @@ them. This is the same session, after those nineteen runs:
 ```
 gpudb> .residents
 table          columns               state  bytes     estimated  worth
-main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  1.08
+main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  2.13
 1 set · 80.1 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
 
 table     column      dtype  rows       width  bytes     state
@@ -266,7 +286,7 @@ lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
 - `worth` is the set's value: milliseconds of DuckDB time it saves per second
   of wall time, per GiB it holds. It reads `-` until the set has been used
   enough to have one, and it is what the budget compares when it has to
-  choose. Nineteen runs of one statement put this one at 1.08.
+  choose. Nineteen runs of one statement put this one at 2.13.
 - The **column** lines are the store underneath, and their `state` means
   something narrower: whether *that lane* has a sort cache. Only a key lane
   ever needs one, so a payload lane reads `preparing` and stays there. Read
@@ -276,10 +296,10 @@ lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
 
 ```
 gpudb> .memory
-backend:      Metal · Apple M4 Max · 51.8 GiB device memory
-resident:     80.1 MiB in 1 set
-budget:       16.0 GiB
-residency:    background
+backend:       Metal · Apple M4 Max · 51.8 GiB device memory
+resident:      80.1 MiB in 1 set
+budget:        16.0 GiB
+residency:     background
 ```
 
 Raise or lower it with `--memory-budget 16GB` (`unlimited` removes the cap).

@@ -48,9 +48,9 @@ $ gpudb data/tpch_sf1/tpch.duckdb --readonly
 [gpudb] registered gpu_groupby_{sum,sum_f64,count,exact}_resident[_having|_topk] + gpu_topk_resident[_f64]
 [gpudb] registered gpu_sum / gpu_min / gpu_max streaming aggregates + resident-column functions (gpu_upload, gpu_*_resident) (backend=Metal)
 gpudb 0.7.0
-backend:      Metal · Apple M4 Max · 51.8 GiB device memory
-transparent:  available — every statement goes through the wrapper
-database:     data/tpch_sf1/tpch.duckdb
+backend:       Metal · Apple M4 Max · 51.8 GiB device memory
+transparent:   available — every statement goes through the wrapper
+database:      data/tpch_sf1/tpch.duckdb
 Enter .help for usage.
 
 gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;
@@ -65,7 +65,7 @@ gpudb> SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey
 │     10426 │       1513.00 │
 └───────────┴───────────────┘
 
-DuckDB (not_resident: the resident set is not ready yet) · 24.3 ms
+DuckDB (not_resident: the resident set is not ready yet) · 24.1 ms
 ```
 
 The first ask is on DuckDB on purpose: the columns are uploaded in short
@@ -76,14 +76,17 @@ same statement, nine runs each way in the same session:
 ```
 gpudb> .gpu off
 GPU path off — statements go straight to DuckDB.
-… DuckDB · 25.9, 18.6, 16.2, 15.1, 15.0, 15.0, 15.0, 14.9, 15.1 ms
+… DuckDB · 20.7, 17.4, 15.5, 15.1, 14.8, 14.8, 14.9, 14.8, 14.8 ms
 gpudb> .gpu on
 GPU path on — residency: background.
-… GPU (topk: the resident GROUP BY) · 12.8, 34.0, 5.0, 5.0, 4.9, 4.8, 5.1, 4.7, 4.7 ms
+… GPU (topk: the resident GROUP BY) · 9.6, 32.3, 8.7, 8.7, 8.7, 8.7, 8.5, 8.4, 8.4 ms
 ```
 
-Median 15.1 ms against 5.0 ms — 3.0×, with both series printed whole so the
-warm-up runs and the one outlier are visible.
+Median 14.9 ms against 8.7 ms — 1.7×, with both series printed whole so the
+warm-up runs and the wrapper's own measuring run stay visible. A statement this
+short has two speeds on Apple silicon — 5–6 ms on a quiet machine, 8–9 ms when
+other threads are waking — which is why the wrapper measures in your process
+instead of trusting a published ratio.
 
 The banner's `backend:` line names the runtime, the device as the driver
 reports it, and the device memory the budget plans against; a build without a
@@ -140,7 +143,7 @@ one or two bytes a row rather than eight. Same session as above:
 ```
 gpudb> .residents
 table          columns               state  bytes     estimated  worth
-main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  1.08
+main.lineitem  l_partkey,l_quantity  ready  80.1 MiB  207.5 MiB  2.13
 1 set · 80.1 MiB held · worth is ms saved per second per GiB · `.memory` for the budget
 
 table     column      dtype  rows       width  bytes     state
@@ -213,7 +216,7 @@ sentence behind it.
 | `threshold` | a measured bound says DuckDB is faster for this shape and size, **or** this machine measured it slower and the template went back to DuckDB |
 | `shape` | not a shape the rewrite expresses: a window function, `median`, `ROLLUP`, a set operation, a subquery in the select list |
 | `double` | a `sum` / `avg` over `DOUBLE` or `FLOAT` — never rewritten, because native's own answer depends on the order the values are added |
-| `ties` | a pushed `ORDER BY … LIMIT k` found two of the first *k* rows equal on the ordering value — which rows come back, and in what order, is DuckDB's to choose, and it answered the original. Decided against the data on every execution; a tie that keeps happening shows as `threshold` with the tie named in `detail`, until the 60-second re-measure |
+| `ties` | a pushed `ORDER BY … LIMIT k` found two of the first *k* rows equal on the ordering value — which rows come back, and in what order, is DuckDB's to choose, and it answered the original. Decided against the data on every execution; a tie that keeps happening shows as `threshold` with the tie named in `detail`, until the 60-second re-measure. Through `sql()` — and so through the shell — the check runs on a side cursor inside the call, so the first statement of a data version asks the device once more and the verdict is remembered until the data changes |
 | `backend` | this build has no GPU backend to rewrite for, or the installed extension is older than this client |
 | `memory` | the set does not fit the device-memory budget; it is refused before the upload |
 | `transaction` | a `BEGIN` is open, so the resident sets cannot be trusted |
@@ -230,7 +233,7 @@ GPU (topk: a key join materialised on the device) · 8.1 ms
 DuckDB (threshold: 7 groups < 1000) · 5.0 ms
 DuckDB (threshold: measured 4.20 ms rewritten vs 3.10 ms native (re-measured in 60 s)) · 3.2 ms
 DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
-DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 47.1 ms
+DuckDB (ties: two of the first 5 rows tie on qty, so which rows come back — and in what order — is DuckDB's to choose, and DuckDB answered the original) · 43.8 ms
 DuckDB (off: the transparent path is off on this connection) · 12.0 ms
 ```
 
