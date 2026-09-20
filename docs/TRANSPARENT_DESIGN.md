@@ -96,9 +96,13 @@ GROUP BY k1 [, k2, k3]
   by equalities — many-to-many, `USING`, composite or non-integer keys, extra
   `ON` predicates, self joins, keys or expressions that mix columns of several
   tables — is answered from an upload of the join's result (§4.13, Python
-  wrapper). RIGHT / FULL / semi / anti joins, cross products, subqueries as
-  join inputs and joins whose result is more than four times the largest
-  table run native.
+  wrapper). `A RIGHT JOIN B` is normalised to `B LEFT JOIN A` first (§4.21) and
+  goes the same way. A derived table as a join input is folded in and then
+  joined like any other input. `FULL` joins, `SEMI` / `ANTI` join syntax,
+  `NATURAL` joins (`shape: … INNER NATURAL join`), a `USING` clause over a
+  derived table that renamed the column (`shape: … JOIN ... USING`), cross
+  products, and joins whose result is more than four times the largest table
+  run native.
 - No `GROUP BY` at all (`SELECT sum(x), count(*) FROM … WHERE …`) is its own
   device operator, a single fused pass with no key (§4.12): accepted over a
   join at any size, and over a single table above a measured row and
@@ -2441,9 +2445,13 @@ answered on the device.
   is revisited only if a definition of exactness against native ever exists.
 - **`median`, `stddev`, quantiles.** No kernel and no decomposition that keeps
   rule 2.
-- **`FULL` joins, semi / anti joins, cross products, subqueries as join
-  inputs.** §2 rejects them on shape. The fused semi / anti joins remain
-  available as explicit `gpu_*` calls.
+- **`FULL` joins, `SEMI` / `ANTI` join *syntax*, `NATURAL` joins, cross
+  products.** §2 rejects them on shape. The `EXISTS` / `IN` *forms* are
+  rewritten — §4.18 lowers them to predicate lanes — and the fused semi / anti
+  joins remain available as explicit `gpu_*` calls. A derived table as a join
+  input is *not* in this list: it is folded in and joined like any other input
+  (§4.16). A `USING` clause is rewritten over base tables, and declines over a
+  derived table that renamed the join column.
 - **Correlated subqueries outside a `WHERE` term** (TPC-H Q2, Q20). The inner
   statement does not bind on its own (§4.14). The decorrelation is expressible;
   the `GROUP BY` it produces is output-bound and the measured bounds decline it,

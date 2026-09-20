@@ -85,9 +85,11 @@ order-dependently — the shape is never rewritten.
   exact everywhere. Over `DECIMAL` it is not expressible in SQL at all, since
   the host's `long double` is 80-bit on x86-64 and SQL has no 80-bit type, so
   the division moved into C++: `gpu_avg_decimal(sum HUGEINT, count BIGINT,
-  scale BIGINT)`. The shape is now rewritten on every platform. An extension
-  too old to provide that function still declines it rather than deriving it
-  in SQL, so the change is additive across version skew.
+  scale BIGINT)`. The shape is now rewritten on every platform. Against an
+  extension too old to provide that function the column is derived in SQL, and
+  the wrapper declines the shape only where that derivation is not native's own
+  arithmetic — where `gpu_build_info()` reports `avgf=` anything but 53. So the
+  change is additive across version skew: nothing that was right becomes wrong.
 
 ## Kernels
 
@@ -116,7 +118,8 @@ order-dependently — the shape is never rewritten.
   table's row order with NULLs under a bitmap; one per-table store holds a
   single copy of each column, which statements are views over; each lane is
   stored at the narrowest signed width its values fit. The 22 TPC-H queries at
-  SF10 went from 44.9 GiB to 22.7.
+  SF10 went from 44.9 GiB to 22.7 — and to 18.7 once a key lane with few
+  distinct values stopped keeping a sort cache.
 - **The memory budget** (#115, #122, #144) — a pre-upload estimate that is an
   upper bound by construction, admission before the upload rather than eviction
   after it, a `memory` reason and `detail` when a set is refused, and eviction
@@ -138,16 +141,41 @@ order-dependently — the shape is never rewritten.
 
 ## Using it
 
-- **The `gpudb` shell** (#138) — plain DuckDB SQL from a terminal, DuckDB's own
-  box renderer, and a footer under each result saying where the statement ran
-  and why. `.gpu`, `.gpu on|off`, `.residents`, `.memory`, `.timer`, `.read`,
-  `.open`, `.tables`, `.schema`, `.version`.
-- **`last_rewrite()["detail"]`** (#140) — the decision in a sentence next to the
-  reason code, `sql()` deciding on `execute()`'s path, and the device reported
-  by name.
-- **Distribution name `duckdb-gpudb`** (#136), import name `gpudb`;
-  Apache-2.0 in the package metadata to match the repository (#133), and the
-  full licence text so GitHub detects it (#89).
+There are **three ways in**, and they all talk to the same extension and the
+same resident columns:
+
+1. **The `gpudb` shell** (#138) — plain DuckDB SQL from a terminal, DuckDB's own
+   box renderer, and a footer under each result saying where the statement ran
+   and why. `.gpu`, `.gpu on|off`, `.residents`, `.memory`, `.timer`, `.read`,
+   `.open`, `.tables`, `.schema`, `.version`.
+2. **Python — `gpudb.connect()`** — the same decision from an application, a
+   notebook or a pipeline. **`last_rewrite()["detail"]`** (#140) gives the
+   decision in a sentence next to the reason code, `sql()` decides on
+   `execute()`'s path, and the device is reported by name.
+3. **Explicit `gpu_*` functions** — any DuckDB client in any language,
+   including the stock CLI. This is the only route that needs no wrapper,
+   because DuckDB's stable C API has no hook that sees a statement before it is
+   planned. v0.6.0 registered 38 of these functions; v0.7 registers 65, and
+   every v0.6 one is still there under the same name, return type and parameter
+   types.
+
+Installing both pieces:
+
+```bash
+pip install duckdb-gpudb          # the `gpudb` command and the gpudb module
+```
+```sql
+INSTALL gpudb FROM community;     -- the extension, into DuckDB
+LOAD gpudb;
+```
+
+To replace an extension DuckDB already has, `INSTALL` alone is not enough:
+`FORCE INSTALL gpudb FROM community;`, or `UPDATE EXTENSIONS;`. The wrapper
+upgrades with `pip install -U duckdb-gpudb`.
+
+**Distribution name `duckdb-gpudb`** (#136), import name `gpudb`;
+Apache-2.0 in the package metadata to match the repository (#133), and the
+full licence text so GitHub detects it (#89).
 
 ## Tests, CI and packaging
 
@@ -171,8 +199,9 @@ order-dependently — the shape is never rewritten.
 
 ## What stays on DuckDB
 
-Window functions; `FULL` joins, `SEMI` / `ANTI` **join syntax** and cross
-products (the `EXISTS` / `IN` *forms* are rewritten — see Joins above);
+Window functions; `FULL` joins, `SEMI` / `ANTI` **join syntax**, `NATURAL`
+joins and cross products (the `EXISTS` / `IN` *forms* are rewritten — see Joins
+above);
 `median`, `stddev` and quantiles; `sum` / `avg` over `DOUBLE` or `FLOAT`;
 prepared-statement parameters; statements inside an explicit transaction;
 `WITH RECURSIVE` and `AS MATERIALIZED` CTEs; `ROLLUP` / `CUBE` /

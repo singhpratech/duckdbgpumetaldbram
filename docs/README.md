@@ -79,7 +79,7 @@ Entries are in date order in the file; this groups them by question.
 - A capability flag that was really a placement decision (CUDA)
 
 **Using it**
-- pip install gpudb (the Python wrapper; the distribution is named `duckdb-gpudb`, the import is `gpudb`)
+- The Python wrapper, and the name it had to be published under — the entry titled "pip install gpudb"; the distribution is `duckdb-gpudb`, the import is `gpudb`
 - A terminal is a client (the `gpudb` shell)
 - The end-of-file that arrived while nobody was reading, and the Ctrl-C that had nobody to wake — two pty races that turned out to be stock Python's
 - The other build path, unexercised since the rewriting began
@@ -89,6 +89,8 @@ Entries are in date order in the file; this groups them by question.
 - CI runs the wrapper suite, and what a machine without a GPU can prove
 - A test that pretended to be the other machine
 - The column SQL could not compute (`avg` over `DECIMAL`, derived in C++)
+- Measurements that existed only in review (the CUDA numbers put into the repository)
+- A hypothesis that was wrong, and a 32% win that was real (the CUDA exact upload, double-buffered)
 
 The journal ends with **Open questions** — the shapes the current design does
 not answer, each with the measurement that says why. It is a record of where

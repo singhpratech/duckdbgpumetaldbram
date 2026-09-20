@@ -106,8 +106,10 @@ DuckDB's own headers are present:
    ```
 2. Build:
    ```bash
-   ./scripts/build.sh      # → build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
-   ```                     #   (or build-linux/…/gpudb.linux_amd64.duckdb_extension)
+   ./scripts/build.sh
+   # → build-macos/src/extension/gpudb.osx_arm64.duckdb_extension
+   #   (or build-linux/…/gpudb.linux_amd64.duckdb_extension)
+   ```
 3. Install the wrapper from the same checkout:
    ```bash
    pip install -e python/
@@ -130,11 +132,20 @@ older than the client — the banner's `transparent:` line says so,
 `con.extension_note` carries the same sentence, and every statement simply
 runs on DuckDB.
 
-**Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 (the
-wrapper's own requirements). The community registry needs DuckDB ≥ 1.5.5; a
-binary from the releases page needs only DuckDB ≥ 1.2, because the loadable
-extension is built against the stable C API v1.2.0. macOS: Apple silicon for
-the Metal backend. Linux with CUDA: see the [CUDA
+**Supported versions.** Python ≥ 3.9 and the `duckdb` module ≥ 1.4 — the
+wrapper's own requirements, and they are *not* the same as route 1's. The
+registry builds gpudb for DuckDB ≥ 1.5.5, so a `duckdb` module that satisfies
+`pip` can still be a version the registry has nothing to install for: on
+DuckDB 1.4.5, `INSTALL gpudb FROM community` is a 404. Pin it with `pip install
+"duckdb==1.5.5"` if you are taking route 1. A binary from the releases page
+needs only DuckDB ≥ 1.2, because the loadable extension is built against the
+stable C API v1.2.0.
+
+macOS: an Apple silicon Mac for the Metal backend. Building it needs the
+macOS 15 SDK, which is where `MTLLanguageVersion3_2` comes from (CI builds on
+`macos-15`); the built binary asks the OS at run time and compiles its shaders
+as MSL 3.2 on macOS 15 and later, MSL 3.1 below
+(`src/backends/metal/metal_groupby.mm`). Linux with CUDA: see the [CUDA
 requirements](#cuda-requirements-build-from-source-on-linux) table — the short
 version is that a binary built with CUDA 13 needs an R580+ driver, and one
 built with CUDA 12.x reaches the GPU on R525+.
@@ -379,9 +390,17 @@ lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
 
 - The **set** line is what a statement waits on: `ready` means uploaded and
   its sort cache built. `estimated` is the upper bound the budget reserved
-  against; `bytes` is what the extension actually holds, which is smaller
-  because each lane is stored at the narrowest signed width its values fit
-  (here `l_quantity` in 2 bytes, `l_partkey` in 4).
+  against; `bytes` is what the extension actually holds. That is the lanes
+  *plus the sort cache of a key lane* — which is why `l_partkey` reads 68.7 MiB
+  and not the 22.9 MiB its 6,001,215 rows at 4 bytes each come to: 22.9 MiB of
+  key data and 45.8 MiB of sorted keys and permutation, 8 bytes a row on top of
+  the 4. A lane with no sort cache is exactly its width (`l_quantity`, 2 bytes
+  a row, 11.4 MiB). Each lane is stored at the narrowest signed width its
+  values fit, which is where those widths come from.
+- A set **you uploaded by hand** reads `0 B` here: the wrapper never planned
+  it, so it has no estimate of its own for it and no store columns underneath.
+  It is counted against the memory budget all the same — admission sums every
+  row of `gpu_residents()` — and it is never evicted.
 - `worth` is the set's value: milliseconds of DuckDB time it saves per second
   of wall time, per GiB it holds. It reads `-` until the set has been used
   enough to have one, and it is what the budget compares when it has to
@@ -546,7 +565,7 @@ the whole of what it adds. Everything else is DuckDB's.
 |---|---|
 | `con.residents()` | `{identity tag: state}` for every set the wrapper is managing. State is `missing`, `pending`, `uploading`, `ready`, `stale` or `failed`. |
 | `con.store_columns()` | one dict per resident column — `table`, `column`, `dtype`, `rows`, `width` (bytes a row of the lane is stored at), `bytes`, `prepared`. This is what the shell's `.residents` prints underneath. Returns `[]` when no usable extension is loaded. |
-| `con.transparent` | readable and settable. `con.transparent = False` leaves every statement on DuckDB from then on (`reason == "off"`); `True` puts it back. Nothing is dropped either way — resident sets and decisions survive the round trip, which is what makes it usable as an A/B switch. |
+| `con.transparent` | readable and settable. `con.transparent = False` leaves every statement on DuckDB from then on; `True` puts it back. Nothing is dropped either way — resident sets and decisions survive the round trip, which is what makes it usable as an A/B switch. `reason == "off"` is what a statement that would otherwise have been *decided* reports; one that never reaches the decision — `SELECT 1`, or an aggregate over a table below the row floor — still reports `shape` or `threshold`. |
 | `con.residency` | read-only: `"background"`, `"eager"` or `"manual"`, as passed to `connect()`. To change it, open another connection. |
 | `con.interrupt()` | DuckDB's own interrupt, on this connection's handle. It stops the statement running on **this** connection; a `cursor()` has its own handle and is not affected. |
 | `con.duplicate()` | exactly `con.cursor()`, under DuckDB's name for it. |
@@ -692,7 +711,7 @@ TPC-H Q1 over the very same two keys runs on the GPU is the next section.
 
 ### Explicit `gpu_*` functions — any DuckDB client, including the CLI
 
-The 65 `gpu_*` functions are unchanged in v0.7 (bar one addition, `gpu_avg_decimal`) and need no wrapper. This is
+**Everything you use keeps working.** v0.6.0 registered 38 `gpu_*` functions; v0.7 registers 65. Nothing was removed and nothing changed shape — every v0.6 function is registered in v0.7 under the same name, with the same return type and the same parameter types. None of them needs the wrapper. This is
 also the only route from the stock `duckdb` CLI, because DuckDB's stable C
 extension API — the one the loadable extension uses on purpose, so that one
 binary keeps working across DuckDB versions — has no hook that sees a statement
@@ -737,19 +756,27 @@ transparent path*.
 
 ```bash
 PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf1/tpch.duckdb
-PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb \\
+PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duckdb \
     --memory-budget 200GB      # SF10 holds 18.7 GiB; the default budget is smaller
 ```
+
+The script needs DuckDB's own `tpch` extension for the query texts, and
+installs it over the network the first time if `LOAD tpch` fails — so the
+first run wants a connection, and later runs do not.
 
 | | Queries answered on the GPU | Rows differing | Speed-up on those queries |
 |---|---|---|---|
 | TPC-H SF1 (6M-row `lineitem`) | 17 of 22 | 0 | 1.4× – 13.6× |
 | TPC-H SF10 (60M-row `lineitem`) | 19 of 22 | 0 | 1.3× – 52.9× |
 
-The queries that stay on DuckDB are declined on purpose. Q2 and Q20 hold a
-correlated subquery that does not bind on its own; Q16's inner `GROUP BY`
-declines on its own threshold (forced, it measures 0.02–0.08×); at SF1, Q6 and
-Q11 are below the measured size floors. Each of those runs on DuckDB unchanged.
+The queries that stay on DuckDB are declined on purpose, and which ones stay
+depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
+subquery from inside another subquery, a shape the rewrite does not reach, and
+Q16's inner `GROUP BY` declines on its own threshold — forced past it, Q16
+measures 0.02–0.08×. **At SF1, five**: those three, and Q6 and Q11, which sit
+below the measured size floors at 6M rows (Q2 declines on a size floor there
+too, before its shape is ever looked at). Each of them runs on DuckDB
+unchanged, at DuckDB's speed.
 
 <details>
 <summary>Query by query — scale factor 10</summary>
@@ -845,7 +872,7 @@ argued out with its measurements.
 | Feature | Runs on | Note |
 |---|---|---|
 | **Grouping and aggregation** | | |
-| `sum` `count` `count(*)` `min` `max` `avg`, with `GROUP BY` | ✓ GPU | up to eight aggregated columns in one device pass (§4.9). `avg` over `DECIMAL` is finalised by the extension's own `gpu_avg_decimal`, which is how it matches native bit for bit on every platform |
+| `sum` `count` `count(*)` `min` `max` `avg`, with `GROUP BY` | ✓ GPU | up to eight aggregated columns in one device pass (§4.9). `avg` over `DECIMAL` is finalised by the extension's own `gpu_avg_decimal`, which is how it matches native bit for bit on every platform; against an extension too old to provide it the column is derived in SQL, and the shape declines only where that derivation is not native's own arithmetic (`gpu_build_info()` reporting `avgf=` anything but 53 — x86-64) |
 | Aggregates with no `GROUP BY` | ✓ GPU | one fused pass; over a join at any size, over a single table above a measured row and predicate bound — 16M rows, and rows × predicate terms ≥ 60M (§4.12). A bare `count(*)` over a whole table is never rewritten: DuckDB answers it from the table's own row count |
 | Expressions inside aggregates | ✓ GPU | `sum(price * (1 - discount))`, `sum(CASE …)` (§4.10) |
 | Expressions over aggregates, compound `HAVING` | ✓ GPU | §4.11 |
@@ -872,7 +899,7 @@ argued out with its measurements.
 | `EXISTS` / `IN` / a correlated scalar subquery in `WHERE` | ✓ GPU | lowered to a predicate lane DuckDB fills once per row (§4.18) |
 | Derived tables, views, CTEs | ✓ GPU | folded or spliced in first, then checked against the original with `DESCRIBE` (§4.16, §4.20, §4.22) |
 | Aggregation nested inside a statement DuckDB keeps | ✓ GPU | the inner `SELECT` gets its own decision and its own guards (§4.14) |
-| `FULL` join, `SEMI` / `ANTI` join **syntax**, cross products | DuckDB | the `EXISTS` / `IN` **forms** above are rewritten; the join keywords are not (§2) |
+| `FULL` join, `SEMI` / `ANTI` join **syntax**, `NATURAL` join, cross products | DuckDB | the `EXISTS` / `IN` **forms** above are rewritten; the join keywords are not (§2). `USING` is rewritten over base tables, and declines over a derived table that renamed the join column |
 | `WITH RECURSIVE`, `AS MATERIALIZED` | DuckDB | left as written (§4.22) |
 | `UNION` / `UNION ALL` as the whole statement | DuckDB | an aggregating `SELECT` inside an arm is still offered to the GPU (§2) |
 | **Session and statement handling** | | |
@@ -889,26 +916,27 @@ Every trade-off above, with its reason, is in
 - The statement is rewritten **before DuckDB plans it**, through DuckDB's own
   parser (`json_serialize_sql`) and a pure function in the extension
   (`gpu_rewrite_ast`) — no plan surgery, no C++ API.
-- Size bounds come from a measured sweep (`python/gpudb/_thresholds.py`, from
-  `scripts/transparent_gate.py`): tables under `floor_rows` (default
-  1,000,000) are never parsed; the plain form returns at most 300K groups (50K
-  under a `WHERE`); top-k needs at least 100K distinct keys; an aggregate
-  without `GROUP BY` over a single table needs 16M rows, and 60M rows ×
-  predicate terms. The shapes outside those bounds measured 0.23–0.99× against
-  native, and those rows stay in the gate output.
-- **The group floor is a floor with one exemption, and it is worth knowing.**
-  A key estimated at fewer than 1,000 distinct values does not rewrite —
-  native aggregates a tiny integer domain through a perfect hash in 1.5–5 ms
-  per 6M rows and the device cannot beat that. The exemption is a `VARCHAR`
-  key, which native has to hash on every row: those rewrite below the floor
-  with no `WHERE` at all, and under a `WHERE` when at least two of the
-  payloads are computed expressions and at least half the rows survive —
-  because from two expressions on, native pays per expression per row and a
-  resident lane does not. That is why TPC-H Q1 (two `VARCHAR` keys, eight
+- **Size bounds are per form, not one rule.** Every statement needs a table of
+  at least `floor_rows` rows (default 1,000,000) behind its answer; above that
+  floor the plain `GROUP BY`, `HAVING`, top-k, join, global-aggregate,
+  inner-statement and `count(DISTINCT)` forms each carry their own group floor,
+  output-size cap and selectivity bound, measured by
+  `scripts/transparent_gate.py` and written down in
+  `python/gpudb/_thresholds.py`. All of them, with the exact numbers and the
+  sentence each one prints, are in [KNOWN_ISSUES.md — the size bounds, form by
+  form](KNOWN_ISSUES.md#the-size-bounds-form-by-form).
+- Two of those bounds explain most of what you will see. A key estimated at
+  fewer than 1,000 distinct values does not rewrite on a single table — native
+  aggregates a tiny integer domain through a perfect hash in 1.5–5 ms per 6M
+  rows — but a `VARCHAR` key is exempt for the **plain** form, with no `WHERE`
+  at all or under a `WHERE` that keeps at least half the rows with at least two
+  computed-expression payloads, because native hashes the strings and evaluates
+  the expressions on every row. That is why TPC-H Q1 (two `VARCHAR` keys, eight
   aggregates over expressions, 98% of rows kept) is on the GPU at 3.8× while
-  the four-aggregate `sum` and `count(*)` over the *same* two keys in the
-  example above is declined: plain column payloads, no expressions, no
-  exemption.
+  the plain `sum` and `count(*)` over the *same* two keys in the example above
+  declines at `6 groups < 1000`: column payloads, no expressions, no exemption.
+  And over a **join** there is no group floor at all — native has to run the
+  join whatever the group count, so a join returning one group is rewritten.
 - Then the run-time measurement above overrides the bounds in either direction.
   `last_rewrite()["detail"]` names the rule that decided, in both directions.
 - Any error on the rewritten path re-runs the user's original statement on

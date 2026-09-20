@@ -6,7 +6,8 @@ query's answer.** They change which code path runs, how much host or device
 memory it may use, or what it prints. If you find one that changes an answer,
 that is a bug worth an issue.
 
-Anything not on this list is not read. In particular `GPUDB_FORCE_BACKEND` is
+Anything not on this list is read by nothing in `src/` or `python/`. In
+particular `GPUDB_FORCE_BACKEND` is
 **not** honoured: it routed machinery deleted in v0.3.0 and setting it does
 nothing (`test/sql/gpu_force_backend.test` only pins that it does not crash).
 
@@ -76,6 +77,12 @@ Read by the shell scripts and CMake, never by the extension at run time.
 | `DUCKDB_VERSION` | `v1.5.5` | Which DuckDB release `scripts/get_duckdb_libs.sh` fetches (`latest` is accepted). |
 | `CUDAARCHS` | `75;80;86;89;90` | Standard CMake variable; when unset **or set but empty** the project falls back to that list. |
 | `GPUDB_SQL_TIMEOUT_SECS` | `30` | Per-query timeout in the SQL suite. |
+| `BUILD_TYPE` | `Release` | `CMAKE_BUILD_TYPE` for `scripts/build.sh`. |
+| `EXT_VERSION` | the project version | The version stamped into the packaged extension's metadata footer. |
+| `SF` | `1` | TPC-H scale factor for `scripts/gen_tpch.sh`. |
+| `DUCKDB` | `./.tools/duckdb` | Which DuckDB CLI `scripts/gen_tpch.sh` generates the data with. |
+| `FORCE` | `0` | `1` makes `scripts/get_duckdb_libs.sh` re-fetch over an existing `third_party/duckdb-libs/`. |
+| `RUNTIME_BACKEND` | read from `gpu_build_info()` | Which backend `scripts/run_sql_tests.sh` reports and gates backend-specific cases on; falls back to `cpu`. |
 
 `GPUDB_CUDA_STATIC_RUNTIME` is a CMake option, not an environment variable:
 pass `-DGPUDB_CUDA_STATIC_RUNTIME=ON` (which is what the root `Makefile`

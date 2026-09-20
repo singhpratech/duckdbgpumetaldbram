@@ -226,6 +226,21 @@ DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms
 DuckDB (off: the transparent path is off on this connection) · 12.0 ms
 ```
 
+## The third way in: explicit `gpu_*` functions
+
+The shell and `gpudb.connect()` are two of three routes. The third needs no
+wrapper at all: `INSTALL gpudb FROM community; LOAD gpudb;` in **any** DuckDB
+client, in any language, and then call the functions by name —
+`gpu_upload` / `gpu_upload_pair` to make a column resident once, then
+`gpu_sum_resident`, `gpu_groupby_sum_resident` (with `_having` and `_topk`
+forms that filter on the device), `gpu_topk_resident`, `gpu_inner_join` and the
+exact `gpu_groupby_exact_*` family to read it back. `gpu_last_stats()` says
+which processor ran and for how long. v0.7 registers 65 of these; v0.6.0
+registered 38, and every one of those is still there unchanged.
+
+It is full manual control, and it is the only route from the stock `duckdb`
+CLI. The repository's README documents the whole surface.
+
 Design, limits and measurements: `docs/TRANSPARENT_DESIGN.md`,
 `docs/ENVIRONMENT.md`, `KNOWN_ISSUES.md` and `BENCHMARK.md` in the
 [repository](https://github.com/singhpratech/duckdbgpumetaldbram).
