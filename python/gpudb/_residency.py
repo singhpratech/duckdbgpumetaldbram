@@ -21,11 +21,28 @@ Consecutive interrupts pause the session (50 ms, doubling per interrupt,
 capped at 1 s) so a cadence whose statements keep landing on segments pays
 the interrupt latency at most once per pause, not once per statement; a
 completed segment resets the pause.
+
+Two steps of a session an interrupt CANNOT stop: `gpu_upload_finish` (the
+device copy, ~110-140 ms for a lineitem-sized set) and the sort cache built
+after it (~150-170 ms). They are the whole of the upload's measured p99 cost
+to a user statement, and they only cost anything when the machine's cores
+are oversubscribed (2026-09-20, docs/RESEARCH_NOTES.md). So the session
+measures, for free, how many cores the machine is giving it — CPU seconds
+per wall second of a completed segment scan — and when that says the cores
+are contended, a step an interrupt cannot stop waits for a genuinely quiet
+connection before it starts. The window it asks for decays to the ordinary
+idle threshold over `quiet_max_s`, so the step takes the best window the
+connection offers and, if the connection never offers one, runs anyway at
+the deadline: readiness is delayed by at most `quiet_max_s` per such step,
+never withheld.
 """
 from __future__ import annotations
 
 import json
 import math
+import os
+import statistics
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -35,9 +52,63 @@ SEGMENT_BYTES = 8 << 20          # the extension's host segment (gpu_resident.cp
 RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling per consecutive interrupt
 EVICT_MIN_AGE_S = 60.0            # §5.5: a set is never evicted within this long of being uploaded (anti-thrash)
 MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget kept off the device
+POST_MAX_ATTEMPTS = 8            # interrupted sort-cache attempts before the set goes ready without it
 RETRY_PAUSE_MAX_MS = 1000.0      # the idle wait already yields to every statement; a longer cap only
                                  # delayed readiness (measured: 15 of 20 segments landed in 3 s, the
                                  # rest took 30+ s at a 5 s cap under a 0-10 ms statement cadence)
+
+# ---- a step an interrupt cannot stop, on a machine whose cores are taken ----
+# The quiet window such a step asks for. The longest one measured at SF10 is
+# the sort cache at 171 ms, the device copy is 110-140 ms; 400 ms is the pair
+# with margin, and it is a gap a connection that is between bursts — rather
+# than in one — offers without trying.
+HEAVY_QUIET_MS = 400.0
+# ... and the longest it waits for that window. The window asked for decays
+# linearly to `idle_ms` across this, so the step takes the best gap the
+# connection offers in the meantime and runs unconditionally at the end. This
+# is the whole of the mechanism's worst case: a session is delayed by at most
+# this per step an interrupt cannot stop (one device copy plus one sort cache
+# for a single-table set, so at most 2x this), never by more, and never
+# indefinitely.
+HEAVY_QUIET_MAX_S = 20.0
+# How many cores a completed segment scan gets when nothing else wants them,
+# as a fraction of os.cpu_count(): measured on this machine 10.1 of 16 idle
+# and 6.5 of 16 with 8 cores busy, so half the machine separates the two with
+# no overlap (idle median 10.1 against a loaded maximum of 7.1).
+CONTENDED_CORES_FRACTION = 0.5
+CONTENTION_SEGMENTS = 16         # completed segments the estimate is taken over (the most recent ones)
+CONTENTION_MIN_SAMPLES = 3       # ... below which the machine is called free, i.e. today's behaviour
+# A scan DuckDB did not parallelise says nothing about how many cores the
+# machine has to spare, and DuckDB parallelises a table scan by ROW GROUP
+# (122,880 rows). Measured: a 100K-row segment — less than one row group, so a
+# serial scan — reports 2.6-2.7 cores of 16 with nothing else running, at 1.4 ms
+# and at 5 ms alike, while the 1M-row segments of a lineitem-sized set report
+# 9.2-10.1. So a segment votes only when it spans at least four row groups and
+# ran long enough to have been worth parallelising; otherwise the estimate stays
+# empty and the manager behaves as it did before this mechanism existed.
+DUCKDB_ROW_GROUP = 122880
+CONTENTION_MIN_SEG_ROWS = 4 * DUCKDB_ROW_GROUP
+CONTENTION_MIN_SEG_MS = 2.0
+
+# ---- a segment that does not fit the window the workload leaves ----
+# A segment's cost is host work — lanes x rows, plus validity — so the same
+# `segment_rows` is a different number of milliseconds on different machines
+# and for different sets, while the window a workload leaves between its
+# statements is whatever it is. When the two do not fit, almost every attempt
+# is interrupted and the session makes no progress (measured on the x86 box,
+# 2026-09-20: 2 of 69 attempts landed at a 2.5 ms mean window against a 4.9 ms
+# segment, where this machine lands 58 of 95). So the size follows the yield:
+# halve it when attempts stop landing, double it back when they do.
+SEG_YIELD_WINDOW = 8             # attempts a decision is taken over
+# 1 of 8 or fewer land -> halve the segment. The threshold is low on purpose:
+# this machine's yield is ~0.6, where a window of 8 falls to 3 or fewer 17% of
+# the time, so a 3-of-8 rule made the size oscillate here for no reason (58
+# segments became 75-81 under load). At 1 of 8 a yield of 0.6 trips 0.9% of
+# the time and the starving box's 0.03 trips at once — which is the case the
+# rule is for. It is a starvation guard, not a tuning knob.
+SEG_YIELD_LOW = 0.125
+SEG_YIELD_HIGH = 0.875           # 7 of 8 or more land -> give the halving back
+SEG_SCALE_MAX = 32               # ... down to 1/32 of the 8 MiB segment (256 KiB), the floor
 
 # ---- what a resident set is WORTH (§5.5, value-aware residency) ----
 # A set's value is a decaying rate: the milliseconds it saves per second of
@@ -89,6 +160,13 @@ class SetState:
     interrupts: int = 0             # interrupted segment statements, over the set's life
     session_ms: float = 0.0         # wall time of the last session, begin -> finish
     seg_ms: List[float] = field(default_factory=list)   # scan time of each landed segment (last session)
+    # what waiting for a quiet connection cost this set, for the gate to print:
+    # how many steps an interrupt cannot stop had to wait, for how long in
+    # total, and how many of them gave up waiting and ran at the deadline
+    quiet_waits: int = 0
+    quiet_wait_ms: float = 0.0
+    quiet_forced: int = 0
+    segment_rows_used: int = 0      # the size the yield settled on for the last session
     finish_window: tuple = (0.0, 0.0)  # time.monotonic() start/end of the last gpu_upload_finish call
     # a DERIVED set (a materialised join, §4.8): no table scan of its own —
     # once every set in `deps` is ready, `steps` (gpu_join_materialize calls)
@@ -132,6 +210,14 @@ class SetState:
     @property
     def segment_rows_default(self) -> int:
         return SEGMENT_BYTES // (16 if self.pair else 8)
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        v = os.environ.get(name)
+        return default if v is None or v == "" else max(0.0, float(v))
+    except ValueError:
+        return default
 
 
 def _is_interrupt(err: str) -> bool:
@@ -182,6 +268,26 @@ class ResidencyManager:
         self._uploading_tag: Optional[str] = None   # set only while a statement runs on the cursor
         self._closed = False
         self._thread: Optional[threading.Thread] = None
+        # ---- contention (§5.5): how many cores the machine is giving us ----
+        self._cpus = float(os.cpu_count() or 1)
+        # CPU seconds per wall second of the most recent completed segment
+        # scans. Only COMPLETED segments count: a segment a statement arrived
+        # on was interrupted, and its CPU time would be the statement's too.
+        self._seg_cores: List[float] = []
+        # the segment size the machine and the workload have settled on, as a
+        # power-of-two divisor of the 8 MiB default, and the recent attempts
+        # (landed or interrupted) it is decided from
+        self._seg_scale = 1
+        self._seg_landed: List[bool] = []
+        # the quiet window a step an interrupt cannot stop asks for on a
+        # contended machine; 0 turns the mechanism off (GPUDB_UPLOAD_QUIET_MS)
+        self.quiet_ms = _env_float("GPUDB_UPLOAD_QUIET_MS", HEAVY_QUIET_MS)
+        self.quiet_max_s = _env_float("GPUDB_UPLOAD_QUIET_MAX_S", HEAVY_QUIET_MAX_S)
+        # GPUDB_RESIDENCY_TRACE=1: one stderr line per segment attempt and per
+        # quiet wait — how long the session waited for its window, how long the
+        # scan then ran, how many cores it got, and whether it landed. This is
+        # what a box where segments starve has to be read with.
+        self._trace = os.environ.get("GPUDB_RESIDENCY_TRACE", "") not in ("", "0")
 
     def _now(self) -> float:
         """The clock the residency POLICY runs on — ages, decay, cooldowns.
@@ -323,11 +429,24 @@ class ResidencyManager:
     def progress(self) -> Dict[str, Dict[str, object]]:
         """Test / diagnostics helper: per set, the session progress counters."""
         with self._lock:
+            cores = (statistics.median(self._seg_cores)
+                     if len(self._seg_cores) >= CONTENTION_MIN_SAMPLES else 0.0)
             return {t: {"state": s.state, "segments": s.segments, "planned": s.segments_planned,
                         "rows_seen": s.rows_seen, "interrupts": s.interrupts,
                         "attempts": s.attempts, "session_ms": round(s.session_ms, 1),
                         "seg_ms": [round(x, 1) for x in s.seg_ms],
-                        "finish_window": s.finish_window}
+                        "finish_window": s.finish_window,
+                        # §5.5 back-off: the machine's answer to how many cores
+                        # it has to spare, and what waiting for quiet cost
+                        "cores": round(cores, 2), "cpus": self._cpus,
+                        "quiet_waits": s.quiet_waits,
+                        "quiet_wait_ms": round(s.quiet_wait_ms, 1),
+                        "quiet_forced": s.quiet_forced,
+                        # ... and the segment size the yield settled on (inline:
+                        # segment_rows_for would take the lock this holds)
+                        "segment_rows": (s.segment_rows_used or int(self.segment_rows or 0)
+                                         or max(1, s.segment_rows_default // self._seg_scale)),
+                        "seg_scale": self._seg_scale}
                     for t, s in self._sets.items()}
 
     # ---- value: what a set is worth (§5.5) ----
@@ -935,6 +1054,169 @@ class ResidencyManager:
                 wait_s = max(wait_s, not_before - now)
             self._cv.wait(timeout=wait_s)
 
+    def _trace_line(self, msg: str) -> None:
+        if self._trace:
+            print(f"[gpudb/residency] {msg}", file=sys.stderr, flush=True)
+
+    # ---- contention, and the steps an interrupt cannot stop (§5.5) ----
+    def note_cores(self, cores: float) -> None:
+        """One completed segment scan used `cores` cores (CPU seconds per wall
+        second). Two clock reads per segment, which is the whole cost of
+        knowing whether this machine has cores to spare."""
+        with self._lock:
+            self._seg_cores.append(cores)
+            del self._seg_cores[:-CONTENTION_SEGMENTS]
+
+    def _cores_locked(self) -> float:
+        """The estimate, for a caller that already holds the lock (`self._cv`
+        shares it and it is not re-entrant, so a locked caller must never go
+        through `cores_seen`)."""
+        xs = self._seg_cores
+        return statistics.median(xs) if len(xs) >= CONTENTION_MIN_SAMPLES else 0.0
+
+    def cores_seen(self) -> float:
+        """The median of those, or 0.0 while too few have been measured."""
+        with self._lock:
+            return self._cores_locked()
+
+    def contended(self) -> bool:
+        """Is something else on this machine taking the cores? Measured, not
+        configured: a segment scan that gets less than half the machine while
+        nothing of ours is running beside it means the cores are spoken for.
+        Unknown (too few segments) reads as free — that is today's behaviour,
+        and the conservative direction is to protect nothing we cannot show
+        needs protecting."""
+        if self.quiet_ms <= 0.0:
+            return False
+        seen = self.cores_seen()
+        return 0.0 < seen < CONTENDED_CORES_FRACTION * self._cpus
+
+    def note_segment(self, landed: bool) -> int:
+        """One segment attempt ended. Returns the divisor the next segment
+        should use: the size follows the YIELD, not the clock, because what
+        decides whether a segment lands is its cost against the window the
+        workload leaves, and neither of those is knowable in advance — only
+        the outcome is. A halving is given back as readily as it is taken, so
+        a session that is only briefly crowded does not stay small.
+
+        Both bounds are hard: the divisor never passes SEG_SCALE_MAX, and a
+        landed segment is progress that is never undone, so a session
+        terminates at the floor however busy the connection is."""
+        if self.segment_rows:
+            return 1                     # the size is pinned; there is nothing to decide
+        with self._lock:
+            self._seg_landed.append(bool(landed))
+            if len(self._seg_landed) < SEG_YIELD_WINDOW:
+                return self._seg_scale
+            yld = sum(self._seg_landed) / float(len(self._seg_landed))
+            if yld <= SEG_YIELD_LOW and self._seg_scale < SEG_SCALE_MAX:
+                self._seg_scale *= 2
+                self._seg_landed = []
+            elif yld >= SEG_YIELD_HIGH and self._seg_scale > 1:
+                self._seg_scale //= 2
+                self._seg_landed = []
+            else:
+                del self._seg_landed[:-SEG_YIELD_WINDOW]
+            return self._seg_scale
+
+    def segment_rows_for(self, s: SetState) -> int:
+        """Rows in the next segment of this set: its own 8 MiB worth, divided
+        by what the yield has settled on. An explicit `segment_rows` (a test,
+        a sweep) is taken as given and never adapted."""
+        if self.segment_rows:
+            return int(self.segment_rows)
+        with self._lock:
+            scale = self._seg_scale
+        return max(1, s.segment_rows_default // scale)
+
+    def quiet_want_ms(self, need_ms: float, waited_s: float) -> float:
+        """The idle stretch a step an interrupt cannot stop still insists on,
+        `waited_s` after it first asked for `need_ms`. Decays linearly to the
+        ordinary idle threshold at `quiet_max_s` — so the step takes the best
+        gap the connection offers along the way, and at the deadline it asks
+        for no more than any segment does, which is what bounds the wait."""
+        if need_ms <= self.idle_ms or self.quiet_max_s <= 0.0:
+            return self.idle_ms
+        frac = min(1.0, max(0.0, waited_s / self.quiet_max_s))
+        return need_ms + (self.idle_ms - need_ms) * frac
+
+    def _post_step(self, cur, s: SetState, epoch: int, stmt: str) -> str:
+        """One post-upload step — the view's sort cache — retried while it is
+        interrupted. Returns "" when the session may go on, or the outcome it
+        must return instead.
+
+        `ready` is defined as uploaded AND PREPARED (§5.5). An interrupt used
+        to end the loop silently, which broke that in two visible ways: the
+        first statement to use the set paid the sort, and the set had no row
+        in `gpu_residents()` at all, because a store-backed set is a VIEW the
+        extension only synthesises when something acquires it — and the sort
+        cache is what acquires it here. Measured under the wrapper suite's
+        `big:` cadence (~130 statements/s, 8 of 16 cores busy), that happened
+        in 3 of 40 runs. Retrying is safe: prepare() is idempotent."""
+        pause_until, since = 0.0, time.monotonic()
+        for attempt in range(POST_MAX_ATTEMPTS):
+            # `since` is shared by every attempt: the quiet window decays once,
+            # so the whole step is bounded by quiet_max_s plus the interrupt
+            # back-off, not by quiet_max_s per retry
+            if not self._wait_quiet(s, epoch, not_before=pause_until, since=since):
+                return "closed" if self._closed else "stale"
+            try:
+                self._run(cur, s, stmt)
+                return ""
+            except Exception as e:
+                err = str(e)
+                if _not_resident(err):
+                    # the acquire the sort cache does is the second reader of the
+                    # store, and it has just said the lanes are not there after all
+                    with self._lock:
+                        s.error = self._store_gone_error(s)
+                    return "recheck"
+                if not _is_interrupt(err):
+                    return self._fail(s, e)
+                pause_until = time.monotonic() + min(
+                    RETRY_PAUSE_MS * (2.0 ** attempt), RETRY_PAUSE_MAX_MS) / 1000.0
+        # the columns are resident either way; only the cache is missing, and the
+        # first statement to use the set builds it. Said out loud rather than
+        # left as a set that claims to be prepared and is not.
+        self._log(f"sort cache not built for {s.tag}: {POST_MAX_ATTEMPTS} attempts in a row were "
+                  f"interrupted; the first statement to use the set builds it")
+        return ""
+
+    def _wait_quiet(self, s: SetState, epoch: int, not_before: float = 0.0,
+                    since: float = 0.0) -> bool:
+        """`_wait_idle`, but for a step an interrupt cannot stop. On a machine
+        with cores to spare this IS `_wait_idle` (measured: such a step costs a
+        user statement nothing there). On a contended one it holds the step
+        back until the connection goes quiet for `quiet_want_ms`, which decays
+        to the idle threshold over `quiet_max_s` — the bound on how long
+        readiness can be delayed by one step."""
+        need = self.quiet_ms if self.contended() else 0.0
+        if need <= self.idle_ms:
+            with self._cv:
+                return self._wait_idle(s, epoch, self.idle_ms, not_before)
+        t_enter = time.monotonic()
+        t0 = since or t_enter          # the decay's clock; the accounting's is t_enter
+        with self._cv:
+            while True:
+                if self._closed or s.epoch != epoch or s.state != "uploading":
+                    return False
+                now = time.monotonic()
+                waited = now - t0
+                want = self.quiet_want_ms(need, waited)
+                if now >= not_before and self._in_flight == 0 and self._idle_ms() >= want:
+                    s.quiet_waits += 1
+                    s.quiet_wait_ms += (now - t_enter) * 1000.0
+                    if waited >= self.quiet_max_s:
+                        s.quiet_forced += 1
+                    if self._trace:
+                        self._trace_line(
+                            f"{s.tag}: a step an interrupt cannot stop asked for {need:.0f} ms of quiet "
+                            f"on {self._cores_locked():.1f} of {self._cpus:.0f} cores and waited "
+                            f"{waited * 1000.0:.0f} ms for {want:.0f} ms"
+                            f"{' (took it at the deadline)' if waited >= self.quiet_max_s else ''}")
+                    return True
+                self._cv.wait(timeout=max(0.002, min(0.01, not_before - now) if now < not_before else 0.01))
+
     def _run(self, cur, s: SetState, sql: str, params=None) -> List[tuple]:
         """Execute one statement on the upload cursor, marking it interruptible
         for the duration. Raises whatever the cursor raises."""
@@ -998,23 +1280,13 @@ class ResidencyManager:
                     s.error = self._store_gone_error(s)
                 self._log(f"not uploaded: {s.tag}: {s.error}")
                 return "recheck"
-            try:
-                for stmt in s.post_sql:
-                    self._run(cur, s, stmt)
-            except Exception as e:
-                err = str(e)
-                if _is_interrupt(err):
-                    return "pending"
-                if _not_resident(err):
-                    # the acquire the sort cache does is the second reader of the store,
-                    # and it has just said the lanes are not there after all
-                    with self._lock:
-                        s.error = self._store_gone_error(s)
-                    return "recheck"
-                return self._fail(s, e)
+            for stmt in s.post_sql:                  # the sort cache: an interrupt cannot stop it
+                bad = self._post_step(cur, s, epoch, stmt)
+                if bad:
+                    return bad
             return "ready"
         fqn = s.fqn or s.upload_sql.split(" FROM ", 1)[1]
-        seg_rows = self.segment_rows or s.segment_rows_default
+        seg_rows = self.segment_rows_for(s)
         idle_ms = self.idle_ms
         # 1. bounds (metadata-fast; the rowid range is stable while no write
         #    lands, and every write through the wrapper invalidates the set)
@@ -1031,6 +1303,8 @@ class ResidencyManager:
             s.segments_planned = planned
             s.rows_seen = 0
             s.seg_ms = []
+            s.quiet_waits = s.quiet_forced = 0
+            s.quiet_wait_ms = 0.0
         # 2. begin
         try:
             self._run(cur, s, "SELECT gpu_upload_begin(?)", [s.session_name])
@@ -1039,6 +1313,7 @@ class ResidencyManager:
         # 3. segments, each only in an idle window
         a, done, consecutive_interrupts, not_before = 0, 0, 0, 0.0
         while a <= max_rowid:
+            t_want = time.monotonic()
             with self._cv:
                 ok = self._wait_idle(s, epoch, idle_ms, not_before)
             if not ok:
@@ -1046,12 +1321,23 @@ class ResidencyManager:
                 return "closed" if self._closed else "stale"
             b = a + seg_rows
             seg_sql = f"{s.upload_sql} WHERE rowid >= {a} AND rowid < {b}"
+            cores = 0.0
             try:
-                t_seg = time.monotonic()
+                t_seg, c_seg = time.monotonic(), time.process_time()
                 self._run(cur, s, seg_sql)
                 landed = True
+                wall = time.monotonic() - t_seg
                 with self._lock:
-                    s.seg_ms.append((time.monotonic() - t_seg) * 1000.0)
+                    s.seg_ms.append(wall * 1000.0)
+                # nothing of ours ran beside this one (a statement that arrives
+                # interrupts, and an interrupted segment does not land here), so
+                # the CPU it burned per wall second is the machine's answer to
+                # "how many cores can you give me right now"
+                if wall > 0.0:
+                    cores = (time.process_time() - c_seg) / wall
+                    if (seg_rows >= CONTENTION_MIN_SEG_ROWS
+                            and wall * 1000.0 >= CONTENTION_MIN_SEG_MS):
+                        self.note_cores(cores)
             except Exception as e:
                 if not _is_interrupt(str(e)):
                     self._abort(cur, s)
@@ -1068,15 +1354,33 @@ class ResidencyManager:
                 not_before = time.monotonic() + pause / 1000.0
                 with self._lock:
                     s.interrupts += 1
+            self.note_segment(landed)
+            if self._trace:
+                self._trace_line(
+                    f"{s.tag} segment {done}/{planned} rows [{a},{b}) ({seg_rows} rows): waited "
+                    f"{(t_seg - t_want) * 1000.0:.1f} ms for an idle window, scan "
+                    f"{(time.monotonic() - t_seg) * 1000.0:.1f} ms on {cores:.1f} of "
+                    f"{self._cpus:.0f} cores, "
+                    f"{'landed' if landed else 'interrupted'}"
+                    f"{'' if landed else f' (consecutive {consecutive_interrupts}, pausing {pause:.0f} ms)'}")
             if landed:
                 a, done = b, done + 1
                 consecutive_interrupts, not_before = 0, 0.0
                 with self._lock:
                     s.segments = done
+            # the size the yield has settled on, for the segments still to come,
+            # and what the plan now says (the count changes with the size, and
+            # an exhausted range plans nothing — `done` is the whole of it)
+            seg_rows = self.segment_rows_for(s)
+            left = max(0, int(max_rowid) - a + 1)
+            with self._lock:
+                s.segment_rows_used = seg_rows
+                s.segments_planned = done + (left + seg_rows - 1) // seg_rows
+                planned = s.segments_planned
         # 4. finish: device copy + prepare + publish (one scalar call; an
-        #    interrupt arriving during it is only seen after it returns)
-        with self._cv:
-            ok = self._wait_idle(s, epoch, self.idle_ms)
+        #    interrupt arriving during it is only seen after it returns, so on
+        #    a machine whose cores are taken it waits for a quiet connection)
+        ok = self._wait_quiet(s, epoch)
         if not ok:
             self._abort(cur, s)
             return "closed" if self._closed else "stale"
@@ -1101,15 +1405,20 @@ class ResidencyManager:
                     return "pending"
             else:
                 return self._fail(s, e)
-        try:
-            for stmt in s.post_sql:                  # the view's sort cache, once the columns are there
-                self._run(cur, s, stmt)
-        except Exception as e:
-            if not _is_interrupt(str(e)):
-                return self._fail(s, e)
+        with self._lock:
+            # the window the finish CALL occupied. Closed here and not after the
+            # sort cache: the cache now waits for a quiet connection of its own,
+            # and a window that swallowed that wait would tell the gate that a
+            # 20 s call had statements inside it.
+            s.finish_window = (t_fin, time.monotonic())
+        for stmt in s.post_sql:                  # the view's sort cache, once the columns are there
+            # the sort cache is the session's OTHER step an interrupt cannot
+            # stop, and the longer of the two (171 ms at SF10)
+            bad = self._post_step(cur, s, epoch, stmt)
+            if bad:
+                return bad
         with self._lock:
             s.rows_seen = rows
-            s.finish_window = (t_fin, time.monotonic())
             s.session_ms = (time.monotonic() - t_start) * 1000.0
         return "ready"
 
@@ -1118,9 +1427,9 @@ class ResidencyManager:
         device (tens of ms), issued only in an idle window like a finish."""
         rows = 0
         for stmt in s.steps:
-            with self._cv:
-                ok = self._wait_idle(s, epoch, self.idle_ms)
-            if not ok:
+            # each step is device work an interrupt cannot stop, so it waits
+            # for a quiet connection on a machine whose cores are taken
+            if not self._wait_quiet(s, epoch):
                 return "closed" if self._closed else "stale"
             try:
                 row = self._run(cur, s, stmt)
@@ -1207,7 +1516,10 @@ class ResidencyManager:
                 if outcome == "ready" and s.epoch == epoch and s.state == "uploading":
                     s.state = "ready"
                     self._log(f"resident: {s.tag} ({s.segments} segments, "
-                              f"{s.interrupts} interrupts, {s.session_ms:.0f} ms)")
+                              f"{s.interrupts} interrupts, {s.session_ms:.0f} ms"
+                              + (f", {s.quiet_wait_ms / 1000.0:.1f} s waiting for a quiet "
+                                 f"connection on {self._cores_locked():.1f} of {self._cpus:.0f} cores"
+                                 if s.quiet_wait_ms >= 1.0 else "") + ")")
                 elif outcome == "pending" and s.epoch == epoch and s.state == "uploading":
                     s.state = "pending"           # retry once idle again; no rate wait
                     s.resume_at = now

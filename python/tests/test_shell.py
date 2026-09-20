@@ -188,6 +188,16 @@ def run():
                        "-c", ".gpu")
     check(rc == 0 and "rewritten:" in out and "reason:" in out,
           ".gpu prints the whole of last_rewrite()")
+    # every row's label is padded to the same column — `round_trip_ms:` is the
+    # longest one and used to leave no space at all — and a time is printed as
+    # a time, not as 17 digits of float repr
+    rows = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in out.splitlines()
+            if re.match(r"^[a-z_]+:", re.sub(r"\x1b\[[0-9;]*m", "", l))]
+    check(rows and len({len(l) - len(l.split(":", 1)[1].lstrip()) for l in rows}) == 1,
+          f".gpu: every label ends in the same column ({[l.split(':')[0] for l in rows]})")
+    rt = [l for l in rows if l.startswith("round_trip_ms:")]
+    check(not rt or re.fullmatch(r"round_trip_ms: +\d+\.\d{3} ms", rt[0]),
+          f".gpu: a time reads as a time ({rt[0] if rt else 'not printed for this statement'})")
     rc, out, _ = shell("--timer", "--no-gpu", "-c", BIG,
                        "-c", "SELECT k, sum(v) FROM t GROUP BY k")
     check(rc == 0 and "DuckDB (off" in out, "--no-gpu leaves the statement on DuckDB")
@@ -238,12 +248,28 @@ def run():
               "--readonly refuses a write with DuckDB's own error")
         rc, out, _ = shell("--readonly", db, "-c", "SELECT count(*) AS n FROM r")
         check(rc == 0 and " n " in out, "--readonly still reads")
+        # `.open` with no argument asks for the in-memory database, which
+        # DuckDB refuses to open read-only ("Cannot launch in-memory database
+        # in read-only mode!"). --readonly is a promise about the FILES the
+        # session was pointed at, and an in-memory database is not one of them.
+        rc, out, err = shell("--readonly", db, "-c", ".open", "-c", "CREATE TABLE m(a INTEGER)",
+                             "-c", ".tables")
+        check(rc == 0 and " m " in out and "in-memory" not in err,
+              f"--readonly then `.open`: the in-memory database opens and takes a write ({err[:70]})")
+        # ... and a FILE the same session opens still gets the flag
+        rc, out, err = shell("--readonly", db, "-c", f".open {db}", "-c", "INSERT INTO r VALUES (1)")
+        check(rc == 1 and "read-only" in err.lower(),
+              "--readonly then `.open <file>`: the file is still read-only")
 
     print("== entry points")
     rc, out, _ = shell("--version")
     check(rc == 0 and out.startswith("gpudb ") and gpudb.__version__ in out,
           "python -m gpudb --version")
-    check(console_script(), "the console script `gpudb` resolves after an install")
+    # None = this environment cannot make the check; console_script() has
+    # already said which part of it was missing
+    installed = console_script()
+    if installed is not None:
+        check(installed, "the console script `gpudb` resolves after an install")
 
     print("== a bounded way out")
     bounded_close()
@@ -299,24 +325,41 @@ def console_script():
             venv.create(tmp, with_pip=True, system_site_packages=True)
         except Exception as e:
             skip(f"no virtual environment available ({e})")
-            return True
+            return None
         pip = os.path.join(tmp, "bin", "pip")
         exe = os.path.join(tmp, "bin", "gpudb")
         if not os.path.exists(pip):
             skip("the virtual environment has no pip")
-            return True
+            return None
         p = subprocess.run([pip, "install", "--quiet", "--no-deps", "--no-build-isolation", PKG],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True, timeout=600)
         if p.returncode != 0:
             skip(f"pip install of the package did not run here ({p.stdout.strip()[-200:]})")
-            return True
+            return None
         if not os.path.exists(exe):
             print("  FAIL console script not installed:", os.listdir(os.path.join(tmp, "bin")))
             return False
+        # --no-deps means this environment has to bring its own `duckdb`, and
+        # --system-site-packages only inherits the packages of the interpreter
+        # `venv` was told to build from. Run from a virtual environment of its
+        # own (`venv155/bin/python`), the new one is built from that venv's
+        # BASE interpreter and inherits nothing, so the entry point dies on
+        # `import duckdb` — which says nothing about the entry point. It is a
+        # skip there and a hard check everywhere the import works.
+        p = subprocess.run([os.path.join(tmp, "bin", "python"), "-c", "import duckdb"],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           universal_newlines=True, timeout=300)
+        if p.returncode != 0:
+            skip("the throwaway virtual environment cannot import duckdb (--no-deps, and "
+                 "--system-site-packages inherited none), so the entry point cannot start")
+            return None
         p = subprocess.run([exe, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            universal_newlines=True, timeout=300)
-        return p.returncode == 0 and p.stdout.startswith("gpudb ")
+        if p.returncode != 0 or not p.stdout.startswith("gpudb "):
+            print("  FAIL console script did not run:", p.stdout.strip()[-200:])
+            return False
+        return True
 
 
 def interactive():

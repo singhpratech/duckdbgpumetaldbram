@@ -2747,7 +2747,7 @@ private:
     }
 
     // =====================================================================
-    // v0.8 — the direct, row-order grouped reduce (few distinct keys)
+    // v0.7 — the direct, row-order grouped reduce (few distinct keys)
     //
     // The sort path answers a GROUP BY by masking every row, finding the run
     // starts of the key's sort cache and gathering each payload through the

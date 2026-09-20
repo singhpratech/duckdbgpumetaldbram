@@ -136,6 +136,101 @@ GROUP BY k1 [, k2, k3]
   and keeping it is what makes the direction, NULL order, VARCHAR ordering
   and session defaults native's problem, not ours.
 
+  **Ties (§4.24).** `ORDER BY agg LIMIT k` is not a total order, and when
+  groups share the ordering value the answer is not one answer. The device
+  picks its k rows by its own rule; DuckDB picks by an order that depends on
+  which thread finished which partition. Measured on TPC-H SF1
+  (`SELECT l_orderkey, sum(l_quantity) qty FROM lineitem GROUP BY l_orderkey
+  ORDER BY qty DESC LIMIT 5`, three groups tied at 320.00 for positions 4–5):
+  plain DuckDB returned **5 different orderings and 3 different row SETS over
+  20 runs** at `threads=16`, on 1.4.5 and 1.5.5 alike — deterministic only at
+  `threads=1`. So there is nothing to reproduce and nothing to match; a tie is
+  DuckDB's to choose, and the statement is handed back to it.
+
+  The mechanism is inside the rewritten statement. The device is asked for
+  **k + 1** rows instead of k, and the statement carries
+
+  ```sql
+  QUALIFY CASE WHEN rank() OVER w = row_number() OVER w OR rank() OVER w > k
+               THEN TRUE ELSE error('GPUDB_TIES: …') END     -- w = (ORDER BY <agg> <dir>)
+  ```
+
+  `rank()` and `row_number()` differ on exactly the second and later member of
+  a group of equal values, and `rank() > k` excludes the rows past the k-th,
+  which no `LIMIT k` returns — so this raises when the k-th and (k+1)-th rows
+  tie **and** when two rows inside the top k do (where the row set is right
+  but the order is not). The wrapper answers the user's original statement on
+  DuckDB when it sees `GPUDB_TIES` and reports `reason = "ties"`
+  (`Connection._on_ties`); the shell footer reads
+  `DuckDB (ties: two of the first 5 rows tie on qty, …)`.
+
+  Cost with no tie: one extra row out of the device and two window functions
+  over k + 1 rows — one window specification, so one pass. `execute()` pays
+  nothing else. `sql()` returns a lazy relation that is read after the call
+  has returned, where a raise could not be answered, so it runs the guard on a
+  side cursor first (`_guard_now`) — one extra device top-k, the same bargain
+  the staleness guard already strikes there.
+
+  **The fallback is a loss, and rule 1 is told so.** The tie is decided against
+  the data on every execution, but a tie that does not go away would otherwise
+  cost the device pass *and* DuckDB's run for ever — a dashboard's top-10 over
+  a coarse measure ties every time, and the statement would be permanently
+  slower than native with nothing looking at the arithmetic, which is rule 1's
+  whole job. So the honest rewritten cost of a tied execution (device pass +
+  the native run that followed) is compared against native alone, a comparison
+  that can only go one way, and the template is measured-declined exactly as
+  any losing template is (§9.1) — same reason code, same `measured_declined`
+  flag, same window, with the tie named in `detail`:
+
+  ```
+  DuckDB (threshold: two of the first 5 rows tie on qty, so DuckDB answers it — and the
+  device pass costs 10.19 ms on top of native's 11.52 ms, so the template is native from
+  here (re-measured in 60 s))
+  ```
+
+  Coming back needs nothing of its own. After `_REMEASURE_S` the ordinary
+  declined-template path probes the rewritten form on a side cursor; while the
+  tie is there that probe raises and `_probe_ms` answers None, so the template
+  stays native, and once the data stops tying the probe returns a time and the
+  template is rewritten again. A tie that appears once and goes away therefore
+  costs one window and no more — and a write clears the decision outright, so
+  a `DELETE` that removes the tie does not wait for the window at all.
+
+  The decline follows the **literals**, not just the template text: `LIMIT 4`
+  and `LIMIT 5` normalise to one template and do not behave alike here, since
+  the 5th row can tie with the 6th while the first four are in no doubt. The
+  decision is made literal-sensitive and the decline attaches to the k that
+  tied; every other k gets a decision of its own (the §4.10 `variants`
+  machinery) and keeps the device.
+
+  `gpudb.connect(thresholds=False)` turns the measured rule off along with the
+  rest of the table, so there the tie is re-tested on every execution and no
+  template is ever declined — which is what that setting means.
+
+  Two shapes are *not* in doubt and keep the fast path: an `ORDER BY` that is
+  already total (a second key — `ORDER BY qty DESC, k` — is never pushed as a
+  top-k, so DuckDB sorts every group by a total order and the rows are
+  native's), and a `LIMIT k` above the group count with no tie among the
+  groups. `LIMIT … OFFSET` declines earlier, on shape.
+
+  The **explicit** table functions (`gpu_groupby_*_resident_topk`,
+  `gpu_topk_resident`) are unchanged: their documented contract is that the
+  tie order is unspecified (KNOWN_ISSUES.md), and a caller who names them has
+  asked for the device's answer.
+
+  **What this does not cover.** The guard rides on the push, so a `LIMIT` whose
+  top-k is *not* pushed does not carry it: an `ORDER BY` on an aggregate beside
+  a `HAVING`, an `avg` or temporal ordering value on the exact path, and
+  `ORDER BY count(*)` over a v0.6 sum set. Those statements hand every group
+  the device produced to DuckDB, which applies the `ORDER BY … LIMIT` itself —
+  the same multiset of rows native would sort, so the choice among ties is
+  DuckDB's own both ways. It is still not *identical*: DuckDB's top-N is
+  sensitive to the order its input arrives in, and the device's group order is
+  not the hash aggregate's, so at `threads=1` — the one setting where native is
+  reproducible — a tie there can still land differently. Covering it means a
+  window sort over every group returned rather than over k + 1 rows, which is a
+  cost with its own measurements; it is left open rather than guessed at.
+
 **Rejected by field, not by node.** The matcher reads every field of every
 node on the path and declines the statement when any of these is present
 (field names as `json_serialize_sql` emits them, checked 2026-09-03 on
@@ -1423,6 +1518,75 @@ same database — the extension stays free of threads and hidden connections
   the set being `ready` in `gpu_residents()`, not treated as a lost session.
   A session that never goes idle never uploads and runs native throughout
   — rule 1 holds, the win is simply not there yet.
+- **The two steps an interrupt cannot stop, and the back-off that hides
+  them.** A session has exactly two of them: `gpu_upload_finish` (the device
+  copy, 107–142 ms for a lineitem-sized set at SF10) and the sort cache
+  built after it (146–171 ms). Measured on 2026-09-20 they are the *whole*
+  of the upload's p99 cost to a user statement: statements that arrive
+  during a SEGMENT are not slower than the manual control on either an idle
+  or a loaded machine (the interrupt does its job — 0.27 ms median, 0.58 ms
+  p99 to be honoured with 8 of 16 cores busy), and statements that arrive
+  inside those two calls are, but only when the cores are oversubscribed.
+  On an idle machine they cost nothing at all (in-window statements
+  measured *faster* than the control, because the upload's own work holds
+  the clocks up). So the session asks the machine, for free, how many cores
+  it is being given — CPU seconds per wall second of a completed segment
+  scan, two clock reads per segment, 10.1 of 16 idle against 6.5 of 16 with
+  8 cores busy — and calls the machine contended below half of
+  `os.cpu_count()`. Only a segment DuckDB actually parallelised may vote:
+  DuckDB parallelises a table scan by row group (122,880 rows), and a
+  segment below four of them is serial by construction — measured, the
+  wrapper suite's 100K-row segments report 2.6 cores of 16 with nothing
+  else on the machine, at 1.4 ms and at 5 ms alike. Without that rule every
+  hot loop over a small table read as a contended machine. With no votes
+  the estimate is empty and the manager behaves exactly as it did before
+  this mechanism existed. On a contended machine, and only there, a step an
+  interrupt cannot stop waits for a genuinely quiet connection: an idle
+  stretch of 400 ms (the longer of the two steps, with margin). That window
+  **decays linearly to the ordinary idle threshold over 20 s**, so the step
+  takes the best gap the connection offers in the meantime and, if the
+  connection never offers one, runs unconditionally at the end of it. That
+  decay is the whole worst case: **readiness is delayed by at most 20 s per
+  such step plus the interrupt back-off its retries pay (about 5 s), and
+  never withheld.** An idle machine takes the old path exactly (the
+  estimate says free, the wait is the 20 ms idle threshold), which is why
+  time-to-ready there does not move. While a step waits, the session's host
+  buffer stays allocated, which is what `GPUDB_UPLOAD_POOL_MAX_MB` already
+  caps. `residency='eager'` is untouched: the caller asked for the upload,
+  so it runs beside nothing and waits for nothing.
+- **An interrupted sort cache is retried, not skipped.** `ready` means
+  uploaded *and prepared*, and an interrupt used to end the post-upload
+  loop silently, leaving a set that claimed to be prepared and was not. It
+  showed twice: the first statement to use the set paid the sort, and the
+  set had no row in `gpu_residents()` at all — a store-backed set is a VIEW
+  the extension synthesises only when something acquires it, and during a
+  session the sort cache is what acquires it. Measured under the wrapper
+  suite's cadence with 8 of 16 cores busy, that happened in 3 of 40 runs
+  (and in 1 of 15 in a second batch); with the retry, 0 of 25. The retry is
+  safe because `prepare()` is idempotent, it shares one quiet deadline
+  across its attempts so the bound above still holds, and after 8
+  interrupted attempts it gives up, says so in the log and leaves the cache
+  to the first statement that needs it — the columns are resident either
+  way, and no answer ever depended on the cache.
+- **Segment size follows the yield, not the clock.** A segment's cost is
+  host work — lanes × rows, plus validity bitmaps — so one `segment_rows` is
+  a different number of milliseconds on different machines and for
+  different sets, while the window a workload leaves between its statements
+  is whatever it is. When the two do not fit, nearly every attempt is
+  interrupted and the session makes no progress: measured on the x86 box on
+  2026-09-20, 2 of 69 attempts landed against a 2.5 ms mean window and a
+  4.9 ms segment, where this machine lands 58 of 95. So the manager counts
+  the last 8 attempts and halves `segment_rows` when **1 or fewer** of them
+  landed, doubling it back when 7 or more do, down to 1/32 of the 8 MiB
+  default and no further. The threshold is deliberately that low: this
+  machine's yield of 0.6 falls to 3-or-fewer in 8 about 17% of the time, so
+  a 3-of-8 rule made the size oscillate here for nothing (58 segments
+  became 75–81 under load), where 1-of-8 trips 0.9% of the time on a yield
+  of 0.6 and at once on the starving box's 0.03. It is a starvation guard,
+  not a tuning knob. Both bounds are hard: the divisor stops at 32, and a
+  landed segment is progress that is never undone, so a session terminates
+  at the floor however crowded the connection is. A pinned `segment_rows`
+  (a test, a sweep) is never adapted.
 - **Quiet period and rate cap.** No upload session starts within 2 s of the
   last invalidation of that table, and no more than one session per table
   per 30 s (wrapper settings). A write-heavy session therefore runs native
@@ -2048,6 +2212,19 @@ p99 B) / thresh`, losing above `max(p99 A, p99 B) / thresh`, and
 re-measuring in between — a row fails only on a loss that survived the
 re-measurement, and INCONCLUSIVE (exit 3) says the machine never held still
 enough to resolve the margin. `--dump` keeps every latency.
+
+Extended 2026-09-20 with the state the §5.5 back-off decides from, because a
+row that passes for the wrong reason is worth no more than a row that fails.
+The background pass now prints, per round, how many cores its segment scans
+were given (and therefore whether the machine read as contended), how many
+steps an interrupt cannot stop had to wait for a quiet connection, how long
+they waited in total, and how many of them ran at the 20 s deadline; and when
+the set is not ready by the end of the pass, how long after the last statement
+it became ready. **That last number is the price**: on a machine with 8 of 16
+cores busy the gate's own cadence never offers the window, so the set goes
+ready shortly after the pass ends instead of in the middle of it, and the
+session's wall time grows from ~4.7 s to ~11.7 s. The row is judged exactly as
+before — the tolerance, the statistic and the shapes did not move.
 
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make

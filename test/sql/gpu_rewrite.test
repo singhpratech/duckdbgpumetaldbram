@@ -47,14 +47,18 @@ SELECT (SELECT count(*) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_se
        json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING 200000 < sum(v)'), getvariable('ctx'))) LIKE '%_having(''gpudb:v1:memory:main:t:9:k,v'', ''>'', 200000)%' AS flipped_op;
 -- expect: true  true  true  true  true
 
--- 5. ORDER BY <aggregate> LIMIT k pushes the _topk form; ORDER BY / LIMIT stay in the statement
+-- 5. ORDER BY <aggregate> LIMIT k pushes the _topk form; ORDER BY / LIMIT stay in the statement.
+--    The device is asked for k + 1 rows and the statement carries the tie guard (§4.24): when two
+--    of the first k rows share the ordering value the answer is DuckDB's to choose, and the
+--    QUALIFY raises GPUDB_TIES so the client hands the statement back to it.
 -- setup: CREATE TABLE t AS SELECT (i % 7)::BIGINT AS k, (i * 3 - 100)::BIGINT AS v FROM range(1000) r(i)
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:9:k,v', k, v) FROM t
 -- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"CUDA","rows":1000,"ready":true,"default_order":"ASC","outputs":[{"name":"k","type":"BIGINT"},{"name":"sum(v)","type":"HUGEINT"}],"thresholds":{"min_rows":10},"stats":{"k":{"has_null":false,"min":0,"max":6},"v":{"has_null":false,"min":-100,"max":2897}}}'
 SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY sum(v) DESC LIMIT 2'), getvariable('ctx'))) AS by_expr,
-       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 2 DESC LIMIT 2'), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', 2, ''desc'')%ORDER BY "sum(v)" DESC LIMIT 2' AS ordinal_pushed,
-       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 1 LIMIT 2'), getvariable('ctx'))) LIKE '%_resident(''gpudb:v1:memory:main:t:9:k,v'')%ORDER BY k LIMIT 2' AS ordinal_key_kept;
--- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)" FROM gpu_groupby_sum_resident_topk('gpudb:v1:memory:main:t:9:k,v', 2, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "sum(v)" DESC LIMIT 2  true  true
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 2 DESC LIMIT 2'), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', 3, ''desc'')%ORDER BY "sum(v)" DESC LIMIT 2' AS ordinal_pushed,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 1 LIMIT 2'), getvariable('ctx'))) LIKE '%_resident(''gpudb:v1:memory:main:t:9:k,v'')%ORDER BY k LIMIT 2' AS ordinal_key_kept,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k ORDER BY 1 LIMIT 2'), getvariable('ctx'))) NOT LIKE '%GPUDB_TIES%' AS key_order_needs_no_guard;
+-- expect: SELECT "key" AS k, CAST(sum AS HUGEINT) AS "sum(v)" FROM gpu_groupby_sum_resident_topk('gpudb:v1:memory:main:t:9:k,v', 3, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k,v', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok QUALIFY CASE  WHEN (((rank() OVER (ORDER BY "sum(v)" DESC) = row_number() OVER (ORDER BY "sum(v)" DESC)) OR (rank() OVER (ORDER BY "sum(v)" DESC) > 2))) THEN (CAST('t' AS BOOLEAN)) ELSE "error"('GPUDB_TIES: the first 2 rows are not ordered uniquely by sum(v)') END ORDER BY "sum(v)" DESC LIMIT 2  true  true  true
 
 -- 5b. ORDER BY with no explicit direction uses the connection's default_order;
 --     without one the ORDER BY is kept but nothing is pushed
@@ -81,7 +85,7 @@ SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k AS kk, 
 SELECT json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k ORDER BY count(*) DESC LIMIT 3'), getvariable('ctx'))) AS sql,
        (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql('SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142'), getvariable('ctx')))) EXCEPT (SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 142))) AS extra,
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) FROM t GROUP BY k'), getvariable('ctx')), '$.gpudb.reason') AS sum_declined;
--- expect: SELECT "key" AS k, count AS "count_star()" FROM gpu_groupby_count_resident_topk('gpudb:v1:memory:main:t:9:k', 3, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok ORDER BY "count_star()" DESC LIMIT 3  0  shape
+-- expect: SELECT "key" AS k, count AS "count_star()" FROM gpu_groupby_count_resident_topk('gpudb:v1:memory:main:t:9:k', 4, 'desc') AS r , (SELECT gpu_assert_rows('gpudb:v1:memory:main:t:9:k', count_star()) AS ok FROM memory.main.t) AS gd WHERE gd.ok QUALIFY CASE  WHEN (((rank() OVER (ORDER BY "count_star()" DESC) = row_number() OVER (ORDER BY "count_star()" DESC)) OR (rank() OVER (ORDER BY "count_star()" DESC) > 3))) THEN (CAST('t' AS BOOLEAN)) ELSE "error"('GPUDB_TIES: the first 3 rows are not ordered uniquely by count_star()') END ORDER BY "count_star()" DESC LIMIT 3  0  shape
 
 -- 7. DECIMAL(15,2) payload: the wrapper uploaded (v*100)::BIGINT; the sum comes
 --    back typed DECIMAL(38,2) and equal to native; thresholds rescale exactly
@@ -199,13 +203,14 @@ SELECT (SELECT count(*) FROM ((SELECT * FROM json_execute_serialized_sql(gpu_rew
        json_extract_string(gpu_rewrite_ast(json_serialize_sql('SELECT k, sum(v) AS s FROM t GROUP BY k HAVING count(*) = 13187'), getvariable('ctx')), '$.gpudb.form') AS form;
 -- expect: 0  true  0  true  having
 
--- 20. EXACT: top-k by sum / count(*) / max pushes _topk with the aggregate name; identical rows
+-- 20. EXACT: top-k by sum / count(*) / max pushes _topk with the aggregate name and k + 1 rows
+--     (the (k+1)-th is what the §4.24 tie guard needs to see); identical rows
 -- setup: CREATE TABLE t AS SELECT CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 700)::BIGINT END AS k, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 3 - 100)::BIGINT END AS v FROM range(100000) r(i)
 -- setup: SELECT gpu_upload_rows_exact('gpudb:v1:memory:main:t:9:k,v', k, v, [], []) FROM t
 -- setup: SET VARIABLE ctx = '{"tag":"gpudb:v1:memory:main:t:9:k,v","exact":true,"table":{"catalog":"memory","schema":"main","name":"t","oid":9},"columns":{"k":"BIGINT","v":"BIGINT"},"backend":"METAL","rows":100000,"ready":true,"default_order":"ASC","outputs":[{"name":"k","type":"BIGINT"},{"name":"m","type":"BIGINT"}],"thresholds":{"min_rows":1000}}'
 -- setup: SET VARIABLE q = 'SELECT k, max(v) AS m FROM t GROUP BY k ORDER BY m DESC LIMIT 5'
 SELECT json_extract_string(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')), '$.gpudb.form') AS form,
-       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', ''max'', 5, ''desc'')%' AS pushed,
+       json_deserialize_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx'))) LIKE '%_topk(''gpudb:v1:memory:main:t:9:k,v'', ''max'', 6, ''desc'')%GPUDB_TIES%' AS pushed,
        (SELECT string_agg(k || ':' || m, ' ' ORDER BY m DESC, k) FROM json_execute_serialized_sql(gpu_rewrite_ast(json_serialize_sql(getvariable('q')), getvariable('ctx')))) = (SELECT string_agg(k || ':' || m, ' ' ORDER BY m DESC, k) FROM (SELECT k, max(v) AS m FROM t GROUP BY k ORDER BY m DESC LIMIT 5)) AS same_rows;
 -- expect: topk  true  true
 

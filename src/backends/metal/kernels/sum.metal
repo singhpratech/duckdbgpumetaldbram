@@ -177,9 +177,9 @@ kernel void max_partials_i64(
 //   partials[block_id*4 + 2] = MAX
 //   partials[block_id*4 + 3] = COUNT
 //
-// This is the wedge: separate sum_i64 / min_i64 / max_i64 calls each
-// re-read the column. Fusing them halves (or quarters) DRAM traffic on a
-// memory-bandwidth-bound workload.
+// This is what the fused form buys: separate sum_i64 / min_i64 / max_i64
+// calls each re-read the column. Fusing them halves (or quarters) DRAM
+// traffic on a memory-bandwidth-bound workload.
 
 constant long INIT_MIN = 0x7FFFFFFFFFFFFFFFL;   // INT64_MAX
 constant long INIT_MAX = (long)0x8000000000000000L; // INT64_MIN as signed long
@@ -2047,7 +2047,7 @@ kernel void gagg_masked_i64(
 }
 
 // ===========================================================================
-//  v0.8 — the WHERE stage of the sort path, in one pass (§4.6)
+//  v0.7 — the WHERE stage of the sort path, in one pass (§4.6)
 //
 //  gbx_mask_i64 is one dispatch per term, and each of them reads a byte of the
 //  60 MB mask and writes one back to look at a single lane: five terms walked
@@ -2221,7 +2221,7 @@ kernel void gbx_smask_eval_i64(
 }
 
 // ===========================================================================
-//  v0.8 — the direct, row-order grouped reduce (few distinct keys)
+//  v0.7 — the direct, row-order grouped reduce (few distinct keys)
 //
 //  The exact GROUP BY is sort-based: a mask pass per predicate, run starts
 //  over the key's sort cache, then a reduce that gathers every payload
