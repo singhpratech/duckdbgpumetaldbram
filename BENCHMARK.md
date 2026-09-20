@@ -5124,3 +5124,49 @@ accumulates in uint64 so overflow wraps rather than being signed-overflow UB,
 an empty input reports sum 0 / min INT64_MAX / max INT64_MIN, and `count` is
 the row count because these entry points refuse a column carrying NULLs.
 
+## v0.7 stage C — narrow lane storage on CUDA, RTX 4090, SF1 (2026-09-20)
+
+Every I64 lane of an exact set is now stored at the narrowest signed width its
+values fit (1, 2, 4 or 8 bytes). Metal has done this since #125; this is the
+CUDA half, and the measurement is what it saves on real TPC-H sets rather than
+what the design predicted.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89), driver 580.178.04, CUDA
+13.0.88, DuckDB 1.5.5, `GPUDB_CUDA_EXACT=1`, TPC-H SF1. Lane widths read from
+`gpu_store_columns()` after six GROUP BY statements over `lineitem`, `orders`
+and `partsupp`.
+
+| lane | dtype | rows | width | stored | at 8 bytes |
+|---|---|---|---|---|---|
+| `lineitem.l_linenumber` | I64 | 6,001,215 | **1** | 5.72 MiB | 45.79 MiB |
+| `lineitem.l_quantity` | I64 | 6,001,215 | **2** | 11.45 MiB | 45.79 MiB |
+| `lineitem.l_suppkey` | I64 | 6,001,215 | **2** | 11.45 MiB | 45.79 MiB |
+| `orders.o_custkey` | I64 | 1,500,000 | **4** | 5.72 MiB | 11.44 MiB |
+| `orders.o_totalprice` | I64 | 1,500,000 | **4** | 5.72 MiB | 11.44 MiB |
+| `lineitem` string key | STR | 6,001,215 | 8 | 45.79 MiB | 45.79 MiB |
+
+**85.8 MiB against 206.0 MiB — 58% less**, for the identical set of lanes. The
+same six lanes on main are all 8 bytes. Widths observed: 1B x1, 2B x2, 4B x2,
+8B x1; the string key lane holds 64-bit hashes and cannot narrow.
+
+`l_linenumber` at one byte is the shape the design was aimed at: a column whose
+values are 1..7 was costing 8 bytes a row.
+
+### What this does NOT narrow, and why that now matters more
+
+The sort cache is untouched — it still holds i64 sorted keys and i64 row ids.
+For `l_suppkey` that is 91.6 MiB of cache against an 11.45 MiB lane: **having
+narrowed the lane, the cache is now eight times the thing it derives from.**
+Narrowing it (keys at the lane's width, the permutation as u32, per the design)
+would take that 91.6 MiB to ~34.3 MiB, and it is the larger remaining win.
+
+So `narrow_lanes()` reports true because the flag means lane storage and lane
+storage is narrow. It is not a claim about the derived structures, and this
+section exists partly so that distinction is on the record rather than implied.
+
+### Correctness, unchanged
+
+unit 750/750; SQL 224 pass / 0 fail with `GPUDB_CUDA_EXACT=1` and 223/1 with it
+off; wrapper 4 failures, the same pre-existing segmented-upload cluster; TPC-H
+SF1 17 of 22 on the device with 0 rows differing from native.
+
