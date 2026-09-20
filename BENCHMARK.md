@@ -5690,3 +5690,87 @@ peaked at 511.4 MiB.
 | `test_wrapper.py` | **1267 checks, 0 skipped, 0 failing** — identical under DuckDB 1.4.5 and 1.5.5 |
 | `test_residency_policy.py` | **131 checks, 0 failing** — both DuckDB versions |
 | `test_shell.py` | **77 / 0 skipped** under DuckDB 1.4.5; **76 / 1 skipped** under 1.5.5 (the skip is a throwaway virtualenv that cannot import duckdb, so the entry point cannot start) |
+**The "Q1 straddles 1.0x" caveat in the CUDA exact-path sections above is
+superseded**, by the CUDA section below. Q1 was not straddling for a reason
+anyone had looked into: on CUDA it is a few-group VARCHAR key, and the
+exemption that admitted it is a capability CUDA does not have. It declines
+now.
+
+## v0.7.0 release measurements — CUDA, RTX 4090, SF1 (2026-09-20)
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver
+580.178.04, host toolkit CUDA 13.0.88, Linux x86_64, DuckDB 1.5.5, thresholds
+on, `data/tpch_sf1/tpch.duckdb`. No environment variable set. Default memory
+budget **8,359,084,032 B (7972 MiB)**, half the card.
+
+`gpu_build_info()`: `compiled=cpu,cuda runtime=cuda exact=true join=true
+global=true narrow=true store=true device_memory=16718168064
+device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| suite | result |
+|---|---|
+| unit (`test_gpudb`) | **752 / 752** |
+| SQL suite | **225 pass / 0 fail**, 45 guardrail, 2 skip |
+| wrapper (`test_wrapper.py`) | all pass, including the new few-group checks |
+| unit, container with CUDA compiled in and no device | **402 / 402**, CUDA-only checks skipped |
+
+### TPC-H SF1
+
+| path | on device | differing | ratio range | slowest | fastest |
+|---|---|---|---|---|---|
+| `--path execute` | **16 of 22** | **0** | 1.53× – 22.67× | Q12 | Q19 |
+| `--path sql` | **16 of 22** | **0** | 1.42× – 10.42× | Q12 | Q19 |
+
+Sixteen, not seventeen, and the sixteenth is the point: Q1 used to be counted
+here at 0.96× and 0.98×, which is a loss dressed as a query answered on the
+device. It declines now, on the threshold, before it runs — see the entry in
+`docs/RESEARCH_NOTES.md` for why. Every remaining cell is a win, and the
+narrowest of them is 1.42×.
+
+The six that stay native, both paths: Q1 and Q6, Q2, Q11, Q16 on thresholds,
+Q20 on shape (the correlated statement does not bind on its own).
+
+### The transparent gate
+
+`--subqueries --exprs --ctes --inner --lane-floor --path auto`, default budget.
+
+| | before the fix, run 1 | before, run 2 | **after** |
+|---|---|---|---|
+| cells | 1631 | 1631 | **1631** |
+| PASS | 1013 | 1009 | **999** |
+| declined (threshold) | 616 | 619 | **631** |
+| **cells below 1.0×** | 1 | 2 | **0** |
+| **cells differing** | 0 | 0 | **0** |
+| ratio range of PASS | 1.00× – 406.70× | 1.08× – 442.16× | **1.05× – 452.62×** |
+| wall | 20m51s | 20m54s | **21m24s** |
+| exit | 1 | 1 | **0** |
+
+Device memory peaked at 8525 MiB across the window covering the two runs
+before the fix — the same ~8.4 GiB plateau on record, and for the same reason
+(the budget accounts for resident sets, not operator working memory). The run
+after the fix was not sampled.
+
+The fourteen cells that moved from PASS to declined are the few-group VARCHAR
+shapes: they were passing the gate at ratios above 1.0 in the runs where the
+measured rule had already declined them mid-cell, and failing it in the runs
+where it had not. They do not reach the device at all now.
+
+### What the two runs before the fix were really showing
+
+Run 1 lost `l_returnflag / no WHERE / plain` at 0.93×. Run 2 lost
+`projected` and `inner_agg` for the same key and passed `plain` at 1.74×. One
+key, three cells, two runs — because the gate times a shape before the
+continuous measured rule declines it in some runs and after in others. The
+device cost underneath was never ambiguous:
+
+| key | groups | device | native |
+|---|---|---|---|
+| `l_returnflag` | 3 | 7.57 ms | 2.67 ms |
+| `l_shipmode` | 7 | 6.20 ms | 2.71 ms |
+| `l_suppkey` | 10,000 | 8.51 ms | 21.67 ms |
+| `l_partkey` | 200,000 | 141.39 ms | 209.17 ms |
+
+The device cost is a floor set by the row count; native's falls as groups get
+fewer. They cross in the hundreds, and `min_groups = 1000` already sits above
+the crossing.
+
