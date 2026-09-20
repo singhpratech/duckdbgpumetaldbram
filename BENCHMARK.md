@@ -3617,7 +3617,7 @@ bound and none differing, exit 0. The `global` form is now swept over single
 tables as well as joins — 74 rows, of which the 8 single-table ones decline on
 the threshold at SF1 and the 66 over joins run 1.02× to 75×.
 
-## v0.8 — the direct, row-order grouped reduce, Metal, SF10 (2026-09-18)
+## v0.7 — the direct, row-order grouped reduce, Metal, SF10 (2026-09-18)
 
 A GROUP BY key with few distinct values gets a dense group-id lane derived from
 its sort cache (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) and the exact operators
@@ -3915,7 +3915,7 @@ scratch needs are not cold any more. The prewarm stays because it costs nothing
 the direct path allocates no row-sized scratch at all.
 
 
-## v0.8 — what the direct reduce costs before its first row, Metal (2026-09-18)
+## v0.7 — what the direct reduce costs before its first row, Metal (2026-09-18)
 
 The section above measured one row count, 60M, and concluded there was no
 crossover. That was wrong, and the way it was wrong is worth keeping: a pass
@@ -4152,7 +4152,7 @@ are and the run-time measured rule 1 keeps deciding these shapes. The only
 rows below 1.0× in that sweep are the global-aggregate form at SF1, which its
 own rule (`rows × (1 + terms) ≥ 60M`) already declines.
 
-## v0.8 — shedding what the direct reduce made unnecessary, Metal, SF10 (2026-09-18)
+## v0.7 — shedding what the direct reduce made unnecessary, Metal, SF10 (2026-09-18)
 
 A key column with a group-id lane releases its sort cache, and a lane that is a
 GROUP BY key and nothing else releases the lane too (`key[row] =
@@ -4212,7 +4212,7 @@ column per structure and never twice, and `--joins none`, `--no-single` and
 `--exprs` alone find none. The gate is still exit 0 with every rewritten cell at
 or above the bound.
 
-## v0.8 — the WHERE stage of the sort path in one pass, Metal, SF10 (2026-09-18)
+## v0.7 — the WHERE stage of the sort path in one pass, Metal, SF10 (2026-09-18)
 
 `gbx_mask_i64` was one kernel dispatch per predicate over the rows, each of them
 reading a byte of the mask and writing one back in order to look at a single
@@ -4355,7 +4355,7 @@ the machine, on the final code: 782 cells, 509 rewritten and at or above the
 bound, 273 declined by a threshold, 0 slower, 0 differing, exit 0. No threshold
 changed.
 
-## v0.8 stage D1 — a lane read through an index vector, Metal, SF1 + SF10 (2026-09-19)
+## v0.7 stage D1 — a lane read through an index vector, Metal, SF1 + SF10 (2026-09-19)
 
 **Hardware / build:** Apple M4 Max (unified memory), macOS 25.6, `./scripts/build.sh`
 (`build-macos`, CPU + Metal), DuckDB via `gpudb.connect()` with `threads = 1`.

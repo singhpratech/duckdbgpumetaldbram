@@ -68,8 +68,8 @@ Five pieces, in dependency order:
 | D | **The rewrite** (§6): `GROUP BY` with `WHERE`, `HAVING`, `ORDER BY … LIMIT`, over resident columns, with a device-side predicate mask | the user-visible feature |
 | E | **The gate** (§9): break-even sweeps, thresholds per backend, `transparent_gate.sh`, three-way parity | rules 1 and 2 mechanically |
 
-Joins on the transparent path are v0.8 (§10) and are designed for here so
-nothing in A–E has to be redone for them.
+Joins on the transparent path (§4.8, §4.13) are designed for here so nothing
+in A–E had to be redone for them.
 
 ## 2. Plan shapes covered
 
@@ -705,7 +705,8 @@ their DOUBLE paths with the parity tolerance `groupby_parity_check.sh`
 already applies, and the device result there is deterministic run to run
 (fixed reduction tree, no atomics on either backend), which the docs may
 state. The double-double option stays a setting on the explicit path.
-Revisited in v0.8 only if a definition of exactness against native exists.
+This is revisited only if a definition of exactness against native ever
+exists for it.
 
 ### 4.8 Key joins, materialised on the device
 The join shapes analytics SQL is made of are fact-to-dimension: `lineitem
@@ -2017,8 +2018,8 @@ never come back unnoticed.
 
 ### 5.7 Shared with joins
 A resident set is `{identity, columns, sorted key permutation, validity,
-state}`. The v0.5 join build side is the same object, which is what lets
-v0.8 route joins through the same manager (§10).
+state}`. The v0.5 join build side is the same object, which is what lets the
+transparent path's joins (§4.8, §4.13) go through the same manager.
 
 ### 5.9 Foreign writes: the file is the change log
 The staleness guard (`gpu_assert_rows`) compares row counts, so a write from
@@ -2424,21 +2425,38 @@ explicit upload + `gpu_groupby_*` call returns the native answer. The GPU
 node is demonstrated on the release assets (Metal, CUDA), not on the
 community binary.
 
-## 10. v0.8, designed for now
+## 10. Not in v0.7, and why
 
-- **Transparent joins**: `t1 JOIN t2 ON t1.k = t2.k` with aggregates above,
-  routed to the v0.5 resident join on the same resident sets (§5). The
-  matcher gains one more shape; the residency manager and gate are already
-  there.
-- **Fused aggregate → join** (TPC-H Q18 end to end: filtered groups joined
-  back to `orders`/`customer` on the device without materialising the group
-  rows). New kernel, both backends.
-- **Window functions** over resident sorted columns (`WINDOW_FUNCTIONS_DESIGN.md`).
-- **DOUBLE sums**, only with a definition of exactness against native (§4.7).
+Each of these runs on DuckDB. The statement is answered; it is simply not
+answered on the device.
 
-## 11. v0.6.1 — maintenance release (first)
+- **Window functions.** The `WINDOW` class is rejected in §2. There is no
+  kernel: what one would look like over resident sorted columns is worked out
+  in `WINDOW_FUNCTIONS_DESIGN.md`, which is a design note and not an
+  implementation.
+- **`sum` / `avg` over `DOUBLE` or `FLOAT`.** Not a gap but a decision (§4.7):
+  native's own result depends on the order the values are added, so there is no
+  single answer for a device to match, and rule 2 forbids guessing at one. This
+  is revisited only if a definition of exactness against native ever exists.
+- **`median`, `stddev`, quantiles.** No kernel and no decomposition that keeps
+  rule 2.
+- **`FULL` joins, semi / anti joins, cross products, subqueries as join
+  inputs.** §2 rejects them on shape. The fused semi / anti joins remain
+  available as explicit `gpu_*` calls.
+- **Correlated subqueries outside a `WHERE` term** (TPC-H Q2, Q20). The inner
+  statement does not bind on its own (§4.14). The decorrelation is expressible;
+  the `GROUP BY` it produces is output-bound and the measured bounds decline it,
+  which is rule 1 working rather than a missing feature.
+- **Prepared-statement parameters, several statements in one call, and
+  statements inside an explicit transaction.** §5.2 and §5.4.
 
-Packaging only. No operator changes.
+`docs/RESEARCH_NOTES.md` ends with the open questions behind several of these,
+with the measurements that produced them.
+
+## 11. The portable Linux build (prepared as v0.6.1, not released)
+
+Packaging only. No operator changes. Kept here as the record of the problem
+and the fix, which apply to every Linux release asset from here on.
 
 **Problem.** The v0.6.0 `gpudb.linux_amd64.duckdb_extension` release asset
 was built on Ubuntu 24.04 and needs `GLIBCXX_3.4.32` / `GLIBC_2.38`, so it

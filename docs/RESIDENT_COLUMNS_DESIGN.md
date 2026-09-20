@@ -1,8 +1,10 @@
-# Resident columns — the v0.8 storage design
+# Resident columns — the storage design
 
-Status: design 2026-09-18; stage A merged (#123), stage B merged (#124), stage C
-merged (#125); the group-id lane of §7 built 2026-09-18 (this PR, Metal); stage
-D next. Companion to
+Status: designed 2026-09-18 and shipped in v0.7 — stage A merged (#123), stage B
+merged (#124), stage C merged (#125), the group-id lane of §7 built 2026-09-18
+(Metal). Stage D (a join result read through index vectors instead of copied)
+is designed and measured in §8; the indexed read is not wired into SQL, and
+the section says so where it says so. Companion to
 `docs/TRANSPARENT_DESIGN.md` (the rewrite, the rules, the thresholds), which it
 does not change: rule 1 (never slower than native) and rule 2 (never a
 different answer) are enforced by the same gate and the same tests.

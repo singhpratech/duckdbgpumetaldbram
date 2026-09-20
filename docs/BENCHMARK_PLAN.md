@@ -20,10 +20,10 @@ We use these because reviewers will ask for them:
 
 | Suite | What it is | Why it matters | Status |
 |---|---|---|---|
-| **TPC-H** | 22 SQL queries on 8-table snowflake schema, multiple SFs | THE canonical analytical SQL benchmark. CUDA path already runs SF1 lineitem aggregations. | SF1 generated; SF10 next |
-| **TPC-DS** | 99 queries on 17-table snowflake, more complex (CTEs, windows) | Modern decision-support; tests window functions and complex joins | Future (post hash-join) |
-| **ClickBench** | 43 queries on real Yandex.Metrica web traffic (~14 GiB hits.parquet) | Modern OLAP leaderboard, lots of GROUP BY at varying cardinalities | Wired once DuckDB extension is fully end-to-end |
-| **SSB (Star Schema Benchmark)** | Denormalized TPC-H, 13 queries | Dense aggregations + star joins; the workload `cuDF` paper uses | Planned |
+| **TPC-H** | 22 SQL queries on 8-table snowflake schema, multiple SFs | THE canonical analytical SQL benchmark. | In use: SF1 through SF100; `scripts/tpch_coverage.py` runs all 22 through DuckDB and through the transparent path and compares every row |
+| **TPC-DS** | 99 queries on 17-table snowflake, more complex (CTEs, windows) | Modern decision-support; tests window functions and complex joins | Not run |
+| **ClickBench** | 43 queries on real Yandex.Metrica web traffic (~14 GiB hits.parquet) | Modern OLAP leaderboard, lots of GROUP BY at varying cardinalities | Not run |
+| **SSB (Star Schema Benchmark)** | Denormalized TPC-H, 13 queries | Dense aggregations + star joins; the workload `cuDF` paper uses | Not run |
 
 Both CUDA and Metal numbers go in the **same** BENCHMARK.md table for each
 TPC-H query so the comparison is apples-to-apples.

@@ -36,7 +36,7 @@ else             → CPU
 
 ## Memory model
 - **CUDA**: explicit `cudaMalloc` + `cudaMemcpyAsync` over a single stream. Reuses device buffers across calls (`ensure_buffers`).
-- **Metal** (planned): `MTLBuffer` with `MTLResourceStorageModeShared` — Apple Silicon UMA means no transfer cost, just a CPU-visible pointer the GPU can read directly.
+- **Metal**: `MTLBuffer` with `MTLResourceStorageModeShared` — Apple Silicon UMA means no transfer cost, just a CPU-visible pointer the GPU can read directly. Buffers are released under ARC since v0.6.0.
 - **CPU**: zero-copy obviously.
 
 ## Why this shape (and not a full DuckDB extension first)

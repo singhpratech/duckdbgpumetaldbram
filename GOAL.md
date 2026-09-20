@@ -2,6 +2,12 @@
 
 > A DuckDB extension that gives you GPU-accelerated analytical operators on **both NVIDIA workstations (CUDA)** and **Apple Silicon (Metal/MLX)** — with a planner honest enough to use the CPU when it's faster.
 
+*This page is the project charter as it was written in May 2026, kept as a
+record of what was set out then and what the comparison with the other GPU
+engines was. It is not a statement of what is planned now: what has shipped is
+in the README's **Release history**, what runs on the GPU today is in the
+README's v0.7 section, and what does not is in `KNOWN_ISSUES.md`.*
+
 ## Why this and not "another GPU database"
 
 The 2013–2024 GPU-database graveyard is real (HEAVY.AI acqui-hired by NVIDIA 2025; BlazingSQL dormant; Voltron Data 50% layoff; Brytlyt acqui-hired). Building "yet another GPU SQL engine" is not a viable bet.
@@ -18,8 +24,8 @@ What's open in 2026:
 | Apple Silicon (Metal/MLX) backend | ❌ | ❌ | ❌ | **✅ unique** |
 | DuckDB-extension shape (no migration) | ✅ | ❌ | ❌ | **✅** |
 | CUDA backend | ✅ | ✅ | ✅ | ✅ |
-| Hybrid CPU/GPU planner that picks correctly | partial | ❌ | ❌ | **✅ planned** |
-| Window functions on GPU | ❌ | partial | ✅ | **✅ planned (open gap in Sirius)** |
+| Hybrid CPU/GPU planner that picks correctly | partial | ❌ | ❌ | **✅ shipped** |
+| Window functions on GPU | ❌ | partial | ✅ | ❌ — they run on DuckDB |
 | Apache-2.0 + community-friendly from day 1 | ✅ | ✅ | ✅ | **✅** |
 
 ## Hard commitments (what we will ship, in order)
