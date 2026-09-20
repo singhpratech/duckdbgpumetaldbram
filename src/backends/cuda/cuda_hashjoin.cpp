@@ -125,11 +125,14 @@ public:
         if (n_build == 0 || n_probe == 0) return r;
 
         const std::int64_t empty = gpudb_cuda_hashjoin_empty_sentinel();
-        // Defensive: refuse build keys equal to the empty sentinel.
+        // Refuse the sentinel in build keys rather than drop them. As in the
+        // hash GROUP BY, this is a property of the open-addressing table and
+        // not a gap: the slot array needs one value to mean "empty".
         for (std::size_t i = 0; i < n_build; ++i) {
             if (build_keys[i] == empty)
                 throw std::runtime_error(
-                    "build key INT64_MIN clashes with empty sentinel; not yet supported");
+                    "build key INT64_MIN is this hash table's empty slot marker and cannot "
+                    "be joined on by it");
         }
 
         const std::uint32_t cap = pick_table_capacity(n_build);

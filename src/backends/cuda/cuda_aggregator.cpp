@@ -45,6 +45,9 @@ cudaError_t gpudb_cuda_min_i64(const std::int64_t* d_in, std::size_t n,
 cudaError_t gpudb_cuda_max_i64(const std::int64_t* d_in, std::size_t n,
                                std::int64_t* d_partials, std::int64_t* d_out,
                                std::int64_t init, int grid, cudaStream_t s);
+cudaError_t gpudb_cuda_agg_all_i64(const std::int64_t* d_in, std::size_t n,
+                                   std::int64_t* d_partials, std::int64_t* d_out,
+                                   int grid, cudaStream_t s);
 cudaError_t gpudb_cuda_sum_f64(const double* d_in, std::size_t n,
                                double* d_partials, double* d_out,
                                int grid, cudaStream_t s);
@@ -460,19 +463,59 @@ public:
         return reduce_i64_resident(check_i64(c), ReduceKind::Max,
                                    std::numeric_limits<std::int64_t>::min());
     }
-    // TODO(linux-claude): implement fused multi-agg kernel for CUDA.
-    // Pattern matches Metal: per-block reduction producing 4 partials
-    // (sum/min/max/count), final tree reduction over the per-block partials.
-    // Until then this throws so the abstract interface is satisfied without
-    // a half-baked implementation. macOS Claude must not write CUDA per
-    // CLAUDE.md.
-    AggAllResult agg_all_i64(const std::int64_t* /*data*/, std::size_t /*n*/) override {
-        throw std::runtime_error(
-            "CUDA agg_all_i64 not implemented yet — see TODO in cuda_aggregator.cpp");
+    // ---- fused SUM + MIN + MAX + COUNT in one pass (agg_all) ----
+    // The point of the fused form is that the column is read ONCE: three
+    // separate reductions over a bandwidth-bound column cost about three
+    // times as much. count needs no kernel — these entry points refuse a
+    // column carrying NULLs, so every row is a value.
+    //
+    // Semantics are the CPU reference's: the sum accumulates in uint64 so
+    // overflow wraps (defined) rather than being signed-overflow UB, and an
+    // empty input reports sum 0, min INT64_MAX, max INT64_MIN.
+    AggAllResult agg_all_i64(const std::int64_t* data, std::size_t n) override {
+        AggAllResult r{};
+        r.rows = n;
+        r.count = n;
+        if (n == 0) {
+            r.sum = 0;
+            r.min = std::numeric_limits<std::int64_t>::max();
+            r.max = std::numeric_limits<std::int64_t>::min();
+            return r;
+        }
+        const auto t_wall0 = std::chrono::steady_clock::now();
+        const std::size_t bytes = n * sizeof(std::int64_t);
+        ensure_in(bytes);
+        const auto t_xfer0 = std::chrono::steady_clock::now();
+        GPUDB_CUDA_CHECK(cudaMemcpyAsync(d_in_, data, bytes, cudaMemcpyHostToDevice, stream_),
+                         "agg_all H2D");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "agg_all H2D sync");
+        const double h2d_ms = elapsed_ms(t_xfer0);
+        AggAllResult k = agg_all_device(static_cast<const std::int64_t*>(d_in_), n);
+        r.sum = k.sum; r.min = k.min; r.max = k.max;
+        r.kernel_ms   = k.kernel_ms;
+        r.transfer_ms = h2d_ms + k.transfer_ms;
+        r.wall_ms     = elapsed_ms(t_wall0);
+        return r;
     }
-    AggAllResult agg_all_resident_i64(const ResidentColumn& /*c*/) override {
-        throw std::runtime_error(
-            "CUDA agg_all_resident_i64 not implemented yet — see TODO in cuda_aggregator.cpp");
+    AggAllResult agg_all_resident_i64(const ResidentColumn& c) override {
+        const auto& col = check_i64(c);
+        AggAllResult r{};
+        r.rows = col.rows();
+        r.count = col.rows();
+        if (col.rows() == 0) {
+            r.sum = 0;
+            r.min = std::numeric_limits<std::int64_t>::max();
+            r.max = std::numeric_limits<std::int64_t>::min();
+            return r;
+        }
+        const auto t_wall0 = std::chrono::steady_clock::now();
+        AggAllResult k = agg_all_device(static_cast<const std::int64_t*>(col.device_ptr()),
+                                        col.rows());
+        r.sum = k.sum; r.min = k.min; r.max = k.max;
+        r.kernel_ms   = k.kernel_ms;
+        r.transfer_ms = k.transfer_ms;      // resident: the 24 bytes back, nothing more
+        r.wall_ms     = elapsed_ms(t_wall0);
+        return r;
     }
 
     AggResult sum_resident_f64(const ResidentColumn& c) override {
@@ -1572,6 +1615,35 @@ private:
     static double elapsed_ms(std::chrono::steady_clock::time_point t0) {
         return std::chrono::duration<double, std::milli>(
                    std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // The device half of agg_all: one fused pass over `n` values already on
+    // the device, then the three results back in a single 24-byte copy.
+    AggAllResult agg_all_device(const std::int64_t* d_values, std::size_t n) {
+        AggAllResult r{};
+        const int grid = gpudb_cuda_grid_for(n);
+        // three runs of `grid` partials (sums, mins, maxs) and three results
+        ensure_partials_out(static_cast<std::size_t>(grid) * 3 * sizeof(std::int64_t),
+                            3 * sizeof(std::int64_t));
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const cudaError_t err = gpudb_cuda_agg_all_i64(
+            d_values, n, static_cast<std::int64_t*>(d_partials_),
+            static_cast<std::int64_t*>(d_out_), grid, stream_);
+        if (err != cudaSuccess) cuda_throw(err, "agg_all kernel launch");
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_stop_, stream_), "ev_stop");
+        GPUDB_CUDA_CHECK(cudaEventSynchronize(ev_stop_), "ev_sync");
+        float kernel_ms = 0.0f;
+        GPUDB_CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev_start_, ev_stop_), "elapsed");
+
+        std::int64_t out[3] = {0, 0, 0};
+        const auto t_xfer = std::chrono::steady_clock::now();
+        GPUDB_CUDA_CHECK(cudaMemcpyAsync(out, d_out_, sizeof(out), cudaMemcpyDeviceToHost, stream_),
+                         "agg_all D2H");
+        GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "agg_all D2H sync");
+        r.transfer_ms = elapsed_ms(t_xfer);
+        r.kernel_ms   = static_cast<double>(kernel_ms);
+        r.sum = out[0]; r.min = out[1]; r.max = out[2];
+        return r;
     }
 
     AggResult reduce_i64_resident(const CudaResidentColumn& r, ReduceKind kind, std::int64_t init) {

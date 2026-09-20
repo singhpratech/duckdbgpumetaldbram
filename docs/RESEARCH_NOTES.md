@@ -3757,6 +3757,40 @@ have meant the diagnosis was still wrong.
 
 Both exact uploads get it: the row form and the pair form had the same loop.
 
+## 2026-09-20 — Three passes into one, and a ratio that checks itself
+
+`agg_all_i64` — SUM, MIN, MAX and COUNT in one pass — had been a throwing stub
+on CUDA since v0.1, with a TODO saying what to write. CPU and Metal had it. The
+unit suite had a block for it guarded by `if (b != gpudb::Backend::CUDA)`, which
+is the tidy way of recording that a backend does not do something.
+
+The kernel is unremarkable: a grid-stride loop folding each element into three
+registers, a shared-memory tree reduce, three runs of per-block partials in one
+buffer, a second pass over them. What is worth noting is the number it produced.
+
+    separate SUM+MIN+MAX   2.150 ms
+    fused agg_all          0.719 ms      2.99x
+
+Three passes into one, on 381 MiB, and the ratio landed within 0.3% of 3.00.
+That is not a coincidence to be pleased about — it is a check. A bandwidth-bound
+kernel that reads a column once instead of three times SHOULD be almost exactly
+3x, and the useful information in the measurement is the agreement, not the
+speed. A fused reduce measuring 1.8x would mean something else was wrong —
+occupancy, or a spill, or a read that was not coalesced — and the 2.99x says
+there is nothing else to look for. The absolute number agrees too: 517.8 GiB/s
+against ~576 GB/s of theoretical bandwidth is ~90% of peak.
+
+The CPU is the instructive contrast: the same fusion there is 1.16x. The win
+from fusing is proportional to how much of the time was spent moving bytes, and
+on 20 OpenMP threads at this size that is not most of it. "Fusing aggregates is
+a 3x win" is false as a general claim and true on the machine where memory is
+the constraint — which is the machine this project targets, so it is easy to
+forget the qualifier.
+
+Removing the skip took the unit suite from 711 to 730 checks, all passing.
+Those nineteen were not new tests: they were tests that already existed and had
+been running on two backends out of three.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
