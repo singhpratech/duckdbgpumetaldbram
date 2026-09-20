@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import statistics
 import sys
 import threading
@@ -52,6 +53,14 @@ SEGMENT_BYTES = 8 << 20          # the extension's host segment (gpu_resident.cp
 RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling per consecutive interrupt
 EVICT_MIN_AGE_S = 60.0            # §5.5: a set is never evicted within this long of being uploaded (anti-thrash)
 MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget kept off the device
+DEVICE_ERROR = "device refused: " # ... and of one the DEVICE would not take (an upload that raised)
+# A set the budget or the device turned away is not asked for again until
+# something that could change the answer changes: the data under it, the
+# budget, the anti-thrash window, the resident population — all watched, not
+# waited for — and, as the backstop, `rate_s`. Measured on an M4 Max
+# 2026-09-20 (a lineitem upload the device refuses, the same statement twelve
+# times): without this the wrapper made one upload attempt per statement, for
+# ever, and each attempt cost a full host-side buffering of the table.
 POST_MAX_ATTEMPTS = 8            # interrupted sort-cache attempts before the set goes ready without it
 RETRY_PAUSE_MAX_MS = 1000.0      # the idle wait already yields to every statement; a longer cap only
                                  # delayed readiness (measured: 15 of 20 segments landed in 3 s, the
@@ -248,6 +257,18 @@ class SetState:
     measured_uses: int = 0          # uses whose saving was measured, not estimated
     last_use: float = 0.0
     override_evicted_at: float = 0.0  # ... when it was last evicted by a minimum-age override
+    # §5.5 a refusal the manager REMEMBERS. A set the budget or the device
+    # turned away is not asked for again while the four things that could
+    # change the answer are unchanged: the data under it (`epoch`), the
+    # budget, the resident population (`room_seq`, which every eviction and
+    # every invalidation moves) and time (`resume_at`). Without this an eager
+    # connection re-ran the whole admission — and, where the refusal came from
+    # the device, the whole upload — once per statement, for ever.
+    refused_at: float = 0.0
+    refused_epoch: int = -1
+    refused_budget: Optional[int] = None
+    refused_room_seq: int = -1
+    refused_min_age: float = -1.0     # ... and the anti-thrash window it was taken under
 
     @property
     def session_name(self) -> str:
@@ -273,6 +294,28 @@ def _env_float(name: str, default: float) -> float:
         return default if v is None or v == "" else max(0.0, float(v))
     except ValueError:
         return default
+
+
+# What a backend says when an OPERATOR — not an upload — could not get its
+# working memory, in the one shape that carries numbers:
+#   "CUDA exact reduce_by_key failed: out of memory (needs 274 MiB of working
+#    memory, 186 MiB free)"
+# Absent (Metal today, an older extension) the two are None and the policy
+# falls back on the refusal alone, which is the conservative direction.
+_WORKING_MEM_RE = re.compile(
+    r"needs\s+(\d+(?:\.\d+)?)\s*MiB\s+of\s+working\s+memory,\s*(\d+(?:\.\d+)?)\s*MiB\s+free",
+    re.IGNORECASE)
+
+
+def _working_memory(err: str):
+    """(needed bytes, free bytes) from a backend's working-memory message, or
+    (None, None). Only MiB is accepted: it is the unit the message is written
+    in, and inventing a parse for units nobody emits would be inventing the
+    measurement too."""
+    m = _WORKING_MEM_RE.search(err or "")
+    if not m:
+        return None, None
+    return int(float(m.group(1)) * 2**20), int(float(m.group(2)) * 2**20)
 
 
 def _is_interrupt(err: str) -> bool:
@@ -312,6 +355,22 @@ class ResidencyManager:
         # this structurally unreachable except when a drop itself fails, and it
         # is counted rather than assumed (§5.5).
         self.evictions_wasted = 0
+        # refusals the manager is still holding to (see SetState.refused_at),
+        # and how many upload attempts they have saved
+        self.refusals = 0
+        self.refusals_held = 0
+        # Moves whenever the resident population does — an eviction, an
+        # invalidation. A refusal taken at one value of this is reconsidered
+        # at the next, because room that did not exist then may exist now.
+        self._room_seq = 0
+        # Working memory an operator needs TRANSIENTLY and the budget cannot
+        # hold, because it is never resident: the exact reduce's scratch, a
+        # sort's temporaries. Zero until a backend reports a shortfall in
+        # `note_execution_refusal`, then the largest shortfall it reported.
+        # Subtracted from the budget at admission, so a device that has just
+        # said it needed 88 MiB it did not have is not packed to the last byte
+        # again on the next upload.
+        self.scratch_headroom = 0
         self._col_uploaded: Dict[tuple, float] = {}   # (store, lane) -> monotonic time it landed (anti-thrash)
         self._log = log or (lambda m: None)
         self._sets: Dict[str, SetState] = {}
@@ -429,10 +488,22 @@ class ResidencyManager:
                 # a store-backed set sighted without a recipe keeps the one it has:
                 # erasing it would leave a view-backed set with nothing to upload and
                 # no sort cache to build, i.e. ready for free over columns that are gone
-            # a set the memory budget refused stays refused until its retry time: re-queueing it on
-            # every sighting would hide the reason and make the worker ask again every few ms
-            refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
-                       and self._now() < s.resume_at)
+            # a set the budget or the device refused stays refused until something
+            # that could change the answer changes: re-queueing it on every sighting
+            # would hide the reason and make the worker ask again every few ms
+            refused = self._refusal_holds_locked(s)
+            if refused:
+                self.refusals_held += 1
+            elif s.state == "failed" and s.refused_epoch >= 0:
+                # the refusal has lapsed, so the set gets its attempts back.
+                # `max_attempts` is there to stop a set that cannot be uploaded
+                # from being tried again every few milliseconds, and the
+                # refusal's own retry window already does that — without this
+                # reset the cap was a CLIFF: twenty failures and the template
+                # declined 'not_resident' for the life of the connection, long
+                # after whatever caused them was over (x86, 2026-09-20).
+                s.attempts = 0
+                s.refused_epoch = -1
             if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
                 s.state = "pending"
                 self._cv.notify_all()
@@ -456,6 +527,7 @@ class ResidencyManager:
             return prefix is not None and (t == prefix or t.startswith(prefix + ":"))
         with self._cv:
             now = self._now()
+            self._room_seq += 1          # what is resident changed; refusals taken before it are stale
             hit = {t for t in self._sets if (tag is None and prefix is None) or t == tag or under(t)}
             # a derived set goes with any of its sources
             hit |= {t for t, s in self._sets.items() if any(d in hit for d in s.deps)}
@@ -480,11 +552,87 @@ class ResidencyManager:
             s = self._sets.get(tag)
             if s is None:
                 return
-            refused = (s.state == "failed" and s.error.startswith(MEMORY_ERROR)
-                       and self._now() < s.resume_at)
+            refused = self._refusal_holds_locked(s)
             if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
                 s.state = "pending"
                 self._cv.notify_all()
+
+    # ---- refusals the manager remembers (§5.5) ----
+    def _refusal_holds_locked(self, s: SetState) -> bool:
+        """Is this set's recorded refusal still the right answer? Caller holds
+        the lock.
+
+        It stops being the right answer when any of the things it was taken
+        against moves: the data under the set, the budget, the anti-thrash
+        window the plan was judged under (what refuses most candidates is a
+        resident unit still inside it), the resident population (an eviction
+        freed room, an invalidation gave it back), or the clock. Anything
+        else — another statement over the same template, another template
+        over the same table — cannot change it, and asking again costs an
+        upload."""
+        if s.state != "failed" or s.refused_epoch < 0:
+            return False
+        if (s.refused_epoch != s.epoch or s.refused_budget != self.memory_budget
+                or s.refused_room_seq != self._room_seq
+                or s.refused_min_age != self.evict_min_age_s):
+            return False
+        return self._now() < s.resume_at
+
+    def _note_refusal_locked(self, s: SetState, error: str) -> None:
+        """Record WHY this set is not resident and what that answer was taken
+        against, so the next sighting can tell whether it still stands. Caller
+        holds the lock."""
+        now = self._now()
+        s.state = "failed"
+        s.error = error
+        s.refused_at = now
+        s.refused_epoch = s.epoch
+        s.refused_budget = self.memory_budget
+        s.refused_room_seq = self._room_seq
+        s.refused_min_age = self.evict_min_age_s
+        s.resume_at = now + self.rate_s
+        self.refusals += 1
+
+    def note_execution_refusal(self, tags: Iterable[str], error: str) -> None:
+        """An operator over these sets ran out of memory although the sets
+        themselves fit (the reduce's scratch, a join's temporaries — working
+        memory the budget does not account for and cannot, since it is never
+        resident and the wrapper never sees its size).
+
+        Two things happen, and the second is the one that stops it recurring.
+
+        The sets are refused, so the next statement over the same template
+        does not walk into the same failure; time, an eviction, a write or a
+        budget change let it try again, exactly as for an upload the device
+        refused.
+
+        And, where the backend SAYS how much it needed and how much was free
+        ("out of memory (needs 274 MiB of working memory, 186 MiB free)"), the
+        shortfall becomes the budget's working-memory HEADROOM: from then on
+        admission leaves that much of the budget unspent. The number is the
+        device's own measurement of this workload rather than a constant
+        picked here, it is taken at its largest and never guessed — a backend
+        that reports no numbers leaves the headroom where it was, which is
+        zero, and the refusal alone does the work."""
+        need, free = _working_memory(error)
+        with self._lock:
+            short = 0
+            if need is not None and free is not None and need > free:
+                short = need - free
+                if short > self.scratch_headroom:
+                    self.scratch_headroom = short
+                    self._log(f"working memory: an operator needed {need / 2**20:.0f} MiB with "
+                              f"{free / 2**20:.0f} MiB free, so admission now leaves "
+                              f"{short / 2**20:.0f} MiB of the budget unspent")
+            note = (f", which asked for {need / 2**20:.0f} MiB with {free / 2**20:.0f} MiB free"
+                    if short else "")
+            for t in tags:
+                s = self._sets.get(t)
+                if s is None:
+                    continue
+                self._note_refusal_locked(
+                    s, f"{DEVICE_ERROR}an operator over this set ran out of device memory{note} "
+                       f"— working memory the budget does not hold: {error.splitlines()[0][:160]}")
 
     def snapshot(self) -> Dict[str, str]:
         with self._lock:
@@ -660,10 +808,13 @@ class ResidencyManager:
         budget = self.memory_budget
         if not budget or s.est_bytes <= 0:
             return True
+        # what an operator over the set will need beside it, as the device has
+        # measured it on this connection (0 until a backend says otherwise)
+        budget = max(1, budget - self.scratch_headroom)
         if s.est_bytes > budget:
             with self._lock:
                 s.error = (f"{MEMORY_ERROR}the set needs about {s.est_bytes / 2**20:.0f} MiB, "
-                           f"the budget is {budget / 2**20:.0f} MiB")
+                           f"the budget is {budget / 2**20:.0f} MiB" + self._headroom_note())
             self._log(f"not uploaded: {s.tag}: {s.error}")
             return False
         with self._lock:
@@ -690,6 +841,15 @@ class ResidencyManager:
         self._note_wasted(before)
         return False
 
+    def _headroom_note(self) -> str:
+        """What the budget is holding back for an operator's working memory,
+        said where the arithmetic is, so the two numbers add up for a reader."""
+        if not self.scratch_headroom:
+            return ""
+        return (f" (the budget is {self.memory_budget / 2**20:.0f} MiB less "
+                f"{self.scratch_headroom / 2**20:.0f} MiB an operator has already needed "
+                f"as working memory beside its set)")
+
     def _note_wasted(self, before: int) -> None:
         """This call is refusing. Anything it dropped on the way bought nothing."""
         with self._lock:
@@ -708,9 +868,46 @@ class ResidencyManager:
             return None
         live = {r[0]: r for r in rows}
         cols = {(r[0], r[1]): (int(r[2] or 0), r[3]) for r in crows}
-        used = (sum(int(r[2] or 0) for r in rows if r[0] != s.tag)
-                + sum(b for b, _u in cols.values()))
+        used = self._physical_locked(live, cols, skip=s.tag)
         return live, cols, used
+
+    @staticmethod
+    def _physical_locked(live: dict, cols: dict, skip: str = "") -> int:
+        """Bytes actually on the device, counting each physical thing ONCE.
+
+        Two surfaces, no overlap between them, and the reason is worth stating
+        because summing the wrong one is wrong in both directions:
+
+          * `gpu_store_columns()` is the physical column — the lane, its
+            validity bitmap and the derived structures on it (the sort cache,
+            the group-id lane). A column is shared by every view that reads
+            it, and it is freed only when the last of them is gone, so this is
+            where the bytes are.
+          * `gpu_residents()` is the SET. A store-backed set is a view and
+            owns nothing, so it reports 0 there — by design, not by omission;
+            a set that holds its own columns (a materialised join, a
+            hand-uploaded set) reports what it holds.
+
+        Summing a set's own reported `bytes` per set over-counts a view by
+        every column it shares (measured on an M4 Max, 26 sets: 2120 MiB
+        against 472 MiB physical, 4.5x). Summing `gpu_residents().bytes`
+        ALONE under-counts them to nothing. The total the budget is compared
+        with is this one, and only this one."""
+        return (sum(int(r[2] or 0) for r in live.values() if r[0] != skip)
+                + sum(b for b, _u in cols.values()))
+
+    def physical_bytes(self, run: Callable[[str], List[tuple]]) -> Optional[int]:
+        """The same total, for a caller outside an admission decision (the
+        budget gate, `Connection.memory()`). None when the extension cannot be
+        asked."""
+        try:
+            rows = run("SELECT name, origin, bytes FROM gpu_residents()")
+            crows = run("SELECT store, \"column\", bytes FROM gpu_store_columns()")
+        except Exception:
+            return None
+        live = {r[0]: r for r in rows}
+        cols = {(r[0], r[1]): (int(r[2] or 0), None) for r in crows}
+        return self._physical_locked(live, cols)
 
     def _plan(self, s: SetState, budget: int, used: int, live: dict, cols: dict):
         """The whole eviction plan for `s`, or None with `s.error` saying why
@@ -843,6 +1040,7 @@ class ResidencyManager:
                 cols.pop(key, None)
                 with self._lock:
                     self.evictions += 1
+                    self._room_seq += 1      # room exists now that did not before
                     self._col_uploaded.pop(key, None)
                     gone = set()
                     for t, o in self._sets.items():
@@ -864,6 +1062,7 @@ class ResidencyManager:
             live.pop(key, None)
             with self._lock:
                 self.evictions += 1
+                self._room_seq += 1
                 o = self._sets.get(key)
                 if o is not None and o.state == "ready":
                     o.state = "missing"              # a later sighting uploads it again
@@ -884,7 +1083,8 @@ class ResidencyManager:
          allow_young, cand_density, cand_value, priced) = ctx
         managed = [r for r in live.values() if r[1] == "managed" and int(r[2] or 0) > 0]
         head = (f"{MEMORY_ERROR}{used / 2**20:.0f} MiB resident + about "
-                f"{s.est_bytes / 2**20:.0f} MiB needed > {budget / 2**20:.0f} MiB")
+                f"{s.est_bytes / 2**20:.0f} MiB needed > {budget / 2**20:.0f} MiB"
+                + self._headroom_note())
         mine = (f"is worth {cand_value:.3f} ms/s ({self._per_gib(cand_density):.2f} per GiB)"
                 if not priced else
                 f"has nothing measured yet and is priced at the median, "
@@ -990,7 +1190,14 @@ class ResidencyManager:
         """Diagnostics: the budget, and per set the estimate, the extension's
         figure, and what the set is worth — `value` in ms saved per second of
         wall time, `density` the same per GiB it holds, which is the quantity
-        admission compares."""
+        admission compares.
+
+        A set's `bytes` is what the set COSTS — for a view, what its lanes
+        cost in the store — and lanes are shared, so the per-set figures do
+        not add up to what is resident and must never be summed for that.
+        `Connection.memory()['bytes']` is the physical total (see
+        `_physical_locked`); this dict's per-set numbers are the policy's
+        ranking quantities."""
         with self._lock:
             now = self._now()
             out = {}
@@ -1001,7 +1208,9 @@ class ResidencyManager:
                           "error": s.error, "value": v, "uses": s.uses,
                           "density": self._per_gib(v / size) if size else 0.0}
             return {"budget": self.memory_budget, "evictions": self.evictions,
-                    "evictions_wasted": self.evictions_wasted, "sets": out}
+                    "evictions_wasted": self.evictions_wasted,
+                    "refusals": self.refusals, "refusals_held": self.refusals_held,
+                    "sets": out}
 
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:
@@ -1010,6 +1219,12 @@ class ResidencyManager:
         s = self.get(tag)
         if s is None:
             return False
+        with self._lock:
+            if self._refusal_holds_locked(s):
+                # the answer for this set has not changed since it was refused;
+                # asking again costs an upload and gets the same answer
+                self.refusals_held += 1
+                return False
         for d in s.deps:
             if not self.is_ready(d) and not self.upload_now(d, run):
                 ds = self.get(d)
@@ -1030,9 +1245,11 @@ class ResidencyManager:
                         s.error = f"source set {d} is not resident"
                 return False
         if not self._make_room(run, s):
+            # a budget refusal is not an upload ATTEMPT: nothing was asked of the
+            # device, so it may not burn the attempt budget that exists to stop a
+            # set that genuinely cannot be uploaded from being tried for ever
             with self._lock:
-                s.state = "failed"
-                s.attempts += 1
+                self._note_refusal_locked(s, s.error)
             return False
         if not s.derived and not s.upload_sql and not self._store_holds(run, s):
             # the recipe says every lane is in the store and the store says otherwise:
@@ -1069,18 +1286,130 @@ class ResidencyManager:
                     s.error = err[:200]
                 self._log(f"not uploaded: {s.tag}: {err[:120]}")
                 return False
+            # the upload RAISED: the device would not take it, the host pool
+            # would not hold it, or something under it broke. Leave nothing of
+            # it behind and remember the answer, or the next statement over the
+            # same template walks into the same failure — measured on an M4 Max
+            # 2026-09-20, once per statement for ever.
+            self._purge(run, s, err)
             with self._lock:
-                s.state = "failed"
-                s.error = err[:200]
+                self._note_refusal_locked(s, self._upload_refused_error(err))
+            self._log(f"not uploaded: {s.tag}: {err[:160]}")
             return False
         self._note_bytes(run, s)
         self._note_columns(s)
+        if not self._placed_on_device(run, s):
+            return False
         with self._lock:
             if s.epoch == epoch and s.state == "uploading":
                 s.state = "ready"
                 return True
             s.state = "stale"
             return False
+
+    @staticmethod
+    def _upload_refused_error(err: str) -> str:
+        """The set's own sentence for an upload that raised. A device refusal
+        is named as one — it is the case a person can act on (free the card,
+        raise the budget, use a smaller set) and the case the budget's own
+        arithmetic cannot see, because the bytes never became resident."""
+        head = (DEVICE_ERROR if ("GPUDB_DEVICE_UPLOAD_REFUSED" in err
+                                 or "out of memory" in err.lower()
+                                 or "allocation failed" in err.lower())
+                else "the upload failed: ")
+        return head + err.splitlines()[0][:200]
+
+    def _purge(self, run: Callable[[str], List[tuple]], s: SetState, err: str) -> None:
+        """After an upload that raised: leave nothing of the set on the device.
+
+        An upload can fail after part of it landed — a store is filled by
+        several calls and only the failing one unwinds itself — so the open
+        session is aborted and anything the set owns is dropped, and then the
+        extension is ASKED whether anything remains rather than assumed to
+        have obeyed. What remains is logged with the set's name: a residue
+        nobody can drop is a bug in the extension, and it should be findable
+        from a log rather than from a memory graph."""
+        try:
+            run("SELECT gpu_upload_abort('%s')" % s.session_name.replace("'", "''"))
+        except Exception:
+            pass
+        if not s.store_key:
+            try:
+                run("SELECT gpu_drop_resident('%s')" % s.tag.replace("'", "''"))
+            except Exception:
+                pass
+        left = self._residue(run, s)
+        if left:
+            self._log(f"after a failed upload of {s.tag} the extension still holds "
+                      f"{', '.join(left)} — this is residue, not a resident set ({err[:80]})")
+        with self._lock:
+            s.bytes = 0
+
+    def _residue(self, run: Callable[[str], List[tuple]], s: SetState) -> List[str]:
+        """What the extension still holds of a set that failed to upload: its
+        own registry row, and — for a store-backed set — any lane of the store
+        that is on the HOST rather than the device. A host lane is not a
+        resident column at all: it is what a device refusal leaves when
+        something places the set on the CPU instead, and every view that reads
+        it beside a device lane refuses with 'columns are resident on different
+        backends'. It is dropped here rather than discovered there."""
+        left: List[str] = []
+        try:
+            rows = run("SELECT name FROM gpu_residents() WHERE name = '%s'" % s.tag.replace("'", "''"))
+            left.extend(str(r[0]) for r in rows)
+        except Exception:
+            pass
+        left.extend(self._drop_host_lanes(run, s))
+        return left
+
+    def _drop_host_lanes(self, run: Callable[[str], List[tuple]], s: SetState) -> List[str]:
+        """Drop every lane of this set's store the extension reports as NOT on
+        the device, and return what was dropped. `on_gpu` is NULL where no
+        backend could answer, and an absent answer is left alone — a reader
+        must not turn 'nobody could say' into 'it is on the host'."""
+        if not s.store_key:
+            return []
+        try:
+            rows = run("SELECT \"column\", on_gpu FROM gpu_store_columns() "
+                       "WHERE store = '%s' AND on_gpu IS NOT NULL AND NOT on_gpu"
+                       % s.store_key.replace("'", "''"))
+        except Exception:
+            return []                       # an older extension has no such column
+        gone = []
+        for r in rows:
+            lane = str(r[0])
+            try:
+                run("SELECT gpu_drop_column('%s', '%s')"
+                    % (s.store_key.replace("'", "''"), lane.replace("'", "''")))
+                gone.append(f"{lane} of {s.store_key} (host-placed)")
+            except Exception:
+                pass
+        if gone:
+            with self._lock:
+                self._room_seq += 1
+        return gone
+
+    def _placed_on_device(self, run: Callable[[str], List[tuple]], s: SetState) -> bool:
+        """The upload returned without raising — but did the set land on the
+        DEVICE? False (and the set refused) when any of its lanes is on the
+        host instead.
+
+        A set is only ever rewritten to because it is on the GPU; one answered
+        from host memory runs the CPU reference, which is slower than the
+        database, so a half-placed or wholly host-placed set is not a slower
+        set but a wrong one. The lanes that are on the host are dropped, so the
+        state cannot be inherited by the next view over the same store."""
+        host = self._drop_host_lanes(run, s)
+        if not host:
+            return True
+        with self._lock:
+            self._note_refusal_locked(
+                s, f"{DEVICE_ERROR}the upload landed on the host, not the device "
+                   f"({len(host)} lane{'' if len(host) == 1 else 's'}: {', '.join(host[:3])}) — "
+                   f"a host-resident set would answer from the CPU reference, which is slower "
+                   f"than the database, so it was dropped")
+        self._log(f"not uploaded: {s.tag}: {s.error}")
+        return False
 
     # ---- background worker ----
     def _ensure_thread(self) -> None:
@@ -1842,12 +2171,24 @@ class ResidencyManager:
                 cur = self._upload_cursor
             run = lambda q, _c=cur: _c.execute(q).fetchall()      # noqa: E731  (sub-millisecond, no device work)
             if not self._make_room(run, s):
-                outcome = "failed"
+                with self._lock:
+                    self._note_refusal_locked(s, s.error)
+                outcome = "refused"
             else:
                 outcome = self._session(cur, s, epoch)
                 if outcome == "ready":
                     self._note_bytes(run, s)
                     self._note_columns(s)
+                    if not self._placed_on_device(run, s):
+                        outcome = "refused"      # the lanes are on the host; _placed_on_device said why
+                elif outcome == "failed":
+                    # the same rule as the eager path: leave nothing behind and
+                    # remember the answer rather than re-running the upload on
+                    # the next idle window, every 30 s, for the session's life
+                    self._purge(run, s, s.error)
+                    with self._lock:
+                        self._note_refusal_locked(s, self._upload_refused_error(s.error))
+                    outcome = "refused"
             with self._cv:
                 now = self._now()
                 if outcome == "ready" and s.epoch == epoch and s.state == "uploading":
@@ -1862,6 +2203,8 @@ class ResidencyManager:
                     s.resume_at = now
                 elif outcome == "recheck" and s.epoch == epoch and s.state == "uploading":
                     s.state = "missing"           # the recipe is out of date: the next sighting recomputes it
+                elif outcome == "refused":
+                    pass        # _make_room / _purge already recorded it, with its retry time
                 elif outcome == "failed":
                     s.state = "failed"
                     s.resume_at = s.last_upload_start + self.rate_s

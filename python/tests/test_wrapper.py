@@ -1629,8 +1629,16 @@ def run():
     if getattr(_probe, "_exact", False):
         _probe.execute(qa).fetchall()
         one_real = _resident(_probe)
-        # since stage C the estimate sizes each lane from its type, so take the figure
-        # the admission rule will actually use rather than the flat 8-bytes-a-lane one
+        # Since stage C the estimate sizes each lane from its type, and since
+        # the estimate also narrows from the column's own statistics the three
+        # tables' estimates differ from each other (t's payload holds values
+        # under 128 and is charged one byte; tm's and tu's are charged four).
+        # The budget that leaves room for exactly two sets therefore has to be
+        # built from the LARGEST estimate any of the three will be admitted
+        # on — a budget built from the smallest refuses the second set, which
+        # is a fair budget and a useless test.
+        for _q in (qb, qc):
+            _probe.execute(_q).fetchall()
         one = max([m["est_bytes"] for m in _probe.memory()["sets"].values()] or [one])
         # ... and it must still bound a NARROW-typed table (INTEGER key, DATE, SMALLINT)
         _probe.execute("SELECT k, sum(v) FROM tn3 WHERE dt >= DATE '1995-01-10' AND z < 4 GROUP BY k").fetchall()
@@ -2404,8 +2412,10 @@ def run():
     check(con.last_rewrite() == before, "store_columns(): the last statement's record is untouched")
     if con._backend not in ("", "CPU") and cols:
         keys = set(cols[0])
-        check(keys == {"table", "column", "dtype", "rows", "width", "bytes", "prepared"},
+        check(keys == {"table", "column", "dtype", "rows", "width", "bytes", "prepared", "on_gpu"},
               f"store_columns(): every field is there ({sorted(keys)})")
+        check(all(c["on_gpu"] in (True, None) for c in cols),
+              f"store_columns(): nothing landed on the host ({[c['on_gpu'] for c in cols]})")
         check(all(c["rows"] > 0 for c in cols), "store_columns(): every column reports its rows")
         check(all(c["width"] is None or c["width"] in (1, 2, 4, 8) for c in cols),
               f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
@@ -2413,7 +2423,133 @@ def run():
 
     ties_checks()
     extension_age_checks()
+    rewrite_error_checks()
+    budget_checks()
     return report()
+
+
+def rewrite_error_checks():
+    """A rewritten statement that raises: DuckDB answers, and `last_rewrite()`
+    says what raised — this run and the next run of the same template."""
+    print("== a rewritten statement that fails at execution says what failed")
+    con = fresh()
+    if not has_device(con) or not getattr(con, "_exact", False):
+        skip("execution fallback: needs a backend that rewrites")
+        con.close()
+        return
+    sql = "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k"
+    want, _ = native(sql)
+    rows = con.execute(sql).fetchall()
+    check(con.last_rewrite()["rewritten"], "execution fallback: the template rewrites first")
+    admit = con.last_rewrite()["detail"]
+
+    # Make the REWRITTEN text — and only it — raise, the way a device that has
+    # run out of working memory does. The original statement still runs, so
+    # what the user gets must be native's rows.
+    rewritten = con.last_rewrite()["sql"]
+    boom = ("Invalid Input Error: Metal exact reduce failed: out of memory "
+            "(needs 274 MiB of working memory, 186 MiB free)")
+
+    class Exploding:
+        """`con._raw` with the REWRITTEN statement failing once. The rewritten
+        text may be run as a PREPAREd plan, so the match is on 'this is not
+        the user's statement and it reads the device'. `execute` on a raw
+        connection is read-only, so the connection itself is wrapped rather
+        than the method replaced."""
+        def __init__(self, raw):
+            self._raw, self.fired = raw, False
+
+        def execute(self, q, *a, **kw):
+            if (not self.fired and isinstance(q, str) and q != sql
+                    and (q == rewritten or q.startswith("EXECUTE gpudb_p"))):
+                self.fired = True
+                raise duckdb.InvalidInputException(boom)
+            return self._raw.execute(q, *a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self._raw, name)
+
+    real_raw = con._raw
+    con._raw = Exploding(real_raw)
+    try:
+        got = con.execute(sql).fetchall()
+        check(con._raw.fired, "execution fallback: the rewritten statement really did raise")
+    finally:
+        con._raw = real_raw
+    last = con.last_rewrite()
+    check(got == want, "execution fallback: the user gets native's rows")
+    check(last["fallback"] and not last["rewritten"],
+          f"execution fallback: it is reported as a fallback ({last['reason']})")
+    check("out of memory" in last["detail"],
+          f"execution fallback: the detail is the exception, not the last admit note "
+          f"({last['detail'][:100]})")
+    check(admit not in last["detail"],
+          "execution fallback: and not the sentence that admitted it last time")
+
+    # ... and the NEXT run of the same template, which reads the cached
+    # decision, must not resurrect that stale note either.
+    con.execute(sql).fetchall()
+    nxt = con.last_rewrite()
+    check(not nxt["rewritten"] and nxt["reason"] in ("error", "memory", "not_resident"),
+          f"execution fallback: the template stays native after a failure ({nxt['reason']})")
+    check(admit.split(" —")[0] not in nxt["detail"],
+          f"execution fallback: the next run does not show the old admit note "
+          f"({nxt['detail'][:110]})")
+    check("out of memory" in nxt["detail"] or "device" in nxt["detail"].lower()
+          or "memory" in nxt["detail"].lower(),
+          f"execution fallback: it says what is wrong instead ({nxt['detail'][:110]})")
+    mem = con.memory()
+    check(mem["refusals"] >= 1,
+          f"execution fallback: the device's working-memory failure is a refusal ({mem['refusals']})")
+    con.close()
+
+
+def budget_checks():
+    """The memory budget: what it reports, and that an upload the device
+    refuses is attempted once rather than once per statement."""
+    print("== the memory budget's accounting and its refusals")
+    con = fresh()
+    if not has_device(con) or not getattr(con, "_exact", False):
+        skip("budget: needs a backend that rewrites")
+        con.close()
+        return
+    con.execute("SELECT k, sum(v) FROM t GROUP BY k ORDER BY k").fetchall()
+    mem = con.memory()
+    cols = con.store_columns()
+    physical = sum(c["bytes"] for c in cols)
+    check(mem["bytes"] == physical,
+          f"budget: memory()['bytes'] is the store's own bytes ({mem['bytes']} vs {physical})")
+    per_set = sum(v["bytes"] for v in mem["sets"].values() if v["state"] == "ready")
+    check(per_set >= mem["bytes"],
+          f"budget: the per-set figures are per SET and never below the physical total "
+          f"({per_set} vs {mem['bytes']})")
+    check(mem["device_allocated"] is None or mem["device_allocated"] >= mem["bytes"],
+          f"budget: the driver holds at least what is resident ({mem['device_allocated']})")
+    con.close()
+
+    # An upload the device will not take: one attempt over many statements,
+    # every answer native, and the reason says memory with the sizes.
+    con = fresh(memory_budget=1 << 20)      # 1 MiB: nothing rewritable fits
+    sql = "SELECT k, sum(v) FROM t GROUP BY k ORDER BY k"
+    want, _ = native(sql)
+    for _ in range(50):
+        check_rows = con.execute(sql).fetchall()
+    last = con.last_rewrite()
+    check(check_rows == want, "budget: 50 statements over a set that cannot fit are all native's rows")
+    check(last["reason"] == "memory", f"budget: and the reason is memory ({last['reason']})")
+    check("MiB" in last["detail"],
+          f"budget: with the sizes in the sentence ({last['detail'][:120]})")
+    mem = con.memory()
+    check(mem["evictions_wasted"] == 0,
+          f"budget: nothing was evicted for a candidate that was then refused "
+          f"({mem['evictions_wasted']})")
+    tries = max((con._manager.get(t).attempts for t in mem["sets"]), default=0)
+    check(tries <= 1,
+          f"budget: the refusal is remembered — at most one upload attempt over 50 "
+          f"statements ({tries})")
+    check((mem["bytes"] or 0) <= (mem["budget"] or 0),
+          f"budget: and nothing became resident over the budget ({mem['bytes']} / {mem['budget']})")
+    con.close()
 
 
 # One group per k, sum(v) = 600 * k: every group's sum differs from every

@@ -93,6 +93,14 @@ def main() -> int:
         if not lr["rewritten"]:
             why = [x for x in logs[mark:] if "declined" in x or "threshold" in x or "split" in x]
             note = (why[-1] if why else "").replace("|", "/")[:110]
+            # `error`, `memory` and `not_resident` leave no 'declined' line —
+            # nothing declined the shape, something went wrong or would not
+            # fit — so the note comes from the wrapper's own sentence. Without
+            # this an (error) row says only 'error'.
+            if lr["reason"] in ("error", "memory", "not_resident"):
+                first = (lr.get("detail") or "").splitlines()
+                if first and first[0]:
+                    note = first[0].replace("|", "/")[:160]
             print(f"| Q{nr} | native ({lr['reason']}) | {t_nat:.1f} | — | — | — | {note} |")
             continue
         for _ in range(15):

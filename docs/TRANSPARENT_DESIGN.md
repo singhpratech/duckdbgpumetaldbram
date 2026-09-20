@@ -1742,23 +1742,76 @@ same database — the extension stays free of threads and hidden connections
   memory and 8 GiB). Implemented in the wrapper (`_residency._make_room`),
   with the extension as the source of truth:
   - *Before an upload* the set's cost is estimated as `rows × (Σ lane widths +
-    key width + 4 + 8) + rows × lanes / 8`: an upper bound on each lane from
-    the DuckDB type of the column it holds (BOOLEAN / TINYINT 1, SMALLINT 2,
-    INTEGER / DATE 4, everything else 8 — a backend stores a lane at the
-    narrowest width its values fit and the wrapper cannot know that before the
-    upload, `docs/RESIDENT_COLUMNS_DESIGN.md` §6), a validity bit per row and
-    lane, the key lane's sort cache (its width plus a u32 row id) when that
-    lane is the one being uploaded, and one row-sized scratch lane. On a
-    backend that does not store lanes narrow (`gpu_build_info()` says
-    `narrow=false`) every lane is charged 8; a set with no key (§4.12) is
-    charged no sort cache. It is an UPPER bound by construction — that is what
-    the admission rule needs — and a wrapper test pins it against what
-    `gpu_residents()` / `gpu_store_columns()` report afterwards, on a BIGINT
-    table and on a narrow-typed one. An uploaded join counts
-    its result rows, a device join at most its probe table's.
-  - *What is resident and what it costs* comes from `gpu_residents()`
-    (`bytes` includes derived structures). Sets uploaded by hand count toward
-    the total and are never evicted.
+    key width + 4 + 8) + rows × lanes / 8`: an upper bound on each lane, a
+    validity bit per row and lane, the key lane's sort cache (its width plus a
+    u32 row id) when that lane is the one being uploaded, and one row-sized
+    scratch lane. The bound on a lane's width comes from two places, narrowest
+    wins: the DuckDB type of the column (BOOLEAN / TINYINT 1, SMALLINT 2,
+    INTEGER / DATE 4, everything else 8) and, for a lane that is a plain
+    column, the column's own min and max from DuckDB's zone-map statistics
+    (`SELECT stats(col) FROM t LIMIT 1` — metadata, 0.1–0.4 ms at SF10, read
+    once per template and cached). Since stage C a backend stores a lane at
+    the narrowest signed width its values fit
+    (`docs/RESIDENT_COLUMNS_DESIGN.md` §6), and the type alone is a poor bound
+    on that: an `INTEGER` key holding 0–999 is stored at two bytes and a
+    `BIGINT` payload holding 0–96 at one, which made the estimate 2.4x the
+    truth and refused sets that fit (2026-09-20). Statistics are bounds — loose
+    if anything, never narrower than the data — which is the direction an upper
+    bound needs; a lane whose statistics cannot be read, or whose min/max are
+    not plain integers (a DECIMAL image, a string hash, a computed
+    expression), keeps its type's width. On a backend that does not store
+    lanes narrow (`gpu_build_info()` says `narrow=false`) every lane is
+    charged 8; a set with no key (§4.12) is charged no sort cache. It is an
+    UPPER bound by construction — that is what the admission rule needs — and
+    a wrapper test pins it against what `gpu_residents()` /
+    `gpu_store_columns()` report afterwards, on a BIGINT table and on a
+    narrow-typed one. An uploaded join counts its result rows, a device join
+    at most its probe table's.
+  - *What is resident and what it costs* is ONE PHYSICAL THING COUNTED ONCE:
+    the distinct columns of `gpu_store_columns()` (`bytes` includes the
+    derived structures on the column — its sort cache, its group-id lane) plus
+    every set in `gpu_residents()` that holds columns of its own. Neither
+    surface is the total on its own, and getting that wrong is wrong in both
+    directions: a store-backed set is a VIEW over shared columns and reports 0
+    bytes in `gpu_residents()` by design, while `con.memory()["sets"]` reports
+    per set what its lanes cost — so summing the first misses every view and
+    summing the second counts a shared column once per reader (measured
+    2026-09-20 over 26 sets: 0 MiB and 2143 MiB against 489 MiB physical).
+    `con.memory()["bytes"]` is the physical total and is what the budget is
+    compared with; the per-set figures are the policy's ranking quantities and
+    are not summable. `con.memory()["device_allocated"]` is what the driver
+    says the process holds, where a backend can say
+    (`gpu_build_info()`'s `device_allocated=`, from a
+    `src/include/backend_notes.hpp` note); it exceeds the physical total by
+    the backend's own machinery and any operator's working memory, and that
+    difference is exactly what the budget does not account for. Sets uploaded
+    by hand count toward the total and are never evicted.
+  - *Working memory* — the exact reduce's scratch, a sort's temporaries — is
+    never resident, so no budget over resident bytes can hold it. When a
+    statement fails for it the sets are refused (so the next statement over
+    the same template does not repeat the failure), and where the backend says
+    how much it needed and how much was free (`out of memory (needs 274 MiB of
+    working memory, 186 MiB free)`) the shortfall becomes a headroom the
+    budget holds back from then on, taken at its largest. It is the device's
+    own measurement of this workload; a backend that reports no numbers leaves
+    it at zero.
+  - *A refused upload is remembered.* A set the budget or the device turned
+    away is not asked for again until one of the things the answer was taken
+    against moves: the set's epoch (a write), the budget, the anti-thrash
+    window, the resident population (an eviction freed room), or the retry
+    time (30 s). Without this an eager connection re-ran the whole admission —
+    and, where the refusal came from the device, the whole upload — once per
+    statement for ever. `max_attempts` is a rate limit under that rule, not a
+    cliff: the attempt budget is given back when the refusal lapses.
+  - *A set must be on the DEVICE or nowhere.* An upload that the GPU refuses
+    is reported (`GPUDB_DEVICE_UPLOAD_REFUSED`) rather than placed on the host
+    reference, because a host-resident exact set makes the wrapper rewrite
+    onto the CPU reference — slower than the database — and because a store
+    filled by several uploads, one of which landed on the host, is what
+    produces "columns are resident on different backends" one statement later.
+    As a second line `gpu_store_columns().on_gpu` reports where each lane
+    actually is (NULL where no backend can say, which is not "on the host"),
+    and the wrapper drops any host lane and refuses the set.
   - *Eviction* goes by what a set is WORTH (see "Value-aware residency"
     below), through `gpu_drop_resident` — and, since the store (§5.10),
     through `gpu_drop_column` for the columns views share: a view costs
@@ -1773,6 +1826,17 @@ same database — the extension stays free of threads and hidden connections
     running on DuckDB with `last_rewrite()["reason"] == "memory"`, and
     `detail` carries the arithmetic; a refused set is asked about again no
     sooner than the failed-upload retry time (30 s), not on every sighting.
+  - *The gate* is `scripts/budget_gate.py` (§9.3): a long eager session over
+    169 distinct templates under a budget too small for them, asserting at
+    every sample that the physical resident total is at or under the budget,
+    that `evictions_wasted` is 0, that no lane is on the host, that every
+    statement's rows equal plain DuckDB's, that nothing declines with `error`,
+    and that no set is uploaded more than once. The bound is EXACT rather than
+    "the budget plus one upload in flight": admission decides before it
+    uploads, so nothing is ever above the line. It runs in `local_check.sh`
+    (56 s at SF1). With `--refuse-mb N` the Metal backend refuses any exact
+    upload above N MiB, which is the only way to reach the device-refusal
+    paths on a machine with memory to spare.
 - **Value-aware residency (2026-09-19).** Least recently used says nothing
   about what a set is FOR. Under a budget smaller than the working set it lets
   a set that saves 25 ms a run hold memory a set saving 250 ms a run needs,

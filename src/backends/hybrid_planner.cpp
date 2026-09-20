@@ -138,6 +138,7 @@ public:
         // backend_notes.hpp: our columns wrap somebody else's, so the width
         // reporter here only unwraps and asks again.
         register_lane_width_reporter(&HybridAggregatorImpl::lane_width_note);
+        register_column_placement_reporter(&HybridAggregatorImpl::placement_note);
     }
 
     Backend backend() const noexcept override { return Backend::CPU; /* hybrid label */ }
@@ -246,6 +247,35 @@ public:
         return out;
     }
 
+    // An exact upload the DEVICE refused, once a GPU exact backend is the one
+    // that was asked. It is reported, never worked around, and the reason is
+    // measured rather than tidy:
+    //
+    //   * A host-placed exact set is not a slower answer, it is a WRONG
+    //     placement. The wrapper only rewrites a statement because the set is
+    //     on the GPU; a set the device refused and the host silently took
+    //     makes the rewrite fire onto the CPU reference, which is measurably
+    //     slower than plain DuckDB — rule 1 broken by a fallback nobody asked
+    //     for. (Measured on the x86 box 2026-09-20: a lineitem set that could
+    //     not fit came back `rewritten=True` and answered from host memory.)
+    //   * A store is filled by SEVERAL of these calls, so one of them landing
+    //     on the host leaves a store with lanes on both sides, and the next
+    //     operator over a view that reads one of each refuses with "columns
+    //     are resident on different backends". The half-placed store is the
+    //     cause; this is where it is prevented.
+    //
+    // A backend that has no exact path at all is a different case and still
+    // goes to the reference: the branch below is only entered when the GPU
+    // said it CAN do this and then could not.
+    static std::runtime_error device_upload_refused(const char* what,
+                                                    const std::exception& e) {
+        return std::runtime_error(
+            std::string("GPUDB_DEVICE_UPLOAD_REFUSED: ") + what +
+            ": the GPU refused the upload and the set is not placed on the host in its "
+            "place (a host-resident exact set would answer from the CPU reference, which "
+            "is slower than the database) — free device memory and upload again: " + e.what());
+    }
+
     // v0.7 milestone 3: same placement rule; a backend without the exact
     // upload (default throw) sends the pair to the CPU reference.
     ResidentPair upload_pair_exact(const KvSpan* spans, std::size_t n_spans,
@@ -268,8 +298,8 @@ public:
                 out.vals = std::make_unique<HybridResidentColumn>(
                     Backend::CPU, std::move(inner.vals), rows, vdt, /*on_gpu=*/true);
                 return out;
-            } catch (const std::exception&) {
-                // fall through to the CPU upload
+            } catch (const std::exception& e) {
+                throw device_upload_refused("upload_pair_exact", e);
             }
         }
         ResidentPair inner = cpu_->upload_pair_exact(spans, n_spans, vdt);
@@ -533,8 +563,8 @@ public:
         if (gpu_ && gpu_->exact_supported()) {          // see upload_pair_exact
             try {
                 return wrap(gpu_->upload_rows_exact(spans, n_spans, dtypes, n_lanes), /*on_gpu=*/true);
-            } catch (const std::exception&) {
-                // fall through to the CPU upload
+            } catch (const std::exception& e) {
+                throw device_upload_refused("upload_rows_exact", e);
             }
         }
         return wrap(cpu_->upload_rows_exact(spans, n_spans, dtypes, n_lanes), /*on_gpu=*/false);
@@ -695,6 +725,18 @@ private:
     static unsigned lane_width_note(const ResidentColumn& col) {
         const auto* h = dynamic_cast<const HybridResidentColumn*>(&col);
         return h ? lane_storage_width(h->inner()) : 0u;
+    }
+
+    // ... and WHERE the column landed. The hybrid is the only thing that
+    // knows — it is what chose — and after it has chosen nothing downstream
+    // can tell a device column from a host one until an operator over a mix
+    // of them refuses. Reported by gpu_store_columns().on_gpu, so a store
+    // that holds both can be found and cleaned up rather than discovered by
+    // the next statement.
+    static ColumnPlacement placement_note(const ResidentColumn& col) {
+        const auto* h = dynamic_cast<const HybridResidentColumn*>(&col);
+        if (!h) return ColumnPlacement::Unknown;
+        return h->on_gpu() ? ColumnPlacement::Device : ColumnPlacement::Host;
     }
 
     static const HybridResidentColumn& check_hybrid(const ResidentColumn& c) {

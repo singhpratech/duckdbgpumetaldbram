@@ -15,7 +15,7 @@ import duckdb
 
 from . import (_aggs, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax,
                _thresholds, _views)
-from ._residency import MEMORY_ERROR, ResidencyManager
+from ._residency import DEVICE_ERROR, MEMORY_ERROR, ResidencyManager
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
 
@@ -79,6 +79,13 @@ STALE_MARKER = "GPUDB_STALE"
 # ... and what a pushed top-k's tie guard says when it stops (_rewrite.ties_qualify):
 # the k it was rendered for and the column the ORDER BY named.
 _TIES_RE = re.compile(r"GPUDB_TIES: the first (\d+) rows are not ordered uniquely by (.*?)(?:\n|$)")
+# A lane name that is a plain column, so `stats()` can be asked about it — a
+# computed lane, a packed key or a dictionary lane ('k#...') is not one.
+_PLAIN_COL_RE = re.compile(r"[A-Za-z_][A-Za-z_0-9$]*")
+# The integer min/max of DuckDB's `stats()` summary. Only a WHOLE-number pair
+# is taken: a DECIMAL prints '1.00' there and its stored lane is the unscaled
+# integer, which is not what these digits say.
+_STATS_RANGE_RE = re.compile(r"\[Min:\s*(-?\d+),\s*Max:\s*(-?\d+)\]")
 # measured rule 1 (§9.1): a template is re-measured against native at most this often — one
 # side-cursor probe per template per interval, the user's own statement never the experiment
 _REMEASURE_S = 60.0
@@ -278,6 +285,16 @@ class LastRewrite:
         return dict(self.__dict__)
 
 
+def _is_device_oom(err: str) -> bool:
+    """Did this statement fail because the DEVICE ran out of memory? The
+    backends word it their own way ('CUDA exact where mask failed: out of
+    memory', 'device allocation failed (Metal)'), so the test is on the words
+    they have in common rather than on a code none of them carries."""
+    low = err.lower()
+    return ("out of memory" in low or "allocation failed" in low
+            or "out of buffer memory" in low or "device_upload_refused" in low)
+
+
 def _num(x: Optional[str]):
     if x is None:
         return None
@@ -408,8 +425,42 @@ class Connection:
         expected, the size the extension reports, and what the set is worth:
         `value`, the milliseconds it saves per second of wall time, and
         `density`, the same per GiB it holds — the quantity admission and
-        eviction compare."""
-        return self._manager.memory()
+        eviction compare.
+
+        `bytes` is what is PHYSICALLY resident: every store column counted
+        once plus every set that holds columns of its own. It is the number
+        the budget is compared with, and it is not the sum of the per-set
+        `bytes` below — a store-backed set is a view over shared columns and
+        reports what its lanes cost, so summing those counts a shared column
+        once per set that reads it (measured: 4.5x). None when the extension
+        could not be asked.
+
+        `device_allocated` is what the DRIVER says this process holds, when a
+        backend can say (gpu_build_info's `device_allocated=`). It is larger
+        than `bytes` by whatever the backend's own machinery and an
+        in-progress operator's working memory cost, and that difference is
+        exactly what the budget does not account for."""
+        out = self._manager.memory()
+        try:
+            out["bytes"] = self._manager.physical_bytes(
+                lambda q: self._raw.execute(q).fetchall())
+        except Exception:
+            out["bytes"] = None
+        out["device_allocated"] = self._device_allocated()
+        return out
+
+    def _device_allocated(self) -> Optional[int]:
+        """What the driver says this process holds on the device, or None
+        where no backend installed a reporter (src/include/backend_notes.hpp).
+        An absent answer is an answer: it is not 0."""
+        try:
+            info = self._raw.execute("SELECT gpu_build_info()").fetchone()[0] or ""
+        except Exception:
+            return None
+        for f in info.split():
+            if f.startswith("device_allocated="):
+                return _num(f.split("=", 1)[1])
+        return None
 
     def residents(self) -> Dict[str, str]:
         return self._manager.snapshot()
@@ -417,10 +468,31 @@ class Connection:
     def store_columns(self) -> List[Dict[str, Any]]:
         """One entry per resident table column (stage B): the table it belongs
         to, its name and dtype, the rows it holds and the bytes per row it is
-        stored at (`width`, None where the backend leaves no note), and the
-        backend memory it costs. Read on a side cursor, so `last_rewrite()`
-        still describes the user's last statement; an empty list on a build
-        with no extension loaded."""
+        stored at (`width`, None where the backend leaves no note), the backend
+        memory it costs, and whether it is on the device at all (`on_gpu`, None
+        where no backend could say — an absent answer, not "on the host").
+        Read on a side cursor, so `last_rewrite()` still describes the user's
+        last statement; an empty list on a build with no extension loaded.
+
+        These bytes are the PHYSICAL ones: a column is here once however many
+        resident sets read it, so this is what may be summed for what the
+        device holds (`memory()['bytes']` is that sum)."""
+        try:
+            cur = self._raw.cursor()
+            try:
+                rows = cur.execute(
+                    'SELECT "table", "column", dtype, rows, width, bytes, prepared, on_gpu '
+                    "FROM gpu_store_columns() ORDER BY \"table\", \"column\"").fetchall()
+            finally:
+                cur.close()
+        except Exception:
+            return self._store_columns_without_placement()
+        names = ("table", "column", "dtype", "rows", "width", "bytes", "prepared", "on_gpu")
+        return [dict(zip(names, r)) for r in rows]
+
+    def _store_columns_without_placement(self) -> List[Dict[str, Any]]:
+        """The same, for an extension built before `on_gpu` existed: the
+        column is reported absent rather than the call failing."""
         try:
             cur = self._raw.cursor()
             try:
@@ -432,7 +504,7 @@ class Connection:
         except Exception:
             return []
         names = ("table", "column", "dtype", "rows", "width", "bytes", "prepared")
-        return [dict(zip(names, r)) for r in rows]
+        return [dict(zip(names, r), on_gpu=None) for r in rows]
 
     def _refresh_settings(self) -> None:
         row = self._raw.execute(
@@ -1083,10 +1155,16 @@ class Connection:
         """The rewritten statement failed for a reason that is not staleness:
         answer natively now, and keep this template native from here on (its
         sets are re-noted as stale so a healthy upload can replace them)."""
+        # The statement that ANSWERED was DuckDB's, so the record says so: a
+        # run reported `rewritten` although the rewrite is what failed is the
+        # one line a reader takes at face value and should not (this is what
+        # `_on_ties` has always done for its own fallback).
+        self._last.rewritten = False
+        self._last.reason = "error"
         self._last.fallback = True
         self._drop_plans()
         (self._parent or self)._ties_ok.clear()   # §4.24: whatever the sets are now, nothing was verified against them
-        self._last.error = str(e)[:300]
+        self._last.error = str(e)[:512]
         # the decision was taken before the statement ran, so its sentence is
         # re-read now that the statement's own answer is known
         self._last.detail = ("the rewritten statement failed and DuckDB answered the original: "
@@ -1096,8 +1174,27 @@ class Connection:
         if d is not None:
             d.rewritten = False
             d.reason = "error"
-        for tag in [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]:
+            # ... and the sentence goes with the reason. The decision is
+            # cached, so a `why` left over from the run that ADMITTED this
+            # template would be shown for every later run of it — a statement
+            # declined with 'error' reporting the row floor that let it
+            # through last time (the defect this replaces).
+            d.why = ("the rewritten statement failed at execution and DuckDB answered the "
+                     "original: " + self._last.error.splitlines()[0][:240])
+        tags = [t for t in (getattr(self, "_last_tags", None) or [self._last.tag]) if t]
+        for tag in tags:
             self._manager.invalidate(tag)
+        # A statement that failed for want of memory ON THE DEVICE failed over
+        # working memory the budget never held — the operator's scratch, not
+        # the resident bytes — so dropping the sets is not enough on its own:
+        # the next statement over the same template would upload them again
+        # and fail the same way. The manager is told, and holds the refusal
+        # until an eviction, a write, a budget change or its retry window says
+        # the answer could have changed. After the invalidation and never
+        # before it: `invalidate` moves the epoch and the resident
+        # population's sequence, which is what a refusal is recorded against.
+        if _is_device_oom(str(e)):
+            self._manager.note_execution_refusal(tags, str(e))
 
     def _check_output_size(self) -> None:
         """Once per template, after its first rewritten run: the shape's
@@ -1320,6 +1417,10 @@ class Connection:
         self._flat_cache.clear()
         self._unique_cache.clear()
         self._expr_types.clear()
+        # the estimate's lane widths are read from the table's statistics, and
+        # a write can widen a column's range — a stale range under-estimates a
+        # set, which is the one direction an admission bound may not be wrong in
+        getattr(self._parent or self, "_range_cache", {}).clear()
         self._big_tables = None
         self._view_catalog = None
         self._flat_views.clear()
@@ -1490,9 +1591,17 @@ class Connection:
         reason = last.reason
         if reason in ("not_resident", "memory"):
             base = ("the resident set is not ready yet" if reason == "not_resident"
-                    else "the set does not fit the device-memory budget")
+                    else ("the device would not take the set"
+                          if (last.error or "").startswith(DEVICE_ERROR)
+                          else "the set does not fit the device-memory budget"))
             first = (last.error or "").splitlines()[0] if last.error else ""
             return f"{base}: {first}" if first else base
+        if reason == "error" and why:
+            # the decision's own sentence already says what raised and when;
+            # prefixing it with 'the rewrite raised while deciding' would say
+            # the opposite of the truth for a statement that raised at
+            # EXECUTION
+            return why
         text = self._REASON_TEXT.get(reason, "")
         if reason == "backend" and getattr(self, "_backend_note", ""):
             text = self._backend_note        # absent, or older than this client
@@ -2084,11 +2193,20 @@ class Connection:
                 # set will cost from now on and must not be read as its saving (§5.5)
                 self._uploaded_now = self._manager.is_ready(d.tag)
             if not self._manager.is_ready(d.tag):
-                self._last.reason = ("memory" if st.state == "failed" and st.error.startswith(MEMORY_ERROR)
+                # the budget's arithmetic and the device's own refusal are the
+                # same answer to the user — the data does not fit — and they
+                # read as one reason, `memory`, with the sentence saying which
+                self._last.reason = ("memory" if st.state == "failed" and
+                                     st.error.startswith((MEMORY_ERROR, DEVICE_ERROR))
                                      else "not_resident")
                 # what the set is waiting on, in its own words (a source that has to be
                 # uploaded again, the budget's arithmetic, an upload that raised)
-                self._last.error = st.error[:300]
+                # long enough for a whole refusal sentence: the budget's is one
+                # sentence carrying five numbers and two set names, and cutting
+                # it mid-word is how a reader loses the part that says nothing
+                # was evicted (measured at 313 characters once the estimate
+                # stopped rounding sets up)
+                self._last.error = st.error[:512]
                 return None
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql
@@ -2117,6 +2235,65 @@ class Connection:
             return None
         self._last.rewritten = True
         self._last.sql = out
+        return out
+
+    def _narrow_widths(self, ident, widths: Dict[str, int]) -> None:
+        """Bring each lane's estimated width down to the width the backend will
+        actually store it at, where the table's own statistics say so.
+
+        Since stage C a lane is stored at the narrowest SIGNED width holding
+        its values, and the type is a poor bound on that: `l_orderkey` is a
+        BIGINT whose values fit four bytes, `l_suppkey` and `l_partkey` too,
+        so the type charges twice what the lane costs and the sort cache with
+        it. Measured before this, one lineitem set estimated 217 MiB against
+        69 MiB stored — and that estimate is the budget's admission rule, so
+        it refused sets that fit.
+
+        DuckDB's `stats()` reads the column's zone-map summary, which is
+        metadata: 0.1-0.4 ms per column at SF10, once per template, never per
+        statement. Min and max there are BOUNDS — loose if anything, never
+        narrower than the data — which is the direction an upper bound needs.
+        A lane whose statistics cannot be read, or whose min/max are not plain
+        integers (a DECIMAL image, a string hash, a computed expression),
+        keeps the width its type gives it."""
+        for lane, have in list(widths.items()):
+            if have <= 1:
+                continue                       # already the narrowest a lane can be
+            lo, hi = self._column_range(ident, lane)
+            if lo is None or hi is None:
+                continue
+            w = 8
+            for cand, bound in ((1, 127), (2, 32767), (4, 2147483647)):
+                if lo >= -bound - 1 and hi <= bound:
+                    w = cand
+                    break
+            if w < have:
+                widths[lane] = w
+
+    def _column_range(self, ident, column: str):
+        """(min, max) of a plain column from the table's statistics, or
+        (None, None). Cached per (table, column) for the connection: the
+        answer only moves when the table does, and every write through the
+        wrapper drops the sets that depend on it."""
+        root = self._parent or self
+        cache = getattr(root, "_range_cache", None)
+        if cache is None:
+            cache = root._range_cache = {}
+        key = (ident.catalog, ident.oid, column)
+        if key in cache:
+            return cache[key]
+        out = (None, None)
+        if _PLAIN_COL_RE.fullmatch(column or ""):
+            try:
+                text = self._raw.execute(
+                    'SELECT stats("%s") FROM %s LIMIT 1' % (column.replace('"', '""'), ident.fqn)
+                ).fetchone()[0] or ""
+                m = _STATS_RANGE_RE.search(text)
+                if m:
+                    out = (int(m.group(1)), int(m.group(2)))
+            except Exception:
+                out = (None, None)
+        cache[key] = out
         return out
 
     def _store_upload(self, d: "Decision"):
@@ -2719,6 +2896,7 @@ class Connection:
                 for c in plan.pred_cols:
                     if c not in computed:
                         d.lane_widths[c] = lane_width(plan.pred_types.get(c, ""))
+                self._narrow_widths(ident, d.lane_widths)
                 d.key_lane = "" if plan.no_key else (("k#" + plan.key_field) if plan.dict_key else plan.key_field)
                 d.store_key = f"gpudb:v1:{ident.catalog}:{ident.schema}:{ident.table}:{ident.oid}"
                 d.store_lanes = [l[0] for l in lanes]
