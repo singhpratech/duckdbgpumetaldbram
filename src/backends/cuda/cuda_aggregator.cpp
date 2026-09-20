@@ -168,6 +168,7 @@ public:
         if (d_perm_)      cudaFree(d_perm_);
         if (d_ex_sorted_) cudaFree(d_ex_sorted_);
         if (d_ex_perm_)   cudaFree(d_ex_perm_);
+        if (d_ex_distinct_) cudaFree(d_ex_distinct_);
         if (d_valid_)     cudaFree(d_valid_);
         if (dptr_)        cudaFree(dptr_);
         if (own_stream_) cudaStreamDestroy(own_stream_);
@@ -211,6 +212,8 @@ public:
             b += 2 * rows_ * sizeof(std::int64_t);
         if (d_ex_sorted_.load(std::memory_order_acquire))   // exact cache: lane width + u32 row ids
             b += rows_ * (static_cast<std::size_t>(width_) + sizeof(std::uint32_t));
+        if (d_ex_distinct_)                                 // the distinct keys: at most 256 of them
+            b += ex_groups_ * sizeof(std::int64_t);
         if (d_valid_) b += ((rows_ + 63) / 64) * sizeof(unsigned long long);
         return b;
     }
@@ -319,6 +322,34 @@ public:
             cudaFree(sorted); cudaFree(perm);
             cuda_throw(e, "exact cache build (sort of the valid keys)");
         }
+        // The column's distinct-key count, and the keys themselves when there
+        // are few enough to serve the direct grouped reduce. Both are
+        // properties of the COLUMN, so they belong here and not in the
+        // per-call path: computing them per call costs a full pass over the
+        // sorted keys, which showed up as a 1.12x cell falling to 0.99x on a
+        // join statement that never takes the direct path at all.
+        const int cap = gpudb_cuda_exact_direct_max_groups();
+        std::size_t groups = 0;
+        void* distinct = nullptr;
+        e = cudaMalloc(&distinct, static_cast<std::size_t>(cap) * sizeof(std::int64_t));
+        if (e == cudaSuccess) {
+            e = gpudb_cuda_exact_distinct(sorted, width_, n_valid,
+                                          static_cast<std::int64_t*>(distinct),
+                                          static_cast<std::size_t>(cap), &groups, s);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        }
+        if (e != cudaSuccess) {
+            if (distinct) cudaFree(distinct);
+            cudaFree(sorted); cudaFree(perm);
+            cuda_throw(e, "exact cache build (distinct keys)");
+        }
+        if (groups == 0 || groups > static_cast<std::size_t>(cap)) {
+            cudaFree(distinct);               // too many to be worth holding
+            distinct = nullptr;
+        }
+        ex_groups_ = groups;
+        d_ex_distinct_ = static_cast<std::int64_t*>(distinct);
+
         n_valid_ = n_valid;
         d_ex_perm_.store(perm, std::memory_order_relaxed);
         d_ex_sorted_.store(sorted, std::memory_order_release);
@@ -330,6 +361,11 @@ public:
         return static_cast<const std::uint32_t*>(d_ex_perm_.load(std::memory_order_acquire));
     }
     std::size_t exact_valid_rows() const noexcept { return n_valid_; }
+    // How many distinct keys the whole column has, and those keys ascending —
+    // nullptr when there are more than the direct path serves. Valid once
+    // ensure_exact_cache() has run.
+    std::size_t          exact_groups()   const noexcept { return ex_groups_; }
+    const std::int64_t*  exact_distinct() const noexcept { return d_ex_distinct_; }
 
     // Build-side join cache: keys sorted + original-index permutation, built
     // on first use as a join build side (or by prepare()), reused across
@@ -407,6 +443,11 @@ private:
     mutable std::atomic<void*>  d_ex_sorted_ { nullptr };
     mutable std::atomic<void*>  d_ex_perm_   { nullptr };
     mutable std::size_t         n_valid_  = 0;
+    // Built with the exact cache, under the same lock: the column's distinct
+    // key count, and those keys ascending when there are few enough for the
+    // direct grouped reduce (at most 256, so at most 2 KiB).
+    mutable std::size_t         ex_groups_ = 0;
+    mutable std::int64_t*       d_ex_distinct_ = nullptr;
     unsigned long long*         d_valid_  = nullptr;
     std::size_t                 null_count_ = 0;
     int                         width_ = 8;
@@ -1505,16 +1546,30 @@ private:
         }
         const unsigned char* mask = n_preds ? d_mask.p : nullptr;
 
-        // ---- the surviving sorted positions ----
-        // With no WHERE the sort cache IS the input: no copy, no compaction.
+        // ---- which reduce, decided before anything is compacted ----
+        // The sort path needs the surviving rows gathered into a sorted array
+        // and a permutation to read the payload through. The direct path needs
+        // neither: it reads rows in order and only wants the list of distinct
+        // keys, which the whole column's sort cache already answers. Deciding
+        // here rather than after the compaction is the difference between the
+        // two — a compaction the direct path would not read costs ~1.6 ms on
+        // 6M rows whatever the WHERE keeps, more than the grouping itself.
         const std::size_t     n_valid    = k.exact_valid_rows();
         const int             kwidth     = k.width();
+        // Both come from the exact cache, built once per column: deciding this
+        // per call cost a pass over the sorted keys even for statements that
+        // then take the sort path, and that showed up as a join cell going
+        // from 1.12x to 0.99x.
+        const std::size_t     all_runs   = k.exact_groups();
+        const std::int64_t*   distinct   = k.exact_distinct();
+        const bool direct = all_runs > 0 && distinct != nullptr;
+
         const void*           use_sorted = k.exact_sorted();
         const std::uint32_t*  use_perm   = k.exact_perm();
         std::size_t           n_sel      = n_valid;
         DeviceOut<unsigned char> sel_sorted(0, "");
         DeviceOut<std::uint32_t> sel_perm(0, "");
-        if (mask && n_valid) {
+        if (!direct && mask && n_valid) {
             sel_sorted.reset(n_valid * static_cast<std::size_t>(kwidth), "exact selected keys");
             sel_perm.reset(n_valid, "exact selected rows");
             GPUDB_CUDA_CHECK(gpudb_cuda_exact_select_sorted(use_sorted, kwidth, use_perm, n_valid,
@@ -1530,17 +1585,28 @@ private:
         const int                 has_v  = v ? 1 : 0;
         const int                 vwidth = v ? v->width() : 8;
 
-        std::size_t runs = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, kwidth, n_sel, &runs, stream_),
-                         "exact run count");
+        // How many groups the reduce will produce. The sort path counts the
+        // runs of the compacted keys. The direct path grinds every distinct
+        // key of the column and lets the empty ones fall out afterwards, so
+        // its upper bound is the column's own count — at most 256 rows, which
+        // is why dropping the empties costs nothing.
+        std::size_t runs = all_runs;
+        if (!direct) {
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(use_sorted, kwidth, n_sel, &runs, stream_),
+                             "exact run count");
+        }
         gpudb::cuda_exact::ExactTuple nullg{};
         GPUDB_CUDA_CHECK(gpudb_cuda_exact_null_group(k.valid_bits(), mask, rows, vptr, vwidth,
                                                      vvalid, has_v, &nullg, stream_),
                          "exact null-key group");
-        const bool        has_null_group = nullg.cnt_star > 0;
-        const std::size_t groups         = runs + (has_null_group ? 1 : 0);
-        r.groups_total = groups;
-        if (!f.active() && groups > max_groups) throw_cap(op, groups, max_groups, false);
+        const bool has_null_group = nullg.cnt_star > 0;
+        if (!direct) {
+            // The direct path's count is not final until the empty groups are
+            // dropped, so its cap check waits for that (a few lines below).
+            const std::size_t groups = runs + (has_null_group ? 1 : 0);
+            r.groups_total = groups;
+            if (!f.active() && groups > max_groups) throw_cap(op, groups, max_groups, false);
+        }
 
         DeviceOut<std::int64_t> d_keys(runs, "exact out keys");
         DeviceOut<std::int64_t> d_lo(runs, "exact out sum (low limb)");
@@ -1549,12 +1615,28 @@ private:
         DeviceOut<std::int64_t> d_cs(runs, "exact out count(*)");
         DeviceOut<std::int64_t> d_mn(runs, "exact out min");
         DeviceOut<std::int64_t> d_mx(runs, "exact out max");
-        std::size_t got = 0;
-        GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, kwidth, use_perm, n_sel, vptr, vwidth, vvalid, has_v,
-                                                 d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
-                                                 d_mn.p, d_mx.p, &got, stream_),
-                         "exact reduce_by_key");
-        check_runs(op, got, runs);
+        // Both reduces produce the same rows in the same order. The sort path
+        // reads the payload through the permutation — a random gather per row,
+        // per payload — which is what a few-group statement spends its time
+        // on. The direct path reads keys and payload in row order against the
+        // column's distinct keys and never touches the permutation.
+        // Backend-private: it changes which kernel answers, never the answer.
+        const bool use_direct = direct;
+        if (use_direct) {
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_direct(k.device_ptr(), kwidth, k.valid_bits(),
+                                                     rows, mask, vptr, vwidth, vvalid, has_v,
+                                                     distinct, static_cast<int>(runs),
+                                                     d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
+                                                     d_mn.p, d_mx.p, stream_),
+                             "exact direct reduce");
+        } else {
+            std::size_t got = 0;
+            GPUDB_CUDA_CHECK(gpudb_cuda_exact_reduce(use_sorted, kwidth, use_perm, n_sel, vptr, vwidth, vvalid, has_v,
+                                                     d_keys.p, d_lo.p, d_hi.p, d_cv.p, d_cs.p,
+                                                     d_mn.p, d_mx.p, &got, stream_),
+                             "exact reduce_by_key");
+            check_runs(op, got, runs);
+        }
         r.kernel_ms = stop_kernel_timer();
 
         const auto tx = std::chrono::steady_clock::now();
@@ -1567,6 +1649,31 @@ private:
         d2h_raw(r.maxs,        d_mx.p,   runs, "exact maxs D2H");
         GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "sync D2H");
         r.transfer_ms = elapsed_ms(tx);
+
+        // The direct path grouped every distinct key of the column, so a WHERE
+        // leaves some of them with no rows. They are not groups — the sort
+        // path would never have produced them — so drop them here, on at most
+        // 256 rows, in the ascending order they are already in.
+        if (use_direct && mask) {
+            std::size_t w = 0;
+            for (std::size_t i = 0; i < runs; ++i) {
+                if (!r.counts_star[i]) continue;
+                r.keys[w] = r.keys[i];           r.sums[w]     = r.sums[i];
+                r.sums_hi[w] = r.sums_hi[i];     r.counts[w]   = r.counts[i];
+                r.counts_star[w] = r.counts_star[i];
+                r.mins[w] = r.mins[i];           r.maxs[w]     = r.maxs[i];
+                ++w;
+            }
+            r.keys.resize(w); r.sums.resize(w); r.sums_hi.resize(w);
+            r.counts.resize(w); r.counts_star.resize(w);
+            r.mins.resize(w); r.maxs.resize(w);
+            runs = w;
+        }
+        if (use_direct) {
+            const std::size_t groups = runs + (has_null_group ? 1 : 0);
+            r.groups_total = groups;
+            if (!f.active() && groups > max_groups) throw_cap(op, groups, max_groups, false);
+        }
         r.key_null.assign(runs, 0);
 
         // The NULL keys are ONE group and it goes last — where native's

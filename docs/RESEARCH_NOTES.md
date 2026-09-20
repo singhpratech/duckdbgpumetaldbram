@@ -5510,6 +5510,110 @@ complaint, and why it survived a flip, a gate and a release candidate. A
 guardrail that works costs one slow execution per process per shape; that is
 cheap enough to hide a hole for weeks.
 
+## 2026-09-20 — The grouping was never the expensive part
+
+The previous entry ends with a threshold keeping the rewrite away from
+few-group VARCHAR keys on CUDA, because the device took 6–8 ms where DuckDB
+took 2.7. This is what was actually costing that, and what it took to make the
+shape a win instead of a decline.
+
+**The permuted gather.** The sort path reads the payload *through* the sort
+permutation: one random 8-byte load per row, per payload. That is why the same
+table function answered 3 groups in 7.57 ms and 10,000 groups in 8.51 ms — the
+group count barely entered into it. A direct pass that reads keys and payload
+in row order, maps each key to its rank among the distinct keys and
+accumulates into replicated shared-memory tuples, took the one-payload
+no-WHERE case from **6.1 ms to 1.10 ms**.
+
+Replication matters more than it looks. With three groups, a single
+accumulator set has every thread in the block atomically updating three
+addresses. The shared budget buys up to 32 private copies, folded once per
+block; the 128-bit add is the same carry add as `AddExact`, associative and
+commutative mod 2^128, so no folding order changes a bit of the answer.
+
+**Then the measurement said the work was not done.** Twelve sweep cells had
+gone from 0.17–0.47× to 1.39–3.46×, which looked like enough to restore the
+exemption. TPC-H Q1 — the statement the whole thing started from — still
+measured 19.5 and 29.2 ms against native's 10.6. Twelve cells winning is not
+the thirteenth winning, and the exemption is one rule over both, so the flag
+went back to False and stayed there until Q1 was measured properly.
+
+**The second cost was a step the new path never reads.** Timing one statement
+at four selectivities:
+
+    no WHERE                      1.10 ms
+    l_shipdate <= 1998-09-02 (98%)  3.78 ms
+    l_shipdate <= 1993-01-01  (9%)  3.07 ms
+    l_orderkey < 0            (0%)  2.73 ms
+
+A predicate that keeps **nothing** still cost 2.73 ms against 1.10. That is not
+work on surviving rows; it is `select_sorted` rewriting the sorted keys and the
+permutation over the whole column, plus the mask. The sort path needs that
+compaction. The direct path reads rows in row order and needs only the list of
+distinct keys, which the column's own sort cache already answers — so for the
+direct path the compaction was pure waste, inherited by bolting a new reduce
+onto the old flow and leaving the old flow's setup in place.
+
+Deciding which reduce to take *before* compacting, and letting the empty groups
+fall out on the host afterwards (at most 256 rows), removed it:
+
+    case                      sort path   direct   + no compaction   native
+    1 payload, no WHERE          6.1 ms   1.10 ms       1.10 ms       2.36
+    1 payload, Q1's WHERE             —   3.78          1.12          3.61
+    8 payloads, Q1's WHERE            —   18.15         5.71          8.92
+    TPC-H Q1                  19.5-29.2   ~15           5.21         10.91
+
+Q1 is a **2.09× win** with identical rows, and the whole few-group family
+measures 1.16–5.72× over 72 cells (four VARCHAR keys × six WHEREs × 1/3/5
+payloads). SF1 coverage is 17 of 22 on both paths with **every one a win**,
+narrowest 1.21×, against 16 of 22 under the guardrail. So
+`string_key_few_groups` is True on CUDA again — restored on the sweep, which is
+the only thing that should ever move it.
+
+Three things worth keeping.
+
+**A capability is not a constant, and the flag earned its keep twice.** It let
+the table say "not here" for one day and "here again" the next, both times on
+measurements, without either edit touching a number that had been swept on
+another machine.
+
+**The second fix was invisible to the sweep that motivated the first.** The
+no-WHERE cells were already winning at 1.39–3.46× when the masked ones were
+still losing. A sweep of the shape that hurts is not a sweep of the shape that
+ships, and Q1 was the only cell that made the difference legible.
+
+**The gate caught a regression the sweep could not.** Deciding which reduce to
+take meant counting the column's distinct keys, and doing that per call cost a
+pass over the sorted keys — charged to every exact GROUP BY, including the ones
+that then take the sort path and never use the answer. It was invisible in the
+few-group sweep, where the direct path wins by milliseconds, and it showed up
+1631 cells later as a join statement falling from 1.12x to 0.99x:
+
+    pre-fix run 1   1.12x   rewritten 39.4 ms
+    pre-fix run 2   1.08x   rewritten 38.0
+    the #178 gate   1.12x   rewritten 38.3
+    this branch     0.99x   rewritten 41.0
+
+Three earlier runs clustered at 38.0-39.4 against 41.0, which is a regression
+and not a straddle — the distinction the earlier entry got wrong, made by
+comparing against the runs on record rather than by reasoning. The count and
+the distinct keys are properties of the COLUMN, so they moved into
+`ensure_exact_cache()` beside the sort cache, under the same lock: the per-call
+decision is a field read, the per-call Unique pass is gone as well, and the
+cached list is at most 256 x 8 bytes, freed in the destructor and counted in
+`resident_bytes()`. The cell reads 1.16x and 1.11x since.
+
+**What is still slower than native.** A predicate that matches nothing: DuckDB
+skips the table through its zone maps and answers in 0.21 ms, where the device
+still scans six million rows to find nothing, at 0.76 ms. It is a loss on a
+fifth of a millisecond and the measured rule declines it after one run, but it
+is a real shape where the device has no equivalent of a zone map. And the
+multi-payload form still takes one pass per payload where native shares one
+scan: 8 payloads cost 5.71 ms against a single payload's 1.12, which the
+interface has always had a place for —
+`Aggregator::groupby_exact_masked_multi` exists to be overridden so a backend
+can share the mask and the grouping, and CUDA does not override it.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

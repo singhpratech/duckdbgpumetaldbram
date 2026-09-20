@@ -256,14 +256,27 @@ not by the group count: the same table function answers 3 groups in 7.6 ms and
 already sits above the crossover. The exemption was the only rule letting these
 statements through.
 
-So `string_key_few_groups` is False on CUDA. It is not a tuned constant and it
-should not become one: CUDA's exact GROUP BY has one path, the sort, and this
-flag describes that. It is tied to the algorithm, so if a backend answers a
-few-group key without reading the column into a sort, re-run the sweep above
-and let the numbers set the flag for it.
+`string_key_few_groups` was False on CUDA on that evidence. It is not a tuned
+constant: it describes whether the backend can answer a few-group key without
+reading the column into a sort, and on 2026-09-20 CUDA could not.
 
-The continuous measured rule (connection._note_timing) is what caught these
-before the flag existed, and it catches them one slow execution late.
+Later the same day it could, and the same sweep set it back (the direct grouped
+reduce, `exact_kernel.cu`; the per-call mask compaction dropped from the path
+that never read it). The four keys, plain form, 1/3/5 payloads, with and
+without a WHERE — 72 cells:
+
+    payloads   before          after
+    1          0.45 - 0.47x    2.02 - 5.72x
+    3          0.22 - 0.24x    1.16 - 2.52x
+    5          0.17 - 0.19x    1.39 - 1.86x
+
+and TPC-H Q1, the statement this bound is hardest on, 19.5-29.2 ms against
+native's 10.6 before, 5.21 against 10.91 after. So the flag is True on both
+tables, set each time by this sweep and by nothing else.
+
+The continuous measured rule (connection._note_timing) is what caught the
+losses while the flag did not exist, and it catches them one slow execution
+late — which is why the bound is worth having as well as the rule.
 """
 from __future__ import annotations
 from dataclasses import dataclass, replace
@@ -334,12 +347,19 @@ METAL = Thresholds(min_groups=1_000, plain_max_groups=300_000, plain_max_groups_
                    plain_min_selectivity=0.5,
                    having_min_selectivity=0.3, having_min_selectivity_big=0.2,
                    topk_min_groups=100_000, topk_min_selectivity=0.8)
-# CUDA shares every CONSTANT with Metal — the gate has been run on it and found
-# none that wants a different number. It does not share the VARCHAR few-group
-# exemption, because that one is not a number: it is a claim about the backend's
-# algorithm, and the claim is false here. See "The one thing CUDA does not
-# inherit" at the top of this file.
-CUDA = replace(METAL, string_key_few_groups=False)
+# Deliberately the same object again, and the flag is what let it become one
+# safely. CUDA held `string_key_few_groups=False` for as long as its exact
+# GROUP BY answered a few-group key by sorting the whole column: the shape
+# measured 0.17-0.47x there (2026-09-20, the sweep below). With the direct
+# grouped reduce, and with the mask compaction dropped from the path that never
+# reads it, the same family measures 1.16-5.72x over 72 cells and TPC-H Q1 —
+# the statement the exemption was hardest on — goes from 19.5-29.2 ms against
+# native's 10.6 to 5.21 against 10.91.
+#
+# The field stays rather than being folded away: it names the capability the
+# exemption rests on, so a backend arriving without it has somewhere to say no,
+# and the sweep below is what it says no by.
+CUDA = METAL
 TABLE = {"METAL": METAL, "CUDA": CUDA}
 
 

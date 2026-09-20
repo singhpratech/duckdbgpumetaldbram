@@ -2212,6 +2212,193 @@ void test_cuda_device_fault_is_an_error() {
     EXPECT_EQ(rc, 0);             // runtime_error naming the illegal access
     std::printf("  child: %s, rc=%d\n", clean_exit ? "exited" : "killed by signal", rc);
 }
+
+// ---- the direct grouped reduce answers what the CPU reference answers ------
+// A key with few distinct values is grouped on CUDA by a row-order pass over
+// replicated shared-memory accumulators instead of the sort path's mask,
+// compaction and permuted gather. The choice is backend-private and must not
+// be visible in any answer, so every case below runs the SAME operator on the
+// CPU backend — the reference the whole exact path is defined against — and
+// compares every output vector cell for cell.
+//
+// The admission rule lives in CudaAggregator::exact_common: take the direct
+// path when the COLUMN has 1..gpudb_cuda_exact_direct_max_groups() distinct
+// keys (256, a shared-memory budget in exact_kernel.cu), otherwise sort. The
+// cases below sit either side of that bound on purpose.
+void test_cuda_direct_reduce_matches_reference() {
+    std::printf("--- the CUDA direct grouped reduce vs the CPU reference ---\n");
+    std::unique_ptr<gpudb::Aggregator> gpu;
+    try {
+        gpu = gpudb::make_aggregator(gpudb::Backend::CUDA);
+    } catch (const std::exception& e) {
+        std::printf("  SKIP (%s)\n", e.what());
+        return;
+    }
+    auto cpu = gpudb::make_aggregator(gpudb::Backend::CPU);
+
+    auto same = [](const gpudb::GroupByResidentResult& a,
+                   const gpudb::GroupByResidentResult& b) {
+        return a.keys == b.keys && a.key_null == b.key_null &&
+               a.sums == b.sums && a.sums_hi == b.sums_hi &&
+               a.counts == b.counts && a.counts_star == b.counts_star &&
+               a.mins == b.mins && a.maxs == b.maxs;
+    };
+
+    // One shape, built the same way for both backends. `groups` distinct keys,
+    // NULL keys and NULL payloads sprinkled, one group given only NULL
+    // payloads, and INT64_MIN/MAX plus values large enough that the 128-bit
+    // sum carries out of its low limb.
+    struct Case { const char* name; std::size_t groups; std::size_t rows; bool huge; };
+    const Case cases[] = {
+        {"1 distinct key",    1,   50'000,  true},
+        {"2 distinct keys",   2,   50'000,  true},
+        {"255 distinct keys", 255, 120'011, false},
+        {"256 distinct keys", 256, 120'011, false},   // the last the direct path serves
+        {"257 distinct keys", 257, 120'011, false},   // one past it: the sort path, same answer
+    };
+
+    for (const auto& c : cases) {
+        const std::size_t N = c.rows;
+        std::mt19937_64 rng(0xD12EC7ULL + c.groups);
+        std::vector<std::int64_t>  kv(2 * N);
+        std::vector<std::uint64_t> kvalid((N + 63) / 64, ~std::uint64_t{0});
+        std::vector<std::uint64_t> vvalid((N + 63) / 64, ~std::uint64_t{0});
+        auto clr = [](std::vector<std::uint64_t>& m, std::size_t i) {
+            m[i >> 6] &= ~(std::uint64_t{1} << (i & 63));
+        };
+        std::uniform_int_distribution<int> pct(0, 99);
+        for (std::size_t i = 0; i < N; ++i) {
+            const std::int64_t k = static_cast<std::int64_t>(i % c.groups);
+            std::int64_t v;
+            if (c.huge && pct(rng) < 30) {
+                // wide values: the low limb of the 128-bit sum must carry
+                v = (pct(rng) & 1) ? std::numeric_limits<std::int64_t>::max()
+                                   : std::numeric_limits<std::int64_t>::min();
+            } else {
+                v = static_cast<std::int64_t>(rng() % 200'001) - 100'000;
+            }
+            kv[2 * i] = k; kv[2 * i + 1] = v;
+            if (pct(rng) < 5) clr(kvalid, i);                 // NULL key -> the null group
+            if (k == 0 || pct(rng) < 9) clr(vvalid, i);       // group 0: every payload NULL
+        }
+        gpudb::Aggregator::KvSpan sp{};
+        sp.kv = kv.data(); sp.rows = N;
+        sp.key_valid = kvalid.data(); sp.val_valid = vvalid.data();
+
+        auto g = gpu->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+        auto h = cpu->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+        const std::size_t cap = std::size_t(100) * 1000000;
+
+        // with a payload: sum / count(v) / count(*) / min / max
+        const bool ok_pay = same(gpu->groupby_exact_resident(*g.keys, g.vals.get(), cap),
+                                 cpu->groupby_exact_resident(*h.keys, h.vals.get(), cap));
+        // keys only: count(*) alone, min/max at their sentinels
+        const bool ok_keys = same(gpu->groupby_exact_resident(*g.keys, nullptr, cap),
+                                  cpu->groupby_exact_resident(*h.keys, nullptr, cap));
+        EXPECT(ok_pay);
+        EXPECT(ok_keys);
+
+        // Masks. `keeps nothing` is the one that proves empty groups are
+        // dropped rather than emitted with count(*) = 0: the direct path
+        // grinds every distinct key of the column, so it produces them and
+        // then must throw them away to agree with the reference.
+        auto pred = [&](gpudb::Predicate::Op op, std::int64_t value,
+                        const gpudb::ResidentColumn& col) {
+            gpudb::Predicate p{}; p.col = &col; p.op = op; p.value = value; return p;
+        };
+        struct M { const char* what; gpudb::Predicate::Op op; std::int64_t value; };
+        const M masks[] = {
+            {"keeps nothing",     gpudb::Predicate::Op::LT, std::numeric_limits<std::int64_t>::min()},
+            {"keeps everything",  gpudb::Predicate::Op::GE, std::numeric_limits<std::int64_t>::min()},
+            {"keeps some",        gpudb::Predicate::Op::LT, 0},
+        };
+        bool ok_masked = true;
+        for (const auto& m : masks) {
+            const gpudb::Predicate pg = pred(m.op, m.value, *g.vals);
+            const gpudb::Predicate ph = pred(m.op, m.value, *h.vals);
+            auto rg = gpu->groupby_exact_masked_resident(*g.keys, g.vals.get(), &pg, 1, cap);
+            auto rh = cpu->groupby_exact_masked_resident(*h.keys, h.vals.get(), &ph, 1, cap);
+            if (!same(rg, rh)) { ok_masked = false; break; }
+            // no group may come back empty, whichever path produced it
+            for (std::size_t j = 0; j < rg.counts_star.size(); ++j)
+                if (rg.counts_star[j] == 0) { ok_masked = false; break; }
+        }
+        EXPECT(ok_masked);
+
+        // Several payloads in one call (§4.9). The default multi runs one
+        // single-payload pass per column, so this is the direct path used
+        // repeatedly over one set of keys.
+        gpudb::MultiPayload mpg[2]; mpg[0].vals = g.vals.get(); mpg[1].vals = g.vals.get();
+        gpudb::MultiPayload mph[2]; mph[0].vals = h.vals.get(); mph[1].vals = h.vals.get();
+        auto vg = gpu->groupby_exact_masked_multi(*g.keys, mpg, 2, 0, nullptr, 0, cap);
+        auto vh = cpu->groupby_exact_masked_multi(*h.keys, mph, 2, 0, nullptr, 0, cap);
+        bool ok_multi = vg.size() == vh.size();
+        for (std::size_t p = 0; ok_multi && p < vg.size(); ++p) ok_multi = same(vg[p], vh[p]);
+        EXPECT(ok_multi);
+
+        std::printf("    %-18s rows=%zu groups=%zu  pay=%d keys=%d masked=%d multi=%d\n",
+                    c.name, N, c.groups, int(ok_pay), int(ok_keys), int(ok_masked), int(ok_multi));
+    }
+
+    // Narrow lanes (#165) and the narrow sort cache (#166): the distinct-key
+    // list the direct path reads comes out of that cache, so a column stored
+    // at 1, 2 and 4 bytes has to give the same answer as one stored at 8.
+    {
+        const std::size_t N = 60'013;
+        bool ok_narrow = true;
+        for (const std::int64_t span : {std::int64_t(100),        // fits a byte
+                                        std::int64_t(30'000),     // fits two
+                                        std::int64_t(2'000'000),  // fits four
+                                        std::int64_t(1) << 40}) { // needs eight
+            std::mt19937_64 rng(0xBADC0DEULL ^ static_cast<std::uint64_t>(span));
+            std::vector<std::int64_t> kv(2 * N);
+            for (std::size_t i = 0; i < N; ++i) {
+                kv[2 * i]     = static_cast<std::int64_t>(i % 64);      // few groups
+                kv[2 * i + 1] = static_cast<std::int64_t>(rng() % static_cast<std::uint64_t>(span))
+                              - span / 2;
+            }
+            gpudb::Aggregator::KvSpan sp{}; sp.kv = kv.data(); sp.rows = N;
+            auto g = gpu->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+            auto h = cpu->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+            const std::size_t cap = std::size_t(100) * 1000000;
+            if (!same(gpu->groupby_exact_resident(*g.keys, g.vals.get(), cap),
+                      cpu->groupby_exact_resident(*h.keys, h.vals.get(), cap))) {
+                ok_narrow = false; break;
+            }
+        }
+        EXPECT(ok_narrow);
+        std::printf("    narrow lanes (1/2/4/8-byte payloads) agree: %d\n", int(ok_narrow));
+    }
+
+    // Device memory: the direct path adds ONE device buffer, the distinct-key
+    // list (at most 256 * 8 bytes), held in a DeviceOut that frees on every
+    // exit including a throw. Its accumulators are shared memory, per block,
+    // never an allocation. Repeats of the masked form — the path with the most
+    // buffers in flight — must leave free memory where they found it: a
+    // bounded leak and an unbounded one look the same after one call, which is
+    // what #172 was on Metal.
+    {
+        const std::size_t N = 200'003;
+        std::vector<std::int64_t> kv(2 * N);
+        for (std::size_t i = 0; i < N; ++i) {
+            kv[2 * i]     = static_cast<std::int64_t>(i % 17);
+            kv[2 * i + 1] = static_cast<std::int64_t>(i % 1013) - 500;
+        }
+        gpudb::Aggregator::KvSpan sp{}; sp.kv = kv.data(); sp.rows = N;
+        auto g = gpu->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+        const std::size_t cap = std::size_t(100) * 1000000;
+        gpudb::Predicate p{}; p.col = g.vals.get(); p.op = gpudb::Predicate::Op::LT; p.value = 0;
+        (void)gpu->groupby_exact_masked_resident(*g.keys, g.vals.get(), &p, 1, cap);  // warm
+        const std::size_t before = gpudb_cuda_debug_free_bytes();
+        for (int i = 0; i < 64; ++i)
+            (void)gpu->groupby_exact_masked_resident(*g.keys, g.vals.get(), &p, 1, cap);
+        const std::size_t after = gpudb_cuda_debug_free_bytes();
+        const bool ok_free = after >= before;
+        EXPECT(ok_free);
+        std::printf("    64 masked direct calls leave free memory at %zu -> %zu MiB: %d\n",
+                    before >> 20, after >> 20, int(ok_free));
+    }
+}
 #endif
 
 
@@ -4279,6 +4466,7 @@ int main(int argc, char** argv) {
 #if GPUDB_HAVE_CUDA
     test_backend(gpudb::Backend::CUDA);
     test_cuda_failed_upload_leaves_nothing();
+    test_cuda_direct_reduce_matches_reference();
 #endif
 #if GPUDB_HAVE_METAL
     test_backend(gpudb::Backend::METAL);
