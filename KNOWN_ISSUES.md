@@ -295,7 +295,7 @@ cd duckdbgpumetaldbram
 For the transparent path (the Python wrapper and the `gpudb` shell):
 
 ```bash
-PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # 1206 checks: parity against native
+PYTHONPATH=python python3 -m pytest python/tests/test_wrapper.py   # 1238 checks: parity against native
                                 # DuckDB for every shape, staleness, background residency, the memory
                                 # budget, error fallback — needs the extension built (above).
                                 # Green under DuckDB 1.4.5 and 1.5.5

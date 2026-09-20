@@ -49,6 +49,7 @@ Entries are in date order in the file; this groups them by question.
 - A guard that tested for a value the serializer never emits
 - A formula verified bit-exact on one architecture and wrong on the other
 - The tie at the k-th row, and what native actually does with one — twenty plain-DuckDB runs of one `ORDER BY … LIMIT 5`, and the three different row sets they returned
+- Both doors, or neither: a guard that only one entrance pays — the tie guard cost a shell user a second device pass, and a gate that drove one entry point never saw it
 
 **Deciding when the GPU should answer**
 - The gate: thresholds come from measurements
@@ -81,6 +82,7 @@ Entries are in date order in the file; this groups them by question.
 - The lane got smaller and the cache did not — narrow lanes on CUDA, and the derived structure that had not followed them
 - The number went the wrong way — narrowing the CUDA exact sort cache, and the double count the A/B caught
 - It was never the segments — what a background upload actually costs a statement, and the back-off that followed from measuring it
+- What a segment costs before it reads anything — the fixed cost no smaller segment escapes, the floor derived from it, and the session that reports itself starved rather than grinding finer
 
 **Kernels**
 - Raw performance first: where a statement's time goes
@@ -137,6 +139,13 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py \
 PYTHONPATH=python python3 scripts/transparent_gate.py \
     --subqueries --exprs                                    # the sweep behind the thresholds (about an hour)
 ```
+
+Both scripts take `--path`, the wrapper entry point each side of a cell is
+measured through. `transparent_gate.py --path execute|sql|both|auto` defaults to
+`auto` — `execute()` everywhere, plus `sql()` for the top-k forms, whose guard
+is a device pass — and `--path both` forces every form through both.
+`tpch_coverage.py --path execute|sql` defaults to `execute()`. A gate that
+measures one entry point proves nothing about the other.
 
 Measurements are on an Apple M4 Max (Metal) unless an entry says otherwise.
 Timings of statements under about 5 ms are taken with `SET threads TO 1`,

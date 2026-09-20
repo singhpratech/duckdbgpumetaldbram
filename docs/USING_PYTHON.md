@@ -50,6 +50,33 @@ they rarely fit the window a workload leaves between its statements.
 `GPUDB_RESIDENCY_TRACE=1` prints a line per segment attempt and per wait
 ([every environment variable](ENVIRONMENT.md)).
 
+A segment is **priced from what this machine measures**, not from a constant. It
+has a fixed cost no smaller segment escapes — the statement's own parse and
+bind, and DuckDB's scan set-up over the table's row groups — so halving the size
+stops paying somewhere, and the floor is the smallest size whose predicted total
+for the table is still within reach of the total at the default size, fitted to
+the segments that actually landed here. Until two sizes have landed and a
+halving can be priced at all, the floor is the old constant of 1/32 of the
+default.
+
+When no size above that floor fits the pauses a workload leaves, the set is
+**starved** and says so rather than grinding finer. Nothing is forced: the set
+stays off the device and every statement keeps its native answer — correct, at
+native speed, simply not resident. `residency="eager"` (one upload on first
+sight, for a script that knows its workload) or a pause long enough for one
+segment is the way out. `con._manager.progress()` reports it per set:
+
+| Key | |
+|---|---|
+| `starved` | `True` when no segment above the floor fits the windows this connection leaves |
+| `floor_rows` | the smallest segment size still worth taking on this machine |
+| `window_ms` | the idle window the workload has been leaving, as measured |
+| `fixed_ms` | the fixed part of a segment's cost here, fitted to the segments that landed |
+| `per_row_us` | the per-row part of the same fit, in microseconds a row, taken near the small end of the sizes that landed |
+
+`fixed_ms` and `per_row_us` read `0.0` until two sizes have landed, which is the
+same condition that keeps the floor at the constant.
+
 ## Seeing what happened
 
 `con.last_rewrite()` returns the record for the last statement. Its keys are
