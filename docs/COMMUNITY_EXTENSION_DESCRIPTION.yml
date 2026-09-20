@@ -8,6 +8,12 @@
 #     https://github.com/duckdb/community-extensions/blob/main/CONTRIBUTING.md
 #
 # `repo.ref` is filled with the release tag's commit when the PR is opened.
+#
+# RE-RUN before submitting: the measured TPC-H table inside `extended_description`
+# and the hello_world block are re-measured and re-run on the release build.
+# CUDA-DEFAULT: the platform table says a CUDA build comes from the releases or
+# from source. If CUDA ships on by default, that row and the `known_limitations`
+# wording about the CPU-only registry binary are the two places to change.
 
 extension:
   name: gpudb
