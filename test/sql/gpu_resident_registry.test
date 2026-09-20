@@ -25,7 +25,13 @@ SELECT name, origin, catalog IS NULL AS no_identity, kind, dtype, rows FROM gpu_
 -- expect: p  explicit  true  pair  I64/F64  6
 
 -- 3. Managed sets are READY (prepared) at upload; explicit sets are
---    'uploaded' until an operator or gpu_prepare_resident builds the cache
+--    'uploaded' until an operator or gpu_prepare_resident builds the cache.
+--    That second half is a GPU fact: a CPU-resident column has nothing to
+--    derive and is "prepared from birth" (src/include/gpu_backend.hpp), so on
+--    a CPU-only build the explicit set is already 'ready' and there is no
+--    distinction left to assert. Same for every `requires_backend: gpu`
+--    below: they read a device's sort cache, not a query's answer.
+-- requires_backend: gpu
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', range::BIGINT, range::BIGINT) FROM range(100)
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(100)
 SELECT name, state, prepared FROM gpu_residents() ORDER BY name;
@@ -108,14 +114,17 @@ WHERE gd.ok;
 SELECT gpu_invalidate('gpudb:v1:memory:main:t:1') AS marked;
 -- expect: 2
 
--- 12b. ... and the states afterwards
+-- 12b. ... and the states afterwards. What this asserts is WHICH sets the
+--    prefix took down; whether a live explicit set reads 'uploaded' or
+--    'ready' is the backend's business (case 3), so collapse that here.
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,v', range::BIGINT, range::BIGINT) FROM range(10)
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t:1:k,x', range::BIGINT, range::BIGINT) FROM range(10)
 -- setup: SELECT gpu_upload_pair('gpudb:v1:memory:main:t2:2:k,v', range::BIGINT, range::BIGINT) FROM range(10)
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
 -- setup: SELECT gpu_invalidate('gpudb:v1:memory:main:t:1')
-SELECT string_agg(name || '=' || state, ' ' ORDER BY name) FROM gpu_residents();
--- expect: gpudb:v1:memory:main:t2:2:k,v=ready gpudb:v1:memory:main:t:1:k,v=stale gpudb:v1:memory:main:t:1:k,x=stale p=uploaded
+SELECT string_agg(name || '=' || CASE WHEN state = 'stale' THEN 'stale' ELSE 'live' END,
+                  ' ' ORDER BY name) FROM gpu_residents();
+-- expect: gpudb:v1:memory:main:t2:2:k,v=live gpudb:v1:memory:main:t:1:k,v=stale gpudb:v1:memory:main:t:1:k,x=stale p=live
 
 -- 13. GUARDRAIL: operators refuse a stale set with the typed prefix
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
@@ -127,13 +136,15 @@ SELECT * FROM gpu_groupby_sum_resident('p');
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(10)
 -- setup: SELECT gpu_invalidate('p')
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, (range * 3)::BIGINT) FROM range(4)
-SELECT state, epoch, rows, (SELECT sum(sum) FROM gpu_groupby_sum_resident('p')) AS total FROM gpu_residents();
--- expect: uploaded  1  4  18
+SELECT state <> 'stale' AS live, epoch, rows,
+       (SELECT sum(sum) FROM gpu_groupby_sum_resident('p')) AS total FROM gpu_residents();
+-- expect: true  1  4  18
 
 -- 15. Invalidating a prefix that matches nothing returns 0 and changes nothing
 -- setup: SELECT gpu_upload('c', range::BIGINT) FROM range(3)
-SELECT gpu_invalidate('nothing') AS marked, (SELECT state FROM gpu_residents()) AS state;
--- expect: 0  uploaded
+SELECT gpu_invalidate('nothing') AS marked,
+       (SELECT state <> 'stale' FROM gpu_residents()) AS untouched;
+-- expect: 0  true
 
 -- 16. GUARDRAIL: the "gpudb:" prefix is reserved — a malformed tag is an error
 -- expected_fail: gpu_upload_pair: malformed identity tag 'gpudb:oops'
@@ -172,6 +183,8 @@ FROM gpu_residents() ORDER BY name;
 -- expect: p  2  true  true
 
 -- 21. gpu_resident_info keeps its v0.6 prefix and now reports set/origin/state
+--     (state=uploaded is the GPU shape — see case 3)
+-- requires_backend: gpu
 -- setup: SELECT gpu_upload('c', range::BIGINT) FROM range(7)
 SELECT gpu_resident_info('c') LIKE 'dtype=I64 rows=7 device=% set=c origin=explicit state=uploaded prepared=%' AS ok;
 -- expect: true
@@ -188,7 +201,10 @@ SELECT bytes FROM gpu_residents();
 --      documented layouts are accepted here rather than one backend's choice:
 --      28000 = 16000 + 8000 sorted + 4000 for u32 row ids (Metal, and CUDA
 --      once it reaches stage C of docs/RESIDENT_COLUMNS_DESIGN.md), 32000 =
---      16000 + 8000 sorted + 8000 for 64-bit row ids (CUDA today).
+--      16000 + 8000 sorted + 8000 for 64-bit row ids (CUDA today). A
+--      CPU-only build derives nothing at all and stays at 16000, so there is
+--      no growth to measure there.
+-- requires_backend: gpu
 -- setup: SELECT gpu_upload_pair('p', range::BIGINT, range::BIGINT) FROM range(1000)
 -- setup: SELECT gpu_prepare_resident('p')
 SELECT bytes IN (28000, 32000) AS documented_layout FROM gpu_residents();

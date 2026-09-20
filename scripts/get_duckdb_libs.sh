@@ -7,9 +7,28 @@
 # multi-GB and minutes per compile. For our purposes (registering aggregate
 # functions via the C API in a loadable .so) the pre-built distribution is
 # enough.
+#
+# Version: PINNED, not "latest". These libs back `gpudb-sql`, which is what
+# ./scripts/run_sql_tests.sh runs the SQL suite through — so the DuckDB build
+# under the suite must be the same one on every machine and in CI, or the
+# expected answers in test/sql/*.test drift with whatever DuckDB shipped that
+# morning. The default tracks the version the extension is published for and
+# gated against: the community registry serves gpudb for DuckDB v1.5.5, which
+# is also the hard leg of .github/workflows/duckdb-compat.yml and the floor
+# stated in README.md. (Independent of the extension ABI, which is the
+# vendored C_STRUCT header set in third_party/duckdb_capi/, TARGET_DUCKDB_VERSION
+# = v1.2.0 in the root Makefile.)
+#
+# Usage:
+#   ./scripts/get_duckdb_libs.sh                    # the pinned default below
+#   DUCKDB_VERSION=v1.4.5 ./scripts/get_duckdb_libs.sh
+#   DUCKDB_VERSION=latest ./scripts/get_duckdb_libs.sh   # whatever is newest
+#   FORCE=1 ./scripts/get_duckdb_libs.sh            # re-fetch over an existing tree
 
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
+
+DUCKDB_VERSION="${DUCKDB_VERSION:-v1.5.5}"
 
 DEST="third_party/duckdb-libs"
 mkdir -p "$DEST"
@@ -23,18 +42,31 @@ case "$OS-$ARCH" in
     *) echo "unsupported platform: $OS-$ARCH" >&2; exit 1 ;;
 esac
 
-if [ -f "$DEST/duckdb.h" ] && [ -f "$DEST/libduckdb.so" -o -f "$DEST/libduckdb.dylib" ]; then
+if [ "${FORCE:-0}" != "1" ] &&
+   [ -f "$DEST/duckdb.h" ] && { [ -f "$DEST/libduckdb.so" ] || [ -f "$DEST/libduckdb.dylib" ]; }; then
     echo "==> $DEST already populated; nothing to do"
+    echo "    (FORCE=1 re-fetches; a tree fetched earlier can predate the pin)"
+    have="$(sed -n 's/^#define DUCKDB_VERSION "\(.*\)"/\1/p' "$DEST/duckdb.hpp" 2>/dev/null | head -1 || true)"
+    if [ -n "$have" ]; then
+        echo "    on disk: $have   (pin: $DUCKDB_VERSION)"
+    fi
     ls -lh "$DEST"
     exit 0
 fi
 
-echo "==> downloading $asset"
-curl -fsSL -o "$DEST/$asset" \
-    "https://github.com/duckdb/duckdb/releases/latest/download/$asset"
+# `latest` keeps the old floating behaviour, on request only.
+if [ "$DUCKDB_VERSION" = "latest" ]; then
+    url="https://github.com/duckdb/duckdb/releases/latest/download/$asset"
+else
+    url="https://github.com/duckdb/duckdb/releases/download/$DUCKDB_VERSION/$asset"
+fi
+
+echo "==> fetching $asset ($DUCKDB_VERSION)"
+curl -fsSL -o "$DEST/$asset" "$url"
 
 echo "==> extracting"
 (cd "$DEST" && unzip -o "$asset" && rm "$asset")
 
 echo "==> done"
+sed -n 's/^#define DUCKDB_VERSION "\(.*\)"/    version: \1/p' "$DEST/duckdb.hpp" 2>/dev/null | head -1
 ls -lh "$DEST"
