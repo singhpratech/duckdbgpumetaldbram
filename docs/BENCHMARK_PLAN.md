@@ -153,8 +153,8 @@ Where we lose, we **say so in BENCHMARK.md** and explain why. Honesty buys credi
 |---|:-:|:-:|:-:|---|---|
 | SUM/MIN/MAX i64 | ✅ | ✅ | ✅ | Q1 (SUM(l_quantity)) | "Metal SUM at scale" |
 | SUM f64 | ✅ | ✅ | host fallback | Q1 (SUM(l_extendedprice)) | same |
-| `agg_all_i64` (multi-agg) | 🔜 | — | 🔜 (`feat/metal-multiagg`) | derived from Q1 | (incoming) |
+| `agg_all_i64` (multi-agg) | ✅ | ✅ | ✅ | derived from Q1 | "Multi-agg fusion" |
 | GROUP BY hash | ✅ | ✅ | ✅ (radix sort) | Q1 GROUP BY l_returnflag | "Metal GROUP BY" / matrix |
 | Hash join probe | ✅ | ✅ | ✅ adaptive + partitioned TG hash | Q3, Q5, Q12 | Metal hash join (2026-07-07) |
-| Window functions | — | — | — | Q8 (window) — future | — |
-| DuckDB extension wrapper | — | — | scaffold + `gpu_sum`, `gpu_min`, `gpu_max` (Linux-built; macOS validation: `feat/ext-macos-validate`) | All TPC-H | (when end-to-end) |
+| Window functions | ✅ | — | ✅ | Q8 (window) | "Window functions: ROW_NUMBER" |
+| DuckDB extension wrapper | ✅ | ✅ | ✅ | All TPC-H | "v0.7 TPC-H coverage map" |
