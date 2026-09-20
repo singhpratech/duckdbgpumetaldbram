@@ -2026,6 +2026,21 @@ outside it. The Q18 run took 19 s to go ready because 0–50 ms gaps rarely
 clear the 20 ms idle bar beside a 200 ms statement — expected: a session
 that cannot find idle time waits, it does not intrude.
 
+Reworked 2026-09-19 (RESEARCH_NOTES.md, "The gate whose native shapes had
+stopped being native"), because two of its three shapes had stopped being
+native — the wrapper rewrote them in the background pass once the set was
+ready, so that pass mixed device statements into a native-vs-native
+comparison and the verdict followed whenever readiness happened to fall.
+Now: the shapes are ones the rewriter declines structurally (`stddev`,
+`quantile_cont`, a point lookup), every timed statement's rewrite is counted
+and a rewritten shape voids the row (exit 2); each pass is warmed for 1.5 s
+and replays the same gap sequence; and the verdict is taken on the pooled
+samples of up to three rounds, passing at `p99(background) <= min(p99 A,
+p99 B) / thresh`, losing above `max(p99 A, p99 B) / thresh`, and
+re-measuring in between — a row fails only on a loss that survived the
+re-measurement, and INCONCLUSIVE (exit 3) says the machine never held still
+enough to resolve the margin. `--dump` keeps every latency.
+
 ### 9.4 Community path
 Unchanged C-API template path (`make configure && make release && make
 test`) on Linux plus the registry-smoke workflow. The registry's Linux
