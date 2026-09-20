@@ -16,7 +16,7 @@ extension:
 
 repo:
   github: singhpratech/duckdbgpumetaldbram
-  ref: 0000000000000000000000000000000000000000  # the v0.7.0 tag's commit
+  ref: TAG_SHA_GOES_HERE  # the commit the v0.7.0 tag points at
 
 docs:
   hello_world: |
@@ -56,8 +56,14 @@ docs:
 
     ### Three ways in
 
-    The first two need the Python package as well as this extension:
-    `pip install duckdb-gpudb`.
+    This extension, loaded in any DuckDB client, gives the explicit `gpu_*`
+    functions — route 3. The first two routes, the ones that put **plain** SQL on
+    the device, additionally need the Python package, because DuckDB's stable C
+    API has no hook that sees a statement before it is planned:
+    `pip install duckdb-gpudb`. On Apple Silicon (macOS 15 or later) and x86-64
+    Linux (glibc 2.34 or newer) that wheel carries a matching extension binary
+    inside it, so it is the quickest way to plain SQL on the GPU; elsewhere it
+    uses the extension DuckDB has installed from this registry.
 
     **1. The `gpudb` shell** — a SQL shell whose footer says, under every result,
     where the statement ran and why.
@@ -144,14 +150,19 @@ docs:
     Source, benchmarks and issues: https://github.com/singhpratech/duckdbgpumetaldbram
 
   hardware_requirements: |
-    Apple Metal: an Apple Silicon Mac (M1 or later) on macOS 14 or later.
-    The binary asks the OS at run time and compiles its shaders as Metal
-    shading language 3.2 on macOS 15 and later, 3.1 below; building from
+    Apple Metal: an Apple Silicon Mac (M1 or later) on macOS 15 or later,
+    which is the floor the shipped binaries declare. The binary compiles
+    its shaders at run time as Metal shading language 3.2; building from
     source needs the macOS 15 SDK.
     NVIDIA CUDA: any GPU with sm_75 or later (Turing and newer). The driver
     a binary needs follows the CUDA toolkit it was built with: a CUDA 13
     build needs R580 or newer, a CUDA 12.x build reaches the GPU on R525+.
     Falls back to CPU otherwise.
+    Linux: x86-64 with glibc 2.34 or newer, and libgomp.so.1 present at
+    load time (apt install libgomp1, dnf install libgomp) - the extension
+    links OpenMP dynamically. It is on most images already; in a minimal
+    container LOAD fails with "libgomp.so.1: cannot open shared object
+    file".
 
   known_limitations: |
     * Window functions, FULL joins, median / stddev / quantiles, and
@@ -172,9 +183,14 @@ docs:
       every GPU. TPC-H Q1 sits at parity on that machine, and the
       per-process measured rule is what decides such a statement.
     * Ordinary SQL is answered on the device only through a client that
-      sees the statement before DuckDB plans it — the project's `gpudb`
-      shell or its Python wrapper. LOAD gpudb in the stock CLI gives the
-      explicit gpu_* functions.
+      sees the statement before DuckDB plans it - the project's `gpudb`
+      shell or gpudb.connect(), both from pip install duckdb-gpudb. LOAD
+      gpudb in the stock CLI, or in any other client, gives the explicit
+      gpu_* functions and the same answers, not the rewrite.
+    * A copy of the extension already installed is kept by a plain
+      INSTALL; FORCE INSTALL gpudb FROM community; or UPDATE EXTENSIONS;
+      is what replaces it with the newest build this registry has, and
+      neither reaches a process that has already loaded the old one.
     * GROUP BY at very low cardinality is a native win: DuckDB's
       streaming aggregate is scan-bound and very fast there, and the
       size thresholds leave those statements with it.
