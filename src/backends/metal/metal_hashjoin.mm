@@ -139,10 +139,15 @@ public:
             throw std::runtime_error("hash join: row count exceeds uint32 limit");
         }
 
+        // Refuse the sentinel in build keys rather than drop them. As in the
+        // hash GROUP BY, this is a property of the open-addressing table and
+        // not a gap: the slot array needs one value to mean "empty". Same
+        // sentence as the CUDA backend, so the two report identically.
         for (std::size_t i = 0; i < n_build; ++i) {
             if (build_keys[i] == kEmptySentinel) {
                 throw std::runtime_error(
-                    "build key INT64_MIN clashes with empty sentinel; not yet supported");
+                    "build key INT64_MIN is this hash table's empty slot marker and cannot "
+                    "be joined on by it");
             }
         }
 

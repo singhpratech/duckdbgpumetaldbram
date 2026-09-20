@@ -8,7 +8,11 @@
 // without having to also stand up plumbing.
 //
 // =========================================================================
-//  Planned real Metal algorithm (gated on PR #5 — `feat/metal-radix-sort`)
+//  Design note: what a real Metal ROW_NUMBER would do
+//
+//  Written down so the shape of the kernel is not rediscovered from scratch
+//  if it is ever wanted. It is a sketch, not a commitment, and nothing in the
+//  project depends on it: the CPU reference above answers every ROW_NUMBER.
 // =========================================================================
 //
 // ROW_NUMBER over an int64 ASC ordering reduces to "stable sort the input
@@ -17,10 +21,9 @@
 //
 //   Step 1. Stable radix sort over (key, original_index) pairs.
 //
-//     PR #5 (`feat/metal-radix-sort`) introduces an LSD radix sort over
-//     int64 keys with a sibling payload buffer for groupby_sum. The same
-//     kernel (in groupby.metal) accepts a `payload[]` parameter that
-//     follows the key permutation. For ROW_NUMBER we reuse it with
+//     groupby.metal already has an LSD radix sort over int64 keys with a
+//     sibling payload buffer, used by groupby_sum: its `payload[]`
+//     parameter follows the key permutation. ROW_NUMBER would reuse it with
 //     `payload[i] = i` (the original index, written as int64 so it fits
 //     the existing int64-payload kernel without a templated copy).
 //

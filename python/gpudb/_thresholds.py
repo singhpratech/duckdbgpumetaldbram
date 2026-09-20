@@ -83,11 +83,11 @@ another output column on both sides and the plain form's margin shrinks to
 1.01–1.09× (one 0.93× at 10K groups under a three-term WHERE), 1.00–1.08× at
 100K groups over a join                               → multi_plain_max_groups,
 multi_join_plain_max_groups; the plain form under a WHERE runs native
-CUDA: the same table until scripts/transparent_gate.py has run on the
-Linux box (the CUDA exact kernels do not exist yet, so the wrapper never
-takes the exact path there today).
+CUDA uses this Metal-measured table until scripts/transparent_gate.py has
+been run on CUDA; the CUDA exact path is implemented and opt-in
+(GPUDB_CUDA_EXACT=1).
 
-The direct grouped reduce (v0.8, `docs/RESIDENT_COLUMNS_DESIGN.md` §7) did not
+The direct grouped reduce (`docs/RESIDENT_COLUMNS_DESIGN.md` §7) did not
 move any of these, and the measurement says why. Inside the backend, a key with
 few distinct values now answers in one row-order pass over a group-id lane
 instead of masking, sorting and gathering: at SF10 that is 1.65× to 8.57×
