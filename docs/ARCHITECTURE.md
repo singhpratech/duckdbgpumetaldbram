@@ -70,3 +70,19 @@ only.
 - `src/backends/{cpu,cuda,metal}/*_hashjoin.*` — the join probe (CUDA: open-addressing atomicCAS; Metal: sort-merge)
 - `src/backends/{cpu,metal}/*_window.*` — the window operators, which no SQL path takes: window functions run on DuckDB
 - `src/extension/duckdb_loadable.cpp` — the loadable extension's entry point, on the stable C API
+
+## The two SQL paths
+
+- **Streaming** `gpu_sum/min/max` — CPU-shaped running accumulators, native
+  parity in any query shape. Deliberate: the v0.2.0 numbers in
+  [BENCHMARK.md](../BENCHMARK.md) showed per-query buffering-for-GPU loses
+  3×–110× through this interface.
+- **Resident** `gpu_upload` + `gpu_*_resident` — the GPU path with substance:
+  pay the transfer once, then reductions run on-device (CUDA and Metal) at
+  memory-bandwidth speed with `transfer_ms=0.000`. This is where the
+  4–25× numbers above come from.
+- **Resident joins (v0.5.0)** `gpu_upload_pair` + `gpu_[left_|semi_|anti_]join_{sum,count}_resident[_f64]`
+  — fused join + reduction against a device-cached sorted build side; the
+  11–376× join rows above. Row-returning `gpu_join_rows_resident` exists as
+  the composability primitive (wins on unified memory, loses to native across
+  PCIe — [BENCHMARK.md](../BENCHMARK.md) states both).

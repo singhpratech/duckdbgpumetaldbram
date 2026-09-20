@@ -216,7 +216,7 @@ this repository records:
   install from the community registry.
 
 Which CUDA toolkit needs which driver is in the README's [CUDA
-requirements](../README.md#cuda-requirements-build-from-source-on-linux) table:
+requirements](INSTALL.md#cuda-requirements-build-from-source-on-linux) table:
 a binary built with CUDA 13 needs an R580+ driver, and one built with CUDA 12.x
 reaches the GPU on R525+.
 

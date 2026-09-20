@@ -37,7 +37,7 @@ variable and the default it is falling back to, and the run continues.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GPUDB_CUDA_EXACT` | off | Exactly `1` opts the CUDA backend into the v0.7 exact operators, which is what lets the transparent path rewrite plain SQL on NVIDIA hardware. Read once per process. See [Platforms](../README.md#platforms-and-install) for why it is opt-in in this release. |
+| `GPUDB_CUDA_EXACT` | off | Exactly `1` opts the CUDA backend into the v0.7 exact operators, which is what lets the transparent path rewrite plain SQL on NVIDIA hardware. Read once per process. See [Platforms](INSTALL.md#platforms-and-install) for why it is opt-in in this release. |
 
 ## The Metal backend: path selection and sweeps
 
