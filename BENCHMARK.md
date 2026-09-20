@@ -2040,7 +2040,7 @@ hash-table 12–22× wins at high cardinality from the section below: GPU
 GROUP BY's value is in the random-access-bound regime where CPU caches
 collapse.
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **GPU-resident radix sort with on-device scan** — eliminates the host
    scan + commit/wait overhead that gates the prototype. Expected to push
@@ -2060,7 +2060,7 @@ hash-table 12–22× wins at high cardinality from the section below: GPU
 GROUP BY's value is in the random-access-bound regime where CPU caches
 collapse.
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **Replace bitonic with radix sort** — 8-bit buckets × 8 passes for
    64-bit keys, ~25 total dispatches. Expected to flip the 16M case and
@@ -2212,7 +2212,7 @@ exactly the macOS analog of the Metal bitonic-GROUP-BY's 2.1× win at the
    Anyone evaluating GPU OLAP must have an answer for this — ours is "keep
    the column resident; the API supports it."
 
-### Next-PR perf paths (in priority order)
+### Further perf paths (in priority order)
 
 1. **Stream + overlap.** Use multiple CUDA streams to overlap PCIe transfer
    with kernel execution. Should hide ~30–50% of the cold-mode transfer cost.
