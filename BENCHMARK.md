@@ -4978,3 +4978,107 @@ far below the budget, so no cell in this gate reaches the admission rule at
 all; it is here to show that nothing else moved. The plan-then-execute change
 that followed touches only `_make_room`'s contended path, which that gate
 never reaches, so it was not re-run for it.
+
+## v0.7 the transparent path on CUDA — RTX 4090, SF1 (2026-09-20)
+
+The first `scripts/tpch_coverage.py` run against a **CUDA** exact backend. Every
+earlier transparent-path section in this file is Metal; the CUDA numbers had
+been reported only in review and were not in the repo, which is what this
+section fixes.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 16376 MiB), driver 580.178.04,
+CUDA 13.0.88, Linux x86_64. Extension built by `scripts/build.sh`; DuckDB 1.5.5
+(pip `duckdb`, same version as `third_party/duckdb-libs`). `GPUDB_CUDA_EXACT=1`
+— the CUDA exact path is implemented but still opt-in, so the flag is what puts
+these queries on the device. Thresholds on (`python/gpudb/_thresholds.py`,
+Metal-measured), N=9 (minimum of 9 hot runs), `data/tpch_sf1/tpch.duckdb`.
+
+`gpu_build_info()`: `compiled=cpu,cuda runtime=cuda exact=true join=true
+global=true narrow=false device_memory=0 store=true rebuilds=0/0
+device='NVIDIA GeForce RTX 4090 Laptop GPU' avgf=64`
+
+| query | path | native ms | transparent ms | ratio | identical |
+|---|---|---|---|---|---|
+| Q1  | GPU (plain)     | 11.4 | 10.9 | 1.04× | True |
+| Q2  | native (threshold) | 7.4 | — | — | — |
+| Q3  | GPU (plain)     | 10.7 | 3.6  | 2.94× | True |
+| Q4  | GPU (plain)     | 11.0 | 1.3  | 8.34× | True |
+| Q5  | GPU (plain)     | 10.8 | 0.8  | 13.66× | True |
+| Q6  | native (threshold) | 2.9 | — | — | — |
+| Q7  | GPU (plain)     | 11.9 | 3.6  | 3.28× | True |
+| Q8  | GPU (projected) | 11.1 | 5.3  | 2.11× | True |
+| Q9  | GPU (plain)     | 37.9 | 3.7  | 10.33× | True |
+| Q10 | GPU (topk)      | 22.6 | 4.0  | 5.69× | True |
+| Q11 | native (threshold) | 5.1 | — | — | — |
+| Q12 | GPU (plain)     | 8.0  | 5.7  | 1.40× | True |
+| Q13 | GPU (nested)    | 30.9 | 5.4  | 5.73× | True |
+| Q14 | GPU (projected) | 8.4  | 0.5  | 15.46× | True |
+| Q15 | GPU (nested)    | 5.7  | 3.8  | 1.49× | True |
+| Q16 | native (threshold) | 19.2 | — | — | — |
+| Q17 | GPU (projected) | 8.6  | 0.5  | 16.20× | True |
+| Q18 | GPU (plain)     | 29.8 | 3.2  | 9.23× | True |
+| Q19 | GPU (projected) | 14.5 | 0.7  | 21.68× | True |
+| Q20 | native (shape)  | 11.2 | — | — | — |
+| Q21 | GPU (plain)     | 34.9 | 4.2  | 8.24× | True |
+| Q22 | GPU (plain)     | 13.8 | 0.8  | 16.79× | True |
+
+**17 of 22 on the device, 0 with rows that differ from native.** Same coverage
+and the same five declines as Metal at SF1 (Q2, Q6, Q11, Q16 on thresholds,
+Q20 on shape — it does not bind on its own).
+
+### Q1 is at parity, not a win
+
+Q1 measured 1.04× here and 0.96×, 0.99×, 0.97×, 1.02× on four earlier runs of
+the same build: it straddles 1.0×. It is printed as measured rather than
+tuned away.
+
+Before avg over DECIMAL was derived in C++ (`gpu_avg_decimal`), Q1 was
+**declined** on x86-64 — the SQL derivation could not reproduce native's
+`long double` quotient, so the row was not eligible at all. Earlier still,
+when it *was* rewritten with that derivation, it measured 1.09× — and was
+returning wrong rows on data whose group sums pass 2^53. So the honest
+statement is that Q1 became correct and, at SF1 on this box, stopped being
+faster. Whether a statement that hovers at 1.0× should be rewritten is a
+threshold question, and `_thresholds.py` is Metal-measured: rule 1 on CUDA is
+not yet established by measurement. That is its own change.
+
+### Wrapper suite
+
+`python/tests/test_wrapper.py`, same build and flags: **1154 ok, 4 failures,
+0 skips**.
+
+All four failures are one cluster, the segmented background upload
+(`== segmented upload (0c)`), and they are **not** related to the exact path —
+they reproduce identically with `GPUDB_CUDA_EXACT` unset:
+
+| | exact path on | exact path off |
+|---|---|---|
+| segments landed | 5 of 20 | 9 of 20 |
+| interrupts | 201 | 205 |
+| statements issued in the 180 s budget | 21735 | 25392 |
+| per-segment time | 4.4, 3.8, 4.6 ms | 2.0–4.6 ms |
+
+The test uploads a 2M-row table in 20 segments while issuing short statements
+with 0–10 ms gaps, and asserts the session completes without intruding. The
+segments themselves are quick — twenty of them is ~80 ms of work — so the
+budget is not the constraint; the manager never finds a quiet window
+(`quiet_s = 0.2`) under a cadence that issues ~21–25k statements in 180 s, and
+backs off after each interrupt. The same suite passes on the M4 Max, so this is
+cadence-dependent rather than a difference in the uploader, but that is a
+hypothesis about *why*, not a reason to call it benign: it is an open failure
+on this box and is recorded as one.
+
+### What the published registry binary reports
+
+Checked because the community descriptor carries
+`requires_toolchains: "python3;cuda"`, which could be read as promising a CUDA
+build. With the stock DuckDB 1.5.5 client in a clean `HOME`:
+
+    INSTALL gpudb FROM community; LOAD gpudb; SELECT gpu_build_info();
+    -> compiled=cpu runtime=cpu
+
+The registry's linux_amd64 v0.6.0 binary is **CPU-only**, and registers the
+v0.6 function set (no exact forms). Everything in this section requires a local
+build with a CUDA toolchain; none of it is reachable from the published
+extension.
+

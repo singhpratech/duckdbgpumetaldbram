@@ -1,8 +1,12 @@
-// exact_api.h — the device entry points of the v0.7 exact GROUP BY, shared by
-// the kernel TU (exact_kernel.cu) and the host wrapper (cuda_aggregator.cpp).
+// exact_api.h — the device entry points of the v0.7 exact path (the exact
+// GROUP BY and its WHERE mask, the global masked aggregate and the
+// materialised key join), shared by the kernel TU (exact_kernel.cu) and the
+// host wrapper (cuda_aggregator.cpp).
 //
-// The exact path differs from the v0.6 resident GROUP BY in three ways, and
-// every entry point here exists for one of them (docs/CUDA_EXACT_PATH.md):
+// The exact GROUP BY differs from the v0.6 resident one in three ways, and
+// most of the entry points here exist for one of them (docs/CUDA_EXACT_PATH.md).
+// The rest belong to the two operators built on the same columns: the global
+// masked aggregate (no key, no sort) and the materialised key join.
 //
 //   * columns carry NULLs. A column is a value buffer plus a validity bitmap
 //     in DuckDB's layout (row i is valid iff bit i % 64 of word i / 64 is

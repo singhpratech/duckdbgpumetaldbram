@@ -3638,6 +3638,70 @@ at 1.0x should be rewritten at all is the per-backend threshold question, and
 that belongs to its own change with its own measurements, not to a correctness
 fix that happens to have made the row eligible again.
 
+## 2026-09-20 — Measurements that existed only in review
+
+An independent read of the release docs found that the CUDA numbers were not in
+the repository. They had been produced, checked and discussed — and they lived
+in review messages. The journal had no CUDA `tpch_coverage` run, BENCHMARK.md
+had no CUDA transparent-path section at all (every one of them is Metal), and a
+comment in `cuda_aggregator.cpp` still read:
+
+    Neither has ever run against a CUDA exact backend.
+
+of `test_wrapper.py` and `tpch_coverage.py` — true when written, false for a
+day by the time it was read. So the public story for CUDA was unit tests and
+the SQL suite, and a reader had no way to learn that 17 of 22 TPC-H queries run
+on the device with no differing rows.
+
+That is worth naming as a failure mode of its own. Work reported to a reviewer
+feels finished, because someone acknowledged it. But the reviewer is not the
+artifact. A number that only exists in a conversation is not a measurement
+anyone else can find, cite or re-run, and a comment that describes the state of
+the evidence goes stale the moment the evidence changes — faster than code
+comments do, because nothing recompiles when a claim about the world expires.
+
+The fix is BENCHMARK.md's first CUDA transparent-path section, the six stale
+CUDA-owned comments, and this entry.
+
+### Two things the write-up forced into the open
+
+**Q1 is at parity, not a win.** Writing the table made it obvious in a way the
+running total had not. Q1 measures 1.04x here and 0.96x / 0.99x / 0.97x / 1.02x
+on four earlier runs: it straddles 1.0x. Its history is worth keeping together —
+it was rewritten at 1.09x while returning WRONG rows on sums past 2^53; then
+declined outright once the guard was made to fire; now correct and eligible
+again, at parity. "Became correct and stopped being faster" is the honest
+sentence, and it is the one a table makes you write.
+
+**The published binary is CPU-only.** The community descriptor carries
+`requires_toolchains: "python3;cuda"`, which reads like a promise of a CUDA
+build. Installed from the registry with a stock client in a clean HOME:
+
+    INSTALL gpudb FROM community; LOAD gpudb; SELECT gpu_build_info();
+    -> compiled=cpu runtime=cpu
+
+So the docs calling it CPU-only are right, and the toolchain field is what
+misleads. None of the CUDA measurements are reachable from the published
+extension; they all need a local build. Stating that next to the numbers seemed
+more useful than stating the numbers alone.
+
+### The four failures that are recorded as failures
+
+The wrapper suite is 1154 ok / 4 fail / 0 skip on the 4090, and all four are the
+segmented background upload. They reproduce identically with the exact path off
+(5 of 20 segments landed with it on, 9 of 20 with it off; ~200 interrupts
+either way), so they are not the exact path. The segments are 2-5 ms each, so
+twenty of them is ~80 ms against a 180 s budget — the manager simply never finds
+a quiet window under a cadence issuing 21-25k statements in that time.
+
+The same suite passes on the M4 Max. That makes cadence the likely explanation,
+and it is written down as a hypothesis rather than a verdict: it is an open
+failure on this box, recorded as one, with the numbers a reader needs to judge
+it for themselves. The temptation with a failure you believe is environmental is
+to describe it as environmental. What can honestly be said is that it does not
+depend on the code under test, and that the reason it fails here and not there
+is not yet established.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
