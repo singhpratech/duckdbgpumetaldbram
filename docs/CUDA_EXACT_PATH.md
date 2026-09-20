@@ -127,7 +127,7 @@ is being added.
   table function, including its guardrails), `test/sql/gpu_groupby_exact*.test`,
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
-- `python/tests/test_wrapper.py` — 1157 checks through `gpudb.connect()`: parity
+- `python/tests/test_wrapper.py` — 1206 checks through `gpudb.connect()`: parity
   against native DuckDB for every shape, staleness, background residency, the
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
