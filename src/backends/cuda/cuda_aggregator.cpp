@@ -741,22 +741,24 @@ public:
 
     // ---- v0.7 milestone 3: the exact path (§4.1, §4.2, §4.6) ----
     // Whether the transparent rewrite may target this backend for an exact
-    // statement. OFF by default until the exact path is COMPLETE, and here is
-    // why the flag is not independent of the others:
+    // statement. The exact path is now COMPLETE — upload, GROUP BY, the global
+    // aggregate and the materialised key join all run here — but the default
+    // stays opt-in behind GPUDB_CUDA_EXACT=1 until the wrapper-level evidence
+    // exists on a CUDA box.
     //
-    // exact_supported() does not only answer "can you group?" — it decides
-    // where upload_rows_exact puts the columns. Once a set is resident on this
-    // device, every other exact operator over it must also run here: the CPU
-    // reference cannot read CUDA memory, so there is no per-operator fallback
-    // to take. Saying true while aggregate_exact_masked and join_materialize
-    // are still stubs turns their clean CPU answer into a thrown error — which
-    // is exactly what it did when measured: the SQL suite went from 1 failure
-    // to 19, all of them operators this milestone never claimed.
+    // The distinction that keeps this flag off is worth keeping in view: the
+    // SQL suite proves the TABLE FUNCTIONS, and it is green. What flipping this
+    // on additionally does is make the Python wrapper start rewriting plain SQL
+    // statements here, and only python/tests/test_wrapper.py and
+    // scripts/tpch_coverage.py prove a rewritten statement returns native's
+    // rows. Neither has ever run against a CUDA exact backend. A runtime rule-1
+    // check would catch a slow template; nothing at runtime catches a different
+    // answer, so that evidence has to come first.
     //
-    // So GPUDB_CUDA_EXACT=1 opts in for development and measurement, and the
-    // default flips to on in the milestone that lands the last stub. The
-    // kernels below are live either way — the unit tests drive this backend
-    // directly, not through the planner.
+    // The flag is also not only a capability answer: it decides where
+    // upload_rows_exact PUTS the columns, and a resident column is
+    // single-homed, so a set on this device cannot fall back to the CPU
+    // reference for any operator.
     bool exact_supported() const noexcept override {
         static const bool on = [] {
             const char* e = std::getenv("GPUDB_CUDA_EXACT");
@@ -1029,6 +1031,88 @@ public:
         }
         r.count_star = count_star;
         r.wall_ms    = elapsed_ms(t0);
+        return r;
+    }
+
+    // ---- v0.7 §4.8: the materialised key join ----
+    // The build side needs no hash table: it is the exact sort cache of the
+    // build key (its VALID rows), so a match is a binary search, and the
+    // uniqueness precondition falls out of the run count — a sorted array of n
+    // cells holds n distinct values iff it has n runs. Gated with
+    // exact_supported(), which is what placed the columns here.
+    bool join_supported() const noexcept override { return exact_supported(); }
+
+    JoinMaterializeResult join_materialize(const ResidentColumn& probe_key,
+                                           const ResidentColumn& build_key,
+                                           const JoinLane* out, std::size_t n_out) override {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto& pk = check_i64_nullable(probe_key);
+        const auto& bk = check_i64_nullable(build_key);
+        if (n_out == 0 || !out) throw std::runtime_error("join_materialize: no output lanes");
+        for (std::size_t l = 0; l < n_out; ++l) {
+            if (!out[l].col) throw std::runtime_error("join_materialize: output lane without a column");
+            if (out[l].index)
+                throw std::runtime_error("join_materialize: indexed output lanes are not on this backend");
+            if (out[l].col->backend_tag() != Backend::CUDA)
+                throw std::runtime_error("ResidentColumn from wrong backend");
+            if (out[l].col->rows() != (out[l].from_build ? bk.rows() : pk.rows()))
+                throw std::runtime_error("join_materialize: lane " + std::to_string(l) +
+                                         " row count differs from its side of the join");
+        }
+        if (out[0].col->dtype() != Dtype::I64)
+            throw std::runtime_error("join_materialize: the key lane must be I64");
+        if (pk.rows() > 0xFFFFFFFEull || bk.rows() > 0xFFFFFFFEull)
+            throw std::runtime_error("join_materialize: > 2^32-2 rows unsupported");
+
+        JoinMaterializeResult r;
+        r.rows_probe = pk.rows();
+        r.rows_build = bk.rows();
+
+        // The build key's sorted valid cells, and the uniqueness check on them.
+        bk.ensure_exact_cache(stream_);
+        const std::size_t n_bvalid = bk.exact_valid_rows();
+        std::size_t runs = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_exact_run_count(bk.exact_sorted(), n_bvalid, &runs, stream_),
+                         "join build uniqueness");
+        if (runs != n_bvalid)
+            throw std::runtime_error("join_materialize: build key not unique");
+
+        GPUDB_CUDA_CHECK(cudaEventRecord(ev_start_, stream_), "ev_start");
+        const std::size_t n = pk.rows();
+        DeviceOut<std::uint32_t> d_match(n, "join match rows");
+        DeviceOut<std::uint32_t> d_pos(n, "join destinations");
+        DeviceOut<unsigned char> d_cls(n, "join row class");
+        const auto& kc = static_cast<const CudaResidentColumn&>(*out[0].col);
+        std::size_t n1 = 0, n2 = 0;
+        GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_probe(
+                             bk.exact_sorted(), bk.exact_perm(), n_bvalid,
+                             static_cast<const std::int64_t*>(pk.device_ptr()), pk.valid_bits(), n,
+                             kc.valid_bits(), out[0].from_build ? 1 : 0,
+                             d_match.p, d_cls.p, &n1, &n2, stream_),
+                         "join probe");
+        const std::size_t rows_out = n1 + n2;
+        GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_positions(d_cls.p, n, n1, d_pos.p, stream_),
+                         "join destinations");
+
+        r.lanes.reserve(n_out);
+        for (std::size_t l = 0; l < n_out; ++l) {
+            const auto& sc = static_cast<const CudaResidentColumn&>(*out[l].col);
+            auto col = std::make_unique<CudaResidentColumn>(rows_out, sc.dtype());
+            col->ensure_valid_bitmap();      // returns with the fill complete
+            GPUDB_CUDA_CHECK(gpudb_cuda_join_mat_gather(
+                                 static_cast<const std::int64_t*>(sc.device_ptr()), sc.valid_bits(),
+                                 out[l].from_build ? 1 : 0, d_match.p, d_cls.p, d_pos.p, n,
+                                 static_cast<std::int64_t*>(col->device_ptr()),
+                                 col->valid_bits_mutable(), stream_),
+                             "join lane gather");
+            GPUDB_CUDA_CHECK(cudaStreamSynchronize(stream_), "join lane sync");
+            col->finish_exact_upload();      // counts the NULLs, drops a bitmap it did not need
+            r.lanes.push_back(std::move(col));
+        }
+        r.kernel_ms     = stop_kernel_timer();
+        r.rows_out      = rows_out;
+        r.null_key_rows = n2;
+        r.wall_ms       = elapsed_ms(t0);
         return r;
     }
 
