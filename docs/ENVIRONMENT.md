@@ -40,7 +40,7 @@ variable and the default it is falling back to, and the run continues.
 
 | Variable | Default | What it does |
 |---|---|---|
-| `GPUDB_CUDA_EXACT` | off | Exactly `1` opts the CUDA backend into the v0.7 exact operators, which is what lets the transparent path rewrite plain SQL on NVIDIA hardware. Read once per process. See [Platforms](INSTALL.md#platforms-and-install) for why it is opt-in in this release. |
+| `GPUDB_CUDA_EXACT` | **on** | The v0.7 exact operators are on by default on CUDA, which is what lets the transparent path rewrite plain SQL on NVIDIA hardware. Set it to `0` to turn them off: `exact_supported()`, and with it `global_supported()`, `join_supported()` and the placement of exact-upload columns on the device, all go false and every statement stays on DuckDB. Read once per process. The switch exists because a resident column is single-homed, so turning the path off is the only way to put a set back behind the CPU reference without a rebuild. |
 
 ## The Metal backend: path selection and sweeps
 
@@ -65,6 +65,7 @@ fallback paths can be exercised on hardware where the fast one works.
 | `GPUDB_METAL_GROUPBY_PATH` | `auto` | `slotlock \| radix` for the standalone v0.6 `GROUP BY` operator. |
 | `GPUDB_METAL_HASHJOIN_PATH` | `auto` | `hash \| merge \| partition_scan \| partition` for the hash join. Note: setting it to anything unrecognised selects the partitioned path rather than restoring `auto`. |
 | `GPUDB_METAL_TRACE_EXACT` | unset | Per-stage GPU times for the exact path on stderr, plus one line per resident-column rebuild. |
+| `GPUDB_METAL_UPLOAD_REFUSE_MB` | unset | A test hook: the backend refuses any exact upload larger than this many MiB, as a full device would. It is the only way to reach the device-refusal paths on a machine with memory to spare, and it is what `scripts/budget_gate.py --refuse-mb` sets for its child process. Read once at load; unset, the branch costs one `getenv` per upload and changes nothing. |
 
 ## Build and test scripts only
 

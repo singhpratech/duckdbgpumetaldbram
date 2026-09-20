@@ -1,21 +1,24 @@
 # The CUDA backend and the v0.7 exact path — the interface contract, and the tests that prove it
 
-**Status 2026-09-19: implemented.** Every method below exists on the CPU
-reference, on Metal and on CUDA (#152, #153, #154): exact `GROUP BY`, the
-`WHERE` mask, the global masked aggregate and the materialised join. On the
-RTX 4090 Laptop the unit suite is 750 / 750, the SQL suite 224 / 0 with the
-path on, and `scripts/tpch_coverage.py` answers 17 of 22 TPC-H queries at SF1
-on the device with 0 rows differing from native — the same coverage and the
-same five declines as Metal at that scale factor (`BENCHMARK.md`, *the
-transparent path on CUDA*). SF10 on CUDA is not recorded.
+**Status 2026-09-20: implemented, and on by default.** Every method below
+exists on the CPU reference, on Metal and on CUDA (#152, #153, #154): exact
+`GROUP BY`, the `WHERE` mask, the global masked aggregate and the materialised
+join. On the RTX 4090 Laptop the unit suite is 752 / 752, the SQL suite 225 / 0,
+the wrapper suite 1258 / 0, and `scripts/tpch_coverage.py` answers 17 of 22
+TPC-H queries at SF1 on the device with 0 rows differing from native, through
+`--path execute` and `--path sql` alike — the same coverage and the same five
+declines as Metal at that scale factor (`BENCHMARK.md`, *the CUDA exact path on
+by default*). SF10 on CUDA is not recorded.
 
-It is **opt-in in v0.7**: `GPUDB_CUDA_EXACT=1` makes the CUDA backend report
-`exact_supported()`, and with it `global_supported()` and `join_supported()`,
-true. The default is off: `scripts/transparent_gate.py` has not been run on that
-machine, so the thresholds a CUDA build decides with are Metal's, and rule 1 is
-a measurement rather than an assumption. Note that a
-column is single-homed: a set resident on the GPU cannot fall back to the CPU
-reference for an operator the GPU lacks.
+The path is **on by default**: the CUDA backend reports `exact_supported()`,
+and with it `global_supported()` and `join_supported()`, true without anything
+being set. What turned it on was the evidence rather than the code being
+finished — the full gate on that box ran 1630 cells at the wrapper's own memory
+budget with 0 cells slower than native and 0 differing, minimum ratio 1.07×.
+`GPUDB_CUDA_EXACT=0` turns it off again without a rebuild, and that switch
+exists because a column is single-homed: a set resident on the GPU cannot fall
+back to the CPU reference for an operator the GPU lacks, so disabling the path
+is the only way to put those sets back behind the reference.
 
 This page stays the interface contract — what each method must do, and what
 proves it. Read it as the specification the three backends are held to, not as
@@ -121,28 +124,41 @@ is being added.
   that keeps nothing, an empty column, a 128-bit sum that leaves 64 bits, and
   2.6M rows so the parallel reduction runs many threadgroups — every case
   compared limb for limb against the CPU reference.
-- `./scripts/run_sql_tests.sh` — the whole suite is 224 passing cases and 45
-  expected fails, on Metal and on CUDA with the exact path on (2026-09-19). The exact path's
+- `./scripts/run_sql_tests.sh` — the whole suite is 225 passing cases and 45
+  expected fails, on Metal and on CUDA (2026-09-20). The exact path's
   own files: `test/sql/gpu_agg_exact_global.test` (the
   table function, including its guardrails), `test/sql/gpu_groupby_exact*.test`,
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
-- `python/tests/test_wrapper.py` — 1238 checks through `gpudb.connect()`: parity
+- `python/tests/test_wrapper.py` — over 1200 checks through `gpudb.connect()`
+  (1258 on the RTX 4090, and the count differs per host — see the README's
+  Testing table): parity
   against native DuckDB for every shape, staleness, background residency, the
   memory budget, error fallback. Needs the extension built with
   `third_party/duckdb-libs/` present (`./scripts/get_duckdb_libs.sh`).
 - `scripts/tpch_coverage.py` — the 22 TPC-H queries. SF1 gives 17 of 22 on the
-  device with identical rows on both backends (on CUDA with
-  `GPUDB_CUDA_EXACT=1`); on Metal, `--db data/tpch_sf10/tpch.duckdb
-  --memory-budget 200GB` gives 19 of 22. SF10 on CUDA is not recorded.
+  device with identical rows on both backends; on Metal, `--db
+  data/tpch_sf10/tpch.duckdb` gives 19 of 22 at the default memory budget. SF10
+  on CUDA is not recorded.
 
-## 4. Rule 1 on CUDA: measure, then set the thresholds
+## 4. Rule 1 on CUDA: the thresholds, and how to revisit them
 
 The thresholds in `python/gpudb/_thresholds.py` carry a `METAL` table and
-`CUDA = METAL` as a placeholder. They were derived from
-`scripts/transparent_gate.py` on Apple silicon (unified memory, no PCIe): a
-discrete GPU moves results over the bus, so the output-bound limits
-(`plain_max_groups`, `reagg_max_pairs`, …) will differ. Procedure:
+`CUDA = METAL` — and since 2026-09-20 that is a measured result rather than a
+placeholder. The table was derived from `scripts/transparent_gate.py` on Apple
+silicon (unified memory, no PCIe), and the worry was that a discrete GPU moves
+results over the bus, so the output-bound limits (`plain_max_groups`,
+`reagg_max_pairs`, …) would differ. The gate was then run on the RTX 4090
+Laptop with the exact path on and the wrapper's own memory budget: 1630 cells,
+0 slower than native, 0 differing, minimum ratio 1.07×. Nothing in it asked for
+a different constant, so no CUDA table is written. The one shape to re-check if
+that is ever reconsidered is TPC-H Q1, which straddles 1.0× on that box
+(0.95–1.04× across runs of the same build) and which the measured rule decides
+per process. Two cells that did lose, on an earlier run, turned out to be
+artefacts of running with no memory budget at all — the card had filled — which
+is its own lesson about what a gate measures.
+
+The procedure, should a CUDA table ever be wanted:
 
 1. `PYTHONPATH=python python3 scripts/transparent_gate.py --no-thresholds --subqueries --exprs`
    (data collection: every shape rewritten, losing rows reported) at SF1 and SF10.

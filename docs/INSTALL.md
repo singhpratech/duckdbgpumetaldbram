@@ -89,26 +89,34 @@ built with CUDA 12.x reaches the GPU on R525+.
 
 | | Metal (Apple Silicon) | CUDA (NVIDIA) | No GPU |
 |---|---|---|---|
-| Plain SQL on the GPU, through the shell or `gpudb.connect()` | yes | opt-in, see below | no — everything runs on DuckDB |
+| Plain SQL on the GPU, through the shell or `gpudb.connect()` | yes | yes, on by default — from a CUDA build, see below | no — everything runs on DuckDB |
 | Explicit `gpu_*` functions | yes | yes | yes, on the CPU backend, same answers |
 | From the community registry | yes | a registry Linux binary may report `compiled=cpu`; `SELECT gpu_build_info();` is what answers this for whichever binary is in front of you | yes |
 
 On NVIDIA hardware every operator the transparent path needs is implemented —
 exact `GROUP BY`, the `WHERE` mask, the global aggregate and the materialised
-join. On an RTX 4090 Laptop with the path enabled the unit suite is
-**750 / 750**, the SQL suite **224 passing, 0 failing**, and TPC-H at SF1 is
-**17 of 22 queries on the device, 0 rows differing from native** — the same
-coverage and the same five declines as Metal at that scale factor
-([BENCHMARK.md](../BENCHMARK.md), *the transparent path on CUDA*).
+join — and the path is **on by default**. On an RTX 4090 Laptop the unit suite
+is **752 / 752**, the SQL suite **225 passing, 0 failing**, the wrapper suite
+**1258 passing, 0 failing**, and TPC-H at SF1 is **17 of 22 queries on the
+device, 0 rows differing from native** — the same coverage and the same five
+declines as Metal at that scale factor ([BENCHMARK.md](../BENCHMARK.md), *the
+CUDA exact path on by default*).
 
-It is **opt-in** in this release: set `GPUDB_CUDA_EXACT=1` to let the CUDA
-backend answer plain SQL. One thing makes it opt-in, and it is not the
-kernels. Every threshold the wrapper decides with was measured on Metal, and
-the gate that measures them (`scripts/transparent_gate.py`) has not been run on
-CUDA hardware. Rule 1 says never slower, and an unswept table is not
-evidence for it — TPC-H Q1 straddling 1.0× on that box is exactly the kind of
-row a sweep is for. Without the flag a CUDA machine gets the explicit `gpu_*`
-functions and leaves plain SQL to DuckDB — correct, with no speed-up.
+What turned it on was a measurement: the full gate on that box, at the
+wrapper's own memory budget, ran **1630 cells with 0 slower than native and 0
+differing**, minimum ratio 1.07×. Two caveats are worth carrying. The
+thresholds the wrapper decides with are the Metal-measured ones, **verified on
+one CUDA machine** rather than measured for every GPU. And TPC-H Q1 sits at
+parity on that box — it has measured either side of 1.0× across runs of the
+same build — which is the case the per-process measured rule exists to settle.
+`GPUDB_CUDA_EXACT=0` turns the path off without a rebuild, leaving a CUDA
+machine the explicit `gpu_*` functions and plain SQL on DuckDB: correct, with
+no speed-up.
+
+**This needs a binary that carries CUDA.** A Linux binary installed from the
+community registry may report `compiled=cpu` and have no CUDA in it at all, and
+no environment variable changes that — take the release binary (Option B) or
+build from source. `SELECT gpu_build_info();` is what tells them apart.
 
 `SELECT gpu_build_info();` tells any binary apart: `compiled=` lists the
 backends it was built with and `runtime=` the one it chose. The install routes
@@ -176,7 +184,7 @@ compiled with CUDA and which backend it picked at runtime.
 | `backend: none — the extension is not loaded` in the banner, and `transparent: a plain DuckDB shell — every statement goes straight to DuckDB` under it | No extension this connection can load. `con.extension_note` (and `last_rewrite()["detail"]`) spells it out: *install it with `INSTALL gpudb FROM community` run on the same DuckDB version as this client's `duckdb` module, or point `GPUDB_EXTENSION_PATH` at a built one.* The registry builds gpudb separately for each DuckDB version and installs it under that version's own directory, so an `INSTALL` run from a different version leaves nothing this one will find. |
 | `transparent: off — the loaded gpudb extension is older than this client: it does not provide …` | DuckDB has an older gpudb installed. The message ends with the advice that works: *update it with `FORCE INSTALL gpudb FROM community;` (or `UPDATE EXTENSIONS;`), then start a new session.* A plain `INSTALL` does nothing when a copy is already installed — it keeps the file it finds — and neither form reaches a process that has already loaded the old one, which is why it ends in a new session. |
 | `IO Error: Extension "…" could not be loaded because its signature is either missing or invalid` | A locally built binary. Start DuckDB with `-unsigned`, or from Python pass `config={"allow_unsigned_extensions": "true"}`. The `gpudb` shell already does this for a build it found itself. |
-| `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build, or a CUDA build without `GPUDB_CUDA_EXACT=1`. |
+| `transparent: not on this build` | The extension loaded but has no exact operators — a CPU-only build (a registry Linux binary can be one), or a CUDA build started with `GPUDB_CUDA_EXACT=0`. |
 | Every statement says `DuckDB (threshold: …)` | Working as intended: your tables or your shapes are below the measured bounds. `.gpu` names the bound. |
 | `Catalog Error: … gpu_sum does not exist` | The extension is installed but not loaded in *this* session. `LOAD gpudb;`. |
 
@@ -200,12 +208,31 @@ that answers exactly as it did before.
 
 ## When GPU memory is full
 
-The budget is a hard admission bound, not a target. A set whose estimated size
-would put the total over it is refused **before** the upload, its statements
-keep running on DuckDB, and `last_rewrite()["reason"]` is `memory` with the
-arithmetic in `["error"]` — *"900 MiB resident + about 300 MiB needed > 1024
-MiB, and this set is worth 0.012 ms/s (12.9 per GiB) against 0.030 ms/s for
-&lt;the set that would have to go&gt;"*.
+The budget is a hard admission bound, not a target, and what it is compared
+with is the **physical** total: every store column counted once, plus whatever
+a set holds of its own (`con.memory()["bytes"]`). A set whose estimated size
+would put that total over the budget is refused **before** the upload, its
+statements keep running on DuckDB, and `last_rewrite()["reason"]` is `memory`
+with the arithmetic in `["detail"]` (and verbatim in `["error"]`) — *"900 MiB
+resident + about 300 MiB needed &gt; 1024 MiB, and this set is worth 0.012 ms/s
+(12.9 per GiB) against 0.030 ms/s for &lt;the set that would have to go&gt;"*.
+
+**A refusal is remembered.** Asking again costs an upload and gets the same
+answer, so it is not asked again until something that could change it changes:
+the data, the budget, the resident population, or the anti-thrash window
+lapsing. Fifty executions of a statement whose set cannot fit are one upload
+attempt, not fifty.
+
+**An upload the device itself refuses fails cleanly.** The set is not quietly
+placed in host memory — that would be slower than plain DuckDB and would leave
+a table's columns split across two backends — so the statement is answered by
+DuckDB and the set is refused like any other.
+
+**Working memory is not resident**, so no budget over resident bytes can see a
+reduce's scratch or a sort's temporaries. A statement that runs out of it is
+answered by DuckDB, its sets are refused rather than retried, and where the
+backend reports how much it wanted against how much was free, that shortfall is
+held back as headroom from then on.
 
 What is kept under pressure is decided by measured value per byte, not by
 recency. A set's value is the DuckDB time it has saved, decayed over about
@@ -214,10 +241,9 @@ Eviction only runs when the candidate is worth at least 25% more than what it
 would displace, a set younger than 60 seconds that has not earned anything yet
 is protected unless the candidate is twice the median density, and a set in
 use by a running operator, a set another resident set was derived from, and
-anything you uploaded by hand are never evicted at all. A refused set is
-retried after 30 seconds — and because statements that ran on DuckDB still
-feed the value model, a set that was refused once can be admitted later on its
-own merit.
+anything you uploaded by hand are never evicted at all. Because statements that
+ran on DuckDB still feed the value model, a set refused once can be admitted
+later on its own merit.
 
 ## Reporting a bug
 

@@ -5111,6 +5111,15 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py --db data/tpch_sf10/tpch.duck
     --memory-budget 200GB
 ```
 
+**Later (2026-09-20, the memory-budget work):** the raised budget is no longer
+needed. Once a refusal was remembered and the budget compared with the physical
+resident total rather than with a sum that double-counted shared store columns,
+the same SF10 run gives **19 of 22 on the device, 0 rows differing, and no
+`memory` declines at the DEFAULT budget** — so the second command above is the
+first one with `--db data/tpch_sf10/tpch.duckdb` and nothing else. A run also
+prints more than this one could: an `error`, `memory` or `not_resident` row now
+carries the wrapper's own sentence beside the reason code.
+
 ### Scale factor 1 — 17 of 22 on the device, 0 rows differing
 
 | query | path | native ms | transparent ms | ratio |

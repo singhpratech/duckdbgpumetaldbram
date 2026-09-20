@@ -59,10 +59,12 @@ same questions can be asked in the SQL you already write. Same rows, same
 column names, same column types as native, either way. No hints, no schema
 changes, nothing to call.
 
-On Apple Silicon this path is on by default; on NVIDIA the same path is
-implemented and **opt-in** — set `GPUDB_CUDA_EXACT=1` — because the thresholds
-it decides with were swept on Metal hardware rather than on CUDA
-([Platforms and install](docs/INSTALL.md#platforms-and-install) has the detail).
+This path is **on by default on both GPUs** — Apple Silicon Metal and NVIDIA
+CUDA. It was turned on for CUDA once the measurement was there: the full gate
+on an RTX 4090 Laptop ran 1630 cells with **0 slower than native and 0
+differing**. `GPUDB_CUDA_EXACT=0` turns the CUDA path off again without a
+rebuild ([Platforms and install](docs/INSTALL.md#platforms-and-install) has the
+detail, including what a registry install on Linux gives you).
 
 ### Try it in a minute
 
@@ -144,7 +146,7 @@ resident**. These numbers are from two machines; yours will differ.
 |---|---|---:|---:|---:|
 | SF1 (6M-row `lineitem`) | MacBook M4 Max · Metal | 17 of 22 | 0 | 1.4× – 13.6× |
 | SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | 19 of 22 | 0 | 1.3× – 52.9× |
-| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA, opt-in (`GPUDB_CUDA_EXACT=1`) | 17 of 22 | 0 | 1.04× – 21.7× |
+| SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | 17 of 22 | 0 | 0.95× – 23.3× |
 
 The queries that stay on DuckDB are declined on purpose, and which ones stay
 depends on the scale factor. **At SF10, three**: Q2 and Q20 each read a
@@ -154,7 +156,14 @@ inner `GROUP BY` declines on its own threshold; forced past it, Q16 measures
 0.02–0.08×. **At SF1, five**: those three, and Q6 and Q11, which sit
 below the measured size floors at 6M rows (Q2 declines on a size floor there
 too, before its shape is ever looked at). Each of them runs on DuckDB
-unchanged, at DuckDB's speed.
+unchanged, at DuckDB's speed. The SF10 row is measured at the **default memory
+budget** — nothing has to be raised for those 19 queries.
+
+The CUDA row's low end is one query: **Q1 sits at parity on that box** and has
+measured either side of 1.0× across runs of the same build, which is exactly
+the case the measured rule decides per process. The thresholds both GPUs use
+are the Metal-measured ones, verified on one CUDA machine rather than measured
+for every GPU — the gate that verified them is the 1630-cell run named above.
 
 Query by query at both scale factors, the exact conditions and what each run
 did not record: [BENCHMARK.md](BENCHMARK.md), *TPC-H coverage, the whole 22
@@ -431,11 +440,26 @@ correct and at native speed, simply not resident. `residency="eager"`, or a
 pause long enough for one segment, is the way out.
 
 The memory budget defaults to a quarter of unified memory on Apple silicon and
-half of device memory on a discrete GPU (`memory_budget=`, or
-`GPUDB_MEMORY_BUDGET_MB`). A set that does not fit is refused **before** the
-upload and its statements run on DuckDB. What is kept under pressure is decided
-by measured value per byte rather than by recency: the sets that save the most
-DuckDB time per byte stay.
+half of the card's own memory on a discrete GPU (`memory_budget=`, or
+`GPUDB_MEMORY_BUDGET_MB`). What it is compared with is the **physical** total —
+every store column counted once, plus whatever a set holds of its own — not the
+sum of the per-set figures, which are ranking quantities and count a shared
+column once per set that reads it. A set that does not fit is refused **before**
+the upload, and the refusal is **remembered**: one upload attempt, not one per
+statement, until something that could change the answer changes — the data, the
+budget, the resident population or the anti-thrash window. Those statements run
+on DuckDB, and `last_rewrite()` says `memory` with both sizes in its detail.
+What is kept under pressure is decided by measured value per byte rather than by
+recency: the sets that save the most DuckDB time per byte stay.
+
+An upload the **device** refuses fails cleanly rather than quietly landing
+somewhere slower: the set is not placed in host memory, no store is left with
+lanes on both sides, and DuckDB answers the statement. And a statement that runs
+out of device **working** memory — a reduce's scratch, a sort's temporaries,
+none of which is resident and so none of which a budget over resident bytes can
+see — is answered by DuckDB, after which the budget holds back exactly the
+shortfall the backend reported as headroom, so the next statement does not walk
+into the same wall.
 
 Where the GPU loses is published in the same place it wins: low-cardinality
 `GROUP BY` on Metal, whole-column `min` / `max` against DuckDB's zonemaps and
@@ -706,23 +730,24 @@ PYTHONPATH=python python3 scripts/tpch_coverage.py                 # the 22 TPC-
 |---|---|---|
 | `test_wrapper.py` — the transparent path | 1238 checks, 0 skipped, 0 failing, under DuckDB 1.4.5 and under 1.5.5 | M4 Max |
 | `test_residency_policy.py` — the residency policy, on a driven clock | 105 checks, 0 failing | M4 Max |
-| `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22, 0 rows differing | M4 Max |
-| `tpch_coverage.py` with `GPUDB_CUDA_EXACT=1` | SF1 17 of 22 on the device, 0 rows differing | RTX 4090 Laptop |
-| `test_gpudb` — unit checks | 750 / 750 | RTX 4090 Laptop, CPU + CUDA |
-| `run_sql_tests.sh` | 224 passing, 0 failing with `GPUDB_CUDA_EXACT=1` | RTX 4090 Laptop |
+| `tpch_coverage.py` | SF1 17 of 22 on the device, SF10 19 of 22 at the default budget, 0 rows differing | M4 Max |
+| `tpch_coverage.py` | SF1 17 of 22 on the device, 0 rows differing, through `--path execute` and `--path sql` alike | RTX 4090 Laptop |
+| `test_wrapper.py` — the transparent path | 1258 checks, 0 skipped, 0 failing | RTX 4090 Laptop |
+| `test_gpudb` — unit checks | 752 / 752 | RTX 4090 Laptop, CPU + CUDA |
+| `run_sql_tests.sh` | 225 passing, 0 failing | RTX 4090 Laptop |
 | `run_sql_tests.sh` guardrails | 45 `expected_fail` cases across the 18 files in `test/sql/` | — |
+| `budget_gate.py` — the memory budget under pressure | PASS: 169 statements, 0 rows differing, 0 errors, resident never above the budget | M4 Max and RTX 4090 Laptop |
 
-The wrapper and coverage rows were re-measured on the M4 Max on this commit;
-the unit and SQL rows are the RTX 4090's, which is where they were last run
-against this code. `test_gpudb` and the SQL suite on the M4 Max run in CI on
-every push and were not re-run by hand here. The x86-64 box used to carry four
-failures in the segmented-upload cases — the background uploader never found a
-quiet window under that test's statement cadence — and once a segment was
-priced from what each machine measures rather than from a constant, that box
-came back fully green with the exact path on, **1209 of 1209** at the time it
-was run. The check count differs between the two boxes because the
-`avg`-over-`DECIMAL` section branches on the host's `long double`; the number
-above is the Mac's, on this commit.
+Each row names the machine that took it. The unit and SQL rows are the RTX
+4090's, run there when the CUDA path was turned on by default; `test_gpudb` and
+the SQL suite on the M4 Max run in CI on every push and were not re-run by hand
+here, and the Mac's wrapper count above was taken before the memory-budget work
+added its cases, so it is re-counted on the release build. The x86-64 box used
+to carry four failures in the segmented-upload cases — the background uploader
+never found a quiet window under that test's statement cadence — and once a
+segment was priced from what each machine measures rather than from a constant,
+that box came back fully green. The check count differs between the two boxes
+because the `avg`-over-`DECIMAL` section branches on the host's `long double`.
 
 The SQL suite lives in `test/sql/*.test` — plain SQL with `-- expect:` lines,
 reported per query as PASS / FAIL / GUARDRAIL / SKIP; `test/sqllogic/` is a
@@ -760,7 +785,7 @@ table):
 |---|---|---|---|---|
 | Runs on an Apple Silicon GPU | no — requires an NVIDIA GPU, compute capability 7.5+ | no — requires an NVIDIA GPU, compute capability 7.0+ | no — NVIDIA GPUs; CPU-only on x86, Power and ARM | **yes — Metal** |
 | Runs as a DuckDB extension | yes — loaded into DuckDB, statements intercepted by an optimizer hook | no — a CUDA C++ and Python dataframe library | no — a standalone SQL engine | **yes — loaded into DuckDB; a client rewrites the statement before DuckDB plans it, over the stable C API** |
-| CUDA backend | yes | yes | yes | yes — the exact path behind `GPUDB_CUDA_EXACT=1` |
+| CUDA backend | yes | yes | yes | **yes — including plain SQL on the GPU, on by default** |
 | What sends work back to the CPU | operators it does not support | an operation cuDF does not implement, or one that raises | operations that cannot run on GPU, and steps needing more memory than the GPU has | **a per-statement speed measurement**, re-taken on your own machine, as well as the shapes it does not express |
 | SQL window functions on the GPU | not in its published supported-operator list | not applicable — a dataframe library; it documents a rolling-window API | supported in SQL; the documentation states they are computed in CPU mode | no — they run on DuckDB |
 | Apache-2.0 | yes | yes | yes | yes |

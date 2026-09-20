@@ -33,8 +33,11 @@ on DuckDB.
 **Requires** Python >= 3.9 and the `duckdb` module >= 1.4. The registry builds
 gpudb separately for each DuckDB version from 1.5.5 on; a binary from the project's releases
 page needs only DuckDB >= 1.2, because the loadable extension is built against
-the stable C API v1.2.0. Apple silicon for the Metal backend; on NVIDIA
-hardware the path is opt-in behind `GPUDB_CUDA_EXACT=1`.
+the stable C API v1.2.0. Apple silicon for the Metal backend, an NVIDIA GPU for
+the CUDA one; plain SQL runs on the GPU by default on both, and
+`GPUDB_CUDA_EXACT=0` turns the CUDA path off without a rebuild. On Linux, a
+binary installed from the community registry may report `compiled=cpu` and
+carry no CUDA at all — `SELECT gpu_build_info();` says which one you have.
 
 ## The `gpudb` shell
 

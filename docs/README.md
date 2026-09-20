@@ -59,6 +59,8 @@ Entries are in date order in the file; this groups them by question.
 - The second door into the wrapper
 - A bound is a measurement of a situation, and three of ours were in the wrong one
 - The gate whose native shapes had stopped being native
+- The flip, and what a gate is actually for — turning the CUDA exact path on by default, and why the evidence and not the code was the gate
+- A gate measures the system it runs on — the two cells that "lost" on CUDA were measurements of a full card, and what that means for reading any gate
 
 **Widening the SQL that qualifies**
 - WHERE on the device
@@ -83,6 +85,8 @@ Entries are in date order in the file; this groups them by question.
 - The number went the wrong way — narrowing the CUDA exact sort cache, and the double count the A/B caught
 - It was never the segments — what a background upload actually costs a statement, and the back-off that followed from measuring it
 - What a segment costs before it reads anything — the fixed cost no smaller segment escapes, the floor derived from it, and the session that reports itself starved rather than grinding finer
+- The memory budget nobody was enforcing — three numbers called "resident bytes", the refusal that was asked again every statement, the upload that leaked 140 MiB per attempt, and the device refusal that quietly became a host-resident set
+- What an out-of-memory error should say — an operator that cannot get working memory now reports how much it wanted against how much was free, and the budget keeps the difference as headroom
 
 **Kernels**
 - Raw performance first: where a statement's time goes
@@ -135,10 +139,22 @@ SF=1 ./scripts/gen_tpch.sh                                  # data
 ./scripts/get_duckdb_libs.sh && ./scripts/build.sh          # extension + tools
 PYTHONPATH=python python3 scripts/tpch_coverage.py          # the 22 TPC-H queries: who answers, how fast, identical?
 PYTHONPATH=python python3 scripts/tpch_coverage.py \
-    --db data/tpch_sf10/tpch.duckdb --memory-budget 200GB   # ... at SF10, which needs the budget raised
+    --db data/tpch_sf10/tpch.duckdb                         # ... at SF10, at the same default budget
 PYTHONPATH=python python3 scripts/transparent_gate.py \
     --subqueries --exprs                                    # the sweep behind the thresholds (about an hour)
+PYTHONPATH=python python3 scripts/budget_gate.py            # the memory budget under pressure (about a minute)
+./scripts/vram_sampler.sh 6 600 > /tmp/vram.txt &           # NVIDIA only: device memory every 6 s, to watch a plateau
 ```
+
+`transparent_gate.py` and `budget_gate.py` both run at the wrapper's **own**
+memory budget — the one that ships. `transparent_gate.py --memory-budget
+unlimited` removes the cap, which is useful for seeing every shape the engine
+accepts and misleading for anything else: with no budget a long run fills the
+card and then measures a degraded machine. `budget_gate.py` goes the other way
+and asserts, at every sample of a long eager session under a budget too small
+for it, that the physical resident total stays at or under the budget, that no
+lane landed on the host, that no set was uploaded twice, and that every
+statement's rows equal plain DuckDB's.
 
 Both scripts take `--path`, the wrapper entry point each side of a cell is
 measured through. `transparent_gate.py --path execute|sql|both|auto` defaults to
