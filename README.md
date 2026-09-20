@@ -71,25 +71,38 @@ detail, including what a registry install on Linux gives you).
 ### Try it in a minute
 
 ```bash
-pip install duckdb-gpudb                        # the `gpudb` command and the gpudb module
-gpudb -c "INSTALL gpudb FROM community;"        # the extension, into DuckDB
-gpudb my.duckdb                                 # a shell whose footer says where each statement ran
+pip install duckdb-gpudb          # the `gpudb` command, the gpudb module, and the extension
+gpudb my.duckdb                   # a shell whose footer says where each statement ran
+```
+```
+gpudb> SELECT l_partkey, sum(l_quantity) FROM lineitem GROUP BY l_partkey;
 ```
 
-> **Where this stands today.** The `duckdb-gpudb` package is not on PyPI yet
-> and the community registry serves v0.6.0; both change when v0.7.0 is
-> released. Until then, route 2 — [from a checkout](docs/INSTALL.md#installing-in-full) — is
-> the one that works end to end. On Linux the three lines above install a
-> binary that may carry no CUDA at all: `SELECT gpu_build_info();` says what
-> the one in front of you has, and [Platforms and
-> install](docs/INSTALL.md#platforms-and-install) says what to do about it.
+`pip install duckdb-gpudb` is the shortest way to plain SQL on the GPU, because
+it carries the matching binary: on Apple Silicon (macOS 15 or later) and on
+x86-64 Linux (glibc 2.34 or newer — Ubuntu 22.04 and later) the wheel bundles
+the v0.7.0 extension itself. No `INSTALL`, no build, no environment variable.
+On any other platform `pip` installs the wrapper alone and the extension comes
+from DuckDB's own install:
 
-There are **two pieces**, and you need both: the *extension*, which is the GPU
-code and lives inside DuckDB, and the *wrapper*, which is the `gpudb` command
-and `gpudb.connect()`. The three lines above install one each. Already have an
-older gpudb extension? `FORCE INSTALL gpudb FROM community;` replaces it, and
-[How to tell it is working](docs/USING_THE_SHELL.md#how-to-tell-it-is-working)
-is two commands that say which piece is missing when one is.
+```sql
+INSTALL gpudb FROM community;     -- in any DuckDB ≥ 1.5.5 client
+LOAD gpudb;
+```
+
+That registry build is what gives **any** DuckDB client the explicit `gpu_*`
+functions, wrapper or no wrapper. `FORCE INSTALL gpudb FROM community;` — or
+`UPDATE EXTENSIONS;` — replaces an already-installed copy with the newest the
+registry has. On Linux a registry binary may carry no CUDA at all: `SELECT
+gpu_build_info();` says what the one in front of you has, and [Platforms and
+install](docs/INSTALL.md#platforms-and-install) says what to do about it.
+
+There are **two pieces**: the *extension*, which is the GPU code and lives
+inside DuckDB, and the *wrapper*, which is the `gpudb` command and
+`gpudb.connect()` — the piece that puts plain SQL on the device. A platform
+wheel is both in one install. [How to tell it is
+working](docs/USING_THE_SHELL.md#how-to-tell-it-is-working) is two commands that
+say which piece is missing when one is.
 
 One session on an M4 Max over TPC-H SF1, opened read-only. The first ask lands
 on DuckDB while the columns go to the device in idle segments; the next one is
@@ -654,6 +667,11 @@ device — installs on its own:
 ```bash
 pip install duckdb-gpudb          # the `gpudb` command and the gpudb module
 ```
+
+On Apple Silicon (macOS 15+) and x86-64 Linux (glibc 2.34+) that wheel also
+bundles the v0.7.0 extension, so it is the whole install; everywhere else the
+extension comes from `INSTALL gpudb FROM community;` as in Option A, and a
+checkout's own build is preferred over the bundled copy when you have one.
 
 Both routes in full, the lookup order, the supported versions, troubleshooting
 and upgrading: **[docs/INSTALL.md](docs/INSTALL.md)**.
