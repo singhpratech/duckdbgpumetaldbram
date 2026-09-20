@@ -169,6 +169,13 @@ def run_round(args, label, sql, iters, rnd):
                      if ready_at else f"NOT ready during the run (state={pr['state']})")
             print(f"[{label}/background#{rnd}] upload: {where}; {seg_s}; interrupts={pr['interrupts']} "
                   f"attempts={pr['attempts']} session={pr['session_ms']:.0f} ms")
+            # §5.5 back-off: what the machine had to spare, and what holding the
+            # steps an interrupt cannot stop back cost this session
+            print(f"[{label}/background#{rnd}] back-off: segment scans got "
+                  f"{pr['cores']:.1f} of {pr['cpus']:.0f} cores -> "
+                  f"{'CONTENDED' if 0 < pr['cores'] < 0.5 * pr['cpus'] else 'free'}; "
+                  f"{pr['quiet_waits']} step(s) waited {pr['quiet_wait_ms'] / 1000.0:.1f} s in total "
+                  f"for a quiet connection, {pr['quiet_forced']} ran at the deadline")
             # the pass split where the upload ended: a row that loses because of
             # the session loses HERE, and one that loses anyway does not
             if ready_at and 0 < ready_at[0] < len(lat) - 1:
@@ -182,10 +189,17 @@ def run_round(args, label, sql, iters, rnd):
                       f"; slowest statement overall {max(lat):.1f} ms at #{lat.index(max(lat))}"
                       f"{' (inside finish)' if f0 - 0.001 <= starts[lat.index(max(lat))] <= f1 else ''}")
             if not ready_at:
-                con._manager.wait_idle(120)
+                # how long readiness took once the statements stopped: on a
+                # contended machine this is where the back-off's price shows
+                t_after = time.perf_counter()
+                done = con._manager.wait_idle(180)
                 pr = con._manager.progress()[tag]
                 print(f"[{label}/background#{rnd}] after the run: state={pr['state']} segments={pr['segments']}/{pr['planned']} "
-                      f"interrupts={pr['interrupts']} session={pr['session_ms']:.0f} ms")
+                      f"interrupts={pr['interrupts']} session={pr['session_ms']:.0f} ms; "
+                      f"ready {(time.perf_counter() - t_after) * 1000.0:.0f} ms after the last statement"
+                      f"{'' if done else ' (still not settled after 180 s)'}; "
+                      f"{pr['quiet_waits']} quiet wait(s), {pr['quiet_wait_ms'] / 1000.0:.1f} s, "
+                      f"{pr['quiet_forced']} at the deadline")
         con.close()
         sys.stdout.flush()
     return results
