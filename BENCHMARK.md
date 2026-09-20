@@ -5514,3 +5514,178 @@ TPC-H **Q1 straddles 1.0×** on this box: 0.97× on `--path execute` and 1.03× 
 The measured rule handles it per process. It is the one shape to re-check if a
 CUDA-specific table is ever reconsidered.
 
+## 2026-09-20 — the release build
+
+**Hardware / build:** Apple M4 Max (Metal), macOS 26.6.2, commit `98b19c2`, a
+clean rebuild at the 15.0 deployment target, DuckDB 1.5.5, Python 3.13.9,
+**default memory budget**, thresholds on, N=5, every row compared with native
+before any time was counted. `gpu_build_info()`:
+`compiled=cpu,metal runtime=metal exact=true join=true global=true narrow=true
+device_memory=55662788608 store=true rebuilds=0/0 device='Apple M4 Max' avgf=53`.
+
+This is the run the README, the release notes, the registry descriptor and
+`KNOWN_ISSUES.md` quote for v0.7.0. Earlier sections stay as they are: they are
+the record of other builds on other days, and nothing here replaces them.
+
+| | queries on the device | rows differing | speed-up on those queries |
+|---|---|---|---|
+| SF1, `--path execute` | 17 of 22 | 0 | 1.52× (Q15) – 15.32× (Q9) |
+| SF1, `--path sql` | 17 of 22 | 0 | 1.37× (Q15) – 9.49× (Q13) |
+| SF10, `--path execute` | 19 of 22 | 0 | 1.06× (Q11) – 48.10× (Q5) |
+| SF10, `--path sql` | 19 of 22 | 0 | 0.92× (Q11) – 26.39× (Q5) |
+
+Declines: at SF1 **Q2, Q6, Q11, Q16** (threshold) and **Q20** (shape); at SF10
+**Q16** (threshold) and **Q2, Q20** (shape). Q6 is above its bound at SF10 and
+below it at SF1, which is the size threshold doing its job.
+
+### The losing row, printed as one
+
+**Q11 at SF10 straddles parity.** It is a 6–7 ms statement — small enough that
+the decision is close and the machine's state decides it. Through `execute()`
+it measured **1.06×**; through `sql()` it measured **0.92×** in this run, and
+**1.06×** and **0.89×** in two immediate re-runs of the same build. So it is
+reported as a straddle, not as a win: the per-process measured rule is what
+settles it on any given machine, the same way TPC-H Q1 straddles 1.0× on the
+RTX 4090 (see *the CUDA exact path on by default*). No other rewritten row in
+this run is below 1.0× at either scale factor.
+
+**SF1, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.7 | 3.2 | 3.98× | True | |
+| Q2 | native (threshold) | 4.3 | — | — | — |  |
+| Q3 | GPU (plain) | 5.9 | 2.1 | 2.80× | True | |
+| Q4 | GPU (plain) | 6.0 | 0.6 | 10.79× | True | |
+| Q5 | GPU (plain) | 6.8 | 1.1 | 5.97× | True | |
+| Q6 | native (threshold) | 1.8 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 6.8 | 2.0 | 3.39× | True | |
+| Q8 | GPU (projected) | 6.0 | 1.5 | 4.10× | True | |
+| Q9 | GPU (plain) | 18.1 | 1.2 | 15.32× | True | |
+| Q10 | GPU (topk) | 13.0 | 3.8 | 3.46× | True | |
+| Q11 | native (threshold) | 2.6 | — | — | — |  |
+| Q12 | GPU (plain) | 5.1 | 1.6 | 3.29× | True | |
+| Q13 | GPU (nested) | 18.0 | 1.7 | 10.41× | True | |
+| Q14 | GPU (projected) | 5.3 | 1.4 | 3.90× | True | |
+| Q15 | GPU (nested) | 3.2 | 2.1 | 1.52× | True | |
+| Q16 | native (threshold) | 11.9 | — | — | — |  |
+| Q17 | GPU (projected) | 4.6 | 1.4 | 3.32× | True | |
+| Q18 | GPU (plain) | 13.9 | 1.5 | 9.51× | True | |
+| Q19 | GPU (projected) | 10.0 | 1.4 | 6.98× | True | |
+| Q20 | native (shape) | 7.3 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 20.0 | 3.2 | 6.16× | True | |
+| Q22 | GPU (plain) | 8.0 | 1.1 | 7.38× | True | |
+
+**SF1, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 12.2 | 3.6 | 3.38× | True | |
+| Q2 | native (threshold) | 4.4 | — | — | — |  |
+| Q3 | GPU (plain) | 6.1 | 2.9 | 2.11× | True | |
+| Q4 | GPU (plain) | 6.1 | 1.5 | 4.00× | True | |
+| Q5 | GPU (plain) | 6.5 | 1.7 | 3.71× | True | |
+| Q6 | native (threshold) | 1.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 7.0 | 3.2 | 2.18× | True | |
+| Q8 | GPU (projected) | 6.3 | 2.0 | 3.16× | True | |
+| Q9 | GPU (plain) | 18.1 | 2.1 | 8.49× | True | |
+| Q10 | GPU (topk) | 13.2 | 4.2 | 3.14× | True | |
+| Q11 | native (threshold) | 2.6 | — | — | — |  |
+| Q12 | GPU (plain) | 5.2 | 1.9 | 2.78× | True | |
+| Q13 | GPU (nested) | 18.1 | 1.9 | 9.49× | True | |
+| Q14 | GPU (projected) | 5.5 | 1.7 | 3.18× | True | |
+| Q15 | GPU (nested) | 3.3 | 2.4 | 1.37× | True | |
+| Q16 | native (threshold) | 12.7 | — | — | — |  |
+| Q17 | GPU (projected) | 5.0 | 1.5 | 3.39× | True | |
+| Q18 | GPU (plain) | 14.1 | 1.9 | 7.28× | True | |
+| Q19 | GPU (projected) | 10.2 | 1.7 | 5.97× | True | |
+| Q20 | native (shape) | 7.5 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 20.0 | 6.5 | 3.09× | True | |
+| Q22 | GPU (plain) | 8.5 | 1.5 | 5.78× | True | |
+
+**SF10, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 109.5 | 14.3 | 7.63× | True | |
+| Q2 | native (shape) | 16.8 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 43.0 | 13.9 | 3.10× | True | |
+| Q4 | GPU (plain) | 43.6 | 2.5 | 17.12× | True | |
+| Q5 | GPU (plain) | 39.1 | 0.8 | 48.10× | True | |
+| Q6 | GPU (projected) | 14.0 | 5.9 | 2.39× | True | |
+| Q7 | GPU (plain) | 35.8 | 11.0 | 3.27× | True | |
+| Q8 | GPU (projected) | 35.7 | 7.9 | 4.51× | True | |
+| Q9 | GPU (plain) | 112.4 | 5.5 | 20.33× | True | |
+| Q10 | GPU (topk) | 76.8 | 14.0 | 5.49× | True | |
+| Q11 | GPU (nested) | 6.2 | 5.9 | 1.06× | True | |
+| Q12 | GPU (plain) | 40.2 | 10.4 | 3.88× | True | |
+| Q13 | GPU (nested) | 147.8 | 13.6 | 10.84× | True | |
+| Q14 | GPU (projected) | 29.1 | 4.3 | 6.74× | True | |
+| Q15 | GPU (nested) | 20.5 | 15.3 | 1.34× | True | |
+| Q16 | native (threshold) | 34.8 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 37.5 | 3.2 | 11.61× | True | |
+| Q18 | GPU (plain) | 111.7 | 9.1 | 12.33× | True | |
+| Q19 | GPU (projected) | 63.4 | 4.2 | 15.24× | True | |
+| Q20 | native (shape) | 32.6 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 138.9 | 21.7 | 6.40× | True | |
+| Q22 | GPU (plain) | 26.2 | 1.5 | 17.32× | True | |
+
+**SF10, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | GPU (plain) | 110.8 | 15.0 | 7.40× | True | |
+| Q2 | native (shape) | 17.1 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 43.3 | 14.8 | 2.93× | True | |
+| Q4 | GPU (plain) | 44.1 | 3.7 | 11.78× | True | |
+| Q5 | GPU (plain) | 39.9 | 1.5 | 26.39× | True | |
+| Q6 | GPU (projected) | 14.9 | 6.1 | 2.44× | True | |
+| Q7 | GPU (plain) | 36.7 | 11.7 | 3.14× | True | |
+| Q8 | GPU (projected) | 38.4 | 8.6 | 4.47× | True | |
+| Q9 | GPU (plain) | 127.6 | 6.7 | 19.05× | True | |
+| Q10 | GPU (topk) | 83.3 | 15.3 | 5.45× | True | |
+| Q11 | GPU (nested) | 6.6 | 7.2 | 0.92× | True | |
+| Q12 | GPU (plain) | 46.9 | 10.7 | 4.39× | True | |
+| Q13 | GPU (nested) | 161.5 | 13.9 | 11.59× | True | |
+| Q14 | GPU (projected) | 31.9 | 4.8 | 6.57× | True | |
+| Q15 | GPU (nested) | 22.2 | 15.9 | 1.40× | True | |
+| Q16 | native (threshold) | 36.1 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 42.9 | 3.7 | 11.60× | True | |
+| Q18 | GPU (plain) | 121.7 | 9.5 | 12.75× | True | |
+| Q19 | GPU (projected) | 67.6 | 4.6 | 14.65× | True | |
+| Q20 | native (shape) | 34.7 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 145.0 | 22.4 | 6.48× | True | |
+| Q22 | GPU (plain) | 27.7 | 1.9 | 14.54× | True | |
+
+### Gates
+
+`scripts/transparent_gate.py --subqueries --exprs --ctes --inner --lane-floor
+--path auto`, 668 s wall:
+
+| | cells |
+|---|---|
+| rewritten and PASS | **970** — 0 slower than native, 0 differing, min **1.04×**, max **55.2×** |
+| declined (threshold) | 495 |
+| declined after the first run (threshold) | 77 |
+| declined (shape) | 72 |
+| declined (not_found) | 16 |
+| **total** | **1630** |
+
+`scripts/wrapper_residency_gate.py`: pass, **0 failing rows**, 118 s.
+
+`scripts/budget_gate.py`, 256 MiB budget, 169 templates: **PASS — 169
+statements, 0 differing, 0 errors, resident never above the budget.** Physical
+resident 91.6–231.8 MiB at every sample, 1 eviction with **wasted 0**, 10
+refusals, at most 1 upload attempt for any one set, reasons
+`{rewritten: 17, threshold: 142, memory: 10}`, RSS 70 → 979 MiB, device memory
+peaked at 511.4 MiB.
+
+### Suites on this build
+
+| Suite | Result |
+|---|---|
+| `test_gpudb` (unit, CPU + Metal) | **3056 / 3056** |
+| `run_sql_tests.sh` | **225 passing, 0 failing**, 46 expected failures, 1 skipped |
+| `test_wrapper.py` | **1267 checks, 0 skipped, 0 failing** — identical under DuckDB 1.4.5 and 1.5.5 |
+| `test_residency_policy.py` | **131 checks, 0 failing** — both DuckDB versions |
+| `test_shell.py` | **77 / 0 skipped** under DuckDB 1.4.5; **76 / 1 skipped** under 1.5.5 (the skip is a throwaway virtualenv that cannot import duckdb, so the entry point cannot start) |
