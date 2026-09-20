@@ -4,7 +4,16 @@ Everything that was tried, measured, kept or dropped while building gpudb is
 written down in this repository. This page says where, and in what order to
 read it.
 
-## Start here
+## Using it
+
+| If you want | Read |
+|---|---|
+| The `gpudb` shell, end to end — the banner, the footer and its reason codes, `.gpu` / `.residents` / `.memory` | **[USING_THE_SHELL.md](USING_THE_SHELL.md)** |
+| `gpudb.connect()` — every option, `last_rewrite()` and `memory()`, threads, writes and transactions | **[USING_PYTHON.md](USING_PYTHON.md)** |
+| Installing both pieces on Apple Silicon Metal or NVIDIA CUDA, the platform detail, troubleshooting | **[INSTALL.md](INSTALL.md)** |
+| What shipped in each release | **[RELEASE_HISTORY.md](RELEASE_HISTORY.md)** · [RELEASE_NOTES_v0.7.md](RELEASE_NOTES_v0.7.md) for v0.7.0 by theme |
+
+## The record
 
 | If you want | Read |
 |---|---|
@@ -108,7 +117,7 @@ the edges are, not a plan.
 | [ENVIRONMENT.md](ENVIRONMENT.md) | Every environment variable the code honours, one line each |
 | [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md) · [DATASETS.md](DATASETS.md) | How the benchmarks are run and on what data |
 | [DEVELOPMENT.md](DEVELOPMENT.md) · [MACOS_EXTENSION_BUILD.md](MACOS_EXTENSION_BUILD.md) · [CI_RECIPES.md](CI_RECIPES.md) | Building, testing, CI |
-| [RELEASE_NOTES_v0.7.md](RELEASE_NOTES_v0.7.md) | What v0.7 ships, by theme |
+| [RELEASE_NOTES_v0.7.md](RELEASE_NOTES_v0.7.md) · [RELEASE_HISTORY.md](RELEASE_HISTORY.md) | What v0.7 ships, by theme; and every release before it |
 | [RELEASE_READINESS.md](RELEASE_READINESS.md) | Historical: the first community-extension submission's punch list |
 
 ## Reproducing a number

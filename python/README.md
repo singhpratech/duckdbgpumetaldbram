@@ -1,5 +1,10 @@
 # gpudb — plain DuckDB SQL on the GPU
 
+**New in v0.7 — plain DuckDB SQL runs on the GPU.** No `gpu_*` calls, no query
+changes: write the SQL you already write, and the GPU answers it when that is
+measured faster — DuckDB answers everything else, with the same rows either
+way. Apple Silicon Metal and NVIDIA CUDA, from one extension.
+
 Ordinary DuckDB SQL, unchanged: statements the GPU answers faster are answered
 on the device, everything else runs on DuckDB exactly as before, and the rows,
 names and types are identical either way.
@@ -130,8 +135,7 @@ Statements may span lines and end at `;`; Ctrl-C stops the running statement
 `.residents` prints two tables: the resident SETS — what a statement is waiting
 on — and, under them, the COLUMNS those sets are views over. A lane is kept at
 the narrowest signed width its values fit, so a column of small integers costs
-one or two bytes a row rather than eight, and the table says which. Same
-session as above:
+one or two bytes a row rather than eight. Same session as above:
 
 ```
 gpudb> .residents
@@ -149,7 +153,9 @@ lineitem  l_quantity  I64    6,001,215  2 B    11.4 MiB  preparing
 holds — what the memory budget compares when it has to choose. On a column
 line, `state` means something narrower: whether *that lane* has a sort cache.
 Only a key lane ever needs one, so a payload lane reads `preparing` and stays
-there; the set's own state is what a statement waits on.
+there; the set's own state is what a statement waits on. Every dot-command and
+option, and the session these came from, are in
+[the shell guide](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_THE_SHELL.md).
 
 There is a shell because the transparent path cannot live in the extension.
 DuckDB's stable C extension API — the one the loadable extension uses on
@@ -241,6 +247,13 @@ registered 38, and every one of those is still there unchanged.
 It is full manual control, and it is the only route from the stock `duckdb`
 CLI. The repository's README documents the whole surface.
 
-Design, limits and measurements: `docs/TRANSPARENT_DESIGN.md`,
-`docs/ENVIRONMENT.md`, `KNOWN_ISSUES.md` and `BENCHMARK.md` in the
-[repository](https://github.com/singhpratech/duckdbgpumetaldbram).
+## Going deeper
+
+- [The `gpudb` shell, end to end](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_THE_SHELL.md)
+- [`gpudb.connect()`, every option](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_PYTHON.md)
+- [Installing both pieces, platforms, troubleshooting](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/INSTALL.md)
+- [How a plain `SELECT` reaches the GPU](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/TRANSPARENT_DESIGN.md) ·
+  [every environment variable](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/ENVIRONMENT.md)
+- [Every measurement, losing cells included](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/BENCHMARK.md) ·
+  [every documented trade-off](https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/KNOWN_ISSUES.md)
+- [The repository](https://github.com/singhpratech/duckdbgpumetaldbram)

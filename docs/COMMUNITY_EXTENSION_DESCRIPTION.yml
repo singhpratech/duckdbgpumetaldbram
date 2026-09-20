@@ -129,6 +129,13 @@ docs:
     (the C_STRUCT ABI): it links no libduckdb, includes no DuckDB C++ headers and does
     no plan surgery.
 
+    Guides: the `gpudb` shell
+    https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_THE_SHELL.md ,
+    `gpudb.connect()`
+    https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_PYTHON.md ,
+    installing both pieces
+    https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/INSTALL.md
+
     Source, benchmarks and issues: https://github.com/singhpratech/duckdbgpumetaldbram
 
   hardware_requirements: |

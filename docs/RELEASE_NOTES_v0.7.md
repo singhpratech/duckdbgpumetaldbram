@@ -251,6 +251,9 @@ been the base of the join stack since v0.5.0.
 
 ## Reading further
 
+- [docs/USING_THE_SHELL.md](USING_THE_SHELL.md) — the `gpudb` shell, end to end
+- [docs/USING_PYTHON.md](USING_PYTHON.md) — `gpudb.connect()`, every option
+- [docs/INSTALL.md](INSTALL.md) — both install routes, platforms, troubleshooting
 - [docs/README.md](README.md) — a reading guide to the journal and the design documents
 - [docs/TRANSPARENT_DESIGN.md](TRANSPARENT_DESIGN.md) — the rewrite, the rules, the thresholds
 - [docs/RESIDENT_COLUMNS_DESIGN.md](RESIDENT_COLUMNS_DESIGN.md) — how columns live on the device

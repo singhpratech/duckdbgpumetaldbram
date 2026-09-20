@@ -745,7 +745,7 @@ table):
 
 If you use this project in research or commercial work:
 ```
-gpudb: GPU-accelerated DuckDB extension for NVIDIA CUDA and Apple Silicon Metal.
+gpudb: GPU-accelerated DuckDB extension for Apple Silicon Metal and NVIDIA CUDA.
 2026. https://github.com/singhpratech/duckdbgpumetaldbram
 ```
 
