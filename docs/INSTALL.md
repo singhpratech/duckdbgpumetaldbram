@@ -9,9 +9,11 @@ full.
 
 ## Installing, in full
 
-Two routes, both of which end with the extension inside DuckDB and the wrapper
-on your `PATH`. Installing one piece without the other is the single most
-common way to end up with a shell that works but never uses the GPU.
+Two routes, both of which end with an extension the wrapper can load and the
+wrapper itself on your `PATH`. On the two platforms the wheels are built for,
+route 1 is one command and brings both. Everywhere else you need both pieces,
+and having one without the other is the single most common way to end up with a
+shell that works but never uses the GPU.
 
 **Route 1 — `pip`, which on a supported platform is the whole install.**
 
