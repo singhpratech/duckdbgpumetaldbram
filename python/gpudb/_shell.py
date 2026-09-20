@@ -37,7 +37,10 @@ HISTORY = "~/.gpudb_history"
 HISTORY_LEN = 2000
 MAX_READ_DEPTH = 10           # `.read` of a file that reads itself
 CLOSE_S = 5.0                 # how long the way out may take before it is taken by force
-LABEL = 14                    # width of the `key:` column in the banner, `.gpu` and `.memory`
+# Width of the `key:` column in the banner, `.gpu` and `.memory`. One wider
+# than the longest label any of them prints (`round_trip_ms:`, 14), so every
+# row keeps a space between the label and its value.
+LABEL = 15
 DIM = "2"
 # a calm teal for the line that says the GPU answered; staying on DuckDB is
 # normal, not a warning, so its line is only dim
@@ -491,7 +494,11 @@ class Shell:
                 continue
             if value is False and key != "rewritten":
                 continue
-            self.say(self.paint(f"{key + ':':<{LABEL}}") + str(value))
+            # A time is a time, not a float repr: `round_trip_ms` printed all
+            # 17 digits of 0.0624... beside fields that read as words. Every
+            # row goes through the banner's own `field()`, so the label column
+            # is the one the banner and `.memory` use.
+            self.field(key, f"{value:.3f} ms" if isinstance(value, float) else str(value))
 
     def residents(self) -> None:
         """Two tables. First the wrapper's SETS — what each statement is

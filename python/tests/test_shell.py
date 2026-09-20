@@ -188,6 +188,16 @@ def run():
                        "-c", ".gpu")
     check(rc == 0 and "rewritten:" in out and "reason:" in out,
           ".gpu prints the whole of last_rewrite()")
+    # every row's label is padded to the same column — `round_trip_ms:` is the
+    # longest one and used to leave no space at all — and a time is printed as
+    # a time, not as 17 digits of float repr
+    rows = [re.sub(r"\x1b\[[0-9;]*m", "", l) for l in out.splitlines()
+            if re.match(r"^[a-z_]+:", re.sub(r"\x1b\[[0-9;]*m", "", l))]
+    check(rows and len({len(l) - len(l.split(":", 1)[1].lstrip()) for l in rows}) == 1,
+          f".gpu: every label ends in the same column ({[l.split(':')[0] for l in rows]})")
+    rt = [l for l in rows if l.startswith("round_trip_ms:")]
+    check(not rt or re.fullmatch(r"round_trip_ms: +\d+\.\d{3} ms", rt[0]),
+          f".gpu: a time reads as a time ({rt[0] if rt else 'not printed for this statement'})")
     rc, out, _ = shell("--timer", "--no-gpu", "-c", BIG,
                        "-c", "SELECT k, sum(v) FROM t GROUP BY k")
     check(rc == 0 and "DuckDB (off" in out, "--no-gpu leaves the statement on DuckDB")
