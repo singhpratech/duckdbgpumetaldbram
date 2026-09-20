@@ -5195,16 +5195,93 @@ built with the directory empty and come out `py3-none-any`.
 
 The platform part is read from the binary rather than from the machine:
 `otool -l` gives `LC_BUILD_VERSION`, whose `minos` field is the minimum macOS
-the loader will accept, and `lipo -archs` gives the architecture. On this build
-`minos` is **26.0**, so the tag is `macosx_26_0_arm64` and not the
-`macosx_11_0_arm64` that was assumed — nothing in the build sets
-`CMAKE_OSX_DEPLOYMENT_TARGET`, so the binary inherits the SDK's own floor and
-claims to need the macOS it was compiled on. A wheel may not claim to install
-where the loader will refuse the binary, so the true value is what the script
-uses; lowering the floor is a build change, with its own weak-linking
-questions, and it belongs in its own measurement rather than in a release
-commit. On Linux the tag must be passed in: the manylinux/glibc floor is a
-property of the toolchain and the script does not guess it.
+the loader will accept, and `lipo -archs` gives the architecture. On Linux the
+tag must be passed in: the manylinux/glibc floor is a property of the toolchain
+and the script does not guess it.
+
+Reading it from the binary is what exposed the next problem. The first build
+came out at `minos` **26.0** — a wheel installable only on the macOS it was
+compiled on.
+
+### The deployment target nobody was setting
+
+Nothing in this project set `CMAKE_OSX_DEPLOYMENT_TARGET`, and nothing in
+`extension-ci-tools` sets one either: the C-API extension makefiles pass
+`EXTENSION_NAME`, the target DuckDB version and the vcpkg triplet, and no
+deployment target at all. (The only `11.0` in that submodule is
+`VCPKG_OSX_DEPLOYMENT_TARGET` in a vcpkg port file, which governs vcpkg-built
+dependencies; this extension has none.) So the floor is whatever SDK the build
+ran against, and the binaries on this machine say exactly that:
+
+| binary | minos | sdk |
+|---|---|---|
+| `~/.duckdb/extensions/v1.5.5/osx_arm64/gpudb.duckdb_extension` (registry) | 15.0 | 15.5 |
+| `~/.duckdb/extensions/v1.5.5/osx_arm64/tpch.duckdb_extension` (DuckDB core) | 11.0 | 15.5 |
+| `~/.duckdb/extensions/v1.5.2/osx_arm64/httpfs.duckdb_extension` (DuckDB core) | 11.0 | 15.5 |
+| this tree, before | 26.0 | 27.0 |
+
+DuckDB's own extensions are at 11.0 because DuckDB sets the target in its own
+build. Ours is at 15.0 because the community-extensions runner's SDK was 15.5
+when it built — an inherited number, not a decision. That 15.0 is nevertheless
+the floor users already get today.
+
+The target is now set in `CMakeLists.txt` before `project()` — before, because
+that is when the compiler is probed and the value baked into the toolchain —
+and only when neither `CMAKE_OSX_DEPLOYMENT_TARGET` nor the
+`MACOSX_DEPLOYMENT_TARGET` environment variable already says otherwise.
+
+Choosing the value is a compile question. Building the library with
+`-Wunguarded-availability-new -Wunguarded-availability`:
+
+* **11.0** — four warnings in three files. `MTLLanguageVersion3_1` (macOS 14.0)
+  in `metal_groupby.mm`, `metal_hashjoin.mm` and `metal_radix_sort.mm`, and
+  `MTLGPUFamilyMetal3` (macOS 13.0) in `metal_aggregator.mm`. The language
+  version is already inside an `@available(macOS 15.0, *)` check that picks
+  3.2 or falls back to 3.1; guarding that fallback further would mean naming a
+  third, older language version, which is a fallback this code does not have.
+  Inventing one would change the shader language on machines nobody here can
+  test.
+* **14.0** — zero availability warnings.
+* **15.0** — zero availability warnings.
+
+So the floor is **14.0**: the lowest target the source compiles at without an
+invented fallback, and one version below what the registry's binary already
+demands. The packaged extension and the dylib now both report `minos 14.0`, and
+the wheel tag follows on its own — `macosx_14_0_arm64`.
+
+**What that claim rests on, exactly:** compile-time availability checking at
+target 14.0, which says no symbol newer than macOS 14 is reached without a
+guard; and the fact that the registry has been serving a 15.0 binary, so 14.0
+is not a regression for anyone. It does **not** rest on a test run on macOS 14.
+No machine older than 26 is available here, and none of the suites below were
+run on one.
+
+### What the deployment target does not change
+
+The Metal shaders are compiled at run time, not at build time: `sum.metal` and
+`groupby.metal` are embedded as C strings (`cmake/embed_metal_sources.cmake`)
+and handed to `newLibraryWithSource:options:error:`. No `.metallib` is produced
+anywhere in the build, so there is no second binary with a floor of its own.
+
+Three of the four compile sites already choose the language version behind a
+runtime check — `MTLLanguageVersion3_2` on macOS 15 or newer, `3_1` below —
+which the deployment target does not affect. The fourth, `metal_aggregator.mm`,
+leaves `MTLCompileOptions.languageVersion` at its default, and that default
+could in principle be derived from the deployment target. Measured, on this
+machine, with a two-line program compiled at two different targets:
+
+    -mmacosx-version-min=26.0  ->  languageVersion 0x40000 (Metal 4.0)
+    -mmacosx-version-min=15.0  ->  languageVersion 0x40000 (Metal 4.0)
+
+The default comes from the runtime Metal framework, not from the target, so
+lowering the floor does not move the generated code. Nothing was changed about
+the shader language version, deliberately.
+
+The suites agree: 3056 / 3056 unit checks, 225 SQL pass / 0 fail, the wrapper
+and shell suites clean under DuckDB 1.5.5, the budget gate PASS at 169
+statements with 0 differing, and TPC-H SF1 coverage unchanged at 17 of 22 on
+the device, 0 differing, ratios 1.44x to 12.59x against the 1.4x-13.6x on
+record.
 
 ## Open questions
 

@@ -87,8 +87,11 @@ ehthumbs.db
 # Per-worktree symlink to shared data dir
 /data
 
-# DuckDB pre-built shared libs (~140 MB; downloaded by scripts/get_duckdb_libs.sh)
+# DuckDB pre-built shared libs (~140 MB; fetched by scripts/get_duckdb_libs.sh).
+# Both spellings: the trailing slash matches only a directory, and a worktree
+# reaches these through a symlink to the main checkout's copy.
 third_party/duckdb-libs/
+third_party/duckdb-libs
 
 # community-extensions CI build dirs (created by the root Makefile / extension-ci-tools)
 cmake_build/

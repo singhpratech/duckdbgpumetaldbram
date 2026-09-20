@@ -1,5 +1,37 @@
 cmake_minimum_required(VERSION 3.20)
 
+# -------------------------------------------------------------------
+# macOS deployment target — the minimum macOS the produced binaries
+# declare (Mach-O LC_BUILD_VERSION minos). It must be set BEFORE
+# project(), because that is when the compiler is probed and the value
+# baked into the toolchain.
+#
+# Left unset, a binary inherits the floor of whatever SDK built it, and
+# claims to need the macOS it was compiled on. That is how the
+# extension the community registry serves ended up at minos 15.0 while
+# DuckDB's own core extensions ship at 11.0 — extension-ci-tools sets no
+# deployment target of its own, so the value is whatever the CI runner
+# happened to have. For a pip wheel that floor is not a detail: the
+# platform tag is read from the binary, and it decides where the wheel
+# can be installed at all.
+#
+# 14.0 is the lowest target this source compiles at with no
+# unguarded-availability warnings. Below it, MTLLanguageVersion3_1
+# (macOS 14.0) in the shader-compile paths and MTLGPUFamilyMetal3
+# (macOS 13.0) in the aggregator are reached without a guard, and a
+# guard there would need a fallback language version that does not
+# exist in this code — so the floor rises to the API instead of
+# inventing one.
+#
+# This is a COMPILE-TIME claim: the availability checking says no symbol
+# newer than the target is reached unguarded. It is not a test on macOS
+# 14; no such machine is available here.
+if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET
+         AND NOT DEFINED ENV{MACOSX_DEPLOYMENT_TARGET})
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING
+        "Minimum macOS version the produced binaries declare")
+endif()
+
 project(gpudb
     VERSION 0.7.0
     DESCRIPTION "GPU-accelerated operators for DuckDB (Metal + CUDA)"
