@@ -54,6 +54,12 @@ class Device:
         self.dropped = []
         self.fail_drop = set()          # names whose drop always raises
         self.fail_once = set()          # ... and names whose NEXT drop raises, once
+        # (store, lane) pairs the extension reports as NOT on the device — what
+        # an upload the GPU refused used to leave behind. Everything else
+        # answers `on_gpu = true`.
+        self.host_cols = set()
+        self.aborted = []               # upload sessions the manager aborted
+        self.upload_fails = {}          # tag -> the error its upload raises
 
     # -- what the test drives it with --
     def touch(self, name):
@@ -89,6 +95,15 @@ class Device:
             self.dropped.append((store, lane))
             self.cols.pop((store, lane), None)
             return [(1,)]
+        if sql.startswith('SELECT "column", on_gpu FROM gpu_store_columns()'):
+            store = sql.split("'")[1]
+            return [(c, False) for (s, c) in self.cols if s == store and (s, c) in self.host_cols]
+        if sql.startswith("SELECT name FROM gpu_residents()"):
+            name = sql.split("'")[1]
+            return [(name,)] if name in self.sets else []
+        if sql.startswith("SELECT gpu_upload_abort"):
+            self.aborted.append(sql.split("'")[1])
+            return [(True,)]
         if sql.startswith("SELECT bytes FROM gpu_residents()"):
             name = sql.split("'")[1]
             return [(self.sets[name][0],)] if name in self.sets else []
@@ -100,11 +115,15 @@ class Device:
             return [(c,) for (s, c) in self.cols if s == store]
         if sql.startswith("UPLOADCOL"):
             _, store, per, lanes = sql.split(" ", 3)
+            if store in self.upload_fails:
+                raise RuntimeError(self.upload_fails[store])
             for lane in lanes.split(","):
                 self.cols[(store, lane)] = [int(per), self.clock()]
             return [(1,)]
         if sql.startswith("UPLOAD"):
             _, tag, nbytes = sql.split(" ")
+            if tag in self.upload_fails:
+                raise RuntimeError(self.upload_fails[tag])
             self.sets[tag] = [int(nbytes), 0, self.clock(), "managed"]
             return [(1,)]
         if sql.startswith("MATERIALIZE"):
@@ -868,6 +887,160 @@ def backoff():   # noqa: C901
           "back-off: GPUDB_UPLOAD_QUIET_MS=0 turns the mechanism off on any machine")
     check(abs(mgr.quiet_want_ms(mgr.idle_ms, 0.0) - mgr.idle_ms) < 1e-6,
           "back-off: a step that asks for no more than idle_ms is the ordinary idle wait")
+
+    run_accounting()
+    run_refusals()
+
+
+def run_accounting():
+    import gpudb._residency as _res
+    """What the budget is compared with: one physical thing counted once."""
+    print("== accounting: a shared column is counted once, and a view weighs what it reads")
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, 8 * MiB)
+    # two views over one store: 'kv' reads k and v, 'kw' reads k and w, so three
+    # physical columns of 1 MiB. A view owns nothing, so gpu_residents() gives 0.
+    offer_view(mgr, "kv", "store", ["k", "v"], 1 * MiB)
+    upload(mgr, dev, "kv")
+    offer_view(mgr, "kw", "store", ["k", "w"], 1 * MiB, missing=["w"])
+    upload(mgr, dev, "kw")
+    physical = mgr.physical_bytes(dev.run)
+    check(physical == 3 * MiB,
+          f"accounting: three distinct lanes are 3 MiB, whoever reads them ({physical / MiB:.1f})")
+    per_set = sum(v["bytes"] for v in mgr.memory()["sets"].values() if v["state"] == "ready")
+    check(per_set == 4 * MiB,
+          f"accounting: summing per-set bytes counts the shared lane twice — 4 MiB, "
+          f"which is why it is not the total ({per_set / MiB:.1f})")
+    check(mgr.memory()["sets"]["kv"]["bytes"] == 2 * MiB,
+          "accounting: a view still reports what its own lanes cost, for the density ranking")
+    # ... and the total the budget uses is the physical one, so a candidate is
+    # admitted against 3 MiB and not against 4
+    offer(mgr, "mine", 4 * MiB)
+    snap = mgr._snapshot(dev.run, mgr.get("mine"))
+    check(snap is not None and snap[2] == 3 * MiB,
+          f"accounting: admission compares the physical total ({snap[2] / MiB:.1f} MiB)")
+    check(upload(mgr, dev, "mine"),
+          "accounting: so a 4 MiB set fits an 8 MiB budget beside 3 MiB of columns")
+
+    print("== accounting: a narrowed lane is estimated at the width it is stored at")
+    from gpudb.connection import estimate_set_bytes
+    wide = estimate_set_bytes(6_000_000, 2, None, 8)
+    narrow = estimate_set_bytes(6_000_000, 2, [4, 4], 4)
+    # the lanes and the sort cache halve; the scratch lane the exact operators
+    # keep beside a set does not, so the SET does not halve — 137 against 206
+    # MiB for a two-lane lineitem set, and further apart the more lanes it has
+    check(narrow < wide * 0.7,
+          f"accounting: four-byte lanes and a four-byte key cost a third less "
+          f"({narrow / MiB:.0f} MiB vs {wide / MiB:.0f} MiB)")
+    six = estimate_set_bytes(6_000_000, 6, None, 8)
+    six_narrow = estimate_set_bytes(6_000_000, 6, [4, 4, 4, 4, 4, 4], 4)
+    check(six_narrow < six * 0.6,
+          f"accounting: ... and further apart the more lanes the set reads "
+          f"({six_narrow / MiB:.0f} MiB vs {six / MiB:.0f} MiB)")
+    check(estimate_set_bytes(1000, 1, [4], 0) < estimate_set_bytes(1000, 1, [4], 4),
+          "accounting: a keyless set is not charged for a sort cache it will never build")
+
+    print("== accounting: the working-memory headroom comes from what the device measured")
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, 4 * MiB)
+    offer(mgr, "a", 3 * MiB)
+    check(upload(mgr, dev, "a"), "headroom: 3 MiB fits 4 MiB while nothing has been measured")
+    mgr.note_execution_refusal(
+        ["a"], "CUDA exact reduce_by_key failed: out of memory "
+               "(needs 3 MiB of working memory, 1 MiB free)")
+    check(mgr.scratch_headroom == 2 * MiB,
+          f"headroom: the shortfall the device named is what is held back "
+          f"({mgr.scratch_headroom / MiB:.1f} MiB)")
+    check(mgr.get("a").error.startswith(_res.DEVICE_ERROR)
+          and "3 MiB" in mgr.get("a").error,
+          f"headroom: and the set says so, with the numbers ({mgr.get('a').error[:90]})")
+    dev.sets.clear()
+    clock.advance(mgr.rate_s + 1.0)
+    offer(mgr, "b", 3 * MiB)
+    check(not upload(mgr, dev, "b"),
+          "headroom: a 3 MiB set no longer fits 4 MiB less the 2 MiB an operator needed")
+    check("working memory" in mgr.get("b").error,
+          f"headroom: and the refusal says where the missing MiB went ({mgr.get('b').error[:110]})")
+    mgr.note_execution_refusal(["b"], "Metal exact reduce failed: out of memory")
+    check(mgr.scratch_headroom == 2 * MiB,
+          "headroom: a backend that reports no numbers leaves it where it was")
+
+
+def run_refusals():
+    import gpudb._residency as _res
+    """A refusal is REMEMBERED: the same statement does not buy the same
+    failed upload over and over."""
+    print("== refusals: an upload the device refused is not attempted again per statement")
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, None)
+    dev.upload_fails["t"] = "GPUDB_DEVICE_UPLOAD_REFUSED: upload_rows_exact: out of memory"
+    for i in range(50):
+        offer(mgr, "t", 1 * MiB)                 # one sighting per statement
+        upload(mgr, dev, "t")
+    s = mgr.get("t")
+    check(s.attempts == 1,
+          f"refusals: 50 statements over a set the device will not take = 1 upload attempt "
+          f"({s.attempts})")
+    check(s.state == "failed" and s.error.startswith(_res.DEVICE_ERROR),
+          f"refusals: and the set says the device refused it ({s.error[:80]})")
+    check(dev.aborted == ["t"],
+          f"refusals: the upload session was aborted exactly once ({dev.aborted})")
+    check(not dev.sets and not dev.cols,
+          f"refusals: and nothing of it is left resident ({dev.sets}, {dev.cols})")
+    check(mgr.refusals == 1 and mgr.refusals_held >= 49,
+          f"refusals: the held refusal is counted ({mgr.refusals}, {mgr.refusals_held})")
+
+    print("== refusals: ... and it IS attempted again when something could have changed")
+    clock.advance(mgr.rate_s + 1.0)
+    offer(mgr, "t", 1 * MiB)
+    upload(mgr, dev, "t")
+    check(mgr.get("t").attempts == 1,
+          f"refusals: the retry window reopens it, and the attempt budget starts again "
+          f"({mgr.get('t').attempts})")
+    # ... and a write under the set reopens it at once, without waiting
+    mgr.invalidate("t")
+    offer(mgr, "t", 1 * MiB)
+    check(mgr.get("t").state in ("pending", "uploading"),
+          f"refusals: a write under the set reopens it immediately ({mgr.get('t').state})")
+
+    print("== refusals: max_attempts is a rate limit, not a cliff")
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, None, max_attempts=3)
+    dev.upload_fails["t"] = "Runtime Error: something broke"
+    for _ in range(3):
+        offer(mgr, "t", 1 * MiB)
+        upload(mgr, dev, "t")
+        clock.advance(mgr.rate_s + 1.0)
+    del dev.upload_fails["t"]
+    offer(mgr, "t", 1 * MiB)
+    check(upload(mgr, dev, "t"),
+          "refusals: a set that failed three times still uploads once the trouble is over")
+
+    print("== placement: a set that landed on the host is dropped, not used")
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, None)
+    offer_view(mgr, "v", "store", ["k", "p"], 1 * MiB)
+    dev.host_cols = {("store", "k"), ("store", "p")}
+    check(not upload(mgr, dev, "v"),
+          "placement: an upload whose lanes are on the host is not a resident set")
+    check(not dev.cols,
+          f"placement: the host lanes were dropped, so no later view inherits them ({dev.cols})")
+    check(mgr.get("v").state == "failed"
+          and "host" in mgr.get("v").error,
+          f"placement: and the set says where it landed ({mgr.get('v').error[:100]})")
+    # an extension that cannot say leaves the set alone: an absent answer is
+    # not "on the host"
+    clock = Clock()
+    dev = Device(clock)
+    mgr = manager(clock, dev, None)
+    offer_view(mgr, "v", "store", ["k", "p"], 1 * MiB)
+    check(upload(mgr, dev, "v"),
+          "placement: a backend that reports no placement does not lose its set")
 
 
 if __name__ == "__main__":
