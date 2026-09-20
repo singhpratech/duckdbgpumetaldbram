@@ -1606,13 +1606,23 @@ same database — the extension stays free of threads and hidden connections
   lets the size fall three halvings below the last measured one before the
   budget stops it, measuring each size on the way; a table is never cut into
   more than 2048 pieces; and until a segment has landed at the default size
-  at all, the floor is the old constant, 1/32 of the 8 MiB default. Given the
-  whole curve, the rule derives 32768 rows on the x86 box — where that
-  constant happened to sit — and 65536 on the M4 Max. A session that is being
-  starved outright has only the sizes it managed to land to go on, so it stops
-  at the first size the evidence no longer justifies (three halvings below the
-  last measured one) and reports starvation there rather than continuing on a
-  curve it has not seen.
+  at all — pricing a halving needs TWO of them, one being the default — the
+  floor is the old constant, 1/32 of the 8 MiB default, and the size goes on
+  halving on the yield rule alone until it gets there. That matters because a
+  connection starved from its first statement never collects a second size:
+  measured on the x86 box, one segment of nine landed, the model stayed empty
+  and a floor derived from that single point would stop the shrinking at the
+  size already in use, with the window it was measuring (4.0 ms) twice what a
+  segment an eighth that size costs there. The unpriced path is therefore
+  exactly what it was before any of this was measured — bounded at five
+  halvings, no retry loop, 1/32 still a floor — and starvation is reported
+  there. Given the whole curve the priced rule derives 32768 rows on the x86
+  box, where that constant happened to sit, and 65536 on the M4 Max. The
+  measured window has one say of its own, in the direction it can be trusted:
+  a connection plainly leaving several times what the cheapest segment cost
+  here lets those blind halvings through a priced floor as well. It only ever
+  ALLOWS — never forces a segment, never goes below the constant, never
+  overrides a size that is landing.
 - **A connection that leaves no window is told so, not ground finer.** When
   the yield asks for a smaller segment and the floor refuses, the manager
   records that the session is STARVED and `progress()` reports it with the

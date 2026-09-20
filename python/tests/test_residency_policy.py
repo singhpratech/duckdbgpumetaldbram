@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from gpudb._residency import (CONTENTION_MIN_SAMPLES, CONTENTION_SEGMENTS,   # noqa: E402
                               MEMORY_ERROR, NATIVE_USE_WEIGHT,
                               ResidencyManager, SEG_SCALE_MAX, SEG_TOTAL_MAX_RATIO,
-                              SEG_YIELD_WINDOW,
+                              SEG_WINDOW_SAMPLES, SEG_YIELD_WINDOW,
                               YOUNG_OVERRIDE_RATIO)
 
 MiB = 1 << 20
@@ -648,9 +648,15 @@ def backoff():   # noqa: C901
     # the x86 box's curve, measured 2026-09-20: 1.5 ms fixed, 0.02 us/row
     m, st = costed(1.5, 0.02, 2_000_000, [base])
     blind = m.segment_floor_rows(st)
-    check(blind == base // 8,
-          f"floor: with only the default measured, an untried halving is priced at the least it "
-          f"could be worth, which allows three of them ({blind} rows of {base})")
+    check(blind == base // SEG_SCALE_MAX,
+          f"floor: ONE landed size prices nothing — a halving needs two — so the floor is still "
+          f"the constant backstop and the size keeps halving on the yield alone ({blind} rows "
+          f"of {base})")
+    m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2])
+    check(m.segment_floor_rows(st) == base // 16,
+          f"floor: the second landed size is what hands over to the measured floor, and an "
+          f"untried halving is then priced at the least it could be worth — three of them below "
+          f"the smallest size measured ({m.segment_floor_rows(st)} rows of {base})")
     m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2, base // 4, base // 8, base // 16])
     check(m.segment_floor_rows(st) == base // 32,
           f"floor: with the sizes measured, that curve's floor is 1/32 of the default "
@@ -669,8 +675,47 @@ def backoff():   # noqa: C901
           f"({m3.segment_floor_rows(st3)} rows of {base})")
     check(m.segment_floor_rows(st) >= -(-2_000_000 // 2048),
           "floor: and a table is never cut into more than 2048 pieces whatever the costs say")
+    # ... on the blind path too: a table big enough that 1/32 of the default
+    # segment would be more than 2048 pieces
+    big = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    stbig = offer(big, "seg", 1 * MiB)
+    stbig.table_rows = 256 * base            # 1/32 of the default would be 8192 pieces
+    check(big.segment_floor_rows(stbig) == -(-stbig.table_rows // 2048) > base // SEG_SCALE_MAX,
+          f"floor: the 2048-piece cap binds on the unpriced path as well, above the constant "
+          f"backstop ({big.segment_floor_rows(stbig)} rows of a {base} default over "
+          f"{stbig.table_rows} rows)")
+    # the window only ever ALLOWS: a connection leaving several times what the
+    # cheapest segment cost lets the blind halvings through the measured floor
+    m, st = costed(3.0, 0.0001, 2_000_000, [base, base // 2, base // 4])
+    tight = m.segment_floor_rows(st)
+    for _ in range(4):
+        m.note_segment(False, st, window_ms=0.1)    # a window far under any segment
+    check(m.segment_floor_rows(st) == tight,
+          f"floor: a window smaller than any segment changes nothing ({m.segment_floor_rows(st)})")
+    for _ in range(SEG_WINDOW_SAMPLES):
+        m.note_segment(False, st, window_ms=100.0)  # ... and one far above every segment
+    check(m.segment_floor_rows(st) == base // SEG_SCALE_MAX < tight,
+          f"floor: a window several times the cheapest segment measured is evidence the size is "
+          f"not the reason, so the blind halvings are allowed through — down to the backstop and "
+          f"no further ({m.segment_floor_rows(st)} rows, the priced floor was {tight})")
 
     print("== back-off: at the floor it reports starvation instead of grinding")
+    # starved from the very first statement: nothing lands, so nothing can be
+    # priced, and the size must still walk all the way down to the backstop
+    # before the manager calls it starvation (the x86 box, 2026-09-20: one
+    # segment of nine landed and the floor collapsed to the size in use)
+    cold = manager(Clock(), Device(Clock()), None, idle_ms=20.0)
+    stc = offer(cold, "seg", 1 * MiB)
+    stc.table_rows = 2_000_000
+    for _ in range(SEG_YIELD_WINDOW * (SEG_SCALE_MAX + 4)):
+        cold.note_segment(False, stc, window_ms=4.0)
+    check(cold.segment_rows_for(stc) == base // SEG_SCALE_MAX and cold.starved(),
+          f"starvation: a session that starves from its first statement reaches the backstop "
+          f"({cold.segment_rows_for(stc)} rows of {base}) and only reports starved there")
+    cold.note_segment(True, stc, rows=base // SEG_SCALE_MAX, ms=1.6)
+    cold.note_segment(True, stc, rows=base // SEG_SCALE_MAX, ms=1.6)
+    check(not cold.starved() and cold.segment_cost_model(stc) is None,
+          "starvation: a segment that lands clears it, and one size is still not a model")
     m, st = costed(1.5, 0.02, 2_000_000, [base, base // 2, base // 4, base // 8, base // 16])
     floor = m.segment_floor_rows(st)
     check(not m.starved(), "starvation: a session that is landing segments is not starving")

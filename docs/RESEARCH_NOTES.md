@@ -4321,11 +4321,18 @@ The x86 box first (measured there, with an ample window so nothing races):
        262144         8       8.20     0.031
        500000         4      11.60     0.023
 
-i.e. about **1.5 ms of fixed cost** before a segment reads a row, and 0.02 us a
-row after that. Against a mean window of 2.5 ms, a 32768-row segment at 2.50 ms
-is a coin flip that mostly loses — and a segment small enough to fit reliably
-would be about 8192 rows, which still costs 1.75 ms, because five sixths of
-that is the fixed part. Below it there is nothing left to save.
+Re-measured there, pooled over three repetitions, that is
+
+    seg_ms  =  1.57 ms  +  4.07 us per 1000 rows
+
+— the same intercept, a slope five times smaller than the single-run figures
+above suggested, and a noise floor of about 1 ms, which is why that box cannot
+see the effect of the PREPARE below from outside a segment. So about **1.5 ms
+of fixed cost** before a segment reads a row. Against a mean window of 2.5 ms,
+a 32768-row segment at 2.50 ms is a coin flip that mostly loses — and a segment
+small enough to fit reliably would be about 8192 rows, which still costs
+1.75 ms, because most of that is the fixed part. Below it there is nothing left
+to save.
 
 The same measurement on an M4 Max, through the real manager (`seg_ms` as the
 session itself recorded it, 2M-row table, nothing racing):
@@ -4416,13 +4423,27 @@ budget of 4x is the one number chosen rather than measured, and it is chosen so
 that both machines' useful range is inside it: at 8192 rows the x86 box would
 scan the table nine times over for a segment 30% cheaper to attempt.
 
-Those two figures are what the rule derives when it has seen the whole curve. A
-session being starved outright has only the sizes it managed to land, so it
-stops three halvings below the last size it measured and reports starvation
-there rather than walking on down a curve it has not seen. That is the
-conservative direction — the alternative is the grinding this change exists to
-stop — but it does mean the x86 box's starved session will stop above 32768
-until an idle moment lets it measure further down.
+Those two figures are what the rule derives when it has seen the whole curve —
+and the first thing the x86 box did with the rule was show what happens when it
+has not. Starved from the first statement there, one segment of nine landed:
+1048576 rows at t=0, 524288 at 2.7 s, 262144 at 10.8 s, 131072 at 18.9 s, then
+`starved=True` at 27 s with `fixed_ms=0.0` — no model, because pricing a
+halving takes two landed sizes and there was one — and a floor that had
+collapsed to the size in use, while `window_ms` said 4.02 against a segment of
+about 1.6 ms at 8192 rows. The allowance of three blind halvings below the last
+measured size buys nothing when the last measured size IS the current one.
+
+So the rule reads: a halving is priced only once **two** sizes have landed (one
+of them the default). Until then the size keeps halving on the yield rule alone
+down to the old constant, 1/32 of the default, and starvation is declared
+there. That is exactly what `main` does today, so the unpriced path cannot be
+worse than it; it is bounded at five halvings with no retry loop; and it keeps
+the no-grinding property, because 1/32 is still a floor. The window earns a
+small say of its own, in the one direction it can be trusted: when the
+connection is plainly leaving several times what the cheapest segment measured
+here cost, the blind halvings are let through a measured floor too. It only
+ever ALLOWS — it never forces a segment, never goes below the constant, and
+never overrides a size that is landing.
 
 Three details that took a measurement each:
 
@@ -4506,6 +4527,15 @@ interrupt latency left real windows after all and what landed is whole. On the
 M4 Max the first branch is what happens (three runs: 6, 10 and 6 segments of
 81, 47 and 88, always starved, statements at p50 1.55 ms / p99 2.8 ms), and the
 whole section takes 29 s instead of up to 180.
+
+On the x86 box the same section is green — the first fully green wrapper run
+there with the exact path on, 1209 of 1209: it measured 1.65 ms for a
+100000-row segment, drove gaps of up to 26.6 ms, finished in 5.3 s of a 30 s
+budget with 20 of 20 segments and `(2000000, 2000000, 'ready')`, and took the
+starved branch in both runs of the second case (4 of 95 segments, 3020
+statements native, floor 16384 of a 131072 default, a 3.31 ms window against
+the 1.03 ms a floor segment needs). Two machines whose segment costs differ by
+four times, asserting the same property.
 
 ## Open questions
 

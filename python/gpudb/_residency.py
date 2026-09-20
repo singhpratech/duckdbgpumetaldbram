@@ -147,6 +147,19 @@ SEG_BLIND_GAIN = 0.75
 SEG_COST_SAMPLES = 8             # landed segments kept per size, for the fit
 SEG_WINDOW_SAMPLES = 16          # recent windows the workload left, for the report
 SEG_MAX_SEGMENTS = 2048          # ... and a table is never cut into more pieces than this
+# Pricing a halving takes TWO landed sizes. A connection that starves from the
+# first statement never gets them — measured on the x86 box (2026-09-20): one
+# segment landed of nine, the model stayed empty, and a floor derived from a
+# single point stopped the shrinking at the size it was already using while the
+# window it was measuring (4.0 ms) was twice what a segment of an eighth that
+# size costs there. So with fewer than two sizes measured the size keeps
+# halving on the yield rule alone, down to the constant backstop and no
+# further — exactly what this did before any of it was measured, so it cannot
+# be worse — and STARVED is declared there rather than three halvings earlier.
+# The window can also let those blind halvings through once a model exists: a
+# connection leaving several times what the cheapest segment measured is not
+# refusing because of the size. It only ever allows.
+SEG_WINDOW_MARGIN = 1.5
 
 # ---- what a resident set is WORTH (§5.5, value-aware residency) ----
 # A set's value is a decaying rate: the milliseconds it saves per second of
@@ -1315,20 +1328,24 @@ class ResidencyManager:
         `fixed + rows x per_row` this is exactly the size at which the two
         parts are equal, which is the same statement in other words.
 
-        Until a segment has landed it is the constant backstop, 1/SEG_SCALE_MAX
-        of the default — what this was before any of it was measured. A table
-        is never cut into more than SEG_MAX_SEGMENTS pieces either way."""
+        Pricing a halving takes TWO landed sizes (and one of them the default,
+        or the reference is an extrapolation across the part of the curve that
+        bends). Until then the floor is the constant backstop, 1/SEG_SCALE_MAX
+        of the default — what this was before any of it was measured, so a
+        connection that starves from its first statement keeps halving on the
+        yield rule alone and reports STARVED at that backstop rather than
+        wherever a single measurement happened to leave it. A table is never
+        cut into more than SEG_MAX_SEGMENTS pieces on any of these paths."""
         if s is None:
             return 0
         base = s.segment_rows_default
         rows = float(s.table_rows or base)
         hard = max(1, -(-int(rows) // SEG_MAX_SEGMENTS))
+        blind = min(base, max(hard, max(1, base // SEG_SCALE_MAX)))
         pts = self.segment_costs(s)
         at_base = dict(pts).get(base, 0.0)
-        if at_base <= 0.0:
-            # nothing landed at the default size, so there is no baseline to
-            # judge a smaller one against: the constant backstop, as before
-            return min(base, max(hard, max(1, base // SEG_SCALE_MAX)))
+        if len(pts) < 2 or at_base <= 0.0:
+            return blind
         budget = SEG_TOTAL_MAX_RATIO * (rows / base) * at_base
         floor = r = base
         while r // 2 >= hard:
@@ -1336,7 +1353,32 @@ class ResidencyManager:
             if (rows / r) * self._cost_at(pts, r) > budget:
                 break
             floor = r
-        return min(base, max(1, floor))
+        floor = min(base, max(1, floor))
+        # ... and the window has the last word in the one direction it can be
+        # trusted in: if the connection is plainly leaving more time than the
+        # cheapest segment ever cost here, a smaller one may well fit and the
+        # blind halvings are let through after all. It only ever ALLOWS; it
+        # never forces a segment, never goes below the constant backstop, and
+        # never overrides a size that is landing.
+        if floor > blind and self._window_allows_smaller_locked(pts):
+            return blind
+        return floor
+
+    def _window_allows_smaller_locked(self, pts: List[Tuple[int, float]]) -> bool:
+        """Is the measured window evidence that a smaller segment would fit?
+        Caller holds the lock.
+
+        The window is how long an interrupted segment got to run before the
+        statement arrived, so it is an upper bound on what this connection
+        leaves — it includes the latency of honouring the interrupt. Compared
+        against the cheapest segment ever measured here, it is still worth
+        something: a window several times that cost, with nothing landing,
+        says the size is not yet the reason."""
+        if not self._seg_windows or not pts:
+            return False
+        cheapest = min(t for _r, t in pts)
+        return (cheapest > 0.0
+                and statistics.median(self._seg_windows) > SEG_WINDOW_MARGIN * cheapest)
 
     def segment_floor_rows(self, s: SetState) -> int:
         with self._lock:
