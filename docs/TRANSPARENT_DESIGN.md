@@ -453,9 +453,17 @@ it — ONE division by the scaled count, `double(unscaled sum) / (count ×
 from the exact `sum` and `count` the table function returns. Verified against
 native over thousands of groups at four scales; `(sum / count) / 10^s`,
 `(sum / 10^s) / count` and `sum(decimal)::DOUBLE / count` each differ from
-native on 20–30% of groups. Native does this arithmetic in `long double`
-(80-bit on x86, double on ARM): the formula is verified on ARM and must be
-re-verified on x86 with the CUDA port.
+native on 20–30% of groups. Native does this arithmetic in `long double`,
+which is a plain `double` on arm64 (53-bit mantissa) and the 80-bit type on
+x86-64 (64-bit), and SQL has no wider type to divide in: the derivation is
+native's own expression only on arm64. Once a group's unscaled sum passes
+2^53 the two widths round apart (measured on x86: 982 of 5000 groups over a
+DECIMAL(18,2) payload, 4M rows), so the shape is offered only where
+`gpu_build_info()` reports `avgf=53` and declines (`shape`) everywhere else —
+an extension too old to report the field counts as not proven. The guard is
+`_rewrite._check_avg_decimal`; it covers the select list and a `HAVING` over
+an `avg` that is not selected. The permanent fix is to derive the column in
+C++ (`native_avg_decimal`), which has no 53-bit ceiling.
 
 ### 4.4 Packed multi-column keys
 `GROUP BY a, b [, c]` over integer/date/timestamp columns: at upload, each

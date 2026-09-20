@@ -3553,6 +3553,500 @@ assert the yield rule and the bound directly, as
 test with a generous budget. Not changed here.
 
 
+## 2026-09-20 — A guard that was green on a fixture and dead on the path
+
+The 2026-09-19 entry above left `avg` over a DECIMAL payload as an open
+decision: the wrapper derives it in SQL as `double(unscaled sum) / (count *
+10^s)`, which is native's own expression only where `long double` IS `double`
+(arm64, 53-bit mantissa), and differs on x86-64 (64-bit). PR #149 took the
+decline: `_rewrite.check_types` refuses any `avg` over a DECIMAL payload unless
+the extension reports `avgf=53` in `gpu_build_info()`, and `avg_float_bits == 0`
+— an extension too old to report the width — counts as "not proven", not
+"fine". A unit check went in with it and passed.
+
+The guard never ran. It tested `plan.scales.get(col, plan.scale)` near the top
+of `check_types`, and `plan.scales` / `plan.scale` are filled by the payload
+loop *further down in the same function*, which reads each payload's type off
+`columns`. A plan that comes from the matcher arrives with `scales == {}` and
+`scale == 0`, so the condition was false for every statement a user can write.
+The unit check passed because it hand-built a `Plan` with its scales already
+filled — the one state no real plan is ever in at that point.
+
+It surfaced on the x86 box: TPC-H Q1 was rewritten there, on a build reporting
+`avgf=64`, where it should have declined. Measured on that machine on main,
+default thresholds, `residency="eager"`: `SELECT k, avg(amt) FROM d GROUP BY k`
+over a `DECIMAL(18,2)` payload, 4M rows, 5000 groups — rewritten, and **982 of
+5000 groups differ from native** (e.g. `5101177250496.538` against
+`5101177250496.537`); `sum` / `count` / `min` / `max` differ in 0.
+
+The condition is sharper than "x86". The two expressions agree until a group's
+unscaled 128-bit sum passes 2^53, beyond which the double quotient and the
+80-bit one round apart. That is why Q1 at SF1 *looked* identical — its group
+sums are small enough — and why a test over small values would pass for the
+wrong reason. The reproducer therefore builds values around 1e13 so the widest
+group sum is ~4.1e17 unscaled, and it ships as `scripts/avg_decimal_parity.py`
+with a `--force-avg-bits` switch so either platform can be simulated on the
+other.
+
+**The fix** moves the check to the end of `check_types`, after the loop that
+fills `plan.scales`, as `_check_avg_decimal`. It also widens it: the old loop
+looked only at `plan.outputs`, and an `avg` that appears *only* in `HAVING`
+(`… GROUP BY k HAVING avg(d) > 5`) is not an output — it is `plan.having`, and
+`_render_exact` renders it through the same `_agg_expr`, so it reached
+`_avg_decimal_expr` untouched. `ORDER BY` can only name an `avg` that is an
+output, and the top-k push refuses `avg`, so those two are covered by the
+outputs. `check_types` has exactly one caller, so with both sources checked
+there is no second way in: verified end to end that all of single payload,
+several payloads, a computed DECIMAL lane (§4.10), `HAVING avg`, the global
+aggregate (§4.12), a join payload (§4.8), the post-aggregate split (§4.11),
+`WHERE`, top-k, `FILTER`, `GROUP BY ALL`, a view, a CTE and a derived table now
+decline at 64 and are rewritten at 53.
+
+**The general lesson**, which is why this is written down rather than just
+fixed: a test that asserts "not rewritten" asserts almost nothing — a threshold,
+a `nulls` gate or a plain shape mismatch satisfies it too. A decline check must
+assert the REASON and the DETAIL. And a guard test must go through the real
+path: `connect().execute()` with the width forced and the caches dropped, not a
+hand-built plan handed to the function. The new section in
+`python/tests/test_wrapper.py` does both, over data whose group sums pass 2^53,
+and the old fixture check stays with a comment saying what it does and does not
+prove. (Its `columns` argument had to be corrected too: it claimed a
+`DECIMAL(18,2)` payload while the plan said scale 0, an inconsistency only a
+hand-built plan can have.)
+
+**What x86 users get until `native_avg_decimal` lands.** Simulated on the Mac by
+forcing the reported width to 64 and running `scripts/tpch_coverage.py` over
+SF1: coverage goes from 17 of 22 to **16 of 22**, and the single query that
+moves off the device is **Q1**, with `shape: avg over DECIMAL is finalised by
+DuckDB in long double …`. Nothing else in TPC-H declines for this reason — Q17's
+`avg` sits inside a correlated subquery DuckDB evaluates itself, and Q14 and
+Q19 are ratios of sums. On the Mac itself nothing changes: SF1 stays 17 of 22,
+0 rows differing, Q1 on the GPU at 3.9×, because Metal reports `avgf=53`.
+
+The before / after proof on real x86 hardware is owed by the Linux instance:
+`scripts/avg_decimal_parity.py` on main (expected: rewritten, ~982 of 5000
+groups differing) and on this branch (expected: declined, 0 differing). The
+permanent fix stays what the 2026-09-19 entry named — derive the column in C++
+with `native_avg_decimal`, which has no 53-bit ceiling — after which the guard
+becomes unnecessary rather than merely correct.
+
+## 2026-09-20 — CI runs the wrapper suite, and what a machine without a GPU can prove
+
+**What was not covered.** `python/tests/test_wrapper.py` is the only suite that
+puts a REWRITTEN statement and native's next to each other and compares the
+rows; every other suite runs statements written by hand. No CI job ran it
+against a built extension. The SQL suite went into the Linux job on 2026-09-19
+(above), but it exercises the `gpu_*` functions directly, not the client that
+composes calls to them. Both bugs found that week lived in that gap: the CTE
+`AS MATERIALIZED` hint the rewrite dropped under DuckDB 1.5.5 (the serializer
+carries it on 1.4.5, and 1.4.5 was the only interpreter with the module on the
+Mac), and the `avg`-over-DECIMAL guard that was green on a hand-built fixture
+and dead on every real statement.
+
+**What it covers now.** The Linux job, after the SQL suite, installs the pip
+`duckdb` module at exactly the version of the libs it fetched and runs the
+wrapper suite against the extension it just built, through
+`GPUDB_EXTENSION_PATH` (the wrapper sets `allow_unsigned_extensions` itself
+when the path is explicit, so the unsigned local build loads). The version is
+read from `scripts/get_duckdb_libs.sh --print-version`, a new flag that prints
+the tag the script would fetch and exits — the pin stays in one place, which
+matters because the client renders through DuckDB's own
+`json_serialize_sql` / `json_deserialize_sql` and that output is a property of
+the version. A `.duckdb_extension` built against the C_STRUCT ABI loads into
+the pip module of the matching version: verified here with the osx_arm64 build
+under pip duckdb 1.5.5.
+
+**The CPU-backend counts.** A hosted runner has no GPU, so the extension
+reports `runtime=cpu` — and the wrapper never rewrites there, by design: the
+CPU resident path is a single-threaded sort per call, slower than native, so
+rule 1 forbids lowering onto it and `Connection._rewrite_select` declines with
+reason `backend` before it looks at the statement. Run as written, the suite
+did not merely fail on such a machine, it stopped: 75 ok, 202 failures, 0 skips,
+and then an AttributeError in "writes and invalidation", where a decline leaves
+no tag to look up — about a sixth of the way through.
+
+Note that `_exact` is not the gate for this. The CPU backend is the reference
+implementation of every exact operator, so `gpu_build_info()` on a CPU-only
+build says `exact=true join=true global=true store=true avgf=53`; a dozen
+sections gated on `_exact` therefore ran and failed. The suite now asks
+`has_device(con)` — `_backend not in ("", "CPU")` — announces the nine areas
+that need a device through its existing `skip()`, and in their place runs the
+never-rewrite path over the same corpus: 61 statements, each of which must come
+back declined for reason `backend` and with native's rows (122 of the 133
+checks; the other 11 are the extension-age section, which never needed a
+device). Nothing was
+downgraded from a failure to a skip. **CPU backend: 133 ok, 0 failures, 9 skips,
+identical under pip duckdb 1.5.5 and 1.4.5.**
+
+**What still needs a machine with a GPU.** Everything the suite exists for:
+every parity check against native, the scalar renderer against the reference
+renderer, decline reasons other than `backend`, writes and the in-statement row
+guard, cached plans, residency and segmented uploads, computed lanes,
+expressions over aggregates, subquery lanes, CTEs, nested rewriting, joins,
+thresholds and measured rule 1. Neither of the two bugs above would have been
+caught by the CPU leg — both needed a rewrite to happen. What the CPU leg does
+catch is a class that had no owner at all: the client and the extension drifting
+apart (`REQUIRED_FUNCTIONS` is pinned against the built binary), the loadable
+extension failing to load into the pip module of the served DuckDB version, an
+import or packaging break, and any statement in the corpus that stops returning
+native's rows when the wrapper declines it. The parity checks remain the Mac's
+and, once the CUDA exact path is on, the Linux box's to run before a release.
+
+The macOS job was left alone. Its runner has a paravirtual GPU: several Metal
+pipelines refuse to build there, so the backend would be Metal with `exact`
+reachable in principle and pipelines failing case by case — a suite that is
+neither the CPU leg's clean skip nor the real device leg's parity run, and
+flaky in between. A device parity run needs real hardware, which CI does not
+have on either platform.
+
+
+
+## 2026-09-20 — A test that pretended to be the other machine
+
+The avg(DECIMAL) guard landed and main's wrapper suite went from 4 failures to
+27 on x86-64. None of them were the guard being wrong. All of them were
+expectations that had been written on a machine where the guard does not fire.
+
+Two classes, and the second is the interesting one.
+
+**Stale parity expectations (18 checks).** `avg_decimal`, `avg_decimal_nulls`,
+`avg_decimal_having`, `avg_decimal_order`, `avg_decimal_expr`,
+`post-agg avg_decimal_inside`, `global single_decimal`, `spelling avg_filter`
+all assert that avg over a DECIMAL column IS rewritten. On x86 it is now
+correctly declined, so they fail. They passed on main before only because the
+guard was dead. These are dropped where the platform declines them, with a
+visible skip naming each case, and the dedicated end-to-end section still
+covers the decline itself on both platforms.
+
+**A test that cannot hold on this hardware (5 checks).** The new section ends
+with:
+
+    avg_bits(con, 53)
+    for name, sql in ...:
+        check(lr["rewritten"], ...)
+        check(got == want, f"avgf=53 {name}: rows identical to native")
+
+`avg_bits(con, 53)` forces the wrapper to believe the extension reported a
+53-bit mantissa. That changes which path the wrapper CHOOSES. It does not
+change what the machine COMPUTES. On x86-64 DuckDB still finalises native's
+average in the 80-bit type while the SQL derivation computes in 64-bit double,
+so the two differ — on exactly the groups past 2^53 that the fixture is built
+to contain, since the section's own first assertion is that the widest unscaled
+sum is past 2^53.
+
+So the block asserts something false by construction on x86. It passed on arm64
+because forcing 53 there is a no-op: long double already IS double, and the
+simulation and the hardware agree.
+
+That is the distinction worth keeping: a flag that stands for a platform fact
+can be forced, and doing so simulates the DECISION but never the ARITHMETIC.
+The decision half is checkable everywhere and stays checked on both platforms.
+The row-equality half is only checkable where the fact is really true, and now
+runs only there, with a skip on other hosts that says why rather than passing
+quietly.
+
+### Why none of this was visible from the machine that wrote it
+
+The guard fires only where `long double` is wider than `double`. The Mac is
+arm64, where it is not. So every check that the guard changes was, on that
+machine, a check the guard does not touch — and the suite was green for the
+same reason the bug had been invisible for weeks. Merging on that green is what
+put 27 failures on main.
+
+Third time today the same shape has appeared: a check passing for a reason
+other than the one under test. The `MATERIALIZED` guard tested a value the
+serializer had stopped emitting. The avg(DECIMAL) guard read a field before the
+loop that fills it. Now a parity assertion simulated a platform it was not
+running on. In each case the green came from somewhere other than the property
+being asserted, and in each case only the second machine could tell.
+
+After: 1112 checks, 4 failures on x86 — the pre-existing segmented-upload
+cluster — and 5 skips. On arm64 nothing changes at all: the helper returns
+early when the reported width is already 53, so no case is dropped and the
+row-equality half still runs.
+
+## 2026-09-20 — The column SQL could not compute
+
+avg over a DECIMAL payload had been declined since the guard was made to fire:
+native finalises an average as a quotient in `long double`, and the wrapper was
+deriving the column in SQL as `CAST(sum AS DOUBLE) / (count * 10^s)`. That is
+native's formula only where `long double` IS double. On x86-64 it is the
+80-bit type, and the two differ once a group's unscaled sum passes 2^53 —
+measured at 982 of 5000 groups with default settings.
+
+The important part is that no SQL expression fixes it. SQL has no 80-bit type.
+Every candidate rearrangement was tried and each is wrong in its own way —
+`(sum/count)/10^s` and `(sum/10^s)/count` differ from native on 20-30% of
+groups even in exact arithmetic, because native divides once by the scaled
+count. The shape was not declined for want of a better expression; it was
+declined because the target arithmetic is not expressible in the language the
+rewrite emits.
+
+So the derivation moved into C++, where the type exists.
+
+### The seam was already there
+
+The first design sketched threading the payload's DECIMAL scale through the
+table functions, so the extension could fill its `avg` column correctly. That
+meant a new parameter on eight signatures, or the scale carried in the identity
+tag's `extra` field and stored per lane on the resident set — about two hundred
+lines across shared C++ and Python, and a per-lane scale vector because one set
+can be aggregated on different payload lanes by different statements.
+
+None of it was necessary, because the exact GROUP BY already returns the sum as
+a **HUGEINT**. The full 128-bit unscaled sum was in SQL the whole time; the
+only thing missing was a function to divide it the way native does. One scalar:
+
+    gpu_avg_decimal(sum HUGEINT, count BIGINT, scale BIGINT) -> DOUBLE
+
+built on `native_avg_decimal()`, which had been sitting in native_avg.hpp
+since the first avg fix with no caller. Forty lines instead of two hundred, no
+signature changed, no tag changed, no per-lane bookkeeping — and it works for
+the single-payload, multi-payload and global forms at once, because all three
+expose that same HUGEINT column.
+
+Verified directly in SQL against native over 401 groups: the old derivation
+differs on 85, the scalar on 0.
+
+### Two renderers, and only one of them was the one running
+
+The first attempt changed `_avg_decimal_expr` in the Python wrapper, and the
+rewritten statement came back still carrying `CAST(r.sum AS DOUBLE) / ...`.
+The tell was the quoting: the Python renderer emits `r."sum"`, and the
+statement had `r.sum`. The wrapper has two renderers — a C++ one behind
+`gpu_rewrite_ast` and a Python reference implementation — and prefers the C++
+one when the extension provides it. The Python edit was correct and was simply
+not the code that ran.
+
+Both now emit the function, and the suite's own scalar-vs-python agreement
+check is what keeps them honest: it compares rows, names, types and form
+between the two engines on every case.
+
+### What it dissolved
+
+The platform gating added a day earlier — dropping avg-over-DECIMAL parity
+cases on x86 and skipping a row-equality assertion that could not hold there —
+is now inert, because the platform difference is gone. The guard is kept for an
+extension too old to provide the function, and the tests gate on the function's
+presence rather than on the host. The wrapper suite goes from 1112 checks with
+5 skips to **1154 checks with none**: forty-two assertions that had been
+platform-dependent now simply run.
+
+### And one number that is not a win
+
+Q1 returns to the device, and lands at parity: 0.96x, 0.99x, 0.97x, 1.02x over
+four runs. Coverage is 17 of 22 with 0 rows differing, but Q1 is no longer
+clearly above native the way it was at 1.09x before any of this. It is printed
+as measured and no threshold is touched here — whether a statement that hovers
+at 1.0x should be rewritten at all is the per-backend threshold question, and
+that belongs to its own change with its own measurements, not to a correctness
+fix that happens to have made the row eligible again.
+
+## 2026-09-20 — Measurements that existed only in review
+
+An independent read of the release docs found that the CUDA numbers were not in
+the repository. They had been produced, checked and discussed — and they lived
+in review messages. The journal had no CUDA `tpch_coverage` run, BENCHMARK.md
+had no CUDA transparent-path section at all (every one of them is Metal), and a
+comment in `cuda_aggregator.cpp` still read:
+
+    Neither has ever run against a CUDA exact backend.
+
+of `test_wrapper.py` and `tpch_coverage.py` — true when written, false for a
+day by the time it was read. So the public story for CUDA was unit tests and
+the SQL suite, and a reader had no way to learn that 17 of 22 TPC-H queries run
+on the device with no differing rows.
+
+That is worth naming as a failure mode of its own. Work reported to a reviewer
+feels finished, because someone acknowledged it. But the reviewer is not the
+artifact. A number that only exists in a conversation is not a measurement
+anyone else can find, cite or re-run, and a comment that describes the state of
+the evidence goes stale the moment the evidence changes — faster than code
+comments do, because nothing recompiles when a claim about the world expires.
+
+The fix is BENCHMARK.md's first CUDA transparent-path section, the six stale
+CUDA-owned comments, and this entry.
+
+### Two things the write-up forced into the open
+
+**Q1 is at parity, not a win.** Writing the table made it obvious in a way the
+running total had not. Q1 measures 1.04x here and 0.96x / 0.99x / 0.97x / 1.02x
+on four earlier runs: it straddles 1.0x. Its history is worth keeping together —
+it was rewritten at 1.09x while returning WRONG rows on sums past 2^53; then
+declined outright once the guard was made to fire; now correct and eligible
+again, at parity. "Became correct and stopped being faster" is the honest
+sentence, and it is the one a table makes you write.
+
+**The published binary is CPU-only.** The community descriptor carries
+`requires_toolchains: "python3;cuda"`, which reads like a promise of a CUDA
+build. Installed from the registry with a stock client in a clean HOME:
+
+    INSTALL gpudb FROM community; LOAD gpudb; SELECT gpu_build_info();
+    -> compiled=cpu runtime=cpu
+
+So the docs calling it CPU-only are right, and the toolchain field is what
+misleads. None of the CUDA measurements are reachable from the published
+extension; they all need a local build. Stating that next to the numbers seemed
+more useful than stating the numbers alone.
+
+### The four failures that are recorded as failures
+
+The wrapper suite is 1154 ok / 4 fail / 0 skip on the 4090, and all four are the
+segmented background upload. They reproduce identically with the exact path off
+(5 of 20 segments landed with it on, 9 of 20 with it off; ~200 interrupts
+either way), so they are not the exact path. The segments are 2-5 ms each, so
+twenty of them is ~80 ms against a 180 s budget — the manager simply never finds
+a quiet window under a cadence issuing 21-25k statements in that time.
+
+The same suite passes on the M4 Max. That makes cadence the likely explanation,
+and it is written down as a hypothesis rather than a verdict: it is an open
+failure on this box, recorded as one, with the numbers a reader needs to judge
+it for themselves. The temptation with a failure you believe is environmental is
+to describe it as environmental. What can honestly be said is that it does not
+depend on the code under test, and that the reason it fails here and not there
+is not yet established.
+
+## 2026-09-20 — A hypothesis that was wrong, and a 32% win that was real
+
+I told the review that the per-span `cudaStreamSynchronize` in
+`upload_rows_exact` was a candidate for why the segmented-upload test lands 5
+of 20 segments on this box against 20 of 20 on the Mac. It is not, and the way
+that came apart is worth keeping.
+
+Instrumenting the upload printed exactly ONE line for the whole run:
+
+    upload_rows_exact rows=2000000 lanes=3 spans=996 sync_ms=6.719 total_ms=23.085
+
+One call, two million rows. The segmented uploader does not call the backend
+per segment at all — `gpu_upload_begin/finish` buffers segments on the HOST and
+the device copy happens once, at finish. The extension says so in its own
+comment: *nothing touches the device until gpu_upload_finish*. So the per-segment
+cost the test races against is host-side scanning and buffering, and no CUDA
+code runs inside it. My candidate was not merely unproven, it was on a
+different code path.
+
+What makes that worth recording is how plausible it was. The numbers fit: the
+exact path's segments cost 4.90 ms against the v0.6 path's 2.60 ms, I knew the
+exact upload had a synchronize the v0.6 one did not, and the ratio was about
+right. A hypothesis that explains the data is not thereby the cause of it —
+and the thing that settled it was not more reasoning but one print statement
+asking how many times the function was called.
+
+The real difference between 2.60 ms and 4.90 ms per segment is that the exact
+segment buffers three lanes plus validity bitmaps where the v0.6 one buffers
+two lanes and none. That is host work in shared code, and it belongs to the
+back-off branch's problem, not to CUDA.
+
+### The win that survived
+
+The sync was still half the upload. Measured A/B on one build with identical
+instrumentation, five runs each, 2M rows / 3 lanes / 996 spans:
+
+    per-span stream sync   total p50 18.67 ms   of which sync 9.37 ms
+    double buffer + event  total p50 12.75 ms   of which wait  3.52 ms
+
+**32% off the upload.** The old rule was "one staging buffer, synchronize the
+stream after every span", which is correct — a span's H2D must not overwrite
+bytes the previous span's kernels are still reading — and needlessly strong: it
+also serialises the copy against the kernel, leaving the PCIe link idle for
+every kernel's duration and the GPU idle for every copy's. With a buffer each,
+span i+1 copies while span i scatters, and the only wait is on the event saying
+buffer i-1's kernels are done, which is usually already true by the time we
+look. 996 spans is 996 avoidable full-stream barriers.
+
+It does not fix the test, and the test proves it: the `big:` section still
+lands 5 of 20 afterwards. That is the confirmation that the correction above is
+right, rather than a disappointment — a change that fixed the symptom would
+have meant the diagnosis was still wrong.
+
+Both exact uploads get it: the row form and the pair form had the same loop.
+
+## 2026-09-20 — Three passes into one, and a ratio that checks itself
+
+`agg_all_i64` — SUM, MIN, MAX and COUNT in one pass — had been a throwing stub
+on CUDA since v0.1, with a TODO saying what to write. CPU and Metal had it. The
+unit suite had a block for it guarded by `if (b != gpudb::Backend::CUDA)`, which
+is the tidy way of recording that a backend does not do something.
+
+The kernel is unremarkable: a grid-stride loop folding each element into three
+registers, a shared-memory tree reduce, three runs of per-block partials in one
+buffer, a second pass over them. What is worth noting is the number it produced.
+
+    separate SUM+MIN+MAX   2.150 ms
+    fused agg_all          0.719 ms      2.99x
+
+Three passes into one, on 381 MiB, and the ratio landed within 0.3% of 3.00.
+That is not a coincidence to be pleased about — it is a check. A bandwidth-bound
+kernel that reads a column once instead of three times SHOULD be almost exactly
+3x, and the useful information in the measurement is the agreement, not the
+speed. A fused reduce measuring 1.8x would mean something else was wrong —
+occupancy, or a spill, or a read that was not coalesced — and the 2.99x says
+there is nothing else to look for. The absolute number agrees too: 517.8 GiB/s
+against ~576 GB/s of theoretical bandwidth is ~90% of peak.
+
+The CPU is the instructive contrast: the same fusion there is 1.16x. The win
+from fusing is proportional to how much of the time was spent moving bytes, and
+on 20 OpenMP threads at this size that is not most of it. "Fusing aggregates is
+a 3x win" is false as a general claim and true on the machine where memory is
+the constraint — which is the machine this project targets, so it is easy to
+forget the qualifier.
+
+Removing the skip took the unit suite from 711 to 730 checks, all passing.
+Those nineteen were not new tests: they were tests that already existed and had
+been running on two backends out of three.
+
+## 2026-09-20 — The lane got smaller and the cache did not
+
+Stage C on CUDA: every I64 lane of an exact set is stored at the narrowest
+signed width its values fit. On TPC-H SF1 that is 85.8 MiB of lanes against
+206.0 MiB, 58% less, with `l_linenumber` — a column whose values are 1..7 —
+going from 8 bytes a row to 1.
+
+Two things are worth keeping from building it.
+
+### A uniform, not a template
+
+Metal passes the width as a uniform and branches inside a load helper. The
+CUDA reflex is to template each kernel on the width so there is no branch at
+all, and that is wrong here for a specific reason: several kernels read two or
+three lanes at once — a key, a payload, a predicate — and templating would need
+4^2 or 4^3 instantiations of each. The uniform is warp-uniform, so it costs a
+predicted branch rather than divergence, and it keeps the two backends the
+same shape, which is worth something on a project where the second backend is
+how bugs get found.
+
+### The optimisation that quietly became a bug
+
+`ensure_exact_cache` had a fast path: with no NULLs, the v0.5 sort cache IS the
+exact cache, so it delegated. That was true and is now conditional, because the
+v0.5 builder reads the column as raw `int64_t` — which is exactly what a packed
+lane stops being. The first run after narrowing was 707 of 711, with
+`sort_by_key failed: invalid argument`.
+
+The fast path was correct when written and became wrong when a property it
+silently depended on stopped holding. It is the same shape as the hybrid
+planner choosing placement by "did the GPU throw?", and the same shape as a
+guard testing for a serializer value that stopped being emitted. Three times
+now: a condition that was equivalent to the thing it stood for, until it
+wasn't. What makes them findable is that each one had a test that exercised the
+combination — here, a join over a column with no NULLs whose values happen to
+be small.
+
+### The number that moved the problem rather than solving it
+
+`l_suppkey`: an 11.45 MiB lane and a 91.6 MiB sort cache. Before narrowing, the
+lane and the cache were 45.8 and 91.6 — the cache was twice the lane and that
+felt proportionate. Now it is eight times, and the cache is plainly the thing
+to fix next.
+
+That is worth saying out loud because it is easy to report "58% less" and stop.
+The lanes really are 58% smaller; the resident footprint is not, because the
+derived structure that was always the larger half did not move. `narrow_lanes()`
+reports true, and it means lane storage and nothing else — the flag's own
+documentation says so, which is lucky rather than clever. Keys at the lane's
+width and a u32 permutation take that 91.6 MiB to ~34.3 MiB, and that is the
+next change.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

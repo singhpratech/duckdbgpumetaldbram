@@ -81,6 +81,37 @@ jobs:
         run: |
           ./scripts/run_sql_tests.sh
 
+      # --- the Python wrapper, against the extension just built -------------
+      # The SQL suite above runs statements a user writes by hand. This suite
+      # is the only one that runs statements the WRAPPER wrote — it puts a
+      # rewritten statement and native's next to each other and compares the
+      # rows. Two bugs reached main in 2026-09 because nothing here ran it
+      # against a built extension: a CTE hint the rewrite dropped under
+      # DuckDB 1.5.5 but not 1.4.5, and a decline guard that was green on a
+      # fixture and dead on the real path.
+      #
+      # The pip `duckdb` module is pinned to the same version as the libs
+      # fetched above — read from the fetch script, so the pin lives in one
+      # place — because the client renders statements through DuckDB's own
+      # json_serialize_sql / json_deserialize_sql, whose output is a property
+      # of that version.
+      #
+      # A hosted runner has no GPU, so the backend is CPU and the wrapper
+      # never rewrites there (rule 1: the CPU resident path is slower than
+      # native). The suite says so and skips the checks that need a device;
+      # what runs here is the never-rewrite path over the whole corpus, the
+      # decline reasons, and the client/extension version pin. Whatever runs
+      # must pass — no failure is downgraded to a skip.
+      - name: python wrapper suite (CPU backend, pip duckdb at the pinned version)
+        run: |
+          duckdb_tag="$(./scripts/get_duckdb_libs.sh --print-version)"
+          python3 -m pip install --quiet "duckdb==${duckdb_tag#v}"
+          # printed, not asserted: a LOAD failure below is a platform mismatch
+          # between the module and the footer build.sh stamps on the .so
+          python3 -c "import duckdb; c = duckdb.connect(); print('pip duckdb', duckdb.__version__, c.execute('SELECT * FROM pragma_platform()').fetchone()[0])"
+          GPUDB_EXTENSION_PATH="$PWD/build-linux/src/extension/gpudb.linux_amd64.duckdb_extension" \
+              python3 python/tests/test_wrapper.py
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2

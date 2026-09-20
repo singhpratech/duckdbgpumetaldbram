@@ -1045,17 +1045,25 @@ json j_guard(const Context& cx) {
                 {"column_name_alias", json::array()}};
 }
 
-// avg over a DECIMAL(p, s) payload, exactly as native computes it (verified
-// against native on millions of rows at several scales, NULLs and negatives):
-//   double(unscaled sum) / (count * 10^s)
-// — ONE division by the scaled count. (sum / count) / 10^s and
-// (sum / 10^s) / count each differ from native on 20-30% of groups.
+// avg over a DECIMAL(p, s) payload, exactly as native computes it: the exact
+// unscaled 128-bit sum over count * 10^s, as ONE division by the scaled count
+// ((sum / count) / 10^s and (sum / 10^s) / count each differ from native on
+// 20-30% of groups).
+//
+// The division happens in gpu_avg_decimal, in C++, because native finalises an
+// average as a quotient in `long double` and SQL has no 80-bit type. The
+// former rendering —
+//     CAST(r.sum AS DOUBLE) / (r.count * 10^s)
+// — is that formula in `double`, which IS native's on arm64 and is NOT on
+// x86-64: measured at 85 differing of 401 groups on a DECIMAL(18,2) payload
+// once a group's unscaled sum passes 2^53, where double stops being exact.
+// No SQL expression can fix that, which is why the column is derived by a
+// function instead of an operator tree.
 json j_avg_decimal(const std::string& sum_col, const std::string& count_col, int scale, const std::string& name) {
-    std::int64_t p10 = 1;
-    for (int i = 0; i < scale; ++i) p10 *= 10;
-    json num = j_cast(j_colref2("r", sum_col), j_type("DOUBLE"));
-    json den = j_function("*", json::array({j_colref2("r", count_col), j_const_bigint(p10)}), true);
-    return j_function("/", json::array({std::move(num), std::move(den)}), true, name);
+    return j_function("gpu_avg_decimal",
+                      json::array({j_colref2("r", sum_col), j_colref2("r", count_col),
+                                   j_const_bigint(scale)}),
+                      /*is_operator=*/false, name);
 }
 
 Result do_rewrite_exact(json tree, json node, const Context& cx,

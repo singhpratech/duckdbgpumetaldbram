@@ -133,8 +133,9 @@ void test_backend(gpudb::Backend b) {
     }
 
     // Multi-agg fusion: sum + min + max + count in one pass.
-    // CUDA throws (stub); skip there. CPU + Metal must match the reference.
-    if (b != gpudb::Backend::CUDA) {
+    // Every compiled backend implements it and must match the reference —
+    // CUDA included since it grew the fused kernel (it used to throw here).
+    {
         // Empty
         {
             auto r = agg->agg_all_i64(nullptr, 0);
@@ -582,6 +583,51 @@ void test_backend(gpudb::Backend b) {
             } else {
                 std::printf("    FAIL: %s\n", e.what());
                 ++failures; ++total;
+            }
+        }
+        if (implemented) std::printf("    ok\n");
+    }
+
+    // ---- Exact GROUP BY: the extreme key values ----
+    // INT64_MIN is the v0.6 hash paths' empty sentinel, and those refuse it by
+    // design (cuda_groupby.cpp / cuda_hashjoin.cpp raise on it). The exact
+    // path sorts instead of hashing, so it has no sentinel and must accept
+    // both ends of the range — a boundary one code path explicitly rejects is
+    // exactly where another can quietly be wrong.
+    {
+        std::printf("  exact group by, INT64_MIN / INT64_MAX keys:\n");
+        constexpr std::int64_t kMin = std::numeric_limits<std::int64_t>::min();
+        constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+        std::vector<std::int64_t> keys{kMin, kMin, kMax, 0, 0};
+        std::vector<std::int64_t> vals{10, 20, 30, 40, 50};
+        std::vector<std::uint64_t> kvalid(1, ~std::uint64_t{0});
+        kvalid[0] &= ~(std::uint64_t{1} << 4);          // last row: NULL key
+        gpudb::Aggregator::KvSpan sp{};
+        sp.kv = nullptr; sp.rows = keys.size();
+        std::vector<std::int64_t> kv(keys.size() * 2);
+        for (std::size_t i = 0; i < keys.size(); ++i) { kv[2 * i] = keys[i]; kv[2 * i + 1] = vals[i]; }
+        sp.kv = kv.data(); sp.key_valid = kvalid.data(); sp.val_valid = nullptr;
+        bool implemented = true;
+        try {
+            auto pair = agg->upload_pair_exact(&sp, 1, gpudb::Dtype::I64);
+            auto r = agg->groupby_exact_resident(*pair.keys, pair.vals.get(), 1000);
+            // sorted ascending, NULL key last: INT64_MIN, 0, INT64_MAX, NULL
+            EXPECT_EQ(r.keys.size(), std::size_t{4});
+            EXPECT_EQ(r.keys[0], kMin);
+            EXPECT_EQ(r.sums[0], 30);          // 10 + 20
+            EXPECT_EQ(r.counts[0], 2);
+            EXPECT_EQ(r.keys[1], std::int64_t{0});
+            EXPECT_EQ(r.sums[1], 40);
+            EXPECT_EQ(r.keys[2], kMax);
+            EXPECT_EQ(r.sums[2], 30);
+            EXPECT_EQ(r.key_null[3], std::uint8_t{1});
+            EXPECT_EQ(r.sums[3], 50);
+        } catch (const std::exception& e) {
+            if (std::string(e.what()).find("not implemented") != std::string::npos) {
+                implemented = false;
+                std::printf("SKIP (%s)\n", e.what());
+            } else {
+                throw;
             }
         }
         if (implemented) std::printf("    ok\n");

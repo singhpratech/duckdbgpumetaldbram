@@ -33,6 +33,48 @@ def skip(msg):
     print("  skip", msg)
 
 
+def has_device(con):
+    """True when the transparent path can run at all on this machine.
+
+    The wrapper declines every statement with reason "backend" when the
+    extension's runtime is CPU (`Connection._rewrite_select`): the CPU
+    resident path is a single-threaded sort per call, slower than native, so
+    rule 1 forbids lowering onto it (docs/TRANSPARENT_DESIGN.md §7). That is
+    a property of the machine, not a gap in the build, so a check that asserts
+    a rewrite is announced as a skip there rather than run and failed.
+
+    `_exact` is NOT the right gate for this: the CPU backend is the reference
+    implementation of every exact operator, so `gpu_build_info()` on a
+    CPU-only build reports exact=true, join=true, global=true, store=true.
+    """
+    return con._backend not in ("", "CPU")
+
+
+def drop_avg_decimal(con, cases, names, where):
+    """Remove the parity cases that average a DECIMAL column, where this
+    platform declines them.
+
+    avg over DECIMAL is derived in SQL as double(unscaled sum) / (count *
+    10^scale), which is native's own expression only where `long double` IS
+    double. On x86-64 it is the 80-bit type, so the guard in
+    _rewrite._check_avg_decimal() declines the shape and there is no rewritten
+    form for a parity case to compare. The decline itself is covered on both
+    platforms by the dedicated end-to-end section, so nothing goes unchecked
+    here — these cases simply have no second engine to check against."""
+    # An extension that provides gpu_avg_decimal derives the column in C++, in
+    # long double, on every platform — so the shape is rewritten everywhere and
+    # there is nothing platform-dependent left to drop. Only an older
+    # extension, which has to derive it in SQL, still declines it off arm64.
+    if getattr(con, "_has_avg_decimal", False) or getattr(con, "_avg_float_bits", 53) == 53:
+        return
+    for n in names:
+        cases.pop(n, None)
+    skip(f"{where}: avg over DECIMAL is declined where long double is "
+         f"{con._avg_float_bits} bits, not 53 ({', '.join(names)})")
+
+
+
+
 def native(sql):
     c = duckdb.connect()
     c.execute(SETUP)
@@ -73,8 +115,10 @@ def same(a, b):
 def run():
     print("== rewrite + parity")
     con = fresh()
-    if con._backend in ("", "CPU"):
-        print("no GPU backend; only the never-rewrite path can be tested here")
+    if not has_device(con):
+        print(f"backend {con._backend or 'none'}: the wrapper never rewrites on a CPU "
+              "runtime, so only the never-rewrite path can be tested here — the corpus "
+              "below runs, and every statement must come back declined and native")
     elif not getattr(con, "_exact", False):
         # A GPU backend that has not implemented the v0.7 exact path declines
         # every rewritable shape with reason "shape", so most checks below
@@ -156,12 +200,54 @@ def run():
         "str_pred":   "SELECT k, sum(v) FROM t WHERE s = 'delta' GROUP BY k ORDER BY k",
         "explain":    "EXPLAIN SELECT k, sum(v) FROM t GROUP BY k",
     }
+    drop_avg_decimal(con, cases,
+                     ["avg_decimal", "avg_decimal_nulls", "avg_decimal_having",
+                      "avg_decimal_order", "avg_decimal_expr"], "group-by parity")
     if not con._exact:
         for name in ("nulls", "min_max_avg", "where_int", "where_mixed", "where_having", "where_topk",
                      "having_eq", "having_avg", "decimal_minmax", "date_key", "date_pred",
                      "two_keys", "two_keys_where", "three_keys_topk",
                      "str_key", "str_key_pred", "str_mixed", "str_pred"):
             cases.pop(name)
+    if not has_device(con):
+        # Everything between here and the extension-age section at the end of
+        # run() asserts a rewrite, and on a CPU runtime there is never one to
+        # assert: the wrapper declines before it even looks at the statement.
+        # Those checks are announced as skips below — not silently, and not as
+        # failures, since no build could make them pass on this machine.
+        #
+        # What a CPU runtime does prove is the never-rewrite path: the same
+        # corpus goes through the whole client (classification, splitting,
+        # name resolution, the template cache, the decline) and every
+        # statement must come back with native's rows and the right reason.
+        # This is what a hosted CI runner runs.
+        for name, sql in cases.items():
+            if name == "explain":
+                continue                      # a plan, not rows: nothing to compare
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            nat, _ = native(sql)
+            check(not lr["rewritten"] and lr["reason"] == "backend",
+                  f"{name}: declined on a CPU runtime (reason={lr['reason']})")
+            check(same(got, nat), f"{name}: rows identical to native ({len(got)} rows)")
+        for what in (
+                "rewrite and parity: every shape the engine accepts, against native's "
+                "rows, names and types",
+                "the scalar renderer against the reference renderer",
+                "rejections, catalog shadowing and their decline reasons",
+                "writes, invalidation and the in-statement row guard",
+                "cached plans: every event that re-decides one",
+                "residency: eager, background and segmented uploads, eviction, the "
+                "memory budget, view-backed sets and store_columns()",
+                "computed lanes, expressions over aggregates, subquery lanes, folded "
+                "derived tables, CTEs, nested rewriting, aggregate spellings, "
+                "shorthand, DISTINCT forms and views",
+                "key joins",
+                "thresholds: the row floor, inner-statement bounds and measured rule 1"):
+            skip(f"{what} — needs a GPU backend, and this extension reports runtime=CPU")
+        con.close()
+        extension_age_checks()
+        return report()
     for name, sql in cases.items():
         got = con.execute(sql).fetchall()
         lr = con.last_rewrite()
@@ -507,6 +593,11 @@ def run():
     # and the shape is declined unless that says 53. Driven through check_types
     # directly so both answers are exercised on any platform — end to end only
     # one of them would ever be reachable.
+    #
+    # NOTE: these five checks prove the FUNCTION, not the PATH. They hand
+    # check_types a Plan whose scales are already filled, which no plan from
+    # the matcher ever is — so they stayed green while the guard itself was
+    # dead on every real statement (see the end-to-end section below).
     from gpudb import _rewrite as _rw
 
     def _plan(kind, scale):
@@ -520,9 +611,11 @@ def run():
         return p
 
     def _declines(kind, scale, bits):
+        # `columns` says what the payload really is: check_types reads the
+        # scales off it, so the fixture's own p.scale must agree with it.
+        cols = {"k": "BIGINT", "v": "DECIMAL(18,2)" if scale else "BIGINT"}
         try:
-            _rw.check_types(_plan(kind, scale), {"k": "BIGINT", "v": "DECIMAL(18,2)"},
-                            exact=True, avg_float_bits=bits)
+            _rw.check_types(_plan(kind, scale), cols, exact=True, avg_float_bits=bits)
             return False
         except _rw.Decline:
             return True
@@ -532,6 +625,122 @@ def run():
     check(_declines("avg", 2, 0), "avg(DECIMAL) declined when the extension does not report avgf")
     check(not _declines("avg", 0, 64), "avg over an integer payload is unaffected")
     check(not _declines("sum", 2, 64), "sum over DECIMAL is unaffected")
+
+    # ---- the same guard through the REAL path (every avg(DECIMAL) shape) ----
+    # The checks above went green on a hand-built Plan while the guard was dead
+    # on every statement a user can write: it read plan.scales BEFORE the loop
+    # in check_types that fills them, so it saw 0 for every payload and never
+    # fired. On an x86 box (avgf=64) TPC-H Q1 was rewritten where it should have
+    # declined. These go through connect().execute() with _avg_float_bits forced
+    # and assert the REASON and the DETAIL, not merely "not rewritten" — a
+    # threshold or a nulls decline would satisfy that too, and that ambiguity is
+    # how the bug hid. The data is shaped so the answers would actually differ if
+    # the guard were dead: the difference only appears once a group's unscaled
+    # 128-bit sum passes 2^53, which is why Q1 at SF1 looked like it matched.
+    print("== avg over DECIMAL: the long double guard, end to end")
+    con = fresh()
+    if not getattr(con, "_exact", False):
+        skip("avg(DECIMAL) guard end to end: this backend has no exact path, "
+             "so no avg shape is rewritten at either width")
+    else:
+        con.execute("""
+        CREATE TABLE ab AS
+            SELECT (i % 2000)::BIGINT AS k,
+                   (((i * 7919) % 99991) * 10000000000 / 100.0 + (i % 997))::DECIMAL(18,2) AS amt,
+                   (((i * 7919) % 99991) * 100000000)::DECIMAL(15,2) AS m,
+                   (i % 97)::BIGINT AS v,
+                   (i % 40)::INTEGER AS did
+            FROM range(400000) r(i);
+        CREATE TABLE ad (did INTEGER PRIMARY KEY, tier INTEGER);
+        INSERT INTO ad SELECT i, (i % 7)::INTEGER FROM range(40) r(i);
+        """)
+        host_avgf = con._avg_float_bits          # before avg_bits() forces anything
+        widest = con._raw.execute(
+            "SELECT max(s) FROM (SELECT abs(sum(amt) * 100) AS s FROM ab GROUP BY k)").fetchone()[0]
+        check(float(widest) > 2.0 ** 53,
+              f"avg guard: the widest group sum is {widest} unscaled, past 2^53 "
+              "(below it the SQL derivation and native agree even on x86)")
+
+        def avg_bits(c, bits):
+            """Force the reported long double width and drop everything decided
+            under the old one: the per-template decision cache, the nested /
+            folded caches, the prepared plans and the measurement state."""
+            c._avg_float_bits = bits
+            c._invalidate_all("SET")
+            c._split_cache.clear()
+            c._timing_decision = None
+
+        acases = {
+            "single":    "SELECT k, avg(amt) FROM ab GROUP BY k ORDER BY k",
+            "two_pay":   "SELECT k, sum(v), avg(amt) FROM ab GROUP BY k ORDER BY k",
+            "computed":  "SELECT k, avg(m * 2) FROM ab GROUP BY k ORDER BY k",
+            "having":    "SELECT k, sum(amt) FROM ab GROUP BY k HAVING avg(amt) > 5000000000000 ORDER BY k",
+            "global":    "SELECT avg(amt), count(*) FROM ab",
+            "join":      "SELECT tier, avg(amt) FROM ab JOIN ad ON ab.did = ad.did GROUP BY tier ORDER BY tier",
+            "post_agg":  "SELECT k, avg(amt) * 2 AS twice FROM ab GROUP BY k ORDER BY k",
+            "where":     "SELECT k, avg(amt) FROM ab WHERE v > 3 GROUP BY k ORDER BY k",
+            "topk":      "SELECT k, avg(amt) AS a FROM ab GROUP BY k ORDER BY a DESC, k LIMIT 5",
+        }
+        # unaffected by the guard: the derivation is only used for a DECIMAL payload
+        ucases = {
+            "avg_bigint":  "SELECT k, avg(v) FROM ab GROUP BY k ORDER BY k",
+            "sum_decimal": "SELECT k, sum(amt) FROM ab GROUP BY k ORDER BY k",
+            "minmax_decimal": "SELECT k, min(amt), max(amt) FROM ab GROUP BY k ORDER BY k",
+        }
+        native_dec = getattr(con, "_has_avg_decimal", False)
+        avg_bits(con, 64)
+        for name, sql in list(acases.items()):
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            if native_dec:
+                # gpu_avg_decimal finalises the column in C++ the way native
+                # does, so a 64-bit long double is no longer a reason to
+                # decline — and the rows have to match on THIS host, which is
+                # the whole point of deriving it there.
+                check(lr["rewritten"],
+                      f"avgf=64 {name}: rewritten — the column is derived in C++ "
+                      f"({lr['reason']}: {str(lr['detail'])[:50]})")
+                check(got == want, f"avgf=64 {name}: rows identical to native ({len(want)} rows)")
+            else:
+                check(not lr["rewritten"] and lr["reason"] == "shape"
+                      and "long double" in (lr["detail"] or ""),
+                      f"avgf=64 {name}: declined, reason=shape, detail names long double "
+                      f"({lr['reason']}: {str(lr['detail'])[:60]})")
+                check(got == want, f"avgf=64 {name}: DuckDB answers, and the rows are native's")
+        for name, sql in ucases.items():
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            check(lr["rewritten"], f"avgf=64 {name}: still rewritten ({lr['reason']}: "
+                                   f"{str(lr['detail'])[:60]})")
+            check(got == want, f"avgf=64 {name}: rows identical to native")
+        # 53 bits: long double IS double, the derivation is native's own
+        # expression, and every shape above is back on the device — including
+        # the groups whose unscaled sum is past 2^53.
+        avg_bits(con, 53)
+        # Forcing the REPORTED width to 53 changes the wrapper's DECISION. It
+        # does not change this host's arithmetic: on x86-64 DuckDB still
+        # finalises native's avg in the 80-bit type while the SQL derivation
+        # computes in 64-bit double, so the two genuinely differ on exactly the
+        # groups past 2^53 that this fixture is built to contain. The decision
+        # is checked on both platforms; the row equality can only be checked
+        # where long double really IS double.
+        for name, sql in list(acases.items()) + list(ucases.items()):
+            want = con._raw.execute(sql).fetchall()
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            check(lr["rewritten"], f"avgf=53 {name}: rewritten ({lr['reason']}: "
+                                   f"{str(lr['detail'])[:60]})")
+            if native_dec or host_avgf == 53:
+                check(got == want, f"avgf=53 {name}: rows identical to native ({len(want)} rows)")
+        if not native_dec and host_avgf != 53:
+            skip(f"avgf=53 rows-identical ({len(acases) + len(ucases)} shapes): this host's "
+                 f"long double is {host_avgf} bits, so pretending the extension reported 53 "
+                 f"changes which path runs but not what native computes — the derivation "
+                 f"differs from native here by construction, which is the bug the guard exists "
+                 f"for. The decision half of each shape is still checked above.")
+    con.close()
 
     # ---- computed lanes (§4.10): expressions as payloads, keys and predicates ----
     print("== computed lanes")
@@ -644,6 +853,7 @@ def run():
             "two_keys":       "SELECT k, z, sum(a) / count(*) AS m FROM tm GROUP BY k, z ORDER BY k, z",
             "string_key":     "SELECT s, sum(v) * 1.0 / count(*) AS m, upper(s) AS us FROM t GROUP BY s ORDER BY s NULLS LAST",
         }
+        drop_avg_decimal(con, pcases, ["avg_decimal_inside"], "post-aggregate expressions")
         for name, sql in pcases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
@@ -689,6 +899,7 @@ def run():
             "single_having_no": "SELECT sum(v) AS s FROM t WHERE v > 100000 HAVING sum(v) > 1",
             "single_ratio":     "SELECT sum(v) / count(*) AS m, count(*) FROM t WHERE k < 300",
         }
+        drop_avg_decimal(con, sgcases, ["single_decimal"], "global aggregate")
         for name, sql in sgcases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = con._raw.execute("DESCRIBE " + sql).fetchall()
@@ -701,6 +912,8 @@ def run():
                   f"global {name}: names and types identical")
         # EXCEPT both ways through the rewritten text itself
         for name in ("single_plain", "single_where", "single_decimal", "single_expr"):
+            if name not in sgcases:      # dropped above where this platform declines it
+                continue
             sql = sgcases[name]
             con.execute(sql).fetchall()
             rw = con.last_rewrite()["sql"]
@@ -1060,6 +1273,7 @@ def run():
             "over_join":         None,
         }
         acases.pop("over_join")
+        drop_avg_decimal(con, acases, ["avg_filter"], "aggregate FILTER")
         for name, sql in acases.items():
             want = con._raw.execute(sql).fetchall()
             want_desc = [(r[0], r[1]) for r in con._raw.execute("DESCRIBE " + sql).fetchall()]
@@ -2059,12 +2273,23 @@ def run():
               f"store_columns(): a width is a lane width or absent ({[c['width'] for c in cols]})")
     con.close()
 
-    # ---- the client and the extension can be different ages -----------------
-    # The pip package and the loadable extension are installed separately
-    # (PyPI / `INSTALL gpudb FROM community`), so a client can meet an older
-    # extension than the one it was written against. That must read as a plain
-    # DuckDB connection with a sentence saying why, never as a statement
-    # naming a function the catalogue does not have.
+    extension_age_checks()
+    return report()
+
+
+def extension_age_checks():
+    """The client and the extension can be different ages.
+
+    The pip package and the loadable extension are installed separately
+    (PyPI / `INSTALL gpudb FROM community`), so a client can meet an older
+    extension than the one it was written against. That must read as a plain
+    DuckDB connection with a sentence saying why, never as a statement
+    naming a function the catalogue does not have.
+
+    Nothing here needs a device: it runs on every backend, CPU included, and
+    the REQUIRED_FUNCTIONS pin is the one check that catches the client and
+    the built extension drifting apart.
+    """
     from gpudb import connection as _conn
 
     con = fresh()
@@ -2111,6 +2336,8 @@ def run():
           "no extension: last_rewrite()['detail'] says it too")
     bare.close()
 
+
+def report():
     print()
     if SKIPS:
         print(f"{len(SKIPS)} skipped (this backend cannot reach them):")
