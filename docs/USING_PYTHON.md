@@ -40,6 +40,16 @@ A short script that knows what it will read usually wants
 `residency="eager"`. A long-lived service or a notebook wants the default:
 the first statements answer from DuckDB and the uploads fill in behind them.
 
+Under `"background"` an upload has two steps an interrupt cannot stop — the
+copy to the device and the sort cache built after it — and on a machine whose
+cores are already contended those two wait for a quiet moment rather than run
+beside your statements. The wait is bounded at 20 seconds per step, after which
+the step runs anyway: residency is delayed on a busy machine and never
+withheld, and an idle machine is unaffected. Segments also adapt their size when
+they rarely fit the window a workload leaves between its statements.
+`GPUDB_RESIDENCY_TRACE=1` prints a line per segment attempt and per wait
+([every environment variable](ENVIRONMENT.md)).
+
 ## Seeing what happened
 
 `con.last_rewrite()` returns the record for the last statement. Its keys are

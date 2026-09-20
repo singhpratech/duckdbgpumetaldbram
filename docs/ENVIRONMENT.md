@@ -17,6 +17,9 @@ nothing (`test/sql/gpu_force_backend.test` only pins that it does not crash).
 |---|---|---|
 | `GPUDB_EXTENSION_PATH` | unset | Path to the `.duckdb_extension` to load. Second in the lookup order, after an explicit `gpudb.connect(extension=…)` and before a `build-macos/` / `build-linux/` directory beside a checkout and DuckDB's own installed copy. |
 | `GPUDB_MEMORY_BUDGET_MB` | see below | Device memory, in MB, that resident sets may use. `0` removes the cap. An explicit `memory_budget=` argument or `--memory-budget` wins over it. Unset: half of device memory on CUDA, a quarter of host memory on unified memory (Apple silicon), clamped to what the backend reports. |
+| `GPUDB_UPLOAD_QUIET_MS` | `400` | The idle stretch a background upload's two uninterruptible steps — the device copy and the sort cache — ask the connection for before they start, on a machine whose cores are contended. `0` turns the back-off off and takes the old path. |
+| `GPUDB_UPLOAD_QUIET_MAX_S` | `20` | How long such a step waits for that window. The window asked for decays to the ordinary idle threshold across it, so the step takes the best gap the connection offers and runs unconditionally at the end. This is the bound on how long readiness can be delayed, per step. |
+| `GPUDB_RESIDENCY_TRACE` | unset | Anything but empty or `0` prints one stderr line per segment attempt and per quiet wait: how long the session waited for its window, how long the scan then ran, how many cores it got, and whether it landed. |
 | `NO_COLOR` | unset | Any non-empty value turns off the shell's colour ([no-color.org](https://no-color.org)). Colour also needs a terminal. |
 | `TERM` | — | The shell uses a 256-colour accent when it contains `256color`, and basic cyan otherwise. |
 
