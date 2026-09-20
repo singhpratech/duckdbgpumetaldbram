@@ -13,8 +13,11 @@ happened to the last statement.
 
 The wrapper needs the `gpudb` DuckDB extension. It looks, in order, for an
 explicit `extension=` path, the `GPUDB_EXTENSION_PATH` environment variable, a
-local build next to a source checkout, and finally the extension installed in
-DuckDB itself (`INSTALL gpudb FROM community; LOAD gpudb;`).
+local build next to a source checkout, a copy bundled in this package, and
+finally the extension installed in DuckDB itself (`INSTALL gpudb FROM
+community; LOAD gpudb;`). The wheels built for a supported platform carry that
+bundled copy; the `py3-none-any` wheel does not, and there the extension has to
+come from DuckDB's own install.
 
 Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
 `memory_budget` (e.g. `"16GB"`), `thresholds`. Design, limits and measurements:
@@ -24,7 +27,7 @@ Settings: `residency` (`background` | `eager` | `manual`), `floor_rows`,
 
 ```
 $ gpudb my.duckdb
-gpudb 0.7.0.dev0
+gpudb 0.7.0
 backend:      Metal · Apple M4 Max · 51.8 GiB device memory
 transparent:  available — every statement goes through the wrapper
 database:     my.duckdb

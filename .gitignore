@@ -87,8 +87,11 @@ ehthumbs.db
 # Per-worktree symlink to shared data dir
 /data
 
-# DuckDB pre-built shared libs (~140 MB; downloaded by scripts/get_duckdb_libs.sh)
+# DuckDB pre-built shared libs (~140 MB; fetched by scripts/get_duckdb_libs.sh).
+# Both spellings: the trailing slash matches only a directory, and a worktree
+# reaches these through a symlink to the main checkout's copy.
 third_party/duckdb-libs/
+third_party/duckdb-libs
 
 # community-extensions CI build dirs (created by the root Makefile / extension-ci-tools)
 cmake_build/
@@ -97,3 +100,9 @@ duckdb_unittest_tempdir/
 
 # Private working notes — never committed (strategy, drafts, plans)
 .private/
+
+# pip packaging output. The extension binary the platform wheel carries is
+# copied into python/gpudb/_ext/ by scripts/build_wheels.sh and taken out
+# again; it is a build product and is never committed.
+python/gpudb/_ext/
+python/dist/

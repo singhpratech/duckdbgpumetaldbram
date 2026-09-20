@@ -5115,6 +5115,181 @@ straddles 1.0x on this box — 0.97x through `execute`, 1.03x through `sql` — 
 the one shape that might ever justify a CUDA-specific constant is the one the
 measured rule is currently handling per process.
 
+## 2026-09-20 — Shipping the binary with the client
+
+The pip package and the loadable extension reach a user by two different
+routes: `pip install duckdb-gpudb` from PyPI, and `INSTALL gpudb FROM
+community` from the DuckDB community registry. Until now the wrapper found the
+extension in one of three places — an explicit `extension=` path, the
+`GPUDB_EXTENSION_PATH` environment variable, or a source checkout's own
+`build-macos/` / `build-linux/` — and otherwise fell back to `LOAD gpudb`,
+whatever DuckDB itself had installed.
+
+For this release those two routes are not simultaneous. The package is
+published first; the registry serves the previous version until its own build
+lands. And the client will not use an older extension: `_probe_extension` asks
+the catalogue whether every name in `REQUIRED_FUNCTIONS` is registered and, if
+any is missing, puts the connection into plain-DuckDB mode with a sentence
+saying which ones are absent. That check is correct — a client that renders
+statements naming functions the extension does not have would fail every one of
+them after paying for an upload first — but combined with the release order it
+means a pip-only install would have had no GPU path at all.
+
+Measured, in a clean virtual environment with the pure wheel installed and the
+registry's current build present in `~/.duckdb`:
+
+    extension_note : the loaded gpudb extension is older than this client:
+                     it does not provide gpu_residents, gpu_store_columns,
+                     gpu_resident_dictionary and 23 more
+    last_rewrite   : rewritten=False reason=backend
+    rows           : identical to native
+
+So the fix is to put the binary in the wheel. `gpudb/_ext/` is package data —
+empty in the repository, never committed — and `scripts/build_wheels.sh` copies
+one built `.duckdb_extension` into it, builds the platform wheel, takes it out
+again, and builds the `py3-none-any` wheel and the sdist with nothing in them.
+The script fails loudly unless the platform wheel holds exactly one binary and
+the other two hold none.
+
+### The lookup order, and why the checkout comes first
+
+    explicit extension= → GPUDB_EXTENSION_PATH → build-macos/ | build-linux/
+                        → gpudb/_ext/ → LOAD gpudb
+
+The bundled copy is looked for after a source checkout's build and before
+DuckDB's own installed extension. Someone who has just built the extension is
+testing that binary; an installed wheel's `_ext/` shadowing it silently would
+be the worst kind of wrong. And `LOAD gpudb` stays last because it is the only
+entry that can hand back something older than the client.
+
+### What the clean-environment runs showed
+
+Three virtual environments outside the checkout, with no `GPUDB_EXTENSION_PATH`
+and no `PYTHONPATH`, run from a directory with no repository on `sys.path`:
+
+| wheel | Python | DuckDB | `_find_extension` | plain GROUP BY over 2M rows |
+|---|---|---|---|---|
+| platform | 3.9.6 | 1.4.5 | the bundled `_ext/` copy | rewritten, rows identical to native |
+| platform | 3.13.9 | 1.5.5 | the bundled `_ext/` copy | rewritten, rows identical to native |
+| any | 3.13.9 | 1.5.5 | `None` | declined, rows identical to native |
+
+`gpu_build_info()` reports `runtime=metal exact=true join=true global=true
+store=true` in both platform runs, `duckdb_extensions()` reports `v0.7.0`, and
+the `gpudb` console script starts and answers a statement piped on stdin in all
+three. One binary, built once, loads under both DuckDB 1.4.5 and 1.5.5 — which
+is what the stable C_STRUCT ABI is for, and the first time it has been
+demonstrated from an installed package rather than a checkout.
+
+The third row is the documented degradation and nothing more: the wrapper says
+in one sentence why it cannot use what it found, every statement runs on
+DuckDB, and the answers are native's.
+
+### The wheel tags
+
+The platform wheel contains a Mach-O binary and no Python C extension, so
+`py3-none-<platform>` is the honest tag: any CPython 3.x, no ABI, one platform.
+Left alone setuptools stamps the interpreter and ABI of whichever Python ran
+the build, which claims less than the contents support, so `setup.py` overrides
+`get_tag` and marks the distribution impure. The `any` wheel and the sdist are
+built with the directory empty and come out `py3-none-any`.
+
+The platform part is read from the binary rather than from the machine:
+`otool -l` gives `LC_BUILD_VERSION`, whose `minos` field is the minimum macOS
+the loader will accept, and `lipo -archs` gives the architecture. On Linux the
+tag must be passed in: the manylinux/glibc floor is a property of the toolchain
+and the script does not guess it.
+
+Reading it from the binary is what exposed the next problem. The first build
+came out at `minos` **26.0** — a wheel installable only on the macOS it was
+compiled on.
+
+### The deployment target nobody was setting
+
+Nothing in this project set `CMAKE_OSX_DEPLOYMENT_TARGET`, and nothing in
+`extension-ci-tools` sets one either: the C-API extension makefiles pass
+`EXTENSION_NAME`, the target DuckDB version and the vcpkg triplet, and no
+deployment target at all. (The only `11.0` in that submodule is
+`VCPKG_OSX_DEPLOYMENT_TARGET` in a vcpkg port file, which governs vcpkg-built
+dependencies; this extension has none.) So the floor is whatever SDK the build
+ran against, and the binaries on this machine say exactly that:
+
+| binary | minos | sdk |
+|---|---|---|
+| `~/.duckdb/extensions/v1.5.5/osx_arm64/gpudb.duckdb_extension` (registry) | 15.0 | 15.5 |
+| `~/.duckdb/extensions/v1.5.5/osx_arm64/tpch.duckdb_extension` (DuckDB core) | 11.0 | 15.5 |
+| `~/.duckdb/extensions/v1.5.2/osx_arm64/httpfs.duckdb_extension` (DuckDB core) | 11.0 | 15.5 |
+| this tree, before | 26.0 | 27.0 |
+
+DuckDB's own extensions are at 11.0 because DuckDB sets the target in its own
+build. Ours is at 15.0 because the community-extensions runner's SDK was 15.5
+when it built — an inherited number, not a decision. That 15.0 is nevertheless
+the floor users already get today.
+
+The target is now set in `CMakeLists.txt` before `project()` — before, because
+that is when the compiler is probed and the value baked into the toolchain —
+and only when neither `CMAKE_OSX_DEPLOYMENT_TARGET` nor the
+`MACOSX_DEPLOYMENT_TARGET` environment variable already says otherwise.
+
+Choosing the value is partly a compile question. Building the library with
+`-Wunguarded-availability-new -Wunguarded-availability`:
+
+* **11.0** — four warnings in three files. `MTLLanguageVersion3_1` (macOS 14.0)
+  in `metal_groupby.mm`, `metal_hashjoin.mm` and `metal_radix_sort.mm`, and
+  `MTLGPUFamilyMetal3` (macOS 13.0) in `metal_aggregator.mm`. The language
+  version is already inside an `@available(macOS 15.0, *)` check that picks
+  3.2 or falls back to 3.1; guarding that fallback further would mean naming a
+  third, older language version, which is a fallback this code does not have.
+  Inventing one would change the shader language on machines nobody here can
+  test.
+* **14.0** — zero availability warnings.
+* **15.0** — zero availability warnings.
+
+Two targets are clean, so the compiler does not decide between them.
+
+The floor is **15.0**, and 14.0 was deliberately not taken.
+
+Compiling cleanly is not the same as having run. The shader-compile paths pick
+their Metal language version at run time — 3.2 on macOS 15 or newer, 3.1 below
+— and that 3.1 branch has never executed on any machine, because every machine
+gpudb has run on is 15 or newer. A 14.0 target would ship it on the compiler's
+word. 15.0, by contrast, is the floor of the binary the community registry has
+been serving: it has shipped, and it has run.
+
+So the claim is narrow and it is stated as such. **15.0 is claimed because a
+15.0 binary has shipped and run.** 14.0 compiles without a single availability
+warning and is not claimed. Nothing here was tested on a macOS older than the
+one it was built on; no such machine is available.
+
+The packaged extension and the dylib now both report `minos 15.0`, and the
+wheel tag follows on its own — `macosx_15_0_arm64`.
+
+### What the deployment target does not change
+
+The Metal shaders are compiled at run time, not at build time: `sum.metal` and
+`groupby.metal` are embedded as C strings (`cmake/embed_metal_sources.cmake`)
+and handed to `newLibraryWithSource:options:error:`. No `.metallib` is produced
+anywhere in the build, so there is no second binary with a floor of its own.
+
+Three of the four compile sites already choose the language version behind a
+runtime check — `MTLLanguageVersion3_2` on macOS 15 or newer, `3_1` below —
+which the deployment target does not affect. The fourth, `metal_aggregator.mm`,
+leaves `MTLCompileOptions.languageVersion` at its default, and that default
+could in principle be derived from the deployment target. Measured, on this
+machine, with a two-line program compiled at two different targets:
+
+    -mmacosx-version-min=26.0  ->  languageVersion 0x40000 (Metal 4.0)
+    -mmacosx-version-min=15.0  ->  languageVersion 0x40000 (Metal 4.0)
+
+The default comes from the runtime Metal framework, not from the target, so
+lowering the floor does not move the generated code. Nothing was changed about
+the shader language version, deliberately.
+
+The suites agree, on a clean rebuild at the 15.0 target: 3056 / 3056 unit
+checks, 225 SQL pass / 0 fail, the wrapper and shell suites clean under DuckDB
+1.5.5, the budget gate PASS at 169 statements with 0 differing, and TPC-H SF1
+coverage unchanged at 17 of 22 on the device, 0 differing, ratios 1.44x to
+12.59x against the 1.4x-13.6x on record.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

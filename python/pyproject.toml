@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckdb-gpudb"
-version = "0.7.0.dev0"
+version = "0.7.0"
 description = "Plain DuckDB SQL on the GPU: a drop-in gpudb.connect() that answers statements on the device when that is faster, and lets DuckDB run everything else"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -25,3 +25,10 @@ Documentation = "https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/d
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["gpudb*"]
+
+# The extension binary, when one was bundled. `gpudb/_ext/` is empty in the
+# repository and in the sdist: scripts/build_wheels.sh puts exactly one built
+# `.duckdb_extension` there for the platform wheel and removes it again for the
+# `py3-none-any` wheel. See setup.py for the wheel tag that goes with it.
+[tool.setuptools.package-data]
+gpudb = ["_ext/*.duckdb_extension"]
