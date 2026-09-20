@@ -133,8 +133,9 @@ void test_backend(gpudb::Backend b) {
     }
 
     // Multi-agg fusion: sum + min + max + count in one pass.
-    // CUDA throws (stub); skip there. CPU + Metal must match the reference.
-    if (b != gpudb::Backend::CUDA) {
+    // Every compiled backend implements it and must match the reference —
+    // CUDA included since it grew the fused kernel (it used to throw here).
+    {
         // Empty
         {
             auto r = agg->agg_all_i64(nullptr, 0);

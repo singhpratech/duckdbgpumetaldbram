@@ -5082,3 +5082,45 @@ v0.6 function set (no exact forms). Everything in this section requires a local
 build with a CUDA toolchain; none of it is reachable from the published
 extension.
 
+## agg_all on CUDA — the fused reduce, RTX 4090, 50M rows (2026-09-20)
+
+`agg_all_i64` (SUM + MIN + MAX + COUNT in one pass) had been a throwing stub on
+CUDA since v0.1; CPU and Metal implemented it. This is the fused kernel, and
+the measurement of the thing the fused form exists for: reading the column
+ONCE instead of three times.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89, 15943 MiB), driver
+580.178.04, CUDA 13.0.88, Linux x86_64, 20 host threads. `scripts/build.sh`,
+`gpudb-bench --op all --backend all --rows 50000000` (381.5 MiB of int64),
+median of 5.
+
+| backend | | separate SUM+MIN+MAX | fused agg_all | speedup |
+|---|---|---|---|---|
+| CUDA | HOT kernel | 2.150 ms | **0.719 ms** | **2.99×** |
+| CUDA | HOT wall | 2.178 ms | 0.730 ms | 2.98× |
+| CUDA | COLD wall (incl. H2D) | 118.597 ms | 39.539 ms | 3.00× |
+| CPU (20 threads) | HOT wall | 19.382 ms | 18.168 ms | 1.16× |
+
+Fused kernel-only throughput on CUDA: **517.8 GiB/s**, against ~576 GB/s of
+theoretical bandwidth for this part — about 90% of peak, which is what a
+correctly-written streaming reduction should reach and the evidence that the
+kernel is bandwidth-bound rather than occupancy- or ALU-bound.
+
+The 2.99× is the cleanest statement of why the operator exists. Three separate
+reductions are three passes over 381 MiB; one fused pass loads each element
+once into registers and folds it into three accumulators. The ratio lands
+within 0.3% of the naive prediction, which is what you want from a
+bandwidth-bound kernel and is a useful sanity check: a fused reduce that does
+NOT approach 3× is doing something else wrong.
+
+The CPU's 1.16× is the contrast worth keeping. The same fusion on 20 OpenMP
+threads is barely a win because that path is not purely bandwidth-bound at
+this size — the win from fusing is proportional to how much of the time was
+spent moving bytes, and the GPU is the machine where that is nearly all of it.
+
+Semantics match the CPU reference exactly, and the unit suite now runs the
+agg_all block on CUDA rather than skipping it (711 -> 730 checks): the sum
+accumulates in uint64 so overflow wraps rather than being signed-overflow UB,
+an empty input reports sum 0 / min INT64_MAX / max INT64_MIN, and `count` is
+the row count because these entry points refuse a column carrying NULLs.
+
