@@ -3166,6 +3166,111 @@ an assumption, not a result. The correctness gate is green; the performance
 gate has not been run here. Those are different claims and this entry is
 careful not to let the first one stand in for the second.
 
+## 2026-09-19 — The gate whose native shapes had stopped being native
+
+**Question.** `scripts/wrapper_residency_gate.py` fails at random when the
+machine is busy — on `main` and on feature branches alike, so it is the
+instrument, not the code under test. What exactly is it measuring, and which
+of its assertions depend on timing?
+
+**The before rates.** SF10, M4 Max, Metal, ten runs of the gate on `main` with
+nothing else on the machine: **2 of 10 runs failed**, both on `small_scan`
+(0.56× and 0.86×). Ten more runs beside eight `yes > /dev/null` busy loops:
+**9 of 10 failed**, 14 failing rows in all (`point_lookup` 9, `small_scan` 5).
+The per-run ratios on the idle machine are the more telling half — `q18_native`
+0.91–1.67×, `small_scan` 0.56–1.44×, `point_lookup` 0.92–2.11× — a gate whose
+pass/fail was being decided by a quantity that moves by a factor of two when
+nothing at all has changed.
+
+**Cause 1: two of the three "native" shapes were no longer native.** The gate
+times a native statement against the same native statement while the residency
+manager uploads in the gaps. `q18_native` (`... WHERE l_linenumber > 0 GROUP BY
+l_orderkey HAVING ...`) and `small_scan` (a global aggregate under a date
+predicate) were chosen in 2026-09-04 because the wrapper declined them. It does
+not any more: the exact GROUP BY with a WHERE mask and the global masked
+aggregate both landed since, so in the *background* pass — and only there,
+because that pass is the one with a resident set — the wrapper rewrote them the
+moment the set went ready. Measured: `q18_native` 81 ms native, 32 ms rewritten;
+`small_scan` 8.5 ms native, 3.8 ms rewritten. The background pass was therefore
+a mixture of native statements (before the set was ready) and device statements
+(after it), against two pure-native control passes, and the mixing fraction is
+*when the set went ready*, which is exactly what machine load moves. p99 over
+200 statements is the third slowest of the pass: when readiness came late the
+tail was all native and the row failed, when it came early the tail was device
+statements and the row passed at 1.4–2.1×. Both outcomes were wrong for the same
+reason. `point_lookup` was the only shape still declined (`shape`) throughout.
+
+**Cause 2: one pass is one draw of an order statistic.** The two manual passes
+of a round measure the same thing twice, and on an idle machine they came back
+115.2 ms and 87.2 ms — 32% apart, against a gate tolerance of 10%. Part of that
+is cold: a pass opens its own connection, five warm-up statements do not pay
+for a 60M-row scan's file cache, and the first pass of a round was
+systematically the slowest of the three.
+
+**Cause 3: a sub-millisecond shape has two speeds.** Four configurations of
+`point_lookup` (manual; background during the upload; background with the set
+ready; the same with the manager's worker thread stopped), three repetitions,
+400 statements each: the *median* of a block was 1.38, 0.43 and 1.18 ms in the
+three manual blocks alone. That is the 2026-09-18 "two modes of a short kernel"
+state, and which mode a ten-second pass lands in moves its p99 much further
+than the 10% the gate is testing for. No configuration was consistently slower
+than another across the three repetitions, so nothing there is attributable to
+the manager.
+
+**What changed.** The verdict is now taken on everything measured, not on one
+pass:
+
+* Shapes that stay native by *construction*, not by accident: `stddev` and
+  `quantile_cont` have no device implementation (they are in this file's open
+  questions), so the rewriter declines them whatever else it grows into, and the
+  gate counts the rewrites of every timed statement and stops with exit 2 if a
+  shape is ever rewritten. A shape that rots now says so instead of quietly
+  measuring the wrong thing.
+* Each pass is warmed for 1.5 s of wall time rather than five statements, and
+  every pass of a round replays the same 0–50 ms gap sequence.
+* The control pair is read as the control's own uncertainty: a round passes at
+  `p99(background) <= min(p99 A, p99 B) / 0.9`, loses above
+  `max(p99 A, p99 B) / 0.9`, and between the two claims nothing.
+* A pass ends the shape; a loss or a straddle is re-measured (another round,
+  verdict on the pooled samples, up to three rounds), which is what
+  `transparent_gate.py` does with a losing cell. Every round is printed, losing
+  rounds included, each round's own numbers beside the pooled ones, and the
+  background pass is printed split at the moment the set went ready — which is
+  what made the next paragraph readable off the gate's own output.
+* `--dump` writes every measured latency, so a verdict can be taken apart
+  afterwards.
+
+The tolerance itself (0.9), the statistic (p99, with min-of-N printed and never
+used) and the three shapes' rough sizes are unchanged.
+
+**The after rates.** Ten runs, idle: **0 failing rows in 10**, 28 of 30 rows
+decided in one round, 2 rows re-measured once (`q18_native` 0.89× → 1.00×,
+`point_lookup` 0.86× → 0.92×). `q18_native` and `small_scan` came back
+0.91–1.11× against controls that now agree to 1–8% (60.2/59.3 ms, 15.8/16.0 ms),
+where before they were 1.32× apart.
+
+**What the fixed gate then found, and it is not the gate.** Under the same
+eight busy loops the gate no longer fails at random — it fails the same way
+every time, with the same numbers across three re-measurements
+(`small_scan` 0.76×/0.81×/0.82×, `point_lookup` 0.69×/0.69×/0.49×). Splitting
+each background pass at the moment the set went ready says where it comes
+from: while the upload session is running, `point_lookup` p99 is 0.85/1.84/1.05
+ms against controls of 0.39/0.39 ms, and `small_scan` p99 is 26.7/21.5/20.0 ms
+against 17.3 ms; after the set is ready both are back at the control's tail
+(0.39/0.38 ms, 17.1 ms). Medians do not move at all (0.25 → 0.26 ms). On an
+idle machine the same split shows no such gap (1.84 vs 2.14 ms, 16.1 vs 17.1
+ms). So the design's premise — a user statement overlaps a segment scan by at
+most the interrupt latency, ~0.5 ms — holds while the interrupt is honoured
+promptly, and degrades when the cores are oversubscribed and the scanning
+thread has to wait to be scheduled at all. It is a tail effect, it is confined
+to the upload window, and it is real.
+
+Left open: whether the manager should notice that (its segments are taking
+several times their usual scan time, which it already records in `seg_ms`) and
+back off, or whether §9.3's "run it last and alone" is the whole answer. The
+gate is not the place to decide it — it now reports the effect instead of
+hiding it inside a mixture.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
