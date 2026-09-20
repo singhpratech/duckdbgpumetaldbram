@@ -3702,6 +3702,61 @@ to describe it as environmental. What can honestly be said is that it does not
 depend on the code under test, and that the reason it fails here and not there
 is not yet established.
 
+## 2026-09-20 — A hypothesis that was wrong, and a 32% win that was real
+
+I told the review that the per-span `cudaStreamSynchronize` in
+`upload_rows_exact` was a candidate for why the segmented-upload test lands 5
+of 20 segments on this box against 20 of 20 on the Mac. It is not, and the way
+that came apart is worth keeping.
+
+Instrumenting the upload printed exactly ONE line for the whole run:
+
+    upload_rows_exact rows=2000000 lanes=3 spans=996 sync_ms=6.719 total_ms=23.085
+
+One call, two million rows. The segmented uploader does not call the backend
+per segment at all — `gpu_upload_begin/finish` buffers segments on the HOST and
+the device copy happens once, at finish. The extension says so in its own
+comment: *nothing touches the device until gpu_upload_finish*. So the per-segment
+cost the test races against is host-side scanning and buffering, and no CUDA
+code runs inside it. My candidate was not merely unproven, it was on a
+different code path.
+
+What makes that worth recording is how plausible it was. The numbers fit: the
+exact path's segments cost 4.90 ms against the v0.6 path's 2.60 ms, I knew the
+exact upload had a synchronize the v0.6 one did not, and the ratio was about
+right. A hypothesis that explains the data is not thereby the cause of it —
+and the thing that settled it was not more reasoning but one print statement
+asking how many times the function was called.
+
+The real difference between 2.60 ms and 4.90 ms per segment is that the exact
+segment buffers three lanes plus validity bitmaps where the v0.6 one buffers
+two lanes and none. That is host work in shared code, and it belongs to the
+back-off branch's problem, not to CUDA.
+
+### The win that survived
+
+The sync was still half the upload. Measured A/B on one build with identical
+instrumentation, five runs each, 2M rows / 3 lanes / 996 spans:
+
+    per-span stream sync   total p50 18.67 ms   of which sync 9.37 ms
+    double buffer + event  total p50 12.75 ms   of which wait  3.52 ms
+
+**32% off the upload.** The old rule was "one staging buffer, synchronize the
+stream after every span", which is correct — a span's H2D must not overwrite
+bytes the previous span's kernels are still reading — and needlessly strong: it
+also serialises the copy against the kernel, leaving the PCIe link idle for
+every kernel's duration and the GPU idle for every copy's. With a buffer each,
+span i+1 copies while span i scatters, and the only wait is on the event saying
+buffer i-1's kernels are done, which is usually already true by the time we
+look. 996 spans is 996 avoidable full-stream barriers.
+
+It does not fix the test, and the test proves it: the `big:` section still
+lands 5 of 20 afterwards. That is the confirmation that the correction above is
+right, rather than a disappointment — a change that fixed the symptom would
+have meant the diagnosis was still wrong.
+
+Both exact uploads get it: the row form and the pair form had the same loop.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

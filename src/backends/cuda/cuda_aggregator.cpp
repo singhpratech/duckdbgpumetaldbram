@@ -794,20 +794,24 @@ public:
         }
 
         if (rows > 0) {
-            // One staging pair, sized for the largest span and reused. The
-            // stream is synchronized per span precisely because it IS reused:
-            // the next H2D must not overwrite bytes a running kernel is still
-            // reading. (A double buffer would overlap the two; the upload is
-            // PCIe-bound either way, so that is a later measurement, not a
-            // guess to make now.)
+            // TWO staging buffers, alternating. A span's H2D must not
+            // overwrite bytes the previous span's kernels are still reading.
+            // The cheapest correct way to say that was once "synchronize the
+            // stream after every span", which also serialised the copy against
+            // the kernel and left the link idle for the kernel's duration.
+            // With a buffer each, span i+1 copies while span i scatters, and
+            // the only wait is on the EVENT saying buffer i-1's kernels are
+            // done — which is usually already true by the time we look.
             std::size_t max_lanes = 0, max_words = 0;
             for (std::size_t s = 0; s < n_spans; ++s) {
                 max_lanes = std::max(max_lanes, spans[s].rows * n_lanes);
                 max_words = std::max(max_words, (spans[s].valid_bit + spans[s].rows + 63) / 64);
             }
             cudaStream_t s = cols[0]->own_stream();
-            DeviceOut<std::int64_t>       stage(max_lanes, "exact upload staging (lanes)");
-            DeviceOut<unsigned long long> bits(max_words * n_lanes, "exact upload staging (bitmaps)");
+            DeviceOut<std::int64_t>       stage(max_lanes * 2, "exact upload staging (lanes)");
+            DeviceOut<unsigned long long> bits(max_words * n_lanes * 2, "exact upload staging (bitmaps)");
+            EventPair ev;
+            bool used[2] = {false, false};
 
             std::size_t next = 0;
             for (std::size_t si = 0; si < n_spans; ++si) {
@@ -819,14 +823,21 @@ public:
                 if (sp.rows == 0) continue;
 
                 const std::size_t words = (sp.valid_bit + sp.rows + 63) / 64;
-                GPUDB_CUDA_CHECK(cudaMemcpyAsync(stage.p, sp.lanes,
+                const int b = static_cast<int>(si & 1);
+                // Wait only for the kernels that last read THIS buffer.
+                if (used[b]) GPUDB_CUDA_CHECK(cudaEventSynchronize(ev.e[b]),
+                                              "exact upload staging wait");
+                std::int64_t*       st = stage.p + static_cast<std::size_t>(b) * max_lanes;
+                unsigned long long* bt = bits.p + static_cast<std::size_t>(b) * max_words * n_lanes;
+
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(st, sp.lanes,
                                                  sp.rows * n_lanes * sizeof(std::int64_t),
                                                  cudaMemcpyHostToDevice, s),
                                  "exact upload lanes H2D");
                 for (std::size_t l = 0; l < n_lanes; ++l) {
                     const std::uint64_t* src = sp.valid ? sp.valid[l] : nullptr;
                     if (!src) continue;
-                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p + l * max_words, src,
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bt + l * max_words, src,
                                                      words * sizeof(unsigned long long),
                                                      cudaMemcpyHostToDevice, s),
                                      "exact upload bitmap H2D");
@@ -835,14 +846,16 @@ public:
                     const bool has_bits = sp.valid && sp.valid[l];
                     GPUDB_CUDA_CHECK(
                         gpudb_cuda_exact_scatter_lane(
-                            stage.p, sp.rows, n_lanes, l,
-                            has_bits ? bits.p + l * max_words : nullptr, sp.valid_bit,
+                            st, sp.rows, n_lanes, l,
+                            has_bits ? bt + l * max_words : nullptr, sp.valid_bit,
                             static_cast<std::int64_t*>(cols[l]->device_ptr()),
                             cols[l]->valid_bits_mutable(), d0, s),
                         "exact upload scatter");
                 }
-                GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact upload span sync");
+                GPUDB_CUDA_CHECK(cudaEventRecord(ev.e[b], s), "exact upload staging record");
+                used[b] = true;
             }
+            GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact upload sync");
         }
 
         std::vector<std::unique_ptr<ResidentColumn>> out;
@@ -869,40 +882,51 @@ public:
             for (std::size_t i = 0; i < n_spans; ++i) max_rows = std::max(max_rows, spans[i].rows);
             const std::size_t max_words = (max_rows + 63) / 64;
             cudaStream_t s = k->own_stream();
-            DeviceOut<std::int64_t>       stage(max_rows * 2, "exact pair staging (kv)");
-            DeviceOut<unsigned long long> bits(max_words * 2, "exact pair staging (bitmaps)");
+            // Double-buffered for the same reason as upload_rows_exact above.
+            DeviceOut<std::int64_t>       stage(max_rows * 2 * 2, "exact pair staging (kv)");
+            DeviceOut<unsigned long long> bits(max_words * 2 * 2, "exact pair staging (bitmaps)");
+            EventPair ev;
+            bool used[2] = {false, false};
 
             std::size_t dst = 0;
             for (std::size_t i = 0; i < n_spans; ++i) {
                 const KvSpan& sp = spans[i];
                 if (sp.rows == 0) continue;
                 const std::size_t words = (sp.rows + 63) / 64;
-                GPUDB_CUDA_CHECK(cudaMemcpyAsync(stage.p, sp.kv,
+                const int b = static_cast<int>(i & 1);
+                if (used[b]) GPUDB_CUDA_CHECK(cudaEventSynchronize(ev.e[b]),
+                                              "exact pair staging wait");
+                std::int64_t*       st = stage.p + static_cast<std::size_t>(b) * max_rows * 2;
+                unsigned long long* bt = bits.p + static_cast<std::size_t>(b) * max_words * 2;
+
+                GPUDB_CUDA_CHECK(cudaMemcpyAsync(st, sp.kv,
                                                  sp.rows * 2 * sizeof(std::int64_t),
                                                  cudaMemcpyHostToDevice, s),
                                  "exact pair kv H2D");
                 if (sp.key_valid)
-                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p, sp.key_valid,
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bt, sp.key_valid,
                                                      words * sizeof(unsigned long long),
                                                      cudaMemcpyHostToDevice, s),
                                      "exact pair key bitmap H2D");
                 if (sp.val_valid)
-                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bits.p + max_words, sp.val_valid,
+                    GPUDB_CUDA_CHECK(cudaMemcpyAsync(bt + max_words, sp.val_valid,
                                                      words * sizeof(unsigned long long),
                                                      cudaMemcpyHostToDevice, s),
                                      "exact pair val bitmap H2D");
                 GPUDB_CUDA_CHECK(
                     gpudb_cuda_exact_scatter_pair(
-                        stage.p, sp.rows,
-                        sp.key_valid ? bits.p : nullptr,
-                        sp.val_valid ? bits.p + max_words : nullptr, /*valid_bit=*/0,
+                        st, sp.rows,
+                        sp.key_valid ? bt : nullptr,
+                        sp.val_valid ? bt + max_words : nullptr, /*valid_bit=*/0,
                         static_cast<std::int64_t*>(k->device_ptr()),
                         static_cast<std::int64_t*>(v->device_ptr()),
                         k->valid_bits_mutable(), v->valid_bits_mutable(), dst, s),
                     "exact pair scatter");
-                GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact pair span sync");
+                GPUDB_CUDA_CHECK(cudaEventRecord(ev.e[b], s), "exact pair staging record");
+                used[b] = true;
                 dst += sp.rows;
             }
+            GPUDB_CUDA_CHECK(cudaStreamSynchronize(s), "exact pair sync");
         }
         k->finish_exact_upload();
         v->finish_exact_upload();
@@ -1167,6 +1191,24 @@ public:
 
 private:
     enum class ReduceKind { Sum, Min, Max };
+
+    // Two events, for the double-buffered upload staging below. Created as a
+    // pair so a failure half way cleans up rather than leaking.
+    struct EventPair {
+        cudaEvent_t e[2] = {nullptr, nullptr};
+        EventPair() {
+            for (int i = 0; i < 2; ++i) {
+                const cudaError_t er = cudaEventCreateWithFlags(&e[i], cudaEventDisableTiming);
+                if (er != cudaSuccess) {
+                    for (int j = 0; j < i; ++j) cudaEventDestroy(e[j]);
+                    cuda_throw(er, "cudaEventCreate (upload staging)");
+                }
+            }
+        }
+        ~EventPair() { for (int i = 0; i < 2; ++i) if (e[i]) cudaEventDestroy(e[i]); }
+        EventPair(const EventPair&) = delete;
+        EventPair& operator=(const EventPair&) = delete;
+    };
 
     // Per-call device output buffer (freed on scope exit, including throws).
     template <typename T>
