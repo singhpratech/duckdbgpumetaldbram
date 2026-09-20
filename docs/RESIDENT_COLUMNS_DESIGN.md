@@ -150,7 +150,7 @@ single-table and join-base lanes are 35 shared columns, 11.4 GiB (`lineitem`
 33.5 GiB of join results — 44.9 GiB. The saving on this workload is 0.6 GiB:
 its sets barely overlapped in lanes. What is still uploaded per statement is
 join *results* — the uploaded joins DuckDB evaluates for the shapes the
-device join does not plan yet (composite keys, cross-table expressions, keys
+device join does not plan (composite keys, cross-table expressions, keys
 from several tables) and the device join's own materialised results. That is
 stage D, three quarters of the memory.
 

@@ -198,28 +198,27 @@ cache the artifact:
           ./build-linux/test/test_gpudb
 ```
 
-## 5. Building a Linux binary that loads on older distributions
+## 5. A Linux binary and the distribution it was built on
 
-A Linux extension inherits the floors of the machine it was compiled on, and
-a container image newer than your runners will produce a binary they cannot
-load. The measured facts for this extension:
+A Linux extension inherits the floors of the machine it was compiled on. What
+this repository records:
 
-- A build on Ubuntu 24.04 needs `GLIBCXX_3.4.32` and `GLIBC_2.38`, so it does
-  **not** load on Ubuntu 22.04 hosts (glibc 2.35), Google Colab included.
-- Building in `nvidia/cuda:12.8.1-devel-ubuntu22.04` (glibc 2.35, CUB 2.7.0)
-  with `-DGPUDB_CUDA_STATIC_RUNTIME=ON` and `-static-libstdc++
-  -static-libgcc` brings the floor down to glibc 2.34 with no CXXABI
-  dependency at all, leaving `libgomp.so.1`, `libc.so.6` and
-  `ld-linux-x86-64.so.2` as the only shared objects needed.
-- `libgomp.so.1` is not present on minimal images — `apt install libgomp1`.
-  That floor and the glibc 2.34 one are both stricter than the DuckDB CLI's,
-  so state them beside any Linux asset you publish.
-- CUDA toolkit choice is a driver decision, not a distribution one. A binary
-  built with CUDA 13 needs an R580+ driver; CUDA 12.x minor-version
-  compatibility means a 12.8-built binary reaches the GPU on any R525+
-  driver, which is what Colab's T4 runtime has.
-- Ship SASS for the architectures you care about. A PTX-only fallback does
-  not help a driver older than the toolkit's JIT expects.
+- The CI Linux job builds on `ubuntu-24.04` (`.github/workflows/ci.yml`), and a
+  Linux asset built there carries that box's `GLIBCXX_3.4.32` floor
+  (`docs/RESEARCH_NOTES.md`, 2026-09-19, "The other build path,
+  unexercised since the rewriting began"). It therefore does **not** load on an
+  Ubuntu 22.04-class host — Google Colab included.
+- The registry's own Linux build is made in an older container and does not
+  carry that floor, which is why `INSTALL gpudb FROM community` works on hosts
+  a release-page binary refuses.
+- So the documented route on a machine whose glibc is older than the build
+  box's is to build from source on that machine (Option C in the README), or to
+  install from the community registry.
+
+Which CUDA toolkit needs which driver is in the README's [CUDA
+requirements](../README.md#cuda-requirements-build-from-source-on-linux) table:
+a binary built with CUDA 13 needs an R580+ driver, and one built with CUDA 12.x
+reaches the GPU on R525+.
 
 ## 6. Colab / Jupyter
 

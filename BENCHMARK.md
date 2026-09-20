@@ -1137,7 +1137,7 @@ the hardware ceiling story and document the path to extending it.
 
 ---
 
-## 2026-05-09 (night, macOS) — Hybrid planner v1 (GOAL.md item 7)
+## 2026-05-09 (night, macOS) — Hybrid planner v1 (goal 7 of the May 2026 charter)
 
 Hardware: Apple M4 Max (Apple GPU family 9, 40-core GPU, ~64 GB unified
 memory). macOS 15.x, MSL 3.2. Code state: `feat/core-hybrid-planner`,
@@ -1225,7 +1225,7 @@ dependent and "always GPU" naively loses on this hardware.
 
 ### What this milestone proves
 
-GOAL.md item 7 is satisfied: the hybrid CPU/GPU planner is wired into
+Goal 7 of the May 2026 charter is satisfied: the hybrid CPU/GPU planner is wired into
 `gpudb-bench` and `gpudb-groupby-bench` via `--backend hybrid` (single-
 call) and `--backend sweep` (the table above). Decisions are exposed via
 `HybridAggregator::last_decision()` so the DuckDB extension and any
@@ -1239,7 +1239,7 @@ Hardware: Apple M4 Max, ~64 GiB unified memory, macOS 15.x, MSL 3.2.
 Code state: latest main (after PR #5 radix GROUP BY merged).
 Single-thread CPU `std::unordered_map` baseline. Median of 5 runs.
 
-This is the comprehensive TPC-H bench that GOAL.md item 5 + 9 calls for —
+This is the comprehensive TPC-H bench that goals 5 and 9 of the May 2026 charter call for —
 **same workloads CUDA shipped on, run on Metal, with the SQL extension
 also verified end-to-end on macOS**.
 
@@ -1295,7 +1295,7 @@ Hardware: Apple M4 Max, ~64 GB unified memory. macOS 15.x, AppleClang 21.0.0.
 Code state: `feat/core-window-functions`. New `WindowAggregator` interface,
 CPU reference, Metal scaffold, and `gpudb-window-bench`.
 
-This is **GOAL.md item 8** — the operator Sirius (CIDR 2026 GPU OLAP paper)
+This is **goal 8 of the May 2026 charter** — the operator Sirius (CIDR 2026 GPU OLAP paper)
 explicitly lacks. The v1 ships the interface and the CPU reference; the Metal
 scaffold reports `backend()==METAL` but delegates to the CPU implementation.
 Honest reporting: `device_name()` says "Metal scaffold — ROW_NUMBER delegates
@@ -1351,7 +1351,7 @@ cmake --build build-macos -j
 
 ## 2026-05-09 (night) — Multi-agg fusion (sum+min+max+count one pass)
 
-The wedge: most analytical queries compute several aggregates over the same
+The shape that pays: most analytical queries compute several aggregates over the same
 column (`SELECT SUM(x), MIN(x), MAX(x), COUNT(x) FROM t`). Calling
 `sum_i64`, `min_i64`, `max_i64` separately reads the column from DRAM
 **three times**. The new `agg_all_i64` operator reads it ONCE and computes
@@ -1576,7 +1576,7 @@ that would require HBM-class memory the M-series doesn't have.
 - HBM raw kernel speed: CUDA wins per-op
 - Ratio over CPU: both decisively beat single-thread CPU; CUDA wins more because its kernel is faster
 
-**The unique-in-the-world artifact GOAL.md asks for:** Metal numbers
+**The artifact the May 2026 charter asks for:** Metal numbers
 that compete with CUDA on real workloads. Achieved.
 
 ### "10× over CPU" — where it's reachable
@@ -1658,9 +1658,9 @@ Metal kernel-only throughput hits **27–29 GiB/s** at low cardinality
 scatter) is what's between us and the hardware ceiling, and is the next
 targeting opportunity.
 
-### What this milestone proves (per GOAL.md)
+### What this milestone proves (against the May 2026 charter)
 
-GOAL.md item 5 deliverable: "**Once Metal SUM and GROUP BY post numbers
+Goal 5 of the May 2026 charter: "**Once Metal SUM and GROUP BY post numbers
 in BENCHMARK.md alongside CUDA, the dual-backend story becomes real —
 that's the unique-in-the-world artifact that makes this project
 defensible.**"
@@ -1746,7 +1746,7 @@ hash table fits in L2/L3 and is cache-resident; at high group counts
 (1M+) it loses cache locality and falls off a cliff (1355 ms at 100M ×
 1M is roughly 7× slower than 100M × 100).
 
-That asymmetry is the wedge: Metal wins decisively where it actually
+That asymmetry is the shape that pays: Metal wins decisively where it actually
 matters for OLAP — high-cardinality GROUP BY (the very regime where
 CPU's hash table breaks down).
 
@@ -1857,7 +1857,7 @@ live in a single command buffer and the wall converges to the kernel
 time. Filed as the next ticket; the GROUP BY architecture this PR ships
 is correct and modular enough to drop in.
 
-### What this milestone proves (per GOAL.md)
+### What this milestone proves (against the May 2026 charter)
 
 > "Reproducing the CUDA numbers in BENCHMARK.md on Apple Silicon, with a
 > working Metal implementation of: ... GROUP BY hash aggregate"
@@ -2032,7 +2032,7 @@ this PR.
 
 ### What this milestone proves
 
-GOAL.md item 5 is satisfied: **real GROUP BY on Apple Silicon GPU, no CPU
+Goal 5 of the May 2026 charter is satisfied: **real GROUP BY on Apple Silicon GPU, no CPU
 fallback, correctness verified, and a regime where the GPU wins** — which
 is what makes the dual-backend story land. The Metal-GROUP-BY-wins row
 (1M rows × 1M groups, 2.1× over CPU) is the macOS analog of the CUDA
@@ -2052,7 +2052,7 @@ collapse.
 
 ### What this milestone proves
 
-GOAL.md item 5 is satisfied: real GROUP BY on Apple Silicon GPU, no CPU
+Goal 5 of the May 2026 charter is satisfied: real GROUP BY on Apple Silicon GPU, no CPU
 fallback, correctness verified, **and a regime where the GPU wins** —
 which is what makes the dual-backend story land. The Metal-GROUP-BY-wins
 row (1M rows × 1M groups, 2.0× over CPU) is the macOS analog of the CUDA
@@ -2485,7 +2485,7 @@ cd ~/Documents/gpubasedpostrgress/duckdbgpumetaldb
 
 ---
 
-## 2026-05-09 (post-launch verification) — TPC-H SF1 CUDA GROUP BY re-bench
+## 2026-05-09 (re-verified) — TPC-H SF1 CUDA GROUP BY re-bench
 
 Triggered while reviewing community-extensions PR #1898. The README had
 listed "GROUP BY 6M TPC-H lineitem | 81.7 ms | 16.9 ms | 4.8× over CPU"

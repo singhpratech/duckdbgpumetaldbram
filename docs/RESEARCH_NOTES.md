@@ -5139,8 +5139,10 @@ measured rule is currently handling per process.
   `GPUDB_CUDA_EXACT=1`. What is open is the gate: every threshold in
   `_thresholds.py` was swept on Metal, and `scripts/transparent_gate.py` has
   not been run on the RTX 4090.
-- **Other client languages**: the join / expression / split lowering lives in
-  the Python wrapper; the pure rewrite function is language-neutral.
+- **Where the lowering lives**: the join / expression / split lowering is in
+  the Python wrapper. The pure rewrite function is language-neutral and
+  carries no client of its own, so a client in another language would repeat
+  that lowering rather than inherit it.
 - **Narrow lanes**: done on Metal (stage C, 2026-09-18) — 44.9 GiB of the 22
   TPC-H queries at SF10 became 22.7; the wrapper's pre-upload estimate now sizes
   each lane from its DuckDB type (2026-09-18). What is left open is CUDA (the
@@ -5168,6 +5170,6 @@ measured rule is currently handling per process.
   2026-09-19 separated the two. Taking the client out (an inner statement, §4.23)
   is worth a lot up to about 200K groups and nothing at all at 1.5M, where
   moving the rows through the table function alone costs more than native's
-  whole aggregate. So an Arrow-native result path moves the plain-form
-  bounds and a cheaper table-function hand-off moves the inner ones: two
-  different problems, neither of them measured here.
+  whole aggregate. So the two bounds are set by two different hand-offs
+  — the client's for the plain form, the table function's for the inner one —
+  and neither has been measured against a cheaper alternative here.

@@ -58,10 +58,15 @@ Pass 2: single-block final reduction
    read partials → tree reduction → 1 scalar
 ```
 
-This avoids needing CUB/Thrust for week 1. We'll swap to CUB once we add more operators (it has well-tuned `DeviceReduce::Sum`, `DeviceScan::ExclusiveSum`, `DeviceRadixSort` — all of which we'll need).
+This hand-written reduction is what the first SUM/MIN/MAX kernels use, and it
+needs neither CUB nor Thrust. The operators added since take CUB where CUB is
+the better primitive: the CUDA GROUP BY, top-k and sort paths call
+`DeviceReduce`, `DeviceSelect`, `DeviceRadixSort` and `DeviceScan` on explicit
+temp storage (`src/backends/cuda/kernels/`), and Thrust is used for iterators
+only.
 
-## Future shape (not yet implemented)
-- `src/operators/group_by_aggregate.cpp` — hash group-by
-- `src/operators/hash_join.cpp` — radix-partitioned probe
-- `src/operators/window.cpp` — the differentiator vs Sirius
-- `src/extension/duckdb_gpu_extension.cpp` — registers operator overrides via DuckDB's Substrait or operator-replacement API
+## Where the operators live now
+- `src/backends/{cpu,cuda,metal}/*_groupby.*` — the GROUP BY family, exact and v0.6
+- `src/backends/{cpu,cuda,metal}/*_hashjoin.*` — the join probe (CUDA: open-addressing atomicCAS; Metal: sort-merge)
+- `src/backends/{cpu,metal}/*_window.*` — the window operators, which no SQL path takes: window functions run on DuckDB
+- `src/extension/duckdb_loadable.cpp` — the loadable extension's entry point, on the stable C API

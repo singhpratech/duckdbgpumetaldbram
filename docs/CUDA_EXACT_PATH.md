@@ -11,9 +11,9 @@ transparent path on CUDA*). SF10 on CUDA is not recorded.
 
 It is **opt-in in v0.7**: `GPUDB_CUDA_EXACT=1` makes the CUDA backend report
 `exact_supported()`, and with it `global_supported()` and `join_supported()`,
-true. The default stays off until `scripts/transparent_gate.py` has been swept
-on that machine, because the thresholds a CUDA build would use are Metal's
-until then, and rule 1 is a measurement rather than an assumption. Note that a
+true. The default is off: `scripts/transparent_gate.py` has not been run on that
+machine, so the thresholds a CUDA build decides with are Metal's, and rule 1 is
+a measurement rather than an assumption. Note that a
 column is single-homed: a set resident on the GPU cannot fall back to the CPU
 reference for an operator the GPU lacks.
 

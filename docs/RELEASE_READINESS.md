@@ -95,7 +95,9 @@ Each community extension needs a `description.yml` with:
 - license
 - supported platforms
 
-Not yet present in the repo. Template available at https://github.com/duckdb/community-extensions/tree/main/extensions
+The repository's copy is `docs/COMMUNITY_EXTENSION_DESCRIPTION.yml`, a mirror
+of what the registry serves. The template is at
+https://github.com/duckdb/community-extensions/tree/main/extensions
 
 ### 6. Multi-platform CI matrix
 

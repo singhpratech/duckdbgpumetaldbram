@@ -50,7 +50,7 @@ real query (TPC-H or ClickBench).
 
 **Status:** in flight on `feat/metal-multiagg`.
 
-### 2.3 GROUP BY (the wedge)
+### 2.3 GROUP BY (the shape that pays)
 - `SUM(value) GROUP BY key` — i64 keys, i64 values
 - Future: multi-column group keys, multiple aggregates per group, COUNT DISTINCT
 
@@ -87,8 +87,8 @@ real query (TPC-H or ClickBench).
 | **Mid N** (10M-100M rows) | TPC-H SF1-SF10 lineitem-class | Mix of bandwidth + setup | Metal wins on cardinality regimes |
 | **Huge N** (1B+ rows) | Data lake / warehouse | Sustained bandwidth | Metal closes gap to CUDA (UMA) |
 | **Low cardinality GROUP BY** (≤ 1K groups) | DAU, status counts | CPU cache locality | CPU often wins; Metal pulls even with min-max trick |
-| **High cardinality GROUP BY** (~rows distinct) | Per-user stats, transaction IDs | Memory latency | **Metal's wedge** — both Metal and CUDA win 3-22× |
-| **Multi-op same column** | "give me sum, min, max, count of price" | I/O efficiency | **Metal's wedge** with multi-agg fusion |
+| **High cardinality GROUP BY** (~rows distinct) | Per-user stats, transaction IDs | Memory latency | **Metal's strongest shape** — both Metal and CUDA win 3-22× |
+| **Multi-op same column** | "give me sum, min, max, count of price" | I/O efficiency | **Metal's strongest shape** with multi-agg fusion |
 | **Star join + agg** | TPC-H Q1, Q5, Q19; SSB | Hash join + group-by | Both Metal and CUDA needed |
 
 ---
