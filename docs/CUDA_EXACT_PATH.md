@@ -3,22 +3,23 @@
 **Status 2026-09-20: implemented, and on by default.** Every method below
 exists on the CPU reference, on Metal and on CUDA (#152, #153, #154): exact
 `GROUP BY`, the `WHERE` mask, the global masked aggregate and the materialised
-join. On the RTX 4090 Laptop the unit suite is 752 / 752, the SQL suite 225 / 0,
-the wrapper suite 1258 / 0, and `scripts/tpch_coverage.py` answers 17 of 22
-TPC-H queries at SF1 on the device with 0 rows differing from native, through
-`--path execute` and `--path sql` alike — the same coverage and the same five
-declines as Metal at that scale factor (`BENCHMARK.md`, *the CUDA exact path on
-by default*). SF10 on CUDA is not recorded.
+join. On the RTX 4090 Laptop the unit suite is 774 / 774, the SQL suite 225 / 0,
+the wrapper suite passing, and `scripts/tpch_coverage.py` answers 17 of 22
+TPC-H queries at SF1 on the device with 0 rows differing from native and every
+one of them faster than native — 1.21× (Q15) – 31.44× (Q9) through
+`--path execute`, 1.66× (Q15) – 16.27× (Q9) through `--path sql` — the same
+coverage and the same five declines as Metal at that scale factor
+(`BENCHMARK.md`, *the direct grouped reduce on CUDA*). SF10 on CUDA is not
+recorded.
 
 The path is **on by default**: the CUDA backend reports `exact_supported()`,
 and with it `global_supported()` and `join_supported()`, true without anything
 being set. What turned it on was the evidence rather than the code being
 finished — the full gate on that box, run before the switch, was 1630 cells at
 the wrapper's own memory budget with 0 cells slower than native and 0 differing,
-minimum ratio 1.07×. On the release build the same gate is 1631 cells, 0
-differing, with one cell at 0.93× (a three-group `GROUP BY` over a full
-`lineitem` scan, the TPC-H Q1 shape) that the measured rule declines when the
-shape is run on its own.
+minimum ratio 1.07×. On the release build the same gate is **1631 cells, 1014
+rewritten and passing, 616 declined on a threshold, 0 below 1.0×, 0 differing,
+exit 0**.
 `GPUDB_CUDA_EXACT=0` turns it off again without a rebuild, and that switch
 exists because a column is single-homed: a set resident on the GPU cannot fall
 back to the CPU reference for an operator the GPU lacks, so disabling the path
@@ -42,7 +43,7 @@ Linux instance's; the shared header `src/include/gpu_backend.hpp` changes only b
 | `groupby_exact_masked_resident(keys, vals, preds, n_preds, cap, filter)` | the same under a WHERE program: conjunction of `Predicate`s over predicate lanes (EQ NE LT LE GT GE IsNull IsNotNull In) | same | mask → selection → reduce |
 | `groupby_exact_masked_multi(keys, pays, n_pays, filter_payload, preds, n_preds, cap, filter)` | several payloads in ONE pass; `MultiPayload::columns` bits select what to produce per payload | the base-class default in `src/backends/backend_factory.cpp` — one `groupby_exact_masked_resident` pass per payload, merged and cross-checked — so this method comes for free on CUDA as soon as the masked single-payload op works; fusing it is a later optimisation | fused: mask / selection / run starts once, reduce per payload |
 | `aggregate_exact_masked(pays, n_pays, preds, n_preds)` | **optional, added 2026-09-18 (§4.12)**: aggregates without GROUP BY under a WHERE — one fused pass over the rows in storage order, no key, no sort cache, no permutation. Returns `GlobalAggResult`: per payload the exact 128-bit sum, `count(payload)`, min and max, plus one `count_star` of the surviving rows. Semantics are one group of `groupby_exact_masked_multi`; `n_pays` may be 0 (`count(*)` only) and `n_preds` may be 0. `global_supported()` is its rule-1 gate, defaulting to false — the CUDA backend builds and answers unchanged until it overrides both | `cpu_aggregator.cpp` (the reference) | `metal_aggregator.mm` + `gagg_masked_i64` in `kernels/sum.metal`: one lane table bound per distinct lane (payloads and predicate columns share slots, 12 of them), per-thread accumulators indexed `[group * n_pays + payload]`, threadgroup tree reduce, host merge |
-| the direct grouped reduce | **backend-private, optional, added 2026-09-18; built on Metal only** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7): a key with few distinct values gets a dense group-id lane derived from its sort cache (`gid[row]` = the rank of the row's key among the distinct valid keys ascending, a NULL key taking the reserved last id) and the exact operators answer with ONE row-order pass over it — the whole WHERE per row, every payload folded into `acc[gid]`, no mask buffer, no run starts, no permutation, no gather. **Nothing in `gpu_backend.hpp` changes**: same methods, same results, same order, same NULL-key group last, same absent-when-emptied groups, HAVING / top-k on the host over the group rows through `apply_group_filter_host`. The tests are the parity block in `test_aggregator.cpp` (every exact form, both algorithms, keys either side of the id-lane's limits) — CUDA gets them free. The one thing to report is which algorithm ran: `gpudb::exact_path_note()` (`src/include/exact_path_note.hpp`), printed by `gpu_last_stats()` as `path=…` | not implemented (the reference is always the sort path) | `metal_aggregator.mm` + `gdir_*` in `kernels/sum.metal`. CUDA has 64-bit atomics and `atomicCAS`, which Apple GPUs do not, so the accumulator design does NOT transfer: Metal replicates a slab of 32-bit atomics per threadgroup and carries the 128-bit sums by hand. A CUDA port should use shared-memory 64-bit atomics (or `cub::BlockReduce` per group) and will have a different crossover — measure it, do not copy the numbers. The admission rule Metal needs (`groups >= 3` and `rows x (payloads + WHERE terms) >= 6M`) exists because a threadgroup clears and folds its accumulator slab whatever the rows: sweep ROWS as well as groups, or the fixed cost hides at the top of the range. And gate the path on the DEVICE before asking it to compile anything: a kernel that will not build is a fallback, not an error — Metal marks the path unavailable for the aggregator's lifetime, keeps the compiler's text and answers through the sort path — but a fallback after the fact is not always enough. On a virtualised Apple GPU ("Apple Paravirtual device", a hosted macOS runner) ONE refused pipeline build left that process's Metal compiler unusable: kernels that had built moments before then failed too. So a backend must not ask an unsuitable device to compile an optional kernel at all; it decides from the device's identity and capabilities first, once, before any state the path would leave behind exists |
+| the direct grouped reduce | **backend-private, optional; on Apple Silicon Metal since 2026-09-18 and on NVIDIA CUDA since 2026-09-20** (`docs/RESIDENT_COLUMNS_DESIGN.md` §7): a key with few distinct values is answered by ONE row-order pass instead of a sort and a gather — the whole WHERE per row, every payload folded into an accumulator indexed by the key's rank among the distinct keys, no mask buffer, no run starts, no permutation, no gather. How that rank is obtained is the backend's own business: Metal derives a dense group-id lane from the sort cache (`gid[row]`, a NULL key taking the reserved last id), CUDA reads against the list of distinct keys built beside the sort cache (§4.1). **Nothing in `gpu_backend.hpp` changes**: same methods, same results, same order, same NULL-key group last, same absent-when-emptied groups, HAVING / top-k on the host over the group rows through `apply_group_filter_host`. The tests are the parity block in `test_aggregator.cpp` (every exact form, both algorithms, keys either side of the path's limits) — a backend adding the path gets them free. Which algorithm ran is worth reporting: `gpudb::exact_path_note()` (`src/include/exact_path_note.hpp`), printed by `gpu_last_stats()` as `path=…`, which Metal sets and CUDA does not | not implemented (the reference is always the sort path) | `metal_aggregator.mm` + `gdir_*` in `kernels/sum.metal`. CUDA has 64-bit atomics and `atomicCAS`, which Apple GPUs do not, so the accumulator design does NOT transfer: Metal replicates a slab of 32-bit atomics per threadgroup and carries the 128-bit sums by hand, while CUDA's own version (`gpudb_cuda_exact_direct` in `kernels/exact_kernel.cu`, 2026-09-20) replicates shared-memory tuples and folds them once per block. The crossovers differ and were measured separately — do not copy the numbers across. The admission rule Metal needs (`groups >= 3` and `rows x (payloads + WHERE terms) >= 6M`) exists because a threadgroup clears and folds its accumulator slab whatever the rows: sweep ROWS as well as groups, or the fixed cost hides at the top of the range. And gate the path on the DEVICE before asking it to compile anything: a kernel that will not build is a fallback, not an error — Metal marks the path unavailable for the aggregator's lifetime, keeps the compiler's text and answers through the sort path — but a fallback after the fact is not always enough. On a virtualised Apple GPU ("Apple Paravirtual device", a hosted macOS runner) ONE refused pipeline build left that process's Metal compiler unusable: kernels that had built moments before then failed too. So a backend must not ask an unsuitable device to compile an optional kernel at all; it decides from the device's identity and capabilities first, once, before any state the path would leave behind exists |
 | `narrow_lanes()` | **optional**: does this backend store an exact I64 lane at the narrowest signed width its values fit (`docs/RESIDENT_COLUMNS_DESIGN.md` §6)? Storage width stays backend-private; the flag exists because the wrapper's PRE-upload memory estimate sizes lanes from their DuckDB type when it is true and charges 8 bytes a lane when it is false. Defaults to false, which is correct for any backend that stores 8-byte lanes; both GPU backends now report true | false | true |
 | `join_materialize(probe_key, build_key, lanes, n)` | inner join onto a UNIQUE build key; returns row-aligned lanes (probe or build side), NULL-key rows dropped; `join_supported()` gates it | `cpu_aggregator.cpp` | sort-merge (Metal has no 64-bit atomic CAS); CUDA should use open-addressing with `atomicCAS` as `join_kernel.cu` already does for the v0.6 join |
 | `device_memory_bytes()` | total device memory in bytes (`cudaMemGetInfo` total); reported by `gpu_build_info()`, sets the wrapper's default budget to half of it | 0 | `recommendedMaxWorkingSetSize` |
@@ -135,7 +136,7 @@ is being added.
   `gpu_join_materialize.test`, `gpu_groupby_exact_multi.test`, `gpu_rewrite.test`
   (33 cases: the C++ rewriter's output, backend-independent).
 - `python/tests/test_wrapper.py` — over 1200 checks through `gpudb.connect()`
-  (1258 on the RTX 4090, and the count differs per host — see the README's
+  (the count differs per host — see the README's
   Testing table): parity
   against native DuckDB for every shape, staleness, background residency, the
   memory budget, error fallback. Needs the extension built with
@@ -154,18 +155,62 @@ silicon (unified memory, no PCIe), and the worry was that a discrete GPU moves
 results over the bus, so the output-bound limits (`plain_max_groups`,
 `reagg_max_pairs`, …) would differ. The gate was then run on the RTX 4090
 Laptop with the exact path on and the wrapper's own memory budget: 1630 cells,
-0 slower than native, 0 differing, minimum ratio 1.07×. Re-run on the release
-build it is 1631 cells, 1013 rewritten and passing, 616 declined on a threshold,
-0 differing, with one cell at 0.93× — `GROUP BY l_returnflag`, no `WHERE`, three
-groups over a full `lineitem` scan, 3.4 ms native against 3.7 ms rewritten —
-which the measured rule hands back to DuckDB after the first run when the shape
-is run alone. Nothing in either run asked for a different constant, so no CUDA
-table is written. The one shape to re-check if
-that is ever reconsidered is TPC-H Q1, which straddles 1.0× on that box
-(0.95–1.04× across runs of the same build) and which the measured rule decides
-per process. Two cells that did lose, on an earlier run, turned out to be
-artefacts of running with no memory budget at all — the card had filled — which
-is its own lesson about what a gate measures.
+0 slower than native, 0 differing, minimum ratio 1.07×. On the release build the
+same gate is **1631 cells, 1014 rewritten and passing, 616 declined on a
+threshold, 0 below 1.0×, 0 differing, exit 0**, ratios 1.01×–487.26×, wall
+21m38s. No CUDA constant is written, because none of it asked for one.
+
+What the release build DID ask for was not a constant. `string_key_few_groups`
+is a field of `Thresholds` that lets a key with few distinct values be rewritten
+despite `min_groups`, and it is a claim about the backend, not a number: native
+hashes a VARCHAR key on every row and the device does not, so three groups are
+still worth rewriting — *if* the backend can answer them without reading the
+column into a sort. CUDA could not, and TPC-H Q1 measured 0.96× / 0.98× for it.
+The field went False on CUDA for one day (#178), CUDA got its own direct grouped
+reduce (§4.1 below, #179), the same sweep measured 1.16×–5.72× over 72 cells,
+and the field went back to True. The table is one object again — both backends
+have the capability the rule rests on. Two cells that lost on an earlier run
+turned out to be artefacts of running with no memory budget at all — the card
+had filled — which is its own lesson about what a gate measures.
+
+### 4.1 The direct grouped reduce on CUDA
+
+`gpudb_cuda_exact_direct` (`src/backends/cuda/kernels/exact_kernel.cu`, declared
+in `kernels/exact_api.h`, called from `cuda_aggregator.cpp`) answers an exact
+`GROUP BY` for a key with **at most 256 distinct values** — the cap is a
+shared-memory budget, since the accumulators are replicated per block so that a
+three-group key does not serialise every thread onto three addresses. It exists
+because of where the sort path's time goes: the sort path reads the payload
+*through* the sort permutation, one random 8-byte load per row per payload, so
+3 groups and 10,000 groups cost the same (7.57 ms against 8.51 over 6M rows).
+
+What it does differently:
+
+- It reads keys and payload **in row order**, maps each key to its rank in the
+  column's distinct keys, and accumulates into replicated shared-memory tuples.
+  No sort, no permutation, no gather.
+- The distinct keys and their count are properties of the **column**, so they
+  are built once in `ensure_exact_cache()` beside the sort cache, under the same
+  lock (at most 256 × 8 bytes, freed with the column and counted in
+  `resident_bytes()`). Computing them per call cost a pass over the sorted keys
+  even for statements that then took the sort path, and showed up in the gate as
+  a join cell falling from 1.12× to 0.99×.
+- Which reduce to take is decided **before anything is compacted**, because the
+  direct path never reads the compaction: `select_sorted` rewrites the sorted
+  keys and the permutation over the whole column whatever the `WHERE` keeps, and
+  removing it from this path took a masked single-payload statement from 3.78 ms
+  to 1.12 and TPC-H Q1 from ~15 ms to 5.21 (native 10.91).
+- A `WHERE` can leave some of those groups with no rows. They are dropped **on
+  the host**, over at most 256 rows, in the ascending order they already sit in.
+
+**Nothing about the answer changes.** `d_distinct` is ascending, which is the
+order the sort path emits, so the direct path returns the same rows in the same
+order, with the NULL-key group last and emptied groups absent. NULL keys are not
+touched by it: `gpudb_cuda_exact_null_group` still owns them. It is
+backend-private in the sense the table above means — nothing in
+`gpu_backend.hpp` changes, and the parity block in `test_aggregator.cpp` covers
+both algorithms. Unlike Metal, CUDA does not yet report which one ran through
+`gpudb::exact_path_note()`.
 
 The procedure, should a CUDA table ever be wanted:
 

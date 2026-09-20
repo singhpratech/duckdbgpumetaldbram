@@ -123,14 +123,18 @@ docs:
     | Apple M4 Max (Metal), SF1 | sql() | 17 of 22 | 0 | 1.37x - 9.49x |
     | Apple M4 Max (Metal), SF10 | execute() | 19 of 22 | 0 | 1.06x - 48.10x |
     | Apple M4 Max (Metal), SF10 | sql() | 19 of 22 | 0 | 0.92x - 26.39x |
-    | RTX 4090 Laptop (CUDA), SF1 | execute() | 17 of 22 | 0 | 0.96x - 21.40x |
-    | RTX 4090 Laptop (CUDA), SF1 | sql() | 17 of 22 | 0 | 0.98x - 13.30x |
+    | RTX 4090 Laptop (CUDA), SF1 | execute() | 17 of 22 | 0 | 1.21x (Q15) - 31.44x (Q9) |
+    | RTX 4090 Laptop (CUDA), SF1 | sql() | 17 of 22 | 0 | 1.66x (Q15) - 16.27x (Q9) |
 
-    Plain SQL runs on the GPU by default on both backends. Two rows are below 1.0x
-    and are printed rather than dropped: TPC-H Q11 at SF10 on Metal (a 6-7 ms
-    statement, 1.06x one way and 0.92x the other) and TPC-H Q1 on CUDA both
-    straddle parity, and the per-process measured rule is what declines such a
-    statement where it loses. Nothing else rewritten in the run is below 1.0x.
+    Plain SQL runs on the GPU by default on both backends. One row is below 1.0x
+    and is printed rather than dropped: TPC-H Q11 at SF10 on Metal, a 6-7 ms
+    statement measuring 1.06x through execute() and 0.92x through sql(), which
+    straddles parity - the per-process measured rule is what declines such a
+    statement where it loses. Nothing on CUDA is below 1.0x in these runs: Q1
+    first measured 0.96x and 0.98x there on the release build, the cause was
+    found (a few-group key was being answered by sorting the whole column),
+    CUDA got a direct grouped reduce for such keys, and Q1 now measures 1.99x
+    and 2.07x.
 
     The remaining queries are declined on purpose (correlated subqueries, or shapes
     where DuckDB was measured faster) and run on DuckDB unchanged. Every measurement,
@@ -189,13 +193,13 @@ docs:
       The thresholds it decides with were measured on Apple Silicon and
       verified on one NVIDIA machine, not measured for every GPU. The
       gate run on that RTX 4090 Laptop before the path was switched on
-      was 1630 cells, none slower than native and none differing; re-run
-      on the release build it is 1631 cells, none differing, with one
-      cell at 0.93x - a three-group GROUP BY over a full lineitem scan,
-      3.4 ms native against 3.7 ms rewritten. That is the TPC-H Q1
-      shape, which straddles parity on that machine, and the per-process
-      measured rule is what decides such a statement: run on its own it
-      is handed back to DuckDB after the first run.
+      was 1630 cells, none slower than native and none differing; the
+      same gate on the release build is 1631 cells - 1014 rewritten and
+      passing, 616 declined on a threshold, none below 1.0x, none
+      differing, exit 0. Both backends read one measured thresholds
+      table; the rule that admits a key with few distinct values rests
+      on a backend being able to answer it without sorting the whole
+      column, which both now do.
     * Ordinary SQL is answered on the device only through a client that
       sees the statement before DuckDB plans it - the project's `gpudb`
       shell or gpudb.connect(), both from pip install duckdb-gpudb. LOAD
