@@ -5201,3 +5201,45 @@ statement; see the 2026-09-20 entry in docs/RESEARCH_NOTES.md.
 suite's `big:` section is untouched by both mechanisms — its 100K-row
 segments are below one DuckDB row group, so they never vote on contention
 (`cores 0.0`, `0 quiet waits`) and its pinned `segment_rows` is never adapted.
+
+## v0.7 stage C — the narrowed sort cache on CUDA, RTX 4090, SF1 (2026-09-20)
+
+The companion to the lane narrowing: the exact path's sort cache now holds its
+keys at the LANE's width and its row ids as u32, where it held i64 and i64.
+Apple Silicon Metal has stored u32 row ids since #125; this brings the two to
+the same layout.
+
+**Hardware / build:** RTX 4090 Laptop GPU (sm_89), driver 580.178.04, CUDA
+13.0.88, DuckDB 1.5.5, `GPUDB_CUDA_EXACT=1`, TPC-H SF1. Identical lane set on
+both sides of the comparison (4 lanes; widths 1B x1, 2B x2, 8B x1).
+
+| | lanes | derived | resident total |
+|---|---|---|---|
+| main | 74.4 MiB | 183.1 MiB | 257.5 MiB |
+| this change | 74.4 MiB | **103.0 MiB** | **177.4 MiB** |
+
+**44% off the derived structures and 31% off the resident total**, with the
+lanes untouched — this change is only about what the cache costs.
+
+Per row, on a controlled 100k-row exact set with a width-2 key and a width-1
+payload:
+
+    main         19 bytes/row   (key lane 2 + key cache 16, payload lane 1)
+    this change   9 bytes/row   (key lane 2 + key cache  6, payload lane 1)
+
+The cache went from 16 bytes a row to 6: a width-2 key plus a u32 row id. The
+cache already refused a column above 2^32 rows, so eight bytes for a row id was
+always more than it could use.
+
+### What this does not change
+
+`gpu_resident_registry` q26 measures a set uploaded by `gpu_upload_pair` — the
+v0.6 path — whose cache still holds i64 keys and i64 row ids. That layout is
+untouched here, so q26 stays at 32000 rather than settling on 28000; narrowing
+the v0.6 cache is a separate change over a different set of kernels.
+
+### Correctness
+
+unit 750/750; SQL 224 pass / 0 fail with `GPUDB_CUDA_EXACT=1` and 223/1 with it
+off; wrapper 4 failures, the same pre-existing segmented-upload cluster.
+

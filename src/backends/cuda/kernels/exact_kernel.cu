@@ -81,6 +81,19 @@ __host__ __device__ __forceinline__ void stw(void* __restrict__ p, int w, std::s
     }
 }
 
+// Stage C, second half: the sort cache is narrowed too. The sorted keys keep
+// the LANE's width (they are the same values, reordered) and the permutation
+// holds u32 row ids — the cache already refuses a column above 2^32 rows, so
+// eight bytes a row id was always more than it needed. For a 6M-row lane of
+// width 2 that is 6 bytes a row instead of 16.
+struct LoadKey {
+    const void* p;
+    int         w;
+    __host__ __device__ __forceinline__ i64 operator()(std::size_t i) const {
+        return ldw(p, w, i);
+    }
+};
+
 // Row i is valid iff bit i % 64 of word i / 64 is set; a null bitmap means
 // every row is valid (DuckDB's layout, and the CPU reference's `bit` lambda).
 __host__ __device__ __forceinline__ bool bit_at(const u64* m, std::size_t i) {
@@ -169,7 +182,7 @@ __host__ __device__ __forceinline__ ETup etup_of_value(i64 x) {
 // the payload and its bitmap are indexed by (the exact path keeps every column
 // in input order; only the key's permutation moves).
 struct RowTuple {
-    const i64*  perm;
+    const std::uint32_t* perm;
     const void* vals;
     const u64*  vvalid;
     int         has_vals;
@@ -178,7 +191,7 @@ struct RowTuple {
         ETup t = etup_identity();
         t.cnt_star = 1;
         if (!has_vals) { t.cnt_v = 1; return t; }   // reference: cnt_v = cnt_star, mn/mx untouched
-        const std::size_t row = static_cast<std::size_t>(perm[i]);
+        const std::size_t row = perm[i];
         if (!bit_at(vvalid, row)) return t;         // NULL payload: counts in count(*) only
         return etup_of_value(ldw(vals, vwidth, row));
     }
@@ -275,9 +288,10 @@ struct PopValid {
 };
 
 struct IsRunStart {
-    const i64* sorted;
+    const void* sorted;
+    int         w;
     __host__ __device__ __forceinline__ u64 operator()(std::size_t i) const {
-        return (i == 0 || sorted[i] != sorted[i - 1]) ? 1ull : 0ull;
+        return (i == 0 || ldw(sorted, w, i) != ldw(sorted, w, i - 1)) ? 1ull : 0ull;
     }
 };
 
@@ -377,7 +391,7 @@ __global__ void flags_from_bitmap_kernel(const u64* __restrict__ valid, std::siz
 // flags[i] = mask[perm[i]] — the mask is indexed by ROW, the sorted array by
 // position, and this is the one gather that reconciles them. Doing it once
 // here is what keeps the row loop free of an indirection per predicate.
-__global__ void flags_from_mask_kernel(const i64* __restrict__ perm, std::size_t n,
+__global__ void flags_from_mask_kernel(const std::uint32_t* __restrict__ perm, std::size_t n,
                                        const unsigned char* __restrict__ mask,
                                        unsigned char* __restrict__ flags) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
@@ -394,10 +408,31 @@ __global__ void gather_order_keys_kernel(const void* __restrict__ keys, int kwid
 }
 
 __global__ void unmap_order_keys_kernel(const u64* __restrict__ in, std::size_t n,
-                                        i64* __restrict__ out) {
+                                        void* __restrict__ out, int w,
+                                        const i64* __restrict__ perm_i64,
+                                        std::uint32_t* __restrict__ perm_u32) {
     const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
     for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         i < n; i += stride) out[i] = u64_to_key(in[i]);
+         i < n; i += stride) {
+        stw(out, w, i, u64_to_key(in[i]));
+        perm_u32[i] = static_cast<std::uint32_t>(perm_i64[i]);
+    }
+}
+
+// Keep the k-th selected position of the cache: both arrays move together, so
+// selecting POSITIONS once and gathering beats selecting each array.
+__global__ void gather_selected_kernel(const void* __restrict__ sorted, int w,
+                                       const std::uint32_t* __restrict__ perm,
+                                       const std::uint32_t* __restrict__ pick, std::size_t n_sel,
+                                       void* __restrict__ sorted_out,
+                                       std::uint32_t* __restrict__ perm_out) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t k = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         k < n_sel; k += stride) {
+        const std::size_t i = pick[k];
+        stw(sorted_out, w, k, ldw(sorted, w, i));
+        perm_out[k] = perm[i];
+    }
 }
 
 // Split the reduced tuples into the six result vectors, applying the
@@ -424,18 +459,18 @@ __global__ void finalize_kernel(const ETup* __restrict__ t, std::size_t n,
 // search and there is no hash table on the device. The build key is unique
 // among its valid cells (the operator's precondition, checked by the caller
 // via the run count), so lower_bound landing on an equal cell IS the match.
-__device__ __forceinline__ std::size_t dev_lower_bound(const i64* __restrict__ a,
+__device__ __forceinline__ std::size_t dev_lower_bound(const void* __restrict__ a, int w,
                                                        std::size_t n, i64 x) {
     std::size_t lo = 0, hi = n;
     while (lo < hi) {
         const std::size_t mid = lo + ((hi - lo) >> 1);
-        if (a[mid] < x) lo = mid + 1; else hi = mid;
+        if (ldw(a, w, mid) < x) lo = mid + 1; else hi = mid;
     }
     return lo;
 }
 
-__global__ void join_probe_kernel(const i64* __restrict__ bsorted, const i64* __restrict__ bperm,
-                                  std::size_t n_bvalid,
+__global__ void join_probe_kernel(const void* __restrict__ bsorted, int bkey_width,
+                                  const std::uint32_t* __restrict__ bperm, std::size_t n_bvalid,
                                   const void* __restrict__ pkeys, int pkey_width,
                                   const u64* __restrict__ pvalid, std::size_t rows_probe,
                                   const u64* __restrict__ keylane_valid, int key_from_build,
@@ -449,9 +484,9 @@ __global__ void join_probe_kernel(const i64* __restrict__ bsorted, const i64* __
         if (!bit_at(pvalid, i)) continue;              // NULL probe key never matches
         if (!n_bvalid) continue;
         const i64 k = ldw(pkeys, pkey_width, i);
-        const std::size_t at = dev_lower_bound(bsorted, n_bvalid, k);
-        if (at >= n_bvalid || bsorted[at] != k) continue;
-        const std::size_t brow = static_cast<std::size_t>(bperm[at]);
+        const std::size_t at = dev_lower_bound(bsorted, bkey_width, n_bvalid, k);
+        if (at >= n_bvalid || ldw(bsorted, bkey_width, at) != k) continue;
+        const std::size_t brow = bperm[at];
         match[i] = static_cast<std::uint32_t>(brow);
         const std::size_t krow = key_from_build ? brow : i;
         cls[i] = bit_at(keylane_valid, krow) ? 1u : 2u;
@@ -601,15 +636,19 @@ cudaError_t gpudb_cuda_exact_null_count(const u64* d_valid, std::size_t rows,
 // into d_perm, then sort (order-key, row id) pairs by the key.
 cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
                                   const u64* d_valid, std::size_t rows,
-                                  i64* d_sorted, i64* d_perm,
+                                  void* d_sorted, std::uint32_t* d_perm,
                                   std::size_t* h_n_valid, cudaStream_t s) {
     *h_n_valid = 0;
     if (!rows) return cudaSuccess;
     cudaError_t e;
     std::size_t n_valid = rows;
 
+    // the radix sort carries i64 row ids; they are packed to u32 on the way out
+    DevBuf perm64;
+    if ((e = perm64.alloc(rows * sizeof(i64))) != cudaSuccess) return e;
+    i64* d_perm64 = static_cast<i64*>(perm64.p);
     if (!d_valid) {
-        if ((e = gpudb_cuda_ops::sequence(d_perm, rows, s)) != cudaSuccess) return e;
+        if ((e = gpudb_cuda_ops::sequence(d_perm64, rows, s)) != cudaSuccess) return e;
     } else {
         DevBuf flags, all, num;
         if ((e = flags.alloc(rows)) != cudaSuccess) return e;
@@ -622,7 +661,7 @@ cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
         e = with_temp([&](void* tmp, std::size_t& b) {
             return cub::DeviceSelect::Flagged(tmp, b, static_cast<const i64*>(all.p),
                                               static_cast<const unsigned char*>(flags.p),
-                                              d_perm, static_cast<int*>(num.p),
+                                              d_perm64, static_cast<int*>(num.p),
                                               static_cast<int>(rows), s);
         });
         if (e != cudaSuccess) return e;
@@ -635,12 +674,12 @@ cudaError_t gpudb_cuda_exact_sort(const void* d_keys, int key_width,
     DevBuf uk;
     if ((e = uk.alloc(n_valid * sizeof(u64))) != cudaSuccess) return e;
     gather_order_keys_kernel<<<grid_for(n_valid), kBlock, 0, s>>>(
-        d_keys, key_width, d_perm, n_valid, static_cast<u64*>(uk.p));
+        d_keys, key_width, d_perm64, n_valid, static_cast<u64*>(uk.p));
     if ((e = cudaGetLastError()) != cudaSuccess) return e;
-    if ((e = gpudb_cuda_ops::sort_pairs_u64(static_cast<u64*>(uk.p), d_perm, n_valid, s))
+    if ((e = gpudb_cuda_ops::sort_pairs_u64(static_cast<u64*>(uk.p), d_perm64, n_valid, s))
         != cudaSuccess) return e;
     unmap_order_keys_kernel<<<grid_for(n_valid), kBlock, 0, s>>>(
-        static_cast<const u64*>(uk.p), n_valid, d_sorted);
+        static_cast<const u64*>(uk.p), n_valid, d_sorted, key_width, d_perm64, d_perm);
     if ((e = cudaGetLastError()) != cudaSuccess) return e;
     if ((e = cudaStreamSynchronize(s)) != cudaSuccess) return e;   // uk dies on return
     *h_n_valid = n_valid;
@@ -654,19 +693,20 @@ cudaError_t gpudb_cuda_exact_mask(const gpudb::cuda_exact::DevPred* d_preds, int
     return cudaGetLastError();
 }
 
-cudaError_t gpudb_cuda_exact_select_sorted(const i64* d_sorted, const i64* d_perm,
+cudaError_t gpudb_cuda_exact_select_sorted(const void* d_sorted, int key_width,
+                                           const std::uint32_t* d_perm,
                                            std::size_t n_valid, const unsigned char* d_mask,
-                                           i64* d_sorted_out, i64* d_perm_out,
+                                           void* d_sorted_out, std::uint32_t* d_perm_out,
                                            std::size_t* h_n_sel, cudaStream_t s) {
     *h_n_sel = 0;
     if (!n_valid) return cudaSuccess;
     cudaError_t e;
     if (!d_mask) {                                        // no WHERE: everything survives
-        const std::size_t b = n_valid * sizeof(i64);
-        if ((e = cudaMemcpyAsync(d_sorted_out, d_sorted, b, cudaMemcpyDeviceToDevice, s))
-            != cudaSuccess) return e;
-        if ((e = cudaMemcpyAsync(d_perm_out, d_perm, b, cudaMemcpyDeviceToDevice, s))
-            != cudaSuccess) return e;
+        if ((e = cudaMemcpyAsync(d_sorted_out, d_sorted,
+                                 n_valid * static_cast<std::size_t>(key_width),
+                                 cudaMemcpyDeviceToDevice, s)) != cudaSuccess) return e;
+        if ((e = cudaMemcpyAsync(d_perm_out, d_perm, n_valid * sizeof(std::uint32_t),
+                                 cudaMemcpyDeviceToDevice, s)) != cudaSuccess) return e;
         *h_n_sel = n_valid;
         return cudaSuccess;
     }
@@ -677,29 +717,35 @@ cudaError_t gpudb_cuda_exact_select_sorted(const i64* d_sorted, const i64* d_per
         d_perm, n_valid, d_mask, static_cast<unsigned char*>(flags.p));
     if ((e = cudaGetLastError()) != cudaSuccess) return e;
 
-    // Two Flagged passes over one flag array: the sorted keys and the row ids
-    // keep the same surviving positions, so the two selections agree.
+    // Select the surviving POSITIONS once, then gather both arrays through
+    // them. Selecting each array separately would need a Flagged pass per
+    // array and, now that the two have different element widths, two
+    // differently-typed ones.
+    DevBuf pick;
+    if ((e = pick.alloc(n_valid * sizeof(std::uint32_t))) != cudaSuccess) return e;
+    thrust::counting_iterator<std::uint32_t> pos0(0);
     e = with_temp([&](void* tmp, std::size_t& b) {
-        return cub::DeviceSelect::Flagged(tmp, b, d_sorted,
+        return cub::DeviceSelect::Flagged(tmp, b, pos0,
                                           static_cast<const unsigned char*>(flags.p),
-                                          d_sorted_out, static_cast<int*>(num.p),
-                                          static_cast<int>(n_valid), s);
-    });
-    if (e != cudaSuccess) return e;
-    e = with_temp([&](void* tmp, std::size_t& b) {
-        return cub::DeviceSelect::Flagged(tmp, b, d_perm,
-                                          static_cast<const unsigned char*>(flags.p),
-                                          d_perm_out, static_cast<int*>(num.p),
+                                          static_cast<std::uint32_t*>(pick.p),
+                                          static_cast<int*>(num.p),
                                           static_cast<int>(n_valid), s);
     });
     if (e != cudaSuccess) return e;
     int n = 0;
     if ((e = fetch(num.p, &n, s)) != cudaSuccess) return e;
+    if (n > 0) {
+        gather_selected_kernel<<<grid_for(static_cast<std::size_t>(n)), kBlock, 0, s>>>(
+            d_sorted, key_width, d_perm, static_cast<const std::uint32_t*>(pick.p),
+            static_cast<std::size_t>(n), d_sorted_out, d_perm_out);
+        if ((e = cudaGetLastError()) != cudaSuccess) return e;
+        if ((e = cudaStreamSynchronize(s)) != cudaSuccess) return e;   // pick dies on return
+    }
     *h_n_sel = static_cast<std::size_t>(n);
     return cudaSuccess;
 }
 
-cudaError_t gpudb_cuda_exact_run_count(const i64* d_sorted, std::size_t n,
+cudaError_t gpudb_cuda_exact_run_count(const void* d_sorted, int key_width, std::size_t n,
                                        std::size_t* h_runs, cudaStream_t s) {
     *h_runs = 0;
     if (!n) return cudaSuccess;
@@ -707,7 +753,7 @@ cudaError_t gpudb_cuda_exact_run_count(const i64* d_sorted, std::size_t n,
     cudaError_t e = out.alloc(sizeof(u64));
     if (e != cudaSuccess) return e;
     thrust::counting_iterator<std::size_t> it(0);
-    auto starts = thrust::make_transform_iterator(it, IsRunStart{d_sorted});
+    auto starts = thrust::make_transform_iterator(it, IsRunStart{d_sorted, key_width});
     if ((e = gpudb_cuda_ops::sum_u64(starts, n, static_cast<u64*>(out.p), s)) != cudaSuccess) return e;
     u64 runs = 0;
     if ((e = fetch(out.p, &runs, s)) != cudaSuccess) return e;
@@ -715,7 +761,8 @@ cudaError_t gpudb_cuda_exact_run_count(const i64* d_sorted, std::size_t n,
     return cudaSuccess;
 }
 
-cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std::size_t n_sel,
+cudaError_t gpudb_cuda_exact_reduce(const void* d_sorted, int key_width,
+                                    const std::uint32_t* d_perm, std::size_t n_sel,
                                     const void* d_vals, int val_width,
                                     const u64* d_vvalid, int has_vals,
                                     i64* d_keys_out, i64* d_lo, i64* d_hi,
@@ -734,8 +781,10 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
 
     // One run per distinct key: the keys arrive sorted, so equal keys are
     // adjacent and ReduceByKey's runs ARE the groups.
+    thrust::counting_iterator<std::size_t> kit(0);
+    auto keys_in = thrust::make_transform_iterator(kit, LoadKey{d_sorted, key_width});
     e = with_temp([&](void* tmp, std::size_t& b) {
-        return cub::DeviceReduce::ReduceByKey(tmp, b, d_sorted, d_keys_out, vals,
+        return cub::DeviceReduce::ReduceByKey(tmp, b, keys_in, d_keys_out, vals,
                                               static_cast<ETup*>(tuples.p),
                                               static_cast<int*>(num.p), AddExact(),
                                               static_cast<int>(n_sel), s);
@@ -754,8 +803,8 @@ cudaError_t gpudb_cuda_exact_reduce(const i64* d_sorted, const i64* d_perm, std:
     return cudaSuccess;
 }
 
-cudaError_t gpudb_cuda_join_mat_probe(const i64* d_bsorted, const i64* d_bperm,
-                                      std::size_t n_bvalid,
+cudaError_t gpudb_cuda_join_mat_probe(const void* d_bsorted, int bkey_width,
+                                      const std::uint32_t* d_bperm, std::size_t n_bvalid,
                                       const void* d_pkeys, int pkey_width, const u64* d_pvalid,
                                       std::size_t rows_probe,
                                       const u64* d_keylane_valid, int key_from_build,
@@ -764,7 +813,7 @@ cudaError_t gpudb_cuda_join_mat_probe(const i64* d_bsorted, const i64* d_bperm,
     *h_n1 = 0; *h_n2 = 0;
     if (!rows_probe) return cudaSuccess;
     join_probe_kernel<<<grid_for(rows_probe), kBlock, 0, s>>>(
-        d_bsorted, d_bperm, n_bvalid, d_pkeys, pkey_width, d_pvalid, rows_probe,
+        d_bsorted, bkey_width, d_bperm, n_bvalid, d_pkeys, pkey_width, d_pvalid, rows_probe,
         d_keylane_valid, key_from_build, d_match, d_cls);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
