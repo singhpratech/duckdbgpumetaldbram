@@ -5290,6 +5290,62 @@ checks, 225 SQL pass / 0 fail, the wrapper and shell suites clean under DuckDB
 coverage unchanged at 17 of 22 on the device, 0 differing, ratios 1.44x to
 12.59x against the 1.4x-13.6x on record.
 
+## 2026-09-20 — The dependency a wheel cannot assume
+
+The Linux extension links OpenMP dynamically, so it NEEDs `libgomp.so.1`. On
+this box, on a CI runner, in a Colab notebook, in the release container — it is
+there every time, which is exactly why it went unnoticed. In a bare
+`ubuntu:22.04` it is not there, and the LOAD fails outright:
+
+    IO Error: Extension "..." could not be loaded:
+    libgomp.so.1: cannot open shared object file: No such file or directory
+
+`ldconfig -p | grep -c libgomp.so.1` in that image returns 0. The registry
+build has the same dependency (plus `libstdc++.so.6`, which the static link
+removes for ours), so this is not new in v0.7 — it is a claim about portability
+that had never been tested anywhere the claim could fail.
+
+Two different answers, because there are two different artefacts. The bare
+release asset keeps the dependency and states it: one `apt install libgomp1`.
+The wheel cannot ask that of a `pip install`, so it carries its own copy beside
+the extension in `gpudb/_ext/`, with the licence, and the extension is linked
+with a `$ORIGIN` runpath to find it.
+
+RUNPATH, not RPATH. RUNPATH is consulted after `LD_LIBRARY_PATH` and only for
+the object's own dependencies, and the loader matches a soname that is already
+mapped before it searches any path at all — so a process that already has
+libgomp keeps the copy it has. Measured, both orders, in a bare container with
+no system libgomp:
+
+    numpy + scipy first, then gpudb  ->  1 mapping: .../gpudb/_ext/libgomp.so.1
+    gpudb first, then numpy + scipy  ->  1 mapping: .../gpudb/_ext/libgomp.so.1
+
+and on this machine, where a system libgomp does exist:
+
+    extension first        ->  the $ORIGIN copy; a later CDLL("libgomp.so.1")
+                               reuses it, no second mapping
+    system libgomp first   ->  /usr/lib/x86_64-linux-gnu/libgomp.so.1.0.0, the
+                               bundled copy never opened, GPU path unaffected
+
+Exactly one libgomp in the process in every case.
+
+The bundled copy has to come from the machine that built the extension. That is
+not tidiness: libgomp carries its own glibc floor, 2.38 from this 24.04-based
+host and 2.34 from the 22.04 release container, and bundling the host's copy
+would have raised the wheel's real floor above its own tag — a wheel that
+installs cleanly on Debian 12 and then cannot load. `build_wheels.sh` now reads
+the highest `GLIBC_x.y` out of both objects with `objdump -T` and refuses the
+build if either exceeds what the tag promises. It is three lines of shell and
+it is the only thing standing between a correct tag and a silent one; the same
+class of mistake — an environment that varied without being asked to — has cost
+this project more time than any bug in the kernels.
+
+Floors for the v0.7.0 build, `nvidia/cuda:12.8.1-devel-ubuntu22.04`:
+GLIBC_2.34, no GLIBCXX, no CXXABI, `NEEDED` = libgomp, libm, libc, ld-linux.
+Tag: `manylinux_2_34_x86_64`. Ubuntu 20.04 is out of reach twice over — glibc
+2.31 against our 2.33 symbols, and DuckDB publishes no 1.5.5 wheel for the
+Python 3.8 that ships with it.
+
 ## 2026-09-20 — The use cases were still the v0.6 ones
 
 `README.md`'s *What you'd use it for* still opened on "workloads that ask the
