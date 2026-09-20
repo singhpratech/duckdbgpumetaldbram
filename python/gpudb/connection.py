@@ -319,6 +319,7 @@ class Connection:
         self._backend = ""
         self._backend_note = ""          # why there is no backend, when there is none
         self._has_rewrite_scalar = False
+        self._has_avg_decimal = False
         self._refresh_after = False
         self._big_tables: Optional[set] = None    # names of tables above the floor (§0)
         self._speedups: List[float] = []          # §5.5: measured native/rewritten ratios, newest last
@@ -342,6 +343,7 @@ class Connection:
             self._backend = _parent._backend
             self._backend_note = getattr(_parent, "_backend_note", "")
             self._has_rewrite_scalar = _parent._has_rewrite_scalar
+            self._has_avg_decimal = _parent._has_avg_decimal
 
     # ---- settings ----
     @property
@@ -461,6 +463,14 @@ class Connection:
             self._has_rewrite_scalar = True
         except Exception:
             self._has_rewrite_scalar = False
+        # avg over a DECIMAL payload is finalised in C++ when the extension
+        # provides it (native's long double quotient, which SQL cannot
+        # express). An older extension does not, and the shape is declined.
+        try:
+            self._raw.execute("SELECT gpu_avg_decimal(0::HUGEINT, 1, 0)").fetchall()
+            self._has_avg_decimal = True
+        except Exception:
+            self._has_avg_decimal = False
 
     def _missing_functions(self) -> List[str]:
         """Which of the functions this client can name are absent from the
@@ -2207,6 +2217,7 @@ class Connection:
                 for n, c in computed.items())
             probe_from = f"(SELECT *, {proj} FROM {base_from}) gpudb_c"
         try:
+            plan.native_avg_decimal = getattr(self, "_has_avg_decimal", False)
             _rewrite.check_types(plan, columns, exact=getattr(self, "_exact", False),
                                  avg_float_bits=getattr(self, "_avg_float_bits", 0))
         except _rewrite.Decline as e:

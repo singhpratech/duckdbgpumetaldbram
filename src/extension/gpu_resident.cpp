@@ -100,6 +100,7 @@
 #include "gpu_sum_extension.hpp"
 #include "gpu_backend.hpp"
 #include "backend_notes.hpp"
+#include "native_avg.hpp"
 #include "resident_shed_note.hpp"
 
 #if defined(GPUDB_C_STRUCT_ABI)
@@ -3267,6 +3268,56 @@ void join_materialize_exec(duckdb_function_info info, duckdb_data_chunk input, d
 // set built from a JOIN over it was uploaded. gpu_assert_rows(name,
 // count(*)) over the table is then the staleness guard for that table, as it
 // is for a table's own set. Holds no device memory.
+// gpu_avg_decimal(sum HUGEINT, count BIGINT, scale BIGINT) -> DOUBLE
+//
+// Native's own finalisation of avg() over a DECIMAL(p, s) payload: the exact
+// 128-bit UNSCALED sum divided, in `long double`, by count * 10^s — one
+// division by the scaled count, which is the expression DuckDB itself
+// evaluates (sum/count then /10^s, or sum/10^s then /count, each differ from
+// it on 20-30% of groups).
+//
+// This exists because SQL cannot express it. The wrapper used to derive the
+// column as `CAST(sum AS DOUBLE) / (count * 10^s)`, which is native's formula
+// only where `long double` IS double (arm64). On x86-64 it is the 80-bit
+// type, so the SQL form rounds differently once a group's unscaled sum passes
+// 2^53 — measured at 982 of 5000 groups. There is no SQL expression that fixes
+// it, because SQL has no 80-bit type; the only way to reproduce native's
+// arithmetic is to do it in C++, which is what this function is for.
+//
+// count == 0 is SQL NULL (avg of nothing), matching the table functions' own
+// avg column and native.
+void avg_decimal_exec(duckdb_function_info, duckdb_data_chunk input, duckdb_vector output) {
+    duckdb_vector s_vec = duckdb_data_chunk_get_vector(input, 0);
+    duckdb_vector c_vec = duckdb_data_chunk_get_vector(input, 1);
+    duckdb_vector k_vec = duckdb_data_chunk_get_vector(input, 2);
+    auto* sums   = reinterpret_cast<const duckdb_hugeint*>(duckdb_vector_get_data(s_vec));
+    auto* counts = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(c_vec));
+    auto* scales = reinterpret_cast<const std::int64_t*>(duckdb_vector_get_data(k_vec));
+    uint64_t* sv = duckdb_vector_get_validity(s_vec);
+    uint64_t* cv = duckdb_vector_get_validity(c_vec);
+    uint64_t* kv = duckdb_vector_get_validity(k_vec);
+    const idx_t n = duckdb_data_chunk_get_size(input);
+    auto* out = reinterpret_cast<double*>(duckdb_vector_get_data(output));
+    uint64_t* ov = nullptr;
+    for (idx_t i = 0; i < n; ++i) {
+        const bool null_in = (sv && !duckdb_validity_row_is_valid(sv, i)) ||
+                             (cv && !duckdb_validity_row_is_valid(cv, i)) ||
+                             (kv && !duckdb_validity_row_is_valid(kv, i));
+        // scale is the payload's DECIMAL scale; DuckDB's widest is 38.
+        if (null_in || counts[i] == 0 || scales[i] < 0 || scales[i] > 38) {
+            out[i] = 0.0;
+            if (!ov) {
+                duckdb_vector_ensure_validity_writable(output);
+                ov = duckdb_vector_get_validity(output);
+            }
+            duckdb_validity_set_row_invalid(ov, i);
+            continue;
+        }
+        const gpudb::Sum128 sm{sums[i].lower, sums[i].upper};
+        out[i] = gpudb::native_avg_decimal(sm, counts[i], static_cast<int>(scales[i]));
+    }
+}
+
 void note_rows_exec(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
     duckdb_vector name_vec = duckdb_data_chunk_get_vector(input, 0);
     duckdb_vector n_vec    = duckdb_data_chunk_get_vector(input, 1);
@@ -4087,6 +4138,8 @@ void register_gpu_resident(duckdb_connection con,
         invalidate_exec, DUCKDB_TYPE_BIGINT, 1, ctx);
     register_scalar_names(con, "gpu_join_materialize",
         join_materialize_exec, DUCKDB_TYPE_BIGINT, 6, ctx);
+    register_scalar(con, "gpu_avg_decimal", avg_decimal_exec, DUCKDB_TYPE_DOUBLE,
+                    {DUCKDB_TYPE_HUGEINT, DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar(con, "gpu_note_rows", note_rows_exec, DUCKDB_TYPE_BOOLEAN,
                     {DUCKDB_TYPE_VARCHAR, DUCKDB_TYPE_BIGINT}, ctx);
     register_scalar(con, "gpu_drop_column", drop_column_exec, DUCKDB_TYPE_BOOLEAN,
