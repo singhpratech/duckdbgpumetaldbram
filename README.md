@@ -723,9 +723,14 @@ there. Copy-paste workflows for Apple Silicon runners, Linux runners, Docker,
 and self-hosted CUDA boxes: **[docs/CI_RECIPES.md](docs/CI_RECIPES.md)**.
 
 Prefer a notebook? **[examples/gpudb_quickstart.ipynb](examples/gpudb_quickstart.ipynb)**
-opens directly in Google Colab — registry install + parity checks anywhere,
-plus an optional build-from-source section that runs the CUDA benchmarks on
-Colab's free T4 GPU.
+opens directly in Google Colab and starts at `pip install duckdb-gpudb`, which
+on a Colab runtime brings the CUDA-enabled extension with it — no `INSTALL`, no
+build. It then runs plain SQL over TPC-H SF1 through `gpudb.connect()` and
+through a stock `duckdb` connection side by side, comparing the rows and the
+times and printing where each statement ran and why, does the same from the
+`gpudb` shell, and ends with the explicit `gpu_*` functions and an optional
+build-from-source appendix. With no GPU attached every cell still runs, on
+DuckDB, with the same answers.
 
 ## What you get
 

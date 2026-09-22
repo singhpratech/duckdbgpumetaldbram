@@ -233,10 +233,26 @@ reaches the GPU on R525+.
 ## 6. Colab / Jupyter
 
 There is a ready-made notebook at
-[`examples/gpudb_quickstart.ipynb`](../examples/gpudb_quickstart.ipynb) —
-one-click quick start on Google Colab, including an optional
-build-from-source section that compiles the CUDA backend on Colab's free GPU
-runtime.
+[`examples/gpudb_quickstart.ipynb`](../examples/gpudb_quickstart.ipynb), which
+opens in Google Colab from the README badge and requests a T4 runtime itself.
+
+It starts where a notebook should: `pip install duckdb-gpudb`. On a Colab
+runtime (x86-64, glibc 2.35) that wheel carries the CUDA-enabled extension and
+its own `libgomp`, so there is no `INSTALL`, no build and nothing to
+configure. From there it builds TPC-H SF1 through `gpudb.connect()`, runs plain
+SQL — a top-k `GROUP BY`, a `WHERE` + `HAVING`, a join — against **both** the
+wrapper and a stock `duckdb` connection over the same file, compares the rows
+row for row, prints both times and `con.last_rewrite()` under each one, and
+then does the same from the `gpudb` shell. A short section covers the explicit
+`gpu_*` functions from a stock client via `INSTALL gpudb FROM community` (the
+registry's Linux binary is CPU-only, which that section says out loud), and an
+appendix builds the CUDA engine from source for anyone working on the engine
+itself.
+
+Nothing in it claims a backend it did not find: every heading that mentions
+CUDA or a T4 is conditional on what `gpu_build_info()` reports, and on a
+runtime with no GPU attached every cell still runs, on DuckDB, with the same
+answers.
 
 ---
 
