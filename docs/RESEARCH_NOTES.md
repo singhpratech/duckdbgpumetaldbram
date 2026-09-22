@@ -5662,6 +5662,66 @@ true of the registry build (libgomp.so.1 at load time, with the install hints
 and the exact `LOAD` error), states no glibc floor for it, and puts the x86-64 /
 glibc 2.34 floor in one sentence about the release binary and the wheel.
 
+## 2026-09-22 — The Colab notebook was still a v0.6 artefact
+
+The quick-start notebook opened with `INSTALL gpudb FROM community` and then
+apologised: the registry's Linux binary carries no CUDA, so the whole first
+part ran gpudb's CPU fallback, and the only way the notebook offered to reach a
+T4 was a from-source build in part 2. That was true when it was written. It
+stopped being true when the v0.7.0 platform wheel shipped: on x86-64 Linux with
+glibc 2.34 or newer — which a Colab runtime is — `pip install duckdb-gpudb`
+installs the CUDA-enabled extension inside the package, and `gpudb.connect()`
+answers plain SQL on the device. A notebook is the one place where a reader
+runs every claim themselves, so it was the worst place to still be leading with
+the route that cannot get there.
+
+Rewritten around the pip install, and around the discipline that every line of
+prose must be something a cell demonstrates. The backend is read once from
+`gpu_build_info()` and every sentence about CUDA, Metal or a T4 is conditional
+on it, so the same notebook is truthful on a T4, on a GPU-less Colab runtime
+and on a Mac. The three query sections run each statement on the wrapper *and*
+on a stock `duckdb` connection over the same file, assert the rows are equal,
+print both series of times and end with `con.last_rewrite()` — where it ran and
+why, including the first ask that honestly runs on DuckDB because the columns
+are still uploading.
+
+Four things the machine decided rather than the author:
+
+- **Two connections to one file must share one configuration.** A plain
+  `duckdb.connect(db, read_only=True)` beside `gpudb.connect(db,
+  read_only=True)` is refused, because the wrapper adds
+  `allow_unsigned_extensions` when it loads a bundled binary. The stock
+  connection repeats that setting, with a comment saying why, and falls back to
+  no config for the platforms where no binary is bundled.
+- **A deterministic `ORDER BY` is not free.** The obvious `l_orderkey,
+  sum(l_quantity) … ORDER BY qty DESC LIMIT 10` has ties inside the top ten at
+  SF1, so the two connections legitimately returned different rows and the
+  ties guard declined the statement anyway; adding a tiebreak column removes
+  the `topk` form and the statement falls back to a plain GROUP BY it is then
+  too output-bound to win. The notebook uses shapes whose answer is unique:
+  top-5 on `l_partkey` (no ties at SF1), a `HAVING` ordered by the key, and a
+  five-row join aggregate.
+- **A `WHERE` has to leave enough behind.** `WHERE l_shipdate >= 1994-01-01 …
+  HAVING` declines at SF1 with `selectivity 0.15 < 0.2 for HAVING`; the
+  measured rule wants a filter that keeps most of the table, so the notebook
+  filters on `l_quantity > 5`.
+- **With no GPU there are no thresholds at all.** `_thresholds.TABLE` has
+  METAL and CUDA only, so a CPU runtime reports `threshold: no thresholds for
+  backend 'CPU'` on every statement. The residency wait is skipped entirely in
+  that case rather than polling `residents()` for two minutes over an empty
+  dict, and the prose says what the comparison then is: DuckDB against DuckDB,
+  identical rows, no ratio to read.
+
+Executed end to end on an M4 Max (Python 3.11, duckdb 1.5.5, the 0.7.0 Metal
+wheel from PyPI) with `jupyter nbconvert --execute`: dbgen SF1 in 5.7 s, all
+three shapes rewritten after a 0.5 s residency wait, rows identical in all
+three, best-of-five 14.6 → 7.9 ms (top-k, 1.85×), 14.1 → 6.7 ms (HAVING,
+2.11×), 6.4 → 1.5 ms (join, 4.24×), and the shell cell's two footers reading
+`GPU (plain: the resident GROUP BY) · 71.8 ms` then `· 1.3 ms`. Outputs are
+stripped in the committed file. What a Mac cannot check is the CUDA half: that
+`pip install` on a T4 runtime reports `runtime=cuda`, and what the three ratios
+are there. One real Colab run is owed before this is called done.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
