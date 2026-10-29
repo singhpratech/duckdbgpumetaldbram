@@ -1,0 +1,142 @@
+{
+ "name": "agg_modifiers",
+ "duckdb": "1.5.6",
+ "sql": "SELECT count(DISTINCT x) FILTER (WHERE y > 0), string_agg(x, ',' ORDER BY y) FROM t",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "count",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        }
+       ],
+       "filter": {
+        "class": "COMPARISON",
+        "type": "COMPARE_GREATERTHAN",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "y"
+         ]
+        },
+        "right": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 0
+         }
+        }
+       },
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": true,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "string_agg",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        },
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "VARCHAR",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": ","
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": [
+         {
+          "type": "ORDER_DEFAULT",
+          "null_order": "ORDER_DEFAULT",
+          "expression": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "y"
+           ]
+          }
+         }
+        ]
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

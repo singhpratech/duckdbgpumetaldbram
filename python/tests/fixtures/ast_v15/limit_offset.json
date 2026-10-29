@@ -1,0 +1,77 @@
+{
+ "name": "limit_offset",
+ "duckdb": "1.5.6",
+ "sql": "SELECT x FROM s.t AS u LIMIT 5 OFFSET 2",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "LIMIT_MODIFIER",
+       "limit": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "INTEGER",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": 5
+        }
+       },
+       "offset": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "INTEGER",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": 2
+        }
+       }
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "x"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "u",
+      "sample": null,
+      "schema_name": "s",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

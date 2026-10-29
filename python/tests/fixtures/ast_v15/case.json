@@ -1,0 +1,200 @@
+{
+ "name": "case",
+ "duckdb": "1.5.6",
+ "sql": "SELECT CASE WHEN x > 0 THEN 'p' WHEN x < 0 THEN 'n' ELSE NULL END, CASE x WHEN 1 THEN 'a' END FROM t",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CASE",
+       "type": "CASE_EXPR",
+       "alias": "",
+       "case_checks": [
+        {
+         "when_expr": {
+          "class": "COMPARISON",
+          "type": "COMPARE_GREATERTHAN",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "x"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 0
+           }
+          }
+         },
+         "then_expr": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "p"
+          }
+         }
+        },
+        {
+         "when_expr": {
+          "class": "COMPARISON",
+          "type": "COMPARE_LESSTHAN",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "x"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 0
+           }
+          }
+         },
+         "then_expr": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "n"
+          }
+         }
+        }
+       ],
+       "else_expr": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "NULL",
+          "type_info": null
+         },
+         "is_null": true
+        }
+       }
+      },
+      {
+       "class": "CASE",
+       "type": "CASE_EXPR",
+       "alias": "",
+       "case_checks": [
+        {
+         "when_expr": {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "x"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          }
+         },
+         "then_expr": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "a"
+          }
+         }
+        }
+       ],
+       "else_expr": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "NULL",
+          "type_info": null
+         },
+         "is_null": true
+        }
+       }
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

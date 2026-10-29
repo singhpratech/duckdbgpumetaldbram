@@ -1,0 +1,544 @@
+{
+ "name": "tpch_q11",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.0001000000\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC;\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "value"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "ps_partkey"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "value",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "FUNCTION",
+         "type": "FUNCTION",
+         "alias": "",
+         "function_name": "*",
+         "schema": "",
+         "children": [
+          {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "ps_supplycost"
+           ]
+          },
+          {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "ps_availqty"
+           ]
+          }
+         ],
+         "filter": null,
+         "order_bys": {
+          "type": "ORDER_MODIFIER",
+          "orders": []
+         },
+         "distinct": false,
+         "is_operator": true,
+         "export_state": false,
+         "catalog": ""
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "JOIN",
+       "alias": "",
+       "sample": null,
+       "left": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "partsupp",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "right": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "supplier",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "condition": null,
+       "join_type": "INNER",
+       "ref_type": "CROSS",
+       "using_columns": [],
+       "delim_flipped": false,
+       "duplicate_eliminated_columns": []
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "nation",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "CROSS",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_AND",
+      "alias": "",
+      "children": [
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "ps_suppkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "s_suppkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "s_nationkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "n_nationkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "n_name"
+         ]
+        },
+        "right": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "VARCHAR",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": "GERMANY"
+         }
+        }
+       }
+      ]
+     },
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "ps_partkey"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": {
+      "class": "COMPARISON",
+      "type": "COMPARE_GREATERTHAN",
+      "alias": "",
+      "left": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "FUNCTION",
+         "type": "FUNCTION",
+         "alias": "",
+         "function_name": "*",
+         "schema": "",
+         "children": [
+          {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "ps_supplycost"
+           ]
+          },
+          {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "ps_availqty"
+           ]
+          }
+         ],
+         "filter": null,
+         "order_bys": {
+          "type": "ORDER_MODIFIER",
+          "orders": []
+         },
+         "distinct": false,
+         "is_operator": true,
+         "export_state": false,
+         "catalog": ""
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      "right": {
+       "class": "SUBQUERY",
+       "type": "SUBQUERY",
+       "alias": "",
+       "subquery_type": "SCALAR",
+       "subquery": {
+        "node": {
+         "type": "SELECT_NODE",
+         "modifiers": [],
+         "cte_map": {
+          "map": []
+         },
+         "select_list": [
+          {
+           "class": "FUNCTION",
+           "type": "FUNCTION",
+           "alias": "",
+           "function_name": "*",
+           "schema": "",
+           "children": [
+            {
+             "class": "FUNCTION",
+             "type": "FUNCTION",
+             "alias": "",
+             "function_name": "sum",
+             "schema": "",
+             "children": [
+              {
+               "class": "FUNCTION",
+               "type": "FUNCTION",
+               "alias": "",
+               "function_name": "*",
+               "schema": "",
+               "children": [
+                {
+                 "class": "COLUMN_REF",
+                 "type": "COLUMN_REF",
+                 "alias": "",
+                 "column_names": [
+                  "ps_supplycost"
+                 ]
+                },
+                {
+                 "class": "COLUMN_REF",
+                 "type": "COLUMN_REF",
+                 "alias": "",
+                 "column_names": [
+                  "ps_availqty"
+                 ]
+                }
+               ],
+               "filter": null,
+               "order_bys": {
+                "type": "ORDER_MODIFIER",
+                "orders": []
+               },
+               "distinct": false,
+               "is_operator": true,
+               "export_state": false,
+               "catalog": ""
+              }
+             ],
+             "filter": null,
+             "order_bys": {
+              "type": "ORDER_MODIFIER",
+              "orders": []
+             },
+             "distinct": false,
+             "is_operator": false,
+             "export_state": false,
+             "catalog": ""
+            },
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "DECIMAL",
+               "type_info": {
+                "type": "DECIMAL_TYPE_INFO",
+                "alias": "",
+                "extension_info": null,
+                "width": 11,
+                "scale": 10
+               }
+              },
+              "is_null": false,
+              "value": 1000000
+             }
+            }
+           ],
+           "filter": null,
+           "order_bys": {
+            "type": "ORDER_MODIFIER",
+            "orders": []
+           },
+           "distinct": false,
+           "is_operator": true,
+           "export_state": false,
+           "catalog": ""
+          }
+         ],
+         "from_table": {
+          "type": "JOIN",
+          "alias": "",
+          "sample": null,
+          "left": {
+           "type": "JOIN",
+           "alias": "",
+           "sample": null,
+           "left": {
+            "type": "BASE_TABLE",
+            "alias": "",
+            "sample": null,
+            "schema_name": "",
+            "table_name": "partsupp",
+            "column_name_alias": [],
+            "catalog_name": "",
+            "at_clause": null
+           },
+           "right": {
+            "type": "BASE_TABLE",
+            "alias": "",
+            "sample": null,
+            "schema_name": "",
+            "table_name": "supplier",
+            "column_name_alias": [],
+            "catalog_name": "",
+            "at_clause": null
+           },
+           "condition": null,
+           "join_type": "INNER",
+           "ref_type": "CROSS",
+           "using_columns": [],
+           "delim_flipped": false,
+           "duplicate_eliminated_columns": []
+          },
+          "right": {
+           "type": "BASE_TABLE",
+           "alias": "",
+           "sample": null,
+           "schema_name": "",
+           "table_name": "nation",
+           "column_name_alias": [],
+           "catalog_name": "",
+           "at_clause": null
+          },
+          "condition": null,
+          "join_type": "INNER",
+          "ref_type": "CROSS",
+          "using_columns": [],
+          "delim_flipped": false,
+          "duplicate_eliminated_columns": []
+         },
+         "where_clause": {
+          "class": "CONJUNCTION",
+          "type": "CONJUNCTION_AND",
+          "alias": "",
+          "children": [
+           {
+            "class": "COMPARISON",
+            "type": "COMPARE_EQUAL",
+            "alias": "",
+            "left": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "ps_suppkey"
+             ]
+            },
+            "right": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "s_suppkey"
+             ]
+            }
+           },
+           {
+            "class": "COMPARISON",
+            "type": "COMPARE_EQUAL",
+            "alias": "",
+            "left": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "s_nationkey"
+             ]
+            },
+            "right": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "n_nationkey"
+             ]
+            }
+           },
+           {
+            "class": "COMPARISON",
+            "type": "COMPARE_EQUAL",
+            "alias": "",
+            "left": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "n_name"
+             ]
+            },
+            "right": {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "VARCHAR",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": "GERMANY"
+             }
+            }
+           }
+          ]
+         },
+         "group_expressions": [],
+         "group_sets": [],
+         "aggregate_handling": "STANDARD_HANDLING",
+         "having": null,
+         "sample": null,
+         "qualify": null
+        },
+        "named_param_map": []
+       },
+       "child": null,
+       "comparison_type": "INVALID"
+      }
+     },
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

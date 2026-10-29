@@ -1,0 +1,368 @@
+{
+ "name": "lit_kinds",
+ "duckdb": "1.5.6",
+ "sql": "SELECT true, false, NULL, 'x', 1, -1, 1.5, -1.5, 1e5, .5, 1., 100.00, 0.0, 00.10, 1_000, 1e-3, 1.5e3, '', 'it''s', E'a\\nb', 007",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "VARCHAR",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": "t"
+        }
+       },
+       "cast_type": {
+        "id": "BOOLEAN",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "VARCHAR",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": "f"
+        }
+       },
+       "cast_type": {
+        "id": "BOOLEAN",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "NULL",
+         "type_info": null
+        },
+        "is_null": true
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "VARCHAR",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": "x"
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 1
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": -1
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 2,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": 15
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 2,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": -15
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DOUBLE",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 100000.0
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 1,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": 5
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 1,
+          "scale": 0
+         }
+        },
+        "is_null": false,
+        "value": 1
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 5,
+          "scale": 2
+         }
+        },
+        "is_null": false,
+        "value": 10000
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 2,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": 0
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 4,
+          "scale": 2
+         }
+        },
+        "is_null": false,
+        "value": 10
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 1000
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DOUBLE",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 0.001
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DOUBLE",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 1500.0
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "VARCHAR",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": ""
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "VARCHAR",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": "it's"
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "VARCHAR",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": "a\nb"
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 7
+       }
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

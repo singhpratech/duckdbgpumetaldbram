@@ -1,0 +1,269 @@
+{
+ "name": "tpch_q13",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC;\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "custdist"
+          ]
+         }
+        },
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "c_count"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "c_count"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "custdist",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "SUBQUERY",
+      "alias": "c_orders",
+      "sample": null,
+      "subquery": {
+       "node": {
+        "type": "SELECT_NODE",
+        "modifiers": [],
+        "cte_map": {
+         "map": []
+        },
+        "select_list": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "c_custkey"
+          ]
+         },
+         {
+          "class": "FUNCTION",
+          "type": "FUNCTION",
+          "alias": "",
+          "function_name": "count",
+          "schema": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "o_orderkey"
+            ]
+           }
+          ],
+          "filter": null,
+          "order_bys": {
+           "type": "ORDER_MODIFIER",
+           "orders": []
+          },
+          "distinct": false,
+          "is_operator": false,
+          "export_state": false,
+          "catalog": ""
+         }
+        ],
+        "from_table": {
+         "type": "JOIN",
+         "alias": "",
+         "sample": null,
+         "left": {
+          "type": "BASE_TABLE",
+          "alias": "",
+          "sample": null,
+          "schema_name": "",
+          "table_name": "customer",
+          "column_name_alias": [],
+          "catalog_name": "",
+          "at_clause": null
+         },
+         "right": {
+          "type": "BASE_TABLE",
+          "alias": "",
+          "sample": null,
+          "schema_name": "",
+          "table_name": "orders",
+          "column_name_alias": [],
+          "catalog_name": "",
+          "at_clause": null
+         },
+         "condition": {
+          "class": "CONJUNCTION",
+          "type": "CONJUNCTION_AND",
+          "alias": "",
+          "children": [
+           {
+            "class": "COMPARISON",
+            "type": "COMPARE_EQUAL",
+            "alias": "",
+            "left": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "c_custkey"
+             ]
+            },
+            "right": {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "o_custkey"
+             ]
+            }
+           },
+           {
+            "class": "FUNCTION",
+            "type": "FUNCTION",
+            "alias": "",
+            "function_name": "!~~",
+            "schema": "",
+            "children": [
+             {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "o_comment"
+              ]
+             },
+             {
+              "class": "CONSTANT",
+              "type": "VALUE_CONSTANT",
+              "alias": "",
+              "value": {
+               "type": {
+                "id": "VARCHAR",
+                "type_info": null
+               },
+               "is_null": false,
+               "value": "%special%requests%"
+              }
+             }
+            ],
+            "filter": null,
+            "order_bys": {
+             "type": "ORDER_MODIFIER",
+             "orders": []
+            },
+            "distinct": false,
+            "is_operator": true,
+            "export_state": false,
+            "catalog": ""
+           }
+          ]
+         },
+         "join_type": "LEFT",
+         "ref_type": "REGULAR",
+         "using_columns": [],
+         "delim_flipped": false,
+         "duplicate_eliminated_columns": []
+        },
+        "where_clause": null,
+        "group_expressions": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "c_custkey"
+          ]
+         }
+        ],
+        "group_sets": [
+         [
+          0
+         ]
+        ],
+        "aggregate_handling": "STANDARD_HANDLING",
+        "having": null,
+        "sample": null,
+        "qualify": null
+       },
+       "named_param_map": []
+      },
+      "column_name_alias": [
+       "c_custkey",
+       "c_count"
+      ]
+     },
+     "where_clause": null,
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "c_count"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

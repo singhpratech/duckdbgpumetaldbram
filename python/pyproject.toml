@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckdb-gpudb"
-version = "0.7.0"
+version = "0.7.1"
 description = "Plain DuckDB SQL on the GPU: a drop-in gpudb.connect() that answers statements on the device when that is faster, and lets DuckDB run everything else"
 readme = "README.md"
 requires-python = ">=3.9"

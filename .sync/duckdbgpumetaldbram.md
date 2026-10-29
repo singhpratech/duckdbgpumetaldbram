@@ -1,6 +1,6 @@
 # duckdbgpumetaldbram
-- branch: feat/core-columns-stage-b
-- working on: stage B: placed uploads, base-set views, continuous measured rule 1; gate running
-- status: in_progress
+- branch: fix/ext-duckdb-2-ast
+- working on: (work complete)
+- status: done
 - blocked on: nothing
-- last update: 2026-09-18T04:18:00Z
+- last update: 2026-10-29T00:06:54Z

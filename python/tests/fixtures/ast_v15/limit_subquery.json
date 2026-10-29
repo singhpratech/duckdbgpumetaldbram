@@ -1,0 +1,101 @@
+{
+ "name": "limit_subquery",
+ "duckdb": "1.5.6",
+ "sql": "SELECT * FROM t LIMIT (SELECT 3)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "LIMIT_MODIFIER",
+       "limit": {
+        "class": "SUBQUERY",
+        "type": "SUBQUERY",
+        "alias": "",
+        "subquery_type": "SCALAR",
+        "subquery": {
+         "node": {
+          "type": "SELECT_NODE",
+          "modifiers": [],
+          "cte_map": {
+           "map": []
+          },
+          "select_list": [
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 3
+            }
+           }
+          ],
+          "from_table": {
+           "type": "EMPTY",
+           "alias": "",
+           "sample": null
+          },
+          "where_clause": null,
+          "group_expressions": [],
+          "group_sets": [],
+          "aggregate_handling": "STANDARD_HANDLING",
+          "having": null,
+          "sample": null,
+          "qualify": null
+         },
+         "named_param_map": []
+        },
+        "child": null,
+        "comparison_type": "INVALID"
+       },
+       "offset": null
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "STAR",
+       "type": "STAR",
+       "alias": "",
+       "relation_name": "",
+       "exclude_list": [],
+       "replace_list": [],
+       "columns": false,
+       "expr": null,
+       "qualified_exclude_list": [],
+       "rename_list": []
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

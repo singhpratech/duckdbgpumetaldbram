@@ -22,6 +22,8 @@ import json
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
+from ._resolve import _one
+
 _MAX_DEPTH = 4
 _CREATE_RE = re.compile(r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
                         r"(?P<name>(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\"[^\"]+\"|[A-Za-z_][A-Za-z0-9_]*)){0,2})"
@@ -40,7 +42,7 @@ class ViewCatalog:
     def refresh(self) -> None:
         self.views = {}
         try:
-            db, sch = self.con.execute("SELECT current_database(), current_schema()").fetchone()
+            db, sch = _one(self.con.execute("SELECT current_database(), current_schema()"))
             rows = self.con.execute(
                 "SELECT view_name, sql FROM duckdb_views() WHERE NOT internal AND NOT temporary "
                 "AND database_name = ? AND schema_name = ?", [db, sch]).fetchall()

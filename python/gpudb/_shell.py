@@ -101,11 +101,35 @@ def _split_complete(buf: str) -> Tuple[str, str]:
     if not ends:
         return "", buf
     tail = buf[ends[-1] + 1:]
+    return (buf, "") if _blank(tail) else (buf[:ends[-1] + 1], tail)
+
+
+def _blank(text: str) -> bool:
+    """Only whitespace and comments. DuckDB 1.x's tokenizer reports no token
+    for a comment; 2.0's reports a `comment` token."""
+    comment = getattr(duckdb.token_type, "comment", None)
     try:
-        blank = not duckdb.tokenize(tail)
+        return all(kind == comment for _, kind in duckdb.tokenize(text))
     except Exception:
-        blank = not tail.strip()
-    return (buf, "") if blank else (buf[:ends[-1] + 1], tail)
+        return not text.strip()
+
+
+def _unterminated(sql: str) -> str:
+    """A statement without its terminating `;` and the comments after it.
+    DuckDB 2.0's extract_statements keeps both in the statement's text
+    (`SELECT 5; /* ; */`), and a relation built from that text fails to
+    render; 1.x ended the text before the `;`."""
+    ends = _terminators(sql)
+    if ends and _blank(sql[ends[-1] + 1:]):
+        return sql[:ends[-1]]
+    return sql
+
+
+# statement types that return no result set: DuckDB 1.x's sql() gives None for
+# them, 2.0's a one-row status relation (`Count` / `Success`) the shell does not print
+_NO_RESULT = {"CREATE", "INSERT", "UPDATE", "DELETE", "SET", "TRANSACTION", "COPY", "ATTACH",
+              "DETACH", "LOAD", "DROP", "ALTER", "VACUUM", "EXPORT", "PREPARE"}
+_STATUS = ([["Count"], ["BIGINT"]], [["Success"], ["BOOLEAN"]])
 
 
 
@@ -210,7 +234,8 @@ class Shell:
 
     def _build_info(self) -> Optional[str]:
         try:
-            return self.con.sql("SELECT gpu_build_info()").fetchone()[0]
+            # fetchall(): DuckDB 2.0's relation has no fetchone()
+            return self.con.sql("SELECT gpu_build_info()").fetchall()[0][0]
         except Exception:
             return None
 
@@ -286,27 +311,27 @@ class Shell:
             self.fail(str(e))
             return
         for s in stmts:
-            self.statement(s.query)
+            self.statement(s.query, getattr(getattr(s, "type", None), "name", None))
             if self.exit_code and self.stop_on_error:
                 self.done = True
                 return
             if self.done:
                 return
 
-    def statement(self, sql: str) -> None:
-        sql = sql.strip()
+    def statement(self, sql: str, kind: Optional[str] = None) -> None:
+        sql = _unterminated(sql).strip()
         if not sql:
             return
         t0 = time.perf_counter()
         note = ""
         del self._log[:]          # the detail in the footer is this statement's, or none
         try:
-            self.interruptible(lambda: self.render(self.con.sql(sql)))
+            self.interruptible(lambda: self.render(self.con.sql(sql), kind))
         except _Interrupted:
             self.fail(_INTERRUPTED)
             return
         except duckdb.Error as e:
-            note = self.recover(sql, e)
+            note = self.recover(sql, e, kind)
             if note is None:
                 return
         except KeyboardInterrupt:
@@ -320,7 +345,7 @@ class Shell:
         if self.timer:
             self.footer((time.perf_counter() - t0) * 1000.0, note)
 
-    def recover(self, sql: str, e: duckdb.Error) -> Optional[str]:
+    def recover(self, sql: str, e: duckdb.Error, kind: Optional[str] = None) -> Optional[str]:
         """The statement raised. When it was the REWRITTEN form that raised —
         the rows were being read, so the wrapper's own `sql()` was already past
         its guard — the user's statement is still the original one (rule 2,
@@ -335,7 +360,7 @@ class Shell:
         why = str(e).splitlines()[0]
         try:
             self.interruptible(lambda: self.con.execute(sql))
-            self.interruptible(lambda: self.render(self.con.sql(sql)))
+            self.interruptible(lambda: self.render(self.con.sql(sql), kind))
         except _Interrupted:
             self.fail(_INTERRUPTED)
             return None
@@ -347,11 +372,20 @@ class Shell:
             return None
         return f"the rewritten statement failed: {why}"
 
-    def render(self, rel) -> None:
+    def render(self, rel, kind: Optional[str] = None) -> None:
         """DuckDB's own box renderer. A statement with no result set (CREATE,
-        INSERT, SET, …) gives no relation and prints nothing."""
-        if rel is not None:
-            rel.show(max_rows=MAX_ROWS)
+        INSERT, SET, …) prints nothing: on DuckDB 1.x it gives no relation, on
+        2.0 a status relation, which is left unprinted the same way."""
+        if rel is None:
+            return
+        if kind in _NO_RESULT:
+            try:
+                shape = [list(rel.columns), [str(t) for t in rel.types]]
+            except Exception:
+                shape = None
+            if shape in _STATUS:     # the statement already ran inside sql()
+                return
+        rel.show(max_rows=MAX_ROWS)
 
     def interruptible(self, fn):
         """^C stops the statement, not the shell. A signal handler cannot run

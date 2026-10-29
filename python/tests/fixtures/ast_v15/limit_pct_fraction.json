@@ -1,0 +1,71 @@
+{
+ "name": "limit_pct_fraction",
+ "duckdb": "1.5.6",
+ "sql": "SELECT x FROM t LIMIT 0.5 %",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "LIMIT_PERCENT_MODIFIER",
+       "limit": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "DECIMAL",
+          "type_info": {
+           "type": "DECIMAL_TYPE_INFO",
+           "alias": "",
+           "extension_info": null,
+           "width": 2,
+           "scale": 1
+          }
+         },
+         "is_null": false,
+         "value": 5
+        }
+       },
+       "offset": null
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "x"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

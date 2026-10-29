@@ -1,0 +1,399 @@
+{
+ "name": "casts",
+ "duckdb": "1.5.6",
+ "sql": "SELECT CAST(x AS DECIMAL(15,2)), x::DATE, TRY_CAST(y AS INTEGER), x::BIGINT, x::DOUBLE, x::VARCHAR(10), CAST(x AS NUMERIC), x::REAL, x::TIMESTAMPTZ, x::HUGEINT, x::BOOLEAN, x::INT8, x::TEXT, x::TIMESTAMP, x::SMALLINT, x::UBIGINT, x::BLOB, x::INTERVAL, x::DEC(4,1) FROM t",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "DECIMAL",
+        "type_info": {
+         "type": "DECIMAL_TYPE_INFO",
+         "alias": "",
+         "extension_info": null,
+         "width": 15,
+         "scale": 2
+        }
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "DATE",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "y"
+        ]
+       },
+       "cast_type": {
+        "id": "INTEGER",
+        "type_info": null
+       },
+       "try_cast": true
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "BIGINT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "DOUBLE",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "VARCHAR",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "DECIMAL",
+        "type_info": {
+         "type": "DECIMAL_TYPE_INFO",
+         "alias": "",
+         "extension_info": null,
+         "width": 18,
+         "scale": 3
+        }
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "FLOAT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "TIMESTAMP WITH TIME ZONE",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "HUGEINT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "BOOLEAN",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "BIGINT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "VARCHAR",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "TIMESTAMP",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "SMALLINT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "UBIGINT",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "BLOB",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "INTERVAL",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "x"
+        ]
+       },
+       "cast_type": {
+        "id": "DECIMAL",
+        "type_info": {
+         "type": "DECIMAL_TYPE_INFO",
+         "alias": "",
+         "extension_info": null,
+         "width": 4,
+         "scale": 1
+        }
+       },
+       "try_cast": false
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

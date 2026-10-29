@@ -1,0 +1,146 @@
+{
+ "name": "values",
+ "duckdb": "1.5.6",
+ "sql": "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(x, y)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "STAR",
+       "type": "STAR",
+       "alias": "",
+       "relation_name": "",
+       "exclude_list": [],
+       "replace_list": [],
+       "columns": false,
+       "expr": null,
+       "qualified_exclude_list": [],
+       "rename_list": []
+      }
+     ],
+     "from_table": {
+      "type": "SUBQUERY",
+      "alias": "v",
+      "sample": null,
+      "subquery": {
+       "node": {
+        "type": "SELECT_NODE",
+        "modifiers": [],
+        "cte_map": {
+         "map": []
+        },
+        "select_list": [
+         {
+          "class": "STAR",
+          "type": "STAR",
+          "alias": "",
+          "relation_name": "",
+          "exclude_list": [],
+          "replace_list": [],
+          "columns": false,
+          "expr": null,
+          "qualified_exclude_list": [],
+          "rename_list": []
+         }
+        ],
+        "from_table": {
+         "type": "EXPRESSION_LIST",
+         "alias": "valueslist",
+         "sample": null,
+         "expected_names": [],
+         "expected_types": [],
+         "values": [
+          [
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 1
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "a"
+            }
+           }
+          ],
+          [
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 2
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "b"
+            }
+           }
+          ]
+         ]
+        },
+        "where_clause": null,
+        "group_expressions": [],
+        "group_sets": [],
+        "aggregate_handling": "STANDARD_HANDLING",
+        "having": null,
+        "sample": null,
+        "qualify": null
+       },
+       "named_param_map": []
+      },
+      "column_name_alias": [
+       "x",
+       "y"
+      ]
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

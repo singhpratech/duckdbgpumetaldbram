@@ -1,0 +1,245 @@
+{
+ "name": "in_between",
+ "duckdb": "1.5.6",
+ "sql": "SELECT x FROM t WHERE y IN (1, 2, 3) AND z NOT IN ('a', 'b') AND w BETWEEN 1.0 AND 2.0 AND v NOT BETWEEN 3 AND 4",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "x"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_AND",
+      "alias": "",
+      "children": [
+       {
+        "class": "OPERATOR",
+        "type": "COMPARE_IN",
+        "alias": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 1
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 2
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 3
+          }
+         }
+        ]
+       },
+       {
+        "class": "OPERATOR",
+        "type": "COMPARE_NOT_IN",
+        "alias": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "z"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "a"
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "b"
+          }
+         }
+        ]
+       },
+       {
+        "class": "BETWEEN",
+        "type": "COMPARE_BETWEEN",
+        "alias": "",
+        "input": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "w"
+         ]
+        },
+        "lower": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "DECIMAL",
+           "type_info": {
+            "type": "DECIMAL_TYPE_INFO",
+            "alias": "",
+            "extension_info": null,
+            "width": 2,
+            "scale": 1
+           }
+          },
+          "is_null": false,
+          "value": 10
+         }
+        },
+        "upper": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "DECIMAL",
+           "type_info": {
+            "type": "DECIMAL_TYPE_INFO",
+            "alias": "",
+            "extension_info": null,
+            "width": 2,
+            "scale": 1
+           }
+          },
+          "is_null": false,
+          "value": 20
+         }
+        }
+       },
+       {
+        "class": "OPERATOR",
+        "type": "OPERATOR_NOT",
+        "alias": "",
+        "children": [
+         {
+          "class": "BETWEEN",
+          "type": "COMPARE_BETWEEN",
+          "alias": "",
+          "input": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "v"
+           ]
+          },
+          "lower": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 3
+           }
+          },
+          "upper": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 4
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

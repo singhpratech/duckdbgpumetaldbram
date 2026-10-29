@@ -1,0 +1,179 @@
+{
+ "name": "w_having_alias",
+ "duckdb": "1.5.6",
+ "sql": "SELECT k, sum(a) AS sa, sum(c) AS sc FROM tm GROUP BY k HAVING sum(c) > 67000.5 ORDER BY k",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "k"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "k"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "sa",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "a"
+         ]
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "sc",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "c"
+         ]
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "tm",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "k"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": {
+      "class": "COMPARISON",
+      "type": "COMPARE_GREATERTHAN",
+      "alias": "",
+      "left": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "c"
+         ]
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      "right": {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 6,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": 670005
+       }
+      }
+     },
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

@@ -1,0 +1,106 @@
+{
+ "name": "w_now",
+ "duckdb": "1.5.6",
+ "sql": "SELECT k, count(*) FROM t WHERE ts < now() GROUP BY k",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "k"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": {
+      "class": "COMPARISON",
+      "type": "COMPARE_LESSTHAN",
+      "alias": "",
+      "left": {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "ts"
+       ]
+      },
+      "right": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "now",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     },
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "k"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

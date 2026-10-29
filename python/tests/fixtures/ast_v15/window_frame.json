@@ -1,0 +1,104 @@
+{
+ "name": "window_frame",
+ "duckdb": "1.5.6",
+ "sql": "SELECT sum(x) OVER (PARTITION BY k ORDER BY y ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_AGGREGATE",
+       "alias": "",
+       "function_name": "sum",
+       "schema": "",
+       "catalog": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        }
+       ],
+       "partitions": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "k"
+         ]
+        }
+       ],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "EXPR_PRECEDING_ROWS",
+       "end": "CURRENT_ROW_ROWS",
+       "start_expr": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "INTEGER",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": 1
+        }
+       },
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

@@ -1,0 +1,137 @@
+{
+ "name": "lit_negated",
+ "duckdb": "1.5.6",
+ "sql": "SELECT - 1, -(1), +1, -x, NOT b FROM t",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": -1
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": -1
+       }
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "+",
+       "schema": "",
+       "children": [
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 1
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": true,
+       "export_state": false,
+       "catalog": ""
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "-",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": true,
+       "export_state": false,
+       "catalog": ""
+      },
+      {
+       "class": "OPERATOR",
+       "type": "OPERATOR_NOT",
+       "alias": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "b"
+         ]
+        }
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

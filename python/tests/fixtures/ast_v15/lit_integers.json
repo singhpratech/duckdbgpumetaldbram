@@ -1,0 +1,227 @@
+{
+ "name": "lit_integers",
+ "duckdb": "1.5.6",
+ "sql": "SELECT 2147483647, 2147483648, -2147483649, 9223372036854775807, 9223372036854775808, -9223372036854775808, -9223372036854775809, 12345678901234567890, 123456789012345678901234567890, 170141183460469231731687303715884105727, 170141183460469231731687303715884105728, -170141183460469231731687303715884105728, 340282366920938463463374607431768211455",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 2147483647
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "BIGINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 2147483648
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "BIGINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": -2147483649
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "BIGINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 9223372036854775807
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 0,
+         "lower": 9223372036854775808
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "BIGINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": -9223372036854775808
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": -1,
+         "lower": 9223372036854775807
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 0,
+         "lower": 12345678901234567890
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 6692605942,
+         "lower": 14083847773837265618
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 9223372036854775807,
+         "lower": 18446744073709551615
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "UHUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 9223372036854775808,
+         "lower": 0
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "HUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": -9223372036854775808,
+         "lower": 0
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "UHUGEINT",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": {
+         "upper": 18446744073709551615,
+         "lower": 18446744073709551615
+        }
+       }
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

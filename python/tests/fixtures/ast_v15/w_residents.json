@@ -1,0 +1,100 @@
+{
+ "name": "w_residents",
+ "duckdb": "1.5.6",
+ "sql": "SELECT rows_seen, rows, state FROM gpu_residents() WHERE name = ?",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "rows_seen"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "rows"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "state"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "TABLE_FUNCTION",
+      "alias": "",
+      "sample": null,
+      "function": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "gpu_residents",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      "column_name_alias": [],
+      "with_ordinality": "WITHOUT_ORDINALITY"
+     },
+     "where_clause": {
+      "class": "COMPARISON",
+      "type": "COMPARE_EQUAL",
+      "alias": "",
+      "left": {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "name"
+       ]
+      },
+      "right": {
+       "class": "PARAMETER",
+       "type": "VALUE_PARAMETER",
+       "alias": "",
+       "identifier": "1"
+      }
+     },
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": [
+     {
+      "key": "1",
+      "value": 1
+     }
+    ]
+   }
+  ]
+ }
+}

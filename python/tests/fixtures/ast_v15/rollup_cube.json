@@ -1,0 +1,213 @@
+{
+ "name": "rollup_cube",
+ "duckdb": "1.5.6",
+ "sql": "SELECT a, b, sum(v) FROM t GROUP BY ROLLUP (a, b) UNION ALL SELECT a, b, sum(v) FROM t GROUP BY CUBE (a, b)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SET_OPERATION_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "setop_type": "UNION",
+     "left": {
+      "type": "SELECT_NODE",
+      "modifiers": [],
+      "cte_map": {
+       "map": []
+      },
+      "select_list": [
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "a"
+        ]
+       },
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "b"
+        ]
+       },
+       {
+        "class": "FUNCTION",
+        "type": "FUNCTION",
+        "alias": "",
+        "function_name": "sum",
+        "schema": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "v"
+          ]
+         }
+        ],
+        "filter": null,
+        "order_bys": {
+         "type": "ORDER_MODIFIER",
+         "orders": []
+        },
+        "distinct": false,
+        "is_operator": false,
+        "export_state": false,
+        "catalog": ""
+       }
+      ],
+      "from_table": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "t",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "where_clause": null,
+      "group_expressions": [
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "a"
+        ]
+       },
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "b"
+        ]
+       }
+      ],
+      "group_sets": [
+       [],
+       [
+        0
+       ],
+       [
+        0,
+        1
+       ]
+      ],
+      "aggregate_handling": "STANDARD_HANDLING",
+      "having": null,
+      "sample": null,
+      "qualify": null
+     },
+     "right": {
+      "type": "SELECT_NODE",
+      "modifiers": [],
+      "cte_map": {
+       "map": []
+      },
+      "select_list": [
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "a"
+        ]
+       },
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "b"
+        ]
+       },
+       {
+        "class": "FUNCTION",
+        "type": "FUNCTION",
+        "alias": "",
+        "function_name": "sum",
+        "schema": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "v"
+          ]
+         }
+        ],
+        "filter": null,
+        "order_bys": {
+         "type": "ORDER_MODIFIER",
+         "orders": []
+        },
+        "distinct": false,
+        "is_operator": false,
+        "export_state": false,
+        "catalog": ""
+       }
+      ],
+      "from_table": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "t",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "where_clause": null,
+      "group_expressions": [
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "a"
+        ]
+       },
+       {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "b"
+        ]
+       }
+      ],
+      "group_sets": [
+       [],
+       [
+        0
+       ],
+       [
+        0,
+        1
+       ],
+       [
+        1
+       ]
+      ],
+      "aggregate_handling": "STANDARD_HANDLING",
+      "having": null,
+      "sample": null,
+      "qualify": null
+     },
+     "setop_all": true
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

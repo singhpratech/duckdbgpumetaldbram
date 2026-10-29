@@ -1,0 +1,59 @@
+{
+ "name": "sample_seed",
+ "duckdb": "1.5.6",
+ "sql": "SELECT x FROM t USING SAMPLE 10% (bernoulli, 42)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "x"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": {
+      "sample_size": {
+       "type": {
+        "id": "DOUBLE",
+        "type_info": null
+       },
+       "is_null": false,
+       "value": 10.0
+      },
+      "is_percentage": true,
+      "method": "Bernoulli",
+      "seed": 42
+     },
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

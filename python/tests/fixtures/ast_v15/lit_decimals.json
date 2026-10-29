@@ -1,0 +1,154 @@
+{
+ "name": "lit_decimals",
+ "duckdb": "1.5.6",
+ "sql": "SELECT 1.2345678901234567890123456789012345678, 12345678901234567890123456789012345678.9, 123456789012345678.5, 1234567890123456789.5, 0.000000000000000000001, -.5",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 38,
+          "scale": 37
+         }
+        },
+        "is_null": false,
+        "value": {
+         "upper": 669260594276348691,
+         "lower": 14143994781733811022
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DOUBLE",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 1.2345678901234568e+37
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 19,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": {
+         "upper": 0,
+         "lower": 1234567890123456785
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 20,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": {
+         "upper": 0,
+         "lower": 12345678901234567895
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 22,
+          "scale": 21
+         }
+        },
+        "is_null": false,
+        "value": {
+         "upper": 0,
+         "lower": 1
+        }
+       }
+      },
+      {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "DECIMAL",
+         "type_info": {
+          "type": "DECIMAL_TYPE_INFO",
+          "alias": "",
+          "extension_info": null,
+          "width": 1,
+          "scale": 1
+         }
+        },
+        "is_null": false,
+        "value": -5
+       }
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}
