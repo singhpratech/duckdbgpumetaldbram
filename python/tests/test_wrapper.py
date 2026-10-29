@@ -11,6 +11,7 @@ import decimal
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import duckdb                      # noqa: E402
 import gpudb                       # noqa: E402
+from gpudb._ast_compat import AVG_DECIMAL_PER_PLAN   # noqa: E402
 
 N = 300_000
 FAILS = []
@@ -61,6 +62,15 @@ def drop_avg_decimal(con, cases, names, where):
     form for a parity case to compare. The decline itself is covered on both
     platforms by the dedicated end-to-end section, so nothing goes unchecked
     here — these cases simply have no second engine to check against."""
+    if AVG_DECIMAL_PER_PLAN:
+        # DuckDB 2.0 picks avg(DECIMAL)'s finalisation per statement and the
+        # wrapper declines the shape there; the decline itself is asserted by
+        # the long double section below
+        for n in names:
+            cases.pop(n, None)
+        skip(f"{where}: avg over DECIMAL is declined on DuckDB {duckdb.__version__} "
+             f"({', '.join(names)})")
+        return
     # An extension that provides gpu_avg_decimal derives the column in C++, in
     # long double, on every platform — so the shape is rewritten everywhere and
     # there is nothing platform-dependent left to drop. Only an older
@@ -755,7 +765,10 @@ def run():
             return True
 
     check(_declines("avg", 2, 64), "avg(DECIMAL) declined where long double is wider (avgf=64)")
-    check(not _declines("avg", 2, 53), "avg(DECIMAL) rewritten where long double is double (avgf=53)")
+    if AVG_DECIMAL_PER_PLAN:
+        check(_declines("avg", 2, 53), "avg(DECIMAL) declined on DuckDB 2 whatever the width (avgf=53)")
+    else:
+        check(not _declines("avg", 2, 53), "avg(DECIMAL) rewritten where long double is double (avgf=53)")
     check(_declines("avg", 2, 0), "avg(DECIMAL) declined when the extension does not report avgf")
     check(not _declines("avg", 0, 64), "avg over an integer payload is unaffected")
     check(not _declines("sum", 2, 64), "sum over DECIMAL is unaffected")
@@ -822,6 +835,21 @@ def run():
             "minmax_decimal": "SELECT k, min(amt), max(amt) FROM ab GROUP BY k ORDER BY k",
         }
         native_dec = getattr(con, "_has_avg_decimal", False)
+        if AVG_DECIMAL_PER_PLAN:
+            # DuckDB 2: every avg(DECIMAL) shape declines at either width, with
+            # its own reason, and DuckDB answers it
+            for bits in (64, 53):
+                avg_bits(con, bits)
+                for name, sql in acases.items():
+                    want = con._raw.execute(sql).fetchall()
+                    got = con.execute(sql).fetchall()
+                    lr = con.last_rewrite()
+                    check(not lr["rewritten"] and lr["reason"] == "shape"
+                          and "DuckDB 2.0" in (lr["detail"] or ""),
+                          f"avgf={bits} {name}: declined on DuckDB 2, detail says why "
+                          f"({lr['reason']}: {str(lr['detail'])[:60]})")
+                    check(got == want, f"avgf={bits} {name}: DuckDB answers, and the rows are native's")
+            acases = {}
         avg_bits(con, 64)
         for name, sql in list(acases.items()):
             want = con._raw.execute(sql).fetchall()
@@ -2607,7 +2635,9 @@ def ties_checks():
         check(lr["rewritten"] and lr["form"] == "topk",
               f"ties/none {d}: rewritten as top-k (reason={lr['reason']}, form={lr['form']})")
         check(got == ties_native(sql), f"ties/none {d}: rows identical to native")
-        check(", 6, " in lr["sql"] or ", 6," in lr["sql"] or " 6, " in lr["sql"],
+        # DuckDB 2.0 renders the BIGINT literal as CAST(6 AS BIGINT)
+        check(", 6, " in lr["sql"] or ", 6," in lr["sql"] or " 6, " in lr["sql"]
+              or "CAST(6 AS BIGINT)" in lr["sql"],
               f"ties/none {d}: the device is asked for k + 1 rows")
     # k larger than the group count: every group comes back, still no tie
     sql = q.format("DESC", 1000)
@@ -2766,7 +2796,9 @@ class _CountingRaw:
 
 
 def stats_line(con) -> str:
-    return con._raw.execute("SELECT gpu_last_stats()").fetchone()[0] or ""
+    # fetchall(): on DuckDB 2.0 a fetchone() leaves the result open, and the
+    # caller's relation fetched after it would fail
+    return con._raw.execute("SELECT gpu_last_stats()").fetchall()[0][0] or ""
 
 
 def ties_sql_cost():
@@ -3199,7 +3231,7 @@ def extension_version_checks():
     from gpudb import connection as _conn
 
     print("== this client's version and the extension it requires")
-    check(gpudb.__version__ == "0.7.0", f"the wrapper reports its version ({gpudb.__version__})")
+    check(gpudb.__version__ == "0.7.1", f"the wrapper reports its version ({gpudb.__version__})")
 
     # Names this client calls that a v0.6.0 extension does not register: the
     # exact GROUP BY, the global masked aggregate and the materialised key join
@@ -3219,8 +3251,9 @@ def extension_version_checks():
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'gpudb'"
         ).fetchall()
         if row and row[0][0]:
+            # the 0.7.1 client is a pip-only release: the extension stays v0.7.0
             check(row[0][0] == "v0.7.0",
-                  f"the loaded extension stamps this release's version ({row[0][0]})")
+                  f"the loaded extension stamps the v0.7.0 release this client runs on ({row[0][0]})")
         else:
             skip("the loaded extension's version: DuckDB reports none for it here")
     else:

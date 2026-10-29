@@ -1,0 +1,148 @@
+{
+ "name": "lambda",
+ "duckdb": "1.5.6",
+ "sql": "SELECT list_transform([1,2], x -> x + 1)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "list_transform",
+       "schema": "",
+       "children": [
+        {
+         "class": "FUNCTION",
+         "type": "FUNCTION",
+         "alias": "",
+         "function_name": "list_value",
+         "schema": "main",
+         "children": [
+          {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          },
+          {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 2
+           }
+          }
+         ],
+         "filter": null,
+         "order_bys": {
+          "type": "ORDER_MODIFIER",
+          "orders": []
+         },
+         "distinct": false,
+         "is_operator": false,
+         "export_state": false,
+         "catalog": ""
+        },
+        {
+         "class": "LAMBDA",
+         "type": "LAMBDA",
+         "alias": "",
+         "lhs": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "x"
+          ]
+         },
+         "expr": {
+          "class": "FUNCTION",
+          "type": "FUNCTION",
+          "alias": "",
+          "function_name": "+",
+          "schema": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "x"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 1
+            }
+           }
+          ],
+          "filter": null,
+          "order_bys": {
+           "type": "ORDER_MODIFIER",
+           "orders": []
+          },
+          "distinct": false,
+          "is_operator": true,
+          "export_state": false,
+          "catalog": ""
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

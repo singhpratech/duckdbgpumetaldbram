@@ -13,9 +13,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import (_aggs, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax,
+from . import (_aggs, _ast_compat, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax,
                _thresholds, _views)
 from ._residency import DEVICE_ERROR, MEMORY_ERROR, ResidencyManager
+from ._resolve import _one
 
 GPUDB_EXTENSION_ENV = "GPUDB_EXTENSION_PATH"
 
@@ -483,7 +484,7 @@ class Connection:
         where no backend installed a reporter (src/include/backend_notes.hpp).
         An absent answer is an answer: it is not 0."""
         try:
-            info = self._raw.execute("SELECT gpu_build_info()").fetchone()[0] or ""
+            info = _one(self._raw.execute("SELECT gpu_build_info()"))[0] or ""
         except Exception:
             return None
         for f in info.split():
@@ -536,10 +537,10 @@ class Connection:
         return [dict(zip(names, r), on_gpu=None) for r in rows]
 
     def _refresh_settings(self) -> None:
-        row = self._raw.execute(
+        row = _one(self._raw.execute(
             "SELECT current_setting('default_order'), current_setting('default_null_order'), "
             "current_setting('default_collation'), current_setting('search_path'), "
-            "current_database()").fetchone()
+            "current_database()"))
         self._settings = {"default_order": row[0], "default_null_order": row[1],
                           "default_collation": row[2] or "", "search_path": row[3] or "",
                           "database": row[4]}
@@ -550,7 +551,7 @@ class Connection:
 
     def _probe_extension(self) -> None:
         try:
-            info = self._raw.execute("SELECT gpu_build_info()").fetchone()[0]
+            info = _one(self._raw.execute("SELECT gpu_build_info()"))[0]
         except Exception:
             self._backend = ""
             self._backend_note = _NO_EXTENSION
@@ -1784,7 +1785,7 @@ class Connection:
         when an output-size bound declined an inner statement that the inner
         bounds could admit."""
         try:
-            n = int(self._raw.execute("SELECT count(*) FROM (" + sql + ")").fetchone()[0])
+            n = int(_one(self._raw.execute("SELECT count(*) FROM (" + sql + ")"))[0])
         except Exception as e:
             self._log(f"consumer row count failed: {str(e).splitlines()[0][:120]}")
             return None
@@ -1824,8 +1825,8 @@ class Connection:
                 if isinstance(e, dict):
                     if not top and self._is_aggregate_select(e):
                         try:
-                            sub_sql = self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(
-                                {"error": False, "statements": [{"node": e, "named_param_map": []}]})]).fetchone()[0]
+                            sub_sql = self._deserialize(json.dumps(
+                                {"error": False, "statements": [{"node": e, "named_param_map": []}]}))
                         except Exception:
                             sub_sql = None
                         if sub_sql:
@@ -1919,7 +1920,7 @@ class Connection:
                     for k in path[:-1]:
                         holder = holder[k]
                     holder[path[-1]] = node
-                final = self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(tree)]).fetchone()[0]
+                final = self._deserialize(json.dumps(tree))
                 want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
                 have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + final).fetchall()]
                 if want != have:
@@ -1962,7 +1963,7 @@ class Connection:
                         want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql_v).fetchall()]
                         folded = _flatten.fold(tree, [w[0] for w in want])
                     if folded is not None:
-                        cand = self._raw.execute("SELECT json_deserialize_sql(?)", [folded]).fetchone()[0]
+                        cand = self._deserialize(folded)
                         have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
                         if want == have:
                             flat = cand
@@ -1993,7 +1994,7 @@ class Connection:
             out = _views.inline(self._serialize(sql), vc, self._serialize, [w[0] for w in want])
             if out is None:
                 return sql
-            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            cand = self._deserialize(out)
             have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
             if want == have:
                 # remembered so a redefinition of any of these views (from any connection) is noticed
@@ -2024,7 +2025,7 @@ class Connection:
             out = _ctes.inline(tree, self._function_ok, blocked, [w[0] for w in want])
             if out is None:
                 return sql
-            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            cand = self._deserialize(out)
             have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
             if want == have:
                 return cand
@@ -2063,7 +2064,7 @@ class Connection:
             out = _syntax.normalise(self._serialize(sql), [w[0] for w in want])
             if out is None:
                 return sql
-            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            cand = self._deserialize(out)
             have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
             if want == have:
                 return cand
@@ -2085,7 +2086,7 @@ class Connection:
             out = _aggs.normalise(self._serialize(sql), [w[0] for w in want])
             if out is None:
                 return sql
-            cand = self._raw.execute("SELECT json_deserialize_sql(?)", [out]).fetchone()[0]
+            cand = self._deserialize(out)
             have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
             if want == have:
                 return cand
@@ -2314,9 +2315,9 @@ class Connection:
         out = (None, None)
         if _PLAIN_COL_RE.fullmatch(column or ""):
             try:
-                text = self._raw.execute(
+                text = _one(self._raw.execute(
                     'SELECT stats("%s") FROM %s LIMIT 1' % (column.replace('"', '""'), ident.fqn)
-                ).fetchone()[0] or ""
+                ))[0] or ""
                 m = _STATS_RANGE_RE.search(text)
                 if m:
                     out = (int(m.group(1)), int(m.group(2)))
@@ -2348,9 +2349,9 @@ class Connection:
 
     def _extension_has_ready_set(self, tag: str) -> bool:
         try:
-            row = self._raw.execute(
+            row = _one(self._raw.execute(
                 "SELECT state FROM gpu_residents() WHERE name = ? AND origin = 'managed'",
-                [tag]).fetchone()
+                [tag]))
         except Exception:
             return False
         if row and row[0] == "ready":
@@ -2369,7 +2370,13 @@ class Connection:
         return _WS_RE.sub(" ", _LITERAL_RE.sub(sub, sql)).strip(), tuple(lits)
 
     def _serialize(self, sql: str) -> str:
-        return self._raw.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0]
+        # one tree shape for every reader: DuckDB 2.0's is converted to the
+        # 1.4/1.5 shape here, the single place a tree enters (see _ast_compat)
+        return _ast_compat.normalise_json(_one(self._raw.execute("SELECT json_serialize_sql(?)", [sql]))[0])
+
+    def _deserialize(self, tree: str) -> str:
+        return _one(self._raw.execute("SELECT json_deserialize_sql(?)",
+                                 [_ast_compat.for_renderer(tree)]))[0]
 
     # ---- key joins (§4.8) ----
     def _is_unique(self, ident: _resolve.Identity, col: str) -> bool:
@@ -2387,8 +2394,8 @@ class Connection:
                 "AND constraint_type IN ('PRIMARY KEY', 'UNIQUE')", [ident.oid]).fetchall()
             ok = any(list(r[0] or []) == [col] for r in rows)
             if not ok:
-                ok = bool(self._raw.execute(
-                    f'SELECT count("{col}") = count(DISTINCT "{col}") FROM {ident.fqn}').fetchone()[0])
+                ok = bool(_one(self._raw.execute(
+                    f'SELECT count("{col}") = count(DISTINCT "{col}") FROM {ident.fqn}'))[0])
         except Exception as e:
             self._log(f"uniqueness probe failed: {e}")
             ok = False
@@ -2399,7 +2406,7 @@ class Connection:
         return _join.lower(
             tree,
             lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
-            lambda ident: self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0],
+            lambda ident: _one(self._raw.execute(f"SELECT count(*) FROM {ident.fqn}"))[0],
             self._is_unique)
 
     # ---- computed lanes (§4.10) ----
@@ -2444,7 +2451,7 @@ class Connection:
             self._select_template = json.loads(self._serialize("SELECT 1"))
         stmt = json.loads(json.dumps(self._select_template))
         stmt["statements"][0]["node"]["select_list"] = [json.loads(expr_json)]
-        return self._raw.execute("SELECT json_deserialize_sql(?)", [json.dumps(stmt)]).fetchone()[0]
+        return self._deserialize(json.dumps(stmt))
 
     def _expr_type(self, fqn: str, sql: str) -> str:
         key = (fqn, sql)
@@ -2520,8 +2527,8 @@ class Connection:
         return _join.lower_upload(
             tree,
             lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
-            lambda ident: self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0],
-            lambda stmt: self._raw.execute("SELECT json_deserialize_sql(?)", [stmt]).fetchone()[0],
+            lambda ident: _one(self._raw.execute(f"SELECT count(*) FROM {ident.fqn}"))[0],
+            lambda stmt: self._deserialize(stmt),
             self._validate_join_condition)
 
     def _match(self, sql: str, mode: str = "device"):
@@ -2589,7 +2596,7 @@ class Connection:
                 parts = _split.split_distinct(tree, names, tmpl)          # §4.17
             if parts is None:
                 return None
-            inner_sql, outer_sql = (self._raw.execute("SELECT json_deserialize_sql(?)", [x]).fetchone()[0]
+            inner_sql, outer_sql = (self._deserialize(x)
                                     for x in parts[:2])
             is_global = parts[2]
         except duckdb.BinderException as e:
@@ -2689,7 +2696,7 @@ class Connection:
             # §4.13: the set holds the join's result; how big is it? (one native join, once per template)
             where = f" WHERE {low.edge_where}" if low.edge_where else ""
             try:
-                join_rows = self._raw.execute(f"SELECT count(*) FROM {low.from_text}{where}").fetchone()[0]
+                join_rows = _one(self._raw.execute(f"SELECT count(*) FROM {low.from_text}{where}"))[0]
             except Exception as e:
                 self._log(f"join count failed: {e}")
                 return Decision(False, "error", is_join=True)
@@ -2723,7 +2730,7 @@ class Connection:
         # thresholds: the row count floor (§9.1); group estimate comes from
         # the resident set once it exists
         nrows = (max(t.rows for t in low.tables) if low is not None     # the largest joined table decides
-                 else self._raw.execute(f"SELECT count(*) FROM {ident.fqn}").fetchone()[0])
+                 else _one(self._raw.execute(f"SELECT count(*) FROM {ident.fqn}"))[0])
         # §4.23: the floor asks whether there is enough work to be worth a
         # device at all, so it counts the rows the statement's answer depends
         # on — including the ones a subquery lane (§4.18) reads. A statement
@@ -2735,7 +2742,7 @@ class Connection:
         for c in computed.values():
             for dep in c.dep_tables:
                 try:
-                    dr = int(self._raw.execute(f"SELECT count(*) FROM {dep.fqn}").fetchone()[0])
+                    dr = int(_one(self._raw.execute(f"SELECT count(*) FROM {dep.fqn}"))[0])
                 except Exception as e:
                     self._log(f"lane table row count failed: {e}")
                     continue
@@ -2757,9 +2764,9 @@ class Connection:
                 if col in (plan.keys or [plan.key]):
                     # a computed key: bounds and the distinct estimate from one scan
                     try:
-                        mn, mx, uq, nn = self._raw.execute(
+                        mn, mx, uq, nn = _one(self._raw.execute(
                             f'SELECT min("{col}"), max("{col}"), approx_count_distinct("{col}"), '
-                            f'count(*) - count("{col}") FROM {probe_from}').fetchone()
+                            f'count(*) - count("{col}") FROM {probe_from}'))
                         st = _resolve.ColumnStats(has_null=bool(nn), min=None if mn is None else str(mn),
                                                   max=None if mx is None else str(mx), approx_unique=int(uq))
                     except Exception as e:
@@ -2795,7 +2802,7 @@ class Connection:
                 return Decision(False, "collation")
             try:
                 for idn in idents:
-                    ddl = self._raw.execute("SELECT sql FROM duckdb_tables() WHERE table_oid = ?", [idn.oid]).fetchone()
+                    ddl = _one(self._raw.execute("SELECT sql FROM duckdb_tables() WHERE table_oid = ?", [idn.oid]))
                     if ddl and ddl[0] and "COLLATE" in ddl[0].upper():
                         return Decision(False, "collation")
             except Exception:
@@ -2837,16 +2844,16 @@ class Connection:
                 try:
                     cols = ", ".join(f'"{kc}"' for kc in plan.keys)
                     src = probe_from if probe_from else ident.fqn
-                    est = int(self._raw.execute(
-                        f"SELECT approx_count_distinct(hash({cols})) FROM {src}").fetchone()[0])
+                    est = int(_one(self._raw.execute(
+                        f"SELECT approx_count_distinct(hash({cols})) FROM {src}"))[0])
                 except Exception as e:
                     self._log(f"distinct-count probe failed: {e}")
             sel = None
             if plan.where:
                 try:
-                    kept, total = self._raw.execute(
+                    kept, total = _one(self._raw.execute(
                         f"SELECT count(*) FILTER (WHERE {_rewrite.where_sql(plan)}), count(*) "
-                        f"FROM {probe_from}").fetchone()
+                        f"FROM {probe_from}"))
                     sel = (kept / total) if total else 0.0
                     # there cannot be more groups than rows that survive the WHERE (the
                     # product of several keys' distinct counts overshoots wildly under a filter)
@@ -3010,9 +3017,15 @@ class Connection:
             try:
                 tree = (getattr(plan, "lowered_tree", None)
                         or (low.tree_json if low is not None else self._serialize(sql)))
-                row = self._raw.execute(
-                    "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
-                    [tree, json.dumps(ctx)]).fetchone()
+                if _ast_compat.ENGINE_MAJOR >= 2:
+                    # rendered through for_renderer, as every other tree is on 2.0
+                    r = _one(self._raw.execute("SELECT gpu_rewrite_ast(?, ?)", [tree, json.dumps(ctx)]))[0]
+                    out = json.loads(r)
+                    row = (r, self._deserialize(r) if (out.get("gpudb") or {}).get("rewritten") else None)
+                else:
+                    row = _one(self._raw.execute(
+                        "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
+                        [tree, json.dumps(ctx)]))
                 info = (json.loads(row[0]).get("gpudb") or {})
             except Exception as e:
                 self._log(f"gpu_rewrite_ast failed: {e}")

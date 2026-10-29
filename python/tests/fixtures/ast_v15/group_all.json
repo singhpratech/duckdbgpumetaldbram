@@ -1,0 +1,138 @@
+{
+ "name": "group_all",
+ "duckdb": "1.5.6",
+ "sql": "SELECT k, count(*) FROM t GROUP BY ALL HAVING count(*) > 1 ORDER BY 2 DESC LIMIT 10",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 2
+          }
+         }
+        }
+       ]
+      },
+      {
+       "type": "LIMIT_MODIFIER",
+       "limit": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "INTEGER",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": 10
+        }
+       },
+       "offset": null
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "k"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "FORCE_AGGREGATES",
+     "having": {
+      "class": "COMPARISON",
+      "type": "COMPARE_GREATERTHAN",
+      "alias": "",
+      "left": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      "right": {
+       "class": "CONSTANT",
+       "type": "VALUE_CONSTANT",
+       "alias": "",
+       "value": {
+        "type": {
+         "id": "INTEGER",
+         "type_info": null
+        },
+        "is_null": false,
+        "value": 1
+       }
+      }
+     },
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

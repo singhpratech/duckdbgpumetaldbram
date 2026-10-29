@@ -1,0 +1,141 @@
+{
+ "name": "join_asof_positional",
+ "duckdb": "1.5.6",
+ "sql": "SELECT x FROM t ASOF JOIN u ON t.k = u.k AND t.ts >= u.ts POSITIONAL JOIN v",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "x"
+       ]
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "JOIN",
+       "alias": "",
+       "sample": null,
+       "left": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "t",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "right": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "u",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "condition": {
+        "class": "CONJUNCTION",
+        "type": "CONJUNCTION_AND",
+        "alias": "",
+        "children": [
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "t",
+            "k"
+           ]
+          },
+          "right": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "u",
+            "k"
+           ]
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_GREATERTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "t",
+            "ts"
+           ]
+          },
+          "right": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "u",
+            "ts"
+           ]
+          }
+         }
+        ]
+       },
+       "join_type": "INNER",
+       "ref_type": "ASOF",
+       "using_columns": [],
+       "delim_flipped": false,
+       "duplicate_eliminated_columns": []
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "v",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "POSITIONAL",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

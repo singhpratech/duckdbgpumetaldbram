@@ -1,0 +1,503 @@
+{
+ "name": "tpch_q16",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size;\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "supplier_cnt"
+          ]
+         }
+        },
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "p_brand"
+          ]
+         }
+        },
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "p_type"
+          ]
+         }
+        },
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "p_size"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_brand"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_type"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_size"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "supplier_cnt",
+       "function_name": "count",
+       "schema": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "ps_suppkey"
+         ]
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": true,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "partsupp",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "part",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "CROSS",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_AND",
+      "alias": "",
+      "children": [
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "p_partkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "ps_partkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_NOTEQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "p_brand"
+         ]
+        },
+        "right": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "VARCHAR",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": "Brand#45"
+         }
+        }
+       },
+       {
+        "class": "FUNCTION",
+        "type": "FUNCTION",
+        "alias": "",
+        "function_name": "!~~",
+        "schema": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "p_type"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "MEDIUM POLISHED%"
+          }
+         }
+        ],
+        "filter": null,
+        "order_bys": {
+         "type": "ORDER_MODIFIER",
+         "orders": []
+        },
+        "distinct": false,
+        "is_operator": true,
+        "export_state": false,
+        "catalog": ""
+       },
+       {
+        "class": "OPERATOR",
+        "type": "COMPARE_IN",
+        "alias": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "p_size"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 49
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 14
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 23
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 45
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 19
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 3
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 36
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 9
+          }
+         }
+        ]
+       },
+       {
+        "class": "OPERATOR",
+        "type": "OPERATOR_NOT",
+        "alias": "",
+        "children": [
+         {
+          "class": "SUBQUERY",
+          "type": "SUBQUERY",
+          "alias": "",
+          "subquery_type": "ANY",
+          "subquery": {
+           "node": {
+            "type": "SELECT_NODE",
+            "modifiers": [],
+            "cte_map": {
+             "map": []
+            },
+            "select_list": [
+             {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "s_suppkey"
+              ]
+             }
+            ],
+            "from_table": {
+             "type": "BASE_TABLE",
+             "alias": "",
+             "sample": null,
+             "schema_name": "",
+             "table_name": "supplier",
+             "column_name_alias": [],
+             "catalog_name": "",
+             "at_clause": null
+            },
+            "where_clause": {
+             "class": "FUNCTION",
+             "type": "FUNCTION",
+             "alias": "",
+             "function_name": "~~",
+             "schema": "",
+             "children": [
+              {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "s_comment"
+               ]
+              },
+              {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "VARCHAR",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": "%Customer%Complaints%"
+               }
+              }
+             ],
+             "filter": null,
+             "order_bys": {
+              "type": "ORDER_MODIFIER",
+              "orders": []
+             },
+             "distinct": false,
+             "is_operator": true,
+             "export_state": false,
+             "catalog": ""
+            },
+            "group_expressions": [],
+            "group_sets": [],
+            "aggregate_handling": "STANDARD_HANDLING",
+            "having": null,
+            "sample": null,
+            "qualify": null
+           },
+           "named_param_map": []
+          },
+          "child": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "ps_suppkey"
+           ]
+          },
+          "comparison_type": "COMPARE_EQUAL"
+         }
+        ]
+       }
+      ]
+     },
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_brand"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_type"
+       ]
+      },
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "p_size"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0,
+       1,
+       2
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

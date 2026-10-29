@@ -5722,6 +5722,144 @@ stripped in the committed file. What a Mac cannot check is the CUDA half: that
 `pip install` on a T4 runtime reports `runtime=cuda`, and what the three ratios
 are there. One real Colab run is owed before this is called done.
 
+## 2026-10-28 — DuckDB 2.0: one tree shape, and an `avg` that is chosen per plan
+
+On DuckDB 2.0.0 the wrapper sent nothing to the device: every statement
+declined with `shape`, the answers stayed DuckDB's own, and TPC-H measured 0 of
+22 on the GPU. The cause is `json_serialize_sql`, whose output changed shape;
+the readers (the Python matcher and the extension's `gpu_rewrite_ast`) read
+the 1.4/1.5 shape. `json_deserialize_sql` on 2.0 still accepts that shape, so
+the fix is one conversion where a tree enters the wrapper
+(`Connection._serialize` → `gpudb/_ast_compat.py`) and nothing downstream
+changes. pip-only: the extension binary stays v0.7.0.
+
+What changed, measured as a structural diff of 1.5.6 against 2.0.0 trees over
+the 22 TPC-H queries, every SQL string in `tests/test_wrapper.py` and 50 probe
+statements (469 in all):
+
+- `FUNCTION` / `WINDOW`: `arguments: [{name, expression}]` for `children`; a
+  named argument `f(a := 1)` is the child carrying alias `a` on both.
+- `CONSTANT`: `literal: {kind, text}` — the SQL text, unparsed — for the typed
+  `value`. 1.5's typing is reproduced: integers by size (INTEGER, BIGINT,
+  HUGEINT, UHUGEINT, 128-bit as `{upper, lower}`); a numeric with an exponent
+  is DOUBLE, otherwise DECIMAL(width, scale) with width counting every digit
+  (`00.10` is DECIMAL(4,2)) and DOUBLE past 38 digits; a boolean is
+  `CAST('t' AS BOOLEAN)` (1.5 really does emit a VARCHAR under a cast). Two
+  literals are typed differently by the engines and follow 2.0, which runs the
+  statement: `-2147483648` (1.5 BIGINT, 2.0 INTEGER) and integers past 2^128
+  (1.5 DOUBLE, 2.0 BIGNUM — left unconverted, so they decline).
+- `CAST`: the type as written (`type_expr`, a TYPE node) for the resolved
+  `cast_type`; the names whose resolution was measured are mapped.
+- `NOT`: 1.5 folds `NOT a = b` into `a <> b`, `NOT a IN (…)` into
+  COMPARE_NOT_IN (and `NOT` over `<`, `>`, `<=`, `>=`, `IS DISTINCT FROM`);
+  2.0 keeps OPERATOR_NOT.
+- Set operations: 2.0 writes a chain of one `UNION [ALL]` as one node with N
+  children; 1.5 writes the first arm on the left and the rest reduced pairwise
+  on the right — `(c0, (((c1 c2) (c3 c4)) c5))` for six arms, measured to ten.
+- CTE entries (`query_node`), `LIMIT` (`limit_type: PERCENTAGE` for
+  `LIMIT_PERCENT_MODIFIER`), sample clauses, lambdas, `query_location_length`
+  and `qualified_name` everywhere.
+
+After normalisation all 469 equal the 1.5.6 tree except four differences no
+reader can act on and no 2.0 tree can resolve: a grammar-made function
+(`extract` → `date_part`, `substring`, list and struct literals) has schema
+`main` on 1.5 and `""` on 2.0, and both readers take the two as the same;
+`extract(year …)` passes `'year'` against `'YEAR'`; 1.5 serializes every CTE as
+`CTE_MATERIALIZE_DEFAULT` while 2.0 keeps the hint (the wrapper reads it from
+the text on both); and three things kept in the 2.0 shape on purpose, below.
+`tests/test_ast_compat.py` pins 115 of them (TPC-H plus one statement per
+shape) as 1.5.6 fixtures and runs on both engines.
+
+What "accepts the 1.5 shape" does not cover, found by rendering every
+normalised tree on 2.0 and parsing the text back:
+
+- `LIMIT_PERCENT_MODIFIER` is rejected by 2.0's `json_deserialize_sql`; the
+  readers need it (they treat `LIMIT_MODIFIER` as a row count), so it is
+  converted back where a tree leaves the wrapper (`for_renderer`).
+- A JOIN without `is_implicit` renders as `a, b` without parentheses:
+  `a JOIN (b CROSS JOIN c) ON …` comes out as `a INNER JOIN b , c ON …`. The
+  field is kept, and a join the wrapper builds is given `is_implicit: false`
+  before rendering. (1.5.6's own renderer drops those parentheses too.)
+- lag / lead given an offset or a default: 2.0's renderer ignores
+  `offset_expr` / `default_expr`, so the 1.5 form of `lag(x, 2, 0)` renders as
+  `lag(x)`. Those nodes stay in their 2.0 shape (windows decline anyway).
+
+The extension's rendering is now done through the same `for_renderer` on 2.0:
+`gpu_rewrite_ast` is called on its own and its tree deserialized from Python.
+
+**avg over DECIMAL is chosen per plan on 2.0.** With the trees fixed, the
+parity suite found one aggregate whose native answer moved. 1.5 finalises
+`avg(DECIMAL)` as the unscaled sum over `count * 10^s` (gpu_avg_decimal
+reproduces that); 2.0's optimizer rewrites `avg(x)` to
+`CAST(sum(x) AS DOUBLE) / count(x)` in an aggregate with no GROUP BY and
+wherever the plan can share that `sum` or `count` with another aggregate —
+`avg(d), sum(d)`; `avg(d), count(*)` when `d` has no NULLs (its `count`
+becomes `count_star`); `avg(d), avg(c)` over two NULL-free columns — and keeps
+`avg` otherwise (`avg(d)` alone, `avg(n), count(*)` over a nullable `n`,
+`avg(d), min(d)`, `FILTER`, `DISTINCT`). The two forms differ in the last bit
+on 0–53% of groups depending on the DECIMAL's width and scale (0 for
+DECIMAL(4,0), 1.5% for (12,1), 22–53% for the rest of seven measured). Which
+one runs depends on NULL statistics at plan time, so reproducing it means
+mirroring the optimizer; the wrapper declines `avg` over DECIMAL on DuckDB 2
+instead, with reason `shape` and a detail naming why. avg over integers is
+unaffected on arm64 (both forms divide the same doubles). TPC-H Q1 is the one
+query this moves.
+
+Also 2.0: `stats(col)` is a STRUCT (read as JSON in SQL, so bounds keep
+DuckDB's own text — `1.500`, `1992-01-01 10:00:00.5` — and a TIMESTAMPTZ bound
+needs no pytz; FLOAT bounds are printed back to the shortest float32 text 1.5
+used); a result read with `fetchone()` stays open on its connection and blocks
+the next relation fetched there (`ResourceInUse`), so the wrapper's one-row
+reads now read to the end; `DuckDBPyRelation.fetchone()` is gone; `sql()`
+returns a one-row `Count` / `Success` relation for statements that have no
+result, which the shell does not print; `extract_statements` keeps the `;` and
+a trailing comment in a statement's text (and a relation over
+`SELECT 5; /* x */` fails to render), and `tokenize` now reports comments as
+tokens — the shell strips the terminator and treats comment-only text as blank.
+
+Measured on the M4 Max with the extension built from this tree, thresholds on,
+`--n 3` (SF1) and `--n 5` (SF10); the 2.0 runs on copies of the data files:
+
+| | DuckDB 1.5.6 | DuckDB 2.0.0 |
+|---|---|---|
+| SF1, on the device | 17 of 22 | 16 of 22 (Q1: `shape`, avg over DECIMAL) |
+| SF1, rows differing | 0 | 0 |
+| SF10, on the device | 19 of 22 (measured before this change) | 18 of 22 |
+| SF10, rows differing | 0 | 0 |
+
+SF10 on 2.0.0, best of five:
+
+| query | path | native ms | transparent ms | ratio |
+|---|---|---|---|---|
+| Q1 | native (shape) | 54.3 | — | — |
+| Q2 | native (shape: correlated) | 8.5 | — | — |
+| Q3 | GPU (plain) | 30.9 | 8.6 | 3.60× |
+| Q4 | GPU (plain) | 30.6 | 2.9 | 10.74× |
+| Q5 | GPU (plain) | 34.3 | 1.3 | 27.39× |
+| Q6 | GPU (projected) | 11.7 | 6.1 | 1.92× |
+| Q7 | GPU (plain) | 31.9 | 9.3 | 3.45× |
+| Q8 | GPU (projected) | 33.6 | 8.2 | 4.11× |
+| Q9 | GPU (plain) | 126.1 | 5.9 | 21.36× |
+| Q10 | GPU (topk) | 62.3 | 9.7 | 6.43× |
+| Q11 | GPU (nested) | 6.6 | 6.4 | 1.04× |
+| Q12 | GPU (plain) | 34.5 | 10.6 | 3.26× |
+| Q13 | GPU (nested) | 130.6 | 11.9 | 11.01× |
+| Q14 | GPU (projected) | 29.9 | 4.6 | 6.45× |
+| Q15 | GPU (nested) | 19.7 | 12.2 | 1.61× |
+| Q16 | native (threshold) | 36.6 | — | — |
+| Q17 | GPU (projected) | 28.1 | 3.4 | 8.17× |
+| Q18 | GPU (plain) | 98.9 | 5.4 | 18.42× |
+| Q19 | GPU (projected) | 30.6 | 4.5 | 6.79× |
+| Q20 | native (shape: correlated) | 33.3 | — | — |
+| Q21 | GPU (plain) | 70.8 | 19.5 | 3.63× |
+| Q22 | GPU (plain) | 18.5 | 1.0 | 19.40× |
+
+Open: Q1 back on the device on 2.0 needs the wrapper to know which `avg`
+form the plan chose — from the statement's own aggregate list and the
+columns' NULL statistics, or from the plan itself — and the ratio it would
+then be measured at, since 2.0's own Q1 is faster than 1.5's (6.7 ms against
+12.1 ms native at SF1).
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

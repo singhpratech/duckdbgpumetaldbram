@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 
+from . import _ast_compat
+
 _INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
 _KEY_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}
 _TEMPORAL_TYPES = {"DATE", "TIMESTAMP"}
@@ -669,11 +671,20 @@ def _check_avg_decimal(plan: Plan, avg_float_bits: int) -> None:
     HAVING over an avg that is not selected (plan.having, rendered by
     _render_exact's extra_pred through the same _agg_expr). ORDER BY reaches
     an avg only through an output name, and the top-k push refuses avg."""
-    if plan.native_avg_decimal or avg_float_bits == 53:
-        return
     pays = {o.pay for o in plan.outputs if o.kind == "avg"}
     if plan.having is not None and plan.having[0] == "avg":
         pays.add(plan.having_pay)
+    if _ast_compat.AVG_DECIMAL_PER_PLAN:
+        for pay in pays:
+            col = plan.vals[pay] if pay < len(plan.vals) else plan.val
+            if col is not None and plan.scales.get(col, plan.scale):
+                raise Decline("shape",
+                              "avg over DECIMAL: DuckDB 2.0 finalises it per statement (as sum / count "
+                              "where the plan shares those aggregates, as avg otherwise), and the "
+                              "rewrite does not reproduce that choice")
+        return
+    if plan.native_avg_decimal or avg_float_bits == 53:
+        return
     for pay in pays:
         col = plan.vals[pay] if pay < len(plan.vals) else plan.val
         if col is not None and plan.scales.get(col, plan.scale):

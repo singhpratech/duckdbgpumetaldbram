@@ -1,0 +1,1079 @@
+{
+ "name": "tpch_q19",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE (p_partkey = l_partkey\n    AND p_brand = 'Brand#12'\n    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n    AND l_quantity >= 1\n    AND l_quantity <= 1 + 10\n    AND p_size BETWEEN 1 AND 5\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10\n        AND l_quantity <= 10 + 10\n        AND p_size BETWEEN 1 AND 10\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20\n        AND l_quantity <= 20 + 10\n        AND p_size BETWEEN 1 AND 15\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON');\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "revenue",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "FUNCTION",
+         "type": "FUNCTION",
+         "alias": "",
+         "function_name": "*",
+         "schema": "",
+         "children": [
+          {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_extendedprice"
+           ]
+          },
+          {
+           "class": "FUNCTION",
+           "type": "FUNCTION",
+           "alias": "",
+           "function_name": "-",
+           "schema": "",
+           "children": [
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 1
+             }
+            },
+            {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "",
+             "column_names": [
+              "l_discount"
+             ]
+            }
+           ],
+           "filter": null,
+           "order_bys": {
+            "type": "ORDER_MODIFIER",
+            "orders": []
+           },
+           "distinct": false,
+           "is_operator": true,
+           "export_state": false,
+           "catalog": ""
+          }
+         ],
+         "filter": null,
+         "order_bys": {
+          "type": "ORDER_MODIFIER",
+          "orders": []
+         },
+         "distinct": false,
+         "is_operator": true,
+         "export_state": false,
+         "catalog": ""
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "lineitem",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "part",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "CROSS",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_OR",
+      "alias": "",
+      "children": [
+       {
+        "class": "CONJUNCTION",
+        "type": "CONJUNCTION_AND",
+        "alias": "",
+        "children": [
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_partkey"
+           ]
+          },
+          "right": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_partkey"
+           ]
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_brand"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "Brand#12"
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "p_container"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "SM CASE"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "SM BOX"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "SM PACK"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "SM PKG"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_GREATERTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_LESSTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "FUNCTION",
+           "type": "FUNCTION",
+           "alias": "",
+           "function_name": "+",
+           "schema": "",
+           "children": [
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 1
+             }
+            },
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 10
+             }
+            }
+           ],
+           "filter": null,
+           "order_bys": {
+            "type": "ORDER_MODIFIER",
+            "orders": []
+           },
+           "distinct": false,
+           "is_operator": true,
+           "export_state": false,
+           "catalog": ""
+          }
+         },
+         {
+          "class": "BETWEEN",
+          "type": "COMPARE_BETWEEN",
+          "alias": "",
+          "input": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_size"
+           ]
+          },
+          "lower": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          },
+          "upper": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 5
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "l_shipmode"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR REG"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_shipinstruct"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "DELIVER IN PERSON"
+           }
+          }
+         }
+        ]
+       },
+       {
+        "class": "CONJUNCTION",
+        "type": "CONJUNCTION_AND",
+        "alias": "",
+        "children": [
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_partkey"
+           ]
+          },
+          "right": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_partkey"
+           ]
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_brand"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "Brand#23"
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "p_container"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "MED BAG"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "MED BOX"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "MED PKG"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "MED PACK"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_GREATERTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 10
+           }
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_LESSTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "FUNCTION",
+           "type": "FUNCTION",
+           "alias": "",
+           "function_name": "+",
+           "schema": "",
+           "children": [
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 10
+             }
+            },
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 10
+             }
+            }
+           ],
+           "filter": null,
+           "order_bys": {
+            "type": "ORDER_MODIFIER",
+            "orders": []
+           },
+           "distinct": false,
+           "is_operator": true,
+           "export_state": false,
+           "catalog": ""
+          }
+         },
+         {
+          "class": "BETWEEN",
+          "type": "COMPARE_BETWEEN",
+          "alias": "",
+          "input": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_size"
+           ]
+          },
+          "lower": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          },
+          "upper": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 10
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "l_shipmode"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR REG"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_shipinstruct"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "DELIVER IN PERSON"
+           }
+          }
+         }
+        ]
+       },
+       {
+        "class": "CONJUNCTION",
+        "type": "CONJUNCTION_AND",
+        "alias": "",
+        "children": [
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_partkey"
+           ]
+          },
+          "right": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_partkey"
+           ]
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_brand"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "Brand#34"
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "p_container"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "LG CASE"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "LG BOX"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "LG PACK"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "LG PKG"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_GREATERTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 20
+           }
+          }
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_LESSTHANOREQUALTO",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_quantity"
+           ]
+          },
+          "right": {
+           "class": "FUNCTION",
+           "type": "FUNCTION",
+           "alias": "",
+           "function_name": "+",
+           "schema": "",
+           "children": [
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 20
+             }
+            },
+            {
+             "class": "CONSTANT",
+             "type": "VALUE_CONSTANT",
+             "alias": "",
+             "value": {
+              "type": {
+               "id": "INTEGER",
+               "type_info": null
+              },
+              "is_null": false,
+              "value": 10
+             }
+            }
+           ],
+           "filter": null,
+           "order_bys": {
+            "type": "ORDER_MODIFIER",
+            "orders": []
+           },
+           "distinct": false,
+           "is_operator": true,
+           "export_state": false,
+           "catalog": ""
+          }
+         },
+         {
+          "class": "BETWEEN",
+          "type": "COMPARE_BETWEEN",
+          "alias": "",
+          "input": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "p_size"
+           ]
+          },
+          "lower": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 1
+           }
+          },
+          "upper": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "INTEGER",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": 15
+           }
+          }
+         },
+         {
+          "class": "OPERATOR",
+          "type": "COMPARE_IN",
+          "alias": "",
+          "children": [
+           {
+            "class": "COLUMN_REF",
+            "type": "COLUMN_REF",
+            "alias": "",
+            "column_names": [
+             "l_shipmode"
+            ]
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR"
+            }
+           },
+           {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "VARCHAR",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": "AIR REG"
+            }
+           }
+          ]
+         },
+         {
+          "class": "COMPARISON",
+          "type": "COMPARE_EQUAL",
+          "alias": "",
+          "left": {
+           "class": "COLUMN_REF",
+           "type": "COLUMN_REF",
+           "alias": "",
+           "column_names": [
+            "l_shipinstruct"
+           ]
+          },
+          "right": {
+           "class": "CONSTANT",
+           "type": "VALUE_CONSTANT",
+           "alias": "",
+           "value": {
+            "type": {
+             "id": "VARCHAR",
+             "type_info": null
+            },
+            "is_null": false,
+            "value": "DELIVER IN PERSON"
+           }
+          }
+         }
+        ]
+       }
+      ]
+     },
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

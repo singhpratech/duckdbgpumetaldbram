@@ -1,0 +1,505 @@
+{
+ "name": "tpch_q12",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode;\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "l_shipmode"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "l_shipmode"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "high_line_count",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "CASE",
+         "type": "CASE_EXPR",
+         "alias": "",
+         "case_checks": [
+          {
+           "when_expr": {
+            "class": "CONJUNCTION",
+            "type": "CONJUNCTION_OR",
+            "alias": "",
+            "children": [
+             {
+              "class": "COMPARISON",
+              "type": "COMPARE_EQUAL",
+              "alias": "",
+              "left": {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "o_orderpriority"
+               ]
+              },
+              "right": {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "VARCHAR",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": "1-URGENT"
+               }
+              }
+             },
+             {
+              "class": "COMPARISON",
+              "type": "COMPARE_EQUAL",
+              "alias": "",
+              "left": {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "o_orderpriority"
+               ]
+              },
+              "right": {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "VARCHAR",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": "2-HIGH"
+               }
+              }
+             }
+            ]
+           },
+           "then_expr": {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 1
+            }
+           }
+          }
+         ],
+         "else_expr": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 0
+          }
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "low_line_count",
+       "function_name": "sum",
+       "schema": "",
+       "children": [
+        {
+         "class": "CASE",
+         "type": "CASE_EXPR",
+         "alias": "",
+         "case_checks": [
+          {
+           "when_expr": {
+            "class": "CONJUNCTION",
+            "type": "CONJUNCTION_AND",
+            "alias": "",
+            "children": [
+             {
+              "class": "COMPARISON",
+              "type": "COMPARE_NOTEQUAL",
+              "alias": "",
+              "left": {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "o_orderpriority"
+               ]
+              },
+              "right": {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "VARCHAR",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": "1-URGENT"
+               }
+              }
+             },
+             {
+              "class": "COMPARISON",
+              "type": "COMPARE_NOTEQUAL",
+              "alias": "",
+              "left": {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "o_orderpriority"
+               ]
+              },
+              "right": {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "VARCHAR",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": "2-HIGH"
+               }
+              }
+             }
+            ]
+           },
+           "then_expr": {
+            "class": "CONSTANT",
+            "type": "VALUE_CONSTANT",
+            "alias": "",
+            "value": {
+             "type": {
+              "id": "INTEGER",
+              "type_info": null
+             },
+             "is_null": false,
+             "value": 1
+            }
+           }
+          }
+         ],
+         "else_expr": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 0
+          }
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "orders",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "lineitem",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "CROSS",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_AND",
+      "alias": "",
+      "children": [
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "o_orderkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_orderkey"
+         ]
+        }
+       },
+       {
+        "class": "OPERATOR",
+        "type": "COMPARE_IN",
+        "alias": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "l_shipmode"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "MAIL"
+          }
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "SHIP"
+          }
+         }
+        ]
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_LESSTHAN",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_commitdate"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_receiptdate"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_LESSTHAN",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_shipdate"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_commitdate"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_GREATERTHANOREQUALTO",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_receiptdate"
+         ]
+        },
+        "right": {
+         "class": "CAST",
+         "type": "OPERATOR_CAST",
+         "alias": "",
+         "child": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "1994-01-01"
+          }
+         },
+         "cast_type": {
+          "id": "DATE",
+          "type_info": null
+         },
+         "try_cast": false
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_LESSTHAN",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l_receiptdate"
+         ]
+        },
+        "right": {
+         "class": "CAST",
+         "type": "OPERATOR_CAST",
+         "alias": "",
+         "child": {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "VARCHAR",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": "1995-01-01"
+          }
+         },
+         "cast_type": {
+          "id": "DATE",
+          "type_info": null
+         },
+         "try_cast": false
+        }
+       }
+      ]
+     },
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "l_shipmode"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

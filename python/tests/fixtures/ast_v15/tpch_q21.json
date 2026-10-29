@@ -1,0 +1,565 @@
+{
+ "name": "tpch_q21",
+ "duckdb": "1.5.6",
+ "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100;\n",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "DESCENDING",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "numwait"
+          ]
+         }
+        },
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "s_name"
+          ]
+         }
+        }
+       ]
+      },
+      {
+       "type": "LIMIT_MODIFIER",
+       "limit": {
+        "class": "CONSTANT",
+        "type": "VALUE_CONSTANT",
+        "alias": "",
+        "value": {
+         "type": {
+          "id": "INTEGER",
+          "type_info": null
+         },
+         "is_null": false,
+         "value": 100
+        }
+       },
+       "offset": null
+      }
+     ],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "s_name"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "numwait",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "JOIN",
+       "alias": "",
+       "sample": null,
+       "left": {
+        "type": "JOIN",
+        "alias": "",
+        "sample": null,
+        "left": {
+         "type": "BASE_TABLE",
+         "alias": "",
+         "sample": null,
+         "schema_name": "",
+         "table_name": "supplier",
+         "column_name_alias": [],
+         "catalog_name": "",
+         "at_clause": null
+        },
+        "right": {
+         "type": "BASE_TABLE",
+         "alias": "l1",
+         "sample": null,
+         "schema_name": "",
+         "table_name": "lineitem",
+         "column_name_alias": [],
+         "catalog_name": "",
+         "at_clause": null
+        },
+        "condition": null,
+        "join_type": "INNER",
+        "ref_type": "CROSS",
+        "using_columns": [],
+        "delim_flipped": false,
+        "duplicate_eliminated_columns": []
+       },
+       "right": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "orders",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "condition": null,
+       "join_type": "INNER",
+       "ref_type": "CROSS",
+       "using_columns": [],
+       "delim_flipped": false,
+       "duplicate_eliminated_columns": []
+      },
+      "right": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "nation",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "condition": null,
+      "join_type": "INNER",
+      "ref_type": "CROSS",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": {
+      "class": "CONJUNCTION",
+      "type": "CONJUNCTION_AND",
+      "alias": "",
+      "children": [
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "s_suppkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l1",
+          "l_suppkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "o_orderkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l1",
+          "l_orderkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "o_orderstatus"
+         ]
+        },
+        "right": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "VARCHAR",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": "F"
+         }
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_GREATERTHAN",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l1",
+          "l_receiptdate"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "l1",
+          "l_commitdate"
+         ]
+        }
+       },
+       {
+        "class": "SUBQUERY",
+        "type": "SUBQUERY",
+        "alias": "",
+        "subquery_type": "EXISTS",
+        "subquery": {
+         "node": {
+          "type": "SELECT_NODE",
+          "modifiers": [],
+          "cte_map": {
+           "map": []
+          },
+          "select_list": [
+           {
+            "class": "STAR",
+            "type": "STAR",
+            "alias": "",
+            "relation_name": "",
+            "exclude_list": [],
+            "replace_list": [],
+            "columns": false,
+            "expr": null,
+            "qualified_exclude_list": [],
+            "rename_list": []
+           }
+          ],
+          "from_table": {
+           "type": "BASE_TABLE",
+           "alias": "l2",
+           "sample": null,
+           "schema_name": "",
+           "table_name": "lineitem",
+           "column_name_alias": [],
+           "catalog_name": "",
+           "at_clause": null
+          },
+          "where_clause": {
+           "class": "CONJUNCTION",
+           "type": "CONJUNCTION_AND",
+           "alias": "",
+           "children": [
+            {
+             "class": "COMPARISON",
+             "type": "COMPARE_EQUAL",
+             "alias": "",
+             "left": {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "l2",
+               "l_orderkey"
+              ]
+             },
+             "right": {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "l1",
+               "l_orderkey"
+              ]
+             }
+            },
+            {
+             "class": "COMPARISON",
+             "type": "COMPARE_NOTEQUAL",
+             "alias": "",
+             "left": {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "l2",
+               "l_suppkey"
+              ]
+             },
+             "right": {
+              "class": "COLUMN_REF",
+              "type": "COLUMN_REF",
+              "alias": "",
+              "column_names": [
+               "l1",
+               "l_suppkey"
+              ]
+             }
+            }
+           ]
+          },
+          "group_expressions": [],
+          "group_sets": [],
+          "aggregate_handling": "STANDARD_HANDLING",
+          "having": null,
+          "sample": null,
+          "qualify": null
+         },
+         "named_param_map": []
+        },
+        "child": null,
+        "comparison_type": "INVALID"
+       },
+       {
+        "class": "OPERATOR",
+        "type": "OPERATOR_NOT",
+        "alias": "",
+        "children": [
+         {
+          "class": "SUBQUERY",
+          "type": "SUBQUERY",
+          "alias": "",
+          "subquery_type": "EXISTS",
+          "subquery": {
+           "node": {
+            "type": "SELECT_NODE",
+            "modifiers": [],
+            "cte_map": {
+             "map": []
+            },
+            "select_list": [
+             {
+              "class": "STAR",
+              "type": "STAR",
+              "alias": "",
+              "relation_name": "",
+              "exclude_list": [],
+              "replace_list": [],
+              "columns": false,
+              "expr": null,
+              "qualified_exclude_list": [],
+              "rename_list": []
+             }
+            ],
+            "from_table": {
+             "type": "BASE_TABLE",
+             "alias": "l3",
+             "sample": null,
+             "schema_name": "",
+             "table_name": "lineitem",
+             "column_name_alias": [],
+             "catalog_name": "",
+             "at_clause": null
+            },
+            "where_clause": {
+             "class": "CONJUNCTION",
+             "type": "CONJUNCTION_AND",
+             "alias": "",
+             "children": [
+              {
+               "class": "COMPARISON",
+               "type": "COMPARE_EQUAL",
+               "alias": "",
+               "left": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l3",
+                 "l_orderkey"
+                ]
+               },
+               "right": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l1",
+                 "l_orderkey"
+                ]
+               }
+              },
+              {
+               "class": "COMPARISON",
+               "type": "COMPARE_NOTEQUAL",
+               "alias": "",
+               "left": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l3",
+                 "l_suppkey"
+                ]
+               },
+               "right": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l1",
+                 "l_suppkey"
+                ]
+               }
+              },
+              {
+               "class": "COMPARISON",
+               "type": "COMPARE_GREATERTHAN",
+               "alias": "",
+               "left": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l3",
+                 "l_receiptdate"
+                ]
+               },
+               "right": {
+                "class": "COLUMN_REF",
+                "type": "COLUMN_REF",
+                "alias": "",
+                "column_names": [
+                 "l3",
+                 "l_commitdate"
+                ]
+               }
+              }
+             ]
+            },
+            "group_expressions": [],
+            "group_sets": [],
+            "aggregate_handling": "STANDARD_HANDLING",
+            "having": null,
+            "sample": null,
+            "qualify": null
+           },
+           "named_param_map": []
+          },
+          "child": null,
+          "comparison_type": "INVALID"
+         }
+        ]
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "s_nationkey"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "n_nationkey"
+         ]
+        }
+       },
+       {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "n_name"
+         ]
+        },
+        "right": {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "VARCHAR",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": "SAUDI ARABIA"
+         }
+        }
+       }
+      ]
+     },
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "s_name"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

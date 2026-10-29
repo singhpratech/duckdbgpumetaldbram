@@ -1,0 +1,136 @@
+{
+ "name": "w_range_cast",
+ "duckdb": "1.5.6",
+ "sql": "SELECT (i % 5)::INTEGER k, i::BIGINT v FROM range(10) r(i)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "k",
+       "child": {
+        "class": "FUNCTION",
+        "type": "FUNCTION",
+        "alias": "",
+        "function_name": "%",
+        "schema": "",
+        "children": [
+         {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "i"
+          ]
+         },
+         {
+          "class": "CONSTANT",
+          "type": "VALUE_CONSTANT",
+          "alias": "",
+          "value": {
+           "type": {
+            "id": "INTEGER",
+            "type_info": null
+           },
+           "is_null": false,
+           "value": 5
+          }
+         }
+        ],
+        "filter": null,
+        "order_bys": {
+         "type": "ORDER_MODIFIER",
+         "orders": []
+        },
+        "distinct": false,
+        "is_operator": true,
+        "export_state": false,
+        "catalog": ""
+       },
+       "cast_type": {
+        "id": "INTEGER",
+        "type_info": null
+       },
+       "try_cast": false
+      },
+      {
+       "class": "CAST",
+       "type": "OPERATOR_CAST",
+       "alias": "v",
+       "child": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "i"
+        ]
+       },
+       "cast_type": {
+        "id": "BIGINT",
+        "type_info": null
+       },
+       "try_cast": false
+      }
+     ],
+     "from_table": {
+      "type": "TABLE_FUNCTION",
+      "alias": "r",
+      "sample": null,
+      "function": {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "range",
+       "schema": "",
+       "children": [
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 10
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      },
+      "column_name_alias": [
+       "i"
+      ],
+      "with_ordinality": "WITHOUT_ORDINALITY"
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

@@ -1,0 +1,137 @@
+{
+ "name": "join_nested",
+ "duckdb": "1.5.6",
+ "sql": "SELECT * FROM a JOIN (b JOIN c ON b.x = c.x) ON a.y = b.y",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "STAR",
+       "type": "STAR",
+       "alias": "",
+       "relation_name": "",
+       "exclude_list": [],
+       "replace_list": [],
+       "columns": false,
+       "expr": null,
+       "qualified_exclude_list": [],
+       "rename_list": []
+      }
+     ],
+     "from_table": {
+      "type": "JOIN",
+      "alias": "",
+      "sample": null,
+      "left": {
+       "type": "BASE_TABLE",
+       "alias": "",
+       "sample": null,
+       "schema_name": "",
+       "table_name": "a",
+       "column_name_alias": [],
+       "catalog_name": "",
+       "at_clause": null
+      },
+      "right": {
+       "type": "JOIN",
+       "alias": "",
+       "sample": null,
+       "left": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "b",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "right": {
+        "type": "BASE_TABLE",
+        "alias": "",
+        "sample": null,
+        "schema_name": "",
+        "table_name": "c",
+        "column_name_alias": [],
+        "catalog_name": "",
+        "at_clause": null
+       },
+       "condition": {
+        "class": "COMPARISON",
+        "type": "COMPARE_EQUAL",
+        "alias": "",
+        "left": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "b",
+          "x"
+         ]
+        },
+        "right": {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "c",
+          "x"
+         ]
+        }
+       },
+       "join_type": "INNER",
+       "ref_type": "REGULAR",
+       "using_columns": [],
+       "delim_flipped": false,
+       "duplicate_eliminated_columns": []
+      },
+      "condition": {
+       "class": "COMPARISON",
+       "type": "COMPARE_EQUAL",
+       "alias": "",
+       "left": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "a",
+         "y"
+        ]
+       },
+       "right": {
+        "class": "COLUMN_REF",
+        "type": "COLUMN_REF",
+        "alias": "",
+        "column_names": [
+         "b",
+         "y"
+        ]
+       }
+      },
+      "join_type": "INNER",
+      "ref_type": "REGULAR",
+      "using_columns": [],
+      "delim_flipped": false,
+      "duplicate_eliminated_columns": []
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

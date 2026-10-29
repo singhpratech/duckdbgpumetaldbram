@@ -1,0 +1,45 @@
+{
+ "name": "lit_params_named",
+ "duckdb": "1.5.6",
+ "sql": "SELECT $name",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "PARAMETER",
+       "type": "VALUE_PARAMETER",
+       "alias": "",
+       "identifier": "name"
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": [
+     {
+      "key": "name",
+      "value": 1
+     }
+    ]
+   }
+  ]
+ }
+}

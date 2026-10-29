@@ -1,0 +1,303 @@
+{
+ "name": "window_fns",
+ "duckdb": "1.5.6",
+ "sql": "SELECT row_number() OVER w, lag(x) OVER w, first_value(x IGNORE NULLS) OVER w, nth_value(x, 2) OVER w, ntile(4) OVER w, rank() OVER w FROM t WINDOW w AS (ORDER BY y)",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_ROW_NUMBER",
+       "alias": "",
+       "function_name": "row_number",
+       "schema": "",
+       "catalog": "",
+       "children": [],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      },
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_LAG",
+       "alias": "",
+       "function_name": "lag",
+       "schema": "",
+       "catalog": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        }
+       ],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      },
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_FIRST_VALUE",
+       "alias": "",
+       "function_name": "first_value",
+       "schema": "",
+       "catalog": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        }
+       ],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": true,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      },
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_NTH_VALUE",
+       "alias": "",
+       "function_name": "nth_value",
+       "schema": "",
+       "catalog": "",
+       "children": [
+        {
+         "class": "COLUMN_REF",
+         "type": "COLUMN_REF",
+         "alias": "",
+         "column_names": [
+          "x"
+         ]
+        },
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 2
+         }
+        }
+       ],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      },
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_NTILE",
+       "alias": "",
+       "function_name": "ntile",
+       "schema": "",
+       "catalog": "",
+       "children": [
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 4
+         }
+        }
+       ],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      },
+      {
+       "class": "WINDOW",
+       "type": "WINDOW_RANK",
+       "alias": "",
+       "function_name": "rank",
+       "schema": "",
+       "catalog": "",
+       "children": [],
+       "partitions": [],
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "y"
+          ]
+         }
+        }
+       ],
+       "start": "UNBOUNDED_PRECEDING",
+       "end": "CURRENT_ROW_RANGE",
+       "start_expr": null,
+       "end_expr": null,
+       "offset_expr": null,
+       "default_expr": null,
+       "ignore_nulls": false,
+       "filter_expr": null,
+       "exclude_clause": "NO_OTHER",
+       "distinct": false,
+       "arg_orders": []
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "t",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}

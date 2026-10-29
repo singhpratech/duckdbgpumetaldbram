@@ -1,0 +1,86 @@
+{
+ "name": "lit_params",
+ "duckdb": "1.5.6",
+ "sql": "SELECT ?, ? + 1",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [],
+     "cte_map": {
+      "map": []
+     },
+     "select_list": [
+      {
+       "class": "PARAMETER",
+       "type": "VALUE_PARAMETER",
+       "alias": "",
+       "identifier": "1"
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "+",
+       "schema": "",
+       "children": [
+        {
+         "class": "PARAMETER",
+         "type": "VALUE_PARAMETER",
+         "alias": "",
+         "identifier": "2"
+        },
+        {
+         "class": "CONSTANT",
+         "type": "VALUE_CONSTANT",
+         "alias": "",
+         "value": {
+          "type": {
+           "id": "INTEGER",
+           "type_info": null
+          },
+          "is_null": false,
+          "value": 1
+         }
+        }
+       ],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": true,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "EMPTY",
+      "alias": "",
+      "sample": null
+     },
+     "where_clause": null,
+     "group_expressions": [],
+     "group_sets": [],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": [
+     {
+      "key": "1",
+      "value": 1
+     },
+     {
+      "key": "2",
+      "value": 2
+     }
+    ]
+   }
+  ]
+ }
+}

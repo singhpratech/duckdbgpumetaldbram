@@ -1,0 +1,185 @@
+{
+ "name": "w_cte_distinct",
+ "duckdb": "1.5.6",
+ "sql": "WITH r AS (SELECT DISTINCT k % 10 AS kk, v AS vv FROM t) SELECT kk, count(*) FROM r GROUP BY kk ORDER BY kk",
+ "tree": {
+  "error": false,
+  "statements": [
+   {
+    "node": {
+     "type": "SELECT_NODE",
+     "modifiers": [
+      {
+       "type": "ORDER_MODIFIER",
+       "orders": [
+        {
+         "type": "ORDER_DEFAULT",
+         "null_order": "ORDER_DEFAULT",
+         "expression": {
+          "class": "COLUMN_REF",
+          "type": "COLUMN_REF",
+          "alias": "",
+          "column_names": [
+           "kk"
+          ]
+         }
+        }
+       ]
+      }
+     ],
+     "cte_map": {
+      "map": [
+       {
+        "key": "r",
+        "value": {
+         "aliases": [],
+         "query": {
+          "node": {
+           "type": "SELECT_NODE",
+           "modifiers": [
+            {
+             "type": "DISTINCT_MODIFIER",
+             "distinct_on_targets": []
+            }
+           ],
+           "cte_map": {
+            "map": []
+           },
+           "select_list": [
+            {
+             "class": "FUNCTION",
+             "type": "FUNCTION",
+             "alias": "kk",
+             "function_name": "%",
+             "schema": "",
+             "children": [
+              {
+               "class": "COLUMN_REF",
+               "type": "COLUMN_REF",
+               "alias": "",
+               "column_names": [
+                "k"
+               ]
+              },
+              {
+               "class": "CONSTANT",
+               "type": "VALUE_CONSTANT",
+               "alias": "",
+               "value": {
+                "type": {
+                 "id": "INTEGER",
+                 "type_info": null
+                },
+                "is_null": false,
+                "value": 10
+               }
+              }
+             ],
+             "filter": null,
+             "order_bys": {
+              "type": "ORDER_MODIFIER",
+              "orders": []
+             },
+             "distinct": false,
+             "is_operator": true,
+             "export_state": false,
+             "catalog": ""
+            },
+            {
+             "class": "COLUMN_REF",
+             "type": "COLUMN_REF",
+             "alias": "vv",
+             "column_names": [
+              "v"
+             ]
+            }
+           ],
+           "from_table": {
+            "type": "BASE_TABLE",
+            "alias": "",
+            "sample": null,
+            "schema_name": "",
+            "table_name": "t",
+            "column_name_alias": [],
+            "catalog_name": "",
+            "at_clause": null
+           },
+           "where_clause": null,
+           "group_expressions": [],
+           "group_sets": [],
+           "aggregate_handling": "STANDARD_HANDLING",
+           "having": null,
+           "sample": null,
+           "qualify": null
+          },
+          "named_param_map": []
+         },
+         "materialized": "CTE_MATERIALIZE_DEFAULT",
+         "key_targets": []
+        }
+       }
+      ]
+     },
+     "select_list": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "kk"
+       ]
+      },
+      {
+       "class": "FUNCTION",
+       "type": "FUNCTION",
+       "alias": "",
+       "function_name": "count_star",
+       "schema": "",
+       "children": [],
+       "filter": null,
+       "order_bys": {
+        "type": "ORDER_MODIFIER",
+        "orders": []
+       },
+       "distinct": false,
+       "is_operator": false,
+       "export_state": false,
+       "catalog": ""
+      }
+     ],
+     "from_table": {
+      "type": "BASE_TABLE",
+      "alias": "",
+      "sample": null,
+      "schema_name": "",
+      "table_name": "r",
+      "column_name_alias": [],
+      "catalog_name": "",
+      "at_clause": null
+     },
+     "where_clause": null,
+     "group_expressions": [
+      {
+       "class": "COLUMN_REF",
+       "type": "COLUMN_REF",
+       "alias": "",
+       "column_names": [
+        "kk"
+       ]
+      }
+     ],
+     "group_sets": [
+      [
+       0
+      ]
+     ],
+     "aggregate_handling": "STANDARD_HANDLING",
+     "having": null,
+     "sample": null,
+     "qualify": null
+    },
+    "named_param_map": []
+   }
+  ]
+ }
+}
