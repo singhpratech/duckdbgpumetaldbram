@@ -5860,6 +5860,39 @@ columns' NULL statistics, or from the plan itself — and the ratio it would
 then be measured at, since 2.0's own Q1 is faster than 1.5's (6.7 ms against
 12.1 ms native at SF1).
 
+## 2026-10-30 — DuckDB 2.0 renamed its CLI download
+
+`registry-smoke.yml` has failed on its Linux leg every night since 2026-10-22:
+`releases/latest/download/duckdb_cli-linux-amd64.zip` returns 404. DuckDB
+v2.0.0 publishes the CLI as `duckdb-cli-<plat>.tar.gz` (a gzip tarball holding
+the single `duckdb` binary) where v1.x published `duckdb_cli-<plat>.zip`, so
+every URL built on `latest` with the old name broke the day 2.0.0 became
+latest. v2.0.0 also ships no prebuilt `libduckdb-<plat>.zip` at all, only
+`libduckdb-src.zip`; v1.5.6 still has them.
+
+What changed:
+
+- `registry-smoke.yml`, `scripts/gen_tpch.sh` and the two Linux recipes in
+  `docs/CI_RECIPES.md` fetch `duckdb-cli-<plat>.tar.gz` and extract with
+  `tar xzf`. The Dockerfile recipe no longer installs `unzip`.
+- `duckdb-compat.yml` picks the asset by tag (`v1.*` the zip, anything else
+  the tarball) and gains two hard legs for v2.0.0 (macos-15, ubuntu-latest);
+  the v1.5.5 hard legs and v1.4.5 soft legs are unchanged.
+- `scripts/get_duckdb_libs.sh` keeps its v1.5.5 pin. `DUCKDB_VERSION=latest`
+  and any v2 tag now resolve to nothing; the script says so and exits 1
+  instead of leaving a bare curl 404.
+
+Verified on an M4 Max: HEAD requests return 200 after redirects for
+`latest/duckdb-cli-linux-amd64.tar.gz`, `latest/duckdb-cli-osx-universal.tar.gz`,
+`v2.0.0/duckdb-cli-linux-amd64.tar.gz` and `v1.5.5/duckdb_cli-linux-amd64.zip`,
+and 404 for `latest/duckdb_cli-linux-amd64.zip`,
+`latest/libduckdb-osx-universal.zip` and `v2.0.0/libduckdb-osx-universal.zip`.
+The compat install step, run locally for v2.0.0, v1.5.5 and v1.4.5, printed
+each version. `gen_tpch.sh` with no `DUCKDB` set downloaded the tarball and ran
+dbgen at SF 0.01 under `v2.0.0 (Cyanoptera)`. `get_duckdb_libs.sh` with
+`latest` and with `v2.0.0` printed the new message and exited 1. The workflows
+themselves run on their next schedule.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
