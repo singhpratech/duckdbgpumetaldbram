@@ -32,7 +32,8 @@ add_library(gpudb_duckdb SHARED
     gpu_resident.cpp
     gpu_join_extension.cpp
     gpu_groupby_extension.cpp
-    gpu_rewrite.cpp)
+    gpu_rewrite.cpp
+    gpu_functions.cpp)
 
 # nlohmann/json (MIT, third_party/nlohmann/) — the statement rewriter works
 # on json_serialize_sql trees; header-only, no link dependency.
@@ -161,7 +162,7 @@ set(DUCKDB_LIBS_DIR "${CMAKE_SOURCE_DIR}/third_party/duckdb-libs")
 
 if(EXISTS "${DUCKDB_LIBS_DIR}/duckdb.h")
     # Compiled WITHOUT GPUDB_C_STRUCT_ABI: uses real duckdb.h + real libduckdb.
-    add_library(gpudb_ext STATIC gpu_sum_extension.cpp gpu_resident.cpp gpu_join_extension.cpp gpu_groupby_extension.cpp gpu_rewrite.cpp)
+    add_library(gpudb_ext STATIC gpu_sum_extension.cpp gpu_resident.cpp gpu_join_extension.cpp gpu_groupby_extension.cpp gpu_rewrite.cpp gpu_functions.cpp)
     target_include_directories(gpudb_ext PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${DUCKDB_LIBS_DIR}
