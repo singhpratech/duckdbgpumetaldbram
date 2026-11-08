@@ -5969,6 +5969,40 @@ as the build list, and `gpu_join.test` relies on it). And the streaming
 accumulator since v0.3.0, see the header of `gpu_sum_extension.cpp`). The
 descriptions say both.
 
+## 2026-11-08 — Extension v0.7.1: the version the build stamps, and where it comes from
+
+Release prep for extension v0.7.1 from main, so that the tag, the registry and
+pip all say 0.7.1. Since v0.7.0 the only extension source change is
+`gpu_functions()` (#185); #184 (pip 0.7.1) changed the Python wrapper only, and
+#186 the CI download URLs.
+
+Two build paths stamp the version into the metadata footer, from different
+sources:
+
+- `./scripts/build.sh` and the CMake POST_BUILD step take it from
+  `project(gpudb VERSION …)` in `CMakeLists.txt`, now 0.7.1. Built here, the
+  footer reads `v0.7.1` and `duckdb_extensions()` reports `v0.7.1` under the
+  stock 1.5.6 and 2.0.0 CLIs.
+- The root `Makefile` (the registry's path) does not read CMake: with
+  `EXTENSION_NAME` defined the CMake packaging step is skipped, and
+  extension-ci-tools' `configure_helper.py` writes the tag that points at the
+  checked-out commit, or its short hash when none does. The `v0.7.0` the
+  registry serves came from the tag on `b712f4b`. So the registry shows
+  `v0.7.1` only if the `v0.7.1` tag points at the exact commit in the
+  descriptor's `ref`.
+
+Neither `gpu_build_info()` nor the `[gpudb] registered …` lines printed at
+`LOAD` carry a version; `duckdb_extensions().extension_version` is where a
+client reads it.
+
+`python/tests/test_wrapper.py` pinned the loaded extension to `v0.7.0`; it now
+accepts `v0.7.0` (the binary the pip 0.7.1 wheels bundle) and `v0.7.1`.
+
+Verified on the M4 Max: `test_gpudb` 3056 / 3056; the SQL suite 229 pass, 0
+fail, 46 guardrail, 2 skip over 19 files; `gpu_functions_check.py` 73 / 73
+examples, coverage equal both ways, through pip `duckdb` 1.4.5 and the stock
+1.5.6 and 2.0.0 CLIs.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
