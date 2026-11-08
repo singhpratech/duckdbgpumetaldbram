@@ -24,16 +24,18 @@ DUCKDB="${DUCKDB:-./.tools/duckdb}"
 if [[ ! -x "$DUCKDB" ]]; then
     OS="$(uname -s)"; ARCH="$(uname -m)"
     case "$OS-$ARCH" in
-        Linux-x86_64)  asset="duckdb_cli-linux-amd64.zip" ;;
-        Linux-aarch64) asset="duckdb_cli-linux-arm64.zip" ;;
-        Darwin-arm64)  asset="duckdb_cli-osx-universal.zip" ;;
-        Darwin-x86_64) asset="duckdb_cli-osx-universal.zip" ;;
+        Linux-x86_64)  asset="duckdb-cli-linux-amd64.tar.gz" ;;
+        Linux-aarch64) asset="duckdb-cli-linux-arm64.tar.gz" ;;
+        Darwin-arm64)  asset="duckdb-cli-osx-universal.tar.gz" ;;
+        Darwin-x86_64) asset="duckdb-cli-osx-universal.tar.gz" ;;
         *) echo "unsupported platform: $OS-$ARCH"; exit 1 ;;
     esac
+    # DuckDB v2.0.0+ names the CLI duckdb-cli-<plat>.tar.gz (v1.x shipped
+    # duckdb_cli-<plat>.zip); `latest` resolves to the new name.
     echo "==> downloading DuckDB CLI ($asset)"
-    curl -fsSL -o .tools/duckdb.zip \
+    curl -fsSL -o .tools/duckdb.tar.gz \
         "https://github.com/duckdb/duckdb/releases/latest/download/$asset"
-    (cd .tools && unzip -o duckdb.zip && rm duckdb.zip)
+    (cd .tools && tar xzf duckdb.tar.gz && rm duckdb.tar.gz)
     chmod +x .tools/duckdb
 fi
 

@@ -23,6 +23,9 @@
 #   ./scripts/get_duckdb_libs.sh                    # the pinned default below
 #   DUCKDB_VERSION=v1.4.5 ./scripts/get_duckdb_libs.sh
 #   DUCKDB_VERSION=latest ./scripts/get_duckdb_libs.sh   # whatever is newest
+#     (DuckDB v2.0.0 and later publish no prebuilt libduckdb archives, so
+#     `latest` and any v2 tag find nothing; the newest line that has them
+#     is v1.5.x)
 #   FORCE=1 ./scripts/get_duckdb_libs.sh            # re-fetch over an existing tree
 
 set -euo pipefail
@@ -64,7 +67,9 @@ if [ "${FORCE:-0}" != "1" ] &&
     exit 0
 fi
 
-# `latest` keeps the old floating behaviour, on request only.
+# `latest` keeps the old floating behaviour, on request only. DuckDB v2.0.0
+# and later ship no libduckdb-<plat>.zip (only libduckdb-src.zip), so past
+# v1.5.x `latest` resolves to nothing and the download below 404s.
 if [ "$DUCKDB_VERSION" = "latest" ]; then
     url="https://github.com/duckdb/duckdb/releases/latest/download/$asset"
 else
@@ -76,7 +81,17 @@ echo "==> fetching $asset ($DUCKDB_VERSION)"
 # `curl: (35) Recv failure: Connection reset by peer`. --retry alone only retries
 # transient HTTP codes and timeouts, so --retry-all-errors is what covers a reset
 # mid-transfer (curl >= 7.71; ubuntu-24.04 ships 8.5, macOS 15 ships 8.7).
-curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$DEST/$asset" "$url"
+if ! curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o "$DEST/$asset" "$url"; then
+    rm -f "$DEST/$asset"
+    case "$DUCKDB_VERSION" in
+        latest|v2*)
+            echo "error: no $asset for DuckDB $DUCKDB_VERSION: v2.0.0 and later publish" >&2
+            echo "       no prebuilt libduckdb archives. Use a v1.5.x tag (default v1.5.5)." >&2 ;;
+        *)
+            echo "error: download failed: $url" >&2 ;;
+    esac
+    exit 1
+fi
 
 echo "==> extracting"
 (cd "$DEST" && unzip -o "$asset" && rm "$asset")

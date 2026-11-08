@@ -134,8 +134,8 @@ binary your Linux users get:
     steps:
       - name: Install DuckDB CLI
         run: |
-          curl -sL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o duckdb.zip
-          unzip duckdb.zip && sudo mv duckdb /usr/local/bin/
+          curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb-cli-linux-amd64.tar.gz -o duckdb.tar.gz
+          tar xzf duckdb.tar.gz && sudo mv duckdb /usr/local/bin/
       - name: gpudb smoke
         run: |
           duckdb -c "
@@ -168,9 +168,9 @@ FROM ubuntu:24.04
 # libgomp1 is the one runtime dependency worth naming: the extension links
 # OpenMP dynamically, and a base image this small does not carry it. Without
 # it LOAD fails with "libgomp.so.1: cannot open shared object file".
-RUN apt-get update && apt-get install -y curl unzip libgomp1 \
- && curl -sL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o /tmp/duckdb.zip \
- && unzip /tmp/duckdb.zip -d /usr/local/bin && rm /tmp/duckdb.zip
+RUN apt-get update && apt-get install -y curl libgomp1 \
+ && curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb-cli-linux-amd64.tar.gz -o /tmp/duckdb.tar.gz \
+ && tar xzf /tmp/duckdb.tar.gz -C /usr/local/bin && rm /tmp/duckdb.tar.gz
 # pre-install gpudb into the image's extension directory
 RUN duckdb -c "INSTALL gpudb FROM community;"
 ENTRYPOINT ["duckdb"]
