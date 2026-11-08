@@ -30,7 +30,7 @@ SELECT gpu_last_stats();                                      -- proof: which pr
 --   wall_ms=9.702 kernel_ms=9.533 transfer_ms=0.000
 ```
 
-Apache-2.0 · v0.7.0 · macOS 15+ on Apple silicon · x86-64 Linux, glibc 2.34+ ·
+Apache-2.0 · v0.7.1 · macOS 15+ on Apple silicon · x86-64 Linux, glibc 2.34+ ·
 DuckDB ≥ 1.5.5 from the community registry (a release binary or the pip wheel
 needs only the v1.2.0 C API)
 
@@ -85,10 +85,10 @@ gpudb> SELECT l_partkey, sum(l_quantity) FROM lineitem GROUP BY l_partkey;
 
 `pip install duckdb-gpudb` is the shortest way to plain SQL on the GPU, because
 it carries the matching binary: on Apple Silicon (macOS 15 or later) and on
-x86-64 Linux (glibc 2.34 or newer — Ubuntu 22.04 and later) the wheel bundles
-the v0.7.0 extension itself. No `INSTALL`, no build, no environment variable.
-On any other platform `pip` installs the wrapper alone and the extension comes
-from DuckDB's own install:
+x86-64 Linux (glibc 2.34 or newer — Ubuntu 22.04 and later) the pip 0.7.1
+wheel bundles the v0.7.0 extension itself. No `INSTALL`, no build, no
+environment variable. On any other platform `pip` installs the wrapper alone
+and the extension comes from DuckDB's own install:
 
 ```sql
 INSTALL gpudb FROM community;     -- in any DuckDB ≥ 1.5.5 client
@@ -319,9 +319,10 @@ end, writes and transactions.
 ### Explicit `gpu_*` functions — any DuckDB client, including the CLI
 
 **Everything you use keeps working.** v0.6.0 registered 38 `gpu_*` functions;
-v0.7 registers 65. Nothing was removed and nothing changed shape — every v0.6
-function is registered in v0.7 under the same name, with the same return type
-and the same parameter types. None of them needs the wrapper. This is
+v0.7.0 registers 65 and v0.7.1 66, the new one being `gpu_functions()`.
+Nothing was removed and nothing changed shape — every v0.6 function is
+registered in v0.7 under the same name, with the same return type and the same
+parameter types. None of them needs the wrapper. This is
 also the only route from the stock `duckdb` CLI, because DuckDB's stable C
 extension API — the one the loadable extension uses on purpose, so that one
 binary keeps working across DuckDB versions — has no hook that sees a statement
@@ -370,8 +371,9 @@ JOIN duckdb_functions() d USING (function_name, function_type, parameter_types);
 The table is kept in one file, `src/extension/gpu_functions.cpp`.
 `test/sql/gpu_functions.test` fails when it and `duckdb_functions()` disagree
 in either direction, and `scripts/gpu_functions_check.py` runs every example.
-It ships with the next extension release; the v0.7.0 build the registry
-serves does not have it yet.
+It is in the v0.7.1 extension, which `INSTALL gpudb FROM community;` serves
+(`UPDATE EXTENSIONS;` replaces an older copy). The pip 0.7.1 wheels still
+bundle the v0.7.0 binary, which does not have it.
 
 ## The two rules
 
@@ -653,9 +655,10 @@ SELECT gpu_sum(value::BIGINT) FROM range(1000000) AS t(value);
 ```
 
 Works in any DuckDB ≥ 1.5.5 client (CLI, Python, etc.), signed, no flags
-needed. The v0.7.0 build carries all 65 `gpu_*` functions — the streaming
+needed. The v0.7.1 build carries all 66 `gpu_*` functions — the streaming
 aggregates, the resident-column surface, the joins, the resident GROUP BY and
-top-k table functions and the exact family the transparent path uses. Which
+top-k table functions, the exact family the transparent path uses, and
+`gpu_functions()`, which describes the rest. Which
 backends the binary in front of you actually carries is what `SELECT
 gpu_build_info();` answers; [docs/INSTALL.md](docs/INSTALL.md#platforms-and-install)
 has that and the rest, and `UPDATE EXTENSIONS;` replaces an earlier version.
@@ -732,10 +735,10 @@ device — installs on its own:
 pip install duckdb-gpudb          # the `gpudb` command and the gpudb module
 ```
 
-On Apple Silicon (macOS 15+) and x86-64 Linux (glibc 2.34+) that wheel also
-bundles the v0.7.0 extension, so it is the whole install; everywhere else the
-extension comes from `INSTALL gpudb FROM community;` as in Option A, and a
-checkout's own build is preferred over the bundled copy when you have one.
+On Apple Silicon (macOS 15+) and x86-64 Linux (glibc 2.34+) that wheel (pip
+0.7.1) also bundles the v0.7.0 extension, so it is the whole install; everywhere
+else the extension comes from `INSTALL gpudb FROM community;` as in Option A,
+and a checkout's own build is preferred over the bundled copy when you have one.
 
 Both routes in full, the lookup order, the supported versions, troubleshooting
 and upgrading: **[docs/INSTALL.md](docs/INSTALL.md)**.
@@ -850,6 +853,13 @@ test` path.
 **Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → unit tests → smoke benchmarks → SQL suite → join parity harness). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Release history
+
+**v0.7.1** (2026-11-08) — the Python wrapper reads DuckDB 2.0's serialized
+syntax tree, so plain SQL reaches the GPU on DuckDB 2.0 too (pip 0.7.1,
+2026-10-29; `avg` over `DECIMAL` stays on DuckDB there), and the extension
+gains `gpu_functions()`, which describes every `gpu_*` function from SQL. The
+registry serves extension v0.7.1; the pip 0.7.1 wheels bundle the v0.7.0
+extension binary. In full: **[docs/RELEASE_HISTORY.md](docs/RELEASE_HISTORY.md)**.
 
 **v0.7.0** (2026-09-20) — plain DuckDB SQL on the GPU: a statement rewritten
 before DuckDB plans it, the exact operators behind it, the resident column store

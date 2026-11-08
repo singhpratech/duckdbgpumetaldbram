@@ -3251,9 +3251,10 @@ def extension_version_checks():
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'gpudb'"
         ).fetchall()
         if row and row[0][0]:
-            # the 0.7.1 client is a pip-only release: the extension stays v0.7.0
-            check(row[0][0] == "v0.7.0",
-                  f"the loaded extension stamps the v0.7.0 release this client runs on ({row[0][0]})")
+            # the tree builds extension v0.7.1; the pip 0.7.1 wheels bundle v0.7.0,
+            # and this client runs on either
+            check(row[0][0] in ("v0.7.0", "v0.7.1"),
+                  f"the loaded extension stamps a release this client runs on ({row[0][0]})")
         else:
             skip("the loaded extension's version: DuckDB reports none for it here")
     else:

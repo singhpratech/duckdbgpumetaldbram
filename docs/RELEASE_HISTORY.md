@@ -2,7 +2,45 @@
 
 What shipped in each release, newest first.
 
-### Latest — v0.7.0 (2026-09-20)
+### Latest — v0.7.1 (2026-11-08)
+
+- [x] **DuckDB 2.0 in the Python wrapper** (pip `duckdb-gpudb` 0.7.1,
+  2026-10-29) — DuckDB 2.0 changed the shape of `json_serialize_sql`, so on
+  2.0.0 every statement declined with `shape` and ran on DuckDB. The wrapper
+  now converts a 2.0 tree to the shape its readers take where the tree enters
+  it (`gpudb/_ast_compat.py`), and back where 2.0's deserializer needs it;
+  `python/tests/test_ast_compat.py` pins 115 statements as 1.5.6 fixtures and runs on
+  both engines. TPC-H on the M4 Max on DuckDB 2.0.0: 16 of 22 on the GPU at
+  SF1 and 18 of 22 at SF10, 0 rows differing; on 1.5.6, 17 and 19 (the SF10
+  figure measured before the change).
+- [x] **`avg` over `DECIMAL` stays on DuckDB 2** — 2.0's optimizer finalises
+  `avg(DECIMAL)` as `CAST(sum(x) AS DOUBLE) / count(x)` in some plans and as
+  before in others, depending on NULL statistics at plan time; the two differ
+  in the last bit on up to 53% of groups. The wrapper declines the shape on
+  DuckDB 2 (reason `shape`) rather than return a different double, which moves
+  TPC-H Q1 to DuckDB there. DuckDB 1.4 / 1.5 are unchanged.
+  [KNOWN_ISSUES.md](../KNOWN_ISSUES.md).
+- [x] **`gpu_functions()`** (issue #176) — one row per gpudb overload: the
+  real parameter names, the parameter and return types exactly as
+  `duckdb_functions()` renders them (the two join on `(function_name,
+  function_type, parameter_types)`), a description, a runnable example and
+  categories. The stable C API gives a function no description or parameter
+  names, so this is where they live. The extension now registers 66 `gpu_*`
+  names and 73 overloads. `test/sql/gpu_functions.test` and
+  `test/sqllogic/gpudb.test` compare it with `duckdb_functions()` both ways,
+  and `scripts/gpu_functions_check.py` runs every example.
+- [x] **CI follows DuckDB 2.0's renamed CLI download** — v2.0.0 publishes
+  `duckdb-cli-<plat>.tar.gz` where v1.x published `duckdb_cli-<plat>.zip`.
+  `registry-smoke.yml`, `scripts/gen_tpch.sh` and the Linux recipes in
+  `docs/CI_RECIPES.md` fetch the tarball; `duckdb-compat.yml` picks the asset
+  by tag and gains v2.0.0 legs; `scripts/get_duckdb_libs.sh` keeps its v1.5.5
+  pin and says so, exiting 1, when asked for a v2 tag.
+- [x] **Versions** — extension v0.7.1 from the community registry
+  (`INSTALL gpudb FROM community;`); the pip 0.7.1 platform wheels bundle the
+  v0.7.0 extension binary, which has everything above except
+  `gpu_functions()`. Journal: [docs/RESEARCH_NOTES.md](RESEARCH_NOTES.md).
+
+### Shipped in v0.7.0 (2026-09-20)
 
 - [x] **Plain DuckDB SQL on the GPU** — a statement is rewritten before DuckDB
   plans it, through DuckDB's own parser and the pure `gpu_rewrite_ast` scalar in

@@ -39,7 +39,7 @@ if(APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET
 endif()
 
 project(gpudb
-    VERSION 0.7.0
+    VERSION 0.7.1
     DESCRIPTION "GPU-accelerated operators for DuckDB (Metal + CUDA)"
     LANGUAGES CXX
 )

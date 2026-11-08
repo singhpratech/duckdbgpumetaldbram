@@ -268,8 +268,10 @@ client, in any language, and then call the functions by name —
 `gpu_sum_resident`, `gpu_groupby_sum_resident` (with `_having` and `_topk`
 forms that filter on the device), `gpu_topk_resident`, `gpu_inner_join` and the
 exact `gpu_groupby_exact_*` family to read it back. `gpu_last_stats()` says
-which processor ran and for how long. v0.7 registers 65 of these; v0.6.0
-registered 38, and every one of those is still there unchanged.
+which processor ran and for how long. The v0.7.1 extension the registry
+serves registers 66 of these, `gpu_functions()` among them, which describes the
+rest; the v0.7.0 binary the 0.7.1 platform wheels bundle registers 65. v0.6.0 registered 38,
+and every one of those is still there unchanged.
 
 It is full manual control, and it is the only route from the stock `duckdb`
 CLI. The repository's README documents the whole surface.
