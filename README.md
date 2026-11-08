@@ -347,6 +347,32 @@ SELECT gpu_last_stats();
 The full surface, the identity-tag rules and the one footgun are further down
 under [The resident model in 20 seconds](#the-resident-model-in-20-seconds).
 
+### What each function does, from SQL: `gpu_functions()`
+
+DuckDB's stable C API, the one the loadable extension is built on, gives a
+function a name and parameter types and nothing else. So `duckdb_functions()`
+lists every gpudb overload with parameters `col0`, `col1`, … and no
+description. `gpu_functions()` returns what it cannot: one row per overload
+with the real parameter names, the parameter and return types exactly as
+`duckdb_functions()` reports them, a one-sentence description, a runnable
+example and a category or two. Anything connected over SQL can read it,
+including an agent.
+
+```sql
+SELECT function_name, description FROM gpu_functions();
+
+-- next to DuckDB's own catalogue: the columns line up, so the two join
+SELECT f.function_name, f.parameters, d.parameters AS duckdb_parameters
+FROM gpu_functions() f
+JOIN duckdb_functions() d USING (function_name, function_type, parameter_types);
+```
+
+The table is kept in one file, `src/extension/gpu_functions.cpp`.
+`test/sql/gpu_functions.test` fails when it and `duckdb_functions()` disagree
+in either direction, and `scripts/gpu_functions_check.py` runs every example.
+It ships with the next extension release; the v0.7.0 build the registry
+serves does not have it yet.
+
 ## The two rules
 
 **Never slower than DuckDB.** Not on average — per statement, per shape, per
