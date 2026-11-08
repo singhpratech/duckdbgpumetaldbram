@@ -5860,6 +5860,82 @@ columns' NULL statistics, or from the plan itself — and the ratio it would
 then be measured at, since 2.0's own Q1 is faster than 1.5's (6.7 ms against
 12.1 ms native at SF1).
 
+## 2026-11-08 — `gpu_functions()`: the documentation the C API cannot carry
+
+Issue #176: a client that only speaks SQL, an agent above all, learns what an
+extension does from `duckdb_functions()`. For gpudb that catalogue showed 65
+names and 72 overloads (33 scalar, 24 table, 15 aggregate over 8 names), every
+one with parameters `col0`, `col1`, … and an empty description.
+
+**The constraint.** The loadable extension is built against DuckDB's stable C
+API (C_STRUCT ABI, the vendored v1.2.0 headers in `third_party/duckdb_capi/`,
+no libduckdb link), so that one binary loads across DuckDB versions. That API
+lets a function have a name, parameter types and a return type, and nothing
+else: no description, no example, no parameter name. The route the issue
+points at, `CreateScalarFunctionInfo` with a `FunctionDescription`, is DuckDB's
+C++ API, which this build does not link. DuckDB 2.0 adds a C API v2 with a
+function-docs surface (`function_docs`), but 2.0.0 marks it unstable. Using it
+would tie the binary to one DuckDB version and would mean moving every
+registration onto it, so it stays a later option, for when it is stable. At
+that point `duckdb_functions()` itself could carry the text, generated from the
+same table.
+
+**What was built.** A table function, `gpu_functions()`, with one row per
+registered overload: `function_name`, `function_type` ('scalar' | 'aggregate' |
+'table', spelled as `duckdb_functions()` spells it), `parameters` (the real
+names, from the comments and signatures in `src/extension/`), `parameter_types`
+and `return_type` (exactly as `duckdb_functions()` renders them, `'BIGINT[]'`
+for a list and NULL for a table function), `description`, `example` and
+`categories`. The names and types line up with `duckdb_functions()`, so the two
+join on `(function_name, function_type, parameter_types)`. `categories` takes
+DuckDB's own column name and type. `example` is one string, where DuckDB's
+`examples` is a list, because each entry has exactly one runnable statement
+sequence. With `gpu_functions` itself the catalogue is now 66 names and 73
+overloads. The table lives in `src/extension/gpu_functions.cpp`, registered from
+`register_gpu_sum`, so the loadable extension, the root `Makefile` build and
+`gpudb-sql` all carry it.
+
+An example is a single string DuckDB can run as given (several `;`-separated
+statements, as the CLI's `-c`, `duckdb_query` and Python's `execute` accept). A
+function that reads a resident set has to see the upload as an earlier
+statement, because a table function binds before an aggregate in the same
+statement runs, so those examples begin with their upload.
+
+**How gpudb's functions are told apart.** By the `gpu_` prefix, because
+nothing else works. DuckDB 1.5.5's `duckdb_functions()` has no column naming
+an extension, and 2.0.0's `extension_name` is NULL for every function a C-API
+extension registers (measured: all 72 gpudb overloads, beside 1709
+`core_functions` and 293 `icu`). A database without gpudb has no `gpu_`
+function on either version, and the check below asserts that every time it runs.
+
+**What keeps it true.**
+
+- `test/sql/gpu_functions.test` (SQL suite) compares `(function_name,
+  function_type, parameter_types, return_type)` against `duckdb_functions()`
+  in both directions. A function registered without an entry, or an entry for
+  a function that is not registered, fails it. It also rejects a duplicated
+  overload, a row with fewer names than types, a `col0`, an empty description,
+  or an example that does not call its own function.
+- `test/sqllogic/gpudb.test` makes the same two-way comparison on the
+  community-extensions path.
+- `scripts/gpu_functions_check.py` runs every example in a fresh in-memory
+  database after `LOAD` and fails on any error. It runs through the pip
+  `duckdb` module (CI, after the wrapper suite, at the pinned version; and
+  `local_check.sh`) or through a stock CLI with `--cli`. The SQL suite's
+  format has no dynamic SQL, so it cannot do this part.
+
+Verified here: 73 of 73 examples run, with coverage equal both ways, through pip
+`duckdb` 1.4.5 and the stock 1.5.5 and 2.0.0 CLIs. That holds on the Metal build
+and on a CPU-only build (`GPUDB_NO_METAL=1`, `runtime=cpu`, which is what CI
+has).
+
+Two things that writing the descriptions from the source made explicit:
+`gpu_inner_join` takes the **build** keys first (`join_bind` reads parameter 0
+as the build list, and `gpu_join.test` relies on it). And the streaming
+`gpu_sum` / `gpu_min` / `gpu_max` run on the CPU by design (a running
+accumulator since v0.3.0, see the header of `gpu_sum_extension.cpp`). The
+descriptions say both.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

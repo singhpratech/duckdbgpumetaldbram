@@ -112,6 +112,17 @@ jobs:
           GPUDB_EXTENSION_PATH="$PWD/build-linux/src/extension/gpudb.linux_amd64.duckdb_extension" \
               python3 python/tests/test_wrapper.py
 
+      # gpu_functions() is the extension's own documentation table: the stable
+      # C API cannot give a function a description, an example or parameter
+      # names, so duckdb_functions() cannot either. The SQL suite above checks
+      # that it lists exactly the registered gpu_ overloads
+      # (test/sql/gpu_functions.test); this runs every example it gives, each
+      # in a fresh database, which the SQL suite's format cannot express.
+      - name: gpu_functions() examples (pip duckdb at the pinned version)
+        run: |
+          GPUDB_EXTENSION_PATH="$PWD/build-linux/src/extension/gpudb.linux_amd64.duckdb_extension" \
+              python3 scripts/gpu_functions_check.py
+
   macos-cpu-metal:
     name: macos (cpu + metal scaffold build)
     runs-on: macos-15   # Apple Silicon runner; needs SDK with MTLLanguageVersion3_2

@@ -1,0 +1,38 @@
+# gpu_functions SQL test — the extension's own documentation table
+# (src/extension/gpu_functions.cpp) against what DuckDB has registered.
+#
+# DuckDB's stable C API gives a function a name and parameter types and
+# nothing else, so duckdb_functions() shows every gpudb overload with
+# parameters col0, col1, ... and no description. gpu_functions() carries the
+# names, a description and an example per overload; this file fails when the
+# two catalogues disagree, so a function cannot be registered undocumented and
+# a documented function cannot disappear.
+#
+# gpudb's functions are told apart by the gpu_ prefix: duckdb_functions() has
+# no column naming the extension of a C-API function (DuckDB 1.5 has none, and
+# 2.0's extension_name is NULL for them). scripts/gpu_functions_check.py checks
+# that a database without the extension has no gpu_ function at all, and runs
+# every example; this file cannot do either (gpudb-sql always registers the
+# extension, and the runner has no dynamic SQL).
+#
+# Run via: ./scripts/run_sql_tests.sh gpu_functions
+
+-- 1. Same overloads, both directions: (name, type, parameter types, return type)
+SELECT coalesce(string_agg(side || ' ' || function_name || ' ' || function_type || ' ' || array_to_string(parameter_types, ','), '; ' ORDER BY function_name), 'none') AS mismatches FROM (SELECT 'undocumented:' AS side, * FROM (SELECT function_name, function_type, parameter_types, return_type FROM duckdb_functions() WHERE function_name LIKE 'gpu\_%' ESCAPE '\' EXCEPT SELECT function_name, function_type, parameter_types, return_type FROM gpu_functions()) UNION ALL SELECT 'not registered:', * FROM (SELECT function_name, function_type, parameter_types, return_type FROM gpu_functions() EXCEPT SELECT function_name, function_type, parameter_types, return_type FROM duckdb_functions() WHERE function_name LIKE 'gpu\_%' ESCAPE '\'));
+-- expect: none
+
+-- 2. One row per overload: no (name, type, parameter types) listed twice, and as many rows as DuckDB has overloads
+SELECT (SELECT count(*) FROM (SELECT function_name, function_type, parameter_types FROM gpu_functions() GROUP BY ALL HAVING count(*) > 1)) AS duplicated, (SELECT count(*) FROM gpu_functions()) = (SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'gpu\_%' ESCAPE '\') AS same_count;
+-- expect: 0  true
+
+-- 3. Every row is complete: a name per parameter type, real names (not col0), a description, an example that calls the function, a category; return_type NULL exactly for table functions
+SELECT coalesce(string_agg(function_name || ' ' || array_to_string(parameter_types, ','), '; ' ORDER BY function_name), 'none') AS incomplete FROM gpu_functions() WHERE len(parameters) <> len(parameter_types) OR list_contains(parameters, 'col0') OR coalesce(description, '') = '' OR coalesce(example, '') = '' OR strpos(example, function_name || '(') = 0 OR strpos(example, chr(10)) > 0 OR len(categories) = 0 OR function_type NOT IN ('scalar', 'aggregate', 'table') OR (return_type IS NULL) <> (function_type = 'table');
+-- expect: none
+
+-- 4. The table describes itself, and joins duckdb_functions() on (name, type, parameter types)
+SELECT f.function_type, f.return_type IS NULL AS no_return, d.function_name IS NOT NULL AS joined FROM gpu_functions() f LEFT JOIN duckdb_functions() d ON d.function_name = f.function_name AND d.function_type = f.function_type AND d.parameter_types = f.parameter_types WHERE f.function_name = 'gpu_functions';
+-- expect: table  true  true
+
+-- 5. Parameter names line up with the types, overload by overload (spot check: the three gpu_upload_rows_exact forms)
+SELECT string_agg(array_to_string(parameters, ',') || ' ' || array_to_string(parameter_types, ','), ' | ' ORDER BY len(parameters), parameter_types[2] DESC) FROM gpu_functions() WHERE function_name = 'gpu_upload_rows_exact';
+-- expect: name,k,v,pi,pf VARCHAR,BIGINT,BIGINT,BIGINT[],DOUBLE[] | name,k,v,pi,pf,ps VARCHAR,VARCHAR,BIGINT,BIGINT[],DOUBLE[],VARCHAR[] | name,k,v,pi,pf,ps VARCHAR,BIGINT,BIGINT,BIGINT[],DOUBLE[],VARCHAR[]

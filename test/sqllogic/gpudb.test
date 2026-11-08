@@ -399,3 +399,24 @@ query T
 SELECT gpu_build_info() LIKE 'compiled=cpu%runtime=%';
 ----
 true
+
+# gpu_functions() (src/extension/gpu_functions.cpp) documents every registered
+# gpu_ overload and nothing else: the same (name, type, parameter types, return
+# type) rows as duckdb_functions(), in both directions, none listed twice.
+query I
+SELECT count(*) FROM (
+  (SELECT function_name, function_type, parameter_types, return_type FROM duckdb_functions()
+   WHERE function_name LIKE 'gpu\_%' ESCAPE '\'
+   EXCEPT SELECT function_name, function_type, parameter_types, return_type FROM gpu_functions())
+  UNION ALL
+  (SELECT function_name, function_type, parameter_types, return_type FROM gpu_functions()
+   EXCEPT SELECT function_name, function_type, parameter_types, return_type FROM duckdb_functions()
+   WHERE function_name LIKE 'gpu\_%' ESCAPE '\'));
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT function_name, function_type, parameter_types FROM gpu_functions()
+                      GROUP BY ALL HAVING count(*) > 1);
+----
+0

@@ -108,6 +108,18 @@ if [ "$NO_EXT" = "0" ]; then
     fi
     green "SQL test suite OK"
 
+    # gpu_functions(): every registered gpu_ function documented, every example
+    # it gives runs in a fresh database (the SQL suite cannot run dynamic SQL).
+    if python3 -c "import duckdb" 2>/dev/null; then
+        hr "gpu_functions() examples (through the Python duckdb module)"
+        ext="$(ls build-linux/src/extension/*.duckdb_extension 2>/dev/null | head -1)"
+        if ! GPUDB_EXTENSION_PATH="$ext" python3 scripts/gpu_functions_check.py; then
+            red "gpu_functions(): a function is undocumented, or an example failed"
+            exit 1
+        fi
+        green "gpu_functions() OK"
+    fi
+
     # v0.7 rule 1: every rewritten shape >= 1.0x native through the Python
     # wrapper (docs/TRANSPARENT_DESIGN.md §9.3). Runs when TPC-H SF1 and the
     # duckdb Python module are present; the SF10 run is the pre-tag gate.
