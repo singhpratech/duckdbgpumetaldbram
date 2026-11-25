@@ -21,9 +21,12 @@ Where an expression may stand:
 
 What is accepted inside an expression: column references, constants, casts,
 CASE, comparisons, AND / OR / NOT, IS NULL, BETWEEN, IN lists and every
-function DuckDB lists as a scalar function with stability CONSISTENT (random(),
-now(), nextval() ... are not; macros, subqueries, windows, lambdas, parameters
-and aggregates are not). Everything else raises Decline and runs native.
+scalar function call that binds an overload DuckDB lists as CONSISTENT
+(random(), now(), nextval() ... are not; macros, subqueries, windows, lambdas,
+parameters and aggregates are not). The name is checked here; the overload is
+judged on the bound plan when the lane is described (Connection._check_bound),
+which is also where a time-zone-aware value declines. Everything else raises
+Decline and runs native.
 """
 from __future__ import annotations
 
