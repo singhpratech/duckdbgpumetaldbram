@@ -5884,3 +5884,148 @@ proposed for it: the wrapper sees an estimate and cannot know native will skip,
 and any selectivity floor low enough to catch this would decline the 3–9% cells
 that win 2–6×. The measured rule declines it after one run. A zone-map
 equivalent on the device is what would fix it.
+
+## 2026-11-25 — pip 0.7.2 on DuckDB 2.0.1
+
+**Hardware / build:** Apple M4 Max (Metal), macOS 27.2.1, `pip install duckdb==2.0.1 duckdb-gpudb==0.7.2`
+from PyPI into a clean Python 3.13.9 environment (the platform wheel bundles the v0.7.0 extension
+binary), **default memory budget**, thresholds on, N=5, every row compared with native before any
+time was counted. `scripts/tpch_coverage.py` from `main`, run outside the checkout.
+
+This is the run the project page quotes for DuckDB 2.0.1. The SF10 `execute` table is the run the
+README row comes from; the other three were taken later the same day with desktop applications
+open on the machine, so read small differences between the tables as noise. Earlier sections stay
+as they are.
+
+| | queries on the device | rows differing | speed-up on those queries |
+|---|---:|---:|---:|
+| SF1, `--path execute` | 16 of 22 | 0 | 1.46× (Q15) – 12.36× (Q13) |
+| SF1, `--path sql` | 16 of 22 | 0 | 1.53× (Q15) – 10.58× (Q13) |
+| SF10, `--path execute` | 18 of 22 | 0 | 1.03× (Q11) – 30.39× (Q5) |
+| SF10, `--path sql` | 18 of 22 | 0 | 1.00× (Q11) – 17.76× (Q5) |
+
+On DuckDB 2 `avg` over `DECIMAL` is not rewritten, so Q1 stays on DuckDB at both scale factors.
+Q11 at SF10 sits at parity, as it does on DuckDB 1.5.
+
+**SF1, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | native (shape) | 7.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q2 | native (threshold) | 3.4 | — | — | — |  |
+| Q3 | GPU (plain) | 5.3 | 2.0 | 2.72× | True | |
+| Q4 | GPU (plain) | 4.7 | 0.9 | 5.14× | True | |
+| Q5 | GPU (plain) | 5.8 | 1.1 | 5.08× | True | |
+| Q6 | native (threshold) | 1.6 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 6.5 | 2.0 | 3.20× | True | |
+| Q8 | GPU (projected) | 5.8 | 1.7 | 3.44× | True | |
+| Q9 | GPU (plain) | 17.9 | 1.6 | 11.45× | True | |
+| Q10 | GPU (topk) | 12.1 | 2.6 | 4.67× | True | |
+| Q11 | native (threshold) | 2.9 | — | — | — |  |
+| Q12 | GPU (plain) | 4.7 | 1.8 | 2.61× | True | |
+| Q13 | GPU (nested) | 18.7 | 1.5 | 12.36× | True | |
+| Q14 | GPU (projected) | 5.4 | 1.7 | 3.27× | True | |
+| Q15 | GPU (nested) | 3.1 | 2.1 | 1.46× | True | |
+| Q16 | native (threshold) | 12.3 | — | — | — |  |
+| Q17 | GPU (projected) | 5.2 | 1.3 | 3.89× | True | |
+| Q18 | GPU (plain) | 11.4 | 1.3 | 9.01× | True | |
+| Q19 | GPU (projected) | 7.0 | 1.6 | 4.37× | True | |
+| Q20 | native (shape) | 7.0 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 10.1 | 2.4 | 4.14× | True | |
+| Q22 | GPU (plain) | 9.6 | 1.0 | 10.00× | True | |
+
+**SF1, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | native (shape) | 6.8 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q2 | native (threshold) | 3.8 | — | — | — |  |
+| Q3 | GPU (plain) | 5.6 | 3.2 | 1.76× | True | |
+| Q4 | GPU (plain) | 5.0 | 1.5 | 3.32× | True | |
+| Q5 | GPU (plain) | 6.3 | 3.0 | 2.13× | True | |
+| Q6 | native (threshold) | 2.1 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q7 | GPU (plain) | 6.5 | 3.1 | 2.12× | True | |
+| Q8 | GPU (projected) | 6.1 | 3.1 | 1.96× | True | |
+| Q9 | GPU (plain) | 18.2 | 2.6 | 7.05× | True | |
+| Q10 | GPU (topk) | 12.7 | 4.3 | 2.95× | True | |
+| Q11 | native (threshold) | 3.0 | — | — | — |  |
+| Q12 | GPU (plain) | 4.8 | 2.3 | 2.12× | True | |
+| Q13 | GPU (nested) | 18.8 | 1.8 | 10.58× | True | |
+| Q14 | GPU (projected) | 5.8 | 2.2 | 2.67× | True | |
+| Q15 | GPU (nested) | 3.1 | 2.0 | 1.53× | True | |
+| Q16 | native (threshold) | 12.6 | — | — | — |  |
+| Q17 | GPU (projected) | 5.0 | 1.8 | 2.81× | True | |
+| Q18 | GPU (plain) | 11.6 | 2.0 | 5.78× | True | |
+| Q19 | GPU (projected) | 7.4 | 2.0 | 3.66× | True | |
+| Q20 | native (shape) | 7.5 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 12.3 | 3.5 | 3.47× | True | |
+| Q22 | GPU (plain) | 10.0 | 1.5 | 6.88× | True | |
+
+**SF10, --path execute**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | native (shape) | 54.2 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q2 | native (shape) | 8.7 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 30.4 | 8.6 | 3.52× | True | |
+| Q4 | GPU (plain) | 30.8 | 2.8 | 10.98× | True | |
+| Q5 | GPU (plain) | 34.1 | 1.1 | 30.39× | True | |
+| Q6 | GPU (projected) | 11.8 | 6.1 | 1.95× | True | |
+| Q7 | GPU (plain) | 31.7 | 9.4 | 3.36× | True | |
+| Q8 | GPU (projected) | 32.5 | 8.3 | 3.94× | True | |
+| Q9 | GPU (plain) | 128.5 | 6.1 | 21.17× | True | |
+| Q10 | GPU (topk) | 61.9 | 9.4 | 6.60× | True | |
+| Q11 | GPU (nested) | 6.4 | 6.3 | 1.03× | True | |
+| Q12 | GPU (plain) | 32.6 | 10.6 | 3.07× | True | |
+| Q13 | GPU (nested) | 132.1 | 11.9 | 11.08× | True | |
+| Q14 | GPU (projected) | 28.9 | 4.7 | 6.19× | True | |
+| Q15 | GPU (nested) | 19.5 | 12.7 | 1.53× | True | |
+| Q16 | native (threshold) | 35.7 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 31.2 | 3.7 | 8.39× | True | |
+| Q18 | GPU (plain) | 99.7 | 5.4 | 18.32× | True | |
+| Q19 | GPU (projected) | 26.9 | 4.6 | 5.88× | True | |
+| Q20 | native (shape) | 32.6 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 72.1 | 20.2 | 3.57× | True | |
+| Q22 | GPU (plain) | 19.3 | 1.8 | 10.62× | True | |
+
+**SF10, --path sql**
+
+| query | path | native ms | transparent ms | ratio | identical | note |
+|---|---|---|---|---|---|---|
+| Q1 | native (shape) | 55.9 | — | — | — | split: the inner GROUP BY declined (shape) |
+| Q2 | native (shape) | 9.8 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "p_partkey" not fo |
+| Q3 | GPU (plain) | 31.6 | 9.7 | 3.27× | True | |
+| Q4 | GPU (plain) | 30.8 | 3.7 | 8.45× | True | |
+| Q5 | GPU (plain) | 35.8 | 2.0 | 17.76× | True | |
+| Q6 | GPU (projected) | 12.3 | 6.7 | 1.82× | True | |
+| Q7 | GPU (plain) | 32.3 | 12.3 | 2.62× | True | |
+| Q8 | GPU (projected) | 36.9 | 10.3 | 3.58× | True | |
+| Q9 | GPU (plain) | 138.3 | 7.9 | 17.54× | True | |
+| Q10 | GPU (topk) | 77.7 | 12.3 | 6.31× | True | |
+| Q11 | GPU (nested) | 7.4 | 7.4 | 1.00× | True | |
+| Q12 | GPU (plain) | 36.4 | 11.4 | 3.19× | True | |
+| Q13 | GPU (nested) | 144.2 | 12.4 | 11.66× | True | |
+| Q14 | GPU (projected) | 31.0 | 5.9 | 5.27× | True | |
+| Q15 | GPU (nested) | 20.5 | 13.1 | 1.57× | True | |
+| Q16 | native (threshold) | 38.8 | — | — | — | split: the inner GROUP BY declined (threshold) |
+| Q17 | GPU (projected) | 36.7 | 4.0 | 9.16× | True | |
+| Q18 | GPU (plain) | 110.3 | 6.7 | 16.56× | True | |
+| Q19 | GPU (projected) | 26.4 | 5.5 | 4.83× | True | |
+| Q20 | native (shape) | 32.6 | — | — | — | split: the statement does not bind on its own (correlated): Binder Error: Referenced column "ps_partkey" not f |
+| Q21 | GPU (plain) | 76.7 | 21.0 | 3.64× | True | |
+| Q22 | GPU (plain) | 19.0 | 1.5 | 12.35× | True | |
+
+### The shell session
+
+One `gpudb data/tpch_sf1/tpch.duckdb --readonly` session with the same package (1-minute load
+average 4.6 when it started), the statement `SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem
+GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;`:
+
+- first run: `DuckDB (not_resident: the resident set is not ready yet) · 32.5 ms`
+- ten seconds later: `GPU (topk: the resident GROUP BY) · 33.9 ms`
+- nine runs with `.gpu off`: 23.0, 23.3, 29.8, 32.4, 21.5, 27.5, 29.3, 33.9, 32.5 ms
+- nine runs with `.gpu on`: 14.9, 35.8, 19.0, 13.5, 23.5, 23.0, 20.2, 21.5, 26.3 ms
+- medians: 29.3 ms on DuckDB, 21.5 ms on the GPU, 1.36×
+
+A session taken a few minutes earlier, right after the coverage runs (load average 17), gave
+26.8 ms against 22.7 ms, 1.18×.
