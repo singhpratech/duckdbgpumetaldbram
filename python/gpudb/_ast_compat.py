@@ -30,6 +30,8 @@ and every statement of tests/test_wrapper.py:
              clauses add `repeatable` / `sample_rate`; lambdas `syntax_type`
   every node 2.0 adds `query_location_length`; table and function
              references add `qualified_name`
+  FUNCTION, WINDOW 2.0.1 adds `is_legacy_function_call` (false on every call the
+             wrapper's corpus makes; dropped when false)
 
 How 1.5 types a literal, reproduced (tests/test_ast_compat.py pins it
 against trees generated on 1.5.6):
@@ -303,6 +305,8 @@ def _norm(o: Any) -> Any:
             else:
                 node["children"] = exprs
                 del node["arguments"]
+    if cls in ("FUNCTION", "WINDOW") and node.get("is_legacy_function_call") is False:
+        del node["is_legacy_function_call"]           # 2.0.1 adds it; false is what a reader without it assumes
     if cls == "WINDOW" and isinstance(node.get("has_ignore_nulls"), bool):
         del node["has_ignore_nulls"]                  # IGNORE NULLS itself is `ignore_nulls`, on both
     if cls == "CAST" and "type_expr" in node and "cast_type" not in node:

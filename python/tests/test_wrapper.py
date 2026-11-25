@@ -2457,9 +2457,119 @@ def run():
     extension_version_checks()
     extension_age_checks()
     few_group_string_key_checks()
+    overload_checks()
     rewrite_error_checks()
     budget_checks()
     return report()
+
+
+def overload_checks():
+    """Determinism is judged per bound overload, not per function name.
+
+    DuckDB 2.0.1 lists `+` / `-` (and date_part, year, strftime ...) over
+    TIMESTAMP WITH TIME ZONE as CONSISTENT_WITHIN_QUERY beside the CONSISTENT
+    numeric / DECIMAL / DATE overloads. A per-name rule then declined every
+    statement that used `+` or `-` at all (TPC-H SF10 fell from 18 of 22 on the
+    device to 9). The overload DuckDB binds for the lane's own argument types is
+    what decides; a time-zone-aware value, and a clock function, still decline
+    on every version."""
+    print("== determinism per bound overload (`+` / `-` beside session-dependent overloads)")
+    con = fresh()
+    if not getattr(con, "_exact", False):
+        skip("determinism per bound overload — needs the exact path")
+        con.close()
+        return
+    con.execute("""CREATE TABLE tzt AS SELECT (i % 500)::INTEGER AS k, (i % 97)::BIGINT AS v,
+                          ((i % 977) / 100.0)::DECIMAL(15,2) AS d, DATE '1995-01-01' + (i % 2000)::INTEGER AS dt,
+                          TIMESTAMP '2020-01-01' + INTERVAL (i % 86400) SECOND AS ts,
+                          TIMESTAMPTZ '2020-01-01 00:00:00+00' + INTERVAL (i % 86400) SECOND AS tz
+                   FROM range(200000) r(i)""")
+    # what the catalog says on THIS DuckDB: the overloads of + / - that are not CONSISTENT
+    listed = con._raw.execute(
+        "SELECT function_name, parameter_types FROM duckdb_functions() "
+        "WHERE function_name IN ('+', '-') AND function_type = 'scalar' AND stability <> 'CONSISTENT'").fetchall()
+    check(con._function_ok("+") and con._function_ok("-"),
+          f"`+` / `-` are admitted by name ({len(listed)} non-CONSISTENT overloads listed on DuckDB {duckdb.__version__})")
+    # every non-CONSISTENT scalar overload of ANY name is known to the bound-plan check
+    every = con._raw.execute(
+        "SELECT lower(function_name), parameter_types FROM duckdb_functions() "
+        "WHERE function_type = 'scalar' AND stability <> 'CONSISTENT'").fetchall()
+    missed = [f"{f}({', '.join(map(str, p))})" for f, p in every
+              if con._mixed_overloads.get(f, {}).get(tuple(str(t).upper() for t in p)) in (None, {"CONSISTENT"})]
+    check(not missed, f"the overload catalog knows all {len(every)} non-CONSISTENT scalar overloads "
+                      f"({len(listed)} of them `+` / `-`){': missing ' + ', '.join(missed[:5]) if missed else ''}")
+    accept = {
+        "int_plus_minus":  "SELECT k, sum(v + 1) AS a, sum(v - k) AS b FROM tzt GROUP BY k ORDER BY k",
+        "decimal_arith":   "SELECT k, sum(d * (1 - d)) AS a, sum(d + 2) AS b FROM tzt GROUP BY k ORDER BY k",
+        "date_minus_iv":   "SELECT k, count(*) FROM tzt WHERE dt <= DATE '1998-12-01' - INTERVAL 90 DAY GROUP BY k ORDER BY k",
+        "date_plus_int":   "SELECT k, count(*) FROM tzt WHERE dt + 30 < DATE '1997-01-01' GROUP BY k ORDER BY k",
+        "ts_plus_iv":      "SELECT k, count(*) FROM tzt WHERE ts + INTERVAL 1 HOUR < TIMESTAMP '2020-01-01 12:00:00' GROUP BY k ORDER BY k",
+        "extract_year":    "SELECT extract(year FROM dt) AS y, sum(d * (1 - d)) FROM tzt GROUP BY y ORDER BY y",
+        # not arithmetic: 2.0.1 gave ~45 date/time names a TIMESTAMPTZ overload that is not CONSISTENT
+        "year_date":       "SELECT year(dt) AS y, count(*) FROM tzt GROUP BY year(dt) ORDER BY y",
+        "date_trunc_ts":   "SELECT date_trunc('hour', ts) AS h, count(*) FROM tzt GROUP BY date_trunc('hour', ts) ORDER BY h",
+        "date_diff_date":  "SELECT k, sum(date_diff('day', DATE '1995-01-01', dt)) FROM tzt GROUP BY k ORDER BY k",
+        "strftime_date":   "SELECT strftime(dt, '%Y-%m') AS m, count(*) FROM tzt GROUP BY strftime(dt, '%Y-%m') ORDER BY m",
+    }
+    for name, sql in accept.items():
+        want = con._raw.execute(sql).fetchall()
+        got = con.execute(sql).fetchall()
+        lr = con.last_rewrite()
+        check(lr["rewritten"] and "not a deterministic scalar function" not in str(lr["detail"]),
+              f"overload {name}: rewritten ({lr['reason']}: {str(lr['detail'])[:80]})")
+        check(got == want, f"overload {name}: rows identical to native ({len(want)} rows)")
+    decline = {
+        "tz_plus_iv":   "SELECT k, count(*) FROM tzt WHERE tz + INTERVAL 1 HOUR < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "iv_plus_tz":   "SELECT k, count(*) FROM tzt WHERE INTERVAL 1 HOUR + tz < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "tz_minus_iv":  "SELECT k, count(*) FROM tzt WHERE tz - INTERVAL 1 HOUR < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "tz_minus_tz":  "SELECT k, count(*) FROM tzt WHERE tz - TIMESTAMPTZ '2020-01-01 00:00:00+00' < INTERVAL 3 HOUR GROUP BY k ORDER BY k",
+        "year_tz":      "SELECT year(tz) AS y, count(*) FROM tzt GROUP BY year(tz) ORDER BY y",
+        "date_trunc_tz": "SELECT CAST(date_trunc('hour', tz) AS VARCHAR) AS h, count(*) FROM tzt GROUP BY date_trunc('hour', tz) ORDER BY h",
+        "strftime_tz":  "SELECT strftime(tz, '%H') AS h, count(*) FROM tzt GROUP BY strftime(tz, '%H') ORDER BY h",
+        "timezone_ts":  "SELECT k, count(*) FROM tzt WHERE timezone('UTC', ts) < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "make_tstz":    "SELECT k, count(*) FROM tzt WHERE make_timestamptz(2020, 1, 1, k % 24, 0, 0.0) < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "hour_tz":      "SELECT hour(tz) AS h, count(*) FROM tzt GROUP BY hour(tz) ORDER BY h",
+        "cast_tz":      "SELECT CAST(tz AS DATE) AS dd, count(*) FROM tzt GROUP BY CAST(tz AS DATE) ORDER BY dd",
+        "ts_to_tz":     "SELECT k, count(*) FROM tzt WHERE ts::TIMESTAMPTZ < TIMESTAMPTZ '2020-01-01 12:00:00+00' GROUP BY k ORDER BY k",
+        "cte_tz":       "WITH r AS (SELECT k AS kk, tz + INTERVAL 1 DAY AS t1 FROM tzt) SELECT kk, count(*) FROM r WHERE t1 < TIMESTAMPTZ '2020-01-02 06:00:00+00' GROUP BY kk ORDER BY kk",
+        "join_on_tz":   "SELECT a.k, count(*) FROM tzt a JOIN tu b ON a.k = b.k AND a.tz + INTERVAL 1 HOUR > TIMESTAMPTZ '2020-01-01 03:00:00+00' GROUP BY a.k ORDER BY a.k",
+    }
+    for name, sql in decline.items():
+        want = con._raw.execute(sql).fetchall()
+        got = con.execute(sql).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"], f"overload decline {name}: runs native ({lr['reason']}: {str(lr['detail'])[:80]})")
+        check(got == want, f"overload decline {name}: answer unchanged")
+    # a clock read is never a lane, whatever the catalog lists it as (1.5 / 2.0.0: CONSISTENT)
+    for fn in ("current_localtimestamp()", "pg_postmaster_start_time()", "now()"):
+        sql = f"SELECT k, count(*) FROM tzt WHERE ts < {fn} GROUP BY k"
+        con.execute(sql).fetchall()
+        lr = con.last_rewrite()
+        check(not lr["rewritten"], f"overload decline clock {fn}: runs native ({str(lr['detail'])[:80]})")
+    # the overload, not the name, decides: pretend this DuckDB listed +(BIGINT, BIGINT) as
+    # CONSISTENT_WITHIN_QUERY and the lane binding exactly it declines, while -(BIGINT, BIGINT)
+    # (same names, other overloads) is still accepted
+    saved = con._mixed_overloads
+    try:
+        fake = {n: dict(s) for n, s in saved.items()}
+        fake.setdefault("+", {})[("BIGINT", "BIGINT")] = {"CONSISTENT_WITHIN_QUERY"}
+        fake["+"].setdefault(("INTEGER", "INTEGER"), {"CONSISTENT"})
+        con._mixed_overloads = fake
+        try:
+            con._check_bound("SELECT v + v AS c FROM tzt")
+            ok = False
+        except gpudb.connection._rewrite.Decline as e:
+            ok = "not a deterministic scalar function" in e.detail
+        check(ok, "a lane binding a non-CONSISTENT overload declines (+(BIGINT, BIGINT) marked non-CONSISTENT)")
+        try:
+            con._check_bound("SELECT k + k AS c FROM tzt")
+            ok = True
+        except gpudb.connection._rewrite.Decline:
+            ok = False
+        check(ok, "the same name over another, CONSISTENT overload is accepted (+(INTEGER, INTEGER))")
+    finally:
+        con._mixed_overloads = saved
+    con.close()
 
 
 def rewrite_error_checks():
@@ -3231,7 +3341,7 @@ def extension_version_checks():
     from gpudb import connection as _conn
 
     print("== this client's version and the extension it requires")
-    check(gpudb.__version__ == "0.7.1", f"the wrapper reports its version ({gpudb.__version__})")
+    check(gpudb.__version__ == "0.7.2", f"the wrapper reports its version ({gpudb.__version__})")
 
     # Names this client calls that a v0.6.0 extension does not register: the
     # exact GROUP BY, the global masked aggregate and the materialised key join
@@ -3251,7 +3361,7 @@ def extension_version_checks():
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'gpudb'"
         ).fetchall()
         if row and row[0][0]:
-            # the tree builds extension v0.7.1; the pip 0.7.1 wheels bundle v0.7.0,
+            # the tree builds extension v0.7.1; the pip wheels bundle v0.7.0,
             # and this client runs on either
             check(row[0][0] in ("v0.7.0", "v0.7.1"),
                   f"the loaded extension stamps a release this client runs on ({row[0][0]})")

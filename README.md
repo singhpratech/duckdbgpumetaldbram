@@ -85,7 +85,7 @@ gpudb> SELECT l_partkey, sum(l_quantity) FROM lineitem GROUP BY l_partkey;
 
 `pip install duckdb-gpudb` is the shortest way to plain SQL on the GPU, because
 it carries the matching binary: on Apple Silicon (macOS 15 or later) and on
-x86-64 Linux (glibc 2.34 or newer — Ubuntu 22.04 and later) the pip 0.7.1
+x86-64 Linux (glibc 2.34 or newer — Ubuntu 22.04 and later) the pip 0.7.2
 wheel bundles the v0.7.0 extension itself. No `INSTALL`, no build, no
 environment variable. On any other platform `pip` installs the wrapper alone
 and the extension comes from DuckDB's own install:
@@ -372,7 +372,7 @@ The table is kept in one file, `src/extension/gpu_functions.cpp`.
 `test/sql/gpu_functions.test` fails when it and `duckdb_functions()` disagree
 in either direction, and `scripts/gpu_functions_check.py` runs every example.
 It is in the v0.7.1 extension, which `INSTALL gpudb FROM community;` serves
-(`UPDATE EXTENSIONS;` replaces an older copy). The pip 0.7.1 wheels still
+(`UPDATE EXTENSIONS;` replaces an older copy). The pip 0.7.2 wheels still
 bundle the v0.7.0 binary, which does not have it.
 
 ## The two rules
@@ -736,7 +736,7 @@ pip install duckdb-gpudb          # the `gpudb` command and the gpudb module
 ```
 
 On Apple Silicon (macOS 15+) and x86-64 Linux (glibc 2.34+) that wheel (pip
-0.7.1) also bundles the v0.7.0 extension, so it is the whole install; everywhere
+0.7.2) also bundles the v0.7.0 extension, so it is the whole install; everywhere
 else the extension comes from `INSTALL gpudb FROM community;` as in Option A,
 and a checkout's own build is preferred over the bundled copy when you have one.
 
@@ -853,6 +853,14 @@ test` path.
 **Reproducibility entry point:** [`scripts/local_check.sh`](scripts/local_check.sh) runs the full pipeline end-to-end (configure → build → unit tests → smoke benchmarks → SQL suite → join parity harness). The hosted CI workflow lives at [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Linux + macos-15) and runs on every push to `main`.
 
 ## Release history
+
+**pip 0.7.2** (2026-11-25) — the Python wrapper judges a function by the
+overload DuckDB binds, so plain SQL reaches the GPU on DuckDB 2.0.1 as it does
+on 2.0.0 (2.0.1 lists the time-zone overloads of `+`, `-` and the date
+functions as session-dependent, and pip 0.7.1 then kept every statement using
+those names on DuckDB). Expressions over time-zone-aware values and the
+local-clock functions now stay on DuckDB on every version. The extension is
+unchanged at v0.7.1.
 
 **v0.7.1** (2026-11-08) — the Python wrapper reads DuckDB 2.0's serialized
 syntax tree, so plain SQL reaches the GPU on DuckDB 2.0 too (pip 0.7.1,

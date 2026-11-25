@@ -6003,6 +6003,111 @@ fail, 46 guardrail, 2 skip over 19 files; `gpu_functions_check.py` 73 / 73
 examples, coverage equal both ways, through pip `duckdb` 1.4.5 and the stock
 1.5.6 and 2.0.0 CLIs.
 
+## 2026-11-25 — DuckDB 2.0.1: determinism is a property of the bound overload
+
+On DuckDB 2.0.1 plain SQL through the 0.7.1 wrapper reached the device for 9 of
+the 22 TPC-H queries at SF10, against 18 on 2.0.0. Every row stayed identical;
+the other statements declined to DuckDB with "function - is not a
+deterministic scalar function" (or `+`, or `date_part`).
+
+The cause is in `duckdb_functions()`. 2.0.1 lists the overloads that read the
+session's TimeZone / Calendar settings as `CONSISTENT_WITHIN_QUERY` where 2.0.0
+listed them `CONSISTENT`: 47 names gained one, among them `+` (INTERVAL with
+TIMESTAMP WITH TIME ZONE or TIMESTAMPTZ_NS, either order), `-`
+(TIMESTAMPTZ - INTERVAL, TIMESTAMPTZ - TIMESTAMPTZ, TIMESTAMPTZ_NS - INTERVAL),
+`date_part` (and so `extract`), `year`, `date_trunc`, `date_diff`, `strftime`,
+`age`, `make_timestamptz` and `timezone`. In 43 of the 47 every such overload
+takes a time-zone-aware parameter; `make_timestamptz(y, m, d, h, mi, s[, tz])`
+and `timezone(VARCHAR, TIMESTAMP | DATE ...)` return one, and
+`current_localtime()` / `current_localtimestamp()` take none (they read the
+clock). The wrapper judged stability per function
+NAME (`_function_ok`: every overload CONSISTENT), so a single non-CONSISTENT
+overload of `-` took every `l_extendedprice * (1 - l_discount)` off the device.
+
+The messages for Q5, Q9 and Q15 were the same cause, reported from another
+attempt. Q5 and Q9 are a cycle of six joins: the device-join form declines them
+on every version ("6 join conditions for 6 tables"), and the uploaded-join form
+— the one that answers them on 2.0.0 — declined on `-` (Q5) and `date_part`
+(Q9); `detail` shows the first decline, not the deciding one. Q15's `revenue`
+CTE is spliced in only when its body's functions pass `_function_ok`; with `-`
+refused the CTE stayed, and the nested form then failed to resolve `revenue` as
+a table ("not_found: table").
+
+The rule now (`Connection._check_bound`): a name with at least one CONSISTENT
+overload is admitted by the name check, and every lane, and every uploaded
+join's FROM and ON, is bound once with `json_serialize_plan(…, optimize :=
+false)` — the plan DuckDB itself binds, on 1.4, 1.5 and 2.0 alike. For each
+bound function whose name has any non-CONSISTENT overload, the overload DuckDB
+chose (`arguments` in the plan, matched to `parameter_types`) must be listed
+CONSISTENT, or the lane declines. Nothing is keyed on a version or on an
+operator: it is the catalog of the running DuckDB, overload by overload. Two
+guards hold where the catalog is wrong on older versions:
+
+- Any expression that produces or reads a time-zone-aware value declines (a
+  cast, a comparison and a function alike). 1.5 and 2.0.0 list
+  `year(TIMESTAMPTZ)`, `TIMESTAMPTZ + INTERVAL` ... as CONSISTENT; 2.0.1 says
+  what they are. Those lanes ran on the device on 1.5.6 / 2.0.0 with correct
+  rows — a `SET TimeZone` through the wrapper drops every resident set — and
+  now run on DuckDB there too. A cast from TIMESTAMPTZ to DATE was never in
+  any listing.
+- `current_localtime` / `current_localtimestamp` join the session functions.
+  On 1.5.6 and 2.0.0 they are listed CONSISTENT, and on main
+  `WHERE ts < current_localtimestamp()` was uploaded as a lane that froze the
+  clock: measured on 2.0.0, the rewritten statement kept returning 150 rows for
+  a group while native's count grew (200, 7800, 15400, 23000 over six seconds).
+  A built-in macro over `current_timestamp` (`pg_postmaster_start_time()`) is
+  caught by the plan: it binds `get_current_timestamp`, which returns a
+  TIMESTAMPTZ and has no CONSISTENT overload.
+
+One binder-inserted call is exempt: DuckDB 1.x binds a scalar subquery with
+`CASE WHEN count_star() > 1 THEN error('More than one row …')`, and `error` is
+listed VOLATILE because it raises. An `error(<constant>)` in the plan is that
+guard (one the statement writes is refused by name before the plan is read);
+without the exemption Q22 declined on 1.5.6.
+
+2.0.1 also adds `is_legacy_function_call` to FUNCTION and WINDOW nodes of the
+serialized tree; `_ast_compat` drops it when false (the value on every
+statement of its corpus), so the normalised tree equals the 1.5.6 fixture again.
+
+Measured on the M4 Max, SF10, `scripts/tpch_coverage.py --n 5`:
+
+| DuckDB | on the device | differing rows | native, with the reason printed |
+|---|---|---|---|
+| 2.0.1 | 18 of 22 (9 before) | 0 | Q1 (avg over DECIMAL on DuckDB 2), Q2 / Q20 (correlated), Q16 (threshold) |
+| 2.0.0 | 18 of 22 (18 before) | 0 | the same four |
+| 1.5.6 | 19 of 22 (19 before) | 0 | Q2 / Q20, Q16 |
+
+On 2.0.1 the speedups are 1.05× (Q11) to 30.4× (Q5); Q5 / Q9 / Q15 / Q3 / Q7 /
+Q8 / Q10 / Q14 / Q19 are back on the device. Q11 is a 6 ms statement that
+sits at 1.0×: one 1.5.6 run printed 0.97×, and six rounds of 20 timed runs of
+Q11 alone measured 1.02× to 1.08× with this change and 0.97× to 1.07× on main.
+
+`python/tests/test_wrapper.py` on main measured 1217 ok / 21 FAIL on 2.0.1 here
+(the Linux session counted the same 21: every one a statement with `+`, `-` or
+a date function declined with "shape"). With the change: 1298 ok / 0 FAIL / 4
+skips on 2.0.1 and on 2.0.0 (the skips are avg over DECIMAL on DuckDB 2), 1328
+ok / 0 FAIL / 0 skips on 1.5.6. The new section `overload_checks()` asserts
+that every non-CONSISTENT scalar overload the running DuckDB lists is known to
+the plan check; that `+` / `-` over INTEGER, BIGINT, DECIMAL, DATE and
+TIMESTAMP, `extract` / `year` / `date_diff` / `strftime` over DATE and
+`date_trunc` over TIMESTAMP are rewritten with native's rows; that the same
+operators and functions over a TIMESTAMPTZ, a cast to or from one,
+`timezone('UTC', ts)`, `make_timestamptz(...)`, a CTE body and a join ON
+condition with one, and the clock functions run on DuckDB; and, with the
+catalog patched to list `+(BIGINT, BIGINT)` as CONSISTENT_WITHIN_QUERY, that a
+lane binding exactly that overload declines while `+(INTEGER, INTEGER)` is
+accepted. `test_ast_compat.py` is 9 / 9 on 2.0.1, 2.0.0 and 1.5.6.
+
+## 2026-11-25 — pip 0.7.2: the wrapper release for DuckDB 2.0.1
+
+The package version moves 0.7.1 -> 0.7.2 (`python/pyproject.toml`,
+`gpudb.__version__`). It carries the overload rule of the entry above and
+nothing else. The extension is not rebuilt: the registry keeps serving v0.7.1,
+and the platform wheels bundle the same v0.7.0 binary the 0.7.1 wheels did, so
+the only difference between the two packages is the Python tree. Docs that
+name the current package version follow; statements about what was measured on
+0.7.1 are history and stay.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

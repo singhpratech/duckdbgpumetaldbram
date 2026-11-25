@@ -392,8 +392,12 @@ class Connection:
         self._last_tags: List[str] = []
         self._last_inner_note = ""        # §4.23: the inner-statement rule that admitted the last nested rewrite
         self._inner_admit = ""
-        self._function_stability: Optional[Dict[str, bool]] = None   # name -> every overload is a CONSISTENT scalar
-        self._expr_types: Dict[Tuple[str, str], str] = {}        # (table fqn, expression sql) -> DuckDB type
+        self._function_stability: Optional[Dict[str, bool]] = None   # name -> may stand in a lane (see _function_ok)
+        # name -> {parameter types: stabilities} for every scalar name with an overload
+        # that is not CONSISTENT: the bound overload decides (see _check_bound)
+        self._mixed_overloads: Dict[str, Dict[Tuple[str, ...], set]] = {}
+        # (table fqn, expression sql) -> DuckDB type, or the Decline its bound plan raised
+        self._expr_types: Dict[Tuple[str, str], object] = {}
         self._select_template: Optional[dict] = None
         self._settings: Dict[str, str] = {}
         self._settings_key = ""
@@ -2411,25 +2415,46 @@ class Connection:
 
     # ---- computed lanes (§4.10) ----
     # Listed CONSISTENT, but they read session state a resident lane must not depend on.
+    # current_localtime / current_localtimestamp read the clock: DuckDB 1.5 and 2.0.0
+    # list them CONSISTENT (2.0.1 lists them CONSISTENT_WITHIN_QUERY).
     _SESSION_FUNCTIONS = {"current_setting", "getvariable", "getenv", "version", "current_schema", "current_schemas",
                           "current_database", "current_catalog", "current_user", "user", "session_user",
-                          "current_query", "in_search_path", "current_role"}
+                          "current_query", "in_search_path", "current_role",
+                          "current_localtime", "current_localtimestamp"}
 
     def _function_ok(self, name: str) -> bool:
-        """Is `name` safe inside a computed lane? Every overload must be a
-        scalar function DuckDB lists as CONSISTENT; a built-in macro (nullif,
-        ...) is accepted when its definition names no function that is not."""
+        """May `name` stand inside a computed lane? A scalar function whose
+        every overload DuckDB lists as CONSISTENT is accepted outright. A name
+        with CONSISTENT and other overloads side by side (DuckDB 2.0.1 lists
+        `+` / `-` / date_part ... over TIMESTAMP WITH TIME ZONE as
+        CONSISTENT_WITHIN_QUERY: they read the TimeZone / Calendar settings) is
+        accepted here only provisionally: the overload DuckDB actually binds is
+        judged by _check_bound, which every lane and every uploaded join runs
+        before anything reaches the device. A name with no CONSISTENT overload
+        is refused. A built-in macro (nullif, ...) is accepted when its
+        definition names no refused function."""
         if self._function_stability is None:
             ok: Dict[str, bool] = {}
+            mixed: Dict[str, Dict[Tuple[str, ...], set]] = {}
             try:
                 rows = self._raw.execute(
-                    "SELECT lower(function_name), function_type, stability, internal, macro_definition "
-                    "FROM duckdb_functions()").fetchall()
-                bad = {r[0] for r in rows if r[1] == "scalar" and r[2] != "CONSISTENT"} | self._SESSION_FUNCTIONS
+                    "SELECT lower(function_name), function_type, stability, internal, macro_definition, "
+                    "parameter_types FROM duckdb_functions()").fetchall()
+                scalar: Dict[str, Dict[Tuple[str, ...], set]] = {}
+                for r in rows:
+                    if r[1] == "scalar":
+                        sig = tuple(str(t).upper() for t in (r[5] or []))
+                        scalar.setdefault(r[0], {}).setdefault(sig, set()).add(r[2])
+                for fname, sigs in scalar.items():
+                    stabs = set().union(*sigs.values())
+                    if stabs != {"CONSISTENT"}:
+                        mixed[fname] = sigs
+                bad = {f for f, sigs in mixed.items()
+                       if not any(s == {"CONSISTENT"} for s in sigs.values())} | self._SESSION_FUNCTIONS
                 macros: Dict[str, List[str]] = {}
-                for fname, ftype, stab, internal, mdef in rows:
+                for fname, ftype, stab, internal, mdef, _ in rows:
                     if ftype == "scalar":
-                        ok[fname] = ok.get(fname, True) and stab == "CONSISTENT" and fname not in bad
+                        ok[fname] = ok.get(fname, True) and fname not in bad
                     elif ftype == "macro" and internal:
                         macros.setdefault(fname, []).append(mdef or "")
                     else:
@@ -2443,8 +2468,95 @@ class Connection:
                     ok[fname] = ok.get(fname, True) and not (tokens & bad) and "select" not in tokens
             except Exception as e:
                 self._log(f"function catalog probe failed: {e}")
+                ok, mixed = {}, {}
+            self._mixed_overloads = mixed
             self._function_stability = ok
         return self._function_stability.get(name.lower(), False)
+
+    # A value of a time-zone-aware type is read through the session's TimeZone
+    # (and ICU Calendar) settings by every function, cast and comparison that
+    # touches it, so a lane computed from one would go stale when the setting
+    # changes. DuckDB 2.0.1 lists those overloads CONSISTENT_WITHIN_QUERY;
+    # 1.5 and 2.0.0 list several of them CONSISTENT, so the type itself is the
+    # rule, not the listing.
+    @staticmethod
+    def _zoned_type(t) -> bool:
+        if isinstance(t, dict):
+            tid = str(t.get("id") or "").upper()
+            if "TIME ZONE" in tid or tid.startswith("TIMESTAMPTZ") or tid.startswith("TIMETZ"):
+                return True
+            return any(Connection._zoned_type(v) for k, v in t.items() if k != "id")
+        if isinstance(t, list):
+            return any(Connection._zoned_type(v) for v in t)
+        return False
+
+    @staticmethod
+    def _plan_type_name(t: dict) -> str:
+        """A bound type as duckdb_functions() prints a parameter: DECIMAL
+        without its width, LIST as `<child>[]`, ARRAY as `<child>[n]`."""
+        tid = str((t or {}).get("id") or "").upper()
+        info = (t or {}).get("type_info") or {}
+        if tid == "LIST":
+            return Connection._plan_type_name(info.get("child_type") or {}) + "[]"
+        if tid == "ARRAY":
+            return Connection._plan_type_name(info.get("child_type") or {}) + f"[{info.get('size')}]"
+        return tid
+
+    def _check_bound(self, stmt: str) -> None:
+        """Bind `stmt` (the SELECT a lane or an uploaded join is computed by)
+        and judge what DuckDB bound: every function whose name has a
+        non-CONSISTENT overload must have bound a CONSISTENT one, and no
+        expression may produce or read a time-zone-aware value. Raises
+        Decline; a plan that cannot be obtained declines too."""
+        self._function_ok("")                      # loads the overload catalog
+        plan = None
+        for call in ("SELECT json_serialize_plan(?, optimize := false)", "SELECT json_serialize_plan(?)"):
+            try:
+                plan = json.loads(_one(self._raw.execute(call, [stmt]))[0])
+                break
+            except Exception as e:
+                why = str(e)[:80]
+        if plan is None:
+            raise _rewrite.Decline("shape", f"expression plan unavailable: {why}")
+        if plan.get("error"):
+            raise _rewrite.Decline("shape", f"expression plan unavailable: {str(plan.get('error_message'))[:80]}")
+
+        def walk(x) -> None:
+            if isinstance(x, list):
+                for v in x:
+                    walk(v)
+                return
+            if not isinstance(x, dict):
+                return
+            if "expression_class" in x:
+                if self._zoned_type(x.get("return_type")):
+                    raise _rewrite.Decline("shape", "time-zone-aware value inside an expression")
+                if x.get("expression_class") == "BOUND_FUNCTION":
+                    path = (x.get("qname") or {}).get("path") or [x.get("name") or ""]
+                    fname = str(path[-1]).lower()
+                    args = x.get("arguments") or []
+                    if self._zoned_type(args):
+                        raise _rewrite.Decline("shape", f"function {fname} over a time-zone-aware value")
+                    if fname == "error" and all(isinstance(ch, dict) and ch.get("expression_class") == "BOUND_CONSTANT"
+                                                for ch in x.get("children") or []):
+                        # DuckDB 1.x binds a scalar subquery with its own guard,
+                        # CASE WHEN count_star() > 1 THEN error('More than one row ...'):
+                        # it raises rather than returns a value, so it is not a value
+                        # that varies. An error() the statement writes itself never gets
+                        # here (no CONSISTENT overload: _function_ok refuses it).
+                        return
+                    if fname in self._SESSION_FUNCTIONS:
+                        raise _rewrite.Decline("shape", f"function {fname} reads session state")
+                    sigs = self._mixed_overloads.get(fname)
+                    if sigs is not None:
+                        sig = tuple(self._plan_type_name(a) for a in args)
+                        if sigs.get(sig) != {"CONSISTENT"}:
+                            raise _rewrite.Decline(
+                                "shape", f"function {fname}({', '.join(sig)}) is not a deterministic scalar function")
+            for v in x.values():
+                walk(v)
+
+        walk(plan.get("plans"))
 
     def _expr_to_sql(self, expr_json: str) -> str:
         if self._select_template is None:
@@ -2454,6 +2566,8 @@ class Connection:
         return self._deserialize(json.dumps(stmt))
 
     def _expr_type(self, fqn: str, sql: str) -> str:
+        """DuckDB's type of lane `sql` over `fqn`, once its bound plan has
+        passed _check_bound (a lane is only ever registered through here)."""
         key = (fqn, sql)
         t = self._expr_types.get(key)
         if t is None:
@@ -2461,7 +2575,13 @@ class Connection:
                 t = self._raw.execute(f"DESCRIBE SELECT {sql} AS c FROM {fqn}").fetchall()[0][1]
             except Exception as e:
                 raise _rewrite.Decline("shape", f"expression does not bind: {str(e)[:80]}")
+            try:
+                self._check_bound(f"SELECT {sql} AS c FROM {fqn}")
+            except _rewrite.Decline as d:
+                t = d
             self._expr_types[key] = t
+        if isinstance(t, _rewrite.Decline):
+            raise t
         return t
 
     def _lower_exprs(self, tree: str, low: Optional["_join.Lowered"]):
@@ -2524,12 +2644,27 @@ class Connection:
                 self._validate_join_condition(v)
 
     def _lower_join_upload(self, tree: str) -> "_join.LoweredUpload":
-        return _join.lower_upload(
+        low = _join.lower_upload(
             tree,
             lambda c, sch, t: _resolve.resolve(self._raw, c, sch, t),
             lambda ident: _one(self._raw.execute(f"SELECT count(*) FROM {ident.fqn}"))[0],
             lambda stmt: self._deserialize(stmt),
             self._validate_join_condition)
+        # the ON conditions run during the upload: judge the overloads they bind
+        # (_validate_join_condition only saw the function names)
+        src = low.from_text + (f" WHERE {low.edge_where}" if low.edge_where else "")
+        key = ("", src)
+        hit = self._expr_types.get(key)
+        if hit is None:
+            hit = "ok"
+            try:
+                self._check_bound(f"SELECT 1 FROM {src}")
+            except _rewrite.Decline as d:
+                hit = d
+            self._expr_types[key] = hit
+        if isinstance(hit, _rewrite.Decline):
+            raise hit
+        return low
 
     def _match(self, sql: str, mode: str = "device"):
         """(plan, lowered join or None, computed lanes). Raises _rewrite.Decline.

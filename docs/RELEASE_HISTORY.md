@@ -2,7 +2,29 @@
 
 What shipped in each release, newest first.
 
-### Latest — v0.7.1 (2026-11-08)
+### Latest — pip 0.7.2 (2026-11-25)
+
+- [x] **DuckDB 2.0.1 in the Python wrapper** (pip `duckdb-gpudb` 0.7.2) —
+  DuckDB 2.0.1 lists the TIMESTAMP WITH TIME ZONE overloads of `+`, `-`,
+  `date_part`, `year`, `date_trunc`, `strftime` and others (47 names) as
+  `CONSISTENT_WITHIN_QUERY`. The wrapper judged stability per function name,
+  so on 2.0.1 every statement using one of those names declined with `shape`
+  and ran on DuckDB: TPC-H at SF10 went from 18 of 22 on the GPU to 9, with
+  identical rows. The wrapper now admits a name that has a `CONSISTENT`
+  overload and judges the overload DuckDB binds, on the bound plan, for every
+  lane and every uploaded join. Measured at SF10 on Apple Silicon: 18 of 22 on
+  2.0.1 and 2.0.0, 19 of 22 on 1.5.6, no rows that differ.
+- [x] **Time-zone-aware values stay on DuckDB** — on every DuckDB version, an
+  expression that produces or reads a TIMESTAMPTZ / TIMETZ value is not
+  computed as a resident lane. `current_localtime()` and
+  `current_localtimestamp()` are treated as session functions: DuckDB 1.5 and
+  2.0.0 list them `CONSISTENT`, and a lane computed from one kept the clock
+  value of its upload, which gave rows that differed from native.
+- [x] **Versions** — wrapper only. The extension stays at v0.7.1 in the
+  community registry; the pip 0.7.2 platform wheels bundle the same v0.7.0
+  extension binary as pip 0.7.1.
+
+### v0.7.1 (2026-11-08)
 
 - [x] **DuckDB 2.0 in the Python wrapper** (pip `duckdb-gpudb` 0.7.1,
   2026-10-29) — DuckDB 2.0 changed the shape of `json_serialize_sql`, so on
