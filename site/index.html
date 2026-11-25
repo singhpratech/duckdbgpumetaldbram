@@ -20,7 +20,7 @@
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="The gpudb logo with the line: Plain DuckDB SQL on the GPU, on Apple Silicon (Metal) and NVIDIA (CUDA).">
 <meta name="twitter:card" content="summary_large_image">
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cstyle%3E.t%7Bfill:%230D0D0D%7D.f%7Bfill:%23FFF100%7D%40media%20%28prefers-color-scheme:dark%29%7B.t%7Bfill:%23FFF100%7D.f%7Bfill:%230D0D0D%7D%7D%3C/style%3E%3Crect%20class='t'%20width='24'%20height='24'%20rx='3'/%3E%3Cpath%20class='f'%20d='M11%204H18V20H6V17H15V12H11A4%204%200%200%201%2011%204Z'/%3E%3C/svg%3E">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cstyle%3E.t%7Bfill:%230D0D0D%7D.f%7Bfill:%23FF8A1F%7D%40media%20%28prefers-color-scheme:dark%29%7B.t%7Bfill:%23FF8A1F%7D.f%7Bfill:%230D0D0D%7D%7D%3C/style%3E%3Crect%20class='t'%20width='24'%20height='24'%20rx='3'/%3E%3Cpath%20class='f'%20d='M11%204H18V20H6V17H15V12H11A4%204%200%200%201%2011%204Z'/%3E%3C/svg%3E">
 <link rel="preload" href="assets/fonts/Inter-Variable.woff2" as="font" type="font/woff2" crossorigin>
 <style>
 @font-face {
@@ -50,18 +50,18 @@
   --muted: #666666;
   --rule: #E6E6E6;
   --rule-2: #CCCCCC;
-  --yellow: #FFF100;
-  --yellow-press: #CCBD00;
-  --on-yellow: #0D0D0D;
+  --accent: #FF8A1F;
+  --accent-press: #E06F00;
+  --on-accent: #0D0D0D;
   --head: #0D0D0D;
-  --link-line: #998B00;
-  --loss-text: #A84300;
+  --link-line: #B85400;
+  --loss-text: #C22F34;
   --focus: #0D0D0D;
   --tile: #0D0D0D;
-  --tile-fig: #FFF100;
-  --bar-ex: #FFF100;
-  --bar-sq: #2EAFFF;
-  --bar-loss: #FF6900;
+  --tile-fig: #FF8A1F;
+  --bar-ex: #FF8A1F;
+  --bar-sq: #7B61FF;
+  --bar-loss: #E5484D;
   --bar-line: #0D0D0D;
   --grid: #E6E6E6;
   --one: #666666;
@@ -89,11 +89,11 @@
   --muted: #A6A6A6;
   --rule: #262626;
   --rule-2: #333333;
-  --head: #FFF100;
-  --link-line: #FFF100;
-  --loss-text: #FF6900;
-  --focus: #FFF100;
-  --tile: #FFF100;
+  --head: #FF8A1F;
+  --link-line: #FF8A1F;
+  --loss-text: #E5484D;
+  --focus: #FF8A1F;
+  --tile: #FF8A1F;
   --tile-fig: #0D0D0D;
   --bar-line: transparent;
   --grid: #262626;
@@ -117,11 +117,11 @@
     --muted: #A6A6A6;
     --rule: #262626;
     --rule-2: #333333;
-    --head: #FFF100;
-    --link-line: #FFF100;
-    --loss-text: #FF6900;
-    --focus: #FFF100;
-    --tile: #FFF100;
+    --head: #FF8A1F;
+    --link-line: #FF8A1F;
+    --loss-text: #E5484D;
+    --focus: #FF8A1F;
+    --tile: #FF8A1F;
     --tile-fig: #0D0D0D;
     --bar-line: transparent;
     --grid: #262626;
@@ -146,9 +146,9 @@ body {
   font-kerning: normal;
   overflow-wrap: break-word;
 }
-::selection { background: var(--yellow); color: var(--on-yellow); }
+::selection { background: var(--accent); color: var(--on-accent); }
 a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--link-line); text-decoration-thickness: 2px; text-underline-offset: .2em; }
-a:hover { background: var(--yellow); color: var(--on-yellow); text-decoration-color: var(--on-yellow); }
+a:hover { background: var(--accent); color: var(--on-accent); text-decoration-color: var(--on-accent); }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
 code, pre, kbd { font-family: var(--mono); font-size: .875em; }
 p code, li code, td code, th code, dd code, dt code, figcaption code, h3 code, caption code, .cmd-label code {
@@ -163,7 +163,7 @@ h1, h2, h3 { margin: 0; font-weight: 700; color: var(--head); }
 h3 { color: var(--ink); }
 .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .wrap { max-width: var(--wrap); margin-inline: auto; padding-inline: var(--gutter); }
-.skip { position: absolute; left: var(--gutter); top: -4rem; background: var(--yellow); color: var(--on-yellow); padding: .5rem .9rem; border-radius: 4px; z-index: 100; }
+.skip { position: absolute; left: var(--gutter); top: -4rem; background: var(--accent); color: var(--on-accent); padding: .5rem .9rem; border-radius: 4px; z-index: 100; }
 .skip:focus { top: .5rem; }
 
 /* sticky header */
@@ -181,10 +181,10 @@ h3 { color: var(--ink); }
 .site-nav ul::-webkit-scrollbar { display: none; }
 .site-nav a { display: block; white-space: nowrap; color: var(--text-2); text-decoration: none; font-size: .925rem; font-weight: 500; padding: .35rem .6rem; border-radius: 4px; }
 .site-nav a:hover { background: var(--panel); color: var(--ink); }
-.site-nav a[aria-current] { background: var(--yellow); color: var(--on-yellow); }
+.site-nav a[aria-current] { background: var(--accent); color: var(--on-accent); }
 .site-nav .gh a { color: var(--ink); font-weight: 700; }
 .theme-btn { flex: 0 0 auto; display: inline-grid; place-items: center; width: 2.5rem; height: 2.5rem; border: 1px solid var(--rule-2); border-radius: 4px; background: var(--surface); color: var(--ink); cursor: pointer; padding: 0; }
-.theme-btn:hover { background: var(--yellow); color: var(--on-yellow); border-color: var(--on-yellow); }
+.theme-btn:hover { background: var(--accent); color: var(--on-accent); border-color: var(--on-accent); }
 .theme-btn svg { width: 1.15rem; height: 1.15rem; }
 @media (max-width: 40rem) {
   .brand .w { display: none; }
@@ -224,13 +224,13 @@ h1 {
 .copy {
   flex: 0 0 auto;
   font: inherit; font-size: .85rem; font-weight: 700;
-  color: var(--on-yellow);
-  background: var(--yellow);
+  color: var(--on-accent);
+  background: var(--accent);
   border: 0;
   padding: 0 1rem; min-width: 4.6rem; min-height: 2.75rem;
   cursor: pointer;
 }
-.copy:hover { background: var(--yellow-press); }
+.copy:hover { background: var(--accent-press); }
 .links { display: flex; flex-wrap: wrap; gap: .6rem 1.6rem; margin: 0; padding: 0; list-style: none; font-weight: 600; }
 
 /* terminal panels */
@@ -248,7 +248,7 @@ h1 {
 .term-body .stmt b { font-weight: 400; color: var(--muted); }
 .foot-duck, .foot-gpu { white-space: pre-wrap; }
 .foot-duck { color: var(--muted); }
-.hl { background: var(--yellow); color: var(--on-yellow); padding: 0 .2em; }
+.hl { background: var(--accent); color: var(--on-accent); padding: 0 .2em; }
 .term-sep { font-family: var(--sans); font-size: .85rem; color: var(--muted); margin: .9rem 0 .5rem; padding-top: .8rem; border-top: 1px dashed var(--rule-2); max-width: none; }
 .term-cap { font-size: .875rem; color: var(--muted); margin: .85rem 0 0; max-width: none; }
 
@@ -270,7 +270,7 @@ h1 {
   position: absolute; inset: 0;
   background:
     repeating-linear-gradient(to bottom, transparent 0 calc(100% / 10 - 2px), var(--lp) calc(100% / 10 - 2px) calc(100% / 10)),
-    var(--c, #FFF100);
+    var(--c, #FF8A1F);
   transform-origin: top;
   transform: scaleY(0);
   /* fill in ten segments, hold, drain in ten segments, rest; every lane keeps its own offset */
@@ -311,7 +311,7 @@ h3 { font-size: 1.2rem; line-height: 1.3; margin-bottom: .45em; letter-spacing: 
   content: counter(step);
   display: inline-grid; place-items: center;
   width: 2.25rem; height: 2.25rem; margin-bottom: 1rem;
-  background: var(--yellow); color: var(--on-yellow); border-radius: 4px;
+  background: var(--accent); color: var(--on-accent); border-radius: 4px;
   font-family: var(--mono); font-weight: 700; font-size: 1.05rem;
 }
 .steps p { color: var(--text-2); font-size: 1rem; margin: 0; }
@@ -319,7 +319,7 @@ h3 { font-size: 1.2rem; line-height: 1.3; margin-bottom: .45em; letter-spacing: 
 /* rules */
 .rules { display: grid; gap: 2.5rem 3rem; margin-top: 2.25rem; grid-template-columns: minmax(0, 1fr); }
 @media (min-width: 56rem) { .rules { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-.rule { border-left: 6px solid var(--yellow); padding-left: clamp(1rem, 2.5vw, 1.6rem); }
+.rule { border-left: 6px solid var(--accent); padding-left: clamp(1rem, 2.5vw, 1.6rem); }
 .rule h3 { font-size: clamp(1.6rem, 3vw, 2.1rem); line-height: 1.08; letter-spacing: -.03em; margin-bottom: .6em; }
 .rule p { color: var(--text-2); font-size: 1rem; }
 .rule p:last-child { margin-bottom: 0; }
@@ -356,7 +356,7 @@ td.hot { color: var(--ink); font-weight: 600; }
 .js .seg { display: inline-flex; }
 .seg button { font: inherit; font-size: .875rem; font-weight: 600; background: var(--surface); color: var(--text-2); border: 0; padding: .5rem .9rem; min-height: 2.5rem; cursor: pointer; }
 .seg button + button { border-left: 1px solid var(--rule-2); }
-.seg button[aria-pressed="true"] { background: var(--yellow); color: var(--on-yellow); }
+.seg button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); }
 .seg button:focus-visible { outline-offset: -4px; }
 .legend { display: flex; flex-wrap: wrap; gap: .4rem 1.25rem; list-style: none; margin: 0 0 1rem; padding: 0; font-size: .85rem; color: var(--text-2); }
 .legend li { display: inline-flex; align-items: center; gap: .45rem; }
@@ -482,21 +482,10 @@ details td.num { font-size: .8rem; }
 <header class="site-head" id="top">
   <div class="wrap head-in">
     <a class="brand" href="#top" aria-label="gpudb, back to the top">
-      <svg viewBox="0 -2 82 26" aria-hidden="true" focusable="false">
+      <svg viewBox="0 0 92 24" aria-hidden="true" focusable="false">
         <rect class="t" width="24" height="24" rx="3"/>
         <path class="f" d="M11 4H18V20H6V17H15V12H11A4 4 0 0 1 11 4Z"/>
-        <g class="w" stroke-width="2" transform="translate(30 -1.3333) scale(1.3333)">
-          <path d="M4 4H6V14H0V12H4Z" stroke="none"/>
-          <path d="M5 5H3a2 2 0 0 0 0 4h2" fill="none"/>
-          <rect x="8" y="4" width="2" height="10" stroke="none"/>
-          <path d="M9 5h2a2 2 0 0 1 0 4H9" fill="none"/>
-          <path d="M17 4v3a2 2 0 0 0 4 0" fill="none"/>
-          <rect x="20" y="4" width="2" height="6" stroke="none"/>
-          <path d="M29 5h-2a2 2 0 0 0 0 4h2" fill="none"/>
-          <rect x="28" y="0" width="2" height="10" stroke="none"/>
-          <rect x="32" y="0" width="2" height="10" stroke="none"/>
-          <path d="M33 5h2a2 2 0 0 1 0 4h-2" fill="none"/>
-        </g>
+        <path class="w" stroke="none" d="M36.12 21.62Q34.65 21.62 33.6 21.22Q32.55 20.81 31.94 20.12Q31.32 19.44 31.14 18.58L33.94 18.2Q34.06 18.53 34.34 18.81Q34.61 19.1 35.07 19.27Q35.53 19.44 36.19 19.44Q37.18 19.44 37.82 18.96Q38.47 18.49 38.47 17.36V15.37H38.34Q38.14 15.82 37.74 16.23Q37.34 16.63 36.72 16.89Q36.1 17.15 35.23 17.15Q34 17.15 33 16.57Q31.99 16 31.4 14.82Q30.8 13.64 30.8 11.82Q30.8 9.97 31.41 8.73Q32.01 7.49 33.02 6.87Q34.02 6.25 35.22 6.25Q36.13 6.25 36.75 6.56Q37.37 6.87 37.75 7.32Q38.13 7.78 38.34 8.23H38.45V6.39H41.45V17.41Q41.45 18.8 40.77 19.74Q40.09 20.67 38.89 21.15Q37.68 21.62 36.12 21.62ZM36.19 14.87Q36.91 14.87 37.43 14.51Q37.94 14.14 38.21 13.46Q38.48 12.77 38.48 11.81Q38.48 10.85 38.21 10.15Q37.94 9.44 37.43 9.05Q36.92 8.66 36.19 8.66Q35.44 8.66 34.93 9.06Q34.42 9.46 34.15 10.17Q33.89 10.88 33.89 11.81Q33.89 12.75 34.16 13.44Q34.42 14.13 34.93 14.5Q35.44 14.87 36.19 14.87ZM43.47 21.39V6.39H46.46V8.23H46.59Q46.79 7.78 47.17 7.32Q47.55 6.87 48.16 6.56Q48.78 6.25 49.69 6.25Q50.89 6.25 51.89 6.87Q52.9 7.49 53.51 8.74Q54.11 9.98 54.11 11.86Q54.11 13.68 53.52 14.94Q52.94 16.19 51.93 16.83Q50.93 17.48 49.68 17.48Q48.8 17.48 48.19 17.18Q47.58 16.89 47.19 16.45Q46.8 16.01 46.59 15.56H46.5V21.39ZM46.43 11.85Q46.43 12.82 46.7 13.54Q46.97 14.26 47.49 14.67Q48 15.07 48.72 15.07Q49.47 15.07 49.98 14.66Q50.49 14.25 50.75 13.52Q51.02 12.8 51.02 11.85Q51.02 10.9 50.76 10.18Q50.49 9.46 49.98 9.06Q49.47 8.66 48.72 8.66Q47.99 8.66 47.48 9.05Q46.97 9.44 46.7 10.16Q46.43 10.87 46.43 11.85ZM62.72 12.65V6.39H65.74V17.3H62.84V15.32H62.72Q62.36 16.28 61.5 16.86Q60.64 17.44 59.42 17.44Q58.32 17.44 57.49 16.95Q56.66 16.45 56.19 15.53Q55.73 14.61 55.72 13.34V6.39H58.75V12.8Q58.75 13.76 59.26 14.32Q59.78 14.89 60.64 14.89Q61.18 14.89 61.66 14.63Q62.13 14.38 62.43 13.88Q62.72 13.39 62.72 12.65ZM71.78 17.48Q70.53 17.48 69.53 16.83Q68.52 16.19 67.94 14.94Q67.35 13.68 67.35 11.86Q67.35 9.98 67.95 8.74Q68.56 7.49 69.56 6.87Q70.57 6.25 71.77 6.25Q72.68 6.25 73.3 6.56Q73.91 6.87 74.29 7.32Q74.67 7.78 74.87 8.23H74.96V2.75H77.99V17.3H75V15.56H74.87Q74.66 16.01 74.27 16.45Q73.88 16.89 73.27 17.18Q72.66 17.48 71.78 17.48ZM72.74 15.07Q73.46 15.07 73.97 14.67Q74.48 14.26 74.76 13.54Q75.03 12.82 75.03 11.85Q75.03 10.87 74.76 10.16Q74.49 9.44 73.98 9.05Q73.47 8.66 72.74 8.66Q71.99 8.66 71.48 9.06Q70.96 9.46 70.7 10.18Q70.44 10.9 70.44 11.85Q70.44 12.8 70.71 13.52Q70.97 14.25 71.48 14.66Q71.99 15.07 72.74 15.07ZM80.12 17.3V2.75H83.14V8.23H83.24Q83.44 7.78 83.82 7.32Q84.2 6.87 84.81 6.56Q85.43 6.25 86.34 6.25Q87.54 6.25 88.54 6.87Q89.55 7.49 90.15 8.74Q90.76 9.98 90.76 11.86Q90.76 13.68 90.17 14.94Q89.58 16.19 88.58 16.83Q87.58 17.48 86.33 17.48Q85.45 17.48 84.84 17.18Q84.23 16.89 83.84 16.45Q83.45 16.01 83.24 15.56H83.1V17.3ZM83.08 11.85Q83.08 12.82 83.35 13.54Q83.62 14.26 84.13 14.67Q84.64 15.07 85.37 15.07Q86.12 15.07 86.63 14.66Q87.14 14.25 87.4 13.52Q87.67 12.8 87.67 11.85Q87.67 10.9 87.41 10.18Q87.14 9.46 86.63 9.06Q86.12 8.66 85.37 8.66Q84.64 8.66 84.13 9.05Q83.62 9.44 83.35 10.16Q83.08 10.87 83.08 11.85Z"/>
       </svg>
     </a>
     <nav class="site-nav" aria-label="Sections">
@@ -974,7 +963,7 @@ SELECT gpu_last_stats();
   <div class="wrap foot-grid">
     <div>
       <svg class="foot-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="t" width="24" height="24" rx="3"/><path class="f" d="M11 4H18V20H6V17H15V12H11A4 4 0 0 1 11 4Z"/></svg>
-      <p><strong>gpudb</strong> is open source under the <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/LICENSE">Apache-2.0 licence</a>. The gpudb logo is free to use when referring to gpudb (<a href="assets/LOGO-LICENSE.md">logo licence</a>).</p>
+      <p><strong>gpudb</strong> is open source under the <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/LICENSE">Apache-2.0 licence</a>. The gpudb logo is free to use when referring to gpudb (<a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/site/assets/LOGO-LICENSE.md">logo licence</a>).</p>
       <p class="fine">gpudb is an independent community extension. It is not affiliated with or endorsed by DuckDB Labs or the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.</p>
       <p class="fine">Set in Inter and JetBrains Mono, both under the SIL Open Font License (<a href="assets/fonts/OFL-Inter.txt">Inter</a>, <a href="assets/fonts/OFL-JetBrainsMono.txt">JetBrains Mono</a>).</p>
     </div>

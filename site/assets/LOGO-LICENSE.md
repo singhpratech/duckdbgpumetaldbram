@@ -10,6 +10,6 @@ The mark is a single-storey "g" drawn from three parts of a column store: the st
 - Stem: a 3 × 16 bar (x 15–18, y 4–20).
 - Bowl: an 8-unit-tall shape, a 4-unit-radius half disc joined to a 4 × 8 rectangle that meets the stem (x 7–15, y 4–12).
 - Foot: a 9 × 3 bar along the bottom of the stem (x 6–15, y 17–20), one unit wider to the left than the bowl.
-- Colours: #0D0D0D and #FFF100. On a light background the tile is #0D0D0D with the figure in #FFF100 (`logo-mark.svg`); on a dark background the tile is #FFF100 with the figure in #0D0D0D (`logo-mark-dark.svg`).
+- Colours: #0D0D0D and #FF8A1F. On a light background the tile is #0D0D0D with the figure in #FF8A1F (`logo-mark.svg`); on a dark background the tile is #FF8A1F with the figure in #0D0D0D (`logo-mark-dark.svg`).
 
-The wordmark letters g, p, u, d and b are drawn on a 2-unit stroke: x-height 6, ascender 4, descender 4, bowls of radius 2 on the stroke centre line, letters 6 units wide with 2-unit gaps. The g keeps the mark's flat foot. In the lock-up the wordmark is scaled by 4/3 so its x-height band lines up with the mark's bowl. Every path is drawn by hand from these numbers; no font outlines or icon-set shapes are used.
+The wordmark is the word "gpudb" set in Inter Bold (SIL Open Font License 1.1, the typeface the project page uses) at 20 units with -0.02 em tracking, baseline at y 17.3, converted to outlines and placed 6 units to the right of the tile. The lock-up is 92 × 24 units. The mark is drawn by hand from the numbers above; no icon-set shapes are used.
