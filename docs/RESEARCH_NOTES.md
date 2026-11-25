@@ -6098,6 +6098,16 @@ catalog patched to list `+(BIGINT, BIGINT)` as CONSISTENT_WITHIN_QUERY, that a
 lane binding exactly that overload declines while `+(INTEGER, INTEGER)` is
 accepted. `test_ast_compat.py` is 9 / 9 on 2.0.1, 2.0.0 and 1.5.6.
 
+## 2026-11-25 — pip 0.7.2: the wrapper release for DuckDB 2.0.1
+
+The package version moves 0.7.1 -> 0.7.2 (`python/pyproject.toml`,
+`gpudb.__version__`). It carries the overload rule of the entry above and
+nothing else. The extension is not rebuilt: the registry keeps serving v0.7.1,
+and the platform wheels bundle the same v0.7.0 binary the 0.7.1 wheels did, so
+the only difference between the two packages is the Python tree. Docs that
+name the current package version follow; statements about what was measured on
+0.7.1 are history and stay.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

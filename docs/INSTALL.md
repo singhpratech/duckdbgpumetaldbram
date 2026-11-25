@@ -24,7 +24,7 @@ pip install duckdb-gpudb          # the `gpudb` command, the gpudb module, and t
 On **Apple Silicon, macOS 15 or later** and on **x86-64 Linux with glibc 2.34
 or newer** (Ubuntu 22.04 and later) `pip` installs a platform wheel that carries
 the v0.7.0 extension binary inside the package, in `gpudb/_ext/` (true of pip
-0.7.1, whose wheels predate extension v0.7.1). Nothing else
+0.7.2, whose wheels keep the v0.7.0 binary). Nothing else
 is needed: no `INSTALL`, no build, no `GPUDB_EXTENSION_PATH`. One binary, and it
 has been shown loading under both DuckDB 1.4.5 and 1.5.5 from a clean install —
 which is what building against the stable C API buys. The Linux wheel carries
@@ -218,7 +218,7 @@ you**: `compiled=` lists what it was built with and `runtime=` the backend it
 chose. For the CUDA backend take the release binary (Option B; statically
 linked CUDA runtime, needs only a driver) or build from source with `nvcc`.
 The v0.7.1 build carries all 66 `gpu_*` functions (the v0.7.0 binary the pip
-0.7.1 wheels bundle carries 65: all but `gpu_functions()`): the
+0.7.2 wheels bundle carries 65: all but `gpu_functions()`): the
 streaming aggregates, the full resident-column surface (`gpu_upload`,
 `gpu_sum_resident`, `gpu_residents`, `gpu_build_info`, …), the GPU join
 functions (`gpu_upload_pair`, `gpu_join_*_resident`, `gpu_join_rows_resident`,

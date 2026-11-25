@@ -3341,7 +3341,7 @@ def extension_version_checks():
     from gpudb import connection as _conn
 
     print("== this client's version and the extension it requires")
-    check(gpudb.__version__ == "0.7.1", f"the wrapper reports its version ({gpudb.__version__})")
+    check(gpudb.__version__ == "0.7.2", f"the wrapper reports its version ({gpudb.__version__})")
 
     # Names this client calls that a v0.6.0 extension does not register: the
     # exact GROUP BY, the global masked aggregate and the materialised key join
@@ -3361,7 +3361,7 @@ def extension_version_checks():
             "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'gpudb'"
         ).fetchall()
         if row and row[0][0]:
-            # the tree builds extension v0.7.1; the pip 0.7.1 wheels bundle v0.7.0,
+            # the tree builds extension v0.7.1; the pip wheels bundle v0.7.0,
             # and this client runs on either
             check(row[0][0] in ("v0.7.0", "v0.7.1"),
                   f"the loaded extension stamps a release this client runs on ({row[0][0]})")
