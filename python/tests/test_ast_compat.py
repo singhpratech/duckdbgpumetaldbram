@@ -182,9 +182,14 @@ def _canon(o):
       - `AS [NOT] MATERIALIZED`: 1.5 serializes every CTE as
         CTE_MATERIALIZE_DEFAULT (the wrapper reads the hint from the text), 2.0
         keeps the hint, which is kept;
-      - a JOIN's `is_implicit` (2.0 only) is kept: 2.0's renderer needs it."""
+      - a JOIN's `is_implicit` (2.0 only) is kept: 2.0's renderer needs it;
+      - `named_param_map` is a map DuckDB serializes in its hash order, which
+        differs between standard libraries (["1", "2"] on macOS, ["2", "1"] on
+        Linux for the same statement); it is compared sorted by key."""
     if isinstance(o, list):
         return [_canon(x) for x in o]
+    if isinstance(o, dict) and isinstance(o.get("named_param_map"), list):
+        o = dict(o, named_param_map=sorted(o["named_param_map"], key=lambda e: json.dumps(e, sort_keys=True)))
     if not isinstance(o, dict):
         return o
     o = {k: _canon(v) for k, v in o.items()}

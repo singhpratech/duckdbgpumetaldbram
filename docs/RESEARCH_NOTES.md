@@ -6108,6 +6108,27 @@ the only difference between the two packages is the Python tree. Docs that
 name the current package version follow; statements about what was measured on
 0.7.1 are history and stay.
 
+## 2026-11-25 — After pip 0.7.2: the DuckDB 2.0.1 rows, and a test that depended on hash order
+
+Three small things that followed the release.
+
+- **README, TPC-H coverage.** The table was measured on DuckDB 1.5. Two rows
+  for DuckDB 2.0.1 at SF10 now sit under it, taken with the released package
+  through `execute()`: M4 Max 18 of 22, 1.03× (Q11) to 30.39× (Q5); RTX 4090
+  Laptop 18 of 22, 1.59× (Q11) to 45.72× (Q9); no rows differing on either.
+  The fourth native query on DuckDB 2 is Q1 (`avg` over `DECIMAL`). The CUDA
+  box was busy during its run, and the README says so.
+- **README, the engine comparison.** The Sirius column was re-read against its
+  README and the DuckDB documentation: it installs as a core extension from
+  DuckDB 2.0.1 and runs on NVIDIA GPUs on Linux. The other columns keep their
+  2026-09-20 date.
+- **`test_ast_compat.py` on Linux.** `named_param_map` comes out of
+  `json_serialize_sql` in the order of a hash map: `["1", "2"]` with libc++,
+  `["2", "1"]` with libstdc++, for the same statement on 1.5.5, 2.0.0 and
+  2.0.1. The fixtures were recorded on macOS, so the tree comparison failed on
+  Linux for the two parameter statements while the rendered SQL was the same.
+  The comparison now sorts that list. Nothing in the wrapper reads its order.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

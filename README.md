@@ -178,7 +178,20 @@ the lazy-relation path the `gpudb` shell takes.
 | SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `execute()` | 17 of 22 | 0 | 1.21× (Q15) – 31.44× (Q9) |
 | SF1 (6M-row `lineitem`) | RTX 4090 Laptop · CUDA | `sql()` | 17 of 22 | 0 | 1.66× (Q15) – 16.27× (Q9) |
 
-**One row in that table is below 1.0×, and it is printed rather than dropped.**
+Those rows were measured on DuckDB 1.5. **On DuckDB 2.0.1** (pip 0.7.2,
+`execute()`, the same script) one more query stays on DuckDB, because `avg`
+over `DECIMAL` is not rewritten on DuckDB 2:
+
+| TPC-H | Machine | DuckDB | On the GPU | Rows differing | Speed-up on those queries |
+|---|---|---|---:|---:|---:|
+| SF10 (60M-row `lineitem`) | MacBook M4 Max · Metal | 2.0.1 | 18 of 22 | 0 | 1.03× (Q11) – 30.39× (Q5) |
+| SF10 (60M-row `lineitem`) | RTX 4090 Laptop · CUDA | 2.0.1 | 18 of 22 | 0 | 1.59× (Q11) – 45.72× (Q9) |
+
+The four that stay on DuckDB there are Q1 (`avg` over `DECIMAL`), Q2 and Q20
+(correlated) and Q16 (its threshold). The CUDA row was taken on a machine doing
+other work, so read its ratios as approximate.
+
+**One row in the first table is below 1.0×, and it is printed rather than dropped.**
 On Metal, **Q11 at SF10 straddles parity**: a 6–7 ms statement, 1.06× through
 `execute()` and 0.92× through `sql()` in the timed run, 1.06× and 0.89× in two
 immediate re-runs of the same build. It is exactly the case the per-process
@@ -890,19 +903,19 @@ instead of beside it:
 3. **A decision, not a mode.** The CPU answers where the CPU wins — low cardinality, small tables, selective filters — and the measurement that says so is published, losing rows included.
 
 Where that sits against the other GPU query engines, on axes that are checkable
-from their own documentation (checked 2026-09-20; the sources are under the
-table):
+from their own documentation (checked 2026-09-20, the Sirius column again on 2026-11-25; the sources are
+under the table):
 
 | | Sirius | cuDF / RAPIDS | HeavyDB | gpudb |
 |---|---|---|---|---|
-| Runs on an Apple Silicon GPU | no — requires an NVIDIA GPU, compute capability 7.5+ | no — requires an NVIDIA GPU, compute capability 7.0+ | no — NVIDIA GPUs; CPU-only on x86, Power and ARM | **yes — Metal** |
-| Runs as a DuckDB extension | yes — loaded into DuckDB, statements intercepted by an optimizer hook | no — a CUDA C++ and Python dataframe library | no — a standalone SQL engine | **yes — loaded into DuckDB; a client rewrites the statement before DuckDB plans it, over the stable C API** |
+| Runs on an Apple Silicon GPU | no — requires an NVIDIA GPU, compute capability 7.5+, on Linux | no — requires an NVIDIA GPU, compute capability 7.0+ | no — NVIDIA GPUs; CPU-only on x86, Power and ARM | **yes — Metal** |
+| Runs as a DuckDB extension | yes — a core extension from DuckDB 2.0.1 (`INSTALL sirius`), statements intercepted by an optimizer hook | no — a CUDA C++ and Python dataframe library | no — a standalone SQL engine | **yes — loaded into DuckDB; a client rewrites the statement before DuckDB plans it, over the stable C API** |
 | CUDA backend | yes | yes | yes | **yes — including plain SQL on the GPU, on by default** |
 | What sends work back to the CPU | operators it does not support | an operation cuDF does not implement, or one that raises | operations that cannot run on GPU, and steps needing more memory than the GPU has | **a per-statement speed measurement**, re-taken on your own machine, as well as the shapes it does not express |
 | SQL window functions on the GPU | not in its published supported-operator list | not applicable — a dataframe library; it documents a rolling-window API | supported in SQL; the documentation states they are computed in CPU mode | no — they run on DuckDB |
 | Apache-2.0 | yes | yes | yes | yes |
 
-**Sources.** Sirius: [README](https://github.com/sirius-db/sirius) (requirements, supported operators, `LOAD … sirius.duckdb_extension`, CPU fallback). cuDF / RAPIDS: [README](https://github.com/rapidsai/cudf), [system requirements](https://docs.nvidia.com/datascience/install/), [how `cudf.pandas` falls back](https://docs.nvidia.com/cudf/latest/cudf_pandas/how-it-works/), [`DataFrame.rolling`](https://docs.nvidia.com/cudf/latest/cudf/api_docs/api/cudf.DataFrame.rolling/index.html). HeavyDB: [README](https://github.com/heavyai/heavydb), [window functions](https://docs.nvidia.com/heavyai/sql/data-manipulation-dml/window-functions), [configuration parameters](https://docs.nvidia.com/heavyai/installation-and-configuration/config-parameters/configuration-parameters-for-heavydb). gpudb's own cells are the coverage table above and the code behind it.
+**Sources.** Sirius: [README](https://github.com/sirius-db/sirius) (requirements, supported operators, CPU fallback) and the [DuckDB documentation](https://duckdb.org/docs/2.0/core_extensions/sirius) (installation, platforms). cuDF / RAPIDS: [README](https://github.com/rapidsai/cudf), [system requirements](https://docs.nvidia.com/datascience/install/), [how `cudf.pandas` falls back](https://docs.nvidia.com/cudf/latest/cudf_pandas/how-it-works/), [`DataFrame.rolling`](https://docs.nvidia.com/cudf/latest/cudf/api_docs/api/cudf.DataFrame.rolling/index.html). HeavyDB: [README](https://github.com/heavyai/heavydb), [window functions](https://docs.nvidia.com/heavyai/sql/data-manipulation-dml/window-functions), [configuration parameters](https://docs.nvidia.com/heavyai/installation-and-configuration/config-parameters/configuration-parameters-for-heavydb). gpudb's own cells are the coverage table above and the code behind it.
 
 [BENCHMARK.md](BENCHMARK.md) has the reproducible numbers behind our column.
 
