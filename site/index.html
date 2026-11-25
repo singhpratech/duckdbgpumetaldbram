@@ -1,0 +1,1129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gpudb: plain DuckDB SQL on the GPU</title>
+<script>(function () { try { var t = localStorage.getItem("gpudb-theme"); if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t); } catch (e) {} })();</script>
+<meta name="description" content="gpudb runs plain DuckDB SQL on the GPU, on Apple Silicon (Metal) and NVIDIA (CUDA). Statements the GPU answers identically and measurably faster run on resident columns; everything else runs in DuckDB unchanged.">
+<meta name="author" content="Prateek Singh">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#FCFCFC" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0D0D0D" media="(prefers-color-scheme: dark)">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="gpudb">
+<meta property="og:title" content="gpudb: plain DuckDB SQL on the GPU">
+<meta property="og:description" content="A DuckDB community extension, a Python package and a shell that run plain DuckDB SQL on Apple Silicon (Metal) and NVIDIA (CUDA) GPUs, with the same rows as DuckDB.">
+<meta property="og:url" content="https://singhpratech.github.io/duckdbgpumetaldbram/">
+<meta property="og:image" content="https://singhpratech.github.io/duckdbgpumetaldbram/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The gpudb logo with the line: Plain DuckDB SQL on the GPU, on Apple Silicon (Metal) and NVIDIA (CUDA).">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cstyle%3E.t%7Bfill:%230D0D0D%7D.f%7Bfill:%23FFF100%7D%40media%20%28prefers-color-scheme:dark%29%7B.t%7Bfill:%23FFF100%7D.f%7Bfill:%230D0D0D%7D%7D%3C/style%3E%3Crect%20class='t'%20width='24'%20height='24'%20rx='3'/%3E%3Cpath%20class='f'%20d='M11%204H18V20H6V17H15V12H11A4%204%200%200%201%2011%204Z'/%3E%3C/svg%3E">
+<link rel="preload" href="assets/fonts/Inter-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+@font-face {
+  font-family: "Inter";
+  src: url("assets/fonts/Inter-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("assets/fonts/JetBrainsMono-Variable.woff2") format("woff2");
+  font-weight: 100 800;
+  font-display: swap;
+}
+
+/* light theme: the default */
+:root {
+  color-scheme: light;
+  --paper: #FCFCFC;
+  --surface: #FFFFFF;
+  --panel: #F2F2F2;
+  --term: #F7F7F7;
+  --term-bar: #EDEDED;
+  --ink: #0D0D0D;
+  --text: #1A1A1A;
+  --text-2: #333333;
+  --muted: #666666;
+  --rule: #E6E6E6;
+  --rule-2: #CCCCCC;
+  --yellow: #FFF100;
+  --yellow-press: #CCBD00;
+  --on-yellow: #0D0D0D;
+  --head: #0D0D0D;
+  --link-line: #998B00;
+  --loss-text: #A84300;
+  --focus: #0D0D0D;
+  --tile: #0D0D0D;
+  --tile-fig: #FFF100;
+  --bar-ex: #FFF100;
+  --bar-sq: #2EAFFF;
+  --bar-loss: #FF6900;
+  --bar-line: #0D0D0D;
+  --grid: #E6E6E6;
+  --one: #666666;
+  --hatch: #E6E6E6;
+  --lane-empty: #E6E6E6;
+  --lane-b: #0D0D0D;
+  --code-c: #666666;
+  --sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --wrap: 72rem;
+  --gutter: clamp(1rem, 4vw, 2.5rem);
+  --head-h: 3.5rem;
+}
+/* dark theme: chosen explicitly, or by the system when nothing was chosen */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #0D0D0D;
+  --surface: #141414;
+  --panel: #1A1A1A;
+  --term: #141414;
+  --term-bar: #1F1F1F;
+  --ink: #FCFCFC;
+  --text: #F2F2F2;
+  --text-2: #CCCCCC;
+  --muted: #A6A6A6;
+  --rule: #262626;
+  --rule-2: #333333;
+  --head: #FFF100;
+  --link-line: #FFF100;
+  --loss-text: #FF6900;
+  --focus: #FFF100;
+  --tile: #FFF100;
+  --tile-fig: #0D0D0D;
+  --bar-line: transparent;
+  --grid: #262626;
+  --one: #A6A6A6;
+  --hatch: #2B2B2B;
+  --lane-empty: #262626;
+  --lane-b: #E6E6E6;
+  --code-c: #A6A6A6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --paper: #0D0D0D;
+    --surface: #141414;
+    --panel: #1A1A1A;
+    --term: #141414;
+    --term-bar: #1F1F1F;
+    --ink: #FCFCFC;
+    --text: #F2F2F2;
+    --text-2: #CCCCCC;
+    --muted: #A6A6A6;
+    --rule: #262626;
+    --rule-2: #333333;
+    --head: #FFF100;
+    --link-line: #FFF100;
+    --loss-text: #FF6900;
+    --focus: #FFF100;
+    --tile: #FFF100;
+    --tile-fig: #0D0D0D;
+    --bar-line: transparent;
+    --grid: #262626;
+    --one: #A6A6A6;
+    --hatch: #2B2B2B;
+    --lane-empty: #262626;
+    --lane-b: #E6E6E6;
+    --code-c: #A6A6A6;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; scroll-padding-top: calc(var(--head-h) + 1rem); }
+@media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 1.0625rem;
+  line-height: 1.6;
+  font-kerning: normal;
+  overflow-wrap: break-word;
+}
+::selection { background: var(--yellow); color: var(--on-yellow); }
+a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--link-line); text-decoration-thickness: 2px; text-underline-offset: .2em; }
+a:hover { background: var(--yellow); color: var(--on-yellow); text-decoration-color: var(--on-yellow); }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
+code, pre, kbd { font-family: var(--mono); font-size: .875em; }
+p code, li code, td code, th code, dd code, dt code, figcaption code, h3 code, caption code, .cmd-label code {
+  background: var(--panel);
+  padding: .08em .32em;
+  border-radius: 3px;
+  font-size: .84em;
+  overflow-wrap: anywhere;
+}
+p { margin: 0 0 1em; max-width: 66ch; }
+h1, h2, h3 { margin: 0; font-weight: 700; color: var(--head); }
+h3 { color: var(--ink); }
+.sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.wrap { max-width: var(--wrap); margin-inline: auto; padding-inline: var(--gutter); }
+.skip { position: absolute; left: var(--gutter); top: -4rem; background: var(--yellow); color: var(--on-yellow); padding: .5rem .9rem; border-radius: 4px; z-index: 100; }
+.skip:focus { top: .5rem; }
+
+/* sticky header */
+.site-head { position: sticky; top: 0; z-index: 50; background: var(--paper); border-bottom: 1px solid transparent; }
+.site-head.scrolled { border-bottom-color: var(--rule-2); }
+.head-in { height: calc(var(--head-h) - 1px); display: flex; align-items: center; gap: 1rem; }
+.brand { flex: 0 0 auto; display: inline-flex; align-items: center; color: var(--ink); text-decoration: none; padding: .25rem 0; }
+.brand:hover { background: none; color: var(--ink); }
+.brand svg { height: 1.75rem; width: auto; display: block; }
+.brand .t { fill: var(--tile); }
+.brand .f { fill: var(--tile-fig); }
+.brand .w { fill: currentColor; stroke: currentColor; }
+.site-nav { flex: 1 1 auto; min-width: 0; display: flex; justify-content: flex-end; }
+.site-nav ul { display: flex; gap: .25rem; list-style: none; margin: 0; padding: .25rem 0; overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.site-nav ul::-webkit-scrollbar { display: none; }
+.site-nav a { display: block; white-space: nowrap; color: var(--text-2); text-decoration: none; font-size: .925rem; font-weight: 500; padding: .35rem .6rem; border-radius: 4px; }
+.site-nav a:hover { background: var(--panel); color: var(--ink); }
+.site-nav a[aria-current] { background: var(--yellow); color: var(--on-yellow); }
+.site-nav .gh a { color: var(--ink); font-weight: 700; }
+.theme-btn { flex: 0 0 auto; display: inline-grid; place-items: center; width: 2.5rem; height: 2.5rem; border: 1px solid var(--rule-2); border-radius: 4px; background: var(--surface); color: var(--ink); cursor: pointer; padding: 0; }
+.theme-btn:hover { background: var(--yellow); color: var(--on-yellow); border-color: var(--on-yellow); }
+.theme-btn svg { width: 1.15rem; height: 1.15rem; }
+@media (max-width: 40rem) {
+  .brand .w { display: none; }
+  .brand svg { height: 2rem; }
+  .head-in { gap: .5rem; }
+  .site-nav { justify-content: flex-start; }
+  .site-nav ul { -webkit-mask-image: linear-gradient(to right, #000 82%, transparent); mask-image: linear-gradient(to right, #000 82%, transparent); padding-right: 1.5rem; }
+  .site-nav a { font-size: .875rem; padding: .35rem .5rem; }
+}
+main > section { scroll-margin-top: var(--head-h); }
+
+/* hero */
+.hero { padding-top: clamp(2.25rem, 6vw, 4.5rem); padding-bottom: clamp(3.5rem, 8vw, 6rem); }
+h1 {
+  font-weight: 700;
+  font-size: clamp(3rem, 8.2vw, 6.4rem);
+  line-height: .95;
+  letter-spacing: -.045em;
+  text-wrap: balance;
+  max-width: 10.5ch;
+}
+.hero-top { display: grid; gap: 1.5rem; grid-template-columns: minmax(0, 1fr); }
+.hero-grid { display: grid; gap: clamp(2rem, 5vw, 4rem); margin-top: clamp(1.75rem, 4vw, 3rem); grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 60rem) {
+  .hero-top { grid-template-columns: auto minmax(0, 1fr); gap: clamp(2rem, 4vw, 3.5rem); align-items: stretch; }
+  .hero-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); align-items: start; }
+}
+.sub { font-size: clamp(1.15rem, 2.1vw, 1.375rem); line-height: 1.45; color: var(--text); max-width: 30em; margin-bottom: .9em; letter-spacing: -.01em; }
+.sub-2 { color: var(--text-2); max-width: 34em; }
+
+.install { margin: 1.75rem 0 1.25rem; display: grid; gap: .9rem; grid-template-columns: minmax(0, 1fr); }
+.install > div { min-width: 0; }
+.cmd-label { display: block; font-size: .875rem; color: var(--muted); margin-bottom: .3rem; }
+.cmd { display: flex; align-items: stretch; background: var(--term); border: 1px solid var(--rule-2); border-radius: 4px; min-width: 0; overflow: hidden; }
+.cmd pre { margin: 0; padding: .8rem 1rem; overflow-x: auto; flex: 1 1 auto; min-width: 0; font-size: .925rem; line-height: 1.45; color: var(--text); }
+.cmd pre .p { color: var(--muted); user-select: none; -webkit-user-select: none; }
+.copy {
+  flex: 0 0 auto;
+  font: inherit; font-size: .85rem; font-weight: 700;
+  color: var(--on-yellow);
+  background: var(--yellow);
+  border: 0;
+  padding: 0 1rem; min-width: 4.6rem; min-height: 2.75rem;
+  cursor: pointer;
+}
+.copy:hover { background: var(--yellow-press); }
+.links { display: flex; flex-wrap: wrap; gap: .6rem 1.6rem; margin: 0; padding: 0; list-style: none; font-weight: 600; }
+
+/* terminal panels */
+.term { background: var(--term); border: 1px solid var(--rule-2); border-radius: 6px; overflow: hidden; }
+.term-bar { display: flex; align-items: center; gap: .45rem; padding: .55rem .9rem; background: var(--term-bar); border-bottom: 1px solid var(--rule-2); font-size: .8rem; color: var(--muted); min-width: 0; }
+.term-bar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-left: .35rem; font-family: var(--mono); }
+.term-bar i { flex: 0 0 auto; width: .6rem; height: .6rem; border-radius: 50%; background: var(--rule-2); display: inline-block; }
+.term-body { padding: .9rem 1rem 1rem; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace; font-size: .75rem; line-height: 1.45; color: var(--text); }
+.term-body pre { margin: 0; overflow-x: auto; font-size: inherit; font-family: inherit; }
+.term-body pre.rows { line-height: 1.2; color: var(--text-2); margin-block: .35rem .6rem; }
+.term-body .stmt { white-space: pre-wrap; word-break: break-word; }
+.term-body .stmt b { font-weight: 400; color: var(--muted); }
+.foot-duck, .foot-gpu { white-space: pre-wrap; }
+.foot-duck { color: var(--muted); }
+.hl { background: var(--yellow); color: var(--on-yellow); padding: 0 .2em; }
+.term-sep { font-family: var(--sans); font-size: .85rem; color: var(--muted); margin: .9rem 0 .5rem; padding-top: .8rem; border-top: 1px dashed var(--rule-2); max-width: none; }
+.term-cap { font-size: .875rem; color: var(--muted); margin: .85rem 0 0; max-width: none; }
+
+/* lane field: a flat illustration on a near-black tile in both themes */
+.band { margin: 0; min-width: 0; display: flex; flex-direction: column; }
+.lanes { --lp: #141414; display: flex; gap: 3px; height: 76px; overflow: hidden; background: var(--lp); border-radius: 6px; padding: 10px; }
+@media (min-width: 60rem) {
+  .band { padding-top: .9rem; }
+  .lanes { height: auto; flex: 1 1 auto; min-height: 9rem; padding: 12px; }
+}
+.lane {
+  flex: 0 0 var(--w);
+  position: relative;
+  background:
+    repeating-linear-gradient(to bottom, transparent 0 calc(100% / 10 - 2px), var(--lp) calc(100% / 10 - 2px) calc(100% / 10)),
+    #2B2B2B;
+}
+.lane i {
+  position: absolute; inset: 0;
+  background:
+    repeating-linear-gradient(to bottom, transparent 0 calc(100% / 10 - 2px), var(--lp) calc(100% / 10 - 2px) calc(100% / 10)),
+    var(--c, #FFF100);
+  transform-origin: top;
+  transform: scaleY(0);
+  /* fill in ten segments, hold, drain in ten segments, rest; every lane keeps its own offset */
+  animation: lane-cycle 7s steps(10, end) var(--d) infinite;
+}
+.lane.soft i { --c: #F2F2F2; }
+@keyframes lane-cycle {
+  0% { transform: scaleY(0); }
+  22% { transform: scaleY(1); animation-timing-function: linear; }
+  70% { transform: scaleY(1); animation-timing-function: steps(10, end); }
+  90% { transform: scaleY(0); animation-timing-function: linear; }
+  100% { transform: scaleY(0); }
+}
+.lanes.paused i { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) { .lane i { animation: none; transform: none; } }
+.band figcaption { font-size: .8rem; line-height: 1.45; color: var(--muted); margin-top: .6rem; max-width: 46ch; }
+
+/* sections */
+main > section + section { border-top: 1px solid var(--rule); }
+main > section { padding-block: clamp(3.5rem, 8vw, 6rem); }
+h2 {
+  font-size: clamp(2.1rem, 4.8vw, 3.4rem);
+  line-height: 1.02;
+  letter-spacing: -.035em;
+  margin-bottom: .55em;
+  text-wrap: balance;
+  max-width: 20ch;
+}
+h3 { font-size: 1.2rem; line-height: 1.3; margin-bottom: .45em; letter-spacing: -.015em; }
+.lede { font-size: 1.15rem; color: var(--text-2); max-width: 60ch; }
+
+/* steps */
+.steps { list-style: none; margin: 2.5rem 0 0; padding: 0; display: grid; gap: 2rem 2.25rem; grid-template-columns: minmax(0, 1fr); counter-reset: step; }
+@media (min-width: 40rem) { .steps { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 64rem) { .steps { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+.steps li { counter-increment: step; border-top: 1px solid var(--rule-2); padding-top: 1.1rem; }
+.steps li::before {
+  content: counter(step);
+  display: inline-grid; place-items: center;
+  width: 2.25rem; height: 2.25rem; margin-bottom: 1rem;
+  background: var(--yellow); color: var(--on-yellow); border-radius: 4px;
+  font-family: var(--mono); font-weight: 700; font-size: 1.05rem;
+}
+.steps p { color: var(--text-2); font-size: 1rem; margin: 0; }
+
+/* rules */
+.rules { display: grid; gap: 2.5rem 3rem; margin-top: 2.25rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 56rem) { .rules { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.rule { border-left: 6px solid var(--yellow); padding-left: clamp(1rem, 2.5vw, 1.6rem); }
+.rule h3 { font-size: clamp(1.6rem, 3vw, 2.1rem); line-height: 1.08; letter-spacing: -.03em; margin-bottom: .6em; }
+.rule p { color: var(--text-2); font-size: 1rem; }
+.rule p:last-child { margin-bottom: 0; }
+
+/* tables */
+.tbl-wrap { overflow-x: auto; margin: 1.75rem 0 0; border: 1px solid var(--rule-2); border-radius: 6px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: .95rem; font-variant-numeric: tabular-nums; }
+caption { text-align: left; padding: .9rem 1rem .25rem; color: var(--muted); font-size: .875rem; caption-side: top; }
+th, td { text-align: left; padding: .62rem 1rem; border-top: 1px solid var(--rule); vertical-align: top; }
+thead th { border-top: 0; font-weight: 600; color: var(--muted); font-size: .85rem; white-space: nowrap; }
+td.num, th.num { text-align: right; white-space: nowrap; }
+td.num { font-family: var(--mono); font-size: .85rem; }
+tbody th { font-weight: 600; color: var(--ink); }
+td.hot { color: var(--ink); font-weight: 600; }
+.loss, .loss-t { color: var(--loss-text); font-weight: 700; white-space: nowrap; }
+.loss-t { font-family: var(--mono); font-size: .92em; }
+@media (max-width: 40rem) {
+  table.stack, table.stack tbody, table.stack tr, table.stack td, table.stack th { display: block; }
+  table.stack thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  table.stack tr { border-top: 1px solid var(--rule); padding: .7rem 0; }
+  table.stack tbody tr:first-child { border-top: 0; }
+  table.stack td, table.stack th { border: 0; padding: .12rem 1rem; text-align: left; white-space: normal; }
+  table.stack td::before { content: attr(data-label) ": "; color: var(--muted); font-weight: 400; font-family: var(--sans); font-size: .85rem; }
+  table.stack tbody th { padding-bottom: .25rem; }
+}
+
+/* chart */
+.results-grid { display: grid; gap: 2rem; margin-top: 2.75rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 62rem) { .results-grid { grid-template-columns: minmax(0, 1fr) 17.5rem; align-items: start; } }
+.panel { background: var(--surface); border: 1px solid var(--rule-2); border-radius: 6px; padding: clamp(1rem, 2.5vw, 1.75rem); min-width: 0; }
+.chart-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: .75rem 1.5rem; margin-bottom: 1.1rem; }
+.chart-head h3 { margin: 0; }
+.seg { display: none; border: 1px solid var(--rule-2); border-radius: 4px; overflow: hidden; }
+.js .seg { display: inline-flex; }
+.seg button { font: inherit; font-size: .875rem; font-weight: 600; background: var(--surface); color: var(--text-2); border: 0; padding: .5rem .9rem; min-height: 2.5rem; cursor: pointer; }
+.seg button + button { border-left: 1px solid var(--rule-2); }
+.seg button[aria-pressed="true"] { background: var(--yellow); color: var(--on-yellow); }
+.seg button:focus-visible { outline-offset: -4px; }
+.legend { display: flex; flex-wrap: wrap; gap: .4rem 1.25rem; list-style: none; margin: 0 0 1rem; padding: 0; font-size: .85rem; color: var(--text-2); }
+.legend li { display: inline-flex; align-items: center; gap: .45rem; }
+.sw { display: inline-block; width: 1.1rem; height: 8px; border: 1px solid var(--bar-line); }
+.sw.ex { background: var(--bar-ex); }
+.sw.sq { background: var(--bar-sq); }
+.sw.ls { background: var(--bar-loss); }
+.sw.dk { height: .8rem; background: repeating-linear-gradient(135deg, var(--hatch) 0 2px, transparent 2px 5px); border-color: var(--rule-2); }
+.chart-block + .chart-block { margin-top: 2.5rem; }
+.js .chart-block[hidden] { display: none; }
+.js .chart-block + .chart-block { margin-top: 0; }
+.chart-block h4 { font-size: 1rem; font-weight: 600; margin: 0 0 .6rem; }
+.js .chart-block h4 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.axis, .row { display: grid; grid-template-columns: 2.75rem minmax(0, 1fr) 7.6rem; column-gap: .75rem; align-items: stretch; }
+.axis { font-size: .72rem; color: var(--muted); height: 1.4rem; font-family: var(--mono); }
+.axis .scale { position: relative; }
+.axis .vh { display: flex; justify-content: flex-end; gap: .5rem; text-align: right; font-family: var(--sans); font-size: .75rem; }
+.axis .vh span { width: 3.55rem; }
+.tick { position: absolute; top: 0; left: var(--p); transform: translateX(-50%); white-space: nowrap; }
+.tick:first-child { transform: none; }
+.tick:last-child { transform: translateX(-100%); }
+.tick.one { color: var(--ink); font-weight: 700; }
+.chart { list-style: none; margin: 0; padding: 0; }
+.row { min-height: 1.9rem; }
+.q { font-weight: 600; font-size: .9rem; align-self: center; font-variant-numeric: tabular-nums; color: var(--ink); }
+.track {
+  position: relative;
+  background-image:
+    linear-gradient(to right, var(--one), var(--one)),
+    linear-gradient(to right, var(--grid) 1px, transparent 1px);
+  background-size: 1px 100%, calc(100% / 7) 100%;
+  background-position: 14.286% 0, 0 0;
+  background-repeat: no-repeat, repeat-x;
+}
+.bar { position: absolute; left: var(--a); width: max(var(--w), 3px); height: 8px; border: 1px solid var(--bar-line); }
+.bar.ex { top: calc(50% - 8px); background: var(--bar-ex); }
+.bar.sq { top: calc(50% + 1px); background: var(--bar-sq); }
+.bar.loss { background: var(--bar-loss); }
+.vals { display: flex; justify-content: flex-end; gap: .5rem; align-items: center; font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: .8rem; }
+.v { width: 3.55rem; text-align: right; color: var(--ink); }
+.v.sq { color: var(--text-2); }
+.v.loss { color: var(--loss-text); font-weight: 700; }
+.declined .track::after {
+  content: ""; position: absolute; inset: 4px 0;
+  background: repeating-linear-gradient(135deg, var(--hatch) 0 2px, transparent 2px 6px);
+}
+.decl { position: relative; z-index: 1; display: block; padding: .32rem .5rem; font-size: .8rem; line-height: 1.3; color: var(--text-2); }
+.decl span { background: var(--surface); padding: 0 .3rem; box-decoration-break: clone; -webkit-box-decoration-break: clone; }
+.declined .v { color: var(--muted); }
+@media (max-width: 34rem) {
+  .axis, .row { grid-template-columns: 2.1rem minmax(0, 1fr) 5.9rem; column-gap: .45rem; }
+  .v, .axis .vh span { width: 2.8rem; }
+  .vals { font-size: .72rem; gap: .3rem; }
+  .axis .vh { gap: .3rem; font-size: .62rem; }
+  .tick:first-child, .tick:not(.one):not(:last-child):nth-child(odd) { display: none; }
+}
+.cond { font-size: .9rem; background: var(--panel); border-color: var(--panel); }
+.cond h3 { font-size: 1rem; margin-bottom: .75rem; }
+.cond dl { margin: 0; display: grid; gap: .7rem; }
+.cond dt { color: var(--muted); font-size: .8rem; }
+.cond dd { margin: 0; color: var(--text); }
+.cond code { background: var(--surface); }
+details { margin-top: 1.5rem; }
+summary { cursor: pointer; font-weight: 600; min-height: 2.25rem; display: list-item; color: var(--ink); }
+details .tbl-wrap { margin-top: .75rem; }
+details table { font-size: .85rem; min-width: 40rem; }
+details th, details td { padding: .45rem .7rem; }
+details td.num { font-size: .8rem; }
+
+.losses { margin-top: 3.5rem; display: grid; gap: 2rem 3rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 56rem) { .losses { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } }
+.plain-list { margin: 0; padding: 0; list-style: none; }
+.plain-list li { padding: .7rem 0; border-top: 1px solid var(--rule); color: var(--text-2); font-size: 1rem; }
+.plain-list li:first-child { border-top: 0; padding-top: 0; }
+.plain-list strong { color: var(--ink); font-weight: 600; }
+.note { font-size: .925rem; color: var(--muted); margin-top: 1rem; max-width: 72ch; }
+
+/* ways */
+.ways { display: grid; gap: 3rem; margin-top: 2.5rem; }
+.way { display: grid; gap: 1rem 3rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 60rem) { .way { grid-template-columns: minmax(0, .8fr) minmax(0, 1.2fr); align-items: start; } }
+.way p { color: var(--text-2); font-size: 1rem; }
+.code { position: relative; background: var(--term); border: 1px solid var(--rule-2); border-radius: 6px; min-width: 0; overflow: hidden; }
+.code .term-bar { padding-right: 5.5rem; }
+.code pre { margin: 0; padding: 1rem 1.1rem; overflow-x: auto; font-size: .825rem; line-height: 1.6; color: var(--text); }
+.code .c { color: var(--code-c); }
+.code .copy { position: absolute; top: .3rem; right: .35rem; border-radius: 4px; min-height: 2rem; min-width: 4rem; padding: 0 .7rem; }
+.code-cap { font-size: .85rem; color: var(--muted); margin: .6rem 0 0; }
+
+/* what runs where */
+.where { margin: 1.5rem 0 0; display: grid; gap: 0 3rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 56rem) { .where { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.where div { padding: 1rem 0; border-top: 1px solid var(--rule-2); }
+.where dt { font-weight: 700; color: var(--ink); margin-bottom: .3rem; }
+.where dd { margin: 0; color: var(--text-2); font-size: 1rem; }
+.where-note { margin-top: 1rem; color: var(--text-2); font-size: 1rem; }
+
+/* platforms */
+.req { display: grid; gap: 0 3rem; margin-top: 2.5rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 56rem) { .req { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.req dl { margin: 0; }
+.req div { padding: .9rem 0; border-top: 1px solid var(--rule); }
+.req dt { font-weight: 600; margin-bottom: .2rem; color: var(--ink); }
+.req dd { margin: 0; color: var(--text-2); font-size: 1rem; }
+
+/* footer */
+.site-foot { border-top: 1px solid var(--rule-2); padding-block: 2.75rem 3.5rem; font-size: .925rem; color: var(--text-2); background: var(--panel); }
+.foot-grid { display: grid; gap: 1.75rem 3rem; grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 52rem) { .foot-grid { grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); } }
+.foot-links { display: flex; flex-wrap: wrap; gap: .5rem 1.4rem; list-style: none; margin: 0; padding: 0; }
+.site-foot p { max-width: 60ch; }
+.fine { color: var(--muted); font-size: .85rem; }
+.foot-mark { display: block; width: 2.25rem; height: 2.25rem; margin-bottom: 1rem; }
+.foot-mark .t { fill: var(--tile); }
+.foot-mark .f { fill: var(--tile-fig); }
+.credit { margin-top: 1.5rem; padding-top: 1.1rem; border-top: 1px solid var(--rule-2); }
+.credit span { display: block; font-size: .8rem; color: var(--muted); }
+.credit a { font-weight: 700; font-size: 1rem; }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="site-head" id="top">
+  <div class="wrap head-in">
+    <a class="brand" href="#top" aria-label="gpudb, back to the top">
+      <svg viewBox="0 -2 82 26" aria-hidden="true" focusable="false">
+        <rect class="t" width="24" height="24" rx="3"/>
+        <path class="f" d="M11 4H18V20H6V17H15V12H11A4 4 0 0 1 11 4Z"/>
+        <g class="w" stroke-width="2" transform="translate(30 -1.3333) scale(1.3333)">
+          <path d="M4 4H6V14H0V12H4Z" stroke="none"/>
+          <path d="M5 5H3a2 2 0 0 0 0 4h2" fill="none"/>
+          <rect x="8" y="4" width="2" height="10" stroke="none"/>
+          <path d="M9 5h2a2 2 0 0 1 0 4H9" fill="none"/>
+          <path d="M17 4v3a2 2 0 0 0 4 0" fill="none"/>
+          <rect x="20" y="4" width="2" height="6" stroke="none"/>
+          <path d="M29 5h-2a2 2 0 0 0 0 4h2" fill="none"/>
+          <rect x="28" y="0" width="2" height="10" stroke="none"/>
+          <rect x="32" y="0" width="2" height="10" stroke="none"/>
+          <path d="M33 5h2a2 2 0 0 1 0 4h-2" fill="none"/>
+        </g>
+      </svg>
+    </a>
+    <nav class="site-nav" aria-label="Sections">
+      <ul>
+        <li><a href="#how">How it works</a></li>
+        <li><a href="#rules">Rules</a></li>
+        <li><a href="#results">Results</a></li>
+        <li><a href="#use">Use it</a></li>
+        <li><a href="#platforms">Platforms</a></li>
+        <li class="gh"><a href="https://github.com/singhpratech/duckdbgpumetaldbram">GitHub</a></li>
+      </ul>
+    </nav>
+    <button class="theme-btn" type="button" id="theme-btn" aria-label="Switch to dark theme" title="Switch theme" hidden>
+      <svg viewBox="0 0 20 20" aria-hidden="true" focusable="false"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.75a7.25 7.25 0 0 1 0 14.5z" fill="currentColor"/></svg>
+    </button>
+  </div>
+</header>
+
+<main id="main">
+<section class="hero" aria-labelledby="title">
+  <div class="wrap">
+    <div class="hero-top">
+      <h1 id="title">Plain DuckDB SQL on the GPU</h1>
+      <figure class="band">
+        <div class="lanes" aria-hidden="true"><span class="lane" style="--w:5px"></span><span class="lane" style="--w:9px"><i style="--d:1.68s"></i></span><span class="lane" style="--w:9px"></span><span class="lane soft" style="--w:15px"><i style="--d:1.46s"></i></span><span class="lane" style="--w:9px"></span><span class="lane soft" style="--w:9px"><i style="--d:0.76s"></i></span><span class="lane" style="--w:15px"><i style="--d:0.50s"></i></span><span class="lane" style="--w:15px"><i style="--d:0.52s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.20s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.23s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.58s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.45s"></i></span><span class="lane" style="--w:5px"></span><span class="lane" style="--w:5px"></span><span class="lane" style="--w:3px"><i style="--d:0.92s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.29s"></i></span><span class="lane" style="--w:15px"><i style="--d:0.62s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.45s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.19s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.95s"></i></span><span class="lane" style="--w:15px"></span><span class="lane soft" style="--w:3px"><i style="--d:1.50s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.63s"></i></span><span class="lane" style="--w:3px"></span><span class="lane soft" style="--w:9px"><i style="--d:0.98s"></i></span><span class="lane soft" style="--w:3px"><i style="--d:1.70s"></i></span><span class="lane" style="--w:5px"></span><span class="lane soft" style="--w:9px"><i style="--d:0.44s"></i></span><span class="lane soft" style="--w:3px"><i style="--d:1.50s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.25s"></i></span><span class="lane" style="--w:5px"></span><span class="lane soft" style="--w:9px"><i style="--d:1.22s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.28s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.51s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:0.28s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.13s"></i></span><span class="lane soft" style="--w:15px"><i style="--d:1.11s"></i></span><span class="lane" style="--w:3px"></span><span class="lane" style="--w:3px"><i style="--d:0.62s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:1.29s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.94s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.53s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.55s"></i></span><span class="lane soft" style="--w:3px"><i style="--d:0.48s"></i></span><span class="lane soft" style="--w:3px"><i style="--d:1.20s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.54s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.48s"></i></span><span class="lane" style="--w:3px"><i style="--d:1.12s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:0.43s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.73s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:1.62s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.68s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.28s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.03s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.03s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.23s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.70s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:1.68s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:0.38s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.39s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.11s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.34s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:1.36s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.40s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.22s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.92s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.26s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.35s"></i></span><span class="lane" style="--w:15px"></span><span class="lane" style="--w:3px"></span><span class="lane" style="--w:3px"><i style="--d:1.40s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.43s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.37s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.33s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.26s"></i></span><span class="lane" style="--w:15px"></span><span class="lane soft" style="--w:15px"><i style="--d:1.52s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.33s"></i></span><span class="lane" style="--w:5px"></span><span class="lane soft" style="--w:5px"><i style="--d:0.21s"></i></span><span class="lane soft" style="--w:15px"><i style="--d:0.43s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.96s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.72s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.59s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:1.56s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:0.81s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.35s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.44s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:1.55s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:1.31s"></i></span><span class="lane soft" style="--w:3px"><i style="--d:0.30s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.88s"></i></span><span class="lane" style="--w:9px"><i style="--d:0.58s"></i></span><span class="lane soft" style="--w:15px"><i style="--d:1.43s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.60s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.15s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:0.35s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.33s"></i></span><span class="lane soft" style="--w:9px"><i style="--d:0.22s"></i></span><span class="lane" style="--w:9px"><i style="--d:1.65s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.62s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.68s"></i></span><span class="lane" style="--w:3px"><i style="--d:0.95s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.18s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.87s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.47s"></i></span><span class="lane soft" style="--w:5px"><i style="--d:1.38s"></i></span><span class="lane" style="--w:3px"><i style="--d:1.17s"></i></span><span class="lane" style="--w:5px"><i style="--d:0.31s"></i></span><span class="lane" style="--w:5px"><i style="--d:1.42s"></i></span></div>
+        <figcaption>Illustration: columns become resident in short row-id segments while your connection is idle, each lane at the narrowest width its values fit.</figcaption>
+      </figure>
+    </div>
+    <div class="hero-grid">
+      <div>
+        <p class="sub">On Apple Silicon (Metal) and NVIDIA (CUDA). Write the SQL you already write: the GPU answers a statement when that is measured faster, and DuckDB answers everything else, with the same rows either way.</p>
+        <p class="sub-2">gpudb is a DuckDB community extension, a Python package and a <code>gpudb</code> shell. No hints, no schema changes, no query changes.</p>
+        <div class="install">
+          <div>
+            <span class="cmd-label" id="lbl-pip">Python and the <code>gpudb</code> shell</span>
+            <div class="cmd">
+              <pre aria-labelledby="lbl-pip"><code><span class="p">$ </span>pip install duckdb-gpudb</code></pre>
+              <button class="copy" type="button" data-copy="pip install duckdb-gpudb" aria-label="Copy: pip install duckdb-gpudb" hidden>Copy</button>
+            </div>
+          </div>
+          <div>
+            <span class="cmd-label" id="lbl-ext">Any DuckDB 1.5.5 or later client, for the <code>gpu_*</code> functions</span>
+            <div class="cmd">
+              <pre aria-labelledby="lbl-ext"><code>INSTALL gpudb FROM community; LOAD gpudb;</code></pre>
+              <button class="copy" type="button" data-copy="INSTALL gpudb FROM community; LOAD gpudb;" aria-label="Copy: INSTALL gpudb FROM community; LOAD gpudb;" hidden>Copy</button>
+            </div>
+          </div>
+        </div>
+        <ul class="links">
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram">Source on GitHub</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/INSTALL.md">Installing, in full</a></li>
+        </ul>
+      </div>
+
+      <figure style="margin:0;min-width:0">
+        <div class="term">
+          <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>gpudb data/tpch_sf1/tpch.duckdb --readonly</span></div>
+          <div class="term-body">
+            <pre class="stmt"><b>gpudb&gt; </b>SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;</pre>
+<pre class="rows">┌───────────┬───────────────┐
+│ l_partkey │      qty      │
+│   int64   │ decimal(38,2) │
+├───────────┼───────────────┤
+│    125009 │       1642.00 │
+│    140633 │       1562.00 │
+│     49981 │       1553.00 │
+│    149443 │       1537.00 │
+│     10426 │       1513.00 │
+└───────────┴───────────────┘</pre>
+            <pre class="foot-duck">DuckDB (not_resident: the resident set is not ready yet) · 25.7 ms</pre>
+            <p class="term-sep">Ten seconds later, the same statement:</p>
+            <pre class="stmt"><b>gpudb&gt; </b>SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;</pre>
+            <pre class="rows">… the same five rows …</pre>
+            <pre class="foot-gpu"><span class="hl">GPU (topk: the resident GROUP BY) · 38.8 ms</span></pre>
+          </div>
+        </div>
+        <figcaption class="term-cap">The footer under every result says where the statement ran and why. One session on an Apple M4 Max over TPC-H SF1, DuckDB 1.5.5, v0.7.0 release build. Nine more runs each way: median 22.1&nbsp;ms on DuckDB, 14.4&nbsp;ms on the GPU, 1.53×.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="how" aria-labelledby="how-h">
+  <div class="wrap">
+    <h2 id="how-h">How a statement reaches the GPU</h2>
+    <p class="lede">The extension alone gives the <code>gpu_*</code> functions. Plain SQL reaches the GPU through a client that sees the statement before DuckDB plans it.</p>
+    <ol class="steps">
+      <li>
+        <h3>You write ordinary SQL</h3>
+        <p>Through the <code>gpudb</code> shell or <code>gpudb.connect()</code> in Python. <code>duckdb.connect</code> becomes <code>gpudb.connect()</code>; the SQL is untouched.</p>
+      </li>
+      <li>
+        <h3>DuckDB parses, gpudb rewrites</h3>
+        <p>Before DuckDB plans it, the statement goes through DuckDB's own parser (<code>json_serialize_sql</code>) and a pure function in the extension (<code>gpu_rewrite_ast</code>). No plan surgery, no C++ API.</p>
+      </li>
+      <li>
+        <h3>Resident columns answer it</h3>
+        <p>A shape measured to win, over a table past the 1,000,000-row floor, runs on columns already in GPU memory. Tables become resident in the background, between your statements.</p>
+      </li>
+      <li>
+        <h3>Everything else is DuckDB</h3>
+        <p>Any other statement runs on DuckDB unchanged, at DuckDB's speed. Any error on the rewritten path re-runs your original statement on DuckDB.</p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section id="rules" aria-labelledby="rules-h">
+  <div class="wrap">
+    <h2 id="rules-h">Two rules</h2>
+    <div class="rules">
+      <article class="rule">
+        <h3>Never a different answer than DuckDB</h3>
+        <p>A rewritten statement returns what native DuckDB returns: the same rows, the same order where native guarantees one, the same column names and the same column types. Integer and <code>DECIMAL</code> aggregates are bit-exact, with 128-bit sums on the device.</p>
+        <p>Where “the same as native” is not definable, the shape is never rewritten: <code>sum(DOUBLE)</code>, which DuckDB itself computes in an order-dependent way, and an <code>ORDER BY … LIMIT k</code> whose first <em>k</em> rows tie, which goes back to DuckDB.</p>
+      </article>
+      <article class="rule">
+        <h3>Never slower than DuckDB</h3>
+        <p>Not on average: per statement, per shape, per size. Which shapes may be rewritten comes from bounds a gate measures against native before a release, and the losing measurements stay published.</p>
+        <p>Your machine is not the gate's, so the decision is taken again there. After a statement template's first three rewritten runs, the wrapper times the native form once on a side cursor in your own process, hands the template back to DuckDB if the rewritten runs were not faster, and measures again every 60 seconds.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="results" aria-labelledby="results-h">
+  <div class="wrap">
+    <h2 id="results-h">Measured on TPC-H</h2>
+    <p class="lede">Plain SQL through the transparent path, every table the query reads already resident, every row compared with native DuckDB before any time was counted. Two machines; yours will differ.</p>
+
+    <div class="tbl-wrap">
+      <table class="stack">
+        <caption>DuckDB 1.5.5, release build of 2026-09-20, default memory budget, N=5. <code>sql()</code> is the lazy-relation path the <code>gpudb</code> shell takes; both entry points are timed separately.</caption>
+        <thead>
+          <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">Asked through</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">17 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.52× (Q15) – 15.32× (Q9)</td></tr>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>sql()</code></td><td class="num" data-label="On the GPU">17 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.37× (Q15) – 9.49× (Q13)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">19 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.06× (Q11) – 48.10× (Q5)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>sql()</code></td><td class="num" data-label="On the GPU">19 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up"><span class="loss">0.92× (Q11)</span> – 26.39× (Q5)</td></tr>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">RTX 4090 Laptop, CUDA</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">17 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.21× (Q15) – 31.44× (Q9)</td></tr>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">RTX 4090 Laptop, CUDA</td><td data-label="Asked through"><code>sql()</code></td><td class="num" data-label="On the GPU">17 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.66× (Q15) – 16.27× (Q9)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tbl-wrap">
+      <table class="stack">
+        <caption>DuckDB 2.0.1, through <code>execute()</code>, the same script. One more query stays on DuckDB there, because <code>avg</code> over <code>DECIMAL</code> is not rewritten on DuckDB 2.</caption>
+        <thead>
+          <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">DuckDB</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="DuckDB">2.0.1</td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.03× (Q11) – 30.39× (Q5)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">RTX 4090 Laptop, CUDA</td><td data-label="DuckDB">2.0.1</td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.59× (Q11) – 45.72× (Q9)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">The four that stay on DuckDB 2.0.1 are Q1 (<code>avg</code> over <code>DECIMAL</code>), Q2 and Q20 (correlated) and Q16 (its threshold). The CUDA row was taken on a machine doing other work, so read its ratios as approximate.</p>
+
+    <div class="results-grid">
+      <div class="panel">
+        <div class="chart-head">
+          <h3 id="chart-h">Query by query, Apple M4 Max, DuckDB 1.5.5</h3>
+          <div class="seg" role="group" aria-label="Scale factor">
+            <button type="button" data-sf="sf10" aria-pressed="true">SF10, 60M rows</button>
+            <button type="button" data-sf="sf1" aria-pressed="false">SF1, 6M rows</button>
+          </div>
+        </div>
+        <ul class="legend" aria-label="Legend">
+          <li><span class="sw ex" aria-hidden="true"></span><code>execute()</code></li>
+          <li><span class="sw sq" aria-hidden="true"></span><code>sql()</code>, the shell's path</li>
+          <li><span class="sw ls" aria-hidden="true"></span>below 1.0×</li>
+          <li><span class="sw dk" aria-hidden="true"></span>stays on DuckDB</li>
+        </ul>
+
+        <div class="chart-block" id="sf10">
+          <h4>TPC-H SF10 (60M-row <code>lineitem</code>)</h4>
+          <div class="axis" aria-hidden="true"><span></span><span class="scale"><span class="tick" style="--p:0.000%">0.5×</span><span class="tick one" style="--p:14.286%">1×</span><span class="tick" style="--p:28.571%">2×</span><span class="tick" style="--p:42.857%">4×</span><span class="tick" style="--p:57.143%">8×</span><span class="tick" style="--p:71.429%">16×</span><span class="tick" style="--p:85.714%">32×</span><span class="tick" style="--p:100.000%">64×</span></span><span class="vh"><span>execute</span><span>sql</span></span></div>
+          <ul class="chart" aria-label="Speed-up over native DuckDB per TPC-H query at SF10, execute() then sql()">
+<li class="row"><span class="q">Q1</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:41.881%"></span><span class="bar sq" style="--a:14.286%;--w:41.250%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>7.63×</span><span class="v sq"><span class="sr"> sql() </span>7.40×</span></span></li>
+<li class="row declined"><span class="q">Q2</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:23.318%"></span><span class="bar sq" style="--a:14.286%;--w:22.156%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.10×</span><span class="v sq"><span class="sr"> sql() </span>2.93×</span></span></li>
+<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:58.537%"></span><span class="bar sq" style="--a:14.286%;--w:50.832%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>17.12×</span><span class="v sq"><span class="sr"> sql() </span>11.78×</span></span></li>
+<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:79.828%"></span><span class="bar sq" style="--a:14.286%;--w:67.456%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>48.10×</span><span class="v sq"><span class="sr"> sql() </span>26.39×</span></span></li>
+<li class="row"><span class="q">Q6</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:17.957%"></span><span class="bar sq" style="--a:14.286%;--w:18.384%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.39×</span><span class="v sq"><span class="sr"> sql() </span>2.44×</span></span></li>
+<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.418%"></span><span class="bar sq" style="--a:14.286%;--w:23.582%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.27×</span><span class="v sq"><span class="sr"> sql() </span>3.14×</span></span></li>
+<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:31.045%"></span><span class="bar sq" style="--a:14.286%;--w:30.861%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.51×</span><span class="v sq"><span class="sr"> sql() </span>4.47×</span></span></li>
+<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:62.079%"></span><span class="bar sq" style="--a:14.286%;--w:60.739%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>20.33×</span><span class="v sq"><span class="sr"> sql() </span>19.05×</span></span></li>
+<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:35.097%"></span><span class="bar sq" style="--a:14.286%;--w:34.947%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.49×</span><span class="v sq"><span class="sr"> sql() </span>5.45×</span></span></li>
+<li class="row"><span class="q">Q11</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:1.201%"></span><span class="bar sq loss" style="--a:12.567%;--w:1.718%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.06×</span><span class="v sq loss"><span class="sr"> sql() </span>0.92×</span></span></li>
+<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:27.944%"></span><span class="bar sq" style="--a:14.286%;--w:30.489%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.88×</span><span class="v sq"><span class="sr"> sql() </span>4.39×</span></span></li>
+<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.118%"></span><span class="bar sq" style="--a:14.286%;--w:50.497%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.84×</span><span class="v sq"><span class="sr"> sql() </span>11.59×</span></span></li>
+<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:39.325%"></span><span class="bar sq" style="--a:14.286%;--w:38.798%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.74×</span><span class="v sq"><span class="sr"> sql() </span>6.57×</span></span></li>
+<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:6.032%"></span><span class="bar sq" style="--a:14.286%;--w:6.935%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.34×</span><span class="v sq"><span class="sr"> sql() </span>1.40×</span></span></li>
+<li class="row declined"><span class="q">Q16</span><span class="track"><span class="decl"><span>on DuckDB: its inner GROUP BY is below a measured threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:50.533%"></span><span class="bar sq" style="--a:14.286%;--w:50.515%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>11.61×</span><span class="v sq"><span class="sr"> sql() </span>11.60×</span></span></li>
+<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:51.773%"></span><span class="bar sq" style="--a:14.286%;--w:52.463%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>12.33×</span><span class="v sq"><span class="sr"> sql() </span>12.75×</span></span></li>
+<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:56.140%"></span><span class="bar sq" style="--a:14.286%;--w:55.326%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>15.24×</span><span class="v sq"><span class="sr"> sql() </span>14.65×</span></span></li>
+<li class="row declined"><span class="q">Q20</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:38.258%"></span><span class="bar sq" style="--a:14.286%;--w:38.514%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.40×</span><span class="v sq"><span class="sr"> sql() </span>6.48×</span></span></li>
+<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:58.777%"></span><span class="bar sq" style="--a:14.286%;--w:55.171%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>17.32×</span><span class="v sq"><span class="sr"> sql() </span>14.54×</span></span></li>
+          </ul>
+        </div>
+        <div class="chart-block" id="sf1">
+          <h4>TPC-H SF1 (6M-row <code>lineitem</code>)</h4>
+          <div class="axis" aria-hidden="true"><span></span><span class="scale"><span class="tick" style="--p:0.000%">0.5×</span><span class="tick one" style="--p:14.286%">1×</span><span class="tick" style="--p:28.571%">2×</span><span class="tick" style="--p:42.857%">4×</span><span class="tick" style="--p:57.143%">8×</span><span class="tick" style="--p:71.429%">16×</span><span class="tick" style="--p:85.714%">32×</span><span class="tick" style="--p:100.000%">64×</span></span><span class="vh"><span>execute</span><span>sql</span></span></div>
+          <ul class="chart" aria-label="Speed-up over native DuckDB per TPC-H query at SF1, execute() then sql()">
+<li class="row"><span class="q">Q1</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:28.468%"></span><span class="bar sq" style="--a:14.286%;--w:25.100%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.98×</span><span class="v sq"><span class="sr"> sql() </span>3.38×</span></span></li>
+<li class="row declined"><span class="q">Q2</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:21.220%"></span><span class="bar sq" style="--a:14.286%;--w:15.389%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.80×</span><span class="v sq"><span class="sr"> sql() </span>2.11×</span></span></li>
+<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.023%"></span><span class="bar sq" style="--a:14.286%;--w:28.571%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.79×</span><span class="v sq"><span class="sr"> sql() </span>4.00×</span></span></li>
+<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:36.825%"></span><span class="bar sq" style="--a:14.286%;--w:27.020%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.97×</span><span class="v sq"><span class="sr"> sql() </span>3.71×</span></span></li>
+<li class="row declined"><span class="q">Q6</span><span class="track"><span class="decl"><span>on DuckDB: its inner GROUP BY is below a measured threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.161%"></span><span class="bar sq" style="--a:14.286%;--w:16.062%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.39×</span><span class="v sq"><span class="sr"> sql() </span>2.18×</span></span></li>
+<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:29.080%"></span><span class="bar sq" style="--a:14.286%;--w:23.713%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.10×</span><span class="v sq"><span class="sr"> sql() </span>3.16×</span></span></li>
+<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:56.248%"></span><span class="bar sq" style="--a:14.286%;--w:44.082%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>15.32×</span><span class="v sq"><span class="sr"> sql() </span>8.49×</span></span></li>
+<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.582%"></span><span class="bar sq" style="--a:14.286%;--w:23.582%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.46×</span><span class="v sq"><span class="sr"> sql() </span>3.14×</span></span></li>
+<li class="row declined"><span class="q">Q11</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.544%"></span><span class="bar sq" style="--a:14.286%;--w:21.073%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.29×</span><span class="v sq"><span class="sr"> sql() </span>2.78×</span></span></li>
+<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:48.284%"></span><span class="bar sq" style="--a:14.286%;--w:46.377%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.41×</span><span class="v sq"><span class="sr"> sql() </span>9.49×</span></span></li>
+<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:28.050%"></span><span class="bar sq" style="--a:14.286%;--w:23.843%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.90×</span><span class="v sq"><span class="sr"> sql() </span>3.18×</span></span></li>
+<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:8.630%"></span><span class="bar sq" style="--a:14.286%;--w:6.488%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.52×</span><span class="v sq"><span class="sr"> sql() </span>1.37×</span></span></li>
+<li class="row declined"><span class="q">Q16</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.731%"></span><span class="bar sq" style="--a:14.286%;--w:25.161%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.32×</span><span class="v sq"><span class="sr"> sql() </span>3.39×</span></span></li>
+<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:46.421%"></span><span class="bar sq" style="--a:14.286%;--w:40.913%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>9.51×</span><span class="v sq"><span class="sr"> sql() </span>7.28×</span></span></li>
+<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:40.046%"></span><span class="bar sq" style="--a:14.286%;--w:36.825%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.98×</span><span class="v sq"><span class="sr"> sql() </span>5.97×</span></span></li>
+<li class="row declined"><span class="q">Q20</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
+<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:37.470%"></span><span class="bar sq" style="--a:14.286%;--w:23.252%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.16×</span><span class="v sq"><span class="sr"> sql() </span>3.09×</span></span></li>
+<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:41.195%"></span><span class="bar sq" style="--a:14.286%;--w:36.158%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>7.38×</span><span class="v sq"><span class="sr"> sql() </span>5.78×</span></span></li>
+          </ul>
+        </div>
+
+        <details>
+          <summary>The same runs as a table, with times</summary>
+          <div class="tbl-wrap" role="region" aria-label="Per-query times, SF10" tabindex="0">
+            <table>
+              <caption>SF10, milliseconds. Native is plain DuckDB; gpudb is the transparent path.</caption>
+              <thead><tr><th scope="col">Query</th><th scope="col">Ran on</th><th scope="col" class="num">execute() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th><th scope="col" class="num">sql() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th></tr></thead>
+              <tbody>
+<tr><th scope="row">Q1</th><td>GPU (plain)</td><td>109.5</td><td>14.3</td><td>7.63×</td><td>110.8</td><td>15.0</td><td>7.40×</td></tr>
+<tr><th scope="row">Q2</th><td>DuckDB (shape)</td><td>16.8</td><td>—</td><td>—</td><td>17.1</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>43.0</td><td>13.9</td><td>3.10×</td><td>43.3</td><td>14.8</td><td>2.93×</td></tr>
+<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>43.6</td><td>2.5</td><td>17.12×</td><td>44.1</td><td>3.7</td><td>11.78×</td></tr>
+<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>39.1</td><td>0.8</td><td>48.10×</td><td>39.9</td><td>1.5</td><td>26.39×</td></tr>
+<tr><th scope="row">Q6</th><td>GPU (projected)</td><td>14.0</td><td>5.9</td><td>2.39×</td><td>14.9</td><td>6.1</td><td>2.44×</td></tr>
+<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>35.8</td><td>11.0</td><td>3.27×</td><td>36.7</td><td>11.7</td><td>3.14×</td></tr>
+<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>35.7</td><td>7.9</td><td>4.51×</td><td>38.4</td><td>8.6</td><td>4.47×</td></tr>
+<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>112.4</td><td>5.5</td><td>20.33×</td><td>127.6</td><td>6.7</td><td>19.05×</td></tr>
+<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>76.8</td><td>14.0</td><td>5.49×</td><td>83.3</td><td>15.3</td><td>5.45×</td></tr>
+<tr><th scope="row">Q11</th><td>GPU (nested)</td><td>6.2</td><td>5.9</td><td>1.06×</td><td>6.6</td><td>7.2</td><td>0.92×</td></tr>
+<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>40.2</td><td>10.4</td><td>3.88×</td><td>46.9</td><td>10.7</td><td>4.39×</td></tr>
+<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>147.8</td><td>13.6</td><td>10.84×</td><td>161.5</td><td>13.9</td><td>11.59×</td></tr>
+<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>29.1</td><td>4.3</td><td>6.74×</td><td>31.9</td><td>4.8</td><td>6.57×</td></tr>
+<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>20.5</td><td>15.3</td><td>1.34×</td><td>22.2</td><td>15.9</td><td>1.40×</td></tr>
+<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>34.8</td><td>—</td><td>—</td><td>36.1</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>37.5</td><td>3.2</td><td>11.61×</td><td>42.9</td><td>3.7</td><td>11.60×</td></tr>
+<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>111.7</td><td>9.1</td><td>12.33×</td><td>121.7</td><td>9.5</td><td>12.75×</td></tr>
+<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>63.4</td><td>4.2</td><td>15.24×</td><td>67.6</td><td>4.6</td><td>14.65×</td></tr>
+<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>32.6</td><td>—</td><td>—</td><td>34.7</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>138.9</td><td>21.7</td><td>6.40×</td><td>145.0</td><td>22.4</td><td>6.48×</td></tr>
+<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>26.2</td><td>1.5</td><td>17.32×</td><td>27.7</td><td>1.9</td><td>14.54×</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="tbl-wrap" role="region" aria-label="Per-query times, SF1" tabindex="0">
+            <table>
+              <caption>SF1, milliseconds.</caption>
+              <thead><tr><th scope="col">Query</th><th scope="col">Ran on</th><th scope="col" class="num">execute() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th><th scope="col" class="num">sql() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th></tr></thead>
+              <tbody>
+<tr><th scope="row">Q1</th><td>GPU (plain)</td><td>12.7</td><td>3.2</td><td>3.98×</td><td>12.2</td><td>3.6</td><td>3.38×</td></tr>
+<tr><th scope="row">Q2</th><td>DuckDB (threshold)</td><td>4.3</td><td>—</td><td>—</td><td>4.4</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>5.9</td><td>2.1</td><td>2.80×</td><td>6.1</td><td>2.9</td><td>2.11×</td></tr>
+<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>6.0</td><td>0.6</td><td>10.79×</td><td>6.1</td><td>1.5</td><td>4.00×</td></tr>
+<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>6.8</td><td>1.1</td><td>5.97×</td><td>6.5</td><td>1.7</td><td>3.71×</td></tr>
+<tr><th scope="row">Q6</th><td>DuckDB (threshold)</td><td>1.8</td><td>—</td><td>—</td><td>1.7</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>6.8</td><td>2.0</td><td>3.39×</td><td>7.0</td><td>3.2</td><td>2.18×</td></tr>
+<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>6.0</td><td>1.5</td><td>4.10×</td><td>6.3</td><td>2.0</td><td>3.16×</td></tr>
+<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>18.1</td><td>1.2</td><td>15.32×</td><td>18.1</td><td>2.1</td><td>8.49×</td></tr>
+<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>13.0</td><td>3.8</td><td>3.46×</td><td>13.2</td><td>4.2</td><td>3.14×</td></tr>
+<tr><th scope="row">Q11</th><td>DuckDB (threshold)</td><td>2.6</td><td>—</td><td>—</td><td>2.6</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>5.1</td><td>1.6</td><td>3.29×</td><td>5.2</td><td>1.9</td><td>2.78×</td></tr>
+<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>18.0</td><td>1.7</td><td>10.41×</td><td>18.1</td><td>1.9</td><td>9.49×</td></tr>
+<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>5.3</td><td>1.4</td><td>3.90×</td><td>5.5</td><td>1.7</td><td>3.18×</td></tr>
+<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>3.2</td><td>2.1</td><td>1.52×</td><td>3.3</td><td>2.4</td><td>1.37×</td></tr>
+<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>11.9</td><td>—</td><td>—</td><td>12.7</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>4.6</td><td>1.4</td><td>3.32×</td><td>5.0</td><td>1.5</td><td>3.39×</td></tr>
+<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>13.9</td><td>1.5</td><td>9.51×</td><td>14.1</td><td>1.9</td><td>7.28×</td></tr>
+<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>10.0</td><td>1.4</td><td>6.98×</td><td>10.2</td><td>1.7</td><td>5.97×</td></tr>
+<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>7.3</td><td>—</td><td>—</td><td>7.5</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>20.0</td><td>3.2</td><td>6.16×</td><td>20.0</td><td>6.5</td><td>3.09×</td></tr>
+<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>8.0</td><td>1.1</td><td>7.38×</td><td>8.5</td><td>1.5</td><td>5.78×</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <aside class="panel cond" aria-labelledby="cond-h">
+        <h3 id="cond-h">Conditions</h3>
+        <dl>
+          <div><dt>Machine</dt><dd>Apple M4 Max, Metal, macOS 26.6.2</dd></div>
+          <div><dt>Build</dt><dd>v0.7.0 release build, 2026-09-20, commit <code>98b19c2</code></dd></div>
+          <div><dt>DuckDB</dt><dd>1.5.5, Python 3.13.9</dd></div>
+          <div><dt>Runs</dt><dd>N=5, default memory budget, thresholds on</dd></div>
+          <div><dt>Correctness</dt><dd>Every row compared with native before any time was counted: 0 rows differing</dd></div>
+          <div><dt>Scale</dt><dd>Speed-up over native DuckDB on a log scale; the line marks 1.0×</dd></div>
+        </dl>
+      </aside>
+    </div>
+
+    <div class="losses">
+      <div>
+        <h3>Where it stays on DuckDB</h3>
+        <ul class="plain-list">
+          <li><strong>At SF10, three queries.</strong> Q2 and Q20 each read a subquery from inside another subquery; the inner statement is correlated and does not bind on its own, so there is nothing to hand the device. Q16's inner <code>GROUP BY</code> declines on its own threshold; forced past it, Q16 measures <span class="loss-t">0.02–0.08×</span>.</li>
+          <li><strong>At SF1, five.</strong> Those three, plus Q6 and Q11, which sit below the measured size floors at 6M rows. The CUDA machine declines the same five at SF1.</li>
+          <li>Each of them runs on DuckDB unchanged, at DuckDB's speed.</li>
+        </ul>
+      </div>
+      <div>
+        <h3>Results at or below 1.0×</h3>
+        <ul class="plain-list">
+          <li><strong>Q11 at SF10 on Metal straddles parity.</strong> A 6–7&nbsp;ms statement: 1.06× through <code>execute()</code> and <span class="loss-t">0.92×</span> through <code>sql()</code> in the timed run, 1.06× and <span class="loss-t">0.89×</span> in two immediate re-runs of the same build. This is the case the per-process measured rule exists to settle.</li>
+          <li><strong>TPC-H Q1 on CUDA</strong> first measured <span class="loss-t">0.96×</span> and <span class="loss-t">0.98×</span> on the release build: a few-group key was being answered by sorting the whole column. CUDA got a direct grouped reduce for such keys, and Q1 now measures 1.99× through <code>execute()</code> and 2.07× through <code>sql()</code>.</li>
+          <li><strong>A predicate that matches nothing</strong>, on CUDA at SF1: 0.76&nbsp;ms on the device against 0.21&nbsp;ms native, <span class="loss-t">0.28×</span>. DuckDB skips the table through its zone maps; the measured rule declines it after one run.</li>
+        </ul>
+      </div>
+    </div>
+    <p class="note">Every per-query table and the commands that take the runs again are in <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/BENCHMARK.md">BENCHMARK.md</a> and <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/README.md#reproducing-a-number">the reading guide</a>.</p>
+
+    <h3 style="margin-top:3.5rem">The operators underneath, asked by name</h3>
+    <p class="lede" style="font-size:1rem">These rows call the <code>gpu_*</code> functions directly rather than plain SQL, and were measured when each operator shipped: streaming <code>SUM</code> at v0.4.0, joins at v0.5.0, GROUP BY at v0.6.0. TPC-H <code>lineitem</code>, warm cache, every result verified equal to native before timing counted. GROUP BY rows: statement against statement in one embedded DuckDB v1.5.2 process, after the one-time upload and sort. Aggregate and join rows: DuckDB CLI, v1.5.5 for CUDA and the Metal <code>SUM</code>, v1.5.2 for the Metal joins; 5-run medians.</p>
+    <div class="tbl-wrap">
+      <table class="stack">
+        <thead><tr><th scope="col">Workload</th><th scope="col">Hardware</th><th scope="col" class="num">Native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">Speed-up</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">SF50, 300M rows: <code>SUM</code> BIGINT</th><td data-label="Hardware">MacBook M4 Max, Metal</td><td class="num" data-label="Native">46 ms</td><td class="num" data-label="gpudb">5 ms</td><td class="num hot" data-label="Speed-up">8.5×</td></tr>
+          <tr><th scope="row">SF50, 300M rows: <code>SUM</code> BIGINT</th><td data-label="Hardware">RTX 4090 Laptop, CUDA</td><td class="num" data-label="Native">99 ms</td><td class="num" data-label="gpudb">4 ms</td><td class="num hot" data-label="Speed-up">25×</td></tr>
+          <tr><th scope="row">SF50, 300M ⋈ 75M: <code>JOIN</code> + <code>SUM</code> BIGINT</th><td data-label="Hardware">MacBook M4 Max, Metal</td><td class="num" data-label="Native">429 ms</td><td class="num" data-label="gpudb">37 ms</td><td class="num hot" data-label="Speed-up">11.7×</td></tr>
+          <tr><th scope="row">SF50, 300M ⋈ 75M: <code>JOIN</code> + <code>SUM</code> BIGINT</th><td data-label="Hardware">RTX 4090 Laptop, CUDA</td><td class="num" data-label="Native">998 ms</td><td class="num" data-label="gpudb">27–37 ms</td><td class="num hot" data-label="Speed-up">27–37×</td></tr>
+          <tr><th scope="row">SF50, 75M groups: Q18 inner, <code>HAVING</code> on the device</th><td data-label="Hardware">MacBook M4 Max, Metal</td><td class="num" data-label="Native">462–476 ms</td><td class="num" data-label="gpudb">78 ms</td><td class="num hot" data-label="Speed-up">5.9–6.1×</td></tr>
+          <tr><th scope="row">SF50, 75M groups: Q18 inner, <code>HAVING</code> on the device</th><td data-label="Hardware">RTX 4090 Laptop, CUDA</td><td class="num" data-label="Native">1012–1039 ms</td><td class="num" data-label="gpudb">42–78 ms</td><td class="num hot" data-label="Speed-up">13–24×</td></tr>
+          <tr><th scope="row">SF50, all 75M groups returned</th><td data-label="Hardware">MacBook M4 Max, Metal</td><td class="num" data-label="Native">347–355 ms</td><td class="num" data-label="gpudb">120–123 ms</td><td class="num hot" data-label="Speed-up">2.8–2.9×</td></tr>
+          <tr><th scope="row">SF50, all 75M groups returned</th><td data-label="Hardware">RTX 4090 Laptop, CUDA</td><td class="num" data-label="Native">681–718 ms</td><td class="num" data-label="gpudb">458–471 ms</td><td class="num hot" data-label="Speed-up">1.5× end-to-end</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Where these lose, it is published too. A <code>GROUP BY</code> with a handful of groups is a native win on Metal (<span class="loss-t">0.56–0.65×</span> at SF10–SF50, a tie at SF1). Whole-column <code>min</code>/<code>max</code> on stored tables is a native win, because zonemap statistics answer without scanning. A one-time upload breaks even after about 100–150 repeated aggregate queries. The CUDA all-groups row is bounded by copying 24 bytes per group over PCIe, which unified memory does not pay.</p>
+  </div>
+</section>
+
+<section id="where" aria-labelledby="where-h">
+  <div class="wrap">
+    <h2 id="where-h">What runs where</h2>
+    <dl class="where">
+      <div>
+        <dt>On the GPU</dt>
+        <dd>Aggregating statements over tables past the 1,000,000-row floor: <code>sum</code>, <code>count</code>, <code>min</code>, <code>max</code> and <code>avg</code> with or without <code>GROUP BY</code>, <code>WHERE</code> filters, <code>HAVING</code>, <code>ORDER BY … LIMIT k</code>, <code>DISTINCT</code> and <code>count(DISTINCT)</code>, joins, <code>EXISTS</code> / <code>IN</code> subqueries, CTEs, views and derived tables.</dd>
+      </div>
+      <div>
+        <dt>On DuckDB</dt>
+        <dd>Window functions, <code>sum</code> / <code>avg</code> over <code>DOUBLE</code>, <code>median</code> / <code>stddev</code>, prepared-statement parameters, statements inside an explicit transaction, tables under the floor, a handful of groups, and sets over the memory budget.</dd>
+      </div>
+    </dl>
+    <p class="where-note">A statement that stays on DuckDB returns the same answer at DuckDB's speed, in the same session; nothing fails. <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/KNOWN_ISSUES.md">Full list</a></p>
+  </div>
+</section>
+
+<section id="use" aria-labelledby="use-h">
+  <div class="wrap">
+    <h2 id="use-h">Three ways to use it</h2>
+    <p class="lede">All three talk to the same extension and the same resident columns.</p>
+    <div class="ways">
+      <div class="way">
+        <div>
+          <h3>Python: <code>import gpudb</code></h3>
+          <p>For applications, notebooks and pipelines. <code>gpudb.connect()</code> takes the same arguments as <code>duckdb.connect</code>, anything it does not define is delegated to the underlying DuckDB connection, and <code>last_rewrite()</code> says what happened to the last statement.</p>
+          <p><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_PYTHON.md">The Python guide</a></p>
+        </div>
+        <div class="code">
+          <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>python</span></div>
+          <pre id="ex-py"><code>import gpudb
+
+con = gpudb.connect("my.duckdb")
+con.execute("SELECT k, sum(v) FROM t GROUP BY k").fetchall()
+con.last_rewrite()                <span class="c"># what happened to that statement</span></code></pre><button class="copy" type="button" data-copy-from="ex-py" aria-label="Copy the Python example" hidden>Copy</button>
+        </div>
+      </div>
+
+      <div class="way">
+        <div>
+          <h3>The <code>gpudb</code> shell</h3>
+          <p>For exploring and ad-hoc SQL. Under every result is one line: where the statement ran, why, and how long it took. <code>.gpu</code> prints the whole record including the SQL that actually ran, <code>.gpu off</code> turns the path off for a comparison, and <code>.residents</code> and <code>.memory</code> show what is on the device.</p>
+          <p><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/USING_THE_SHELL.md">The shell guide</a></p>
+        </div>
+        <div>
+          <div class="code">
+            <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>shell</span></div>
+            <pre id="ex-sh"><code>gpudb                             <span class="c"># in-memory database</span>
+gpudb my.duckdb                   <span class="c"># a file</span>
+gpudb my.duckdb --readonly        <span class="c"># nobody writes while you look</span>
+python -m gpudb                   <span class="c"># the same entry point</span></code></pre><button class="copy" type="button" data-copy-from="ex-sh" aria-label="Copy the shell commands" hidden>Copy</button>
+          </div>
+          <div class="code" style="margin-top:.75rem">
+            <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>the footer</span></div>
+            <pre><code><span class="hl">GPU (plain: the resident GROUP BY) · 3.3 ms</span>
+<span class="c">DuckDB (threshold: 7 groups &lt; 1000) · 5.0 ms</span>
+<span class="c">DuckDB (not_resident: the resident set is not ready yet) · 12.0 ms</span></code></pre>
+          </div>
+          <p class="code-cap">Footer lines as the shell prints them, collected from different statements and sessions.</p>
+        </div>
+      </div>
+
+      <div class="way">
+        <div>
+          <h3>The <code>gpu_*</code> functions, in any DuckDB client</h3>
+          <p>Full manual control from any client in any language, and the only route from the stock <code>duckdb</code> CLI: DuckDB's stable C extension API has no hook that sees a statement before it is planned, so there <code>LOAD gpudb</code> gives the functions, not the rewrite. Upload a column once, then ask it many times.</p>
+          <p><a href="https://github.com/singhpratech/duckdbgpumetaldbram#the-resident-model-in-20-seconds">The resident model</a></p>
+        </div>
+        <div class="code">
+          <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>duckdb</span></div>
+          <pre id="ex-sql"><code>INSTALL gpudb FROM community;
+LOAD gpudb;
+
+CREATE TABLE sales AS
+  SELECT (range % 1000)::BIGINT AS store, (range * 7 % 10007)::BIGINT AS amount
+  FROM range(10000000);
+SELECT gpu_upload_pair('sales_by_store', store, amount) FROM sales;   <span class="c">-- resident, once</span>
+
+SELECT * FROM gpu_groupby_sum_resident_topk('sales_by_store', 5, 'desc');
+<span class="c">-- (282, 50037056, 10000) … top 5 stores by sum(amount): (store, sum, count)</span>
+
+SELECT gpu_last_stats();
+<span class="c">-- op=groupby_sum_resident_topk backend=Metal reason=Hot_GpuAlwaysWins</span>
+<span class="c">--   rows_in=10000000 groups=1000 rows_out=5 wall_ms=39.568 kernel_ms=17.752 transfer_ms=0.000</span></code></pre><button class="copy" type="button" data-copy-from="ex-sql" aria-label="Copy the SQL example" hidden>Copy</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="platforms" aria-labelledby="platforms-h">
+  <div class="wrap">
+    <h2 id="platforms-h">Platforms and requirements</h2>
+    <div class="tbl-wrap">
+      <table class="stack">
+        <thead><tr><th scope="col"><span class="sr">Feature</span></th><th scope="col">Metal (Apple Silicon)</th><th scope="col">CUDA (NVIDIA)</th><th scope="col">No GPU</th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Plain SQL on the GPU, through the shell or <code>gpudb.connect()</code></th><td data-label="Metal">Yes</td><td data-label="CUDA">Yes, on by default, from a CUDA build</td><td data-label="No GPU">No: everything runs on DuckDB</td></tr>
+          <tr><th scope="row">Explicit <code>gpu_*</code> functions</th><td data-label="Metal">Yes</td><td data-label="CUDA">Yes</td><td data-label="No GPU">Yes, on the CPU backend, same answers</td></tr>
+          <tr><th scope="row">From the community registry</th><td data-label="Metal">Yes</td><td data-label="CUDA">A registry Linux binary may report <code>compiled=cpu</code>; <code>SELECT gpu_build_info();</code> answers this for whichever binary is in front of you</td><td data-label="No GPU">Yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="req">
+      <dl>
+        <div><dt>Apple Silicon</dt><dd>macOS 15.0 or later. Nothing has been tested on an older macOS.</dd></div>
+        <div><dt>Linux</dt><dd>x86-64 with glibc 2.34 or newer (Ubuntu 22.04 and later). For the GPU: an NVIDIA driver R525 or newer and a card in the sm_75 – sm_90 range (Turing, Ampere, Ada, Hopper). With no NVIDIA driver it loads and falls back to the CPU backend.</dd></div>
+        <div><dt><code>pip install duckdb-gpudb</code></dt><dd>Python 3.9 or later and the <code>duckdb</code> module 1.4 or later. On Apple Silicon and x86-64 Linux the platform wheel carries the extension too, so it is the whole install; the Linux wheel is the CUDA-enabled build and bundles its own <code>libgomp.so.1</code>. Elsewhere it installs the wrapper alone and the extension comes from the registry.</dd></div>
+      </dl>
+      <dl>
+        <div><dt><code>INSTALL gpudb FROM community</code></dt><dd>Any DuckDB 1.5.5 or later client, signed, no flags. On Linux the registry binary may be a CPU-only build that reports <code>compiled=cpu</code>: for CUDA, use the pip wheel, the release binary or a build from source.</dd></div>
+        <div><dt>Release binary</dt><dd>Built against the stable C API v1.2.0, so it loads in any DuckDB 1.2 or later, started with <code>-unsigned</code>. On Linux it needs <code>libgomp.so.1</code> (<code>apt install libgomp1</code>).</dd></div>
+        <div><dt>Which binary do I have?</dt><dd><code>SELECT gpu_build_info();</code> lists the backends it was built with (<code>compiled=</code>) and the one it chose (<code>runtime=</code>).</dd></div>
+      </dl>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="site-foot">
+  <div class="wrap foot-grid">
+    <div>
+      <svg class="foot-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect class="t" width="24" height="24" rx="3"/><path class="f" d="M11 4H18V20H6V17H15V12H11A4 4 0 0 1 11 4Z"/></svg>
+      <p><strong>gpudb</strong> is open source under the <a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/LICENSE">Apache-2.0 licence</a>. The gpudb logo is free to use when referring to gpudb (<a href="assets/LOGO-LICENSE.md">logo licence</a>).</p>
+      <p class="fine">gpudb is an independent community extension. It is not affiliated with or endorsed by DuckDB Labs or the DuckDB Foundation. DuckDB is a trademark of the DuckDB Foundation.</p>
+      <p class="fine">Set in Inter and JetBrains Mono, both under the SIL Open Font License (<a href="assets/fonts/OFL-Inter.txt">Inter</a>, <a href="assets/fonts/OFL-JetBrainsMono.txt">JetBrains Mono</a>).</p>
+    </div>
+    <div>
+      <nav aria-label="Project documents">
+        <ul class="foot-links">
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram#readme">README</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/INSTALL.md">Install guide</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/docs/RELEASE_HISTORY.md">Release history</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/BENCHMARK.md">Benchmarks</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/blob/main/KNOWN_ISSUES.md">Known issues</a></li>
+          <li><a href="https://github.com/singhpratech/duckdbgpumetaldbram/issues">Issues</a></li>
+        </ul>
+      </nav>
+      <p class="credit"><span>Created by</span><a href="https://theaivibe.org/about" rel="author noopener" target="_blank">Prateek Singh</a></p>
+    </div>
+  </div>
+</footer>
+<p class="sr" role="status" aria-live="polite" id="copy-status"></p>
+<script>
+(function () {
+  var root = document.documentElement;
+  root.classList.add("js");
+
+  /* theme toggle: system setting by default, an explicit choice is remembered */
+  var themeBtn = document.getElementById("theme-btn");
+  var mq = window.matchMedia ? window.matchMedia("(prefers-color-scheme: dark)") : null;
+  function current() {
+    var t = root.getAttribute("data-theme");
+    if (t === "light" || t === "dark") return t;
+    return mq && mq.matches ? "dark" : "light";
+  }
+  function label() {
+    var next = current() === "dark" ? "light" : "dark";
+    themeBtn.setAttribute("aria-label", "Switch to " + next + " theme");
+    themeBtn.setAttribute("title", "Switch to " + next + " theme");
+  }
+  themeBtn.hidden = false;
+  label();
+  themeBtn.addEventListener("click", function () {
+    var next = current() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("gpudb-theme", next); } catch (e) {}
+    label();
+  });
+  if (mq && mq.addEventListener) mq.addEventListener("change", label);
+
+  /* copy buttons */
+  var status = document.getElementById("copy-status");
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy") ? resolve() : reject(); } catch (e) { reject(e); }
+      document.body.removeChild(ta);
+    });
+  }
+  document.querySelectorAll(".copy").forEach(function (btn) {
+    btn.hidden = false;
+    btn.addEventListener("click", function () {
+      var src = btn.getAttribute("data-copy-from");
+      var text = src ? document.getElementById(src).textContent : btn.getAttribute("data-copy");
+      copyText(text).then(function () {
+        btn.textContent = "Copied";
+        status.textContent = "Copied to the clipboard";
+        setTimeout(function () { btn.textContent = "Copy"; status.textContent = ""; }, 1800);
+      }, function () {
+        btn.textContent = "Select and copy";
+        status.textContent = "Copying is not available here; select the text instead";
+      });
+    });
+  });
+
+  /* chart: one scale factor at a time */
+  var buttons = document.querySelectorAll(".seg button");
+  function show(id) {
+    buttons.forEach(function (b) {
+      var on = b.getAttribute("data-sf") === id;
+      b.setAttribute("aria-pressed", on ? "true" : "false");
+      document.getElementById(b.getAttribute("data-sf")).hidden = !on;
+    });
+  }
+  buttons.forEach(function (b) { b.addEventListener("click", function () { show(b.getAttribute("data-sf")); }); });
+  show("sf10");
+
+  /* the lane loop runs only while it is on screen and the tab is visible */
+  var lanes = document.querySelector(".lanes");
+  var lanesSeen = true;
+  function lanePlay() { lanes.classList.toggle("paused", !lanesSeen || document.hidden); }
+  if (lanes) {
+    if ("IntersectionObserver" in window) {
+      new IntersectionObserver(function (entries) {
+        lanesSeen = entries[entries.length - 1].isIntersecting;
+        lanePlay();
+      }).observe(lanes);
+    }
+    document.addEventListener("visibilitychange", lanePlay);
+  }
+
+  /* sticky header: a hairline once the page has scrolled */
+  var head = document.querySelector(".site-head");
+  var ticking = false;
+  function onScroll() {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(function () {
+      head.classList.toggle("scrolled", window.scrollY > 4);
+      ticking = false;
+    });
+  }
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  /* the section in view is marked in the header */
+  var nav = document.querySelector(".site-nav ul");
+  var links = {};
+  document.querySelectorAll('.site-nav a[href^="#"]').forEach(function (a) { links[a.getAttribute("href").slice(1)] = a; });
+  function mark(id) {
+    Object.keys(links).forEach(function (k) {
+      if (k === id) links[k].setAttribute("aria-current", "location");
+      else links[k].removeAttribute("aria-current");
+    });
+    var a = links[id];
+    if (a && nav.scrollWidth > nav.clientWidth) {
+      var l = a.offsetLeft, r = l + a.offsetWidth;
+      if (l < nav.scrollLeft) nav.scrollLeft = l - 8;
+      else if (r > nav.scrollLeft + nav.clientWidth) nav.scrollLeft = r - nav.clientWidth + 8;
+    }
+  }
+  if ("IntersectionObserver" in window) {
+    var visible = {};
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { visible[e.target.id] = e.isIntersecting; });
+      var ids = ["how", "rules", "results", "where", "use", "platforms"];
+      var active = null;
+      ids.forEach(function (id) { if (visible[id]) active = active || id; });
+      mark(active);
+    }, { rootMargin: "-40% 0px -55% 0px" });
+    ["how", "rules", "results", "where", "use", "platforms"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) io.observe(el);
+    });
+  }
+})();
+</script>
+</body>
+</html>

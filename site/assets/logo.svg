@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -2 82 26" width="820" height="260" role="img" aria-label="gpudb">
+  <rect width="24" height="24" rx="3" fill="#0D0D0D"/>
+  <path fill="#FFF100" d="M11 4H18V20H6V17H15V12H11A4 4 0 0 1 11 4Z"/>
+  <g fill="#0D0D0D" stroke="#0D0D0D" stroke-width="2" transform="translate(30 -1.3333) scale(1.3333)">
+    <path d="M4 4H6V14H0V12H4Z" stroke="none"/>
+    <path d="M5 5H3a2 2 0 0 0 0 4h2" fill="none"/>
+    <rect x="8" y="4" width="2" height="10" stroke="none"/>
+    <path d="M9 5h2a2 2 0 0 1 0 4H9" fill="none"/>
+    <path d="M17 4v3a2 2 0 0 0 4 0" fill="none"/>
+    <rect x="20" y="4" width="2" height="6" stroke="none"/>
+    <path d="M29 5h-2a2 2 0 0 0 0 4h2" fill="none"/>
+    <rect x="28" y="0" width="2" height="10" stroke="none"/>
+    <rect x="32" y="0" width="2" height="10" stroke="none"/>
+    <path d="M33 5h2a2 2 0 0 1 0 4h-2" fill="none"/>
+  </g>
+</svg>
