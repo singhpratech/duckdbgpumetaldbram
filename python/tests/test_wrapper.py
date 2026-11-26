@@ -3342,7 +3342,7 @@ def extension_version_checks():
     from gpudb import connection as _conn
 
     print("== this client's version and the extension it requires")
-    check(gpudb.__version__ == "0.7.2", f"the wrapper reports its version ({gpudb.__version__})")
+    check(gpudb.__version__ == "0.7.3", f"the wrapper reports its version ({gpudb.__version__})")
 
     # Names this client calls that a v0.6.0 extension does not register: the
     # exact GROUP BY, the global masked aggregate and the materialised key join

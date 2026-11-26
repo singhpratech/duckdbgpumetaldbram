@@ -270,7 +270,7 @@ forms that filter on the device), `gpu_topk_resident`, `gpu_inner_join` and the
 exact `gpu_groupby_exact_*` family to read it back. `gpu_last_stats()` says
 which processor ran and for how long. The v0.7.1 extension the registry
 serves registers 66 of these, `gpu_functions()` among them, which describes the
-rest; the v0.7.0 binary the 0.7.2 platform wheels bundle registers 65. v0.6.0 registered 38,
+rest; the v0.7.0 binary the 0.7.3 platform wheels bundle registers 65. v0.6.0 registered 38,
 and every one of those is still there unchanged.
 
 It is full manual control, and it is the only route from the stock `duckdb`
