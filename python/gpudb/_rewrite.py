@@ -512,6 +512,20 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         base = tgt.split(":")[0]
         if base in ("sum", "count", "count_star", "min", "max"):
             d = direction if direction != "ORDER_DEFAULT" else default_order
+            if (d in ("ASCENDING", "DESCENDING", "ASC", "DESC") and base in ("sum", "min", "max")
+                    and nulls_sort_first(d, nulls, default_null_order)):
+                # The device top-k ranks a group whose sum / min / max is NULL
+                # after every value, in either direction. With NULLs ordered
+                # last that is native's order (NULL groups that fill the k rows
+                # come back last, and several of them tie and go to DuckDB
+                # through the tie guard), but `ORDER BY sum(x) DESC NULLS FIRST
+                # LIMIT k` came back without the NULL group native puts first
+                # (measured 2026-11-26 on DuckDB 2.0.1, through the extension's
+                # renderer as well as this one). count is never NULL. Such a
+                # statement is not pushed: it declines here, and the split
+                # (§4.11) may still answer its GROUP BY with DuckDB ordering
+                # and limiting the groups.
+                raise Decline("shape", "top-k by an aggregate that can be NULL, with NULLs ordered first")
             if d in ("ASCENDING", "DESCENDING", "ASC", "DESC"):
                 plan.form = "topk"
                 plan.topk_agg = base
@@ -533,6 +547,26 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
 # ---------------------------------------------------------------------------
 # typing and rendering
 # ---------------------------------------------------------------------------
+def nulls_sort_first(direction: str, nulls: str, default_null_order: str) -> bool:
+    """Does this ORDER BY item put NULLs before the values? `nulls` is the
+    tree's spelling (`NULLS FIRST` / `NULLS LAST` / `ORDER_DEFAULT`; the
+    underscore form is accepted too), `direction` ASC / DESC in either
+    spelling, `default_null_order` the setting (`NULLS_LAST`, `NULLS_FIRST`,
+    `NULLS_FIRST_ON_ASC_LAST_ON_DESC`, `NULLS_LAST_ON_ASC_FIRST_ON_DESC`)."""
+    n = (nulls or "").upper().replace("_", " ")
+    if n == "NULLS FIRST":
+        return True
+    if n == "NULLS LAST":
+        return False
+    desc = (direction or "").upper().startswith("DESC")
+    dflt = (default_null_order or "NULLS_LAST").upper().replace(" ", "_")
+    if dflt in ("NULLS_FIRST", "NULLS_FIRST_ON_ASC_LAST_ON_DESC"):
+        return dflt == "NULLS_FIRST" or not desc
+    if dflt == "NULLS_LAST_ON_ASC_FIRST_ON_DESC":
+        return desc
+    return False
+
+
 def stat_image(x, col_type: str) -> Optional[int]:
     """A stats() min/max as the integer the resident lane holds (days /
     microseconds for temporal columns), or None when not parseable."""
@@ -1033,9 +1067,19 @@ def _order_suffix(direction: str, nulls: str) -> str:
     """The direction / NULLS words of one ORDER BY item, left empty where the
     statement said nothing: DuckDB's `default_order` and `default_null_order`
     then decide, and they decide the same way for the window ties_qualify()
-    builds as for the ORDER BY beside it."""
+    builds as for the ORDER BY beside it.
+
+    `json_serialize_sql` spells the NULL order with a SPACE (`NULLS FIRST`,
+    `NULLS LAST`) on DuckDB 1.4.5, 1.5.6 and 2.0.1; the underscore form is the
+    setting's spelling, not the tree's. Only the underscore form used to be
+    mapped, so a statement this renderer drew — a decided template re-rendered
+    for new literals — silently dropped an explicit NULL order. Both are read."""
     return ({"ASCENDING": " ASC", "DESCENDING": " DESC"}.get(direction, "")
-            + {"NULLS_FIRST": " NULLS FIRST", "NULLS_LAST": " NULLS LAST"}.get(nulls, ""))
+            + _NULL_ORDER_WORDS.get(nulls, ""))
+
+
+_NULL_ORDER_WORDS = {"NULLS_FIRST": " NULLS FIRST", "NULLS FIRST": " NULLS FIRST",
+                     "NULLS_LAST": " NULLS LAST", "NULLS LAST": " NULLS LAST"}
 
 
 def ties_qualify(plan: Plan) -> str:

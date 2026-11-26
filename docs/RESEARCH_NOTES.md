@@ -6151,6 +6151,81 @@ chart, tables, conditions panel and hero transcript are generated from it.
 - The DuckDB 1.5.5 summary table stays on the page, labelled as the earlier
   build. The operator table (v0.4.0 to v0.6.0 measurements) was not re-run.
 
+## 2026-11-26 — NULL order: the re-rendered ORDER BY, and a top-k with NULLs first
+
+Two statement shapes where pip 0.7.2 on DuckDB 2.0.1 (shipped defaults, M4 Max)
+returned something other than native. Both are wrapper-only; the extension
+binary is the one in the 0.7.2 wheel and was not touched.
+
+- **An explicit NULL order was dropped by the Python renderer.**
+  `json_serialize_sql` spells it `NULLS FIRST` / `NULLS LAST`, with a space, on
+  1.4.5, 1.5.6, 2.0.0 and 2.0.1; `_rewrite._order_suffix` mapped only
+  `NULLS_FIRST` / `NULLS_LAST`. The extension's renderer draws the first
+  execution of a template, so the first literal set was right and every later
+  one — a template re-rendered for new literals — put the NULL group where
+  `default_null_order` puts it. Reproduction: 2M rows, 5000 groups,
+  `... WHERE w < 7 ... ORDER BY k NULLS FIRST` then `w < 8`: the NULL-key group
+  came back last. It reaches every form (plain, HAVING, top-k and its tie
+  window) and every ORDER BY item (key, alias, ordinal, an aggregate beside
+  another item), and `NULLS LAST` under a `nulls_first` setting. Both spellings
+  are now read.
+- **A pushed top-k lost a NULL aggregate ordered first.** Read directly off
+  `gpu_groupby_exact_resident_topk` (and the `topk` filter of
+  `gpu_groupby_exact_multi`): a group whose sum / min / max is NULL ranks after
+  every value in either direction, and comes back only when k is larger than the
+  number of non-NULL groups. `ORDER BY s DESC NULLS FIRST LIMIT 3` over 2M rows,
+  200K groups, one of them all-NULL, returned the three largest sums without
+  `(0, NULL)`. Same with `ASC NULLS FIRST`, with NULLs first by
+  `default_null_order`, and for min / max, a DECIMAL payload, a computed lane,
+  several payloads and a key join, through both renderers. The matcher now
+  declines the push when the item puts NULLs first and the ordering value is a
+  sum / min / max (`_rewrite.nulls_sort_first`); the split (§4.11) then answers
+  the GROUP BY on the device and DuckDB orders and limits (form `projected`).
+
+What was checked and is already native's, and stays pushed: NULLs last with
+fewer than k non-NULL groups (3 groups, one NULL, `LIMIT 4..6`, DESC and ASC:
+the NULL group comes back last, as native); many NULL groups filling the k rows
+(they tie, and the §4.24 guard hands the statement to DuckDB); `count(v)` in
+either NULL order (a group whose v is all NULL counts 0); an `ORDER BY` on the
+aggregate beside a `HAVING` (not pushed: DuckDB orders the groups). The
+explicit table functions are documented in GROUPBY_RESIDENT_DESIGN.md as
+"NULL aggregates rank last in both directions", which is what they do, so
+nothing there changes.
+
+The renderer audit compared, for 55 statement templates under five settings
+(defaults, `default_order = 'desc'`, and three `default_null_order` values),
+three literal sets each against a fresh native connection: 825 runs, 740
+rewritten, 410 of them drawn by the Python renderer. 0.7.2 differed on 184,
+every one Python-rendered and every one an explicit NULL order; with the fix,
+0. Direction, HAVING operators, IN / BETWEEN / IS NULL, string, DATE,
+TIMESTAMP, DECIMAL and negative literals, FILTER, DISTINCT, casts and
+expressions over aggregates (split), collations (declined) and joins were in
+it. Two failures turned up that are not wrong answers — the wrapper falls back
+and DuckDB answers — and are left open: an identifier containing a double quote
+is not escaped by the upload statement (the set never becomes resident) nor by
+the Python renderer's output names (`Parser Error`, answered natively), and a
+LEFT JOIN whose result is uploaded fails when re-rendered for new literals
+(`Binder Error: Referenced column "c1__k" not found`), after which the template
+stays native.
+
+What it costs: a top-k with NULLs first over a sum / min / max is no longer
+pushed. Through the split it is exact where the k rows do not tie; where they
+tie at the boundary it is the case §4.24 lists as not covered (DuckDB's top-N
+over the device's groups — a valid choice among the tied rows, not
+reproducible against a separate native run). In the original reproduction's
+last family 180 groups share the largest sum: ten native runs of
+`ORDER BY sv DESC NULLS FIRST LIMIT 5` gave ten different answers, and the
+wrapper's answer has native's ordering column and only true groups.
+
+Measured with the worktree's `python/` and the 0.7.2 wheel's binary: the four
+wrapper suites pass on DuckDB 2.0.1, 2.0.0 and 1.5.6 (test_wrapper 1408 / 1408
+/ 1438 checks against main's 1298 / 1298 / 1328 — the 110 new ones; shell 76,
+residency policy 131, ast compat 9, unchanged); 60 of the 110 fail with the
+two fixes reverted. `scripts/tpch_coverage.py`, DuckDB 2.0.1, N=5: SF1 16 of
+22 and SF10 18 of 22 on both trees, the same path per query (Q10 still a
+pushed top-k), 0 rows differing, no query below 1.0× (SF1 1.60× to 11.46×,
+SF10 1.08× to 26.19×).
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
