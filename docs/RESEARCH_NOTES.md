@@ -6129,6 +6129,28 @@ Three small things that followed the release.
   Linux for the two parameter statements while the rendered SQL was the same.
   The comparison now sorts that list. Nothing in the wrapper reads its order.
 
+## 2026-11-25 — The project page, and the numbers it quotes
+
+`site/` is a static page published to GitHub Pages by `.github/workflows/pages.yml`.
+It takes its own colours (an orange accent) and its own mark, and refers to
+DuckDB in plain text only, with the trademark line in the footer.
+
+The page quoted the 2026-09-20 release build on DuckDB 1.5.5 for its per-query
+chart and its shell session. Both now come from the current package:
+`pip install duckdb==2.0.1 duckdb-gpudb==0.7.2` in a clean environment on the
+M4 Max. `BENCHMARK.md` has the section ("2026-11-25 — pip 0.7.2 on DuckDB
+2.0.1") with the four per-query tables and the shell session, and the page's
+chart, tables, conditions panel and hero transcript are generated from it.
+
+- SF1: 16 of 22 on the device through both entry points (Q1, Q2, Q6, Q11, Q16
+  and Q20 stay on DuckDB), 1.46× to 12.36× through `execute()`.
+- SF10: 18 of 22 through both (Q1, Q2, Q16, Q20 stay), 1.03× to 30.39× through
+  `execute()`, 1.00× to 17.76× through `sql()`. Q11 is at parity, as before.
+- The shell session's A/B is 29.3 ms against 21.5 ms, 1.36×. A session taken
+  minutes earlier under load gave 1.18×; both are in `BENCHMARK.md`.
+- The DuckDB 1.5.5 summary table stays on the page, labelled as the earlier
+  build. The operator table (v0.4.0 to v0.6.0 measurements) was not re-run.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

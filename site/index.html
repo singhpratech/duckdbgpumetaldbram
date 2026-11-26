@@ -555,14 +555,14 @@ details td.num { font-size: .8rem; }
 │    149443 │       1537.00 │
 │     10426 │       1513.00 │
 └───────────┴───────────────┘</pre>
-            <pre class="foot-duck">DuckDB (not_resident: the resident set is not ready yet) · 25.7 ms</pre>
+            <pre class="foot-duck">DuckDB (not_resident: the resident set is not ready yet) · 32.5 ms</pre>
             <p class="term-sep">Ten seconds later, the same statement:</p>
             <pre class="stmt"><b>gpudb&gt; </b>SELECT l_partkey, sum(l_quantity) AS qty FROM lineitem GROUP BY l_partkey ORDER BY qty DESC LIMIT 5;</pre>
             <pre class="rows">… the same five rows …</pre>
-            <pre class="foot-gpu"><span class="hl">GPU (topk: the resident GROUP BY) · 38.8 ms</span></pre>
+            <pre class="foot-gpu"><span class="hl">GPU (topk: the resident GROUP BY) · 33.9 ms</span></pre>
           </div>
         </div>
-        <figcaption class="term-cap">The footer under every result says where the statement ran and why. One session on an Apple M4 Max over TPC-H SF1, DuckDB 1.5.5, v0.7.0 release build. Nine more runs each way: median 22.1&nbsp;ms on DuckDB, 14.4&nbsp;ms on the GPU, 1.53×.</figcaption>
+        <figcaption class="term-cap">The footer under every result says where the statement ran and why. One session on an Apple M4 Max over TPC-H SF1, DuckDB 2.0.1, pip 0.7.2. Nine more runs each way: median 29.3&nbsp;ms on DuckDB, 21.5&nbsp;ms on the GPU, 1.36×.</figcaption>
       </figure>
     </div>
   </div>
@@ -618,7 +618,24 @@ details td.num { font-size: .8rem; }
 
     <div class="tbl-wrap">
       <table class="stack">
-        <caption>DuckDB 1.5.5, release build of 2026-09-20, default memory budget, N=5. <code>sql()</code> is the lazy-relation path the <code>gpudb</code> shell takes; both entry points are timed separately.</caption>
+        <caption>The current release: DuckDB 2.0.1 with pip 0.7.2, measured 2026-11-25, default memory budget, N=5. <code>sql()</code> is the lazy-relation path the <code>gpudb</code> shell takes; both entry points are timed separately.</caption>
+        <thead>
+          <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">Asked through</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">16 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.46× (Q15) – 12.36× (Q13)</td></tr>
+          <tr><th scope="row">SF1, 6M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>sql()</code></td><td class="num" data-label="On the GPU">16 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.53× (Q15) – 10.58× (Q13)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.03× (Q11) – 30.39× (Q5)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="Asked through"><code>sql()</code></td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.00× (Q11) – 17.76× (Q5)</td></tr>
+          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">RTX 4090 Laptop, CUDA</td><td data-label="Asked through"><code>execute()</code></td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.59× (Q11) – 45.72× (Q9)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">On DuckDB 2 <code>avg</code> over <code>DECIMAL</code> is not rewritten, so Q1 stays on DuckDB. The CUDA row was taken on a machine doing other work, so read its ratios as approximate.</p>
+
+    <div class="tbl-wrap">
+      <table class="stack">
+        <caption>Earlier, for comparison: DuckDB 1.5.5 with the v0.7.0 release build of 2026-09-20, the same script and settings. There Q1 runs on the GPU as well.</caption>
         <thead>
           <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">Asked through</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
         </thead>
@@ -633,24 +650,11 @@ details td.num { font-size: .8rem; }
       </table>
     </div>
 
-    <div class="tbl-wrap">
-      <table class="stack">
-        <caption>DuckDB 2.0.1, through <code>execute()</code>, the same script. One more query stays on DuckDB there, because <code>avg</code> over <code>DECIMAL</code> is not rewritten on DuckDB 2.</caption>
-        <thead>
-          <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">DuckDB</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
-        </thead>
-        <tbody>
-          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">MacBook M4 Max, Metal</td><td data-label="DuckDB">2.0.1</td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.03× (Q11) – 30.39× (Q5)</td></tr>
-          <tr><th scope="row">SF10, 60M-row <code>lineitem</code></th><td data-label="Machine">RTX 4090 Laptop, CUDA</td><td data-label="DuckDB">2.0.1</td><td class="num" data-label="On the GPU">18 of 22</td><td class="num" data-label="Rows differing">0</td><td class="num hot" data-label="Speed-up">1.59× (Q11) – 45.72× (Q9)</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="note">The four that stay on DuckDB 2.0.1 are Q1 (<code>avg</code> over <code>DECIMAL</code>), Q2 and Q20 (correlated) and Q16 (its threshold). The CUDA row was taken on a machine doing other work, so read its ratios as approximate.</p>
 
     <div class="results-grid">
       <div class="panel">
         <div class="chart-head">
-          <h3 id="chart-h">Query by query, Apple M4 Max, DuckDB 1.5.5</h3>
+          <h3 id="chart-h">Query by query, Apple M4 Max, DuckDB 2.0.1</h3>
           <div class="seg" role="group" aria-label="Scale factor">
             <button type="button" data-sf="sf10" aria-pressed="true">SF10, 60M rows</button>
             <button type="button" data-sf="sf1" aria-pressed="false">SF1, 6M rows</button>
@@ -667,56 +671,56 @@ details td.num { font-size: .8rem; }
           <h4>TPC-H SF10 (60M-row <code>lineitem</code>)</h4>
           <div class="axis" aria-hidden="true"><span></span><span class="scale"><span class="tick" style="--p:0.000%">0.5×</span><span class="tick one" style="--p:14.286%">1×</span><span class="tick" style="--p:28.571%">2×</span><span class="tick" style="--p:42.857%">4×</span><span class="tick" style="--p:57.143%">8×</span><span class="tick" style="--p:71.429%">16×</span><span class="tick" style="--p:85.714%">32×</span><span class="tick" style="--p:100.000%">64×</span></span><span class="vh"><span>execute</span><span>sql</span></span></div>
           <ul class="chart" aria-label="Speed-up over native DuckDB per TPC-H query at SF10, execute() then sql()">
-<li class="row"><span class="q">Q1</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:41.881%"></span><span class="bar sq" style="--a:14.286%;--w:41.250%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>7.63×</span><span class="v sq"><span class="sr"> sql() </span>7.40×</span></span></li>
+<li class="row declined"><span class="q">Q1</span><span class="track"><span class="decl"><span>on DuckDB: avg over DECIMAL is not rewritten on DuckDB 2</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
 <li class="row declined"><span class="q">Q2</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:23.318%"></span><span class="bar sq" style="--a:14.286%;--w:22.156%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.10×</span><span class="v sq"><span class="sr"> sql() </span>2.93×</span></span></li>
-<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:58.537%"></span><span class="bar sq" style="--a:14.286%;--w:50.832%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>17.12×</span><span class="v sq"><span class="sr"> sql() </span>11.78×</span></span></li>
-<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:79.828%"></span><span class="bar sq" style="--a:14.286%;--w:67.456%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>48.10×</span><span class="v sq"><span class="sr"> sql() </span>26.39×</span></span></li>
-<li class="row"><span class="q">Q6</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:17.957%"></span><span class="bar sq" style="--a:14.286%;--w:18.384%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.39×</span><span class="v sq"><span class="sr"> sql() </span>2.44×</span></span></li>
-<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.418%"></span><span class="bar sq" style="--a:14.286%;--w:23.582%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.27×</span><span class="v sq"><span class="sr"> sql() </span>3.14×</span></span></li>
-<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:31.045%"></span><span class="bar sq" style="--a:14.286%;--w:30.861%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.51×</span><span class="v sq"><span class="sr"> sql() </span>4.47×</span></span></li>
-<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:62.079%"></span><span class="bar sq" style="--a:14.286%;--w:60.739%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>20.33×</span><span class="v sq"><span class="sr"> sql() </span>19.05×</span></span></li>
-<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:35.097%"></span><span class="bar sq" style="--a:14.286%;--w:34.947%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.49×</span><span class="v sq"><span class="sr"> sql() </span>5.45×</span></span></li>
-<li class="row"><span class="q">Q11</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:1.201%"></span><span class="bar sq loss" style="--a:12.567%;--w:1.718%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.06×</span><span class="v sq loss"><span class="sr"> sql() </span>0.92×</span></span></li>
-<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:27.944%"></span><span class="bar sq" style="--a:14.286%;--w:30.489%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.88×</span><span class="v sq"><span class="sr"> sql() </span>4.39×</span></span></li>
-<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.118%"></span><span class="bar sq" style="--a:14.286%;--w:50.497%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.84×</span><span class="v sq"><span class="sr"> sql() </span>11.59×</span></span></li>
-<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:39.325%"></span><span class="bar sq" style="--a:14.286%;--w:38.798%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.74×</span><span class="v sq"><span class="sr"> sql() </span>6.57×</span></span></li>
-<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:6.032%"></span><span class="bar sq" style="--a:14.286%;--w:6.935%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.34×</span><span class="v sq"><span class="sr"> sql() </span>1.40×</span></span></li>
+<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.937%"></span><span class="bar sq" style="--a:14.286%;--w:24.418%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.52×</span><span class="v sq"><span class="sr"> sql() </span>3.27×</span></span></li>
+<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.383%"></span><span class="bar sq" style="--a:14.286%;--w:43.985%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.98×</span><span class="v sq"><span class="sr"> sql() </span>8.45×</span></span></li>
+<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:70.365%"></span><span class="bar sq" style="--a:14.286%;--w:59.294%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>30.39×</span><span class="v sq"><span class="sr"> sql() </span>17.76×</span></span></li>
+<li class="row"><span class="q">Q6</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:13.764%"></span><span class="bar sq" style="--a:14.286%;--w:12.342%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.95×</span><span class="v sq"><span class="sr"> sql() </span>1.82×</span></span></li>
+<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.978%"></span><span class="bar sq" style="--a:14.286%;--w:19.851%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.36×</span><span class="v sq"><span class="sr"> sql() </span>2.62×</span></span></li>
+<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:28.260%"></span><span class="bar sq" style="--a:14.286%;--w:26.285%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.94×</span><span class="v sq"><span class="sr"> sql() </span>3.58×</span></span></li>
+<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:62.914%"></span><span class="bar sq" style="--a:14.286%;--w:59.037%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>21.17×</span><span class="v sq"><span class="sr"> sql() </span>17.54×</span></span></li>
+<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:38.892%"></span><span class="bar sq" style="--a:14.286%;--w:37.966%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.60×</span><span class="v sq"><span class="sr"> sql() </span>6.31×</span></span></li>
+<li class="row"><span class="q">Q11</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:0.609%"></span><span class="bar sq" style="--a:14.286%;--w:0.000%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.03×</span><span class="v sq"><span class="sr"> sql() </span>1.00×</span></span></li>
+<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:23.118%"></span><span class="bar sq" style="--a:14.286%;--w:23.908%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.07×</span><span class="v sq"><span class="sr"> sql() </span>3.19×</span></span></li>
+<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.570%"></span><span class="bar sq" style="--a:14.286%;--w:50.621%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>11.08×</span><span class="v sq"><span class="sr"> sql() </span>11.66×</span></span></li>
+<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:37.571%"></span><span class="bar sq" style="--a:14.286%;--w:34.254%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.19×</span><span class="v sq"><span class="sr"> sql() </span>5.27×</span></span></li>
+<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:8.765%"></span><span class="bar sq" style="--a:14.286%;--w:9.297%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.53×</span><span class="v sq"><span class="sr"> sql() </span>1.57×</span></span></li>
 <li class="row declined"><span class="q">Q16</span><span class="track"><span class="decl"><span>on DuckDB: its inner GROUP BY is below a measured threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:50.533%"></span><span class="bar sq" style="--a:14.286%;--w:50.515%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>11.61×</span><span class="v sq"><span class="sr"> sql() </span>11.60×</span></span></li>
-<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:51.773%"></span><span class="bar sq" style="--a:14.286%;--w:52.463%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>12.33×</span><span class="v sq"><span class="sr"> sql() </span>12.75×</span></span></li>
-<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:56.140%"></span><span class="bar sq" style="--a:14.286%;--w:55.326%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>15.24×</span><span class="v sq"><span class="sr"> sql() </span>14.65×</span></span></li>
+<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:43.838%"></span><span class="bar sq" style="--a:14.286%;--w:45.648%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>8.39×</span><span class="v sq"><span class="sr"> sql() </span>9.16×</span></span></li>
+<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:59.934%"></span><span class="bar sq" style="--a:14.286%;--w:57.852%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>18.32×</span><span class="v sq"><span class="sr"> sql() </span>16.56×</span></span></li>
+<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:36.512%"></span><span class="bar sq" style="--a:14.286%;--w:32.457%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.88×</span><span class="v sq"><span class="sr"> sql() </span>4.83×</span></span></li>
 <li class="row declined"><span class="q">Q20</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:38.258%"></span><span class="bar sq" style="--a:14.286%;--w:38.514%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.40×</span><span class="v sq"><span class="sr"> sql() </span>6.48×</span></span></li>
-<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:58.777%"></span><span class="bar sq" style="--a:14.286%;--w:55.171%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>17.32×</span><span class="v sq"><span class="sr"> sql() </span>14.54×</span></span></li>
+<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:26.227%"></span><span class="bar sq" style="--a:14.286%;--w:26.628%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.57×</span><span class="v sq"><span class="sr"> sql() </span>3.64×</span></span></li>
+<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:48.696%"></span><span class="bar sq" style="--a:14.286%;--w:51.806%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.62×</span><span class="v sq"><span class="sr"> sql() </span>12.35×</span></span></li>
           </ul>
         </div>
         <div class="chart-block" id="sf1">
           <h4>TPC-H SF1 (6M-row <code>lineitem</code>)</h4>
           <div class="axis" aria-hidden="true"><span></span><span class="scale"><span class="tick" style="--p:0.000%">0.5×</span><span class="tick one" style="--p:14.286%">1×</span><span class="tick" style="--p:28.571%">2×</span><span class="tick" style="--p:42.857%">4×</span><span class="tick" style="--p:57.143%">8×</span><span class="tick" style="--p:71.429%">16×</span><span class="tick" style="--p:85.714%">32×</span><span class="tick" style="--p:100.000%">64×</span></span><span class="vh"><span>execute</span><span>sql</span></span></div>
           <ul class="chart" aria-label="Speed-up over native DuckDB per TPC-H query at SF1, execute() then sql()">
-<li class="row"><span class="q">Q1</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:28.468%"></span><span class="bar sq" style="--a:14.286%;--w:25.100%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.98×</span><span class="v sq"><span class="sr"> sql() </span>3.38×</span></span></li>
+<li class="row declined"><span class="q">Q1</span><span class="track"><span class="decl"><span>on DuckDB: avg over DECIMAL is not rewritten on DuckDB 2</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
 <li class="row declined"><span class="q">Q2</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:21.220%"></span><span class="bar sq" style="--a:14.286%;--w:15.389%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.80×</span><span class="v sq"><span class="sr"> sql() </span>2.11×</span></span></li>
-<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:49.023%"></span><span class="bar sq" style="--a:14.286%;--w:28.571%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.79×</span><span class="v sq"><span class="sr"> sql() </span>4.00×</span></span></li>
-<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:36.825%"></span><span class="bar sq" style="--a:14.286%;--w:27.020%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.97×</span><span class="v sq"><span class="sr"> sql() </span>3.71×</span></span></li>
+<li class="row"><span class="q">Q3</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:20.623%"></span><span class="bar sq" style="--a:14.286%;--w:11.651%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.72×</span><span class="v sq"><span class="sr"> sql() </span>1.76×</span></span></li>
+<li class="row"><span class="q">Q4</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:33.740%"></span><span class="bar sq" style="--a:14.286%;--w:24.731%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.14×</span><span class="v sq"><span class="sr"> sql() </span>3.32×</span></span></li>
+<li class="row"><span class="q">Q5</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:33.498%"></span><span class="bar sq" style="--a:14.286%;--w:15.584%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>5.08×</span><span class="v sq"><span class="sr"> sql() </span>2.13×</span></span></li>
 <li class="row declined"><span class="q">Q6</span><span class="track"><span class="decl"><span>on DuckDB: its inner GROUP BY is below a measured threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.161%"></span><span class="bar sq" style="--a:14.286%;--w:16.062%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.39×</span><span class="v sq"><span class="sr"> sql() </span>2.18×</span></span></li>
-<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:29.080%"></span><span class="bar sq" style="--a:14.286%;--w:23.713%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.10×</span><span class="v sq"><span class="sr"> sql() </span>3.16×</span></span></li>
-<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:56.248%"></span><span class="bar sq" style="--a:14.286%;--w:44.082%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>15.32×</span><span class="v sq"><span class="sr"> sql() </span>8.49×</span></span></li>
-<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.582%"></span><span class="bar sq" style="--a:14.286%;--w:23.582%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.46×</span><span class="v sq"><span class="sr"> sql() </span>3.14×</span></span></li>
+<li class="row"><span class="q">Q7</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:23.972%"></span><span class="bar sq" style="--a:14.286%;--w:15.487%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.20×</span><span class="v sq"><span class="sr"> sql() </span>2.12×</span></span></li>
+<li class="row"><span class="q">Q8</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:25.463%"></span><span class="bar sq" style="--a:14.286%;--w:13.869%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.44×</span><span class="v sq"><span class="sr"> sql() </span>1.96×</span></span></li>
+<li class="row"><span class="q">Q9</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:50.247%"></span><span class="bar sq" style="--a:14.286%;--w:40.252%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>11.45×</span><span class="v sq"><span class="sr"> sql() </span>7.05×</span></span></li>
+<li class="row"><span class="q">Q10</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:31.763%"></span><span class="bar sq" style="--a:14.286%;--w:22.296%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.67×</span><span class="v sq"><span class="sr"> sql() </span>2.95×</span></span></li>
 <li class="row declined"><span class="q">Q11</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.544%"></span><span class="bar sq" style="--a:14.286%;--w:21.073%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.29×</span><span class="v sq"><span class="sr"> sql() </span>2.78×</span></span></li>
-<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:48.284%"></span><span class="bar sq" style="--a:14.286%;--w:46.377%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.41×</span><span class="v sq"><span class="sr"> sql() </span>9.49×</span></span></li>
-<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:28.050%"></span><span class="bar sq" style="--a:14.286%;--w:23.843%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.90×</span><span class="v sq"><span class="sr"> sql() </span>3.18×</span></span></li>
-<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:8.630%"></span><span class="bar sq" style="--a:14.286%;--w:6.488%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.52×</span><span class="v sq"><span class="sr"> sql() </span>1.37×</span></span></li>
+<li class="row"><span class="q">Q12</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:19.772%"></span><span class="bar sq" style="--a:14.286%;--w:15.487%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>2.61×</span><span class="v sq"><span class="sr"> sql() </span>2.12×</span></span></li>
+<li class="row"><span class="q">Q13</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:51.823%"></span><span class="bar sq" style="--a:14.286%;--w:48.618%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>12.36×</span><span class="v sq"><span class="sr"> sql() </span>10.58×</span></span></li>
+<li class="row"><span class="q">Q14</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.418%"></span><span class="bar sq" style="--a:14.286%;--w:20.241%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.27×</span><span class="v sq"><span class="sr"> sql() </span>2.67×</span></span></li>
+<li class="row"><span class="q">Q15</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:7.800%"></span><span class="bar sq" style="--a:14.286%;--w:8.765%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>1.46×</span><span class="v sq"><span class="sr"> sql() </span>1.53×</span></span></li>
 <li class="row declined"><span class="q">Q16</span><span class="track"><span class="decl"><span>on DuckDB: below a measured size threshold</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:24.731%"></span><span class="bar sq" style="--a:14.286%;--w:25.161%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.32×</span><span class="v sq"><span class="sr"> sql() </span>3.39×</span></span></li>
-<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:46.421%"></span><span class="bar sq" style="--a:14.286%;--w:40.913%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>9.51×</span><span class="v sq"><span class="sr"> sql() </span>7.28×</span></span></li>
-<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:40.046%"></span><span class="bar sq" style="--a:14.286%;--w:36.825%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.98×</span><span class="v sq"><span class="sr"> sql() </span>5.97×</span></span></li>
+<li class="row"><span class="q">Q17</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:27.997%"></span><span class="bar sq" style="--a:14.286%;--w:21.294%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>3.89×</span><span class="v sq"><span class="sr"> sql() </span>2.81×</span></span></li>
+<li class="row"><span class="q">Q18</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:45.308%"></span><span class="bar sq" style="--a:14.286%;--w:36.158%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>9.01×</span><span class="v sq"><span class="sr"> sql() </span>5.78×</span></span></li>
+<li class="row"><span class="q">Q19</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:30.395%"></span><span class="bar sq" style="--a:14.286%;--w:26.741%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.37×</span><span class="v sq"><span class="sr"> sql() </span>3.66×</span></span></li>
 <li class="row declined"><span class="q">Q20</span><span class="track"><span class="decl"><span>on DuckDB: a correlated inner statement that does not bind on its own</span></span></span><span class="vals"><span class="v">—</span><span class="v">—</span></span></li>
-<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:37.470%"></span><span class="bar sq" style="--a:14.286%;--w:23.252%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>6.16×</span><span class="v sq"><span class="sr"> sql() </span>3.09×</span></span></li>
-<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:41.195%"></span><span class="bar sq" style="--a:14.286%;--w:36.158%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>7.38×</span><span class="v sq"><span class="sr"> sql() </span>5.78×</span></span></li>
+<li class="row"><span class="q">Q21</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:29.280%"></span><span class="bar sq" style="--a:14.286%;--w:25.642%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>4.14×</span><span class="v sq"><span class="sr"> sql() </span>3.47×</span></span></li>
+<li class="row"><span class="q">Q22</span><span class="track"><span class="bar ex" style="--a:14.286%;--w:47.456%"></span><span class="bar sq" style="--a:14.286%;--w:39.749%"></span></span><span class="vals"><span class="v ex"><span class="sr"> execute() </span>10.00×</span><span class="v sq"><span class="sr"> sql() </span>6.88×</span></span></li>
           </ul>
         </div>
 
@@ -727,28 +731,28 @@ details td.num { font-size: .8rem; }
               <caption>SF10, milliseconds. Native is plain DuckDB; gpudb is the transparent path.</caption>
               <thead><tr><th scope="col">Query</th><th scope="col">Ran on</th><th scope="col" class="num">execute() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th><th scope="col" class="num">sql() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th></tr></thead>
               <tbody>
-<tr><th scope="row">Q1</th><td>GPU (plain)</td><td>109.5</td><td>14.3</td><td>7.63×</td><td>110.8</td><td>15.0</td><td>7.40×</td></tr>
-<tr><th scope="row">Q2</th><td>DuckDB (shape)</td><td>16.8</td><td>—</td><td>—</td><td>17.1</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>43.0</td><td>13.9</td><td>3.10×</td><td>43.3</td><td>14.8</td><td>2.93×</td></tr>
-<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>43.6</td><td>2.5</td><td>17.12×</td><td>44.1</td><td>3.7</td><td>11.78×</td></tr>
-<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>39.1</td><td>0.8</td><td>48.10×</td><td>39.9</td><td>1.5</td><td>26.39×</td></tr>
-<tr><th scope="row">Q6</th><td>GPU (projected)</td><td>14.0</td><td>5.9</td><td>2.39×</td><td>14.9</td><td>6.1</td><td>2.44×</td></tr>
-<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>35.8</td><td>11.0</td><td>3.27×</td><td>36.7</td><td>11.7</td><td>3.14×</td></tr>
-<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>35.7</td><td>7.9</td><td>4.51×</td><td>38.4</td><td>8.6</td><td>4.47×</td></tr>
-<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>112.4</td><td>5.5</td><td>20.33×</td><td>127.6</td><td>6.7</td><td>19.05×</td></tr>
-<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>76.8</td><td>14.0</td><td>5.49×</td><td>83.3</td><td>15.3</td><td>5.45×</td></tr>
-<tr><th scope="row">Q11</th><td>GPU (nested)</td><td>6.2</td><td>5.9</td><td>1.06×</td><td>6.6</td><td>7.2</td><td>0.92×</td></tr>
-<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>40.2</td><td>10.4</td><td>3.88×</td><td>46.9</td><td>10.7</td><td>4.39×</td></tr>
-<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>147.8</td><td>13.6</td><td>10.84×</td><td>161.5</td><td>13.9</td><td>11.59×</td></tr>
-<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>29.1</td><td>4.3</td><td>6.74×</td><td>31.9</td><td>4.8</td><td>6.57×</td></tr>
-<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>20.5</td><td>15.3</td><td>1.34×</td><td>22.2</td><td>15.9</td><td>1.40×</td></tr>
-<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>34.8</td><td>—</td><td>—</td><td>36.1</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>37.5</td><td>3.2</td><td>11.61×</td><td>42.9</td><td>3.7</td><td>11.60×</td></tr>
-<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>111.7</td><td>9.1</td><td>12.33×</td><td>121.7</td><td>9.5</td><td>12.75×</td></tr>
-<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>63.4</td><td>4.2</td><td>15.24×</td><td>67.6</td><td>4.6</td><td>14.65×</td></tr>
-<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>32.6</td><td>—</td><td>—</td><td>34.7</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>138.9</td><td>21.7</td><td>6.40×</td><td>145.0</td><td>22.4</td><td>6.48×</td></tr>
-<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>26.2</td><td>1.5</td><td>17.32×</td><td>27.7</td><td>1.9</td><td>14.54×</td></tr>
+<tr><th scope="row">Q1</th><td>DuckDB (shape)</td><td>54.2</td><td>—</td><td>—</td><td>55.9</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q2</th><td>DuckDB (shape)</td><td>8.7</td><td>—</td><td>—</td><td>9.8</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>30.4</td><td>8.6</td><td>3.52×</td><td>31.6</td><td>9.7</td><td>3.27×</td></tr>
+<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>30.8</td><td>2.8</td><td>10.98×</td><td>30.8</td><td>3.7</td><td>8.45×</td></tr>
+<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>34.1</td><td>1.1</td><td>30.39×</td><td>35.8</td><td>2.0</td><td>17.76×</td></tr>
+<tr><th scope="row">Q6</th><td>GPU (projected)</td><td>11.8</td><td>6.1</td><td>1.95×</td><td>12.3</td><td>6.7</td><td>1.82×</td></tr>
+<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>31.7</td><td>9.4</td><td>3.36×</td><td>32.3</td><td>12.3</td><td>2.62×</td></tr>
+<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>32.5</td><td>8.3</td><td>3.94×</td><td>36.9</td><td>10.3</td><td>3.58×</td></tr>
+<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>128.5</td><td>6.1</td><td>21.17×</td><td>138.3</td><td>7.9</td><td>17.54×</td></tr>
+<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>61.9</td><td>9.4</td><td>6.60×</td><td>77.7</td><td>12.3</td><td>6.31×</td></tr>
+<tr><th scope="row">Q11</th><td>GPU (nested)</td><td>6.4</td><td>6.3</td><td>1.03×</td><td>7.4</td><td>7.4</td><td>1.00×</td></tr>
+<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>32.6</td><td>10.6</td><td>3.07×</td><td>36.4</td><td>11.4</td><td>3.19×</td></tr>
+<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>132.1</td><td>11.9</td><td>11.08×</td><td>144.2</td><td>12.4</td><td>11.66×</td></tr>
+<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>28.9</td><td>4.7</td><td>6.19×</td><td>31.0</td><td>5.9</td><td>5.27×</td></tr>
+<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>19.5</td><td>12.7</td><td>1.53×</td><td>20.5</td><td>13.1</td><td>1.57×</td></tr>
+<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>35.7</td><td>—</td><td>—</td><td>38.8</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>31.2</td><td>3.7</td><td>8.39×</td><td>36.7</td><td>4.0</td><td>9.16×</td></tr>
+<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>99.7</td><td>5.4</td><td>18.32×</td><td>110.3</td><td>6.7</td><td>16.56×</td></tr>
+<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>26.9</td><td>4.6</td><td>5.88×</td><td>26.4</td><td>5.5</td><td>4.83×</td></tr>
+<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>32.6</td><td>—</td><td>—</td><td>32.6</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>72.1</td><td>20.2</td><td>3.57×</td><td>76.7</td><td>21.0</td><td>3.64×</td></tr>
+<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>19.3</td><td>1.8</td><td>10.62×</td><td>19.0</td><td>1.5</td><td>12.35×</td></tr>
               </tbody>
             </table>
           </div>
@@ -757,28 +761,28 @@ details td.num { font-size: .8rem; }
               <caption>SF1, milliseconds.</caption>
               <thead><tr><th scope="col">Query</th><th scope="col">Ran on</th><th scope="col" class="num">execute() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th><th scope="col" class="num">sql() native</th><th scope="col" class="num">gpudb</th><th scope="col" class="num">ratio</th></tr></thead>
               <tbody>
-<tr><th scope="row">Q1</th><td>GPU (plain)</td><td>12.7</td><td>3.2</td><td>3.98×</td><td>12.2</td><td>3.6</td><td>3.38×</td></tr>
-<tr><th scope="row">Q2</th><td>DuckDB (threshold)</td><td>4.3</td><td>—</td><td>—</td><td>4.4</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>5.9</td><td>2.1</td><td>2.80×</td><td>6.1</td><td>2.9</td><td>2.11×</td></tr>
-<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>6.0</td><td>0.6</td><td>10.79×</td><td>6.1</td><td>1.5</td><td>4.00×</td></tr>
-<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>6.8</td><td>1.1</td><td>5.97×</td><td>6.5</td><td>1.7</td><td>3.71×</td></tr>
-<tr><th scope="row">Q6</th><td>DuckDB (threshold)</td><td>1.8</td><td>—</td><td>—</td><td>1.7</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>6.8</td><td>2.0</td><td>3.39×</td><td>7.0</td><td>3.2</td><td>2.18×</td></tr>
-<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>6.0</td><td>1.5</td><td>4.10×</td><td>6.3</td><td>2.0</td><td>3.16×</td></tr>
-<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>18.1</td><td>1.2</td><td>15.32×</td><td>18.1</td><td>2.1</td><td>8.49×</td></tr>
-<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>13.0</td><td>3.8</td><td>3.46×</td><td>13.2</td><td>4.2</td><td>3.14×</td></tr>
-<tr><th scope="row">Q11</th><td>DuckDB (threshold)</td><td>2.6</td><td>—</td><td>—</td><td>2.6</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>5.1</td><td>1.6</td><td>3.29×</td><td>5.2</td><td>1.9</td><td>2.78×</td></tr>
-<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>18.0</td><td>1.7</td><td>10.41×</td><td>18.1</td><td>1.9</td><td>9.49×</td></tr>
-<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>5.3</td><td>1.4</td><td>3.90×</td><td>5.5</td><td>1.7</td><td>3.18×</td></tr>
-<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>3.2</td><td>2.1</td><td>1.52×</td><td>3.3</td><td>2.4</td><td>1.37×</td></tr>
-<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>11.9</td><td>—</td><td>—</td><td>12.7</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>4.6</td><td>1.4</td><td>3.32×</td><td>5.0</td><td>1.5</td><td>3.39×</td></tr>
-<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>13.9</td><td>1.5</td><td>9.51×</td><td>14.1</td><td>1.9</td><td>7.28×</td></tr>
-<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>10.0</td><td>1.4</td><td>6.98×</td><td>10.2</td><td>1.7</td><td>5.97×</td></tr>
-<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>7.3</td><td>—</td><td>—</td><td>7.5</td><td>—</td><td>—</td></tr>
-<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>20.0</td><td>3.2</td><td>6.16×</td><td>20.0</td><td>6.5</td><td>3.09×</td></tr>
-<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>8.0</td><td>1.1</td><td>7.38×</td><td>8.5</td><td>1.5</td><td>5.78×</td></tr>
+<tr><th scope="row">Q1</th><td>DuckDB (shape)</td><td>7.2</td><td>—</td><td>—</td><td>6.8</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q2</th><td>DuckDB (threshold)</td><td>3.4</td><td>—</td><td>—</td><td>3.8</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q3</th><td>GPU (plain)</td><td>5.3</td><td>2.0</td><td>2.72×</td><td>5.6</td><td>3.2</td><td>1.76×</td></tr>
+<tr><th scope="row">Q4</th><td>GPU (plain)</td><td>4.7</td><td>0.9</td><td>5.14×</td><td>5.0</td><td>1.5</td><td>3.32×</td></tr>
+<tr><th scope="row">Q5</th><td>GPU (plain)</td><td>5.8</td><td>1.1</td><td>5.08×</td><td>6.3</td><td>3.0</td><td>2.13×</td></tr>
+<tr><th scope="row">Q6</th><td>DuckDB (threshold)</td><td>1.6</td><td>—</td><td>—</td><td>2.1</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q7</th><td>GPU (plain)</td><td>6.5</td><td>2.0</td><td>3.20×</td><td>6.5</td><td>3.1</td><td>2.12×</td></tr>
+<tr><th scope="row">Q8</th><td>GPU (projected)</td><td>5.8</td><td>1.7</td><td>3.44×</td><td>6.1</td><td>3.1</td><td>1.96×</td></tr>
+<tr><th scope="row">Q9</th><td>GPU (plain)</td><td>17.9</td><td>1.6</td><td>11.45×</td><td>18.2</td><td>2.6</td><td>7.05×</td></tr>
+<tr><th scope="row">Q10</th><td>GPU (topk)</td><td>12.1</td><td>2.6</td><td>4.67×</td><td>12.7</td><td>4.3</td><td>2.95×</td></tr>
+<tr><th scope="row">Q11</th><td>DuckDB (threshold)</td><td>2.9</td><td>—</td><td>—</td><td>3.0</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q12</th><td>GPU (plain)</td><td>4.7</td><td>1.8</td><td>2.61×</td><td>4.8</td><td>2.3</td><td>2.12×</td></tr>
+<tr><th scope="row">Q13</th><td>GPU (nested)</td><td>18.7</td><td>1.5</td><td>12.36×</td><td>18.8</td><td>1.8</td><td>10.58×</td></tr>
+<tr><th scope="row">Q14</th><td>GPU (projected)</td><td>5.4</td><td>1.7</td><td>3.27×</td><td>5.8</td><td>2.2</td><td>2.67×</td></tr>
+<tr><th scope="row">Q15</th><td>GPU (nested)</td><td>3.1</td><td>2.1</td><td>1.46×</td><td>3.1</td><td>2.0</td><td>1.53×</td></tr>
+<tr><th scope="row">Q16</th><td>DuckDB (threshold)</td><td>12.3</td><td>—</td><td>—</td><td>12.6</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q17</th><td>GPU (projected)</td><td>5.2</td><td>1.3</td><td>3.89×</td><td>5.0</td><td>1.8</td><td>2.81×</td></tr>
+<tr><th scope="row">Q18</th><td>GPU (plain)</td><td>11.4</td><td>1.3</td><td>9.01×</td><td>11.6</td><td>2.0</td><td>5.78×</td></tr>
+<tr><th scope="row">Q19</th><td>GPU (projected)</td><td>7.0</td><td>1.6</td><td>4.37×</td><td>7.4</td><td>2.0</td><td>3.66×</td></tr>
+<tr><th scope="row">Q20</th><td>DuckDB (shape)</td><td>7.0</td><td>—</td><td>—</td><td>7.5</td><td>—</td><td>—</td></tr>
+<tr><th scope="row">Q21</th><td>GPU (plain)</td><td>10.1</td><td>2.4</td><td>4.14×</td><td>12.3</td><td>3.5</td><td>3.47×</td></tr>
+<tr><th scope="row">Q22</th><td>GPU (plain)</td><td>9.6</td><td>1.0</td><td>10.00×</td><td>10.0</td><td>1.5</td><td>6.88×</td></tr>
               </tbody>
             </table>
           </div>
@@ -788,9 +792,9 @@ details td.num { font-size: .8rem; }
       <aside class="panel cond" aria-labelledby="cond-h">
         <h3 id="cond-h">Conditions</h3>
         <dl>
-          <div><dt>Machine</dt><dd>Apple M4 Max, Metal, macOS 26.6.2</dd></div>
-          <div><dt>Build</dt><dd>v0.7.0 release build, 2026-09-20, commit <code>98b19c2</code></dd></div>
-          <div><dt>DuckDB</dt><dd>1.5.5, Python 3.13.9</dd></div>
+          <div><dt>Machine</dt><dd>Apple M4 Max, Metal, macOS 27.2.1</dd></div>
+          <div><dt>Build</dt><dd>pip <code>duckdb-gpudb</code> 0.7.2 from PyPI, 2026-11-25; the wheel bundles the v0.7.0 extension binary</dd></div>
+          <div><dt>DuckDB</dt><dd>2.0.1, Python 3.13.9</dd></div>
           <div><dt>Runs</dt><dd>N=5, default memory budget, thresholds on</dd></div>
           <div><dt>Correctness</dt><dd>Every row compared with native before any time was counted: 0 rows differing</dd></div>
           <div><dt>Scale</dt><dd>Speed-up over native DuckDB on a log scale; the line marks 1.0×</dd></div>
@@ -802,15 +806,15 @@ details td.num { font-size: .8rem; }
       <div>
         <h3>Where it stays on DuckDB</h3>
         <ul class="plain-list">
-          <li><strong>At SF10, three queries.</strong> Q2 and Q20 each read a subquery from inside another subquery; the inner statement is correlated and does not bind on its own, so there is nothing to hand the device. Q16's inner <code>GROUP BY</code> declines on its own threshold; forced past it, Q16 measures <span class="loss-t">0.02–0.08×</span>.</li>
-          <li><strong>At SF1, five.</strong> Those three, plus Q6 and Q11, which sit below the measured size floors at 6M rows. The CUDA machine declines the same five at SF1.</li>
+          <li><strong>At SF10, four queries.</strong> Q1 uses <code>avg</code> over <code>DECIMAL</code>, which is not rewritten on DuckDB 2. Q2 and Q20 each read a subquery from inside another subquery; the inner statement is correlated and does not bind on its own, so there is nothing to hand the device. Q16's inner <code>GROUP BY</code> declines on its own threshold; forced past it on the v0.7.0 build, Q16 measured <span class="loss-t">0.02–0.08×</span>.</li>
+          <li><strong>At SF1, six.</strong> Those four, plus Q6 and Q11, which sit below the measured size floors at 6M rows.</li>
           <li>Each of them runs on DuckDB unchanged, at DuckDB's speed.</li>
         </ul>
       </div>
       <div>
         <h3>Results at or below 1.0×</h3>
         <ul class="plain-list">
-          <li><strong>Q11 at SF10 on Metal straddles parity.</strong> A 6–7&nbsp;ms statement: 1.06× through <code>execute()</code> and <span class="loss-t">0.92×</span> through <code>sql()</code> in the timed run, 1.06× and <span class="loss-t">0.89×</span> in two immediate re-runs of the same build. This is the case the per-process measured rule exists to settle.</li>
+          <li><strong>Q11 at SF10 on Metal sits at parity.</strong> A 6–7&nbsp;ms statement: 1.03× through <code>execute()</code> and 1.00× through <code>sql()</code> on DuckDB 2.0.1. On DuckDB 1.5.5 with the v0.7.0 build it measured 1.06× and <span class="loss-t">0.92×</span>, then 1.06× and <span class="loss-t">0.89×</span> in two immediate re-runs. This is the case the per-process measured rule exists to settle.</li>
           <li><strong>TPC-H Q1 on CUDA</strong> first measured <span class="loss-t">0.96×</span> and <span class="loss-t">0.98×</span> on the release build: a few-group key was being answered by sorting the whole column. CUDA got a direct grouped reduce for such keys, and Q1 now measures 1.99× through <code>execute()</code> and 2.07× through <code>sql()</code>.</li>
           <li><strong>A predicate that matches nothing</strong>, on CUDA at SF1: 0.76&nbsp;ms on the device against 0.21&nbsp;ms native, <span class="loss-t">0.28×</span>. DuckDB skips the table through its zone maps; the measured rule declines it after one run.</li>
         </ul>
