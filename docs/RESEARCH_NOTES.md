@@ -6226,6 +6226,21 @@ two fixes reverted. `scripts/tpch_coverage.py`, DuckDB 2.0.1, N=5: SF1 16 of
 pushed top-k), 0 rows differing, no query below 1.0× (SF1 1.60× to 11.46×,
 SF10 1.08× to 26.19×).
 
+## 2026-11-26 — pip 0.7.3: the NULL-order fix as its own release
+
+The package version moves 0.7.2 -> 0.7.3 (`python/pyproject.toml`,
+`gpudb.__version__`). It carries the two NULL-order fixes of the entry above
+and nothing else. The extension is not rebuilt: the registry keeps serving
+v0.7.1, and the platform wheels bundle the same v0.7.0 binary the 0.7.1 and
+0.7.2 wheels did, so the only difference between the packages is the Python
+tree. It is released on its own, a day after 0.7.2, because 0.7.2 returns
+rows that differ from native for a statement with an explicit NULL order run
+a second time with new literals, and for a top-k over a sum / min / max with
+NULLs first. Docs that name the current package version follow; statements
+about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
+`BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
+changes no measured statement. Not yet run on the NVIDIA machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

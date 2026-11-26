@@ -2,7 +2,34 @@
 
 What shipped in each release, newest first.
 
-### Latest — pip 0.7.2 (2026-11-25)
+### Latest — pip 0.7.3 (2026-11-26)
+
+- [x] **An explicit NULL order survives a re-render** (pip `duckdb-gpudb`
+  0.7.3) — `json_serialize_sql` writes the NULL order as `NULLS FIRST` /
+  `NULLS LAST`, and the Python renderer read only `NULLS_FIRST` /
+  `NULLS_LAST`. The first run of a statement was right; run again with
+  different literals, an explicit NULL order was dropped and the NULL group
+  came back where `default_null_order` puts it. Both spellings are now read.
+- [x] **A top-k with NULLs first keeps the NULL group** — `ORDER BY sum(x)
+  DESC NULLS FIRST LIMIT k` (and `ASC NULLS FIRST`, `min` / `max`, and NULLs
+  first through `default_null_order`) came back without the group whose
+  aggregate is NULL: the device top-k ranks a NULL aggregate after every
+  value. That top-k is no longer pushed; the GROUP BY can still run on the
+  device, with DuckDB ordering and limiting the groups.
+- [x] **Who it affects** — only statements with an explicit NULL order or a
+  non-default `default_null_order`; statements with NULLs last (DuckDB's
+  default) were already exact. Anyone who writes `NULLS FIRST` /
+  `NULLS LAST` or sets `default_null_order` should upgrade. A corpus of 55
+  statement templates under 5 order settings with 3 literal sets each: 184 of
+  825 runs differed from native on 0.7.2, 0 on 0.7.3. Wrapper suite: 1408
+  checks on DuckDB 2.0.1 and 2.0.0, 1438 on 1.5.6, 0 failures. TPC-H coverage
+  is unchanged (SF1 16 of 22, SF10 18 of 22 on DuckDB 2.0.1, no rows that
+  differ).
+- [x] **Versions** — wrapper only. The extension stays at v0.7.1 in the
+  community registry; the pip 0.7.3 platform wheels bundle the same v0.7.0
+  extension binary as pip 0.7.1 and 0.7.2.
+
+### pip 0.7.2 (2026-11-25)
 
 - [x] **DuckDB 2.0.1 in the Python wrapper** (pip `duckdb-gpudb` 0.7.2) —
   DuckDB 2.0.1 lists the TIMESTAMP WITH TIME ZONE overloads of `+`, `-`,
