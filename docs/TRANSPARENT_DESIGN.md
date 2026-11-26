@@ -1384,7 +1384,7 @@ boundary and a tie *inside* the top k, where the row set is right and the order
 is not. The wrapper answers the user's original statement on DuckDB when it sees
 that marker, with `reason = "ties"`.
 
-Five properties worth stating, because each was a decision:
+Six properties worth stating, because each was a decision:
 
 - **It is decided against the data, per execution**, not cached as a shape. The
   decline follows the *literals*: `LIMIT 4` and `LIMIT 5` share a template and
@@ -1423,6 +1423,25 @@ Five properties worth stating, because each was a decision:
   §3.3 has the path-measured rule that goes with it.
 - **An `ORDER BY` that is already total** (`ORDER BY qty DESC, k`) is not pushed
   as a top-k at all and keeps the device.
+- **A NULL aggregate ranks last on the device, so only NULLs-last orders are
+  pushed.** The device top-k (`gpu_groupby_exact_resident[_where]_topk`, the
+  `topk` filter of `gpu_groupby_exact_multi`) ranks a group whose `sum` / `min`
+  / `max` is NULL after every value, in either direction. Where the `ORDER BY`
+  item puts NULLs last — DuckDB's default — that is native's order: a NULL group
+  that fills one of the k rows comes back last, and NULL groups that tie at the
+  boundary go to DuckDB through the guard above. An item that puts NULLs first —
+  `NULLS FIRST` written out, or `default_null_order` set to `nulls_first`,
+  `nulls_first_on_asc_last_on_desc` under `ASC` or
+  `nulls_last_on_asc_first_on_desc` under `DESC` (`_rewrite.nulls_sort_first`) —
+  is not pushed when the ordering value is a `sum`, `min` or `max`: the matcher
+  declines the top-k, and the split (§4.11) may still answer the GROUP BY on the
+  device with DuckDB ordering and limiting the groups (form `projected`).
+  `count(v)` and `count(*)` are never NULL and keep the push in either order.
+  Before this rule, pip 0.7.2 on DuckDB 2.0.1 answered `SELECT g, sum(x) AS s
+  FROM t GROUP BY g ORDER BY s DESC NULLS FIRST LIMIT 3` (2M rows, 200K groups,
+  one group's `x` all NULL) with the three largest sums and without the NULL
+  group native returns first, and the same for `min` / `max`, a DECIMAL payload,
+  a computed lane, several payloads and a key join.
 
 Not covered: a `LIMIT` whose top-k is not pushed — a `HAVING` beside it, an
 `avg` or a temporal ordering value, `ORDER BY count(*)` over a v0.6 sum set —

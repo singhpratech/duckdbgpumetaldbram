@@ -2457,6 +2457,7 @@ def run():
     extension_version_checks()
     extension_age_checks()
     few_group_string_key_checks()
+    null_order_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -3422,6 +3423,128 @@ def few_group_string_key_checks():
     for backend in ("METAL", "CUDA"):
         ok_int, _ = _th.decide(backend, **{**shape, "string_key": False})
         check(not ok_int, f"{backend}: a 3-group INTEGER key is declined, as before")
+
+
+# k is NULL on one row in 101; v2 is NULL exactly on those rows (so the NULL-key
+# group is the one group whose sum(v2) is NULL), v3 / d3 exactly on the rows of
+# key 5 (the one group whose sum(v3) / sum(d3) is NULL, and it survives an inner
+# join on k). Every non-NULL aggregate below is distinct per group: no ties.
+NULL_ORDER_SETUP = """
+CREATE TABLE tno AS SELECT CASE WHEN i % 101 = 0 THEN NULL ELSE i % 37 END::INTEGER AS k,
+                           (i % 1000)::BIGINT AS v, (i % 10)::INTEGER AS w,
+                           CASE WHEN i % 101 = 0 THEN NULL ELSE i END::BIGINT AS v2,
+                           CASE WHEN i % 101 <> 0 AND i % 37 = 5 THEN NULL ELSE i END::BIGINT AS v3,
+                           CASE WHEN i % 101 <> 0 AND i % 37 = 5 THEN NULL ELSE i / 100 END::DECIMAL(15,2) AS d3
+                    FROM range(300000) r(i);
+CREATE TABLE dno AS SELECT i::INTEGER AS k, (i % 4)::INTEGER AS cat FROM range(37) r(i);
+"""
+
+
+def null_order_checks():
+    """An explicit NULL order survives every renderer, and a pushed top-k never
+    loses a NULL aggregate.
+
+    `json_serialize_sql` spells the null order `NULLS FIRST` / `NULLS LAST`
+    (with a space) on 1.4.5, 1.5.6 and 2.0.1, and the Python renderer — which
+    draws a decided template again for new literals — only knew the underscore
+    spelling, so from the second literal set on the NULL group moved to
+    DuckDB's default place. Each statement runs with three literal sets: the
+    first is drawn by the extension's renderer, the others by the Python one.
+
+    The device top-k ranks a NULL sum / min / max after every value in either
+    direction. With NULLs ordered first (explicitly, or by default_null_order)
+    the NULL group native puts first was missing, so that statement is not
+    pushed as a top-k; with NULLs last the push is native's order, including a
+    k above the number of non-NULL groups, and stays."""
+    from gpudb import _rewrite as _rw
+
+    print("== NULL order: both spellings, every renderer, top-k over a NULL aggregate")
+    check(_rw._order_suffix("ASCENDING", "NULLS FIRST") == " ASC NULLS FIRST"
+          and _rw._order_suffix("DESCENDING", "NULLS LAST") == " DESC NULLS LAST"
+          and _rw._order_suffix("ORDER_DEFAULT", "NULLS_FIRST") == " NULLS FIRST"
+          and _rw._order_suffix("ORDER_DEFAULT", "ORDER_DEFAULT") == "",
+          "the ORDER BY suffix reads the tree's spelling and the setting's")
+    nsf = getattr(_rw, "nulls_sort_first", None)
+    check(nsf is not None
+          and nsf("DESCENDING", "NULLS FIRST", "NULLS_LAST")
+          and not nsf("DESCENDING", "ORDER_DEFAULT", "NULLS_LAST")
+          and nsf("ASCENDING", "ORDER_DEFAULT", "NULLS_FIRST")
+          and nsf("ASC", "ORDER_DEFAULT", "NULLS_FIRST_ON_ASC_LAST_ON_DESC")
+          and not nsf("DESC", "ORDER_DEFAULT", "NULLS_FIRST_ON_ASC_LAST_ON_DESC")
+          and nsf("DESC", "ORDER_DEFAULT", "NULLS_LAST_ON_ASC_FIRST_ON_DESC")
+          and not nsf("ASCENDING", "NULLS LAST", "NULLS_FIRST"),
+          "where NULLs sort is read from the item, then from default_null_order")
+    probe = fresh()
+    if not has_device(probe) or not getattr(probe, "_exact", False):
+        skip("NULL order on the device: needs the exact path on a GPU backend")
+        probe.close()
+        return
+    probe.close()
+    PUSHED, NOT_PUSHED = "topk", "-topk"
+    cases = [
+        # an explicit NULL order on the key, re-drawn by the Python renderer
+        ("", "SELECT k, sum(v) AS sv FROM tno WHERE w < {} GROUP BY k ORDER BY k NULLS FIRST", "plain"),
+        ("", "SELECT k, sum(v) AS sv FROM tno WHERE w < {} GROUP BY k ORDER BY k DESC NULLS FIRST", "plain"),
+        # NULLS LAST is the default, so it is pinned where the setting says otherwise
+        ("SET default_null_order = 'nulls_first'",
+         "SELECT k, sum(v) AS sv FROM tno WHERE w < {} GROUP BY k ORDER BY k DESC NULLS LAST", "plain"),
+        ("SET default_null_order = 'nulls_first'",
+         "SELECT k, count(*) AS c FROM tno WHERE w < {} GROUP BY k ORDER BY k ASC NULLS LAST", "plain"),
+        # an ORDER BY on the aggregate beside a HAVING is not pushed: DuckDB orders the groups
+        ("", "SELECT k, sum(v3) AS s FROM tno WHERE w < {} GROUP BY k HAVING count(*) > 100 "
+             "ORDER BY s DESC NULLS FIRST LIMIT 4", "having"),
+        # a NULL aggregate ordered first: sum, min, max, DECIMAL, a computed lane, several
+        # payloads, a join, and NULLs first by default_null_order
+        ("", "SELECT k, sum(v2) AS sv FROM tno WHERE w < {} GROUP BY k ORDER BY sv DESC NULLS FIRST LIMIT 5", NOT_PUSHED),
+        ("", "SELECT k, min(v3) AS m FROM tno WHERE w < {} GROUP BY k ORDER BY m ASC NULLS FIRST LIMIT 3", NOT_PUSHED),
+        ("SET default_null_order = 'nulls_first'",
+         "SELECT k, max(v2) AS m FROM tno WHERE w < {} GROUP BY k ORDER BY m LIMIT 3", NOT_PUSHED),
+        ("SET default_null_order = 'nulls_last_on_asc_first_on_desc'",
+         "SELECT k, max(v3) AS m FROM tno WHERE w < {} GROUP BY k ORDER BY m DESC LIMIT 3", NOT_PUSHED),
+        ("", "SELECT k, sum(d3) AS s FROM tno WHERE w < {} GROUP BY k ORDER BY s DESC NULLS FIRST LIMIT 3", NOT_PUSHED),
+        ("", "SELECT k, sum(v3 * 2 + w) AS s FROM tno WHERE w < {} GROUP BY k ORDER BY s DESC NULLS FIRST LIMIT 3",
+         NOT_PUSHED),
+        ("", "SELECT k, sum(v) AS sv, sum(v3) AS s FROM tno WHERE w < {} GROUP BY k "
+             "ORDER BY s ASC NULLS FIRST LIMIT 3", NOT_PUSHED),
+        ("", "SELECT dno.k, sum(tno.v3) AS s FROM tno JOIN dno ON tno.k = dno.k WHERE tno.w < {} "
+             "GROUP BY dno.k ORDER BY s DESC NULLS FIRST LIMIT 3", NOT_PUSHED),
+        # NULLs last: the push is native's order, the NULL group last — also when k is above
+        # the number of non-NULL groups (three groups, one NULL, k >= 4)
+        ("", "SELECT k, sum(v3) AS s FROM tno WHERE k IN (1, 2, 5) GROUP BY k ORDER BY s DESC LIMIT {}", PUSHED),
+        ("", "SELECT k, sum(v3) AS s FROM tno WHERE k IN (1, 2, 5) GROUP BY k ORDER BY s ASC LIMIT {}", PUSHED),
+        ("", "SELECT k, max(d3) AS m FROM tno WHERE k IN (1, 2, 5) GROUP BY k ORDER BY m DESC NULLS LAST LIMIT {}",
+         PUSHED),
+        ("", "SELECT dno.k, sum(tno.v3) AS s FROM tno JOIN dno ON tno.k = dno.k WHERE dno.k IN (1, 2, 5) "
+             "GROUP BY dno.k ORDER BY s DESC LIMIT {}", PUSHED),
+        # count is never NULL: the group whose v3 is all NULL counts 0, and the push stays
+        ("", "SELECT k, count(v3) AS c FROM tno WHERE w < {} GROUP BY k ORDER BY c ASC NULLS FIRST LIMIT 1", PUSHED),
+    ]
+    for setting, tmpl, form in cases:
+        con = fresh()
+        con.execute(NULL_ORDER_SETUP)
+        ref = duckdb.connect()                 # SET default_null_order is global to its database
+        ref.execute(SETUP)
+        ref.execute(NULL_ORDER_SETUP)
+        if setting:
+            con.execute(setting)
+            ref.execute(setting)
+        lits = (4, 5, 6) if tmpl.endswith("LIMIT {}") else (3, 4, 5)
+        for lit in lits:
+            sql = tmpl.format(lit)
+            got = con.execute(sql).fetchall()
+            lr = con.last_rewrite()
+            want = ref.execute(sql).fetchall()
+            what = f"{setting[24:] or 'defaults'}; {sql[sql.index(' FROM '):][-64:]}"
+            check(got == want, f"NULL order, literal {lit}: rows are native's ({what})")
+            if form == NOT_PUSHED:
+                check(lr["form"] != "topk",
+                      f"NULL order, literal {lit}: a NULL aggregate ordered first is not a pushed top-k "
+                      f"({lr['form'] or lr['reason']})")
+            else:
+                check(lr["rewritten"] and lr["form"] == form,
+                      f"NULL order, literal {lit}: rewritten as {form} ({lr['form'] or lr['reason']}, {lr['engine']})")
+        ref.close()
+        con.close()
 
 
 def extension_age_checks():
