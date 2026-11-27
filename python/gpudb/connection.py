@@ -2712,6 +2712,7 @@ class Connection:
             return None
         plan.val_types, plan.scales = cached.val_types, cached.scales
         plan.keys, plan.key_types, plan.pack, plan.dict_key = cached.keys, cached.key_types, cached.pack, cached.dict_key
+        _rewrite.key_predicate_columns(plan)
         if plan.pred_cols != cached.pred_cols:
             return None
         if plan.form == "topk" and cached.form != "topk":
@@ -2892,7 +2893,9 @@ class Connection:
             self._log("floor: " + self._inner_admit)
         # NULLs and the overflow bound from zonemap statistics
         stats: Dict[str, Dict[str, Any]] = {}
-        stat_cols = list(plan.keys or [plan.key]) + ([plan.val] if plan.val else []) + list(plan.pred_cols)
+        # a key column can also be a predicate column (key_predicate_columns): probe it once
+        stat_cols = list(dict.fromkeys(list(plan.keys or [plan.key]) + ([plan.val] if plan.val else [])
+                                       + list(plan.pred_cols)))
         for col in stat_cols:
             if col in computed:
                 st = None

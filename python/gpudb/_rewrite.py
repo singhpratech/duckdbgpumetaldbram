@@ -108,7 +108,10 @@ class Plan:
     dict_key: bool = False             # key is a hashed tuple with a dictionary (any VARCHAR component, §4.5)
     decode_per_key: bool = False       # few groups expected out of a large dictionary: decode each key on its own
     where: List[WhereTerm] = field(default_factory=list)
-    pred_cols: List[str] = field(default_factory=list)   # WHERE columns other than key/payload, first-appearance order
+    # WHERE columns read through a lane of their own, first-appearance order: the
+    # columns other than the key / payload, plus a key column that must not be
+    # read through the key lane (key_predicate_columns)
+    pred_cols: List[str] = field(default_factory=list)
     pred_types: Dict[str, str] = field(default_factory=dict)
     topk_agg: str = ""                 # aggregate kind the top-k push orders by
     guards: List[Tuple[str, str]] = field(default_factory=list)   # joined set (§4.8): (base tag, table fqn) per table
@@ -587,6 +590,37 @@ def decimal_scale(t: str) -> Optional[Tuple[int, int]]:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def key_predicate_columns(plan: Plan) -> None:
+    """Which GROUP BY key columns a WHERE term reads through a predicate lane of
+    their own instead of the key lane. Called by check_types and, for a
+    template re-planned for new literals, by Connection._replan_literals — the
+    same rule both times, so a re-planned plan names the same predicate columns
+    as the cached one (when they differ the re-plan declines).
+
+    - A dictionary key of several components, or of one non-VARCHAR component
+      (DECIMAL): the key lane holds the hashed tuple TEXT, which a numeric
+      literal cannot be compared with, and a component is read back from the
+      dictionary. A WHERE on a component reads that component's own lane.
+    - A single VARCHAR key (a column, or a computed VARCHAR expression): the
+      lane holds its tuple text too, and a NULL key is the text 'N' there — a
+      valid cell, not a NULL one. `=` and `IN` against that lane are right (no
+      literal's tuple text is 'N'), but `<>` keeps the NULL-key rows native
+      drops and IS [NOT] NULL reads a validity bit that is always set. When the
+      WHERE has such a term, the key column (or expression) becomes a predicate
+      column too, and every term on it reads that lane, whose NULLs are NULL:
+      _lane_of looks predicate lanes up first, and so does gpu_rewrite_ast,
+      which reads them from the tag."""
+    if not plan.dict_key:
+        return
+    if len(plan.keys) > 1 or plan.key_type not in _STRING_TYPES:
+        for kc in plan.keys:
+            if any(w.col == kc for w in plan.where) and kc not in plan.pred_cols:
+                plan.pred_cols.append(kc)
+    elif plan.key not in plan.pred_cols \
+            and any(w.col == plan.key and w.op in ("<>", "isnull", "isnotnull") for w in plan.where):
+        plan.pred_cols.append(plan.key)
+
+
 def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
                 avg_float_bits: int = 0) -> None:
     plan.exact = exact
@@ -610,12 +644,7 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
     plan.dict_key = any(t in _STRING_TYPES or decimal_scale(t) for t in plan.key_types) or len(plan.keys) > 3
     if plan.dict_key and not exact:
         raise Decline("shape", "a dictionary key needs the exact path")
-    if plan.dict_key and (len(plan.keys) > 1 or plan.key_type not in _STRING_TYPES):
-        # components of a hashed tuple key are read back from the dictionary; a
-        # WHERE on one goes through its own lane, so they are predicate columns
-        for kc in plan.keys:
-            if any(w.col == kc for w in plan.where) and kc not in plan.pred_cols:
-                plan.pred_cols.append(kc)
+    key_predicate_columns(plan)
     for c in plan.pred_cols:
         pt = columns.get(c)
         if pt is None:
@@ -773,8 +802,14 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
-    """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col and col == plan.key and len(plan.keys) == 1 and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
+    """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'.
+
+    A column with its own predicate lane is read there before anything else —
+    the key included (key_predicate_columns), which is the order
+    gpu_rewrite_ast's lane_of uses: it looks a column up among the tag's
+    predicate lanes first."""
+    if col and col == plan.key and len(plan.keys) == 1 and col not in plan.pred_cols \
+            and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
         return "k", ("s" if plan.dict_key else "i"), 0
     if col == plan.val:
         return "v", "i", plan.scale
