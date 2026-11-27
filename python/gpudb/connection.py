@@ -101,7 +101,46 @@ REASONS = ("shape", "not_resident", "threshold", "backend", "double", "nulls", "
            # rows inside the top k — equal on the value the ORDER BY names, so
            # which rows come back, and in what order, is DuckDB's to choose
            # (_rewrite.ties_qualify). Decided per execution, on the data.
-           "ties")
+           "ties",
+           # 'settings' (§5.11): a setting in force on this connection is one
+           # the device path does not reproduce — it overrides, for itself, a
+           # setting that decides the values a computed lane, a join or a
+           # sentinel holds (the resident sets are built under the database's
+           # value), or it folds the column names (preserve_identifier_case)
+           "settings")
+
+# §5.11: the DuckDB settings a rewrite decision, its rendering or the values a
+# resident lane holds can depend on, read in ONE round trip before every
+# statement about to run on the device. Several are database-wide (a plain SET
+# on any connection of the database moves them for all: default_collation,
+# default_order, default_null_order, old_implicit_casting — measured on 1.5.6,
+# 2.0.0 and 2.0.1), and every one of them can be moved for every connection
+# by SET GLOBAL; so what the wrapper saw its own cursor do is not enough. A
+# name the running DuckDB does not know is left out of the read (probed once
+# per connection family). search_path and the current database are read
+# with them: they are connection-local, but `con._raw` changes them where the
+# wrapper does not look. TimeZone / Calendar are NOT read: no time-zone-aware
+# value reaches the device (every such key, predicate and expression
+# declines, _check_bound), so neither can move an answer the device gives.
+_SETTINGS_READ = ("default_order", "default_null_order", "default_collation", "search_path",
+                  "integer_division", "ieee_floating_point_ops", "error_on_division_by_zero",
+                  "regex_match_operator_semantics", "old_implicit_casting",
+                  "dialect_compatibility_mode", "legacy_disable_null_type", "preserve_identifier_case")
+# ... and the ones that decide the VALUE of a lane computed on the upload
+# cursor: a computed lane, a join's materialisation and a subquery sentinel are
+# SQL that DuckDB parses and evaluates there (`/` is `//` under
+# integer_division, `~` binds a full or a partial match, a division by zero is
+# NULL, an error or an infinity, a string comparison follows the collation).
+# Plain column lanes are casts of a column and depend on none of them.
+_LANE_SETTINGS = ("default_collation", "integer_division", "ieee_floating_point_ops",
+                  "error_on_division_by_zero", "regex_match_operator_semantics", "old_implicit_casting",
+                  "dialect_compatibility_mode", "legacy_disable_null_type")
+
+
+class _SettingsMoved(Exception):
+    """Raised inside one statement's decision when the settings in force on
+    the connection are no longer the ones its caches were filled under; the
+    statement is decided again from scratch (`_route`)."""
 
 
 def _host_memory_bytes() -> int:
@@ -401,6 +440,17 @@ class Connection:
         self._select_template: Optional[dict] = None
         self._settings: Dict[str, str] = {}
         self._settings_key = ""
+        # §5.11: the settings row this connection's caches were filled under,
+        # the read that produces it, and the family's settings generation
+        # (bumped on the root by any cursor that ran a SET, so its siblings
+        # re-read before their next statement without a round trip of their own)
+        self._settings_row: tuple = ()
+        self._settings_sql = ""
+        self._settings_names: Tuple[str, ...] = ()
+        self._settings_gen = 0
+        self._settings_seen = 0
+        self._stmt_settings: Optional[tuple] = None   # this statement's read, taken at most once
+        self._settings_ms = 0.0                        # ... and what it cost
         self._backend = ""
         self._backend_note = ""          # why there is no backend, when there is none
         self._has_rewrite_scalar = False
@@ -412,7 +462,13 @@ class Connection:
         if _parent is None:
             self._manager = ResidencyManager(lambda: self._raw.cursor(), mode=residency,
                                              idle_ms=idle_ms, log=self._log)
+            self._settings_names, self._settings_sql = self._settings_query()
             self._refresh_settings()
+            # §5.11: the lane settings the resident sets are built under — the
+            # database's at connect — pinned on the upload cursor
+            self._lane_env: Dict[str, Any] = self._lane_values(self._settings)
+            self._lane_env_version = 1
+            self._manager.set_session_env(self._lane_env_sql(self._lane_env), self._lane_env_version)
             self._probe_extension()
             self._read_only = bool(read_only)
             self._watch_files = self._watched_files()
@@ -423,8 +479,12 @@ class Connection:
             self._manager.memory_budget = budget or None       # 0 = no cap
         else:
             self._manager = _parent._manager
-            self._settings = dict(_parent._settings)
-            self._settings_key = _parent._settings_key
+            self._settings_names, self._settings_sql = _parent._settings_names, _parent._settings_sql
+            # A cursor is a connection of its own: a setting the parent set
+            # for its session only is not this cursor's, and a database-wide
+            # one may have moved since the parent last looked. So it reads.
+            self._refresh_settings()
+            self._settings_seen = self._root()._settings_gen
             self._backend = _parent._backend
             self._backend_note = getattr(_parent, "_backend_note", "")
             self._has_rewrite_scalar = _parent._has_rewrite_scalar
@@ -540,18 +600,157 @@ class Connection:
         names = ("table", "column", "dtype", "rows", "width", "bytes", "prepared")
         return [dict(zip(names, r), on_gpu=None) for r in rows]
 
-    def _refresh_settings(self) -> None:
-        row = _one(self._raw.execute(
-            "SELECT current_setting('default_order'), current_setting('default_null_order'), "
-            "current_setting('default_collation'), current_setting('search_path'), "
-            "current_database()"))
-        self._settings = {"default_order": row[0], "default_null_order": row[1],
-                          "default_collation": row[2] or "", "search_path": row[3] or "",
-                          "database": row[4]}
-        self._settings_key = "|".join(self._settings.values())
+    # ---- settings in force (§5.11) ----
+    def _settings_query(self) -> Tuple[Tuple[str, ...], str]:
+        """The names of _SETTINGS_READ this DuckDB knows, and the one SELECT
+        that reads them with the current database. A name is probed by
+        reading it: DuckDB 2.0.1 accepts settings duckdb_settings() does not
+        list (error_on_division_by_zero, regex_match_operator_semantics)."""
+        names = []
+        for n in _SETTINGS_READ:
+            try:
+                self._raw.execute(f"SELECT current_setting('{n}')").fetchall()
+                names.append(n)
+            except duckdb.Error:
+                pass
+        sql = "SELECT " + ", ".join(f"current_setting('{n}')" for n in names) + ", current_database()"
+        return tuple(names), sql
+
+    def _read_settings(self) -> tuple:
+        return tuple(_one(self._raw.execute(self._settings_sql)))
+
+    def _refresh_settings(self, row: Optional[tuple] = None) -> None:
+        if row is None:
+            row = self._read_settings()
+        s = {n: ("" if v is None else v) for n, v in zip(self._settings_names, row)}
+        s["database"] = row[len(self._settings_names)]
+        self._settings = s
+        self._settings_row = tuple(row)
+        self._settings_key = "|".join(str(v) for v in s.values())
         # a prepared plan keeps the ORDER BY direction it was bound under
         self._drop_plans()
         self._cache.clear()
+
+    @staticmethod
+    def _lane_values(settings: Dict[str, Any]) -> Dict[str, Any]:
+        return {n: settings[n] for n in _LANE_SETTINGS if n in settings}
+
+    @staticmethod
+    def _lane_env_sql(env: Dict[str, Any]) -> List[str]:
+        """`SET SESSION` statements that put `env` in force on a connection."""
+        out = []
+        for n, v in env.items():
+            lit = ("true" if v else "false") if isinstance(v, bool) else "'" + str(v).replace("'", "''") + "'"
+            out.append(f"SET SESSION {n} = {lit}")
+        return out
+
+    def _root(self) -> "Connection":
+        c = self
+        while c._parent is not None:
+            c = c._parent
+        return c
+
+    def _settings_moved(self) -> None:
+        """A cursor of this family ran a SET (and bumped the root's
+        generation in `_after`): what this cursor decided under the old values
+        goes before its next statement. Costs nothing when nothing moved; the
+        read it takes then is the only one. A SET the family never saw is
+        `_check_settings`'s to find."""
+        root = self._root()
+        if self._settings_seen == root._settings_gen:
+            return
+        self._settings_seen = root._settings_gen
+        self._drop_local_caches()
+        try:
+            self._refresh_settings()
+            self._stmt_settings = self._settings_row     # this statement's read is the one just taken
+        except Exception:
+            pass
+
+    def _adopt_settings(self, row: tuple) -> None:
+        """The settings in force are `row`, and the caches were filled under
+        something else: everything this cursor decided goes, and the family
+        hears that a setting moved."""
+        self._drop_local_caches()
+        self._refresh_settings(row)
+        root = self._root()
+        root._settings_gen += 1
+        self._settings_seen = root._settings_gen
+
+    @staticmethod
+    def _lane_sensitive(d: "Decision") -> bool:
+        """Does the decision read a lane whose VALUES the upload cursor's
+        settings decide (`_LANE_SETTINGS`)? A computed lane (`x_...`), a
+        key join's materialisation or a subquery sentinel. A plain column lane
+        is a cast of the column and is the same under every setting."""
+        if d.join is not None or d.sentinels:
+            return True
+        lanes = d.tag.split(":")[6] if d.tag.count(":") >= 6 else ""
+        if any(p.startswith("x_") for p in re.split(r"[,#]", lanes)):
+            return True
+        return any(str(l[0]).startswith("x_") for l in (d.store_all or []))
+
+    def _check_settings(self, d: "Decision") -> Optional[str]:
+        """§5.11: before a statement runs on the device, the settings in force
+        on THIS connection, now, must be the ones its decision was taken
+        under — and, for a decision that reads a lane computed on the upload
+        cursor, the ones the resident sets were built under.
+
+        One round trip per statement (taken at most once, nested statements
+        share it), paid only by a statement whose decision says "rewrite":
+        a statement that goes to DuckDB never reaches here.
+
+        Raises _SettingsMoved when the row differs from the caches' (the
+        statement is decided again). Returns None to go on, or a decline
+        reason."""
+        row = self._stmt_settings
+        if row is None:
+            t0 = time.perf_counter()
+            row = self._stmt_settings = self._read_settings()
+            self._settings_ms = (time.perf_counter() - t0) * 1000.0
+        if row != self._settings_row:
+            raise _SettingsMoved()
+        pic = self._settings.get("preserve_identifier_case", True)
+        if pic not in (True, "true", "preserve_case"):
+            # the rewritten statement names its columns with unquoted aliases,
+            # which this setting folds to lower case: `"Kk"` would come back
+            # as `kk` (measured on 1.5.6 and 2.0.1)
+            self._last.detail = (f"preserve_identifier_case = {pic!r} folds the column names the "
+                                 f"rewritten statement gives its outputs, so DuckDB answers it")
+            return "settings"
+        if not self._lane_sensitive(d):
+            return None
+        root = self._root()
+        mine = self._lane_values(self._settings)
+        if mine == root._lane_env:
+            return None
+        # The sets were built under root._lane_env, and this connection is under
+        # something else. Either the database's value moved (a SET GLOBAL, a
+        # database-wide setting set anywhere): the sets are wrong for everyone
+        # and are rebuilt under the new value — or this connection overrides
+        # it for its own session: the sets stay, and this statement is DuckDB's.
+        cur = self._raw.cursor()
+        try:
+            names = [n for n in self._settings_names if n in _LANE_SETTINGS]
+            vals = _one(cur.execute("SELECT " + ", ".join(f"current_setting('{n}')" for n in names)))
+        finally:
+            cur.close()
+        db = {n: ("" if v is None else v) for n, v in zip(names, vals)}
+        if db != root._lane_env:
+            moved = sorted(n for n in db if db[n] != root._lane_env.get(n))
+            self._log(f"settings: {', '.join(moved)} moved for the database — resident sets dropped and rebuilt")
+            root._lane_env = db
+            root._lane_env_version += 1
+            self._manager.set_session_env(self._lane_env_sql(db), root._lane_env_version)
+            self._invalidate_sets()
+        if mine != db:
+            diff = sorted(n for n in mine if mine[n] != db.get(n))
+            self._last.detail = (
+                "this connection sets " + ", ".join(f"{n} = {mine[n]!r}" for n in diff)
+                + " for itself, which decides the values a resident lane holds, and the resident "
+                  "sets are built under the database's " + ", ".join(f"{db.get(n)!r}" for n in diff))
+            return "settings"
+        return None
 
     def _probe_extension(self) -> None:
         try:
@@ -966,6 +1165,10 @@ class Connection:
                                              and sql == self._last.sql) else sql
                 self._raw.execute(run, parameters)
                 _ms = (time.perf_counter() - t0) * 1000.0
+                if self._last.rewritten:
+                    # §5.11: the settings read is a cost only the rewritten
+                    # path pays, so the measured rule (§9.1) is charged it
+                    _ms += self._settings_ms
                 self._note_timing(_ms, query, parameters)
                 self._note_value(_ms)
                 if self._last.rewritten:
@@ -1034,7 +1237,8 @@ class Connection:
                     cur.close()
             self._ties_guard()
         finally:
-            self._guard_ms = (time.perf_counter() - t0) * 1000.0
+            # ... and the settings read (§5.11), which only this path pays too
+            self._guard_ms = (time.perf_counter() - t0) * 1000.0 + self._settings_ms
 
     # §4.24: the rendered statements whose top-k was found not to tie. Small,
     # and emptied rather than aged: the entries are per rendered text, so a
@@ -1357,6 +1561,11 @@ class Connection:
                     self._watch_files = self._watched_files()
             except Exception:
                 pass
+            # §5.11: several settings are database-wide, so a SET here can move
+            # a sibling's too; each re-reads before its next statement
+            root = self._root()
+            root._settings_gen += 1
+            self._settings_seen = root._settings_gen
         if self._resnap_after:
             self._resnap_after = False
             root = self._parent or self
@@ -1444,20 +1653,39 @@ class Connection:
         if why in ("ATTACH", "DETACH"):
             self._refresh_after = True
         self._manager.invalidate(None)
-        self._drop_plans()
-        self._cache.clear()
         (self._parent or self)._ties_ok.clear()   # §4.24: the data may tie now where it did not
-        self._nested_cache.clear()
-        self._flat_cache.clear()
-        self._unique_cache.clear()
-        self._expr_types.clear()
         # the estimate's lane widths are read from the table's statistics, and
         # a write can widen a column's range — a stale range under-estimates a
         # set, which is the one direction an admission bound may not be wrong in
         getattr(self._parent or self, "_range_cache", {}).clear()
+        self._drop_local_caches()
+        try:
+            self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
+        except Exception:
+            pass
+
+    def _drop_local_caches(self) -> None:
+        """What THIS connection decided or learnt under the catalog and the
+        settings as they were. A sibling runs it for itself when a setting
+        moves under it (§5.11)."""
+        self._drop_plans()
+        self._cache.clear()
+        self._nested_cache.clear()
+        self._flat_cache.clear()
+        self._unique_cache.clear()
+        self._expr_types.clear()
         self._big_tables = None
         self._view_catalog = None
         self._flat_views.clear()
+        (self._parent or self)._ties_ok.clear()   # §4.24: verdicts on rendered texts that are re-rendered
+
+    def _invalidate_sets(self) -> None:
+        """Every resident set of the database goes (they were built under lane
+        settings that are no longer the database's, §5.11). Not a write: the
+        file snapshot is not re-taken."""
+        self._manager.invalidate(None)
+        self._drop_plans()
+        (self._parent or self)._ties_ok.clear()
         try:
             self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
         except Exception:
@@ -1579,7 +1807,23 @@ class Connection:
         `last_rewrite()` describing the decision — including its `detail`,
         which the body fills in where it knows better and `_detail()`
         composes from the decision otherwise."""
-        out = self._route_body(query, parameters)
+        self._stmt_settings = None
+        self._settings_ms = 0.0
+        self._settings_moved()
+        try:
+            out = self._route_body(query, parameters)
+        except _SettingsMoved:
+            # §5.11: a setting moved where the family did not see it (another
+            # connection, SET GLOBAL, RESET, `con._raw`): the statement is decided
+            # again, from nothing, under the settings this read found
+            self._log("settings: the settings in force moved behind the wrapper — decided again")
+            self._adopt_settings(self._stmt_settings)
+            try:
+                out = self._route_body(query, parameters)
+            except _SettingsMoved:            # moved again within one statement: DuckDB's
+                self._last = LastRewrite(statement=query if isinstance(query, str) else "",
+                                         reason="settings")
+                out = query
         if not self._last.detail:
             try:
                 self._last.detail = self._detail()
@@ -1610,6 +1854,7 @@ class Connection:
         "collation": "a collation other than binary is in force",
         "error": "the rewrite raised while deciding",
         "ties": "the top rows are not ordered uniquely, so the order is DuckDB's to choose",
+        "settings": "a setting in force on this connection is one the device path does not reproduce",
     }
 
     def _detail(self) -> str:
@@ -2158,6 +2403,14 @@ class Connection:
             self._last.reason = d.reason
             if d.measured_declined:
                 self._timing_decision = d        # its native runs keep its native time; it may be re-measured
+            return None
+        # §5.11: the settings in force now, on this connection, are the ones the
+        # decision was taken under (else _SettingsMoved: decided again) and,
+        # where a lane's values depend on them, the ones the sets were built under.
+        # Before residency: nothing may be uploaded for a decision that is stale.
+        declined = self._check_settings(d)
+        if declined is not None:
+            self._last.reason = declined
             return None
         self._timing_decision = d
         self._last.form = d.form

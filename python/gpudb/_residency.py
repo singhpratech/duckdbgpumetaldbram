@@ -380,6 +380,13 @@ class ResidencyManager:
         self._last_activity = time.monotonic()
         self._upload_cursor = None
         self._uploading_tag: Optional[str] = None   # set only while a statement runs on the cursor
+        # §5.11: `SET SESSION` statements the upload cursor runs before its next
+        # upload whenever their version moves — the lane settings the resident
+        # sets are built under, pinned so that a SET GLOBAL from anywhere cannot
+        # change them under a set without the wrapper deciding it did
+        self._env_sql: List[str] = []
+        self._env_version = 0
+        self._cursor_env = -1                       # the version the upload cursor carries
         self._closed = False
         self._thread: Optional[threading.Thread] = None
         # ---- contention (§5.5): how many cores the machine is giving us ----
@@ -1211,6 +1218,14 @@ class ResidencyManager:
                     "evictions_wasted": self.evictions_wasted,
                     "refusals": self.refusals, "refusals_held": self.refusals_held,
                     "sets": out}
+
+    def set_session_env(self, statements: List[str], version: int) -> None:
+        """The settings every later upload on the manager's cursor runs under
+        (§5.11). An upload already under way keeps the old ones; the caller
+        invalidates the sets when the values change, so it never lands."""
+        with self._lock:
+            self._env_sql = list(statements)
+            self._env_version = version
 
     # ---- synchronous upload (residency='eager', and tests) ----
     def upload_now(self, tag: str, run: Callable[[str], None]) -> bool:
@@ -2164,12 +2179,28 @@ class ResidencyManager:
                 if self._upload_cursor is None:
                     try:
                         self._upload_cursor = self._cursor_factory()
+                        self._cursor_env = -1           # a new connection carries no session settings
                     except Exception as e:
                         s.state = "failed"
                         s.error = str(e)[:200]
                         continue
                 cur = self._upload_cursor
+                env = None if self._cursor_env == self._env_version else (list(self._env_sql), self._env_version)
             run = lambda q, _c=cur: _c.execute(q).fetchall()      # noqa: E731  (sub-millisecond, no device work)
+            if env is not None:
+                try:
+                    for q in env[0]:
+                        run(q)
+                    self._cursor_env = env[1]
+                except Exception as e:
+                    # an upload under settings that are not the pinned ones would
+                    # build lanes nobody may read: the set waits instead
+                    with self._cv:
+                        s.state = "failed"
+                        s.error = f"the upload cursor would not take the session settings: {str(e)[:160]}"
+                        s.resume_at = self._now() + self.rate_s
+                        self._cv.notify_all()
+                    continue
             if not self._make_room(run, s):
                 with self._lock:
                     self._note_refusal_locked(s, s.error)

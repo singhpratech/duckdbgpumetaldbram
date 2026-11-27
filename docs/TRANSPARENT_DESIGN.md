@@ -336,7 +336,8 @@ moves under it (DDL, a view redefinition). What it does **not** re-bind is a
 session setting or a name resolution — a temp table that shadows the name, a
 `USE`, `SET default_order` — so the plans are dropped wherever a decision is
 dropped: `_invalidate_all` (every non-SELECT the wrapper sees, including SET,
-ATTACH, DDL, a transaction and a foreign write), `_refresh_settings`,
+ATTACH, DDL, a transaction and a foreign write), `_refresh_settings` (which
+also runs wherever the settings in force moved behind the wrapper, §5.11),
 `_on_stale` and `_on_rewrite_error`. Names are never reused for a different
 statement, so two threads on one connection cannot execute each other's plan.
 
@@ -2152,6 +2153,122 @@ uploads only the missing lanes (`_rewrite.store_lanes` / `store_upload_sql`,
 (`gpu_drop_column`) and a view whose lane went is re-synthesised once the lane
 is back. Nothing in the rewrite, the guards or the gate changed; every suite
 and the gate are the proof. Join results are still copies — stage D.
+
+### 5.11 Settings: a statement is answered under the settings in force
+Found 2026-11-26 in the released wrapper (pip 0.7.3): one cursor of a
+`gpudb.connect()` family ran `SET default_collation = 'nocase'`, and its
+sibling, which had decided `SELECT s, count(*) … GROUP BY s` under binary
+collation, kept answering it from the device — 6000 groups where DuckDB
+returns 3000. The wrapper re-read the settings of the cursor that ran the
+`SET` and of nobody else, and a new cursor copied its parent's cached values
+instead of reading its own.
+
+**Which settings are shared.** Measured with pairs of connections on one
+database (a `cursor()`, and a second `duckdb.connect()` of the same file in
+the same process, behave alike), on DuckDB 1.5.6, 2.0.0 and 2.0.1, for every
+name in `duckdb_settings()` that accepts a second value — not read from its
+`scope` column, which says GLOBAL for both kinds:
+
+- *Database-wide on a plain `SET`*: `default_collation`, `default_order`,
+  `default_null_order` (and its alias `null_order`), `old_implicit_casting`
+  (listed by 1.5; 2.0.x still accepts it without listing it, and it is still
+  database-wide there), `preserve_insertion_order`, `enable_optimizer`,
+  `disabled_optimizers`, the `arrow_*` output settings, `threads`,
+  `memory_limit` and the other engine-wide resources. A `RESET` of one of
+  these from any connection resets it for all.
+- *Connection-local on a plain `SET`*: `integer_division`,
+  `ieee_floating_point_ops`, `error_on_division_by_zero` and
+  `regex_match_operator_semantics` (2.0; 2.0.1 accepts both although its
+  `duckdb_settings()` does not list them), `legacy_disable_null_type` (2.0),
+  `dialect_compatibility_mode` (2.0), `TimeZone`, `Calendar`, `preserve_identifier_case`, `search_path`,
+  `errors_as_json`, `order_by_non_integer_literal`,
+  `scalar_subquery_error_on_multiple_rows` and the rest.
+- *Every* setting is moved for every connection without a session value of
+  its own by `SET GLOBAL` (or `RESET GLOBAL`) from any connection — except
+  `search_path` / `schema`, which have no global value — and `SET SESSION`
+  makes even a database-wide one local.
+
+So what the wrapper saw its own cursor do proves nothing about the settings
+in force: a sibling, `SET GLOBAL`, `RESET`, a plain `duckdb` cursor on the
+same database, or `con._raw` itself can move them.
+
+**Which of them can change an answer.** Two different things depend on
+settings, and they are checked differently:
+
+1. *The decision and its rendering* — `default_order` / `default_null_order`
+   (the rendered ORDER BY, which rows a top-k returns, where a NULL group
+   sorts), `default_collation` (a VARCHAR key or predicate is only taken under
+   binary collation), `integer_division` and `regex_match_operator_semantics`
+   (both act in the PARSER: `/` becomes `//`, `~` binds a partial or a full
+   match, so a cached decision carries the old meaning in its lane text),
+   `old_implicit_casting` (whether `length(k)` over a BIGINT binds at all),
+   `preserve_identifier_case` (the output names), `search_path` and the
+   current database (which table a name is). These are `_SETTINGS_READ`.
+2. *The values a resident lane holds* — a computed lane, a key join's
+   materialisation and a subquery sentinel are SQL that DuckDB parses and
+   evaluates on the upload cursor, which is a connection of its own and does
+   not carry the user's session values: a division by zero there is an
+   infinity, an error or a NULL by `ieee_floating_point_ops` /
+   `error_on_division_by_zero`, a string comparison follows the collation, and
+   so on. Measured on 1.5.6: a connection that ran
+   `SET ieee_floating_point_ops = false` for itself got `[]` for
+   `… WHERE (x / 0) IS NULL GROUP BY k` from the background-built set, where
+   DuckDB returns every group — on the wrapper's own connection, no sibling
+   involved. These are `_LANE_SETTINGS`. A plain column lane is a cast of the
+   column and depends on none of them.
+
+`TimeZone` and `Calendar` are not read: no time-zone-aware value reaches the
+device (a `TIMESTAMPTZ` key, a predicate on one and every expression over one
+decline — `_check_bound`, measured on 2.0.1), so neither can move a device
+answer. `dialect_compatibility_mode` is read although no shape was found whose
+answer it moves (`'spark'` changed none of `7/2`, `1/0`, `~`, list indexing,
+string comparison or a GROUP BY probed on 2.0.1): it is one more value in a
+read that is taken anyway.
+
+**The mechanism** (`connection.py`, `_check_settings`):
+
+- Before a statement whose decision says *rewrite* — and before anything is
+  uploaded for it — the wrapper reads `_SETTINGS_READ` and the current
+  database on the user's connection in ONE `SELECT current_setting(…), …`.
+  If the row is not the one the connection's caches were filled under,
+  everything the connection decided goes (`_drop_local_caches`: decisions,
+  plans, folds, nested entries, tie verdicts) and the statement is decided
+  again from nothing under the new row; the family's settings generation
+  moves, so every sibling does the same before its next statement. A
+  statement that goes to DuckDB never pays the read: it is taken only where a
+  decision would otherwise put the statement on the device.
+- The resident sets are built under one set of lane settings, `_lane_env` on
+  the family's root (the database's values at connect), and the manager's
+  upload cursor has them pinned with `SET SESSION` before its next upload
+  whenever they move (`ResidencyManager.set_session_env`), so a `SET GLOBAL`
+  from anywhere cannot change them under a set unnoticed. A decision that
+  reads a lane whose values depend on them (`_lane_sensitive`) runs on the
+  device only where the connection's own lane settings are `_lane_env`. Where
+  they are not, the database's values are read on a fresh cursor: if the
+  DATABASE moved, `_lane_env` follows it, the upload cursor is re-pinned and
+  every resident set is dropped and rebuilt; if the CONNECTION overrides a
+  value for its own session, the statement is DuckDB's
+  (`reason == "settings"`) and the sets stay for everyone else.
+- A new cursor reads its own settings instead of copying its parent's: a
+  value the parent set for its session only is not the cursor's.
+- `preserve_identifier_case` off declines every rewritten statement
+  (`settings`): the rewritten statement names its outputs with unquoted
+  aliases, which that setting folds — `"Kk"` came back as `kk`, also on a
+  connection that set it itself before its first statement.
+
+**Cost.** One round trip per statement that runs on the device, nothing for a
+statement that goes to DuckDB; the database-value read of the lane rule runs
+only on a mismatch. The measured medians are in the 2026-11-26 entry of
+`docs/RESEARCH_NOTES.md`.
+
+**Not covered.** A setting moved by another connection between this read and
+the statement's execution is the same window the foreign-write snapshot
+(§5.9) has; a relation from `sql()` that is read later than the call that
+built it widens it to the caller's first fetch. A decision DECLINED under a
+setting (a NOCASE collation, a session override) stays declined after the
+setting is put back by a connection the family does not see, until the family
+next sees a `SET`, a write or DDL — the answer is DuckDB's either way, so this
+costs speed only.
 
 ## 6. The rewrite (piece D)
 

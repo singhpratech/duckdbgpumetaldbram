@@ -6241,6 +6241,91 @@ about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
 `BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
 changes no measured statement. Not yet run on the NVIDIA machine.
 
+## 2026-11-26 — Settings in force: database-wide SETs, SET GLOBAL, and the upload cursor
+
+pip 0.7.3, shipped defaults, DuckDB 2.0.1: a cursor ran
+`SET default_collation = 'nocase'` and its sibling, which had decided a
+VARCHAR GROUP BY under binary collation, kept answering it from the device —
+6000 groups where DuckDB returns 3000 (20M rows, 6000 keys folding to 3000).
+The wrapper re-read the settings only on the cursor that ran the SET, and a
+new cursor copied its parent's cached values.
+
+- **Which settings are shared** was measured, not read from
+  `duckdb_settings().scope` (GLOBAL for both kinds): for every setting that
+  accepts a second value (122–123 of 162–170 per version), a plain SET, SET
+  GLOBAL, SET SESSION and RESET on one connection, read back on another, on
+  1.5.6, 2.0.0 and 2.0.1. Database-wide on a plain SET: the collation, both
+  default orders, `old_implicit_casting` (listed by 1.5; 2.0.x accepts it
+  unlisted and shares it too), `preserve_insertion_order`,
+  the optimizer switches, the arrow output settings and the engine resources.
+  Connection-local: `integer_division`, `ieee_floating_point_ops`,
+  `error_on_division_by_zero`, `regex_match_operator_semantics`, `TimeZone`,
+  `Calendar`, `preserve_identifier_case`, `search_path` and the rest — and
+  SET GLOBAL moves every one of them for every connection without a session
+  value (all three versions alike; a second `duckdb.connect()` of the same
+  file in the process is the same database).
+- **What can move an answer.** Wrong answers reproduced on unmodified main by
+  the new tests: the collation, `default_order` and `default_null_order`
+  through a sibling, SET GLOBAL, RESET, a plain duckdb cursor and `con._raw`
+  (order and NULL order on 1.5.6; 2.0's renderer leaves the direction to
+  DuckDB, so the order cases passed there); `integer_division` and
+  `regex_match_operator_semantics` through a plain cursor's SET GLOBAL, RESET
+  GLOBAL and `con._raw` (both act in the parser, so the cached lane text
+  carries the old meaning); `ieee_floating_point_ops` and
+  `error_on_division_by_zero` (an answer where DuckDB raises, and back);
+  `old_implicit_casting` (`length(k)` over a BIGINT answered where DuckDB no
+  longer binds it, on 1.5.6 and on 2.0.x); `search_path` through `con._raw` (a table answered after
+  its name stopped resolving). Two defects that need no second connection at
+  all: on 1.5.6, `SET ieee_floating_point_ops = false` on the wrapper's own
+  connection with background residency returned `[]` for
+  `WHERE (x / 0) IS NULL` where DuckDB returns every group — the upload
+  cursor is a connection of its own and evaluated the lane under the
+  database's value; and `preserve_identifier_case = false` folded the
+  rewritten statement's unquoted output aliases (`"Kk"` came back `kk`).
+  TimeZone / Calendar cannot reach the device: a TIMESTAMPTZ key, predicate
+  and expression all decline (measured), so they are not read.
+  `dialect_compatibility_mode = 'spark'` changed nothing probed and is read
+  anyway.
+- **What was built** (§5.11). Before a statement whose decision says rewrite,
+  one `SELECT current_setting(…), …, current_database()` on the user's
+  connection; a row that differs from the caches' drops everything the
+  connection decided and decides the statement again, and moves a family
+  generation so siblings re-read before their next statement (the unmerged
+  Parquet branch's generation counter, without its file parts). The lane
+  settings the sets are built under are pinned on the upload cursor with
+  `SET SESSION`; a lane-sensitive decision (a computed lane, a join, a
+  sentinel) runs only where the connection's lane settings are those — the
+  database moving rebuilds the sets, a session override declines (new reason
+  `settings`). New cursors read their own settings. `preserve_identifier_case`
+  off declines. The read is charged to the rewritten time the measured rule
+  sees, and to the `sql()` path's guard cost.
+- **Lost / not taken.** An in-statement guard (`CASE WHEN current_setting(…)
+  = … THEN true ELSE error(…) END` beside `gpu_assert_rows`) would cost no
+  round trip and close the window to execution, but the extension's scalar
+  renderer builds the statement text, so it needs an extension change and a
+  release of the binary; not done. A PREPAREd read saves 0.04 ms of 0.23 on
+  2.0.1 (0.003 of 0.111 on 1.5.6) and is a second plan to keep valid; not
+  taken. `duckdb_settings()` filtered by name costs 2.0 ms — ten times the
+  `current_setting` row.
+- **Cost, provisional** (M4 Max, other jobs running, load average 10–15
+  during the runs): the read itself, median of 400 × 5 processes, 0.113 ms on
+  1.5.6 (8 settings) and 0.239 ms on 2.0.1 (12). Per statement, median of 5
+  process medians of 400 executions, main → fix: a rewritten GROUP BY over 4M
+  rows 1.038 → 1.199 ms on 1.5.6, a rewritten one with a computed lane
+  0.914 → 1.091 ms; on 2.0.1 the rewritten statements ran in both of the
+  kernel's two modes (1.0 / 2.7 ms), and within a mode fix is 0.27–0.30 ms
+  slower (1.007 → 1.281 fast, 2.79 → 3.09 slow). Declined statements
+  unchanged within noise: a cached decline (DOUBLE sum) 0.915 → 0.918 ms
+  (1.5.6), 1.298 → 1.322 ms (2.0.1); below the floor 0.179 → 0.178 ms,
+  0.218 → 0.214 ms. Native for the same 4M-row statement is 1.05 ms (1.5.6)
+  and 1.58 ms (2.0.1): a template that won by less than the read now loses,
+  and the measured rule, which sees the read, declines it.
+- Suites with the fix: test_wrapper 1787 ok on 2.0.1 and 2.0.0 (main 1408),
+  1759 on 1.5.6 (main 1438); test_shell 76, test_residency_policy 131,
+  test_ast_compat 9 on each. The new settings checks on unmodified main fail
+  92 (2.0.1, 2.0.0) and 121 (1.5.6). Not run on the NVIDIA machine; the
+  wrapper is shared, so the CUDA path gets the same fix with no CUDA change.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
