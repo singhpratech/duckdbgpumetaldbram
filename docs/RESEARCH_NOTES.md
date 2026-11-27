@@ -6241,6 +6241,50 @@ about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
 `BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
 changes no measured statement. Not yet run on the NVIDIA machine.
 
+## 2026-11-26 — A NULL-sensitive WHERE on a VARCHAR GROUP BY key
+
+A wrong answer in pip 0.7.3 at shipped defaults (`gpudb.connect()`, DuckDB
+2.0.1; reproduced on 20M rows with a 4000-value key): `SELECT s, count(*) FROM
+t WHERE s <> 'k5' GROUP BY s` and `... WHERE s IS NOT NULL GROUP BY s` returned
+a NULL-key group that DuckDB does not, and `WHERE s IS NULL` lost the NULL group.
+
+**Root cause.** A VARCHAR GROUP BY key is uploaded as its tuple text
+(`_rewrite.key_lane_expr`), where a NULL key is the text `N` — a valid cell.
+`_rewrite._lane_of` (and `gpu_rewrite_ast`'s `lane_of` in the extension, which
+renders the statement on 0.7.x) sent a WHERE on that single key to the key lane
+`k`. `=` and `IN` are right there, because no literal's tuple text is `N`; `<>`
+compares `N` with the literal and keeps the row, and `IS [NOT] NULL` reads the
+lane's validity bit, which is always set.
+
+**Extent, mapped on main with the 0.7.3 wrapper and the extension binary pip
+0.7.3 bundles, 85 statements at test settings and again at shipped defaults.**
+Wrong: a single VARCHAR key — a column or a computed VARCHAR expression
+(`upper(s)`) — with `<>`, `!=`, `NOT (s = ...)`, `IS NULL` or `IS NOT NULL` on
+it, alone or AND-ed with other terms, in every form that groups by that key
+alone: plain, HAVING, top-k, an expression over aggregates (the split), with a
+subquery lane, over a device join and over an uploaded join, and a template
+re-planned for new literals. Right throughout: `=`, `IN`, every predicate DuckDB
+evaluates as a lane of its own (`NOT IN`, `IS DISTINCT FROM`, `LIKE`,
+`NOT LIKE`, `coalesce(s, '') <> ''`, an `OR`), several key columns (two VARCHAR,
+VARCHAR with INTEGER), DECIMAL, DATE, INTEGER, packed and computed integer keys
+(they read a raw lane whose NULLs are NULL), the global aggregate, and
+`count(DISTINCT s)`; ordering comparisons on VARCHAR decline.
+
+**Fix, wrapper-only.** `_rewrite.null_sensitive_key_lane`: when a single
+VARCHAR key has such a term, the key column becomes a predicate column of its
+own set, so every term on it reads the column through its own lane. `_lane_of`
+now looks predicate lanes up before the key, which is the order the extension's
+renderer already used (it reads the predicate lanes from the tag), so the
+0.7.3 extension renders the fixed statement unchanged. The rule is applied
+again in `Connection._replan_literals`, or a template re-planned for a new
+literal declines (the predicate-column lists differ). It costs those statements
+one string predicate lane (8 bytes a row) beside the key.
+
+**Tests.** `null_key_where_checks` in `python/tests/test_wrapper.py`: 148
+checks, 31 of which fail on main's wrapper on DuckDB 2.0.1, 2.0.0 and 1.5.6,
+all of which pass with the fix on the three. CUDA shares the wrapper and the
+extension's renderer; the same suite on Linux is the check.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

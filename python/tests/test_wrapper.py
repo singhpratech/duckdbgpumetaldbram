@@ -2458,6 +2458,7 @@ def run():
     extension_age_checks()
     few_group_string_key_checks()
     null_order_checks()
+    null_key_where_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -3614,6 +3615,107 @@ def extension_age_checks():
     check(bare.last_rewrite()["detail"] == bare.extension_note,
           "no extension: last_rewrite()['detail'] says it too")
     bare.close()
+
+
+# s is NULL on one row in 31 and has 40 values; s2, k, d and dt have NULLs of
+# their own; dnk is a dimension whose VARCHAR column is NULL on one id in five.
+NULL_KEY_SETUP = """
+CREATE TABLE tnk AS SELECT
+   CASE WHEN i % 31 = 0 THEN NULL ELSE 's' || (i % 40)::VARCHAR END AS s,
+   CASE WHEN i % 37 = 0 THEN NULL ELSE 'q' || (i % 7)::VARCHAR END AS s2,
+   CASE WHEN i % 41 = 0 THEN NULL ELSE (i % 50)::INTEGER END AS k,
+   CASE WHEN i % 43 = 0 THEN NULL ELSE ((i % 300) / 100.0)::DECIMAL(9,2) END AS d,
+   CASE WHEN i % 47 = 0 THEN NULL ELSE DATE '2001-01-01' + (i % 700)::INTEGER END AS dt,
+   (i % 97)::BIGINT AS v FROM range(300000) r(i);
+CREATE TABLE dnk AS SELECT i::INTEGER AS id, CASE WHEN i % 5 = 0 THEN NULL ELSE 'n' || (i % 4)::VARCHAR END AS name,
+   (i % 3)::INTEGER AS id2 FROM range(50) r(i);
+CREATE TABLE fnk AS SELECT (i % 50)::INTEGER AS id, (i % 3)::INTEGER AS id2, (i % 997)::BIGINT AS v FROM range(300000) r(i);
+CREATE TABLE snk AS SELECT (i % 60)::BIGINT AS v FROM range(1000) r(i);
+"""
+
+
+def null_key_where_checks():
+    """A WHERE on a single VARCHAR GROUP BY key that is NULL-sensitive.
+
+    The key lane of a VARCHAR key holds the key's TUPLE text, and a NULL key is
+    the text 'N' there — a valid cell. `=` and `IN` against that lane are right,
+    but on 0.7.3 `<>` (and `!=`, `NOT (s = ...)`) kept the NULL-key group native
+    drops, and `IS NULL` / `IS NOT NULL` read a validity bit that is always set
+    (the NULL group vanished, or stayed): the single-table form, HAVING, top-k,
+    the split, a subquery lane, a device join, an uploaded join, a computed
+    VARCHAR key, and a template re-planned for new literals. Such terms now read
+    the column through its own lane (_rewrite.null_sensitive_key_lane). The shapes
+    that were never wrong — other key types, several key columns, the
+    predicates DuckDB evaluates as a lane of their own — are pinned beside them."""
+    print("== a NULL-sensitive WHERE on a VARCHAR GROUP BY key")
+    con = fresh()
+    if not has_device(con):
+        skip("NULL-sensitive WHERE on a VARCHAR key — needs a GPU backend")
+        con.close()
+        return
+    con.execute(NULL_KEY_SETUP)
+
+    def same_as_native(sql, what, gpu=True):
+        for _ in range(3):
+            cur = con.execute(sql)
+            got = cur.fetchall()
+            got_t = [(d[0], str(d[1])) for d in (cur.description or [])]
+        lr = con.last_rewrite()
+        nc = con._raw.execute(sql)
+        nat = nc.fetchall()
+        nat_t = [(d[0], str(d[1])) for d in (nc.description or [])]
+        check(got == nat and got_t == nat_t,
+              f"{what}: identical to native [{'gpu' if lr['rewritten'] else 'native: ' + str(lr['reason'])}]")
+        if gpu:
+            check(lr["rewritten"], f"{what}: ran on the GPU ({lr['reason'] or '-'})")
+
+    sensitive = ("s <> 's1'", "s != 's1'", "NOT (s = 's1')", "s IS NULL", "s IS NOT NULL",
+                 "s <> 's1' AND s IS NOT NULL", "s <> 's1' AND v > 20")
+    others = ("s = 's1'", "s IN ('s1', 's2')", "s NOT IN ('s1', 's2')", "s IS DISTINCT FROM 's1'",
+              "s LIKE 's1%'", "s NOT LIKE 's1%'", "coalesce(s, '') <> ''", "(s = 's1' OR s IS NULL)",
+              "(s <> 's1' OR v > 50)")
+    for p in sensitive + others:
+        same_as_native(f"SELECT s, count(*) AS n, sum(v) AS sv FROM tnk WHERE {p} GROUP BY s ORDER BY s NULLS FIRST",
+                       f"GROUP BY s WHERE {p}")
+    for p in ("s <> 's1'", "s IS NULL", "s IS NOT NULL"):
+        same_as_native(f"SELECT s, count(*) AS n FROM tnk WHERE {p} GROUP BY s HAVING count(*) > 10 ORDER BY s NULLS FIRST",
+                       f"HAVING, WHERE {p}")
+        same_as_native(f"SELECT s, count(*) AS n FROM tnk WHERE {p} GROUP BY s ORDER BY n DESC, s LIMIT 5",
+                       f"top-k by count, WHERE {p}")
+        same_as_native(f"SELECT s, sum(v) * 2 + count(*) AS e FROM tnk WHERE {p} GROUP BY s ORDER BY s NULLS FIRST",
+                       f"an expression over aggregates (the split), WHERE {p}")
+        same_as_native(f"SELECT s, count(*) AS n FROM tnk WHERE {p} AND v IN (SELECT v FROM snk) GROUP BY s "
+                       "ORDER BY s NULLS FIRST", f"a subquery lane, WHERE {p}")
+        same_as_native(f"SELECT count(*) AS n, sum(v) AS sv FROM tnk WHERE {p}", f"no GROUP BY, WHERE {p}")
+        same_as_native(f"SELECT count(DISTINCT s) AS ds FROM tnk WHERE {p}", f"count(DISTINCT s), WHERE {p}")
+        same_as_native(f"SELECT k, count(DISTINCT s) AS ds FROM tnk WHERE {p} GROUP BY k ORDER BY k NULLS FIRST",
+                       f"count(DISTINCT s) per k, WHERE {p}")
+        same_as_native(f"SELECT s, s2, count(*) AS n FROM tnk WHERE {p} GROUP BY s, s2 ORDER BY s, s2 NULLS FIRST",
+                       f"GROUP BY s, s2, WHERE {p}")
+        same_as_native(f"SELECT s, k, count(*) AS n FROM tnk WHERE {p} GROUP BY s, k ORDER BY s, k NULLS FIRST",
+                       f"GROUP BY s, k, WHERE {p}")
+    for p in ("upper(s) <> 'S1'", "upper(s) IS NULL", "upper(s) IS NOT NULL", "s IS NULL", "s <> 's1'"):
+        same_as_native(f"SELECT upper(s) AS u, count(*) AS n FROM tnk WHERE {p} GROUP BY u ORDER BY u NULLS FIRST",
+                       f"a computed VARCHAR key upper(s), WHERE {p}")
+    for key, preds in (("d", ("d <> 1.50", "d IS NULL", "d IS NOT NULL")),
+                       ("dt", ("dt <> DATE '2001-01-05'", "dt IS NULL", "dt IS NOT NULL")),
+                       ("k", ("k <> 3", "k IS NULL", "k IS NOT NULL")),
+                       ("year(dt)", ("year(dt) <> 2001", "year(dt) IS NULL", "dt IS NULL")),
+                       ("k, dt", ("k <> 3", "dt IS NULL", "k IS NOT NULL"))):
+        for p in preds:
+            same_as_native(f"SELECT {key}, count(*) AS n FROM tnk WHERE {p} GROUP BY {key} ORDER BY {key} NULLS FIRST",
+                           f"GROUP BY {key}, WHERE {p}")
+    for p in ("d.name <> 'n1'", "d.name IS NULL", "d.name IS NOT NULL", "d.name = 'n1'"):
+        same_as_native("SELECT d.name, count(*) AS n, sum(f.v) AS sv FROM fnk f JOIN dnk d ON f.id = d.id "
+                       f"WHERE {p} GROUP BY d.name ORDER BY d.name NULLS FIRST", f"a device join, WHERE {p}")
+        same_as_native("SELECT d.name, count(*) AS n, sum(f.v) AS sv FROM fnk f JOIN dnk d ON f.id = d.id AND f.id2 = d.id2 "
+                       f"WHERE {p} GROUP BY d.name ORDER BY d.name NULLS FIRST", f"an uploaded join, WHERE {p}")
+    # the same template again with new literals: the re-planned statement keeps the rule
+    for lits in (("s1", "s2", "s3"),):
+        for lit in lits:
+            same_as_native(f"SELECT s, count(*) AS n FROM tnk WHERE s <> '{lit}' GROUP BY s ORDER BY s NULLS FIRST",
+                           f"WHERE s <> '{lit}', the template re-planned for a new literal")
+    con.close()
 
 
 def report():

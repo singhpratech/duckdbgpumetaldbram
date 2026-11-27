@@ -587,6 +587,24 @@ def decimal_scale(t: str) -> Optional[Tuple[int, int]]:
     return (int(m.group(1)), int(m.group(2))) if m else None
 
 
+def null_sensitive_key_lane(plan: Plan) -> None:
+    """A single VARCHAR key's lane holds its TUPLE text (key_lane_expr), and a
+    NULL key is the text 'N' there: a valid cell, not a NULL one. `=` and `IN`
+    against that lane are right (no literal's tuple text is 'N'), but `<>`
+    keeps the NULL-key rows native drops, and IS [NOT] NULL reads a validity
+    bit that is always set. When the WHERE has such a term on the key, the key
+    column becomes a predicate column of its own set too, and every term on it
+    reads the raw column (or, for a computed key, the expression) through its
+    own lane, whose NULLs are NULL: _lane_of looks predicate lanes up first,
+    and so does gpu_rewrite_ast, which reads them from the tag. Called by
+    check_types and, for a template re-planned for new literals, by
+    Connection._replan_literals: the same rule both times."""
+    if plan.dict_key and len(plan.keys) == 1 and plan.key_type in _STRING_TYPES \
+            and plan.key not in plan.pred_cols \
+            and any(w.col == plan.key and w.op in ("<>", "isnull", "isnotnull") for w in plan.where):
+        plan.pred_cols.append(plan.key)
+
+
 def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
                 avg_float_bits: int = 0) -> None:
     plan.exact = exact
@@ -616,6 +634,8 @@ def check_types(plan: Plan, columns: Dict[str, str], exact: bool = False,
         for kc in plan.keys:
             if any(w.col == kc for w in plan.where) and kc not in plan.pred_cols:
                 plan.pred_cols.append(kc)
+    else:
+        null_sensitive_key_lane(plan)
     for c in plan.pred_cols:
         pt = columns.get(c)
         if pt is None:
@@ -773,8 +793,14 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
 
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
-    """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'."""
-    if col and col == plan.key and len(plan.keys) == 1 and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
+    """(lane, kind, scale) for a WHERE column: kind 'i' (integer/DECIMAL) or 'f'.
+
+    A column with its own predicate lane is read there before anything else —
+    the key included (null_sensitive_key_lane), which is the order
+    gpu_rewrite_ast's lane_of uses: it looks a column up among the tag's
+    predicate lanes first."""
+    if col and col == plan.key and len(plan.keys) == 1 and col not in plan.pred_cols \
+            and not (plan.dict_key and plan.key_type not in _STRING_TYPES):
         return "k", ("s" if plan.dict_key else "i"), 0
     if col == plan.val:
         return "v", "i", plan.scale

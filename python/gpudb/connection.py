@@ -2712,6 +2712,7 @@ class Connection:
             return None
         plan.val_types, plan.scales = cached.val_types, cached.scales
         plan.keys, plan.key_types, plan.pack, plan.dict_key = cached.keys, cached.key_types, cached.pack, cached.dict_key
+        _rewrite.null_sensitive_key_lane(plan)
         if plan.pred_cols != cached.pred_cols:
             return None
         if plan.form == "topk" and cached.form != "topk":

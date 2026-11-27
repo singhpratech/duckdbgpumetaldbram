@@ -641,6 +641,24 @@ threshold measured in §9.1 (a 15M-distinct-string dictionary is not a win);
 above it the shape runs native. Ids are hash-ordered, not string-ordered,
 which is one more reason the `ORDER BY` node is kept (§2).
 
+- **A WHERE on the key itself (2026-11-26).** The key lane holds the key's
+  TUPLE text, and a NULL key is the text `N` there — a valid cell, not a NULL
+  one. `=` and `IN` may read that lane (no literal's tuple text is `N`), but a
+  `<>` term would keep the NULL-key rows native drops and `IS [NOT] NULL` would
+  read a validity bit that is always set; through pip 0.7.3 both did, for a
+  single VARCHAR key (a column or a computed VARCHAR expression) in every form
+  that groups by it alone — plain, HAVING, top-k, the split, a subquery lane, a
+  device join, an uploaded join, and a template re-planned for new literals.
+  When the WHERE has such a term on the key, the key column is now also a
+  predicate column of its own set (`_rewrite.null_sensitive_key_lane`), and
+  every term on it reads the raw column through its own lane; the wrapper's
+  `_lane_of` and the extension's `gpu_rewrite_ast` both look a column up among
+  the predicate lanes first, so the fix is the wrapper's alone. Several key
+  columns, DECIMAL / DATE / integer / packed / computed integer keys, and the
+  predicates DuckDB evaluates as a lane of their own (`NOT IN`, `IS DISTINCT
+  FROM`, `LIKE`, `coalesce(...)`, an `OR`) were never affected: they read the
+  column's own lane already.
+
 ### 4.6 Device-side predicate mask (`WHERE`)
 Most real `GROUP BY` queries filter first. The resident set for a table
 includes the columns that appear in `WHERE` clauses of matched shapes (§5
