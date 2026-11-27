@@ -17,8 +17,9 @@ same column with `<>` or `IS [NOT] NULL`. There is no 0.7.4.
   4001 rows where DuckDB returns 3999 and 4000. A `<>` or `IS [NOT] NULL` term
   on such a key now reads a lane of its own, whose NULLs are NULL.
   `=`, `IN`, `NOT IN`, `IS DISTINCT FROM`, `LIKE`, multi-column keys and
-  DECIMAL / DATE / integer keys were already right. Present in pip 0.7.2 and
-  0.7.3.
+  DECIMAL / DATE / integer keys were already right. Present in every
+  pip release from 0.7.0 to 0.7.3, each reproduced from its published wheel;
+  those four are yanked on PyPI.
 - [x] **A DECIMAL key with a WHERE stays on the device for new literals** — a
   statement with a single DECIMAL key and a WHERE on it, re-run with different
   literals, went back to DuckDB on every re-run; its rows were right, and it
