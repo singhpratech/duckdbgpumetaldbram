@@ -867,7 +867,7 @@ test` path.
 
 ## Release history
 
-**pip 0.7.5** (2026-11-26) — on pip 0.7.2 and 0.7.3, a `<>` or
+**pip 0.7.5** (2026-11-26) — on pip 0.7.0 to 0.7.3, a `<>` or
 `IS [NOT] NULL` term on a single VARCHAR GROUP BY key returned a NULL group
 that native DuckDB does not. It is fixed; anyone who groups by a text column
 that contains NULLs and filters on that same column with `<>` or

@@ -6305,7 +6305,9 @@ platform wheels bundle the same v0.7.0 binary the 0.7.1, 0.7.2 and 0.7.3 wheels
 did, which is the binary the fix was tested against, so the only difference
 between the packages is the Python tree. The defect returns rows that differ
 from native with shipped defaults: a `<>` or `IS [NOT] NULL` term on a single
-VARCHAR key kept or lost the NULL group (0.7.2 and 0.7.3). The infinite
+VARCHAR key kept or lost the NULL group (first written here as 0.7.2 and 0.7.3; the same
+reproduction on the published 0.7.1 and 0.7.0 wheels shows it there too, and
+all four are yanked on PyPI). The infinite
 DATE / TIMESTAMP fix was held back from this release because an independent
 review found regressions in the changes around it; the release history lists
 the infinite-TIMESTAMP case, the alias / column ORDER BY case, the settings
