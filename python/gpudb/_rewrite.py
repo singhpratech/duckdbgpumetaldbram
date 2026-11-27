@@ -919,10 +919,8 @@ def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     """r.<col> typed exactly as native: DECIMAL(p, s) through the exact scaled
     multiply (then CAST to DECIMAL(p, s) when p != 38); DATE / TIMESTAMP keys
     back from their day / microsecond image."""
-    if native_type.upper() == "DATE":
-        return f'(DATE \'1970-01-01\' + CAST(r."{col}" AS INTEGER))'
-    if native_type.upper() == "TIMESTAMP":
-        return f'make_timestamp(r."{col}")'
+    if native_type.upper() in _TEMPORAL_TYPES:
+        return _typed_expr(f'r."{col}"', native_type)
     d = decimal_scale(native_type)
     if d and d[1] > 0:
         p, s = d
@@ -933,12 +931,39 @@ def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     return f'CAST(r."{col}" AS {native_type})'
 
 
-def _typed_expr(expr: str, native_type: str) -> str:
-    if native_type.upper() == "DATE":
+def _typed_expr(expr: str, native_type: str, finite: bool = False) -> str:
+    """A BIGINT image back as its native type. A DATE / TIMESTAMP image of an
+    infinite value (_int_image) comes back as that value: `DATE '1970-01-01' +
+    n` and `make_timestamp(n)` raise for it. `finite`: the image is known to be
+    a finite value (a packed key component, which lies within the finite
+    bounds it was packed for), so the plain form is enough."""
+    if finite and native_type.upper() == "DATE":
         return f"(DATE '1970-01-01' + CAST({expr} AS INTEGER))"
-    if native_type.upper() == "TIMESTAMP":
+    if finite and native_type.upper() == "TIMESTAMP":
         return f"make_timestamp({expr})"
+    if native_type.upper() == "DATE":
+        return (f"CASE WHEN {expr} = {DATE_INF_IMAGE} THEN DATE 'infinity' "
+                f"WHEN {expr} = -{DATE_INF_IMAGE} THEN DATE '-infinity' "
+                f"ELSE DATE '1970-01-01' + CAST({expr} AS INTEGER) END")
+    if native_type.upper() == "TIMESTAMP":
+        return (f"CASE WHEN {expr} = {TIMESTAMP_INF_IMAGE} THEN TIMESTAMP 'infinity' "
+                f"WHEN {expr} = -{TIMESTAMP_INF_IMAGE} THEN TIMESTAMP '-infinity' "
+                f"ELSE make_timestamp({expr}) END")
     return f"CAST({expr} AS {native_type})"
+
+
+def decodes_temporal(plan: Plan) -> bool:
+    """Does the rewritten statement turn a device image that may be an
+    infinite DATE / TIMESTAMP back into its type — a single key, a min / max?
+    The extension's renderer decodes those with `DATE '1970-01-01' + n` /
+    `make_timestamp(n)`, which raise for the image of an infinite value, so
+    such a plan is drawn by this renderer, which maps the images back
+    (_typed_expr). A packed key's component is finite (its bounds are), and a
+    dictionary key comes back from DuckDB's own text, so those keep the
+    extension's rendering."""
+    return any(o.native_type.upper() in _TEMPORAL_TYPES
+               and not (o.kind == "key" and (plan.packed or plan.dict_key))
+               for o in plan.outputs)
 
 
 def _key_component_expr(plan: Plan, i: int, native_type: str) -> str:
@@ -949,7 +974,7 @@ def _key_component_expr(plan: Plan, i: int, native_type: str) -> str:
         slot = f"({slot} // {stride})"
     if i > 0:
         slot = f"({slot} % {rng})"
-    return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type)
+    return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type, finite=True)
 
 
 def _guard_sql(plan: Plan, fqn: str, tag: str) -> str:
@@ -1175,13 +1200,48 @@ def _q_default(col: str) -> str:
     return f'"{col}"'
 
 
+# The images of DuckDB's infinite temporal values: exactly the values DuckDB
+# itself stores for them (a DATE is int32 days, `infinity` is INT32_MAX; a
+# TIMESTAMP is int64 microseconds, `infinity` is INT64_MAX; `-infinity` is the
+# negation in both). Every finite value lies strictly between the two, so the
+# image keeps DuckDB's order and equality, and it is never NULL for a value
+# that is not.
+DATE_INF_IMAGE = 2147483647
+TIMESTAMP_INF_IMAGE = 9223372036854775807
+# Raised by an upload that would otherwise store a wrong cell (a packed key
+# component outside the bounds it was packed for): the upload fails, the set
+# is not resident, and DuckDB answers (§5.5).
+IMAGE_ERROR = "GPUDB_IMAGE"
+
+
 def _int_image(qcol: str, t: str) -> str:
-    """The BIGINT image of a key / predicate column: days for DATE,
-    microseconds for TIMESTAMP, the value itself for the integer family."""
+    """The BIGINT image of a key / predicate / payload column: days for DATE,
+    microseconds for TIMESTAMP, the value itself for the integer family.
+
+    The image is never NULL for a value that is not, and it orders and compares
+    as DuckDB orders and compares the values:
+      * DATE: `date - DATE '1970-01-01'` is integer arithmetic on the stored
+        day count, so it is never NULL for a non-NULL date and keeps the
+        infinite values' own day counts (+-DATE_INF_IMAGE). Nothing to add.
+      * TIMESTAMP: `epoch_us` is NULL for `infinity` / `-infinity` and only for
+        them, so it alone turned those rows into NULL cells — a WHERE, a
+        `count` and a `min` / `max` over them then differed from DuckDB's
+        (pip 0.7.3). An infinite value gets +-TIMESTAMP_INF_IMAGE instead.
+    `isinf()` and an ordering comparison pick the infinite rows, not
+    `= TIMESTAMP 'infinity'`: DuckDB 1.5.6 rewrites `date_trunc(..) =
+    <constant>` into a range on the argument, which is empty for an infinite
+    constant, so over a computed lane the equality was false for the very row
+    it was written for. Measured over 20M rows (1% NULL, no infinities): 6.2 ms
+    against 4.0 for `epoch_us` alone; a `coalesce` over `epoch_us` with an
+    `error()` arm for anything else cost 10.9 ms and guarded nothing the CASE
+    leaves open. `test_wrapper.infinite_temporal_checks` pins the property —
+    NULL exactly for NULL, DuckDB's order, decodes back — on every DuckDB the
+    suite runs on."""
     if t == "DATE":
         return f"CAST({qcol} - DATE '1970-01-01' AS BIGINT)"
     if t == "TIMESTAMP":
-        return f"epoch_us({qcol})"
+        return (f"CASE WHEN isinf({qcol}) THEN (CASE WHEN {qcol} > TIMESTAMP '1970-01-01' "
+                f"THEN {TIMESTAMP_INF_IMAGE} ELSE -{TIMESTAMP_INF_IMAGE} END) ELSE epoch_us({qcol}) END")
     return f"CAST({qcol} AS BIGINT)"
 
 
@@ -1202,10 +1262,17 @@ def key_lane_expr(plan: Plan, q=_q_default) -> str:
         parts = [tmpl.format(c=q(kc)) for kc in plan.keys]
         return " || ".join(parts) if len(parts) > 1 else parts[0]
     if plan.exact and plan.packed:
-        # mixed-radix pack: slot_i = coalesce(image - min + 1, 0); key = sum(slot_i * stride_i)
+        # mixed-radix pack: slot_i = image - min + 1 (0 for NULL); key = sum(slot_i * stride_i).
+        # The bounds are the zone map's at decision time. A value outside them (a row
+        # written after the decision, an infinite DATE / TIMESTAMP) would carry into
+        # the next component and land in another group, so the upload refuses it:
+        # IMAGE_ERROR fails the upload and DuckDB answers.
         parts = []
         for kc, kt, (mn, rng, stride) in zip(plan.keys, plan.key_types, plan.pack):
-            slot = f"coalesce({_int_image(q(kc), kt)} - {mn} + 1, 0)"
+            img = _int_image(q(kc), kt)
+            slot = (f"CASE WHEN {img} BETWEEN {mn} AND {mn + rng - 2} THEN {img} - {mn} + 1 "
+                    f"WHEN {img} IS NULL THEN 0 "
+                    f"ELSE error('{IMAGE_ERROR}: a GROUP BY value left the range its key was packed for') END")
             parts.append(f"{slot} * {stride}" if stride > 1 else slot)
         return f"CAST({' + '.join(parts)} AS BIGINT)"
     return _int_image(q(plan.key), plan.key_type)

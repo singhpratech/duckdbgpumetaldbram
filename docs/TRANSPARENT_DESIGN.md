@@ -110,6 +110,41 @@ GROUP BY k1 [, k2, k3]
 - Payloads: integer family, DECIMAL (§4.3); DATE / TIMESTAMP for `min`, `max`
   and `count` (days / microseconds on the device, typed on the way out).
   `count(DISTINCT x)`, one DISTINCT column per statement (§4.17).
+- `infinity` / `-infinity` (2026-11-26). A DATE or TIMESTAMP lane holds what
+  DuckDB itself stores: days or microseconds since the epoch, and for an
+  infinite value INT32_MAX / INT64_MAX or their negation, which lie beyond
+  every finite value — so order, equality, `IS NULL`, `min` / `max` and
+  grouping are DuckDB's. The TIMESTAMP lane used to be `epoch_us(ts)`, which
+  is NULL for an infinite timestamp: those rows became NULL cells and a WHERE,
+  a `count` or a `min` / `max` over them differed from native (pip 0.7.3,
+  reachable with shipped defaults through the aggregate without GROUP BY, and
+  through every shape when the infinity arrived after the decision or came
+  from a computed TIMESTAMP such as `date_trunc` or `CAST(ts_ns AS TIMESTAMP)`).
+  The image is now `CASE WHEN isinf(ts) THEN ±INT64_MAX ELSE epoch_us(ts) END`
+  (`_rewrite._int_image`), which is never NULL for a non-NULL value; the DATE
+  image (`date - DATE '1970-01-01'`) already was. `isinf()` and an ordering
+  comparison pick the infinite rows, not `= TIMESTAMP 'infinity'`, because
+  DuckDB 1.5.6 rewrites `date_trunc(…) = <constant>` into a range on the
+  argument that is empty for an infinite constant. On the way out the infinite
+  images are mapped back (`_typed_expr`: `make_timestamp` and
+  `DATE '1970-01-01' + n` raise for them), and a plan that decodes a single
+  DATE / TIMESTAMP key or a `min` / `max` of one is drawn by the Python
+  renderer, once per decided template, because the extension's renderer
+  decodes with the raising forms (the decision is still the extension's; a
+  packed component is finite by its bounds and a dictionary key comes back
+  from DuckDB's own text, so those keep the extension's rendering). A
+  packed key (§4.4) refuses at upload any component outside the zone-map
+  bounds the decision packed it for (`error('GPUDB_IMAGE: …')`, so the upload
+  fails and DuckDB answers) — a row written after the decision, through any
+  connection or while a segmented upload is in flight, can no longer carry into
+  the next component — and a stale guard now drops the decisions, so the next
+  one reads the new bounds; an infinite bound declines packing (`shape`).
+  TIMESTAMP_S / _MS / _NS, TIMESTAMP WITH TIME ZONE, TIME and INTERVAL are not
+  lanes (a comparison over one is a computed BOOLEAN lane DuckDB evaluates).
+  Measured cost on a table without infinities: the TIMESTAMP image scans
+  20M rows in 7.0 ms against 4.3, the packed key's bounds check 5.7 ms per
+  20M rows, both paid once per upload (up to 4% of one); statements on a
+  resident set are unchanged (`docs/RESEARCH_NOTES.md`, 2026-11-26).
 - A select-project-join derived table (or a single CTE) as the FROM is folded
   into the statement first (§4.16). DOUBLE/FLOAT payloads are not
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.

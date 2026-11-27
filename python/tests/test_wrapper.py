@@ -282,12 +282,20 @@ def run():
             if name == "explain":
                 continue
             a = con.execute(sql).fetchall(); la = con.last_rewrite()
+            dec = getattr(con, "_last_decision", None)
             b = py.execute(sql).fetchall(); lb = py.last_rewrite()
             da = con.execute("DESCRIBE " + la["sql"]).fetchall() if la["rewritten"] else None
             db = py.execute("DESCRIBE " + lb["sql"]).fetchall() if lb["rewritten"] else None
-            check(la["engine"] == "scalar" and lb["engine"] == "python" and a == b and da == db
+            # a statement that decodes a single DATE / TIMESTAMP key or a min / max of one is drawn
+            # by the reference renderer even where the extension's decides it: the extension decodes
+            # those with forms that raise for an infinite value (_rewrite.decodes_temporal)
+            from gpudb import _rewrite as _rw
+            want = ("python" if dec is not None and dec.plan is not None
+                    and getattr(_rw, "decodes_temporal", lambda p: False)(dec.plan) else "scalar")
+            check(la["engine"] == want and lb["engine"] == "python" and a == b and da == db
                   and la["form"] == lb["form"],
-                  f"{name}: scalar={la['engine']}/{la['form']} python={lb['engine']}/{lb['form']} agree")
+                  f"{name}: scalar={la['engine']}/{la['form']} python={lb['engine']}/{lb['form']} agree "
+                  f"(the connection with the extension's renderer drew it with {want})")
         py.close()
     else:
         print("  (gpu_rewrite_ast not in this build; reference renderer only)")
@@ -2458,6 +2466,7 @@ def run():
     extension_age_checks()
     few_group_string_key_checks()
     null_order_checks()
+    infinite_temporal_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -3545,6 +3554,361 @@ def null_order_checks():
                       f"NULL order, literal {lit}: rewritten as {form} ({lr['form'] or lr['reason']}, {lr['engine']})")
         ref.close()
         con.close()
+
+
+def _inf_setup(n, ts_hi, ts_lo, dt_hi, dt_lo):
+    return f"""
+CREATE TABLE tinf AS SELECT (i % 5)::INTEGER AS k, i::BIGINT AS v, (i % 7)::INTEGER AS w,
+  CASE WHEN i = 20 THEN {ts_hi} WHEN i = 21 THEN {ts_lo} WHEN i % 103 = 0 THEN NULL
+       ELSE TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND END AS ts,
+  CASE WHEN i = 30 THEN {dt_hi} WHEN i = 31 THEN {dt_lo} WHEN i % 107 = 0 THEN NULL
+       ELSE DATE '2020-01-01' + (i % 100)::INTEGER END AS dt,
+  CASE WHEN i = 40 THEN TIMESTAMP_NS 'infinity' WHEN i = 41 THEN TIMESTAMP_NS '-infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMP_NS) END AS tns,
+  CASE WHEN i = 40 THEN TIMESTAMP_S 'infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMP_S) END AS tss,
+  CASE WHEN i = 40 THEN TIMESTAMP_MS 'infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMP_MS) END AS tms,
+  CASE WHEN i = 40 THEN TIMESTAMPTZ 'infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMPTZ) END AS ttz,
+  CAST(TIME '00:00:00' + INTERVAL (i % 1000) SECOND AS TIME) AS ttm,
+  INTERVAL (i % 1000) SECOND AS tiv
+FROM range({n}) r(i);
+CREATE TABLE tinf_d AS SELECT * FROM (VALUES
+  ({ts_hi}, {dt_hi}, 'hi'), ({ts_lo}, {dt_lo}, 'lo'),
+  (TIMESTAMP '2020-01-01 00:00:05', DATE '2020-01-05', 'a'), (TIMESTAMP '2020-01-01 00:00:07', DATE '2020-01-07', 'b'))
+  v(ts, dt, label);
+CREATE TABLE tinf_k AS SELECT i::INTEGER AS k, 'name' || i AS name FROM range(5) r(i);
+"""
+
+
+INF_SETUP = _inf_setup(100_003, "TIMESTAMP 'infinity'", "TIMESTAMP '-infinity'", "DATE 'infinity'", "DATE '-infinity'")
+# the largest and smallest values each type holds that are not infinite
+EXTREME_SETUP = _inf_setup(100_003, "TIMESTAMP '294247-01-10 04:00:54.775806'", "TIMESTAMP '290309-12-22 (BC) 00:00:00'",
+                           "DATE '5881580-07-10'", "DATE '5877642-06-25 (BC)'")
+
+
+def _inf_cases():
+    """(statement, who answers it) over INF_SETUP — every path a DATE or a
+    TIMESTAMP takes to the device. True: the device must; False: DuckDB must,
+    with a reason (the comment says which); None: either."""
+    out = []
+    lits = {"ts": ("TIMESTAMP '2020-01-01 00:10:00'", "TIMESTAMP '2020-01-01 00:00:05'",
+                   "TIMESTAMP '2020-01-01 00:00:07'"),
+            "dt": ("DATE '2020-02-01'", "DATE '2020-01-05'", "DATE '2020-01-07'")}
+    for c in ("ts", "dt"):
+        a, b1, b2 = lits[c]
+        terms = [f"{c} {op} {a}" for op in (">", ">=", "<", "<=", "=", "<>")]
+        terms += [f"{c} BETWEEN {b1} AND {a}", f"{c} NOT BETWEEN {b1} AND {a}", f"{c} NOT IN ({b1}, {b2})",
+                  f"{c} IS NULL", f"{c} IS NOT NULL", f"{c} IS DISTINCT FROM {b1}", f"{c} IS NOT DISTINCT FROM {b1}",
+                  f"NOT ({c} > {a})", f"{c} > {b1} AND w < 3"]
+        for wc in terms:
+            out.append((f"SELECT count(*), sum(v) FROM tinf WHERE {wc}", True))
+            out.append((f"SELECT k, count(*), sum(v) FROM tinf WHERE {wc} GROUP BY k ORDER BY k", True))
+        # an IN list of temporal literals is not a shape the matcher reads (each literal is a CAST)
+        out.append((f"SELECT count(*), sum(v) FROM tinf WHERE {c} IN ({b1}, {b2})", False))
+        plus = f"{c} + INTERVAL 1 DAY" if c == "ts" else f"{c} + 1"
+        cast = f"CAST({c} AS DATE)" if c == "ts" else f"CAST({c} AS TIMESTAMP)"
+        out += [
+            (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} NULLS FIRST LIMIT 4", True),
+            (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} DESC NULLS LAST LIMIT 4", True),
+            (f"SELECT {c}, sum(v) FROM tinf WHERE w < 3 GROUP BY {c} ORDER BY {c} LIMIT 4", True),
+            (f"SELECT {c}, count(*), sum(v) FROM tinf GROUP BY {c} ORDER BY {c}", True),
+            # a packed key needs finite zone-map bounds: an infinite one declines
+            (f"SELECT {c}, k, count(*) FROM tinf GROUP BY {c}, k ORDER BY {c}, k LIMIT 6", False),
+            (f"SELECT k, {c}, count(*) FROM tinf GROUP BY k, {c} ORDER BY k, {c} DESC LIMIT 6", False),
+            (f"SELECT year({c}) AS y, count(*) FROM tinf GROUP BY y ORDER BY y NULLS FIRST", True),
+            (f"SELECT date_trunc('month', {c}) AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST", True),
+            (f"SELECT date_part('day', {c}) AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST LIMIT 5", True),
+            (f"SELECT {plus} AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST LIMIT 4", True),
+            (f"SELECT {cast} AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST LIMIT 4", True),
+            (f"SELECT k, count(*) FROM tinf WHERE year({c}) = 2020 GROUP BY k ORDER BY k", True),
+            (f"SELECT k, min({c}), max({c}), count({c}) FROM tinf GROUP BY k ORDER BY k", True),
+            (f"SELECT k, min({c}), max({c}) FROM tinf WHERE w < 3 GROUP BY k ORDER BY k", True),
+            (f"SELECT min({c}), max({c}), count({c}) FROM tinf", True),
+            (f"SELECT min({c}), max({c}), count({c}) FROM tinf WHERE w < 3", True),
+            (f"SELECT count(DISTINCT {c}) FROM tinf", True),
+            # count(DISTINCT) beside a GROUP BY is two keys, which pack only within finite bounds
+            (f"SELECT k, count(DISTINCT {c}) FROM tinf GROUP BY k ORDER BY k", False),
+            (f"SELECT {c}, count(*) AS n FROM tinf GROUP BY {c} ORDER BY n DESC, {c} LIMIT 3", True),
+            (f"SELECT k, max({c}) AS m FROM tinf GROUP BY k ORDER BY m DESC LIMIT 2", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} > {a} GROUP BY k HAVING count(*) > 10 ORDER BY k", True),
+            # HAVING over a temporal payload is not a shape the rewrite carries
+            (f"SELECT k, count(*) FROM tinf GROUP BY k HAVING max({c}) > {a} ORDER BY k", False),
+            (f"SELECT k, count(*) * 2 + 1 AS x FROM tinf WHERE {c} > {a} GROUP BY k ORDER BY k", True),
+            (f"SELECT count(*) + sum(v) AS x FROM tinf WHERE {c} IS NOT NULL", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} > (SELECT min({c}) FROM tinf_d) GROUP BY k ORDER BY k", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} >= (SELECT max({c}) FROM tinf_d) GROUP BY k ORDER BY k", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} IN (SELECT {c} FROM tinf_d) GROUP BY k ORDER BY k", True),
+            (f"SELECT k, count(*) FROM tinf WHERE EXISTS (SELECT 1 FROM tinf_d d WHERE d.{c} = tinf.{c}) "
+             f"GROUP BY k ORDER BY k", True),
+            # a temporal join key: DuckDB runs the join, the device holds its result (§4.13)
+            (f"SELECT d.label, count(*), sum(t.v) FROM tinf t JOIN tinf_d d ON t.{c} = d.{c} "
+             f"GROUP BY d.label ORDER BY d.label", True),
+            (f"SELECT d.label, count(*) FROM tinf t LEFT JOIN tinf_d d ON t.{c} = d.{c} "
+             f"GROUP BY d.label ORDER BY d.label NULLS FIRST", True),
+            # an integer key join carrying the temporal column as a payload and as a WHERE lane (§4.8)
+            (f"SELECT n.name, max(t.{c}), min(t.{c}) FROM tinf t JOIN tinf_k n ON t.k = n.k "
+             f"GROUP BY n.name ORDER BY n.name", True),
+            (f"SELECT n.name, count(*) FROM tinf t JOIN tinf_k n ON t.k = n.k WHERE t.{c} > {a} "
+             f"GROUP BY n.name ORDER BY n.name", True),
+            (f"SELECT count(*) FROM tinf t JOIN tinf_k n ON t.k = n.k WHERE t.{c} IS NOT NULL", True),
+        ]
+    out += [
+        ("SELECT k, count(*) FROM tinf WHERE ts + INTERVAL 1 DAY > TIMESTAMP '2020-01-01 00:10:00' "
+         "GROUP BY k ORDER BY k", True),
+        ("SELECT count(*) FROM tinf WHERE date_trunc('day', ts) > TIMESTAMP '2020-01-01 00:10:00'", True),
+        # DuckDB raises 'Cannot subtract infinite timestamps' here, and so does the rewritten statement
+        ("SELECT k, max(ts) - min(ts) AS span FROM tinf GROUP BY k ORDER BY k", None),
+        ("SELECT k, max(epoch_us(ts)), min(epoch_ms(ts)) FROM tinf GROUP BY k ORDER BY k", True),
+        ("SELECT k, max(dt - DATE '2020-01-01') FROM tinf GROUP BY k ORDER BY k", True),
+        # a TIMESTAMP_NS reaches the device only as a TIMESTAMP computed from it
+        ("SELECT CAST(tns AS TIMESTAMP) AS m, count(*) FROM tinf GROUP BY m ORDER BY m DESC LIMIT 3", True),
+        ("SELECT k, count(*) FROM tinf WHERE CAST(tns AS TIMESTAMP) > TIMESTAMP '2020-01-01 00:10:00' "
+         "GROUP BY k ORDER BY k", True),
+        ("SELECT count(*) FROM tinf WHERE CAST(tns AS TIMESTAMP) IS NOT NULL", True),
+    ]
+    # the other temporal types are not lanes: a statement over one runs on DuckDB (a comparison
+    # may still be a computed BOOLEAN lane, which DuckDB itself evaluates at upload)
+    for c, lit in (("tns", "TIMESTAMP_NS '2020-01-01 00:10:00'"), ("tss", "TIMESTAMP_S '2020-01-01 00:10:00'"),
+                   ("tms", "TIMESTAMP_MS '2020-01-01 00:10:00'"), ("ttz", "TIMESTAMPTZ '2020-01-01 00:10:00+00'"),
+                   ("ttm", "TIME '00:10:00'"), ("tiv", "INTERVAL 600 SECOND")):
+        out += [(f"SELECT count(*), sum(v) FROM tinf WHERE {c} > {lit}", None),
+                (f"SELECT k, count(*) FROM tinf WHERE {c} IS NOT NULL GROUP BY k ORDER BY k", False),
+                (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} DESC LIMIT 3", False),
+                (f"SELECT k, max({c}) FROM tinf GROUP BY k ORDER BY k", False)]
+    return out
+
+
+def _as_text(raw, sql):
+    """The rows as DuckDB's own text. Fetched as values, `infinity` comes back
+    as datetime.max and compares equal to 9999-12-31 23:59:59.999999, and a
+    TIMESTAMPTZ needs pytz."""
+    try:
+        return raw.execute(f"SELECT COLUMNS(*)::VARCHAR FROM ({sql}) gpudb_q").fetchall()
+    except duckdb.Error as e:
+        return "error: " + str(e).splitlines()[0][:60]
+
+
+def _device_text(con, sql):
+    """Run `sql` through the wrapper: (its rows as text, did the device answer,
+    last_rewrite()). The device answered when the statement was rewritten and
+    did not fall back; that statement is re-run as written, guard included."""
+    try:
+        con.execute(sql)
+    except duckdb.Error as e:
+        return "error: " + str(e).splitlines()[0][:60], False, con.last_rewrite()
+    lr = con.last_rewrite()
+    on_device = bool(lr["rewritten"] and not lr["fallback"])
+    return _as_text(con._raw, lr["sql"] if on_device else sql), on_device, lr
+
+
+def infinite_temporal_checks():
+    """`infinity` / `-infinity` and the extreme finite values of DATE and
+    TIMESTAMP, on every path a temporal value takes to the device.
+
+    The lane image of a TIMESTAMP was `epoch_us(ts)`, which is NULL for an
+    infinite timestamp: those rows became NULL cells, so `WHERE ts IS NULL`
+    counted them, `IS NOT NULL` / `>` / `<` lost them and `min` / `max` came
+    back finite (released in pip 0.7.3, reachable with shipped defaults
+    through a global masked aggregate). An infinite DATE kept its day count
+    but did not convert back (`DATE '1970-01-01' + n` raises). Both now have
+    images that order and compare as DuckDB orders and compares the values
+    and decode back, and an image that would be NULL for a non-NULL value, or
+    a packed key slot outside its bounds, fails the upload instead."""
+    from gpudb import _rewrite as _rw
+    from gpudb import connection as _conn
+
+    print("== infinite DATE / TIMESTAMP values: images, decode, every path to the device")
+    c = duckdb.connect()
+    c.execute("""CREATE TABLE vals AS SELECT * FROM (VALUES
+        (TIMESTAMP 'infinity', DATE 'infinity'), (TIMESTAMP '-infinity', DATE '-infinity'), (NULL, NULL),
+        (TIMESTAMP '294247-01-10 04:00:54.775806', DATE '5881580-07-10'),
+        (TIMESTAMP '290309-12-22 (BC) 00:00:00', DATE '5877642-06-25 (BC)'),
+        (TIMESTAMP '1970-01-01', DATE '1970-01-01'), (TIMESTAMP '1969-12-31 23:59:59.999999', DATE '1969-12-31'),
+        (TIMESTAMP '9999-12-31 23:59:59.999999', DATE '9999-12-31'),
+        (TIMESTAMP '2020-01-01 00:00:05', DATE '2020-01-05')) v(ts, dt)""")
+    for t, col in (("TIMESTAMP", "ts"), ("DATE", "dt")):
+        # the column, and a computed lane over it (DuckDB 1.5.6 rewrites `date_trunc(..) = <constant>`)
+        for src in (f'"{col}"', f"date_trunc('day', \"{col}\")" if t == "TIMESTAMP" else f'("{col}" + 0)'):
+            img = _rw._int_image(src, t)
+            try:
+                rows = c.execute(f"SELECT ({src})::VARCHAR, {img} AS i, ({_rw._typed_expr(img, t)})::VARCHAR "
+                                 f"FROM vals ORDER BY {src} NULLS FIRST").fetchall()
+            except duckdb.Error as e:
+                check(False, f"{t} image of {src}: encodes and decodes every value ({str(e)[:60]})")
+                continue
+            check(all((r[0] is None) == (r[1] is None) for r in rows),
+                  f"{t} image of {src}: NULL exactly where the value is NULL")
+            imgs = [r[1] for r in rows if r[1] is not None]
+            check(imgs == sorted(imgs) and len(set(imgs)) == len(imgs),
+                  f"{t} image of {src}: DuckDB's order and equality ({imgs[:2]} ... {imgs[-2:]})")
+            check(all(r[2] == r[0] for r in rows), f"{t} image of {src}: decodes back to the value "
+                  f"({[(r[0], r[2]) for r in rows if r[2] != r[0]][:2]})")
+    # a packed key refuses a value outside the bounds it was packed for (an infinity, or a row
+    # written after the decision) instead of carrying it into the next component
+    plan = _rw.Plan(catalog="", schema="", table="vals", key="k")
+    plan.exact, plan.keys, plan.key_types = True, ["k", "dt"], ["INTEGER", "DATE"]
+    lo = c.execute("SELECT DATE '2020-01-01' - DATE '1970-01-01'").fetchone()[0]
+    plan.pack = [(0, 7, 100), (lo, 100, 1)]   # (min, max - min + 2, stride): k in [0, 5], dt in [lo, lo + 98]
+    key = _rw.key_lane_expr(plan)
+    good = c.execute(f"SELECT count(DISTINCT {key}) FROM (SELECT (i % 5)::INTEGER AS k, "
+                     f"CASE WHEN i % 13 = 0 THEN NULL ELSE DATE '2020-01-01' + (i % 99)::INTEGER END AS dt "
+                     f"FROM range(20000) r(i))").fetchone()[0]
+    check(good == 5 * 100, f"packed key: every in-range tuple, NULL included, has its own slot ({good})")
+    marker = getattr(_rw, "IMAGE_ERROR", "GPUDB_IMAGE")
+    for bad in ("DATE 'infinity'", "DATE '-infinity'", "DATE '2020-04-09'", "DATE '2019-12-31'"):
+        try:
+            c.execute(f"SELECT {key} FROM (SELECT 1 AS k, {bad} AS dt)").fetchall()
+            check(False, f"packed key: {bad} outside the packed bounds is refused")
+        except duckdb.Error as e:
+            check(marker in str(e), f"packed key: {bad} outside the packed bounds is refused ({str(e)[:60]})")
+    bound = getattr(_conn, "_bound", _conn._num)
+    check(bound("infinity") is None and bound("-inf") is None and bound("nan") is None
+          and bound("12") == 12 and bound("2.5") == 2.5,
+          "a non-finite zone-map bound is not written into the renderer's JSON context")
+    c.close()
+
+    probe = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    caps = has_device(probe) and all(getattr(probe, a, False) for a in ("_exact", "_global", "_join"))
+    probe.close()
+    if not caps:
+        skip("infinite DATE / TIMESTAMP on the device: needs the exact, global and join paths on a GPU backend")
+        return
+    cases = _inf_cases()
+    for name, setup in (("infinity", INF_SETUP), ("extreme", EXTREME_SETUP)):
+        con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+        con.execute(setup)
+        ref = duckdb.connect()
+        ref.execute(setup)
+        n_dev = 0
+        for sql, gpu in cases:
+            got, dev, lr = _device_text(con, sql)
+            want = _as_text(ref, sql)
+            n_dev += dev
+            check(got == want, f"{name}: rows are native's ({'device' if dev else 'DuckDB: ' + lr['reason']}; "
+                               f"{sql[:96]})" + ("" if got == want else f" got {str(got)[:160]} want {str(want)[:160]}"))
+            if name == "infinity" and gpu is True:
+                check(dev, f"{name}: the device answered ({lr['reason']} {str(lr.get('detail'))[:60]}; {sql[:80]})")
+            elif name == "infinity" and gpu is False:
+                check(not dev and bool(lr["reason"]),
+                      f"{name}: DuckDB answered, with a reason ({lr['reason']}; {sql[:70]})")
+        check(n_dev > 100, f"{name}: {n_dev} of {len(cases)} statements ran on the device")
+        ref.close()
+        con.close()
+    infinite_temporal_late_checks()
+
+
+INF_LATE_SETUP = """
+CREATE TABLE tlate AS SELECT (i % 5)::INTEGER AS k, i::BIGINT AS v,
+  CASE WHEN i % 103 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND END AS ts,
+  CASE WHEN i % 107 = 0 THEN NULL ELSE DATE '2020-01-01' + (i % 100)::INTEGER END AS dt
+FROM range(100003) r(i)"""
+INF_LATE_STMTS = [
+    "SELECT count(*), sum(v) FROM tlate WHERE ts > TIMESTAMP '2020-01-01 00:10:00'",
+    "SELECT count(*), sum(v) FROM tlate WHERE ts IS NOT NULL",
+    "SELECT count(*) FROM tlate WHERE ts IS NULL",
+    "SELECT k, count(*), sum(v) FROM tlate WHERE ts < TIMESTAMP '2020-01-01 00:10:00' GROUP BY k ORDER BY k",
+    "SELECT k, count(*) FROM tlate WHERE ts IS NULL GROUP BY k ORDER BY k",
+    "SELECT ts, count(*) FROM tlate GROUP BY ts ORDER BY ts DESC LIMIT 3",
+    "SELECT dt, count(*) FROM tlate GROUP BY dt ORDER BY dt DESC LIMIT 3",
+    "SELECT k, min(ts), max(ts) FROM tlate GROUP BY k ORDER BY k",
+    "SELECT min(ts), max(ts), min(dt), max(dt) FROM tlate",
+    "SELECT k, dt, count(*) FROM tlate GROUP BY k, dt ORDER BY k, dt DESC LIMIT 4",
+    "SELECT dt, k, count(*) FROM tlate GROUP BY dt, k ORDER BY dt DESC, k LIMIT 4",
+]
+
+
+def infinite_temporal_late_checks():
+    """The infinity arrives AFTER the statements were decided and their sets
+    uploaded: a write through the wrapper, a write through another connection
+    (a raw cursor of an in-memory database, which changes the row count; a
+    second connection to a database file), and a write while a segmented
+    background upload is between segments. A value outside a packed key's
+    bounds, written the same ways, is the same hazard for the packed key."""
+    import tempfile as _tf
+    writes = {
+        "update": ["UPDATE tlate SET ts = TIMESTAMP 'infinity', dt = DATE 'infinity' WHERE v = 5",
+                   "UPDATE tlate SET ts = TIMESTAMP '-infinity', dt = DATE '-infinity' WHERE v = 6"],
+        "insert": ["INSERT INTO tlate VALUES (1, 7, TIMESTAMP 'infinity', DATE 'infinity'), "
+                   "(2, 8, TIMESTAMP '-infinity', DATE '-infinity')"],
+        "far insert": ["INSERT INTO tlate VALUES (1, 7, TIMESTAMP '2400-01-01', DATE '2400-01-01'), "
+                       "(2, 8, TIMESTAMP '1500-01-01', DATE '1500-01-01')"],
+    }
+    for wname, ws in writes.items():
+        for how in ("wrapper", "raw cursor", "second connection"):
+            if how == "raw cursor" and wname == "update":
+                continue      # a same-count write on a raw cursor of an in-memory database: the §0 gap
+            db = os.path.join(_tf.mkdtemp(), "late.duckdb") if how == "second connection" else ":memory:"
+            con = gpudb.connect(db, residency="eager", floor_rows=0, thresholds=False)
+            con.execute(INF_LATE_SETUP)
+            before = sum(_device_text(con, sql)[1] for sql in INF_LATE_STMTS)
+            if how == "wrapper":
+                for w in ws:
+                    con.execute(w)
+            elif how == "raw cursor":
+                cur = con._raw.cursor()
+                for w in ws:
+                    cur.execute(w)
+                cur.close()
+            else:
+                other = duckdb.connect(db, config={"allow_unsigned_extensions": "true"})
+                for w in ws:
+                    other.execute(w)
+                other.close()
+            ref = duckdb.connect()
+            ref.execute(INF_LATE_SETUP)
+            for w in ws:
+                ref.execute(w)
+            after = 0
+            for sql in INF_LATE_STMTS:
+                for attempt in range(2):       # the first run after the write may be the stale guard's
+                    got, dev, lr = _device_text(con, sql)
+                    want = _as_text(ref, sql)
+                    check(got == want, f"late {wname} via {how}, run {attempt + 1}: rows are native's "
+                                       f"({'device' if dev else lr['reason']}; {sql[:70]})"
+                          + ("" if got == want else f" got {got[:3]} want {want[:3]}"))
+                    after += dev
+            # an infinity in a packed key's column declines it (two statements); every
+            # other statement is back on the device by its second run at the latest
+            check(before >= 9 and after >= 15,
+                  f"late {wname} via {how}: the device answered {before} of {len(INF_LATE_STMTS)} statements "
+                  f"before the write and {after} of {2 * len(INF_LATE_STMTS)} runs after it")
+            ref.close()
+            con.close()
+
+    # a write while the background upload is between segments
+    big = INF_LATE_SETUP.replace("range(100003)", "range(2000003)")
+    con = gpudb.connect(residency="background", floor_rows=0, thresholds=False, idle_ms=5.0)
+    con.execute(big)
+    con._manager.segment_rows = 100_000
+    ref = duckdb.connect()
+    ref.execute(big)
+    sql = INF_LATE_STMTS[0]
+    con.execute(sql).fetchall()
+    tag = con.last_rewrite()["tag"]
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 60:
+        pr = con._manager.progress().get(tag) or {}
+        if pr.get("segments", 0) >= 1 or pr.get("state") == "ready":
+            break
+        time.sleep(0.001)
+    pr = dict(con._manager.progress().get(tag) or {})
+    w = "UPDATE tlate SET ts = TIMESTAMP 'infinity' WHERE v = 1999990"
+    con.execute(w)
+    ref.execute(w)
+    got, dev = None, False
+    for _ in range(5):
+        con._manager.wait_idle(60)
+        got, dev, lr = _device_text(con, sql)
+        if dev:
+            break
+    want = _as_text(ref, sql)
+    check(dev and got == want,
+          f"background: an infinity written after {pr.get('segments')} of {pr.get('planned')} segments "
+          f"({pr.get('state')}): the device answers, with native's rows ({got} / {want})")
+    ref.close()
+    con.close()
 
 
 def extension_age_checks():
