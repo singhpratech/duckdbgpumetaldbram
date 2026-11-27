@@ -2458,6 +2458,7 @@ def run():
     extension_age_checks()
     few_group_string_key_checks()
     null_order_checks()
+    where_literal_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -3545,6 +3546,422 @@ def null_order_checks():
                       f"NULL order, literal {lit}: rewritten as {form} ({lr['form'] or lr['reason']}, {lr['engine']})")
         ref.close()
         con.close()
+
+
+WL_N = 20_000
+WL_SETUP = f"""
+CREATE TABLE twl AS SELECT (i % 40)::INTEGER AS k, (i % 97)::BIGINT AS v,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i % 7) - 3)::TINYINT END AS ti,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i % 7) - 3)::SMALLINT END AS z,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i % 7) - 3)::BIGINT END AS b,
+  CASE WHEN i % 13 = 0 THEN NULL WHEN i = 1 THEN 1152921504606846977 ELSE (i % 7)::BIGINT END AS bw,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 7)::UINTEGER END AS u,
+  CASE WHEN i % 13 = 0 THEN NULL WHEN i % 43 = 0 THEN '-0.0'::FLOAT WHEN i % 47 = 0 THEN 16777216::FLOAT
+       ELSE ((i % 10)::FLOAT / 10) END AS f,
+  CASE WHEN i % 13 = 0 THEN NULL WHEN i % 43 = 0 THEN '-0.0'::DOUBLE ELSE ((i % 10)::DOUBLE / 10) END AS g,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE (((i % 7) - 3) / 2)::DECIMAL(4,1) END AS d4,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i % 300) / 100)::DECIMAL(15,2) END AS d,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i % 300) / 100)::DECIMAL(38,3) END AS d38,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE DATE '1995-01-01' + (i % 7)::INTEGER END AS dt,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ['alpha','beta','it''s','2'][1 + i % 4] END AS s
+FROM range({WL_N}) r(i);
+CREATE TABLE dwl AS SELECT i::INTEGER AS k, (i % 5)::INTEGER AS kk FROM range(40) r(i);
+CREATE TABLE thl AS SELECT (i % 40)::INTEGER AS k, (i % 97)::BIGINT AS v, (i % 7)::INTEGER AS ii,
+  (CASE WHEN i % 40 < 20 THEN (i % 40) * 0.05 ELSE 0.01 END)::DECIMAL(15,2) AS d FROM range(40) r(i);
+"""
+WL_LITS = {
+    "ti": ["2", "2.5", "300", "-0.0", "1e400", "2.5e0", "1.00000000000000000000000000000000001"],
+    "z": ["2", "2.5", "0.1", "100000", "1.005", "2.5e0", "1e400", "9223372036854775808",
+          "1.00000000000000001", "1.99999999999999999", "CAST('0.45' AS DOUBLE)", "CAST('١' AS DOUBLE)",
+          "1.0000000000000000001", "1.00000000000000000000000000000000001", "-9223372036854775809"],
+    "b": ["2", "2.5", "9223372036854775808", "2.5e0", "1.00000000000000000000000000000000001"],
+    "bw": ["2", "2.5", "2.5e0", "1e3", "1152921504606846976e0"],
+    "u": ["2", "-1", "2.5", "4294967296", "2.5e0"],
+    "f": ["0.1", "0.3", "0.7", "1", "16777217", "16777216.5", "0.1e0", "1e0", "-0.0", "3.4e38", "1e400",
+          "0.30000000000000004e0", "CAST('0.45' AS DOUBLE)", "CAST('１' AS DOUBLE)", "CAST(' 1' AS DOUBLE)",
+          "CAST('1_0' AS DOUBLE)", "CAST('Infinity' AS DOUBLE)", "CAST('+1.0' AS DOUBLE)", "CAST('inf' AS DOUBLE)"],
+    "g": ["0.1", "0.3", "1", "9007199254740993", "0.1e0", "1e0", "-0.0", "1e400",
+          "0.30000000000000004", "1.0000000000000000001"],
+    "d4": ["1", "1.25", "1.5", "1234.5", "12345", "0.5e0"],
+    "d": ["1", "1.005", "1.5", "2.0", "100000000000000", "10000000000000000000000000000000000000",
+          "1.0000000000000000000000001", "0.1e0"],
+    "d38": ["0.5", "1.2345", "1"],
+    "dt": ["DATE '1995-01-03'", "'1995-01-03'", "TIMESTAMP '1995-01-03 12:00:00'"],
+    "s": ["'beta'", "'it''s'", "2", "'2'"],
+}
+WL_OPS = ["{c} = {l}", "{c} <> {l}", "{c} < {l}", "{c} <= {l}", "{c} > {l}", "{c} >= {l}",
+          "{c} BETWEEN {lo} AND {l}", "{c} IN ({l}, {lo})", "{c} IN ({l})", "{c} NOT IN ({l}, {lo})",
+          "{c} IS DISTINCT FROM {l}", "{l} < {c}",
+          "{c} BETWEEN {l} AND 2e0", "{c} BETWEEN -5e0 AND {l}", "{c} BETWEEN {l} AND 10000000000000000000000",
+          "{c} IN ({l}, 2e0)", "{c} IN ({l}, 10000000000000000000000)"]
+
+
+def where_literal_checks():
+    """A WHERE literal is compared the way DuckDB compares it.
+
+    DuckDB binds `column <op> literal` by its implicit-cast rules for the pair
+    of types: `f = 0.1` over a FLOAT column casts the literal to FLOAT, `z =
+    2.5` over a SMALLINT column casts both sides to DECIMAL, `f = 1e0` widens
+    the column to DOUBLE, `d = 0.1e0` rounds a DECIMAL column into DOUBLE.
+    0.7.3 compared a FLOAT column with the literal's DOUBLE (wrong rows), raised
+    gpudb._rewrite.Decline out of the global aggregate and out of a template
+    re-run for a literal the lane cannot hold (`z = 2.5`, `z <> 2.5`, `z IN
+    (2.5)`), raised OverflowError for `z < 1e400`, read a 36-digit DECIMAL
+    literal rounded to 28 digits, and the extension's renderer dropped a `<>`
+    it could not represent, which let NULL rows through. Every statement here
+    either equals native or declines; none raises; and the shapes the fix
+    answers are asserted to run on the device."""
+    from gpudb import _rewrite as _rw
+    try:
+        from gpudb import _literals
+    except ImportError:                       # a client without literal resolution: the behaviour is still checked
+        _literals = None
+    print("== WHERE literals: compared as DuckDB compares them")
+    con = fresh()
+    if not has_device(con) or not getattr(con, "_exact", False):
+        skip("WHERE literals on the device: needs the exact path on a GPU backend")
+        con.close()
+        return
+    con.execute(WL_SETUP)
+    ref = duckdb.connect()
+    ref.execute(SETUP)
+    ref.execute(WL_SETUP)
+    types = {r[0]: r[1] for r in ref.execute("DESCRIBE twl").fetchall()}
+
+    # 1. the rules that need no query agree with DuckDB's own binding, term by term
+    agree, tried = 0, 0
+    for col, lits in (WL_LITS.items() if _literals is not None else ()):
+        lo = {"dt": "DATE '1990-01-01'", "s": "'a'"}.get(col, "-1")
+        for lit in lits:
+            for op in WL_OPS:
+                term = op.format(c=col, l=lit, lo=lo)
+                try:
+                    plan = _rw.match(con._serialize(f"SELECT k, count(*) FROM twl WHERE {term} GROUP BY k"),
+                                     "ASCENDING", "NULLS_LAST")
+                except Exception:
+                    continue                          # not a plain term: a computed lane, DuckDB evaluates it
+                try:
+                    if not all(_literals.resolve_fast(_literals.term_type(types[w.col]), w) for w in plan.where):
+                        continue                      # DuckDB binds the whole term (a BETWEEN's other half)
+                except _rw.Decline:
+                    continue                          # the statement declines whatever DuckDB says
+                for w in plan.where:
+                    if w.op in ("isnull", "isnotnull"):
+                        continue
+                    ct = _literals.term_type(types[w.col])
+                    try:
+                        fast = _literals.resolve_fast(ct, w)
+                    except _rw.Decline:
+                        continue
+                    if not fast or not w.dom:
+                        continue
+                    tried += 1
+                    try:
+                        dom, imgs = con._bind_literal_nodes([(w.node, ct, False)])[0]
+                    except _rw.Decline as e:
+                        check(False, f"literal rules: DuckDB binds `{term}` ({e.detail[:60]}) where the fast rule "
+                                     f"answered {w.dom}")
+                        continue
+                    mine = w.img
+                    if w.node.get("class") == "BETWEEN":
+                        imgs = [imgs[0] if w.op == ">=" else imgs[1]]
+                    same_vals = len(mine) == len(imgs) and all(
+                        (a != a and b != b) or a == b for a, b in zip(mine, imgs))
+                    if dom == w.dom and same_vals:
+                        agree += 1
+                    else:
+                        check(False, f"literal rules: `{term}` fast {w.dom} {mine} vs DuckDB {dom} {imgs}")
+    check(tried > 300 and agree == tried,
+          f"literal rules: the no-query rules agree with DuckDB's binding on every term ({agree} of {tried})")
+    # a DOUBLE literal leaves the renderer as a DOUBLE with its own bits (1.5 wrote `0.1e0` as the DECIMAL `0.1`)
+    lits = "0.1e0, 0.30000000000000004e0, 9007199254740993e0, -2.5e0, 1e300"
+    back = con._deserialize(con._serialize(f"SELECT {lits}"))
+    check([r[1] for r in ref.execute("DESCRIBE " + back).fetchall()] == ["DOUBLE"] * 5
+          and ref.execute(back).fetchall() == ref.execute(f"SELECT {lits}").fetchall(),
+          f"renderer: a DOUBLE literal reads back as the same DOUBLE ({back[:70]})")
+
+    # 2. every term on every path: native's answer, or a decline; never a raise
+    def stmt(path, term):
+        if path == "group":
+            return f"SELECT k, count(*), sum(v) FROM twl WHERE {term} GROUP BY k ORDER BY k"
+        if path == "global":
+            return f"SELECT count(*), sum(v), min(v) FROM twl WHERE {term}"
+        if path == "having":
+            return f"SELECT k, count(*) AS c FROM twl WHERE {term} GROUP BY k HAVING count(*) > 1 ORDER BY k"
+        if path == "join":
+            q = " ".join(("twl." + x) if x in WL_LITS else x for x in term.split(" "))
+            return (f"SELECT dwl.kk, count(*), sum(twl.v) FROM twl JOIN dwl ON twl.k = dwl.k AND {q} "
+                    f"GROUP BY dwl.kk ORDER BY dwl.kk")
+        return (f"SELECT k, count(*), sum(v) FROM twl WHERE {term} AND k IN (SELECT k FROM dwl WHERE kk < 3) "
+                f"GROUP BY k ORDER BY k")
+
+    def one(sql):
+        try:
+            return ("rows", [tuple(repr(x) for x in r) for r in con.execute(sql).fetchall()])
+        except duckdb.Error as e:
+            return ("duckdb-error", type(e).__name__)
+        except Exception as e:                       # anything else is the wrapper's own exception
+            return ("raised", f"{type(e).__module__}.{type(e).__name__}: {str(e)[:80]}")
+
+    def want_of(sql):
+        try:
+            return ("rows", [tuple(repr(x) for x in r) for r in ref.execute(sql).fetchall()])
+        except duckdb.Error as e:
+            return ("duckdb-error", type(e).__name__)
+
+    wrong, raised, rewritten, total = [], [], 0, 0
+    for path in ("group", "global", "having", "join", "sublane"):
+        for col in ("z", "f", "d", "g", "u") if path in ("join", "sublane") else WL_LITS:
+            lo = {"dt": "DATE '1990-01-01'", "s": "'a'"}.get(col, "-1")
+            for lit in WL_LITS[col]:
+                for op in WL_OPS:
+                    sql = stmt(path, op.format(c=col, l=lit, lo=lo))
+                    con._cache.clear()
+                    got, want = one(sql), want_of(sql)
+                    lr = con.last_rewrite()
+                    total += 1
+                    rewritten += bool(lr["rewritten"])
+                    if got[0] == "raised" or (got[0] == "duckdb-error" and want[0] == "rows"):
+                        raised.append((sql, got[1]))
+                    elif got != want:
+                        wrong.append((sql, lr["rewritten"]))
+    for sql, err in raised[:5]:
+        print("     raised:", err, "|", sql)
+    for sql, rw in wrong[:5]:
+        print("     wrong:", rw, "|", sql)
+    check(not raised, f"WHERE literals: no statement raises where native answers ({len(raised)} of {total})")
+    check(not wrong, f"WHERE literals: every answer is native's ({len(wrong)} of {total} differ)")
+    check(rewritten > total // 3, f"WHERE literals: the device answers most of them ({rewritten} of {total})")
+
+    # 3. a template re-run: a literal the lane holds, then one it cannot, and the reverse
+    pairs = [("z", "2", "2.5"), ("z", "3", "3.5"), ("z", "2", "1e400"), ("z", "2", "1.00000000000000000000000000000000001"),
+             ("z", "2", "9223372036854775808"), ("f", "0.5", "0.1"), ("f", "1", "16777217"), ("d", "1.5", "1.005"),
+             ("b", "2", "1.00000000000000000000000000000000001"), ("u", "2", "-1"), ("g", "0.5", "0.30000000000000004")]
+    rr_wrong, rr_raised = [], []
+    for col, a, b_ in pairs:
+        for op in WL_OPS[:10]:
+            for path in ("group", "global"):
+                for first, second in ((a, b_), (b_, a)):
+                    con._cache.clear()
+                    for x in (first, second):
+                        sql = stmt(path, op.format(c=col, l=x, lo="-1"))
+                        got, want = one(sql), want_of(sql)
+                        if got[0] == "raised" or (got[0] == "duckdb-error" and want[0] == "rows"):
+                            rr_raised.append((sql, got[1]))
+                        elif got != want:
+                            rr_wrong.append(sql)
+    for sql, err in rr_raised[:5]:
+        print("     raised:", err, "|", sql)
+    for sql in rr_wrong[:5]:
+        print("     wrong:", sql)
+    check(not rr_raised, f"WHERE literals: a template re-run with a literal the lane cannot hold never raises "
+                         f"({len(rr_raised)})")
+    check(not rr_wrong, f"WHERE literals: ... and answers native's rows ({len(rr_wrong)})")
+
+    # 4. the cases 0.7.3 got wrong, on the device and right
+    for sql in ["SELECT count(*), sum(v) FROM twl WHERE f = 0.1",
+                "SELECT k, count(*), sum(v) FROM twl WHERE f = 0.1 GROUP BY k ORDER BY k",
+                "SELECT k, count(*), sum(v) FROM twl WHERE f IN (0.1, 0.3) GROUP BY k ORDER BY k",
+                "SELECT count(*), sum(v) FROM twl WHERE f <= 0.3",
+                "SELECT count(*), sum(v) FROM twl WHERE f = 16777217",
+                "SELECT count(*), sum(v) FROM twl WHERE z = 2.5",
+                "SELECT count(*), sum(v) FROM twl WHERE z <> 2.5",
+                "SELECT count(*), sum(v) FROM twl WHERE z IN (2.5)",
+                "SELECT count(*), sum(v) FROM twl WHERE z < 1e400",
+                "SELECT count(*), sum(v) FROM twl WHERE d = 1.005",
+                "SELECT count(*), sum(v) FROM twl WHERE ti = 1.00000000000000000000000000000000001",
+                "SELECT k, count(*), sum(v) FROM twl WHERE z <> 2.5 GROUP BY k ORDER BY k",
+                "SELECT k, count(*), sum(v) FROM twl WHERE d <> 1.005 GROUP BY k ORDER BY k",
+                # the extension's renderer turns the literal down; the reference renderer draws it
+                "SELECT k, count(*), sum(v) FROM twl WHERE z = 2.5 GROUP BY k ORDER BY k",
+                "SELECT k, count(*), sum(v) FROM twl WHERE z IN (2.5, 3.5) GROUP BY k ORDER BY k",
+                # a BIGINT whose zone map stays inside +-2^53 is a double exactly
+                "SELECT count(*), sum(v) FROM twl WHERE b > 2.5e0",
+                "SELECT k, count(*), sum(v) FROM twl WHERE b > 1e0 GROUP BY k ORDER BY k",
+                # x IN (NULL) is the constant it is, not an empty list the device refuses
+                "SELECT count(*), sum(v) FROM twl WHERE f IN (NULL)",
+                "SELECT count(*), sum(v) FROM twl WHERE s IN (NULL)",
+                "SELECT count(*), sum(v) FROM twl WHERE g IN (NULL, NULL)",
+                # a DOUBLE literal through a round trip of the renderer (a CTE, a view, a split)
+                "WITH q AS (SELECT * FROM twl) SELECT k, count(*), sum(v) FROM q WHERE g > 0.45e0 GROUP BY k ORDER BY k",
+                "WITH q AS (SELECT * FROM twl) SELECT k, count(*), sum(v) FROM q WHERE f > 0.45e0 GROUP BY k ORDER BY k",
+                "WITH q AS (SELECT * FROM twl) SELECT k, count(*), sum(v) FROM q WHERE z > 0.45e0 GROUP BY k ORDER BY k",
+                "SELECT k, sum(v) * 2 AS x, count(*) FROM twl WHERE g > 0.45e0 GROUP BY k ORDER BY k"]:
+        con._cache.clear()
+        got, want = one(sql), want_of(sql)
+        lr = con.last_rewrite()
+        check(got == want and lr["rewritten"] and not lr["fallback"],
+              f"WHERE literals: on the device and native's ({lr['reason'] or lr['engine']}): {sql[sql.index('WHERE'):]}")
+    # ... and the ones that must stay DuckDB's: the column itself is rounded or cast lossily
+    for sql in ["SELECT count(*), sum(v) FROM twl WHERE d = 0.1e0",
+                "SELECT count(*), sum(v) FROM twl WHERE bw > 2.5e0",
+                "SELECT count(*), sum(v) FROM twl WHERE b = 1.00000000000000000000000000000000001",
+                # DECIMAL(38,35) holds three integer digits, a SMALLINT five: native raises for |z| >= 1000
+                "SELECT count(*), sum(v) FROM twl WHERE z = 1.00000000000000000000000000000000001"]:
+        con._cache.clear()
+        got, want = one(sql), want_of(sql)
+        lr = con.last_rewrite()
+        check(got == want and not lr["rewritten"] and lr["reason"] == "shape",
+              f"WHERE literals: declined to DuckDB ({lr['reason']}): {sql[sql.index('WHERE'):]}")
+
+    # 5. a HAVING literal: an exact device filter, or DuckDB compares the typed aggregate itself
+    hv_bad = []
+    for agg in ("count(*)", "sum(v)", "min(v)", "avg(v)", "sum(d)", "sum(z)"):
+        for lit in ("2", "400", "400.5", "0.1e0", "1e400", "9223372036854775808", "1.00000000000000000000000000000000001"):
+            for op in ("=", "<>", "<", ">="):
+                for first in (None, "2"):
+                    con._cache.clear()
+                    for x in ([first] if first else []) + [lit]:
+                        sql = f"SELECT k, count(*), sum(v) FROM twl GROUP BY k HAVING {agg} {op} {x} ORDER BY k"
+                        got, want = one(sql), want_of(sql)
+                        if got != want and not (got[0] == want[0] == "duckdb-error"):
+                            hv_bad.append((sql, got[0]))
+    for agg in ("sum(d)", "max(d)"):
+        for lit in ("0.55e0", "0.15e0", "0.35e0", "1.15e0", "0.95e0", "0.1e0", "0.3e0", "0.55", "0.15"):
+            for op in (">", ">=", "<", "<="):
+                for where in ("", "WHERE ii >= 0 "):
+                    con._cache.clear()
+                    sql = f"SELECT k, count(*), sum(d) FROM thl {where}GROUP BY k HAVING {agg} {op} {lit} ORDER BY k"
+                    for _run in range(2):
+                        got, want = one(sql), want_of(sql)
+                        if got != want:
+                            hv_bad.append((sql, got[0]))
+    for sql, g in hv_bad[:5]:
+        print("     HAVING:", g, "|", sql)
+    check(not hv_bad, f"HAVING literals: native's answer on every one, first sighting and re-run ({len(hv_bad)})")
+
+    # 5b. the same re-run through con.sql(): the relation is native's, nothing raises
+    for first, second in (("z <> 2", "z <> 2.5"), ("z IN (1, 2)", "z IN (1.5, 2.5)"), ("f >= 0.5", "f >= 0.1")):
+        con._cache.clear()
+        for t in (first, second):
+            for path in ("group", "global"):
+                sql = stmt(path, t)
+                try:
+                    got = ("rows", [tuple(repr(x) for x in r) for r in con.sql(sql).fetchall()])
+                except Exception as e:
+                    got = ("raised", f"{type(e).__name__}: {str(e)[:60]}")
+                check(got == want_of(sql), f"WHERE literals: con.sql() re-run is native's ({got[0]}): {sql[-60:]}")
+
+    # 5c. a decline the literal caused is the literal's: the template takes the device back
+    for col, a, b_ in (("bw", "1e3", "1000"), ("bw", "1e3", "2000"), ("z", "2.5", "3"), ("bw", "2.5e0", "3"),
+                       ("z", "1.00000000000000000000000000000000001", "1")):
+        for first, second in ((a, b_), (b_, a)):
+            for path in ("group", "global"):
+                con._cache.clear()
+                s1, s2 = (stmt(path, f"{col} > {x}") for x in (first, second))
+                one(s1)
+                got, want = one(s2), want_of(s2)
+                lr = con.last_rewrite()
+                expect = second in ("1000", "2000", "3", "1")      # an integer literal: the device's
+                check(got == want and (lr["rewritten"] or not expect),
+                      f"WHERE literals: `{col} > {first}` then `{col} > {second}` ({path}): native's rows, "
+                      f"{'on the device' if expect else 'declined is fine'} ({lr['reason'] or lr['engine']})")
+    # a decline is kept as data, not as an exception whose traceback grows by every raise
+    from gpudb import connection as _cn
+    bad = "SELECT k, count(*), sum(v) FROM twl WHERE bw > 1.00000000000000000000000000000000001e0 GROUP BY k"
+    for _ in range(50):
+        one(bad)
+    cached = list(getattr(_cn, "_LITERAL_RULES", {}).values()) + list(getattr(_cn, "_LITERAL_VALUES", {}).values()) \
+        + list(getattr(_cn, "_LITERAL_CACHE", {}).values())
+    check(all(not isinstance(v, BaseException) for v in cached),
+          "WHERE literals: no exception object is cached")
+    # a staleness the zone-map admission depends on: a write past 2^53 re-takes the decision
+    con.execute("CREATE TABLE tbw AS SELECT (i % 4)::INTEGER AS k, (i % 97)::BIGINT AS v, (i % 9)::BIGINT AS b "
+                "FROM range(4000) r(i)")
+    ref.execute("CREATE TABLE tbw AS SELECT (i % 4)::INTEGER AS k, (i % 97)::BIGINT AS v, (i % 9)::BIGINT AS b "
+                "FROM range(4000) r(i)")
+    q = "SELECT k, count(*), sum(v) FROM tbw WHERE b > 2.5e0 GROUP BY k ORDER BY k"
+    got = one(q)
+    check(got == want_of(q) and con.last_rewrite()["rewritten"], "WHERE literals: BIGINT inside +-2^53 vs DOUBLE: on the device")
+    cur = con.cursor()
+    for c in (cur, ref):
+        c.execute("INSERT INTO tbw VALUES (1, 5, 9007199254740993)")
+    got = one(q)
+    lr = con.last_rewrite()
+    check(got == want_of(q) and not lr["rewritten"],
+          f"WHERE literals: after another cursor writes a value past 2^53 the decision is re-taken ({lr['reason']})")
+    cur.close()
+    # an interrupt during the literal binding is the user's interrupt
+    real_raw = con._raw
+
+    class Interrupting:
+        def __init__(self, r):
+            self.r = r
+
+        def execute(self, q, *a, **kw):
+            if isinstance(q, str) and "json_serialize_plan" in q:
+                raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+            return self.r.execute(q, *a, **kw)
+
+        def __getattr__(self, n):
+            return getattr(self.r, n)
+    getattr(_cn, "_LITERAL_RULES", {}).clear()
+    con._cache.clear()
+    con._raw = Interrupting(real_raw)
+    try:
+        con.execute("SELECT k, count(*) FROM twl WHERE g > 0.25 AND f > 0.35 GROUP BY k").fetchall()
+        interrupted = False
+    except duckdb.InterruptException:
+        interrupted = True
+    finally:
+        con._raw = real_raw
+    check(interrupted, "WHERE literals: an interrupt while binding a literal reaches the user")
+
+    # 6. anything the wrapper raises while drawing a decided statement runs the statement natively
+    sql = "SELECT k, count(*), sum(v) FROM twl WHERE z <> 2 GROUP BY k ORDER BY k"
+    con._cache.clear()
+    con.execute(sql).fetchall()
+    real = _rw.render
+
+    def boom(*a, **kw):
+        raise RuntimeError("renderer exploded")
+    _rw.render = boom
+    try:
+        got = one(sql.replace("<> 2", "<> 3"))
+        lr = con.last_rewrite()
+    finally:
+        _rw.render = real
+    check(got == want_of(sql.replace("<> 2", "<> 3")) and not lr["rewritten"] and lr["reason"] == "error",
+          f"WHERE literals: a renderer that raises leaves the statement to DuckDB ({got[0]}, {lr['reason']})")
+    import gpudb.connection as _cn
+    real_body = _cn.Connection._route_body
+
+    def body_boom(self, *a, **kw):
+        raise TypeError("an unexpected tree")
+    _cn.Connection._route_body = body_boom
+    try:
+        got = one(sql)
+        lr = con.last_rewrite()
+    finally:
+        _cn.Connection._route_body = real_body
+    check(got == want_of(sql) and lr["reason"] == "error" and not lr["rewritten"]
+          and "an unexpected tree" in lr["detail"],
+          f"WHERE literals: a decision that raises leaves the statement to DuckDB ({got[0]}, {lr['reason']}, "
+          f"{lr['detail'][:60]})")
+    calls = [0]
+
+    def counting(self, *a, **kw):
+        calls[0] += 1
+        raise TypeError("an unexpected tree")
+    _cn.Connection._route_body = counting
+    try:
+        sql2 = sql.replace("<> 2", "<> 4")
+        for _ in range(3):
+            one(sql2)
+    finally:
+        _cn.Connection._route_body = real_body
+    check(calls[0] == 1, f"WHERE literals: a routing failure is remembered until the next write ({calls[0]} decisions)")
+    # ... and a statement that may write never runs with the sets it may stale still resident
+    _cn.Connection._route_body = body_boom
+    try:
+        con.execute("INSERT INTO twl SELECT * FROM twl WHERE k = 0 ORDER BY ALL LIMIT 1")
+    finally:
+        _cn.Connection._route_body = real_body
+    ref.execute("INSERT INTO twl SELECT * FROM twl WHERE k = 0 ORDER BY ALL LIMIT 1")
+    after = "SELECT k, count(*), sum(v) FROM twl WHERE z <> 1 GROUP BY k ORDER BY k"
+    check(one(after) == want_of(after), "WHERE literals: a write whose routing raised is followed by native's rows")
+    ref.close()
+    con.close()
 
 
 def extension_age_checks():

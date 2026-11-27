@@ -403,9 +403,19 @@ def for_renderer(text: str) -> str:
       - a JOIN without `is_implicit` (one the wrapper built) is rendered as an
         implicit `a, b` without parentheses, which changes what a nested join
         means; it is given `is_implicit: false`, the explicit form.
-    On 1.4/1.5 the text is returned as it is."""
-    if not _RENDER_INVERSE or not isinstance(text, str) or not (
-            '"LIMIT_PERCENT_MODIFIER"' in text or _JOIN_RE.search(text)):
+    And on every version, a DOUBLE constant is handed over as
+    CAST('<shortest spelling>' AS DOUBLE): 1.5's renderer writes `0.1e0` as
+    `0.1`, which reads back as a DECIMAL — a FLOAT column compared with it is
+    then compared in FLOAT, not DOUBLE (`f IS DISTINCT FROM 0.1e0` inside a
+    computed lane counted other rows than native) — and 2.0's writes
+    CAST(0.1 AS DOUBLE), a DECIMAL cast that is not the literal's own bits once
+    its digits pass 2^53. The text cast is DuckDB's correctly rounded parse.
+    Otherwise, on 1.4/1.5 the text is returned as it is."""
+    if not isinstance(text, str):
+        return text
+    doubles = '"DOUBLE"' in text or '"FLOAT"' in text
+    if not doubles and (not _RENDER_INVERSE or not (
+            '"LIMIT_PERCENT_MODIFIER"' in text or _JOIN_RE.search(text))):
         return text
 
     def walk(o):
@@ -414,10 +424,30 @@ def for_renderer(text: str) -> str:
         if not isinstance(o, dict):
             return o
         out = {k: walk(v) for k, v in o.items()}
-        if out.get("type") == "LIMIT_PERCENT_MODIFIER" and "limit" in out:
+        if _RENDER_INVERSE and out.get("type") == "LIMIT_PERCENT_MODIFIER" and "limit" in out:
             out["type"] = "LIMIT_MODIFIER"
             out["limit_type"] = "PERCENTAGE"
-        if out.get("type") == "JOIN" and "left" in out and "right" in out and "is_implicit" not in out:
+        if _RENDER_INVERSE and out.get("type") == "JOIN" and "left" in out and "right" in out \
+                and "is_implicit" not in out:
             out["is_implicit"] = False
+        if doubles and out.get("class") == "CONSTANT":
+            out = _double_constant(out)
         return out
     return json.dumps(walk(json.loads(text)), ensure_ascii=False)
+
+
+def _double_constant(node: dict) -> dict:
+    v = node.get("value")
+    if not isinstance(v, dict) or v.get("is_null"):
+        return node
+    tid = (v.get("type") or {}).get("id")
+    x = v.get("value")
+    if tid not in ("DOUBLE", "FLOAT") or isinstance(x, bool) or not isinstance(x, (int, float)):
+        return node
+    x = float(x)
+    text = "nan" if x != x else ("inf" if x > 0 else "-inf") if x in (float("inf"), float("-inf")) else repr(x)
+    inner = {"class": "CONSTANT", "type": "VALUE_CONSTANT", "alias": "", "query_location": _NO_LOCATION,
+             "value": {"type": _typ("VARCHAR"), "is_null": False, "value": text}}
+    return {"class": "CAST", "type": "OPERATOR_CAST", "alias": node.get("alias", ""),
+            "query_location": node.get("query_location", _NO_LOCATION), "child": inner,
+            "cast_type": _typ(tid), "try_cast": False}

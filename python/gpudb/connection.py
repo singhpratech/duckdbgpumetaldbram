@@ -9,11 +9,12 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
 import duckdb
 
-from . import (_aggs, _ast_compat, _classify, _ctes, _exprs, _flatten, _join, _resolve, _rewrite, _split, _syntax,
+from . import (_aggs, _ast_compat, _classify, _ctes, _exprs, _flatten, _join, _literals, _resolve, _rewrite, _split, _syntax,
                _thresholds, _views)
 from ._residency import DEVICE_ERROR, MEMORY_ERROR, ResidencyManager
 from ._resolve import _one
@@ -54,6 +55,32 @@ REQUIRED_FUNCTIONS = (
 _NO_EXTENSION = ("the gpudb extension is not loaded on this connection — install it with "
                  "`INSTALL gpudb FROM community` run on the same DuckDB version as this "
                  "client's `duckdb` module, or point GPUDB_EXTENSION_PATH at a built one")
+
+# (settings, column type, WHERE term SHAPE: its node with the DECIMAL / DOUBLE
+# literals' values dropped) -> what DuckDB's binding of it decides
+# (Connection._bind_literal_nodes), kept as data, never as an exception object
+_LITERAL_RULES: Dict[str, Any] = {}
+# (settings, the SQL of one literal's cast) -> the value DuckDB cast it to
+_LITERAL_VALUES: Dict[str, Any] = {}
+
+
+_SCALAR_LITERAL_WORDS = ("constant", "threshold", "IN list with no representable value")
+
+
+def _scalar_literal_decline(info: Dict[str, Any]) -> bool:
+    """Did gpu_rewrite_ast decline because of a LITERAL (see the reject()
+    texts in src/extension/gpu_rewrite.cpp: 'not a constant', 'constant of
+    type', 'WHERE equality against a constant the column cannot hold',
+    'HAVING threshold ...', 'IN list with no representable value', ...)?"""
+    return (info.get("reason") in ("shape", "overflow", "decimal")
+            and any(w in str(info.get("detail") or "") for w in _SCALAR_LITERAL_WORDS))
+
+
+def _is_interrupt(e: BaseException) -> bool:
+    """An interrupt is the user's, never a reason to decline: every handler
+    that turns an exception into a decline lets it through."""
+    return isinstance(e, duckdb.InterruptException) or "INTERRUPT" in str(e).upper()
+
 _GROUP_BY_RE = re.compile(r"\bGROUP\s+BY\b", re.IGNORECASE)
 # an aggregate without GROUP BY (§4.12). Over a join it was always worth
 # parsing; over a SINGLE table it is worth parsing since the global masked
@@ -213,6 +240,7 @@ class Decision:
     # computed lanes (§4.10) that embed a literal: the normalised template does
     # not identify the statement, so each literal tuple gets its own decision
     literal_sensitive: bool = False
+    write_seq: int = 0                 # the family's write count when decided (a bounds-admitted plan re-takes)
     # expressions over aggregates (§4.11): the rewritten INNER group by is
     # spliced into this outer statement text at the placeholder
     wrap: Optional[Tuple[str, str]] = None
@@ -1446,6 +1474,9 @@ class Connection:
         self._manager.invalidate(None)
         self._drop_plans()
         self._cache.clear()
+        self.__dict__.get("_route_failures", {}).clear()
+        root = self._parent or self
+        root._write_seq = getattr(root, "_write_seq", 0) + 1     # decisions that read zone-map bounds re-take
         (self._parent or self)._ties_ok.clear()   # §4.24: the data may tie now where it did not
         self._nested_cache.clear()
         self._flat_cache.clear()
@@ -1579,7 +1610,44 @@ class Connection:
         `last_rewrite()` describing the decision — including its `detail`,
         which the body fills in where it knows better and `_detail()`
         composes from the decision otherwise."""
-        out = self._route_body(query, parameters)
+        fkey = (query, self._settings_key) if isinstance(query, str) else None
+        failures = self.__dict__.setdefault("_route_failures", {})
+        if fkey is not None and fkey in failures:
+            # this statement's routing raised before, and nothing has been invalidated
+            # since: the same raise again would only cost a decision per execution
+            self._last = LastRewrite(statement=query, reason="error", detail=failures[fkey])
+            self._timing_decision = self._detail_decision = None
+            self._last_tags = []
+            return query
+        try:
+            out = self._route_body(query, parameters)
+        except Exception as e:
+            # Deciding is the wrapper's business, never the user's: whatever raised
+            # on the way (a renderer, a probe, a tree it did not expect), the
+            # statement runs on DuckDB as written. An interrupt stays an interrupt.
+            if _is_interrupt(e):
+                raise
+            self._log(f"routing raised, the statement runs native: {type(e).__name__}: {str(e)[:160]}")
+            read_only = isinstance(query, str) and ";" not in query and bool(_SELECT_START_RE.match(query))
+            if not read_only:
+                # The statement may write, and the raise may have come before the
+                # resident sets were dropped for it: drop them now, or fail the
+                # statement — never run a write with sets that may go stale behind it.
+                try:
+                    self._invalidate_all("the wrapper raised while routing")
+                except Exception:
+                    raise e
+            why = (f"the wrapper raised while deciding ({type(e).__name__}: {str(e).splitlines()[0][:200] if str(e) else ''}); "
+                   "DuckDB answered the statement")
+            if fkey is not None and read_only:
+                if len(failures) > 256:
+                    failures.clear()
+                failures[fkey] = why
+            self._last = LastRewrite(statement=query if isinstance(query, str) else "", reason="error", detail=why)
+            self._timing_decision = None
+            self._detail_decision = None
+            self._last_tags = []
+            return query
         if not self._last.detail:
             try:
                 self._last.detail = self._detail()
@@ -2127,14 +2195,22 @@ class Connection:
         self._last_literals = literals
         key = (template, self._settings_key + ("" if inner_out is None else f"|inner:{inner_out}"))
         d = self._cache.get(key)
+        seq = getattr(self._parent or self, "_write_seq", 0)
+        if d is not None and d.plan is not None and d.plan.bounds_used and d.write_seq != seq:
+            # admitted on a column's zone-map bounds (_resolve_literals), and some
+            # connection of this family has written since: the bounds may have moved
+            d = None
         if d is None:
             d = self._decide(sql, inner_out=inner_out)
             d.literals = literals
+            d.write_seq = seq
             self._cache[key] = d
         elif d.literal_sensitive and literals != d.literals:
             # a computed lane embeds a literal (substr(s, 1, 2), a LIKE pattern,
             # an OR of comparisons): another literal tuple is another statement
             v = d.variants.get(literals)
+            if v is not None and v.plan is not None and v.plan.bounds_used and v.write_seq != seq:
+                v = None                       # admitted on zone-map bounds that a write may have moved
             if v is None:
                 if len(d.variants) >= 16:
                     self._last.reason = "threshold"
@@ -2142,6 +2218,7 @@ class Connection:
                     return None
                 v = self._decide(sql, inner_out=inner_out)
                 v.literals = literals
+                v.write_seq = seq
                 d.variants[literals] = v
             d = v
         self._detail_decision = d
@@ -2250,12 +2327,33 @@ class Connection:
             # from the current statement's tree with the reference renderer
             # (one serialize, no catalog work, no scalar call)
             plan = d.plan
-            if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
-                plan = self._replan_literals(sql, plan)
-                if plan is None:
-                    self._last.reason = "shape"
-                    return None
-            out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+            try:
+                if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
+                    plan = self._replan_literals(sql, plan)
+                    if plan is not None and plan.bounds_used:
+                        # these literals were admitted on the decision's zone-map bounds
+                        d.plan.bounds_used = True
+                        if d.write_seq != seq:
+                            self._cache.pop(key, None)       # stale bounds: decided again next time
+                            plan = None
+                    if plan is None:
+                        self._last.reason = "shape"
+                        self._last.detail = ("the template was decided for other literals, and the rewritten "
+                                             "form cannot take these")
+                        self._timing_decision = None
+                        return None
+                out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+            except Exception as e:
+                # The decision is taken; this statement's own rendering is not. Nothing
+                # raised here may reach the user: DuckDB answers the statement.
+                if _is_interrupt(e):
+                    raise
+                reason = e.reason if isinstance(e, _rewrite.Decline) else "error"
+                self._log(f"rendering declined ({reason}): {e}")
+                self._last.reason = reason
+                self._last.detail = f"the rewritten form could not be drawn for these literals: {str(e)[:160]}"
+                self._timing_decision = None
+                return None
             self._last.engine = "python"
         if d.wrap is not None:
             out = d.wrap[0] + out + d.wrap[1]
@@ -2515,6 +2613,8 @@ class Connection:
                 plan = json.loads(_one(self._raw.execute(call, [stmt]))[0])
                 break
             except Exception as e:
+                if _is_interrupt(e):
+                    raise
                 why = str(e)[:80]
         if plan is None:
             raise _rewrite.Decline("shape", f"expression plan unavailable: {why}")
@@ -2578,10 +2678,12 @@ class Connection:
             try:
                 self._check_bound(f"SELECT {sql} AS c FROM {fqn}")
             except _rewrite.Decline as d:
-                t = d
+                t = _rewrite.Decline(d.reason, d.detail)      # kept without its traceback
             self._expr_types[key] = t
         if isinstance(t, _rewrite.Decline):
-            raise t
+            # a fresh exception each time: re-raising the cached one grows its
+            # traceback (and the frames it pins) by every raise
+            raise _rewrite.Decline(t.reason, t.detail)
         return t
 
     def _lower_exprs(self, tree: str, low: Optional["_join.Lowered"]):
@@ -2660,10 +2762,10 @@ class Connection:
             try:
                 self._check_bound(f"SELECT 1 FROM {src}")
             except _rewrite.Decline as d:
-                hit = d
+                hit = _rewrite.Decline(d.reason, d.detail)    # kept without its traceback
             self._expr_types[key] = hit
         if isinstance(hit, _rewrite.Decline):
-            raise hit
+            raise _rewrite.Decline(hit.reason, hit.detail)
         return low
 
     def _match(self, sql: str, mode: str = "device"):
@@ -2697,6 +2799,266 @@ class Connection:
         plan.lowered_tree = tree2
         return plan, low, computed
 
+    def _resolve_literals(self, plan: _rewrite.Plan) -> None:
+        """Every WHERE literal as DuckDB compares it (_literals): from the
+        types alone where they decide it (no query), from DuckDB's own binding
+        otherwise. Raises Decline for a comparison no lane image reproduces.
+        A BIGINT column met by a DOUBLE literal is admitted when its zone-map
+        bounds (plan.term_bounds, read with the decision's statistics) stay
+        inside +-2^53; the plan then records that it read them
+        (plan.bounds_used), so a write anywhere in the family re-takes it."""
+        bounds = (plan.term_bounds or {}).get
+
+        def used(c):
+            plan.bounds_used = True
+            return bounds(c)
+        pending = []
+        for w in plan.where:
+            ct = _literals.term_type(_rewrite.term_type(plan, w.col))
+            if not _literals.resolve_fast(ct, w, used):
+                exact_double = ct == "BIGINT" and _literals.bigint_exact(used(w.col))
+                pending.append((w, ct, exact_double))
+        if pending:
+            try:
+                self._bind_literals(pending)
+            except _rewrite.Decline:
+                raise
+            except Exception as e:                  # a bound plan of a shape this reader does not know
+                if _is_interrupt(e):
+                    raise
+                raise _rewrite.Decline("shape", f"the WHERE literals' binding could not be read: "
+                                                f"{type(e).__name__}: {str(e)[:80]}")
+
+    def _bind_literals(self, pending) -> None:
+        """Bind the pending terms the way DuckDB binds them in the statement —
+        each term's own node, its column replaced by a NULL of the column's
+        type — read the comparison type and the casts off the unoptimised
+        plan, and let DuckDB cast each literal to that type.
+
+        What DuckDB's binding decides (the comparison type, the casts on
+        either side) depends on the operands' types, not on a DECIMAL or
+        DOUBLE literal's value, so it is kept per term SHAPE (_LITERAL_RULES):
+        a new literal of the same types costs one SELECT of its cast, a literal
+        seen before costs nothing (_LITERAL_VALUES). The first sighting of a
+        shape costs three round trips (deserialize, json_serialize_plan, the
+        SELECT). A decline is kept as (reason, detail) and raised afresh."""
+        out = self._bind_literal_nodes([(w.node, ct, ex) for w, ct, ex in pending])
+        for (w, _ct, _ex), r in zip(pending, out):
+            dom, imgs = r
+            if w.op == "in":
+                if len(imgs) != len(w.lit):
+                    raise _rewrite.Decline("shape", "an IN list DuckDB bound differently")
+                w.dom, w.img = dom, list(imgs)
+            elif len(imgs) == 2 and w.node is not None and w.node.get("class") == "BETWEEN":
+                w.dom, w.img = dom, [imgs[0] if w.op == ">=" else imgs[1]]
+            elif len(imgs) == 1:
+                w.dom, w.img = dom, [imgs[0]]
+            else:
+                raise _rewrite.Decline("shape", "a WHERE term DuckDB bound differently")
+
+    @staticmethod
+    def _term_literals(node) -> List[Any]:
+        """The literal operands of a term node, in source order (NULLs included)."""
+        cls = node.get("class")
+        if cls == "COMPARISON":
+            return [node.get("right") if (node.get("left") or {}).get("class") == "COLUMN_REF"
+                    else node.get("left")]
+        if cls == "BETWEEN":
+            return [node.get("lower"), node.get("upper")]
+        return list((node.get("children") or [])[1:])
+
+    @staticmethod
+    def _shape_key(node, ct: str, exact_double: bool, settings: str) -> Optional[str]:
+        """The rule cache key of a term: its node with every DECIMAL / DOUBLE
+        literal's VALUE dropped (an integer's is kept: whether it fits decides
+        its binding), or None when a literal is not a plain constant."""
+        def strip(e):
+            if isinstance(e, dict):
+                if e.get("class") == "CONSTANT":
+                    v = e.get("value") or {}
+                    t = v.get("type") or {}
+                    keep = t.get("id") not in ("DECIMAL", "DOUBLE", "FLOAT")
+                    return {"c": t, "n": bool(v.get("is_null")), "v": v.get("value") if keep else None}
+                return {k: strip(x) for k, x in e.items() if k not in ("query_location", "alias")}
+            if isinstance(e, list):
+                return [strip(x) for x in e]
+            return e
+        if any(not isinstance(x, dict) or x.get("class") != "CONSTANT" for x in Connection._term_literals(node)):
+            return None
+        return settings + "\x00" + ct + ("\x00exact" if exact_double else "") + "\x00" + \
+            json.dumps(strip(node), sort_keys=True)
+
+    def _bind_literal_nodes(self, items) -> List[Any]:
+        """[(domain, [image per non-NULL literal])] for [(term node, column type,
+        exact_double)]; Decline when one of them cannot be reproduced."""
+        for cache in (_LITERAL_RULES, _LITERAL_VALUES):
+            if len(cache) > 4096:
+                cache.clear()
+        rules: List[Any] = [None] * len(items)
+        keys = [self._shape_key(n, ct, ex, self._settings_key) for n, ct, ex in items]
+        todo = []
+        for i, k in enumerate(keys):
+            r = _LITERAL_RULES.get(k) if k is not None else None
+            if r is None:
+                todo.append(i)
+            else:
+                rules[i] = r
+        if todo:
+            fresh = self._bind_rules([items[i] for i in todo])
+            for i, r in zip(todo, fresh):
+                rules[i] = r
+                if keys[i] is not None and r[0] != "bound":
+                    _LITERAL_RULES[keys[i]] = r
+        # a rule is ("decline", reason, detail) | ("rule", dom, [(casts, cmp_type)] per literal)
+        # | ("bound", dom, [(constant, casts, cmp_type)]) for a binding that is not kept per shape
+        sqls: List[str] = []
+        wanted: List[Any] = []
+        plans = []
+        for (node, _ct, _ex), r in zip(items, rules):
+            if r[0] == "decline":
+                raise _rewrite.Decline(r[1], r[2])
+            dom = r[1]
+            if r[0] == "rule":
+                lits = [x for x in self._term_literals(node) if not (x.get("value") or {}).get("is_null")]
+                if len(lits) != len(r[2]):
+                    raise _rewrite.Decline("shape", "a WHERE term DuckDB bound differently")
+                pairs = [(c, casts, cmp) for c, (casts, cmp) in zip(lits, r[2])]
+            else:
+                pairs = r[2]
+            slots = []
+            for c, casts, cmp in pairs:
+                sql = _literals.image_sql(c, casts, cmp)
+                vkey = self._settings_key + "\x00" + sql
+                if vkey in _LITERAL_VALUES:
+                    slots.append(("v", _LITERAL_VALUES[vkey]))
+                else:
+                    slots.append(("q", len(sqls)))
+                    sqls.append(sql)
+                    wanted.append(vkey)
+            plans.append((dom, slots))
+        row: tuple = ()
+        if sqls:
+            try:
+                row = _one(self._raw.execute("SELECT " + ", ".join(sqls)))
+            except duckdb.Error as e:
+                if _is_interrupt(e):
+                    raise
+                # natively the same cast raises (or the statement is answered without it): DuckDB's call
+                raise _rewrite.Decline("shape", "a literal does not cast to the type DuckDB compares it in: "
+                                                + str(e).splitlines()[0][:100])
+            for vkey, v in zip(wanted, row):
+                _LITERAL_VALUES[vkey] = v
+        out = []
+        for dom, slots in plans:
+            imgs = []
+            for kind, ref in slots:
+                v = ref if kind == "v" else row[ref]
+                if v is None:
+                    raise _rewrite.Decline("shape", "a literal cast to NULL")
+                if dom == "f":
+                    imgs.append(float(v))
+                elif isinstance(v, float):
+                    imgs.append(Decimal("NaN") if v != v else Decimal(v))
+                else:
+                    imgs.append(Decimal(v) if isinstance(v, int) else Decimal(str(v)))
+            out.append((dom, imgs))
+        return out
+
+    def _bind_rules(self, items) -> List[Any]:
+        """Bind the terms and read, per term, the domain and each literal's
+        cast chain; a term the lane cannot reproduce gets a decline rule. One
+        deserialize and one json_serialize_plan for all of them; a batch that
+        does not bind is retried term by term."""
+        try:
+            return self._bind_rules_once(items)
+        except _rewrite.Decline as e:
+            if len(items) == 1:
+                return [("decline", e.reason, e.detail)]
+            out = []
+            for it in items:
+                try:
+                    out += self._bind_rules_once([it])
+                except _rewrite.Decline as e1:
+                    out.append(("decline", e1.reason, e1.detail))
+            return out
+
+    def _bind_rules_once(self, items) -> List[Any]:
+        sel = []
+        cols = []
+        for i, (node, ct, _ex) in enumerate(items):
+            e = json.loads(json.dumps(node))
+            name = f"gpudb_c{i}"
+            ref = {"class": "COLUMN_REF", "type": "COLUMN_REF", "alias": "",
+                   "query_location": 18446744073709551615, "column_names": [name]}
+            cls = e.get("class")
+            if cls == "COMPARISON":
+                side = "left" if (e.get("left") or {}).get("class") == "COLUMN_REF" else "right"
+                e[side] = ref
+            elif cls == "BETWEEN":
+                e["input"] = ref
+            elif cls == "OPERATOR" and (e.get("children") or []):
+                e["children"][0] = ref
+            else:
+                raise _rewrite.Decline("shape", f"WHERE term {cls}")
+            e["alias"] = f"gpudb_e{i}"
+            sel.append(e)
+            cols.append(f"CAST(NULL AS {ct}) AS {name}")
+        if self._select_template is None:
+            self._select_template = json.loads(self._serialize("SELECT 1"))
+        stmt = json.loads(json.dumps(self._select_template))
+        stmt["statements"][0]["node"]["select_list"] = sel
+        try:
+            text = self._deserialize(json.dumps(stmt))
+            bind_sql = f"{text} FROM (SELECT {', '.join(cols)}) gpudb_b"
+            raw = _one(self._raw.execute("SELECT json_serialize_plan(?, optimize := false)", [bind_sql]))[0]
+            bound = json.loads(raw)
+        except Exception as e:
+            if _is_interrupt(e):
+                raise
+            raise _rewrite.Decline("shape", f"the WHERE literals could not be bound: {str(e).splitlines()[0][:80]}")
+        if not isinstance(bound, dict) or bound.get("error"):
+            raise _rewrite.Decline("shape", "the WHERE literals could not be bound")
+        exprs = ((bound.get("plans") or [{}])[0]).get("expressions") or []
+        if len(exprs) != len(items):
+            raise _rewrite.Decline("shape", "the bound WHERE literals do not line up")
+        out = []
+        for (node, ct, exact_double), ex in zip(items, exprs):
+            try:
+                ops = _literals.operands(ex)
+                colops = [o for o in ops if self._bound_is_column(o)]
+                if len(colops) != 1:
+                    raise _rewrite.Decline("shape", "a WHERE term DuckDB bound with no single column side")
+                colop = colops[0]
+                cast_to, col_type = _literals.column_side(colop)
+                cmp_type = colop.get("return_type") or {}
+                dom = _literals.decide_domain(ct, cast_to, col_type, cmp_type, exact_double)
+                parse_lits = self._term_literals(node)
+                lit_ops = [o for o in ops if o is not colop]
+                cacheable = len(parse_lits) == len(lit_ops)
+                pairs, chains = [], []
+                for k, o in enumerate(lit_ops):
+                    if (o.get("return_type") or (o.get("value") or {}).get("type")) != cmp_type:
+                        raise _rewrite.Decline("shape", "a literal DuckDB compares in another type than its column")
+                    c, casts = _literals.literal_chain(o)
+                    p = parse_lits[k] if cacheable else None
+                    if not (isinstance(p, dict) and p.get("class") == "CONSTANT"
+                            and (p.get("value") or {}) == (c.get("value") or {})):
+                        cacheable = False                 # the binder changed the literal: no rule per shape
+                    if (c.get("value") or {}).get("is_null"):
+                        continue
+                    pairs.append((c, casts, cmp_type))
+                    chains.append((casts, cmp_type))
+                out.append(("rule", dom, chains) if cacheable else ("bound", dom, pairs))
+            except _rewrite.Decline as e:
+                out.append(("decline", e.reason, e.detail))
+        return out
+
+    @staticmethod
+    def _bound_is_column(x) -> bool:
+        while isinstance(x, dict) and _literals._is_cast(x):
+            x = _literals._cast_child(x)
+        return isinstance(x, dict) and x.get("expression_class") in ("BOUND_COLUMN_REF", "BOUND_REF")
+
     def _replan_literals(self, sql: str, cached: _rewrite.Plan) -> Optional[_rewrite.Plan]:
         try:
             plan, _low, _computed = self._match(sql, "upload" if cached.tag and ":joinu-" in cached.tag else "device")
@@ -2716,6 +3078,15 @@ class Connection:
             return None
         if plan.form == "topk" and cached.form != "topk":
             plan.form = cached.form
+        # the new literals, as DuckDB compares them (a template's literal can move
+        # between a value the lane holds and one it cannot, or between types)
+        plan.term_types = cached.term_types
+        plan.term_bounds = cached.term_bounds
+        try:
+            self._resolve_literals(plan)        # the program itself is drawn by render(), inside its own guard
+        except _rewrite.Decline as e:
+            self._log(f"declined (re-planned literals): {e.detail}")
+            return None
         return plan
 
     def _decide_split(self, sql: str, inner_out: Optional[int] = None) -> Optional[Decision]:
@@ -2751,7 +3122,7 @@ class Connection:
         if not d.rewritten:
             self._log(f"split: the inner GROUP BY declined ({d.reason})")
             return Decision(False, d.reason, why=d.why or "the GROUP BY under the expressions declined",
-                            inner_relaxable=d.inner_relaxable)
+                            inner_relaxable=d.inner_relaxable, literal_sensitive=d.literal_sensitive)
         head, tail = outer_sql.split(_split.PLACEHOLDER)
         if is_global:
             # no GROUP BY: one row even when nothing qualifies, as native
@@ -2780,6 +3151,8 @@ class Connection:
         if allow_split:
             ds = self._decide_split(sql, inner_out)
             if ds is not None:
+                if not ds.rewritten and d.literal_sensitive:
+                    ds.literal_sensitive = True     # the literals declined the device form first
                 return ds
         return d
 
@@ -2807,6 +3180,8 @@ class Connection:
                 self._log(f"declined ({e.reason}, {mode}): {e.detail}")
             return Decision(False, e.reason, why=e.detail or "")
         except Exception as e:
+            if _is_interrupt(e):
+                raise
             self._log(f"rewrite error: {e}")
             return Decision(False, "error", why=str(e)[:160])
         if low is None:
@@ -2958,6 +3333,20 @@ class Connection:
                 packs.append((mn, rng, stride))
                 stride *= rng
             plan.pack = list(reversed(packs))
+        # every WHERE literal as DuckDB compares it (_literals): a computed lane is
+        # compared as its expression's own type, not as its lane's; a BIGINT
+        # column's zone-map bounds come from the statistics read just above
+        plan.term_types = {w.col: (computed[w.col].native_type if w.col in computed else columns.get(w.col, ""))
+                           for w in plan.where}
+        plan.term_bounds = {c: (stats[c].get("min"), stats[c].get("max")) for c in plan.term_types
+                            if c in stats and c not in computed}
+        try:
+            self._resolve_literals(plan)
+        except _rewrite.Decline as e:
+            self._log(f"declined ({e.reason}): {e.detail}")
+            # a decline that this statement's LITERALS caused: another literal of the
+            # same template is another statement (`bi > 1e3` then `bi > 1000`)
+            return Decision(False, e.reason, why=e.detail or "", literal_sensitive=True)
         # per-backend thresholds (§9.1): distinct-count estimate of the key and,
         # under a WHERE, the selectivity of THIS statement's literals (one
         # count(*) scan at decision time, cached with the template)
@@ -3161,6 +3550,10 @@ class Connection:
                     row = _one(self._raw.execute(
                         "SELECT r, json_deserialize_sql(r) FROM (SELECT gpu_rewrite_ast(?, ?) AS r) s",
                         [tree, json.dumps(ctx)]))
+                    if row[1] is not None and ('"DOUBLE"' in row[0] or '"FLOAT"' in row[0]):
+                        # 1.5's renderer writes a DOUBLE constant as a DECIMAL: the
+                        # wrapper's renderer pass draws it as the DOUBLE it is
+                        row = (row[0], self._deserialize(row[0]))
                 info = (json.loads(row[0]).get("gpudb") or {})
             except Exception as e:
                 self._log(f"gpu_rewrite_ast failed: {e}")
@@ -3168,6 +3561,13 @@ class Connection:
             if not info.get("rewritten"):
                 if info.get("reason") in ("not_resident", "threshold"):
                     pass                       # static checks passed; residency is ours
+                elif _scalar_literal_decline(info):
+                    # The extension's renderer turned these LITERALS down (`z = 2.5`, a
+                    # CAST('0.45' AS DOUBLE) that a round trip through the renderer
+                    # writes on DuckDB 1.5, a HAVING DOUBLE); the reference renderer
+                    # draws every literal of a template after the first anyway, and
+                    # draws this one.
+                    self._log(f"scalar declined a literal ({info.get('detail', '')}); rendering in Python")
                 else:
                     self._log(f"scalar declined ({info.get('reason')}: {info.get('detail', '')}); "
                               f"reference matcher accepted — following the scalar")
@@ -3177,6 +3577,33 @@ class Connection:
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form
+        if plan.where:
+            # the program, drawn here once so that a literal it cannot draw declines now
+            try:
+                prog = _rewrite._where_program(plan)
+            except _rewrite.Decline as e:
+                return Decision(False, e.reason, why=e.detail or "", literal_sensitive=True)
+            if d.scalar_sql and ("'" + prog.replace("'", "''") + "'") not in d.scalar_sql:
+                # The extension's renderer drew another program for these literals
+                # (it compares a FLOAT column with the literal's DOUBLE, and drops a
+                # `<>` it cannot represent, which lets NULL rows through): the
+                # reference renderer draws the statement, as it does for every
+                # later literal of the template.
+                self._log("the extension's WHERE program differs from the reference one; rendering in Python")
+                d.scalar_sql = ""
+        if d.scalar_sql and plan.having is not None:
+            # The same standard for the device HAVING filter: the extension rescales
+            # a DOUBLE threshold in double arithmetic (0.55e0 * 100 = 55.000000000000007,
+            # ceiling 56) and drops the group whose sum is 0.55. Its statement is kept
+            # only when it filters exactly as the reference renderer would.
+            try:
+                mine = _rewrite.device_having(_rewrite.render(plan, d.fqn, self._settings["default_order"]))
+            except _rewrite.Decline as e:
+                return Decision(False, e.reason, why=e.detail or "", literal_sensitive=True)
+            if mine != _rewrite.device_having(d.scalar_sql):
+                self._log(f"the extension's HAVING filter differs from the reference one "
+                          f"({_rewrite.device_having(d.scalar_sql)} vs {mine}); rendering in Python")
+                d.scalar_sql = ""
         return d
 
 

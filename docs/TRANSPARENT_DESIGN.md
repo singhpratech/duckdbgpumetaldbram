@@ -666,6 +666,72 @@ compares integers. `'nan'::DOUBLE > 5` is true natively and must be true on
 the device; the parity scenarios include NaN and ±inf rows under every
 operator.
 
+**The literal a lane is compared with is the literal DuckDB compares with
+(2026-11-26).** A term `col <op> literal` is not compared in the column's type:
+DuckDB binds the pair by its implicit-cast rules and casts one side or both.
+`f = 0.1` over a FLOAT column casts the literal to FLOAT (0.10000000149011612);
+`z = 2.5` over a SMALLINT casts both to DECIMAL(6,1); `f = 1e0` widens the
+column to DOUBLE; `d = 0.1e0` rounds a DECIMAL column into DOUBLE; a literal
+with 35 decimals casts a BIGINT column to DECIMAL(38,35), which raises
+natively for any value past 999. A BETWEEN's three operands and an IN list's
+members are bound to ONE type: `ii BETWEEN 1.00000000000000001 AND 2e0` is
+compared in DOUBLE, lower bound included, and so is a DECIMAL beside a 23-digit
+integer. The wrapper (`python/gpudb/_literals.py`) gives every term its literal
+as the comparison type holds it, deciding from every literal of the term's node:
+
+- an integer / DECIMAL column against integer / DECIMAL literals whose digits
+  fit DECIMAL(37), a FLOAT / DOUBLE column against DOUBLE literals or integers
+  the float type holds exactly, an integer column of at most 32 bits against
+  DOUBLE literals, and a BIGINT column whose zone-map bounds stay inside
+  ±2^53 against DOUBLE literals are decided from the types alone, with no query
+  (the test suite pins these rules against DuckDB's own binding, term by term);
+- anything else is bound by DuckDB — the term's own node over a NULL of the
+  column's type, `json_serialize_plan(..., optimize := false)` — and the
+  comparison type and every cast are read off the bound plan; DuckDB then casts
+  each literal to that type itself. The binding depends on the operands' types,
+  not on a DECIMAL or DOUBLE literal's value, so it is kept per term shape: the
+  first sighting of a shape costs three round trips, a new literal of a known
+  shape one (the cast), a literal seen before none;
+- a comparison the lane image cannot reproduce declines with reason `shape`:
+  the column rounded into DOUBLE (a DECIMAL column, or a BIGINT not known to
+  stay inside ±2^53, against a DOUBLE literal), the column cast into a type that
+  does not hold every value of its own, a literal that does not cast (native
+  raises, or answers, itself), a `CAST('…' AS DOUBLE)` whose text is not the
+  canonical spelling of a double (DuckDB's cast rejects texts Python's float()
+  accepts). Such a decline is the literal's, not the template's: another
+  literal of the same template is decided on its own;
+- a value the lane cannot hold makes the term constant instead of raising:
+  `=` and `IN` never true (`lane is null; lane is not null`, also for
+  `IN (NULL)`), `<>` true on every non-NULL row (`lane is not null`), and a
+  bound past the BIGINT range or ±inf is always or never true by DuckDB's order
+  (NaN above everything).
+
+The admission on zone-map bounds is re-taken after any write: a write through
+the wrapper drops the writing connection's decisions and counts the family's
+writes (`_invalidate_all`), so a sibling cursor's cached decision that read
+bounds is taken again too, and a foreign write to the database file goes the
+same way (§5.9); an in-process writer the wrapper did not open stays the
+documented gap of §0.
+
+The extension's renderer (`gpu_rewrite_ast`, which draws a template's first
+execution) compares a FLOAT column with the literal's DOUBLE, drops a `<>` it
+cannot represent — which lets NULL rows through — and rescales a DOUBLE HAVING
+threshold in double arithmetic (`sum(d) >= 0.55e0` on DECIMAL(15,2): 55.000000000000007,
+ceiling 56, the group whose sum is 0.55 dropped). The wrapper draws the program
+and the device HAVING filter itself first and keeps the extension's statement
+only when it carries the same ones; otherwise, and when the extension declines
+because of a literal alone (`z = 2.5`, a `CAST('0.45' AS DOUBLE)` that a round
+trip through DuckDB 1.5's renderer writes), the reference renderer draws the
+statement, as it already does for every later literal of the template. A HAVING
+literal the device filter cannot take exactly (a DOUBLE, a value outside
+BIGINT, more than nine decimals) is then compared, in the reference renderer's
+statement, by DuckDB with the typed aggregate. Nothing raised while drawing a
+decided statement reaches the user: the statement runs on DuckDB
+(`_rewrite_text`, and a last net around routing that remembers the failure
+until the next write, and that drops the resident sets — or fails the
+statement — before a statement that may write runs). An interrupt is never
+turned into a decline.
+
 **The mask stage is one pass (Metal, 2026-09-18).** It used to be one kernel
 dispatch per term: each of them read a byte of the mask and wrote one back to
 look at a single lane, so a five-term WHERE walked a 60 MB mask ten times and
