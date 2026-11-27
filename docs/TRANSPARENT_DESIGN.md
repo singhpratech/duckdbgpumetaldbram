@@ -110,6 +110,11 @@ GROUP BY k1 [, k2, k3]
 - Payloads: integer family, DECIMAL (§4.3); DATE / TIMESTAMP for `min`, `max`
   and `count` (days / microseconds on the device, typed on the way out).
   `count(DISTINCT x)`, one DISTINCT column per statement (§4.17).
+- DATE / TIMESTAMP values include `infinity` / `-infinity` everywhere a
+  temporal column reaches the device — key, WHERE, `min` / `max` / `count`,
+  computed lanes, joins — and every plan that turns a device image back into a
+  DATE / TIMESTAMP is drawn by the Python renderer (§4.25). A packed key whose
+  zone map holds an infinity declines (`shape`, §4.4).
 - A select-project-join derived table (or a single CTE) as the FROM is folded
   into the statement first (§4.16). DOUBLE/FLOAT payloads are not
   rewritten (§4.7); they stay available through the explicit `gpu_*` calls.
@@ -628,6 +633,38 @@ component; predicates on later components go through the mask (§4.6).
 DuckDB's base-table min/max are conservative after updates (widened, never
 wrong), which is the safe direction. Exact, no new kernels. When the product
 does not fit, the shape is not resident (native).
+
+The bounds are the zone map's when the decision is taken, and the data can
+leave them afterwards — a row written through any connection, or while a
+segmented upload is in flight. Three rules keep a packed set right whatever
+happened since (2026-11-26; before that, such a row was packed into another
+group's slot):
+
+- **The upload refuses a component outside its bounds.** Each slot is
+  `CASE WHEN image BETWEEN min AND max THEN image - min + 1 WHEN image IS NULL
+  THEN 0 ELSE error('GPUDB_IMAGE: …') END` (`_rewrite.key_lane_expr`), so the
+  upload fails, the set is not resident and DuckDB answers. The residency
+  manager never queues such a set again (`_residency.IMAGE_ERROR`): the same
+  recipe can only fail again, or — after a delete — succeed over bounds the
+  decision no longer trusts.
+- **The bounds are part of the key lane's name** (`a+b~<digest>`,
+  `Plan.key_suffix`), and so of the set's tag and of the store column: a
+  decision can only ever read a set built from its own bounds. The extension's
+  renderer reads the key's components off the tag, so it is handed the tag with
+  exactly that suffix removed, and the suffix is put back into the statement it
+  renders (a column named `a~b` is untouched).
+- **Before a packed set is uploaded again, its decision is looked at**
+  (`Connection._packed_bounds_hold`): if the upload refused a component, or if
+  the components' zone-map bounds — read again once per invalidation of the
+  set, metadata only — no longer lie within the decision's, the decision is
+  taken again on the spot and the old set's manager entry is forgotten. No
+  write drops a decision by itself: the writer cannot always be seen (a raw
+  cursor, another connection), and a set whose data still lies within its
+  bounds is right however it got there. Only the decision being run is
+  touched; another connection's decision over the same set meets the same
+  test at its own next sighting. A computed component has no zone map; for it
+  the upload's refusal is the check (one refused upload, DuckDB answers, the
+  next sighting packs anew).
 
 ### 4.5 VARCHAR keys via dictionary
 A VARCHAR key is uploaded as a dense int32 id against a host-side dictionary
@@ -1475,6 +1512,62 @@ the same multiset native sorts, so the tie is DuckDB's either way, but its
 top-N depends on the order its input arrives in and the device's group order is
 not the hash aggregate's, so at `threads=1` such a tie can still land
 differently.
+
+### 4.25 Infinite DATE / TIMESTAMP values, and who draws a temporal decode
+A DATE or TIMESTAMP lane holds what DuckDB itself stores: days or
+microseconds since the epoch, and for `infinity` / `-infinity` INT32_MAX /
+INT64_MAX or their negation, which lie beyond every finite value — so order,
+equality, `IS NULL`, `min` / `max` and grouping on the device are DuckDB's.
+The TIMESTAMP image used to be `epoch_us(ts)`, which is NULL for an infinite
+timestamp: those rows became NULL cells, so `WHERE ts IS NULL` counted them,
+a comparison lost them and an infinite key joined the NULL group (pip 0.7.5
+and earlier; with shipped defaults through the aggregate without GROUP BY,
+and through every shape once the infinity arrived after the decision or came
+from a computed TIMESTAMP such as `date_trunc`, `ts + INTERVAL …` or a cast
+from DATE). It is now `CASE WHEN isinf(ts) THEN ±INT64_MAX ELSE epoch_us(ts)
+END` (`_rewrite._int_image`); the DATE image, `date - DATE '1970-01-01'`,
+already kept the infinite day counts. `isinf()` picks the infinite rows, not
+`= TIMESTAMP 'infinity'`: DuckDB 1.5.6 rewrites `date_trunc(…) = <constant>`
+into a range on the argument, which is empty for an infinite constant.
+
+On the way out the infinite images are mapped back (`_rewrite._typed_expr`);
+`make_timestamp(n)` and `DATE '1970-01-01' + n` raise for them, and those are
+the forms the extension's renderer decodes with. An infinity can arrive after
+any decision — a write through a cursor, a raw cursor, another connection —
+so the first version of this change, which kept that renderer wherever the
+zone map showed no infinity and retook a decision after its decode raised,
+left the lazy `sql()` path raising to the caller (a relation is read after
+`sql()` has returned) and grew a retake and a decline of its own. Instead,
+**every plan that decodes a DATE / TIMESTAMP — a key that is not a dictionary
+key, a `min` / `max`, a HAVING over one (`_rewrite.decodes_temporal`) — is
+drawn by the Python renderer, always**: `execute()` and `sql()`, the first
+execution and every later one, new literals, every form. The extension's
+renderer still decides whether the statement is rewritten at all (its verdict
+is unchanged), its rendering is set aside. The Python rendering is drawn once
+per decision and kept (`Decision.python_sql`), as the extension's is. Measured
+against it on TPC-H SF1 over the 17 affected plans, in one process over the
+same resident sets, the per-execution times are within the noise of a loaded
+machine (median ratio 0.99); the decode's own CASE costs 0.00–0.11 ms per
+execution, the most where a LIMIT keeps 10 of 100K decoded groups
+(`docs/RESEARCH_NOTES.md`, 2026-11-26), and the measured rule 1 (§9.1) still
+judges every such template against native. Run over the wrapper's whole corpus
+with the extension's rendering discarded for EVERY plan, the Python renderer
+drew each one with the same rows, names and types; the one form it could not
+draw — an output name that holds a quote, such as DuckDB's own `min("d~t")` —
+it now quotes.
+
+The bounds handed to the extension's renderer are written as null where they
+are not finite (a temporal infinity, a DOUBLE's NaN / ±inf): `json.dumps`
+wrote them as `Infinity` / `NaN`, which is not JSON, and the renderer failed
+on the whole context — which is what kept every statement over a column with
+an infinity off the device by accident (reason `error`). A GROUP BY under a
+WHERE on a DOUBLE / FLOAT column whose zone map holds NaN or ±inf declined the
+same way and is not about temporal values: it keeps declining, now with reason
+`double` and a sentence, until it is admitted as a change of its own with its
+own tests on both backends.
+
+TIMESTAMP_S / _MS / _NS, TIMESTAMP WITH TIME ZONE, TIME and INTERVAL are not
+lanes (a comparison over one is a computed BOOLEAN lane DuckDB evaluates).
 
 ## 5. Automatic residency (piece C)
 

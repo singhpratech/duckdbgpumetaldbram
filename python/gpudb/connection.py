@@ -4,6 +4,7 @@ template cache and the rewrite before DuckDB sees it."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -208,6 +209,13 @@ class Decision:
     form: str = ""
     literals: Tuple[str, ...] = ()     # literal values of the template this was decided on
     scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
+    python_sql: str = ""               # the reference renderer's, drawn once, for exactly those literals
+    # §4.4: a packed key's components, where each one's zone-map bounds can be
+    # read again — (table identity, column, type), None for a computed one —
+    # and the epoch of its set (ResidencyManager) they were last read at, so
+    # they are read once per invalidation (-2: the decision read them itself)
+    pack_src: List[Optional[Tuple[Any, str, str]]] = field(default_factory=list)
+    pack_epoch: int = -3
     output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
     join: Optional[Any] = None         # _join.JoinResidency for a statement over a key join (§4.8)
     # computed lanes (§4.10) that embed a literal: the normalised template does
@@ -306,6 +314,17 @@ def _num(x: Optional[str]):
             return float(x)
         except ValueError:
             return None
+
+
+def _bound(x: Optional[str]):
+    """A zone-map bound as a JSON number for the extension's renderer, or None.
+    A temporal column's `infinity` / `-infinity` and a DOUBLE's inf / nan read
+    as non-finite floats, which json.dumps writes as `Infinity` / `NaN` — not
+    JSON — and the renderer then failed on the whole context, declining the
+    statement with reason 'error'. The renderer reads the bounds of an integer
+    payload only (the v0.6 overflow test), so None loses nothing."""
+    v = _num(x)
+    return v if not isinstance(v, float) or math.isfinite(v) else None
 
 
 def _first_extension_in(d: str) -> Optional[str]:
@@ -1166,7 +1185,7 @@ class Connection:
         # decision used to carry, so it goes with them.
         lits = getattr(self, "_last_literals", None)
         if lits is not None and lits != d.literals:
-            d.literals, d.scalar_sql = lits, ""
+            d.literals, d.scalar_sql, d.python_sql = lits, "", ""
         d.literal_sensitive = True
         if native_ms is not None:
             d.native_ms = native_ms if d.native_ms is None else min(d.native_ms, native_ms)
@@ -2156,6 +2175,8 @@ class Connection:
                 v.literals = literals
                 d.variants[literals] = v
             d = v
+        if d.rewritten and d.plan is not None and d.plan.exact and d.plan.packed:
+            d = self._packed_bounds_hold(d, key, literals, sql, inner_out)
         self._detail_decision = d
         self._last.round_trip_ms = (time.perf_counter() - t0) * 1000.0
         if d.rewritten and d.lazy_declined and self._lazy:
@@ -2175,6 +2196,16 @@ class Connection:
         self._last.form = d.form
         self._last.tag = d.tag
         self._last_decision = d
+        if self._foreign_write_seen():
+            # some connection committed a write since the last look: every set may be stale
+            # (an in-place UPDATE keeps the row count, so the guard would not know). Looked at
+            # before residency, so a set still being uploaded is dropped with the rest rather
+            # than finishing over data that moved under it.
+            self._log("foreign write: the database file changed — resident sets dropped, statement runs native")
+            self._invalidate_all("foreign write")
+            self._resnap_after = False
+            self._last.reason = "not_resident"
+            return None
         # residency
         if self._residency_mode == "manual":
             if not self._manager.is_ready(d.tag) and not self._extension_has_ready_set(d.tag):
@@ -2257,6 +2288,11 @@ class Connection:
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql
             self._last.engine = "scalar"
+        elif d.python_sql and literals == d.literals:
+            # the decided literals, drawn by the reference renderer once (a plan
+            # that decodes a DATE / TIMESTAMP, a global aggregate)
+            out = d.python_sql
+            self._last.engine = "python"
         else:
             # literals differ from the cached template (or no scalar): re-render
             # from the current statement's tree with the reference renderer
@@ -2269,19 +2305,99 @@ class Connection:
                     return None
             out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
             self._last.engine = "python"
+            if literals == d.literals:
+                d.python_sql = out
         if d.wrap is not None:
             out = d.wrap[0] + out + d.wrap[1]
-        if self._foreign_write_seen():
-            # some connection committed a write since the last look: every set may be stale
-            # (an in-place UPDATE keeps the row count, so the guard would not know)
-            self._log("foreign write: the database file changed — resident sets dropped, statement runs native")
-            self._invalidate_all("foreign write")
-            self._resnap_after = False
-            self._last.reason = "not_resident"
-            return None
         self._last.rewritten = True
         self._last.sql = out
         return out
+
+    def _packed_bounds_hold(self, d: "Decision", key, literals, sql: str,
+                            inner_out: Optional[int]) -> "Decision":
+        """§4.4: a packed key's slots are sized by the zone-map bounds its
+        decision read, and its set is named after them (Plan.key_suffix). This
+        is where a decision whose bounds the data has left is taken again.
+
+        Nothing is dropped by a write itself — through this connection, a
+        cursor of it, a raw cursor or another connection, the writer cannot
+        always be seen — and a set built from bounds the data still lies
+        within is right whatever happened since. Instead, before a set is
+        (re)uploaded, its decision is looked at:
+
+          * the upload refused a component outside the bounds (IMAGE_ERROR,
+            key_lane_expr): the decision is taken again now;
+          * the set is not resident and no upload of it is running: the
+            components' zone-map bounds are read again (stats(), metadata
+            only, once per invalidation of the set), and if they are no longer
+            within the decision's bounds the decision is taken again now — so
+            the upload that follows packs for the bounds of now, under a set
+            of its own.
+
+        A decision just taken skips the reading (it read them a moment ago).
+        A computed component has no zone map; for it the upload's refusal is
+        the check. Taking the decision again forgets the old set's entry in
+        the residency manager, whose device copy an invalidation or the
+        failed upload has already dropped. Only this decision is touched:
+        another connection's decision over the same set meets the same test
+        at its own next sighting."""
+        st = self._manager.get(d.tag)
+        state = st.state if st is not None else "missing"
+        epoch = st.epoch if st is not None else 0     # a new SetState starts at epoch 0
+        if d.pack_epoch == -2:
+            d.pack_epoch = epoch                       # the decision read them itself, just now
+        if state in ("ready", "uploading"):
+            return d
+        failed = self._image_failed(d)
+        if not failed:
+            if d.pack_epoch == epoch:
+                return d
+            d.pack_epoch = epoch
+            if not self._pack_left(d):
+                return d
+        why = ("the upload refused a value outside the key's packed bounds" if failed
+               else "the zone map left the key's packed bounds")
+        self._log(f"packed key: {why} — the decision is taken again ({d.tag})")
+        # the set, and a device join's base set holding the key lane (its name carries
+        # the same bounds); a base set of another table is any join's to share
+        for t in [d.tag] + ([b.tag for b in d.join.base] if d.join is not None else []):
+            if t == d.tag or d.plan.key_suffix in t:
+                self._manager.forget(t)
+        nd = self._decide(sql, inner_out=inner_out)
+        nd.literals = literals
+        top = self._cache.get(key)
+        if top is d:
+            nd.variants = d.variants
+            self._cache[key] = nd
+        elif top is not None and top.variants.get(literals) is d:
+            top.variants[literals] = nd
+        return nd
+
+    def _image_failed(self, d: "Decision") -> bool:
+        """Did an upload of this decision's set — or, for a device join, of
+        the base set holding its key lane — refuse a value outside the packed
+        bounds (IMAGE_ERROR)?"""
+        tags = [d.tag] + ([b.tag for b in d.join.base] if d.join is not None else [])
+        for t in tags:
+            st = self._manager.get(t)
+            if st is not None and st.state == "failed" and _rewrite.IMAGE_ERROR in (st.error or ""):
+                return True
+        return False
+
+    def _pack_left(self, d: "Decision") -> bool:
+        """Do the zone map's bounds of a packed key's components lie outside
+        the bounds the decision packed for? (A component without a zone map —
+        a computed one — is left to the upload's own check.)"""
+        for (mn, rng, _stride), src in zip(d.plan.pack, d.pack_src):
+            if src is None:
+                continue
+            ident, col, typ = src
+            st = _resolve.column_stats(self._raw, ident, col)
+            lo = _rewrite.stat_image(st.min, typ) if st is not None else None
+            hi = _rewrite.stat_image(st.max, typ) if st is not None else None
+            if lo is None or hi is None or lo < mn or hi > mn + rng - 2:
+                return True
+        return False
 
     def _narrow_widths(self, ident, widths: Dict[str, int]) -> None:
         """Bring each lane's estimated width down to the width the backend will
@@ -2914,9 +3030,13 @@ class Connection:
                 if col in (plan.keys or [plan.key]):
                     # a computed key: bounds and the distinct estimate from one scan
                     try:
+                        # the bounds as DuckDB's own text, as stats() gives them for a
+                        # plain column: fetched as values, an infinite DATE / TIMESTAMP
+                        # became Python's date.max / datetime.max — a finite bound, which
+                        # a packed key then sized its slots by
                         mn, mx, uq, nn = _one(self._raw.execute(
-                            f'SELECT min("{col}"), max("{col}"), approx_count_distinct("{col}"), '
-                            f'count(*) - count("{col}") FROM {probe_from}'))
+                            f'SELECT CAST(min("{col}") AS VARCHAR), CAST(max("{col}") AS VARCHAR), '
+                            f'approx_count_distinct("{col}"), count(*) - count("{col}") FROM {probe_from}'))
                         st = _resolve.ColumnStats(has_null=bool(nn), min=None if mn is None else str(mn),
                                                   max=None if mx is None else str(mx), approx_unique=int(uq))
                     except Exception as e:
@@ -2927,14 +3047,14 @@ class Connection:
                 # the exact path keeps NULLs and never wraps: statistics are
                 # informative only (thresholds), never a gate
                 if st is not None:
-                    stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+                    stats[col] = {"has_null": st.has_null, "min": _bound(st.min), "max": _bound(st.max),
                                   "approx_unique": st.approx_unique,
                                   "min_raw": st.min, "max_raw": st.max}   # temporal bounds stay text
                 continue
             if st is None or st.has_null:
                 return Decision(False, "nulls",
                                 why=f"no statistics for {col}" if st is None else f"{col} carries NULLs")
-            stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+            stats[col] = {"has_null": st.has_null, "min": _bound(st.min), "max": _bound(st.max),
                           "approx_unique": st.approx_unique}
             if col == plan.val and plan.needs_sum:
                 try:
@@ -2958,9 +3078,11 @@ class Connection:
             except Exception:
                 return Decision(False, "collation")
         # packed keys (§4.4): each component's integer image bounds from stats()
+        pack_src: List[Optional[Tuple[Any, str, str]]] = []
         if plan.exact and plan.packed:
             pack = []
             for kc, kt in zip(plan.keys, plan.key_types):
+                pack_src.append(None if kc in computed else (*col_home(kc), kt))
                 st = stats.get(kc) or {}
                 lo, hi = _rewrite.stat_image(st.get("min_raw"), kt), _rewrite.stat_image(st.get("max_raw"), kt)
                 if lo is None or hi is None or hi < lo:
@@ -3101,6 +3223,8 @@ class Connection:
             d = Decision(True, "", plan=plan, fqn=jr.root_fqn or ident.fqn, tag=plan.tag,
                          upload_sql=jr.upload_sql, form=plan.form, join=jr)
         d.literal_sensitive = any(c.has_constant for c in computed.values())
+        if plan.exact and plan.packed:
+            d.pack_src, d.pack_epoch = pack_src, -2
         # §5.5: what the set(s) will hold — an uploaded join its result, a device join at most its
         # largest (probe) table, each base set its own table
         d.set_rows = int(join_rows) if upload_mode else int(nrows)
@@ -3133,12 +3257,39 @@ class Connection:
         # GROUP BY and nothing else — so a global plan is rendered by the
         # reference renderer alone, as the split's outer statement already is.
         if self._has_rewrite_scalar and not plan.global_agg:
+            # A DOUBLE / FLOAT WHERE column whose zone map holds NaN or an
+            # infinity has always declined here: its bound reached the
+            # renderer's context as `NaN` / `Infinity`, which is not JSON, and the
+            # renderer failed on it (reason 'error'). The bounds are now written
+            # as null (_bound), which would admit these statements; admitting
+            # them is a change of its own, with its own tests on both backends,
+            # so until then they decline — with a sentence that says why.
+            for c in plan.pred_cols:
+                st = stats.get(c) or {}
+                if (columns.get(c, "").upper() in ("DOUBLE", "FLOAT", "REAL")
+                        and any(isinstance(_num(st.get(k)), float) and not math.isfinite(_num(st.get(k)))
+                                for k in ("min_raw", "max_raw"))):
+                    return Decision(False, "double",
+                                    why=f"the zone map of {c} holds NaN or an infinity, and a GROUP BY under "
+                                        f"a WHERE on such a column is not on the device yet")
             # The extension's pure scalar is the authority on the decision and
             # renders the statement for these literals; `ready` is passed as
             # true because residency is enforced here, not in the scalar, and
             # the decision must not depend on it.
+            #
+            # A packed key's lane name carries its bounds (Plan.key_suffix); the
+            # extension's renderer reads the key's components off the tag's key
+            # field, so it is handed the tag without exactly that suffix, and the
+            # suffix is put back into the statement it renders.
+            scalar_tag = plan.tag
+            if plan.key_suffix:
+                parts = plan.tag.split(":")
+                cols6 = parts[6].split(",") if len(parts) > 6 else []
+                if cols6 and cols6[0] == plan.key_field and cols6[0].endswith(plan.key_suffix):
+                    cols6[0] = cols6[0][:-len(plan.key_suffix)]
+                    scalar_tag = ":".join(parts[:6] + [",".join(cols6)] + parts[7:])
             ctx = {
-                "tag": plan.tag,
+                "tag": scalar_tag,
                 "exact": plan.exact,
                 "keys": [{"name": kc, "type": kt, **({"min": mn, "max": mn + rng - 2} if plan.packed else {})}
                          for kc, kt, (mn, rng, _st) in zip(plan.keys, plan.key_types,
@@ -3160,7 +3311,7 @@ class Connection:
                 ctx["guards"] = [{"tag": g, "catalog": i.catalog, "schema": i.schema, "table": i.table}
                                  for g, _f, i in d.join.guards]
             elif d.sentinels:
-                ctx["guards"] = [{"tag": plan.tag, "catalog": ident.catalog, "schema": ident.schema,
+                ctx["guards"] = [{"tag": scalar_tag, "catalog": ident.catalog, "schema": ident.schema,
                                   "table": ident.table}] + \
                                 [{"tag": b.tag, "catalog": t.catalog, "schema": t.schema, "table": t.table}
                                  for b, t in zip(d.sentinels, extra)]
@@ -3192,6 +3343,10 @@ class Connection:
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form
+                if scalar_tag != plan.tag:
+                    lit = "'" + scalar_tag.replace("'", "''") + "'"
+                    d.scalar_sql = (d.scalar_sql.replace(lit, "'" + plan.tag.replace("'", "''") + "'")
+                                    if lit in d.scalar_sql else "")     # not found: the reference renderer draws it
                 if d.form == "topk" and _rewrite.tie_window_shadowed(
                         plan, _rewrite.relation_names(json.loads(_ast_compat.normalise_json(row[0])))):
                     # the extension's tie guard names the output inside its window,
@@ -3199,6 +3354,14 @@ class Connection:
                     # (`count(*) AS count`) or a relation (`sum(v) AS r`, the row of
                     # r): the reference renderer, whose window ranks the output's
                     # expression, draws it instead
+                    d.scalar_sql = ""
+                if _rewrite.decodes_temporal(plan):
+                    # the extension's renderer decodes a DATE / TIMESTAMP image with
+                    # forms that raise for `infinity` / `-infinity`, and an infinity
+                    # can arrive after this decision through any connection: the
+                    # reference renderer, whose decode maps them back, draws every
+                    # such plan on every path (§4.25). The scalar's verdict above
+                    # still decides whether the statement is rewritten at all.
                     d.scalar_sql = ""
         return d
 

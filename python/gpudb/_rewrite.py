@@ -19,6 +19,7 @@ operations, PARAMETER nodes, and any CTE that defines the table's name.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import math
 import re
@@ -44,6 +45,19 @@ _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
 # statement; the client answers the user's own statement natively when it sees
 # it (connection.Connection.execute / .sql, reason 'ties'). See ties_qualify().
 TIES_MARKER = "GPUDB_TIES"
+# Raised by an upload that would otherwise store a wrong cell: a packed key
+# component outside the bounds the key was packed for (§4.4). The upload
+# fails, the set is not resident, DuckDB answers, and the decision is taken
+# again from the zone map as it is now (connection.Connection._packed_bounds_hold).
+IMAGE_ERROR = "GPUDB_IMAGE"
+
+# The lane images of DuckDB's infinite temporal values: exactly what DuckDB
+# stores for them (a DATE is int32 days and `infinity` is INT32_MAX; a
+# TIMESTAMP is int64 microseconds and `infinity` is INT64_MAX; `-infinity` is
+# the negation in both). Every finite value lies strictly between the two, so
+# the image keeps DuckDB's order and equality, and it is NULL only for NULL.
+DATE_INF_IMAGE = 2147483647
+TIMESTAMP_INF_IMAGE = 9223372036854775807
 
 
 # DuckDB compares identifiers with ASCII letters folded and every other
@@ -53,6 +67,12 @@ TIES_MARKER = "GPUDB_TIES"
 # lower() fold far more than that, so every comparison of SQL names goes
 # through this table: `name.translate(IDENT_FOLD)`.
 IDENT_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def quote_ident(name: str) -> str:
+    """A SQL name as a quoted identifier: an output named `min("d~t")` (DuckDB's
+    own name for that aggregate) carries quotes of its own, which are doubled."""
+    return '"' + (name or "").replace('"', '""') + '"'
 
 
 def ident_fold(name: str) -> str:
@@ -175,10 +195,24 @@ class Plan:
         return self.global_agg and not self.keys
 
     @property
+    def key_suffix(self) -> str:
+        """What a packed key's lane name carries after its columns: a digest
+        of the bounds the decision packed for (§4.4). Empty for every other
+        key."""
+        if not (self.exact and self.packed and self.pack):
+            return ""
+        return "~" + hashlib.sha1(repr([tuple(p) for p in self.pack]).encode()).hexdigest()[:12]
+
+    @property
     def key_field(self) -> str:
+        """The key lane's name — in the set's identity tag and in the table's
+        store. A packed key's slots are sized by the zone-map bounds the
+        decision read, so its name carries them (key_suffix): a decision taken
+        over other bounds names another lane and another set, and can never
+        decode a set packed for bounds other than its own."""
         if self.no_key:
             return "-"
-        return "+".join(self.keys) if len(self.keys) > 1 else self.key
+        return ("+".join(self.keys) + self.key_suffix) if len(self.keys) > 1 else self.key
 
     @property
     def upload_columns(self) -> List[str]:
@@ -254,10 +288,29 @@ def _temporal_const(e):
                 return _dt.datetime.fromisoformat(t)
             if t[-1] in "Zz" or "+" in t[10:] or t.count("-") > 2:
                 raise Decline("shape", "TIMESTAMP literal with a time zone")
-            return _dt.datetime.fromisoformat(t)
+            return _iso_datetime(t)
     except ValueError:
         raise Decline("shape", f"temporal constant '{text}' is not a plain literal")
     return None
+
+
+# DuckDB prints a TIMESTAMP's fraction with its trailing zeros trimmed
+# (`2020-01-01 00:00:00.5`), and Python before 3.11 reads only 3 or 6
+# fraction digits in datetime.fromisoformat. This is the one form it misses.
+_TS_FRACTION_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})\.(\d{1,6})$")
+
+
+def _iso_datetime(text: str) -> _dt.datetime:
+    """datetime.fromisoformat, plus DuckDB's trimmed fraction on every Python
+    the package supports. Raises ValueError like fromisoformat does."""
+    try:
+        return _dt.datetime.fromisoformat(text)
+    except ValueError:
+        m = _TS_FRACTION_RE.match(text)
+        if m is None:
+            raise
+        y, mo, d, h, mi, s, f = m.groups()
+        return _dt.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s), int(f.ljust(6, "0")))
 
 
 def _temporal_int(x) -> int:
@@ -612,15 +665,17 @@ def nulls_sort_first(direction: str, nulls: str, default_null_order: str) -> boo
 
 
 def stat_image(x, col_type: str) -> Optional[int]:
-    """A stats() min/max as the integer the resident lane holds (days /
-    microseconds for temporal columns), or None when not parseable."""
+    """A stats() min/max — DuckDB's own text — as the integer the resident
+    lane holds (days / microseconds for temporal columns), or None when it is
+    not a plain value: `infinity` / `-infinity`, a year outside 1..9999, text
+    that does not parse. A packed key needs finite bounds, so None declines it."""
     if x is None:
         return None
     try:
         if col_type == "DATE":
             return _temporal_int(_dt.date.fromisoformat(str(x).strip()))
         if col_type == "TIMESTAMP":
-            return _temporal_int(_dt.datetime.fromisoformat(str(x).strip().replace("T", " ")))
+            return _temporal_int(_iso_datetime(str(x).strip().replace("T", " ")))
         return int(x)
     except (ValueError, TypeError):
         return None
@@ -1009,11 +1064,9 @@ def _agg_col(plan: Plan, kind: str, pay: int) -> str:
 def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     """r.<col> typed exactly as native: DECIMAL(p, s) through the exact scaled
     multiply (then CAST to DECIMAL(p, s) when p != 38); DATE / TIMESTAMP keys
-    back from their day / microsecond image."""
-    if native_type.upper() == "DATE":
-        return f'(DATE \'1970-01-01\' + CAST(r."{col}" AS INTEGER))'
-    if native_type.upper() == "TIMESTAMP":
-        return f'make_timestamp(r."{col}")'
+    back from their day / microsecond image (_typed_expr)."""
+    if native_type.upper() in _TEMPORAL_TYPES:
+        return _typed_expr(f'r."{col}"', native_type)
     d = decimal_scale(native_type)
     if d and d[1] > 0:
         p, s = d
@@ -1024,23 +1077,56 @@ def _out_expr(plan: Plan, col: str, native_type: str) -> str:
     return f'CAST(r."{col}" AS {native_type})'
 
 
-def _typed_expr(expr: str, native_type: str) -> str:
-    if native_type.upper() == "DATE":
-        return f"(DATE '1970-01-01' + CAST({expr} AS INTEGER))"
-    if native_type.upper() == "TIMESTAMP":
-        return f"make_timestamp({expr})"
+def _typed_expr(expr: str, native_type: str, finite: bool = False) -> str:
+    """A BIGINT image (_int_image) back as its native type. `DATE '1970-01-01'
+    + n` and `make_timestamp(n)` raise for the image of `infinity` /
+    `-infinity`, so those two images come back as the values they stand for.
+    `finite`: the image is known to be a finite value (a packed key component,
+    which the upload only stores within the finite bounds it was packed for),
+    and the plain form is enough."""
+    t = native_type.upper()
+    if t == "DATE":
+        plain = f"(DATE '1970-01-01' + CAST({expr} AS INTEGER))"
+        return plain if finite else (
+            f"(CASE WHEN {expr} = {DATE_INF_IMAGE} THEN DATE 'infinity' "
+            f"WHEN {expr} = -{DATE_INF_IMAGE} THEN DATE '-infinity' ELSE {plain} END)")
+    if t == "TIMESTAMP":
+        plain = f"make_timestamp({expr})"
+        return plain if finite else (
+            f"(CASE WHEN {expr} = {TIMESTAMP_INF_IMAGE} THEN TIMESTAMP 'infinity' "
+            f"WHEN {expr} = -{TIMESTAMP_INF_IMAGE} THEN TIMESTAMP '-infinity' ELSE {plain} END)")
     return f"CAST({expr} AS {native_type})"
 
 
+def decodes_temporal(plan: Plan) -> bool:
+    """Does the rewritten statement turn a device image back into a DATE /
+    TIMESTAMP — a key, a min / max, a HAVING over one? The extension's
+    renderer decodes those with forms that raise for the image of an infinite
+    value, and an infinity can arrive after any decision (a write, a sibling
+    cursor), so such a plan is always drawn by this renderer, whose decode
+    maps the infinite images back (_typed_expr). A dictionary key comes back
+    from DuckDB's own text and is not a decode."""
+    for o in plan.outputs:
+        t = (o.native_type or "").upper()
+        if t in _TEMPORAL_TYPES and (o.kind in ("min", "max") or (o.kind == "key" and not plan.dict_key)):
+            return True
+    if plan.having is not None and plan.having[0] in ("min", "max"):
+        if _native_type_of(plan, plan.having[0], plan.having_pay).upper() in _TEMPORAL_TYPES:
+            return True
+    return False
+
+
 def _key_component_expr(plan: Plan, i: int, native_type: str) -> str:
-    """Component i of a packed key: nullif((key // stride) % range, 0) - 1 + min."""
+    """Component i of a packed key: nullif((key // stride) % range, 0) - 1 + min.
+    Finite by construction: the upload refuses a component outside its
+    bounds (key_lane_expr), and stat_image gives no bounds for an infinity."""
     mn, rng, stride = plan.pack[i]
     slot = 'r."key"'
     if stride > 1:
         slot = f"({slot} // {stride})"
     if i > 0:
         slot = f"({slot} % {rng})"
-    return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type)
+    return _typed_expr(f"(nullif({slot}, 0) - 1 + {mn})", native_type, finite=True)
 
 
 def _guard_sql(plan: Plan, fqn: str, tag: str) -> str:
@@ -1071,7 +1157,7 @@ def _render_global(plan: Plan, fqn: str) -> str:
     prog = _where_program(plan).replace("'", "''")
     lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
     src = f"gpu_agg_exact_global('{tag}', '{prog}', '{lanes}') r"
-    cols = [f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS "{out.name}"' for out in plan.outputs]
+    cols = [f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS {quote_ident(out.name)}' for out in plan.outputs]
     return f"SELECT {', '.join(cols)} FROM {src}, {_guard_sql(plan, fqn, tag)} WHERE gd.ok"
 
 
@@ -1137,7 +1223,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
             exprs.append(_out_expr(plan, "key", out.native_type))
         else:
             exprs.append(_agg_expr(plan, out.kind, out.pay, out.native_type))
-    cols = [f'{x} AS "{out.name}"' for x, out in zip(exprs, plan.outputs)]
+    cols = [f'{x} AS {quote_ident(out.name)}' for x, out in zip(exprs, plan.outputs)]
     ties = ties_qualify(plan, exprs) if ties else ""
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key and not dict_per_key:
@@ -1152,11 +1238,11 @@ def _order_ref(plan: Plan, tgt: str, out_i: Optional[int] = None) -> str:
     it binds to (by index, so by its final name), else the table function's
     column for an aggregate the select list does not carry."""
     if out_i is not None:
-        return f'"{plan.outputs[out_i].name}"'
+        return quote_ident(plan.outputs[out_i].name)
     kind, _, name = tgt.partition(":")
     if name:
-        return f'"{name}"'
-    return next((f'"{o.name}"' for o in plan.outputs if o.kind == kind),
+        return quote_ident(name)
+    return next((quote_ident(o.name) for o in plan.outputs if o.kind == kind),
                 f'r."{ "key" if kind == "key" else kind }"')
 
 
@@ -1326,7 +1412,7 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
                 exprs.append(f'CAST(r."sum" AS {out.native_type})')
         else:                                  # count / count_star on a v0.6 set
             exprs.append(f'CAST(r."count" AS {out.native_type})')
-    cols = [f'{x} AS "{out.name}"' for x, out in zip(exprs, plan.outputs)]
+    cols = [f'{x} AS {quote_ident(out.name)}' for x, out in zip(exprs, plan.outputs)]
     ties = ties_qualify(plan, exprs) if ties else ""
     sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
            f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
@@ -1339,12 +1425,26 @@ def _q_default(col: str) -> str:
 
 
 def _int_image(qcol: str, t: str) -> str:
-    """The BIGINT image of a key / predicate column: days for DATE,
-    microseconds for TIMESTAMP, the value itself for the integer family."""
+    """The BIGINT image of a key / predicate / payload column: days for DATE,
+    microseconds for TIMESTAMP, the value itself for the integer family.
+
+    The image is NULL exactly where the value is, and it orders and compares
+    as DuckDB orders and compares the values, `infinity` and `-infinity`
+    included:
+      * DATE: `date - DATE '1970-01-01'` is integer arithmetic on the stored
+        day count, so an infinite date keeps its own (+-DATE_INF_IMAGE).
+      * TIMESTAMP: `epoch_us` is NULL for `infinity` / `-infinity`, so alone it
+        turned those rows into NULL cells — `WHERE ts IS NULL` counted them,
+        a comparison lost them, an infinite key joined the NULL group (pip
+        0.7.5 and earlier). They get +-TIMESTAMP_INF_IMAGE instead. `isinf()`
+        picks them, not `= TIMESTAMP 'infinity'`: DuckDB 1.5.6 rewrites
+        `date_trunc(..) = <constant>` into a range on the argument, which is
+        empty for an infinite constant."""
     if t == "DATE":
         return f"CAST({qcol} - DATE '1970-01-01' AS BIGINT)"
     if t == "TIMESTAMP":
-        return f"epoch_us({qcol})"
+        return (f"(CASE WHEN isinf({qcol}) THEN (CASE WHEN {qcol} > TIMESTAMP '1970-01-01' "
+                f"THEN {TIMESTAMP_INF_IMAGE} ELSE -{TIMESTAMP_INF_IMAGE} END) ELSE epoch_us({qcol}) END)")
     return f"CAST({qcol} AS BIGINT)"
 
 
@@ -1365,10 +1465,17 @@ def key_lane_expr(plan: Plan, q=_q_default) -> str:
         parts = [tmpl.format(c=q(kc)) for kc in plan.keys]
         return " || ".join(parts) if len(parts) > 1 else parts[0]
     if plan.exact and plan.packed:
-        # mixed-radix pack: slot_i = coalesce(image - min + 1, 0); key = sum(slot_i * stride_i)
+        # mixed-radix pack: slot_i = image - min + 1 (0 for NULL); key = sum(slot_i * stride_i).
+        # The bounds are the zone map's when the decision was taken. A value outside them
+        # (written later, through any connection, or mid-upload) would carry into the next
+        # component and land in another group, so the upload refuses it: IMAGE_ERROR fails
+        # the upload and DuckDB answers.
         parts = []
         for kc, kt, (mn, rng, stride) in zip(plan.keys, plan.key_types, plan.pack):
-            slot = f"coalesce({_int_image(q(kc), kt)} - {mn} + 1, 0)"
+            img = _int_image(q(kc), kt)
+            slot = (f"(CASE WHEN {img} BETWEEN {mn} AND {mn + rng - 2} THEN {img} - {mn} + 1 "
+                    f"WHEN {img} IS NULL THEN 0 "
+                    f"ELSE error('{IMAGE_ERROR}: a GROUP BY value left the range its key was packed for') END)")
             parts.append(f"{slot} * {stride}" if stride > 1 else slot)
         return f"CAST({' + '.join(parts)} AS BIGINT)"
     return _int_image(q(plan.key), plan.key_type)

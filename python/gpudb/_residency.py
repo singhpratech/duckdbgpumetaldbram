@@ -54,6 +54,12 @@ RETRY_PAUSE_MS = 50.0            # after an interrupted segment: this, doubling 
 EVICT_MIN_AGE_S = 60.0            # §5.5: a set is never evicted within this long of being uploaded (anti-thrash)
 MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget kept off the device
 DEVICE_ERROR = "device refused: " # ... and of one the DEVICE would not take (an upload that raised)
+# An upload refused a packed key component outside the bounds the key was
+# packed for (_rewrite.IMAGE_ERROR, the same text). Retrying the same recipe
+# can only fail the same way or, after a delete, succeed over bounds the
+# decision no longer trusts: such a set is never queued again, and the
+# connection takes its decision again instead (Connection._packed_bounds_hold).
+IMAGE_ERROR = "GPUDB_IMAGE"
 # A set the budget or the device turned away is not asked for again until
 # something that could change the answer changes: the data under it, the
 # budget, the anti-thrash window, the resident population — all watched, not
@@ -491,7 +497,7 @@ class ResidencyManager:
             # a set the budget or the device refused stays refused until something
             # that could change the answer changes: re-queueing it on every sighting
             # would hide the reason and make the worker ask again every few ms
-            refused = self._refusal_holds_locked(s)
+            refused = self._refusal_holds_locked(s) or self._image_refused_locked(s)
             if refused:
                 self.refusals_held += 1
             elif s.state == "failed" and s.refused_epoch >= 0:
@@ -552,10 +558,33 @@ class ResidencyManager:
             s = self._sets.get(tag)
             if s is None:
                 return
-            refused = self._refusal_holds_locked(s)
+            refused = self._refusal_holds_locked(s) or self._image_refused_locked(s)
             if s.state in ("missing", "stale", "failed") and s.attempts < self.max_attempts and not refused:
                 s.state = "pending"
                 self._cv.notify_all()
+
+    def forget(self, tag: str) -> None:
+        """Drop the bookkeeping of a set no decision will read again — a packed
+        key's set once its decision was taken over other bounds (§4.4), so
+        every bounds change does not leave an entry behind for good. The
+        device copy is gone already (an invalidation or the failed upload's
+        purge dropped it); an upload in flight is stopped the way an
+        invalidation stops one, and whatever it leaves is evictable residue."""
+        with self._cv:
+            s = self._sets.pop(tag, None)
+            if s is None:
+                return
+            s.epoch += 1
+            uploading = s.state == "uploading" and self._uploading_tag == tag
+            s.state = "stale"
+            cur = self._upload_cursor if uploading else None
+            self._cv.notify_all()
+        if cur is not None:
+            self._interrupt(cur)
+
+    @staticmethod
+    def _image_refused_locked(s: SetState) -> bool:
+        return s.state == "failed" and IMAGE_ERROR in (s.error or "")
 
     # ---- refusals the manager remembers (§5.5) ----
     def _refusal_holds_locked(self, s: SetState) -> bool:

@@ -284,11 +284,14 @@ def run():
             if name == "explain":
                 continue
             a = con.execute(sql).fetchall(); la = con.last_rewrite()
+            # §4.25: a plan that decodes a DATE / TIMESTAMP is drawn by the
+            # reference renderer on every connection; the scalar still decides it
+            dec = con._last_decision.plan is not None and gpudb._rewrite.decodes_temporal(con._last_decision.plan)
             b = py.execute(sql).fetchall(); lb = py.last_rewrite()
             da = con.execute("DESCRIBE " + la["sql"]).fetchall() if la["rewritten"] else None
             db = py.execute("DESCRIBE " + lb["sql"]).fetchall() if lb["rewritten"] else None
-            check(la["engine"] == "scalar" and lb["engine"] == "python" and a == b and da == db
-                  and la["form"] == lb["form"],
+            check(la["engine"] == ("python" if dec else "scalar") and lb["engine"] == "python" and a == b
+                  and da == db and la["form"] == lb["form"],
                   f"{name}: scalar={la['engine']}/{la['form']} python={lb['engine']}/{lb['form']} agree")
         py.close()
     else:
@@ -2462,6 +2465,7 @@ def run():
     null_order_checks()
     null_key_where_checks()
     order_alias_checks()
+    infinite_temporal_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -4102,6 +4106,753 @@ def null_key_where_checks():
                 check(lr["rewritten"] and lr["engine"] == "python",
                       f"{what}: rewritten through the re-plan (rewritten={lr['rewritten']}, "
                       f"engine={lr['engine']!r}, reason={lr['reason'] or '-'})")
+    con.close()
+
+
+# ---------------------------------------------------------------------------
+# §4.25 infinite DATE / TIMESTAMP values, and §4.4 packed bounds
+# ---------------------------------------------------------------------------
+def _inf_setup(n, ts_hi, ts_lo, dt_hi, dt_lo):
+    return f"""
+CREATE TABLE tinf AS SELECT (i % 5)::INTEGER AS k, i::BIGINT AS v, (i % 7)::INTEGER AS w,
+  CASE WHEN i = 20 THEN {ts_hi} WHEN i = 21 THEN {ts_lo} WHEN i % 103 = 0 THEN NULL
+       ELSE TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND END AS ts,
+  CASE WHEN i = 30 THEN {dt_hi} WHEN i = 31 THEN {dt_lo} WHEN i % 107 = 0 THEN NULL
+       ELSE DATE '2020-01-01' + (i % 100)::INTEGER END AS dt,
+  CASE WHEN i = 40 THEN TIMESTAMP_NS 'infinity' WHEN i = 41 THEN TIMESTAMP_NS '-infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMP_NS) END AS tns,
+  CASE WHEN i = 40 THEN TIMESTAMP_S 'infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMP_S) END AS tss,
+  CASE WHEN i = 40 THEN TIMESTAMPTZ 'infinity'
+       ELSE CAST(TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS TIMESTAMPTZ) END AS ttz
+FROM range({n}) r(i);
+CREATE TABLE tinf_d AS SELECT * FROM (VALUES
+  ({ts_hi}, {dt_hi}, 'hi'), ({ts_lo}, {dt_lo}, 'lo'),
+  (TIMESTAMP '2020-01-01 00:00:05', DATE '2020-01-05', 'a'), (TIMESTAMP '2020-01-01 00:00:07', DATE '2020-01-07', 'b'))
+  v(ts, dt, label);
+CREATE TABLE tinf_k AS SELECT i::INTEGER AS k, 'name' || i AS name FROM range(5) r(i);
+"""
+
+
+INF_SETUP = _inf_setup(100_003, "TIMESTAMP 'infinity'", "TIMESTAMP '-infinity'", "DATE 'infinity'", "DATE '-infinity'")
+# the largest and smallest values each type holds that are not infinite
+EXTREME_SETUP = _inf_setup(100_003, "TIMESTAMP '294247-01-10 04:00:54.775806'", "TIMESTAMP '290309-12-22 (BC) 00:00:00'",
+                           "DATE '5881580-07-10'", "DATE '5877642-06-25 (BC)'")
+
+
+def _inf_cases():
+    """(statement, who answers it over INF_SETUP) — every path a DATE or a
+    TIMESTAMP takes to the device. True: the device must; False: DuckDB must,
+    with a reason; None: either (DuckDB raises for the statement itself)."""
+    out = []
+    lits = {"ts": ("TIMESTAMP '2020-01-01 00:10:00'", "TIMESTAMP '2020-01-01 00:00:05'",
+                   "TIMESTAMP '2020-01-01 00:00:07'"),
+            "dt": ("DATE '2020-02-01'", "DATE '2020-01-05'", "DATE '2020-01-07'")}
+    for c in ("ts", "dt"):
+        a, b1, b2 = lits[c]
+        terms = [f"{c} {op} {a}" for op in (">", ">=", "<", "<=", "=", "<>")]
+        terms += [f"{c} BETWEEN {b1} AND {a}", f"{c} NOT BETWEEN {b1} AND {a}", f"{c} NOT IN ({b1}, {b2})",
+                  f"{c} IS NULL", f"{c} IS NOT NULL", f"{c} IS DISTINCT FROM {b1}", f"{c} IS NOT DISTINCT FROM {b1}",
+                  f"NOT ({c} > {a})", f"{c} > {b1} AND w < 3"]
+        for wc in terms:
+            out.append((f"SELECT count(*), sum(v) FROM tinf WHERE {wc}", True))
+            out.append((f"SELECT k, count(*), sum(v) FROM tinf WHERE {wc} GROUP BY k ORDER BY k", True))
+        # an IN list of temporal literals is not a shape the matcher reads (each literal is a CAST)
+        out.append((f"SELECT count(*), sum(v) FROM tinf WHERE {c} IN ({b1}, {b2})", False))
+        plus = f"{c} + INTERVAL 1 DAY" if c == "ts" else f"{c} + 1"
+        cast = f"CAST({c} AS DATE)" if c == "ts" else f"CAST({c} AS TIMESTAMP)"
+        out += [
+            (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} NULLS FIRST LIMIT 4", True),
+            (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} DESC NULLS LAST LIMIT 4", True),
+            (f"SELECT {c}, sum(v) FROM tinf WHERE w < 3 GROUP BY {c} ORDER BY {c} LIMIT 4", True),
+            (f"SELECT {c}, count(*), sum(v) FROM tinf GROUP BY {c} ORDER BY {c}", True),
+            # a packed key needs finite zone-map bounds: an infinite one declines
+            (f"SELECT {c}, k, count(*) FROM tinf GROUP BY {c}, k ORDER BY {c}, k LIMIT 6", False),
+            (f"SELECT k, {c}, count(*) FROM tinf GROUP BY k, {c} ORDER BY k, {c} DESC LIMIT 6", False),
+            (f"SELECT year({c}) AS y, count(*) FROM tinf GROUP BY y ORDER BY y NULLS FIRST", True),
+            (f"SELECT date_trunc('month', {c}) AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST", True),
+            (f"SELECT {plus} AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST LIMIT 4", True),
+            (f"SELECT {cast} AS m, count(*) FROM tinf GROUP BY m ORDER BY m NULLS FIRST LIMIT 4", True),
+            (f"SELECT k, count(*) FROM tinf WHERE year({c}) = 2020 GROUP BY k ORDER BY k", True),
+            (f"SELECT k, min({c}), max({c}), count({c}) FROM tinf GROUP BY k ORDER BY k", True),
+            (f"SELECT k, min({c}), max({c}) FROM tinf WHERE w < 3 GROUP BY k ORDER BY k", True),
+            (f"SELECT min({c}), max({c}), count({c}) FROM tinf", True),
+            (f"SELECT min({c}), max({c}), count({c}) FROM tinf WHERE w < 3", True),
+            (f"SELECT count(DISTINCT {c}) FROM tinf", True),
+            # count(DISTINCT) beside a GROUP BY is two keys, which pack only within finite bounds
+            (f"SELECT k, count(DISTINCT {c}) FROM tinf GROUP BY k ORDER BY k", False),
+            (f"SELECT {c}, count(*) AS n FROM tinf GROUP BY {c} ORDER BY n DESC, {c} LIMIT 3", True),
+            (f"SELECT k, max({c}) AS m FROM tinf GROUP BY k ORDER BY m DESC LIMIT 2", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} > {a} GROUP BY k HAVING count(*) > 10 ORDER BY k", True),
+            # HAVING over a temporal payload is not a shape the rewrite carries
+            (f"SELECT k, count(*) FROM tinf GROUP BY k HAVING max({c}) > {a} ORDER BY k", False),
+            (f"SELECT k, count(*) * 2 + 1 AS x FROM tinf WHERE {c} > {a} GROUP BY k ORDER BY k", True),
+            (f"SELECT count(*) + sum(v) AS x FROM tinf WHERE {c} IS NOT NULL", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} > (SELECT min({c}) FROM tinf_d) GROUP BY k ORDER BY k", True),
+            (f"SELECT k, count(*) FROM tinf WHERE {c} IN (SELECT {c} FROM tinf_d) GROUP BY k ORDER BY k", True),
+            (f"SELECT k, count(*) FROM tinf WHERE EXISTS (SELECT 1 FROM tinf_d d WHERE d.{c} = tinf.{c}) "
+             f"GROUP BY k ORDER BY k", True),
+            # a temporal join key: DuckDB runs the join, the device holds its result (§4.13)
+            (f"SELECT d.label, count(*), sum(t.v) FROM tinf t JOIN tinf_d d ON t.{c} = d.{c} "
+             f"GROUP BY d.label ORDER BY d.label", True),
+            (f"SELECT d.label, count(*) FROM tinf t LEFT JOIN tinf_d d ON t.{c} = d.{c} "
+             f"GROUP BY d.label ORDER BY d.label NULLS FIRST", True),
+            # ... and the join's temporal key as the GROUP BY key, ordered by its qualified name:
+            # the reference renderer orders by the output's own name, not the lowered column
+            (f"SELECT t.{c}, count(*) FROM tinf t JOIN tinf_d d ON t.{c} = d.{c} GROUP BY t.{c} ORDER BY t.{c}", True),
+            # an integer key join carrying the temporal column as a payload and as a WHERE lane (§4.8)
+            (f"SELECT n.name, max(t.{c}), min(t.{c}) FROM tinf t JOIN tinf_k n ON t.k = n.k "
+             f"GROUP BY n.name ORDER BY n.name", True),
+            (f"SELECT n.name, count(*) FROM tinf t JOIN tinf_k n ON t.k = n.k WHERE t.{c} > {a} "
+             f"GROUP BY n.name ORDER BY n.name", True),
+            (f"SELECT count(*) FROM tinf t JOIN tinf_k n ON t.k = n.k WHERE t.{c} IS NOT NULL", True),
+        ]
+    out += [
+        ("SELECT k, count(*) FROM tinf WHERE ts + INTERVAL 1 DAY > TIMESTAMP '2020-01-01 00:10:00' "
+         "GROUP BY k ORDER BY k", True),
+        ("SELECT count(*) FROM tinf WHERE date_trunc('hour', ts) > TIMESTAMP '2020-01-01 00:10:00'", True),
+        # DuckDB raises 'cannot subtract infinite timestamps' here, and so does the rewritten statement
+        ("SELECT k, max(ts) - min(ts) AS span FROM tinf GROUP BY k ORDER BY k", None),
+        ("SELECT k, max(dt) - min(dt) AS span FROM tinf GROUP BY k ORDER BY k", True),
+        ("SELECT k, max(epoch_us(ts)), min(epoch_ms(ts)) FROM tinf GROUP BY k ORDER BY k", True),
+        # a TIMESTAMP_NS reaches the device only as a TIMESTAMP computed from it
+        ("SELECT CAST(tns AS TIMESTAMP) AS m, count(*) FROM tinf GROUP BY m ORDER BY m DESC LIMIT 3", True),
+        ("SELECT count(*) FROM tinf WHERE CAST(tns AS TIMESTAMP) IS NOT NULL", True),
+        # names that are both an output and another GROUP BY column (DuckDB binds the alias)
+        ("SELECT k AS ts, max(ts) AS k FROM tinf GROUP BY k ORDER BY k", True),
+        ("SELECT dt AS day, count(*) AS dt FROM tinf GROUP BY day ORDER BY day LIMIT 3", True),
+        # the ORDER BY binds the alias, max(ts): a top-k by a temporal aggregate is not pushed
+        ("SELECT k AS kk, max(ts) AS k FROM tinf GROUP BY kk ORDER BY k DESC LIMIT 2", None),
+        ("SELECT k, max(dt) AS dt, count(*) AS n FROM tinf GROUP BY k ORDER BY n DESC, k LIMIT 3", True),
+    ]
+    # the other temporal types are not lanes: a statement over one runs on DuckDB
+    for c, lit in (("tns", "TIMESTAMP_NS '2020-01-01 00:10:00'"), ("tss", "TIMESTAMP_S '2020-01-01 00:10:00'"),
+                   ("ttz", "TIMESTAMPTZ '2020-01-01 00:10:00+00'")):
+        out += [(f"SELECT k, count(*) FROM tinf WHERE {c} IS NOT NULL GROUP BY k ORDER BY k", False),
+                (f"SELECT {c}, count(*) FROM tinf GROUP BY {c} ORDER BY {c} DESC LIMIT 3", False),
+                (f"SELECT k, max({c}) FROM tinf GROUP BY k ORDER BY k", False)]
+    return out
+
+
+def _as_text(raw, sql):
+    """The rows as DuckDB's own text. Fetched as values, `infinity` comes back
+    as datetime.max and compares equal to 9999-12-31 23:59:59.999999, and a
+    TIMESTAMPTZ needs pytz."""
+    try:
+        return raw.execute(f"SELECT COLUMNS(*)::VARCHAR FROM ({sql}) gpudb_q").fetchall()
+    except duckdb.Error as e:
+        return "error: " + str(e).splitlines()[0][:60]
+
+
+def _device_text(con, sql, lazy=False):
+    """Run `sql` through the wrapper — execute(), or sql() with the relation
+    read — and return (its rows as text, did the device answer, last_rewrite()).
+    The device answered when the statement was rewritten and did not fall back;
+    that statement is re-read as written, guard included. A raise reaching the
+    caller is returned as text: it is never what native gives for a statement
+    native answers."""
+    try:
+        res = con.sql(sql) if lazy else con.execute(sql)
+        try:
+            res.fetchall()
+        except duckdb.Error as e:
+            # a TIMESTAMPTZ value needs pytz to become a Python object; the
+            # statement itself ran, and its rows are compared as text below
+            if "pytz" not in str(e):
+                raise
+    except duckdb.Error as e:
+        return "error: " + str(e).splitlines()[0][:60], False, con.last_rewrite()
+    lr = con.last_rewrite()
+    on_device = bool(lr["rewritten"] and not lr["fallback"])
+    return _as_text(con._raw, lr["sql"] if on_device else sql), on_device, lr
+
+
+def _decodes(con):
+    """Does the last decision's plan turn a device image back into a DATE /
+    TIMESTAMP (a key that is not a dictionary key, a min / max)? Read off the
+    plan here rather than through _rewrite.decodes_temporal, so these checks
+    also run, and fail where they should, against a build without it."""
+    d = getattr(con, "_last_decision", None)
+    p = d.plan if d is not None else None
+    return p is not None and any(
+        (o.native_type or "").upper() in ("DATE", "TIMESTAMP")
+        and (o.kind in ("min", "max") or (o.kind == "key" and not p.dict_key)) for o in p.outputs)
+
+
+def infinite_temporal_checks():
+    """`infinity` / `-infinity` and the extreme finite values of DATE and
+    TIMESTAMP, on every path a temporal value takes to the device (§4.25).
+
+    The lane image of a TIMESTAMP was `epoch_us(ts)`, which is NULL for an
+    infinite timestamp: those rows became NULL cells, so `WHERE ts IS NULL`
+    counted them, `IS NOT NULL` / `>` / `<` lost them, `min` / `max` came back
+    finite and an infinite key joined the NULL group (pip 0.7.5 and earlier,
+    reachable with shipped defaults through a global masked aggregate). An
+    infinite DATE kept its day count but did not decode back (`DATE
+    '1970-01-01' + n` raises). Both now have exact images, and every plan that
+    decodes one is drawn by the reference renderer, whose decode maps the
+    infinite images back."""
+    from gpudb import _rewrite as _rw
+    from gpudb import connection as _conn
+
+    print("== infinite DATE / TIMESTAMP values: images, decode, every path to the device")
+    c = duckdb.connect()
+    c.execute("""CREATE TABLE vals AS SELECT * FROM (VALUES
+        (TIMESTAMP 'infinity', DATE 'infinity'), (TIMESTAMP '-infinity', DATE '-infinity'), (NULL, NULL),
+        (TIMESTAMP '294247-01-10 04:00:54.775806', DATE '5881580-07-10'),
+        (TIMESTAMP '290309-12-22 (BC) 00:00:00', DATE '5877642-06-25 (BC)'),
+        (TIMESTAMP '1970-01-01', DATE '1970-01-01'), (TIMESTAMP '1969-12-31 23:59:59.999999', DATE '1969-12-31'),
+        (TIMESTAMP '9999-12-31 23:59:59.999999', DATE '9999-12-31'),
+        (TIMESTAMP '2020-01-01 00:00:05', DATE '2020-01-05')) v(ts, dt)""")
+    for t, col in (("TIMESTAMP", "ts"), ("DATE", "dt")):
+        # the column, and a computed lane over it (DuckDB 1.5.6 rewrites `date_trunc(..) = <constant>`;
+        # 'hour', because before 1.5 a truncation to a day or coarser is a DATE)
+        for src in (f'"{col}"', f"date_trunc('hour', \"{col}\")" if t == "TIMESTAMP" else f'("{col}" + 0)'):
+            img = _rw._int_image(src, t)
+            try:
+                rows = c.execute(f"SELECT ({src})::VARCHAR, {img} AS i, ({_rw._typed_expr(img, t)})::VARCHAR "
+                                 f"FROM vals ORDER BY {src} NULLS FIRST").fetchall()
+            except duckdb.Error as e:
+                check(False, f"{t} image of {src}: encodes and decodes every value ({str(e)[:60]})")
+                continue
+            check(all((r[0] is None) == (r[1] is None) for r in rows),
+                  f"{t} image of {src}: NULL exactly where the value is NULL")
+            imgs = [r[1] for r in rows if r[1] is not None]
+            check(imgs == sorted(imgs) and len(set(imgs)) == len(imgs),
+                  f"{t} image of {src}: DuckDB's order and equality ({imgs[:2]} ... {imgs[-2:]})")
+            check(all(r[2] == r[0] for r in rows), f"{t} image of {src}: decodes back to the value "
+                  f"({[(r[0], r[2]) for r in rows if r[2] != r[0]][:2]})")
+    # a packed key refuses a value outside the bounds it was packed for (an infinity, or a row
+    # written after the decision) instead of carrying it into the next component
+    plan = _rw.Plan(catalog="", schema="", table="vals", key="k")
+    plan.exact, plan.keys, plan.key_types = True, ["k", "dt"], ["INTEGER", "DATE"]
+    lo = c.execute("SELECT DATE '2020-01-01' - DATE '1970-01-01'").fetchone()[0]
+    plan.pack = [(0, 7, 100), (lo, 100, 1)]   # (min, max - min + 2, stride): k in [0, 5], dt in [lo, lo + 98]
+    key = _rw.key_lane_expr(plan)
+    good = c.execute(f"SELECT count(DISTINCT {key}) FROM (SELECT (i % 5)::INTEGER AS k, "
+                     f"CASE WHEN i % 13 = 0 THEN NULL ELSE DATE '2020-01-01' + (i % 99)::INTEGER END AS dt "
+                     f"FROM range(20000) r(i))").fetchone()[0]
+    check(good == 5 * 100, f"packed key: every in-range tuple, NULL included, has its own slot ({good})")
+    marker = getattr(_rw, "IMAGE_ERROR", "GPUDB_IMAGE")
+    for bad in ("DATE 'infinity'", "DATE '-infinity'", "DATE '2020-04-09'", "DATE '2019-12-31'"):
+        try:
+            c.execute(f"SELECT {key} FROM (SELECT 1 AS k, {bad} AS dt)").fetchall()
+            check(False, f"packed key: {bad} outside the packed bounds is refused")
+        except duckdb.Error as e:
+            check(marker in str(e), f"packed key: {bad} outside the packed bounds is refused ({str(e)[:60]})")
+    # the lane name carries the bounds: two decisions over other bounds never share a set
+    p2 = _rw.Plan(catalog="", schema="", table="vals", key="k")
+    p2.exact, p2.keys, p2.key_types, p2.pack = True, ["k", "dt"], ["INTEGER", "DATE"], [(0, 8, 100), (lo, 100, 1)]
+    check(plan.key_field.startswith("k+dt~") and p2.key_field.startswith("k+dt~") and plan.key_field != p2.key_field,
+          f"packed key: the lane is named after its bounds ({plan.key_field} / {p2.key_field})")
+    bound = getattr(_conn, "_bound", _conn._num)
+    check(bound("infinity") is None and bound("-inf") is None and bound("nan") is None
+          and bound("12") == 12 and bound("2.5") == 2.5,
+          "a non-finite zone-map bound is not written into the renderer's JSON context")
+    # DuckDB trims a TIMESTAMP's fraction ('...00.5'); Python 3.9 / 3.10 read only 3 or 6 digits
+    img = _rw.stat_image("2020-01-01 00:00:00.5", "TIMESTAMP")
+    want = c.execute("SELECT epoch_us(TIMESTAMP '2020-01-01 00:00:00.5')").fetchone()[0]
+    check(img == want, f"a zone-map bound with a trimmed fraction reads on Python "
+                       f"{sys.version_info[0]}.{sys.version_info[1]} ({img} / {want})")
+    check(all(_rw.stat_image(x, "TIMESTAMP") is None for x in ("infinity", "-infinity", "294247-01-10 04:00:54.775806"))
+          and _rw.stat_image("infinity", "DATE") is None,
+          "an infinite or out-of-Python-range bound gives no packed bounds (the packed key declines)")
+    c.close()
+
+    probe = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    caps = has_device(probe) and all(getattr(probe, a, False) for a in ("_exact", "_global", "_join"))
+    probe.close()
+    if not caps:
+        skip("infinite DATE / TIMESTAMP on the device: needs the exact, global and join paths on a GPU backend")
+        return
+    cases = _inf_cases()
+    for name, setup in (("infinity", INF_SETUP), ("extreme", EXTREME_SETUP)):
+        con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+        con.execute(setup)
+        ref = duckdb.connect()
+        ref.execute(setup)
+        n_dev, renders = 0, []
+        for sql, gpu in cases:
+            got, dev, lr = _device_text(con, sql)
+            want = _as_text(ref, sql)
+            n_dev += dev
+            check(got == want, f"{name}: rows are native's ({'device' if dev else 'DuckDB: ' + lr['reason']}; "
+                               f"{sql[:96]})" + ("" if got == want else f" got {str(got)[:160]} want {str(want)[:160]}"))
+            if dev and _decodes(con):
+                renders.append((lr["engine"], sql))
+            if name == "infinity" and gpu is True:
+                check(dev, f"{name}: the device answered ({lr['reason']} {str(lr.get('detail'))[:60]}; {sql[:80]})")
+            elif name == "infinity" and gpu is False:
+                check(not dev and bool(lr["reason"]) and lr["reason"] != "error",
+                      f"{name}: DuckDB answered, with a reason ({lr['reason']}; {sql[:70]})")
+        check(n_dev > 100, f"{name}: {n_dev} of {len(cases)} statements ran on the device")
+        bad = [s for e, s in renders if e != "python"]
+        check(renders and not bad, f"{name}: every plan that decodes a DATE / TIMESTAMP is drawn by the reference "
+                                   f"renderer ({len(renders)} plans; {bad[:2]})")
+        ref.close()
+        con.close()
+    infinite_temporal_path_checks()
+    infinite_temporal_late_checks()
+    infinite_temporal_background_checks()
+    packed_bounds_checks()
+    temporal_misc_checks()
+
+
+INF_LATE_SETUP = """
+CREATE TABLE tlate AS SELECT (i % 5)::INTEGER AS k, i::BIGINT AS v,
+  CASE WHEN i % 103 = 0 THEN NULL ELSE TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND END AS ts,
+  CASE WHEN i % 107 = 0 THEN NULL ELSE DATE '2020-01-01' + (i % 100)::INTEGER END AS dt
+FROM range(100003) r(i)"""
+INF_LATE_STMTS = [
+    "SELECT count(*), sum(v) FROM tlate WHERE ts > TIMESTAMP '2020-01-01 00:10:00'",
+    "SELECT count(*), sum(v) FROM tlate WHERE ts IS NOT NULL",
+    "SELECT count(*) FROM tlate WHERE ts IS NULL",
+    "SELECT k, count(*), sum(v) FROM tlate WHERE ts < TIMESTAMP '2020-01-01 00:10:00' GROUP BY k ORDER BY k",
+    "SELECT k, count(*) FROM tlate WHERE ts IS NULL GROUP BY k ORDER BY k",
+    "SELECT ts, count(*) FROM tlate GROUP BY ts ORDER BY ts DESC LIMIT 3",
+    "SELECT dt, count(*) FROM tlate GROUP BY dt ORDER BY dt DESC LIMIT 3",
+    "SELECT k, min(ts), max(ts) FROM tlate GROUP BY k ORDER BY k",
+    "SELECT min(ts), max(ts), min(dt), max(dt) FROM tlate",
+    "SELECT k, dt, count(*) FROM tlate GROUP BY k, dt ORDER BY k, dt DESC LIMIT 4",
+    "SELECT dt, k, count(*) FROM tlate GROUP BY dt, k ORDER BY dt DESC, k LIMIT 4",
+]
+# the statements whose plan decodes a DATE / TIMESTAMP (a key, a min / max)
+INF_DECODE_STMTS = [s for s in INF_LATE_STMTS if "min(" in s or s.split()[1] in ("ts,", "dt,")]
+
+
+def infinite_temporal_path_checks():
+    """The renderer of a plan that decodes a DATE / TIMESTAMP is the
+    reference renderer on EVERY path: execute() and sql(), the first
+    execution and a later one, new literals, the top-k / HAVING / plain forms.
+    Then an infinity written by a sibling cursor after the decisions — the
+    review's sequence: before this change `con.sql(q).fetchall()` raised the
+    extension renderer's decode error to the caller, and kept raising."""
+    print("== infinite DATE / TIMESTAMP: the reference renderer on every path")
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    for c in (con, ref):
+        c.execute(INF_LATE_SETUP)
+    tmpls = ["SELECT ts, count(*) FROM tlate WHERE k < {} GROUP BY ts ORDER BY ts DESC LIMIT {}",
+             "SELECT dt, sum(v) AS s FROM tlate WHERE k < {} GROUP BY dt ORDER BY s DESC LIMIT {}",
+             "SELECT k, max(ts) AS m FROM tlate WHERE k < {} GROUP BY k HAVING count(*) > {} ORDER BY k",
+             "SELECT k, min(dt), max(ts) FROM tlate WHERE v > {} GROUP BY k ORDER BY k LIMIT {}"]
+    seen = []
+    for tmpl in tmpls:
+        for lits in ((4, 3), (3, 2), (4, 3)):
+            sql = tmpl.format(*lits)
+            for lazy in (False, True):
+                got, dev, lr = _device_text(con, sql, lazy=lazy)
+                check(got == _as_text(ref, sql) and dev,
+                      f"{'sql()' if lazy else 'execute()'}: on the device with native's rows ({lr['reason']}; {sql[:70]})")
+                seen.append(lr["engine"] if dev else "-")
+    check(set(seen) == {"python"}, f"the reference renderer drew every one of them ({sorted(set(seen))})")
+    # an infinity written through a sibling cursor after every decision was taken
+    cur = con.cursor()
+    w = "INSERT INTO tlate VALUES (1, 1, TIMESTAMP 'infinity', DATE 'infinity'), (2, 2, TIMESTAMP '-infinity', DATE '-infinity')"
+    cur.execute(w)
+    ref.execute(w)
+    for sql in [t.format(4, 3) for t in tmpls] + INF_DECODE_STMTS:
+        for attempt in range(2):
+            for lazy in (True, False):
+                got, dev, lr = _device_text(con, sql, lazy=lazy)
+                check(got == _as_text(ref, sql),
+                      f"after a sibling's infinity, {'sql()' if lazy else 'execute()'} run {attempt + 1}: native's rows, "
+                      f"no raise ({'device' if dev else lr['reason']}; {sql[:60]})" + ("" if got == _as_text(ref, sql) else f" got {str(got)[:120]}"))
+        packed = "GROUP BY k, dt" in sql or "GROUP BY dt, k" in sql     # an infinite bound declines a packed key
+        check(dev != packed and lr["reason"] != "error",
+              f"after a sibling's infinity: {'DuckDB' if packed else 'back on the device'} ({lr['reason']}; {sql[:60]})")
+        # the sibling itself: right rows whichever path it is on (a cursor declines the
+        # exact path today; this holds as well once it takes it)
+        got, cdev, clr = _device_text(cur, sql)
+        check(got == _as_text(ref, sql), f"the sibling cursor's rows are native's ({'device' if cdev else clr['reason']}; {sql[:60]})")
+    cur.close()
+    ref.close()
+    con.close()
+
+
+def infinite_temporal_late_checks():
+    """The infinity arrives AFTER the statements were decided and their sets
+    uploaded: a write through the wrapper, a write through another connection
+    (a raw cursor of an in-memory database, which changes the row count; a
+    second connection to a database file), and a write while a segmented
+    background upload is between segments. A value outside a packed key's
+    bounds, written the same ways, is the same hazard for the packed key."""
+    import tempfile as _tf
+    print("== infinite DATE / TIMESTAMP, written after the decision")
+    writes = {
+        "update": ["UPDATE tlate SET ts = TIMESTAMP 'infinity', dt = DATE 'infinity' WHERE v = 5",
+                   "UPDATE tlate SET ts = TIMESTAMP '-infinity', dt = DATE '-infinity' WHERE v = 6"],
+        "insert": ["INSERT INTO tlate VALUES (1, 7, TIMESTAMP 'infinity', DATE 'infinity'), "
+                   "(2, 8, TIMESTAMP '-infinity', DATE '-infinity')"],
+        "far insert": ["INSERT INTO tlate VALUES (1, 7, TIMESTAMP '2400-01-01', DATE '2400-01-01'), "
+                       "(2, 8, TIMESTAMP '1500-01-01', DATE '1500-01-01')"],
+    }
+    for wname, ws in writes.items():
+        for how in ("wrapper", "raw cursor", "second connection"):
+            if how == "raw cursor" and wname == "update":
+                continue      # a same-count write on a raw cursor of an in-memory database: the §0 gap
+            db = os.path.join(_tf.mkdtemp(), "late.duckdb") if how == "second connection" else ":memory:"
+            con = gpudb.connect(db, residency="eager", floor_rows=0, thresholds=False)
+            con.execute(INF_LATE_SETUP)
+            before = sum(_device_text(con, sql)[1] for sql in INF_LATE_STMTS)
+            if how == "wrapper":
+                for w in ws:
+                    con.execute(w)
+            elif how == "raw cursor":
+                cur = con._raw.cursor()
+                for w in ws:
+                    cur.execute(w)
+                cur.close()
+            else:
+                other = duckdb.connect(db, config={"allow_unsigned_extensions": "true"})
+                for w in ws:
+                    other.execute(w)
+                other.close()
+            ref = duckdb.connect()
+            ref.execute(INF_LATE_SETUP)
+            for w in ws:
+                ref.execute(w)
+            second = 0
+            for sql in INF_LATE_STMTS:
+                for attempt in range(2):
+                    # the first run after the write may be the stale guard's (answered natively)
+                    got, dev, lr = _device_text(con, sql)
+                    want = _as_text(ref, sql)
+                    check(got == want, f"late {wname} via {how}, run {attempt + 1}: rows are native's "
+                                       f"({'device' if dev else lr['reason']}; {sql[:70]})"
+                          + ("" if got == want else f" got {got[:3]} want {want[:3]}"))
+                    second += dev and attempt == 1
+            # an infinity in a packed key's column declines it (two statements); a far
+            # value packs again under wider bounds; everything else is back by its second run
+            check(before == len(INF_LATE_STMTS) and second >= (len(INF_LATE_STMTS) - (0 if wname == "far insert" else 2)),
+                  f"late {wname} via {how}: the device answered {before} of {len(INF_LATE_STMTS)} before the write, "
+                  f"{second} second runs after it")
+            ref.close()
+            con.close()
+
+    # a write while the background upload is between segments
+    big = INF_LATE_SETUP.replace("range(100003)", "range(2000003)")
+    con = gpudb.connect(residency="background", floor_rows=0, thresholds=False, idle_ms=5.0)
+    con.execute(big)
+    con._manager.segment_rows = 100_000
+    ref = duckdb.connect()
+    ref.execute(big)
+    sql = INF_LATE_STMTS[0]
+    con.execute(sql).fetchall()
+    tag = con.last_rewrite()["tag"]
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 60:
+        pr = con._manager.progress().get(tag) or {}
+        if pr.get("segments", 0) >= 1 or pr.get("state") == "ready":
+            break
+        time.sleep(0.001)
+    pr = dict(con._manager.progress().get(tag) or {})
+    w = "UPDATE tlate SET ts = TIMESTAMP 'infinity' WHERE v = 1999990"
+    con.execute(w)
+    ref.execute(w)
+    got, dev = None, False
+    for _ in range(5):
+        con._manager.wait_idle(60)
+        got, dev, lr = _device_text(con, sql)
+        if dev:
+            break
+    want = _as_text(ref, sql)
+    check(dev and got == want,
+          f"background: an infinity written after {pr.get('segments')} of {pr.get('planned')} segments "
+          f"({pr.get('state')}): the device answers, with native's rows ({got} / {want})")
+    ref.close()
+    con.close()
+
+
+def _wait_device(con, ref, sql, tries=6, lazy=False):
+    """Run `sql` until the device answers it (the background worker uploads in
+    idle windows); every run's rows must be native's. (rows ok, device)."""
+    ok_all, dev = True, False
+    for _ in range(tries):
+        con._manager.wait_idle(60)
+        got, dev, _lr = _device_text(con, sql, lazy=lazy)
+        ok_all = ok_all and got == _as_text(ref, sql)
+        if dev:
+            break
+    return ok_all, dev
+
+
+def infinite_temporal_background_checks():
+    """The late-arriving infinity in background residency (the shipped
+    default): written through the wrapper, through a raw cursor (a
+    count-changing insert); every statement's rows are native's on every run,
+    through execute() and sql(), and each is back on the device once the
+    worker has rebuilt what it needs."""
+    print("== infinite DATE / TIMESTAMP, written later, background residency")
+    for how in ("wrapper", "raw cursor"):
+        con = gpudb.connect(residency="background", floor_rows=0, thresholds=False, idle_ms=5.0)
+        ref = duckdb.connect()
+        for c in (con, ref):
+            c.execute(INF_LATE_SETUP)
+        stmts = [s for s in INF_LATE_STMTS if "GROUP BY k, dt" not in s and "GROUP BY dt, k" not in s]
+        before = sum(_wait_device(con, ref, s)[1] for s in stmts)
+        w = ("INSERT INTO tlate VALUES (1, 7, TIMESTAMP 'infinity', DATE 'infinity'), "
+             "(2, 8, TIMESTAMP '-infinity', DATE '-infinity')")
+        if how == "wrapper":
+            con.execute(w)
+        else:
+            cur = con._raw.cursor()
+            cur.execute(w)
+            cur.close()
+        ref.execute(w)
+        bad = back = 0
+        for s in stmts:
+            for lazy in (True, False):
+                got, _dev, lr = _device_text(con, s, lazy=lazy)
+                bad += got != _as_text(ref, s)
+            ok, dev = _wait_device(con, ref, s, tries=8, lazy=True)
+            bad += not ok
+            back += dev
+        check(bad == 0, f"background, infinity written through {how}: every run's rows are native's ({bad} not)")
+        check(before == len(stmts) and back == len(stmts),
+              f"background, infinity written through {how}: {before} of {len(stmts)} on the device before, "
+              f"{back} after the rebuild")
+        ref.close()
+        con.close()
+
+
+PACK_SETUP = "CREATE TABLE tpk AS SELECT (i % 5)::INTEGER AS a, (i % 7)::INTEGER AS b, i::BIGINT AS v FROM range({n}) r(i)"
+PACK_SQL = "SELECT a, b, count(*), sum(v) FROM tpk GROUP BY a, b ORDER BY a, b"
+
+
+def _packed_entries(con, table="tpk"):
+    """The residency manager's entries for packed key sets over `table`."""
+    return sorted(t for t in con._manager.snapshot() if f":{table}:" in t and "~" in t)
+
+
+def packed_bounds_checks():
+    """A decision never decodes a set packed under bounds other than its own
+    (§4.4), however the data moved: the upload refuses a component outside
+    the bounds (GPUDB_IMAGE), the lane — so the set — is named after them,
+    and a decision whose bounds the zone map has left is taken again before
+    its set is uploaded again. The review's sequences: background residency,
+    a raw cursor inserts a value outside the bounds, the guard fires, the
+    insert is deleted again while the worker rebuilds the old recipe; a write
+    through `con.cursor()` and through a raw cursor, then the parent's
+    statement, eager and background, which is back on the device at once."""
+    print("== packed keys: the set's bounds are the decision's own")
+    for mode in ("background", "eager"):
+        kw = {"idle_ms": 5.0} if mode == "background" else {}
+        logs = []
+        con = gpudb.connect(residency=mode, floor_rows=0, thresholds=False, log=logs.append, **kw)
+        ref = duckdb.connect()
+        for c in (con, ref):
+            c.execute(PACK_SETUP.format(n=300_003))
+        ok, dev = _wait_device(con, ref, PACK_SQL)
+        tag0 = con.last_rewrite()["tag"]
+        check(ok and dev and "a+b~" in tag0, f"packed ({mode}): on the device before any write ({tag0[-40:]})")
+        cur = con._raw.cursor()
+        w = "INSERT INTO tpk VALUES (12, 30, 1)"
+        cur.execute(w)
+        ref.execute(w)
+        got, _dev, lr = _device_text(con, PACK_SQL)      # the guard fires here
+        check(got == _as_text(ref, PACK_SQL),
+              f"packed ({mode}): rows are native's after `{w[:28]}` through a raw cursor ({lr['reason']})")
+        # back to the old rows and row count, the zone map stays widened; no statement runs
+        # while the worker has the old set's recipe in hand
+        w = "DELETE FROM tpk WHERE a = 12"
+        cur.execute(w)
+        ref.execute(w)
+        cur.close()
+        time.sleep(2.0)
+        con._manager.wait_idle(60)
+        for attempt in range(2):
+            got, _dev, lr = _device_text(con, PACK_SQL)
+            check(got == _as_text(ref, PACK_SQL),
+                  f"packed ({mode}): rows are native's after the delete, run {attempt + 1} "
+                  f"({'device' if _dev else lr['reason']})" + ("" if got == _as_text(ref, PACK_SQL) else f" got {got[:6]}"))
+        ok, dev = _wait_device(con, ref, PACK_SQL)
+        check(ok and dev, f"packed ({mode}): back on the device after the delete (rows {ok}, device {dev})")
+        for how in ("con.cursor()", "raw cursor"):
+            cur = con.cursor() if how == "con.cursor()" else con._raw.cursor()
+            w = "INSERT INTO tpk VALUES (40, 90, 3)" if how == "con.cursor()" else "INSERT INTO tpk VALUES (-40, -90, 3)"
+            cur.execute(w)
+            ref.execute(w)
+            got, _dev, lr = _device_text(con, PACK_SQL)
+            check(got == _as_text(ref, PACK_SQL),
+                  f"packed ({mode}): the parent's rows are native's after a write through {how} ({lr['reason']})")
+            if how == "con.cursor()":
+                # the writer's own run: right whichever path it is on (a cursor declines the
+                # exact path today; this holds as well once it takes it)
+                cgot, cdev, clr = _device_text(cur, PACK_SQL)
+                check(cgot == _as_text(ref, PACK_SQL),
+                      f"packed ({mode}): the writing cursor's own rows are native's ({'device' if cdev else clr['reason']})")
+            else:
+                cur.close()
+            runs = 0
+            for runs in range(1, 7):
+                ok, dev = _wait_device(con, ref, PACK_SQL, tries=1)
+                if dev:
+                    break
+            # eager: the very next run re-packs (the bounds were read again before the upload)
+            check(ok and dev and (mode == "background" or runs == 1),
+                  f"packed ({mode}): the parent is back on the device after a write through {how} "
+                  f"({runs} runs; rows {ok}, device {dev}, {con.last_rewrite()['reason']} "
+                  f"{(con.last_rewrite().get('error') or '')[:60]})")
+        tag1 = con.last_rewrite()["tag"]
+        ents = _packed_entries(con)
+        check(tag1 != tag0 and ents == [tag1],
+              f"packed ({mode}): one manager entry, the current bounds' set; the old ones are forgotten ({ents})")
+        # one line per refused attempt (eager: 'not uploaded', background: 'upload failed'); a
+        # set refused for its bounds is never queued again, so no tag is refused twice
+        image = [m.split(": ")[1] for m in logs
+                 if "GPUDB_IMAGE" in m and m.startswith(("not uploaded: ", "upload failed: "))]
+        check(len(image) == len(set(image)), f"packed ({mode}): an upload refused for its bounds is not retried "
+                                             f"({len(image)} refused attempts over {len(set(image))} sets)")
+        ref.close()
+        con.close()
+
+    # a write drops nothing: a packed decision stays while its bounds still hold, and a
+    # decision over another table is untouched by a write to this one
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    for c in (con, ref):
+        c.execute(PACK_SETUP.format(n=100_003))
+        c.execute("CREATE TABLE tpk2 AS SELECT (i % 9)::INTEGER AS a, (i % 4)::INTEGER AS b, i::BIGINT AS v "
+                  "FROM range(100003) r(i)")
+    other = "SELECT a, b, sum(v) FROM tpk2 GROUP BY a, b ORDER BY a, b"
+    for sql in (PACK_SQL, other):
+        _device_text(con, sql)
+    before = dict(con._cache)
+    cur = con._raw.cursor()
+    for w in ("INSERT INTO tpk VALUES (2, 3, 1)", "INSERT INTO tpk2 VALUES (100, 100, 1)"):
+        cur.execute(w)
+        ref.execute(w)
+    cur.close()
+    for sql in (PACK_SQL, other):
+        for _ in range(2):
+            got, dev, lr = _device_text(con, sql)
+            check(got == _as_text(ref, sql), f"raw writes to both tables: native's rows ({lr['reason']}; {sql[:40]})")
+        check(dev, f"raw writes to both tables: back on the device ({lr['reason']}; {sql[:40]})")
+    kept = [k for k, d in con._cache.items() if before.get(k) is d]
+    pk = [k for k in kept if "tpk " in k[0]]
+    check(len(before) == 2 and len(pk) == 1 and "tpk2" not in " ".join(k[0] for k in pk) and len(kept) == 1,
+          f"an in-bounds write keeps tpk's packed decision; the decision over tpk2, whose bounds the "
+          f"write left, is taken again ({len(kept)} of {len(before)} kept)")
+    ref.close()
+    con.close()
+
+    # names with `~` and `+` in them: the bounds' suffix is stripped by its exact text only
+    print("== packed keys: column names that hold `~` / `+`")
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    setup = ("CREATE TABLE tnm AS SELECT (i % 50)::INTEGER AS \"a~b\", (i % 7)::INTEGER AS w, "
+             "(i % 5)::INTEGER AS \"x+y\", i::BIGINT AS v, DATE '2020-01-01' + (i % 100)::INTEGER AS \"d~t\" "
+             "FROM range(100000) r(i)")
+    for c in (con, ref):
+        c.execute(setup)
+    for sql in ('SELECT "a~b", sum(v) FROM tnm GROUP BY "a~b" ORDER BY 1 LIMIT 3',
+                'SELECT "a~b", w, sum(v) FROM tnm GROUP BY "a~b", w ORDER BY 1, 2 LIMIT 3',
+                'SELECT w, "a~b", sum(v) FROM tnm GROUP BY w, "a~b" ORDER BY 1, 2 LIMIT 3',
+                'SELECT "d~t", count(*) FROM tnm GROUP BY "d~t" ORDER BY 1 LIMIT 3',
+                'SELECT "d~t", w, count(*) FROM tnm GROUP BY "d~t", w ORDER BY 1, 2 LIMIT 3'):
+        got, dev, lr = _device_text(con, sql)
+        check(got == _as_text(ref, sql) and dev,
+              f"{sql[7:40]}: on the device with native's rows ({lr['reason']} {lr.get('detail', '')[:60]})")
+    ref.close()
+    con.close()
+
+    # a cursor created on one thread while another writes: the write runs, nothing raises
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    con.execute("CREATE TABLE tcw AS SELECT i AS k FROM range(10) r(i)")
+    keep, errs, stop = [con.cursor() for _ in range(50)], [], [False]
+
+    def maker():
+        while not stop[0]:
+            keep.append(con.cursor())
+            if len(keep) > 300:
+                del keep[:100]
+
+    def writer():
+        w = keep[0]
+        for i in range(200):
+            try:
+                w.execute(f"INSERT INTO tcw VALUES ({i})")
+            except Exception as e:          # noqa: BLE001 — the point is that nothing escapes
+                errs.append(repr(e)[:120])
+    th = [threading.Thread(target=maker), threading.Thread(target=writer)]
+    th[0].start()
+    th[1].start()
+    th[1].join()
+    stop[0] = True
+    th[0].join()
+    n = con._raw.execute("SELECT count(*) FROM tcw").fetchone()[0]
+    check(not errs and n == 210, f"cursors created while a cursor writes: every write ran ({n} rows, {errs[:1]})")
+    con.close()
+
+
+def temporal_misc_checks():
+    """The rest of the review's findings: an uploaded join ordered by its
+    qualified temporal key; a packed computed TIMESTAMP key whose bounds carry
+    a trimmed fraction (Python 3.9 / 3.10 could not read it); a DOUBLE WHERE
+    column whose zone map holds NaN or an infinity keeps a GROUP BY on DuckDB,
+    with a sentence; a foreign write is seen while a set is still uploading."""
+    import tempfile as _tf
+    print("== temporal keys: joins, fractions, NaN zone maps, foreign writes")
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    setup = """CREATE TABLE tj AS SELECT (i % 50)::INTEGER AS k, i::BIGINT AS v,
+                 TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND AS ts,
+                 TIMESTAMP '2020-01-01' + INTERVAL (i % 1000) SECOND + INTERVAL 500 MILLISECOND AS tf,
+                 DATE '2020-01-01' + (i % 100)::INTEGER AS dt FROM range(100000) r(i);
+               CREATE TABLE tjd AS SELECT TIMESTAMP '2020-01-01' + INTERVAL (i) SECOND AS ts,
+                 DATE '2020-01-01' + i::INTEGER AS dt FROM range(20) r(i);
+               CREATE TABLE tdn AS SELECT (i % 5)::INTEGER AS k, i::BIGINT AS v,
+                 CASE WHEN i = 3 THEN 'nan'::DOUBLE WHEN i = 4 THEN 'inf'::DOUBLE ELSE (i % 100)::DOUBLE END AS d
+                 FROM range(100003) r(i)"""
+    for c in (con, ref):
+        c.execute(setup)
+    for sql in ("SELECT tj.ts, count(*) FROM tj JOIN tjd ON tj.ts = tjd.ts GROUP BY tj.ts ORDER BY tj.ts",
+                "SELECT tj.dt, count(*) FROM tj JOIN tjd ON tj.dt = tjd.dt GROUP BY tj.dt ORDER BY tj.dt DESC LIMIT 4",
+                "SELECT tjd.ts, max(tj.v) FROM tj JOIN tjd ON tj.ts = tjd.ts GROUP BY tjd.ts ORDER BY tjd.ts LIMIT 4",
+                # a computed TIMESTAMP key packed with another: its bounds are '...:00.5' as DuckDB prints them
+                "SELECT tf + INTERVAL 1 SECOND AS m, k, count(*) FROM tj GROUP BY m, k ORDER BY m, k LIMIT 4",
+                # a plain TIMESTAMP column with fractions, packed
+                "SELECT tf, k, count(*) FROM tj GROUP BY tf, k ORDER BY tf DESC, k LIMIT 4"):
+        for _ in range(2):
+            got, dev, lr = _device_text(con, sql)
+        check(got == _as_text(ref, sql) and dev and lr["reason"] != "error",
+              f"on the device with native's rows ({lr['reason']} {lr.get('detail', '')[:50]}; {sql[:70]})")
+    sql = "SELECT k, count(*), sum(v) FROM tdn WHERE d > 50 GROUP BY k ORDER BY k"
+    got, dev, lr = _device_text(con, sql)
+    check(got == _as_text(ref, sql) and not dev and lr["reason"] == "double" and "NaN" in (lr.get("detail") or ""),
+          f"DOUBLE with NaN / inf in its zone map: a GROUP BY under a WHERE on it stays on DuckDB, with a "
+          f"reason ({lr['reason']}: {(lr.get('detail') or '')[:70]})")
+    sql = "SELECT count(*), sum(v) FROM tdn WHERE d > 50"
+    got, dev, lr = _device_text(con, sql)
+    check(got == _as_text(ref, sql) and dev, f"... and the global masked aggregate over it stays on the device ({lr['reason']})")
+    ref.close()
+    con.close()
+
+    # a foreign write while the set is still being uploaded: seen at the next sighting,
+    # the upload in flight is dropped with the rest, and the rows stay native's
+    db = os.path.join(_tf.mkdtemp(), "fw.duckdb")
+    logs = []
+    con = gpudb.connect(db, residency="background", floor_rows=0, thresholds=False, idle_ms=5.0, log=logs.append)
+    con.execute(INF_LATE_SETUP.replace("range(100003)", "range(3000003)"))
+    con._manager.segment_rows = 100_000
+    sql = "SELECT k, count(*), sum(v) FROM tlate WHERE ts IS NOT NULL GROUP BY k ORDER BY k"
+    con.execute(sql).fetchall()
+    other = duckdb.connect(db, config={"allow_unsigned_extensions": "true"})
+    other.execute("UPDATE tlate SET ts = TIMESTAMP 'infinity' WHERE v = 7")
+    other.close()
+    st = (con._manager.progress().get(con.last_rewrite()["tag"]) or {}).get("state")
+    got, dev, lr = _device_text(con, sql)
+    check(any("foreign write" in m for m in logs) and not dev,
+          f"a foreign write is seen while the set is {st}, before it is ready ({lr['reason']})")
+    ok_rows = None
+    for _ in range(10):
+        con._manager.wait_idle(60)
+        got, dev, lr = _device_text(con, sql)
+        if dev:
+            ok_rows = got == _as_text(con._raw, sql)
+            break
+    check(dev and ok_rows, f"... and the set rebuilt over the written data answers with native's rows ({lr['reason']})")
     con.close()
 
 

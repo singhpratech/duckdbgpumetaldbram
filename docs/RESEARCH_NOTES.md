@@ -6470,6 +6470,145 @@ average 3-6); the catalog read of the join-arm case runs only on that path.
 The shipped-default reproductions are native-equal on the worktree. Not run on
 the NVIDIA machine.
 
+## 2026-11-26 — Infinite DATE / TIMESTAMP values on the device, and packed keys whose bounds the data left
+
+The defect, in pip 0.7.5 and earlier: a TIMESTAMP lane's image was
+`epoch_us(ts)`, which is NULL for `infinity` / `-infinity`, so those rows were
+NULL cells on the device — `SELECT count(*) FROM te WHERE ts IS NULL`
+over-counted with shipped defaults (the aggregate without GROUP BY), a
+comparison lost them, `min` / `max` came back finite, an infinite key joined
+the NULL group; computed TIMESTAMP lanes (`date_trunc`, `ts + INTERVAL`, a cast
+from DATE) likewise. Decoding an infinite image back raised: the extension's
+renderer uses `make_timestamp(n)` / `DATE '1970-01-01' + n`. A second defect
+on main sat beside it: a packed multi-column key (§4.4) is sized by zone-map
+bounds read at decision time, and a value written later outside them — through
+a raw cursor, a cursor of the connection, or during an upload — was packed into
+another group's slot.
+
+The first attempt (worktree `fix/ext-infinite-timestamps`, PR #197 and a rework
+on top). The images were made exact from the start (±INT64_MAX for a TIMESTAMP
+infinity, via `isinf()`; the DATE image already kept ±INT32_MAX), and the
+Python decode mapped them back. Its first version had every plan that decodes a
+temporal key or `min` / `max` drawn by the Python renderer, which exposed that
+renderer's ORDER BY alias-binding bug (it bound a name to the GROUP BY column
+before a select alias). The rework therefore kept such plans on the extension's
+renderer unless the zone map showed an infinity, added a "retake" of the
+decision after the scalar's decode raised, and declined ("hazard") a plan whose
+output name was also a different GROUP BY column. Two reviews found that
+machinery wrong in several ways: after a sibling cursor inserted an infinity,
+`con.sql(q).fetchall()` raised the decode error to the user (the lazy path reads
+the relation after `sql()` has returned, so there is no fallback) and kept
+raising; the hazard decline took ordinary statements off the device, far more
+than documented; a template retaken once stayed on the Python renderer for
+good; a literal variant's decode error became a permanent `error`. Its packed
+part had its own findings: the suffix stripping split on any `~`, so `GROUP BY
+"a~b"` declined where main ran it; the WeakSet the cursors registered in was
+iterated by a writer while another thread added to it (`Set changed size during
+iteration` escaped from a valid INSERT, which never ran); in background mode a
+refused upload was flipped back to pending and retried up to 20 times; every
+bounds change left a stale manager entry; the doc and the code disagreed on
+what a write dropped; and after a write through `con.cursor()` the parent stayed
+`not_resident`.
+
+What was kept and what was dropped. The alias-binding fix that merged underneath
+(`fix/ext-order-by-alias`: `Plan.order_outs`, `IDENT_FOLD`, the tie guard
+ranking the output's own expression) removed the reason for the machinery, so
+this version keeps the exact images, the Python decode, the null for a
+non-finite bound in the renderer's JSON context, the VARCHAR fetch of a computed
+key's bounds, the upload's refusal of a packed component outside its bounds
+(`GPUDB_IMAGE`) and the bounds in the packed lane's name — and drops the zone-map
+test, the retake, the hazard decline and its `final` flag, the family registry
+and every cross-connection drop:
+
+- every plan that decodes a DATE / TIMESTAMP (`_rewrite.decodes_temporal`) is
+  drawn by the Python renderer, always, on every path; the scalar still decides
+  whether the statement is rewritten (route unchanged), its rendering is set
+  aside, and the Python rendering is drawn once per decision
+  (`Decision.python_sql`);
+- no write drops a decision. Before a packed set is uploaded again, its decision
+  is looked at (`Connection._packed_bounds_hold`): a refused upload, or zone-map
+  bounds — read again once per invalidation — that left the decision's, take it
+  again on the spot and forget the old manager entry (`ResidencyManager.forget`);
+  a set refused for its bounds is never queued again. Only that decision is
+  touched, which is the narrow drop the doc now describes; with no registry
+  there is nothing for two threads to race on;
+- the suffix is removed for the extension's renderer only on a packed plan and
+  only as the exact text it is (`Plan.key_suffix`), and put back into its SQL;
+- the foreign-write check runs before the residency check, so a write seen while
+  a set is still uploading drops it rather than letting it finish;
+- a DOUBLE / FLOAT WHERE column whose zone map holds NaN / ±inf keeps a GROUP BY
+  on DuckDB as before (it declined by accident: the bound was not JSON), now
+  with reason `double` and a sentence; admitting it is a change of its own;
+- DuckDB's trimmed fraction (`'2020-01-01 00:00:00.5'`) is read on Python 3.9 /
+  3.10 too (`_rewrite._iso_datetime`): a zone-map bound or a packed computed
+  TIMESTAMP key's bound no longer fails to parse there.
+
+What the Python renderer could not draw. Run over the wrapper's whole corpus with
+the extension's rendering discarded for EVERY plan (a temporary switch, removed),
+it drew every plan with the same rows, names and types; the only failures were
+the checks that assert the extension's renderer drew a plan. The probes found
+one form it could not draw: an output whose name holds a quote — DuckDB names
+`min("d~t")` that way — was emitted unescaped (`AS "min("d~t")"`, a parser
+error, so the template became `error` after paying for its upload). Output
+names are now quoted (`_rewrite.quote_ident`). The uploaded-join statement the
+review named (`SELECT t.ts, count(*) FROM t JOIN d ON t.ts = d.ts GROUP BY t.ts
+ORDER BY t.ts`) already rendered `ORDER BY "ts"` on the base; it is pinned.
+
+Measured (worktree `python/`, the 0.7.3 wheel's extension binary, other jobs
+running throughout: load average 6–49, stated per line). The base is
+`fix/ext-order-by-alias` (6c100f3).
+
+- Suites. test_wrapper on the base: 2056 / 2056 / 2086 checks on 2.0.1 / 2.0.0
+  / 1.5.6, and 2086 under the system Python 3.9 (DuckDB 1.4.5). With this
+  change: 2831 / 2831 / 2861 and 2861, all passing; the one check that failed
+  on two of the runs — "during a busy loop nothing became resident", a
+  background-idle timing check — failed only at load 38 and passed alone 16 of
+  16 times on both trees at load 11. shell 76 (77 on 3.9), residency policy 131,
+  ast compat 9 on all three; ast compat on 1.4.5 is 8 of 9 on the base too.
+- The new checks (771) fail on the base in 172 places: wrong rows over
+  infinite values and late infinities, the shipped-default global aggregate,
+  packed keys after a write, the renderer on every path, the foreign write seen
+  while a set uploads, the reason of the NaN decline; under Python 3.9 the base
+  also declines a packed key over a TIMESTAMP column with fractions.
+- `explore.py` (202 statements, 300K rows): 0 differing over infinite values on
+  2.0.1, 2.0.0 and 1.5.6, against 21 on the base; over the extreme finite values
+  the one "difference" is the same DuckDB error printed to two lengths (both
+  sides raise), and on 2.0.0 / 1.5.6 two TIMESTAMPTZ statements answered by
+  DuckDB that the script cannot fetch without pytz. 139 statements on the
+  device. `late.py`: 0 differing in every scenario on all three versions,
+  including the infinity written while a background upload is in flight.
+- Shipped defaults (`repro_default_settings.py`, 40M rows, 2.0.1): the base
+  answers `count(*) … WHERE ts IS NULL` 388352 against native's 388350 (and
+  two more statements wrong); this change answers all three as native, on the
+  device.
+- Both reviews' probes: every remaining BAD line is a statement DuckDB itself
+  raises for (the probe prints the two raises differently), a tie DuckDB
+  resolves either way, or a probe whose reference table lacks the row the probe
+  inserted; `con.sql(q).fetchall()` after a sibling's infinity returns native's
+  rows, the cursor race raises nothing, `GROUP BY "a~b"` runs on the device.
+- Route against the base, TPC-H SF1: `tpch_coverage.py` gives 16 of 22 on the
+  device on both trees, the same path per query, 0 rows differing (load 11–14).
+  Over the 22 queries plus 20 ordinary temporal-key statements, through
+  `execute()` and `sql()`: with thresholds off, 0 route differences in 84 paths;
+  with thresholds on, `execute()` identical in three rounds, and four `sql()`
+  verdicts of the measured rule (T1, T5, T12, T19, each within a few percent of
+  native on the lazy path) flip between rounds on both trees.
+- Cost against the base. Per-execution time of the 17 affected plans, drawn by
+  the Python renderer and by the extension's renderer in one process over the
+  same resident sets, alternating per statement, 50 runs each: median ratio
+  0.99, geometric mean 1.03 (load 13–19); a focused run of the five slowest
+  looking, 150 runs each, 1.00–1.10 (load 20). The decode's CASE alone, the same
+  rendering with and without it, prepared, 100 runs: +0.00 to +0.11 ms, the most
+  for `o_custkey, max(o_orderdate) … LIMIT 10`, which decodes 100K groups for 10
+  rows (load 15). The TIMESTAMP image is paid once per upload. Provisional: no
+  quiet machine was available.
+
+Not covered here, and owed: admitting the DOUBLE / FLOAT NaN zone-map shapes;
+a cursor taking the exact path (`Connection.cursor()` copies none of `_exact`,
+`_join`, `_store`, `_global`, `_narrow` from its parent, on main too — the
+cross-cursor checks are written to hold once it does); not run on the NVIDIA
+machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
