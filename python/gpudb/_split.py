@@ -67,6 +67,31 @@ def _first_colref(e) -> Optional[dict]:
     return None
 
 
+def _name_count(names: List[str]) -> dict:
+    out: dict = {}
+    for n in names:
+        out[n.casefold()] = out.get(n.casefold(), 0) + 1
+    return out
+
+
+def _order_alias(e: dict, select_aliases, name_count: dict, ok: list) -> bool:
+    """A top-level ORDER BY item that is an unqualified name a select alias
+    carries binds to that select item, before any column of the same name
+    (DuckDB's ORDER BY binding, §6): `SELECT k AS kk, sum(v) * 2 AS k ...
+    ORDER BY k` orders by the doubled sum. The outer statement keeps the name,
+    and its own select list carries it with the original output names. A
+    name two outputs carry binds to the last of them, which the outer
+    statement could not reproduce once every output is named: it declines."""
+    if e.get("class") != "COLUMN_REF":
+        return False
+    nm = e.get("column_names") or []
+    if len(nm) != 1 or nm[0].casefold() not in select_aliases:
+        return False
+    if name_count.get(nm[0].casefold(), 0) > 1:
+        ok[0] = False
+    return True
+
+
 def _always_false(col: dict) -> dict:
     """(c IS NULL AND c IS NOT NULL): FALSE on every row, never NULL — the
     single group of an aggregate without GROUP BY, as a computed key."""
@@ -115,6 +140,7 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
 
     aggs: List[dict] = []
     select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
+    name_count = _name_count(names)
 
     def key_of(e) -> Optional[int]:
         for i, g in enumerate(groups):
@@ -145,6 +171,8 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
         if not isinstance(e, dict):
             return e
         if "class" in e:
+            if top_level_order and _order_alias(e, select_aliases, name_count, ok):
+                return e                          # the outer ORDER BY names the outer select item
             ki = key_of(e)
             if ki is not None:
                 return dict(_ref(f"__k{ki}"), alias=e.get("alias") or "")
@@ -261,6 +289,7 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
     _DISTINCT_OUTER = {"count": "count", "sum": "sum", "avg": "avg", "min": "min", "max": "max"}
     ok = [True]
     select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
+    name_count = _name_count(names)
 
     def key_of(e) -> Optional[int]:
         for i, g in enumerate(groups):
@@ -283,6 +312,8 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
         if not isinstance(e, dict):
             return e
         if "class" in e:
+            if top_level_order and _order_alias(e, select_aliases, name_count, ok):
+                return e                          # the outer ORDER BY names the outer select item
             ki = key_of(e)
             if ki is not None:
                 return dict(_ref(f"__k{ki}"), alias=e.get("alias") or "")

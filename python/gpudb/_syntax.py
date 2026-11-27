@@ -49,6 +49,18 @@ def _ordinal(e) -> Optional[int]:
     return None
 
 
+def _colname(e) -> Optional[str]:
+    if isinstance(e, dict) and e.get("class") == "COLUMN_REF":
+        names = e.get("column_names") or []
+        return names[-1] if names else None
+    return None
+
+
+def _ordinal_const(i: int) -> dict:
+    return {"class": "CONSTANT", "type": "VALUE_CONSTANT", "alias": "", "query_location": 18446744073709551615,
+            "value": {"type": {"id": "INTEGER", "type_info": None}, "is_null": False, "value": i}}
+
+
 def _bare(item: dict) -> dict:
     out = copy.deepcopy(item)
     out["alias"] = ""
@@ -92,13 +104,31 @@ def normalise(tree_json: str, names: Optional[list] = None) -> Optional[str]:
                 return None                    # ROLLUP / CUBE / GROUPING SETS: not this pass
             node["group_expressions"] = new
             node["group_sets"] = [list(range(len(new)))]
+    # The output names the statement will carry once they are pinned below.
+    out_names = [((names[i] if names is not None and i < len(names) else "") or it.get("alias")
+                  or _colname(it) or "").casefold() for i, it in enumerate(sel)]
+
+    def order_item(i: int) -> dict:
+        """ORDER BY <i> as an expression that binds to select item i. Its bare
+        expression does, unless it is an unqualified name that ANOTHER item's
+        alias carries: ORDER BY binds such a name to that alias first (§6),
+        so `SELECT sum(v) AS k, k AS kk ... ORDER BY 2` would come to order by
+        the sum. Such an item keeps its ordinal, which every renderer reads."""
+        b = _bare(sel[i])
+        n = _colname(b)
+        if n is not None and len(b.get("column_names") or []) == 1 \
+                and any(on == n.casefold() for j, on in enumerate(out_names) if j != i):
+            return _ordinal_const(i + 1)
+        return b
+
     for m in node.get("modifiers") or []:
         if m.get("type") != "ORDER_MODIFIER":
             continue
         orders = m.get("orders") or []
         if len(orders) == 1 and (orders[0].get("expression") or {}).get("class") == "STAR":   # ORDER BY ALL
             o = orders[0]
-            m["orders"] = [{"type": o.get("type"), "null_order": o.get("null_order"), "expression": _bare(it)} for it in sel]
+            m["orders"] = [{"type": o.get("type"), "null_order": o.get("null_order"), "expression": order_item(i)}
+                           for i in range(len(sel))]
             changed = True
             continue
         for o in orders:
@@ -106,8 +136,10 @@ def normalise(tree_json: str, names: Optional[list] = None) -> Optional[str]:
             if i is not None:
                 if i > len(sel):
                     return None
-                o["expression"] = _bare(sel[i - 1])
-                changed = True
+                x = order_item(i - 1)
+                if _ordinal(x) is None:
+                    o["expression"] = x
+                    changed = True
     # SELECT DISTINCT a, b FROM ... (no aggregate, no GROUP BY) is GROUP BY a, b
     mods = node.get("modifiers") or []
     dm = [m for m in mods if m.get("type") == "DISTINCT_MODIFIER"]

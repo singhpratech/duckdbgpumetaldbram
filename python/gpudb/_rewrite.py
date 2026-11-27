@@ -96,6 +96,10 @@ class Plan:
     outputs: List[OutItem] = field(default_factory=list)
     having: Optional[Tuple[str, str, Decimal]] = None   # (agg kind, op, literal)
     order: List[Tuple[str, str, str]] = field(default_factory=list)  # (target kind/name, dir, nulls)
+    # per ORDER BY item: the index into `outputs` it binds to, or None for an
+    # aggregate the select list does not carry. The renderers name the target
+    # through this index, so the name is the output's final (DESCRIBE) name.
+    order_outs: List[Optional[int]] = field(default_factory=list)
     order_sql: str = ""                # the user's ORDER BY, re-targeted to output names
     limit: Optional[int] = None
     form: str = "plain"                # plain | having | topk
@@ -441,6 +445,20 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
         plan.form = "having"
 
     # modifiers: ORDER BY / LIMIT
+    #
+    # An ORDER BY name binds the way DuckDB's binder binds it (measured on
+    # 1.5.6, 2.0.0 and 2.0.1, docs/TRANSPARENT_DESIGN.md §6): an UNQUALIFIED
+    # name is a select-list alias first — an explicit `AS` alias only, matched
+    # without regard to case, quoted or not — and a column of the table only
+    # when no alias carries it; a qualified `t.k` is always the column. So in
+    # `SELECT k AS kk, sum(v) AS k ... ORDER BY k` the order is the sum's. A
+    # name two select items answer to declines: DuckDB takes the last of them,
+    # and the rendered statement could not say which one it means.
+    explicit: Dict[str, List[int]] = {}
+    for i, item in enumerate(sel):
+        if item.get("alias"):
+            explicit.setdefault(item["alias"].casefold(), []).append(i)
+    keys_cf = [k.casefold() for k in plan.keys]
     for m in node.get("modifiers") or []:
         t = m.get("type")
         if t == "ORDER_MODIFIER":
@@ -449,47 +467,53 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                 direction = o.get("type", "ORDER_DEFAULT")
                 nulls = o.get("null_order", "ORDER_DEFAULT")
                 target = None
+                out_i: Optional[int] = None
                 c = _colref(e)
+                bare = (e.get("column_names") or []) if c is not None else []
                 if e.get("class") == "CONSTANT":
                     idx = _const(e)
                     if idx is None or idx != idx.to_integral_value() or not (1 <= int(idx) <= len(plan.outputs)):
                         raise Decline("shape", "order by ordinal")
-                    out = plan.outputs[int(idx) - 1]
-                    target = (out.kind, out.name)
+                    out_i = int(idx) - 1
+                elif c is not None and len(bare) == 1 and c.casefold() in explicit:
+                    hits = explicit[c.casefold()]
+                    if len(hits) > 1:
+                        raise Decline("shape", f"order by {c}: {len(hits)} select items are named {c}")
+                    out_i = hits[0]
                 elif c is not None:
-                    if c in plan.keys:
-                        for out in plan.outputs:
-                            if out.kind == "key" and out.key_index == plan.keys.index(c):
-                                target = ("key", out.name)
-                        if target is None:
-                            raise Decline("shape", "order by a key that is not selected")
-                    else:
-                        # an output alias
-                        for out in plan.outputs:
-                            if out.name == c:
-                                target = (out.kind, out.name)
-                    if target is None:
+                    if c.casefold() not in keys_cf:
                         raise Decline("shape", f"order by {c}")
+                    ki = keys_cf.index(c.casefold())
+                    out_i = next((i for i, out in enumerate(plan.outputs)
+                                  if out.kind == "key" and out.key_index == ki), None)
+                    if out_i is None:
+                        raise Decline("shape", "order by a key that is not selected")
                 else:
                     a = _agg(e) if e.get("class") == "FUNCTION" else None
                     if a is None:
                         raise Decline("shape", "order by expression")
                     kind, col = a
                     if kind == "count_star":
-                        target = ("count_star", None)
+                        out_i = next((i for i, o in enumerate(plan.outputs) if o.kind == "count_star"), None)
+                        if out_i is None:
+                            target = ("count_star", None)
                     elif col in plan.vals:
                         pay = plan.vals.index(col)
-                        hit = next((o for o in plan.outputs if o.kind == kind and o.pay == pay), None)
-                        if hit is not None:
-                            target = (kind, hit.name)
-                        elif pay == 0 and not plan.multi:
-                            target = (kind, None)
-                        else:
-                            raise Decline("shape", "order by an aggregate that is not selected")
+                        out_i = next((i for i, o in enumerate(plan.outputs) if o.kind == kind and o.pay == pay), None)
+                        if out_i is None:
+                            if pay == 0 and not plan.multi:
+                                target = (kind, None)
+                            else:
+                                raise Decline("shape", "order by an aggregate that is not selected")
                     else:
                         raise Decline("shape", "order by aggregate")
+                if out_i is not None:
+                    out = plan.outputs[out_i]
+                    target = (out.kind, out.name)
                 plan.order.append((target[0] + ("" if target[1] is None else ":" + target[1]),
                                    direction, nulls))
+                plan.order_outs.append(out_i)
+            check_order_names(plan)
         elif t == "LIMIT_MODIFIER":
             if m.get("offset"):
                 raise Decline("shape", "OFFSET")
@@ -529,8 +553,9 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             if d in ("ASCENDING", "DESCENDING", "ASC", "DESC"):
                 plan.form = "topk"
                 plan.topk_agg = base
-                name = tgt.partition(":")[2]
-                plan.topk_pay = next((o.pay for o in plan.outputs if name and o.name == name and o.kind == base), 0)
+                # the device selects by the very output the ORDER BY binds to
+                oi = plan.order_outs[0]
+                plan.topk_pay = plan.outputs[oi].pay if oi is not None else 0
     # predicate columns of the set: WHERE columns other than the (single) key /
     # payload; a packed key's components are ordinary lanes
     for w in plan.where:
@@ -728,6 +753,20 @@ def _check_avg_decimal(plan: Plan, avg_float_bits: int) -> None:
                           f"(mantissa {avg_float_bits or 'unknown'} bits, needs 53)")
 
 
+def check_order_names(plan: Plan) -> None:
+    """Every output an ORDER BY item binds to must be the only output of its
+    name. The rewritten statement orders by that name (and its tie guard
+    ranks by it), and DuckDB binds a name two outputs carry to the LAST of
+    them — `SELECT sum(v) AS k, k ... ORDER BY k` orders by the sum natively,
+    but once every output is named, `ORDER BY "k"` would order by the key."""
+    seen: Dict[str, int] = {}
+    for o in plan.outputs:
+        seen[o.name.casefold()] = seen.get(o.name.casefold(), 0) + 1
+    for oi in plan.order_outs:
+        if oi is not None and seen[plan.outputs[oi].name.casefold()] > 1:
+            raise Decline("shape", f"order by {plan.outputs[oi].name}: two outputs carry that name")
+
+
 def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:
     """Names and types of the original statement's outputs, in order."""
     if len(described) != len(plan.outputs):
@@ -735,6 +774,7 @@ def apply_describe(plan: Plan, described: List[Tuple[str, str]]) -> None:
     for out, (name, typ) in zip(plan.outputs, described):
         out.name = name
         out.native_type = typ
+    check_order_names(plan)
 
 
 def make_global(plan: Plan) -> None:
@@ -1022,7 +1062,7 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         else:
             fn += "_topk"
             args += [f"'{plan.topk_agg}'", str(k1), f"'{dir_word}'"]
-        ties = ties_qualify(plan)
+        ties = True                    # drawn below, once the outputs' expressions are known
     if multi:
         lanes = ", ".join("v" if i == 0 else _lane_of(plan, c)[0] for i, c in enumerate(plan.vals))
         fn = "gpu_groupby_exact_multi"
@@ -1030,22 +1070,24 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     # a filtered result (device HAVING / top-k) decodes its few keys one by one instead of
     # joining the whole dictionary (tens of ms for 100K wide tuples, per statement)
     dict_per_key = plan.dict_key and (fn.endswith(("_having", "_topk")) or bool(mfilter) or plan.decode_per_key)
-    cols = []
+    exprs = []                         # one per output, in order
     for out in plan.outputs:
         if out.kind == "key" and plan.dict_key:
             ref = ("gpu_resident_dict_component('%s', r.\"key\", %d)" % (tag, out.key_index) if dict_per_key
                    else 'd."c%d"' % out.key_index)
             t = out.native_type.upper()
             expr = ref if t in _STRING_TYPES or t.startswith("VARCHAR") else f"CAST({ref} AS {out.native_type})"
-            cols.append(f'{expr} AS "{out.name}"')
+            exprs.append(expr)
             continue
         if out.kind == "key" and plan.packed:
-            cols.append(f'{_key_component_expr(plan, out.key_index, out.native_type)} AS "{out.name}"')
+            exprs.append(_key_component_expr(plan, out.key_index, out.native_type))
             continue
         if out.kind == "key":
-            cols.append(f'{_out_expr(plan, "key", out.native_type)} AS "{out.name}"')
+            exprs.append(_out_expr(plan, "key", out.native_type))
         else:
-            cols.append(f'{_agg_expr(plan, out.kind, out.pay, out.native_type)} AS "{out.name}"')
+            exprs.append(_agg_expr(plan, out.kind, out.pay, out.native_type))
+    cols = [f'{x} AS "{out.name}"' for x, out in zip(exprs, plan.outputs)]
+    ties = ties_qualify(plan, exprs) if ties else ""
     src = f"{fn}({', '.join(args)}) r"
     if plan.dict_key and not dict_per_key:
         src += " LEFT JOIN gpu_resident_dictionary('%s', %d) d ON (d.id = r.\"key\")" % (tag, len(plan.keys))
@@ -1054,13 +1096,38 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
     return sql + ties + _order_limit_sql(plan)
 
 
-def _order_ref(plan: Plan, tgt: str) -> str:
-    """The rewritten statement's own name for an ORDER BY target."""
+def _order_ref(plan: Plan, tgt: str, out_i: Optional[int] = None) -> str:
+    """The rewritten statement's own name for an ORDER BY target: the output
+    it binds to (by index, so by its final name), else the table function's
+    column for an aggregate the select list does not carry."""
+    if out_i is not None:
+        return f'"{plan.outputs[out_i].name}"'
     kind, _, name = tgt.partition(":")
     if name:
         return f'"{name}"'
     return next((f'"{o.name}"' for o in plan.outputs if o.kind == kind),
                 f'r."{ "key" if kind == "key" else kind }"')
+
+
+def _order_out(plan: Plan, i: int) -> Optional[int]:
+    return plan.order_outs[i] if i < len(plan.order_outs) else None
+
+
+# The columns the rewritten statement's FROM carries: the table functions'
+# (key, sum, count, count_star, min, max, avg, and sum0 / count0 / ... for
+# several payloads), the dictionary's (id, c0, c1, ...) and the guard's (ok).
+_FROM_COLUMN_RE = re.compile(r"^(?:(?:key|sum|count|count_star|min|max|avg)\d*|ok|id|c\d+)$", re.IGNORECASE)
+
+
+def tie_window_shadowed(plan: Plan) -> bool:
+    """Is the pushed top-k's target an output named like a column of the
+    rewritten statement's FROM? The tie guard's window would rank that
+    column instead of the output (see ties_qualify), so only a renderer that
+    hands the window the output's expression may draw the statement."""
+    if plan.form != "topk" or not plan.order:
+        return False
+    oi = _order_out(plan, 0)
+    return oi is not None and bool(_FROM_COLUMN_RE.match(plan.outputs[oi].name))
 
 
 def _order_suffix(direction: str, nulls: str) -> str:
@@ -1082,7 +1149,7 @@ _NULL_ORDER_WORDS = {"NULLS_FIRST": " NULLS FIRST", "NULLS FIRST": " NULLS FIRST
                      "NULLS_LAST": " NULLS LAST", "NULLS LAST": " NULLS LAST"}
 
 
-def ties_qualify(plan: Plan) -> str:
+def ties_qualify(plan: Plan, exprs: Optional[List[str]] = None) -> str:
     """The tie guard of a PUSHED top-k (§4.24).
 
     A device top-k picks k rows out of the groups by its own rule when their
@@ -1099,11 +1166,22 @@ def ties_qualify(plan: Plan) -> str:
     exactly on the second and later member of a group of equal values, and
     `rank() > k` excludes the ones past the k-th row, which no LIMIT k returns.
     Both windows share one specification, so they cost one pass over the k + 1
-    rows the device returned."""
+    rows the device returned.
+
+    Inside a window, unlike in the ORDER BY beside it, a name binds to a
+    column of the FROM before a select alias (measured on 1.5.6 and 2.0.1).
+    An output named like one of the table function's columns (`count(*) AS
+    count`, `sum(v) AS "key"`) would rank the column, not the output, so the
+    window is given the output's expression instead (`exprs`, one per output,
+    as the renderer built them)."""
     if plan.limit is None or len(plan.order) != 1:
         return ""
     tgt, direction, nulls = plan.order[0]
-    w = f"OVER (ORDER BY {_order_ref(plan, tgt)}{_order_suffix(direction, nulls)})"
+    oi = _order_out(plan, 0)
+    ref = _order_ref(plan, tgt, oi)
+    if oi is not None and exprs is not None and _FROM_COLUMN_RE.match(plan.outputs[oi].name):
+        ref = f"({exprs[oi]})"
+    w = f"OVER (ORDER BY {ref}{_order_suffix(direction, nulls)})"
     kind, _, name = tgt.partition(":")
     msg = (f"{TIES_MARKER}: the first {plan.limit} rows are not ordered uniquely "
            f"by {name or kind}").replace("'", "''")
@@ -1114,8 +1192,8 @@ def ties_qualify(plan: Plan) -> str:
 def _order_limit_sql(plan: Plan) -> str:
     sql = ""
     if plan.order:
-        parts = [_order_ref(plan, tgt) + _order_suffix(direction, nulls)
-                 for tgt, direction, nulls in plan.order]
+        parts = [_order_ref(plan, tgt, _order_out(plan, i)) + _order_suffix(direction, nulls)
+                 for i, (tgt, direction, nulls) in enumerate(plan.order)]
         sql += " ORDER BY " + ", ".join(parts)
     if plan.limit is not None:
         sql += f" LIMIT {plan.limit}"
@@ -1151,20 +1229,22 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
         if tgt.split(":")[0] in (("sum",) if sum_path else ("count", "count_star")):
             fn = base + "_topk"
             args += [str(plan.limit + 1), f"'{dir_word}'"]   # k + 1: the tie guard's boundary row
-            ties = ties_qualify(plan)
+            ties = True                        # drawn below, from the outputs' expressions
         # ORDER BY count on the sum path: plain function, native sort + limit
-    cols = []
+    exprs = []
     for out in plan.outputs:
         if out.kind == "key":
-            cols.append(f'CAST(r."key" AS {out.native_type}) AS "{out.name}"')
+            exprs.append(f'CAST(r."key" AS {out.native_type})')
         elif out.kind == "sum":
             if plan.scale:
-                cols.append(f'(CAST(r."sum" AS DECIMAL({38 - plan.scale},0)) * '
-                            f'{Decimal(1).scaleb(-plan.scale)}) AS "{out.name}"')
+                exprs.append(f'(CAST(r."sum" AS DECIMAL({38 - plan.scale},0)) * '
+                             f'{Decimal(1).scaleb(-plan.scale)})')
             else:
-                cols.append(f'CAST(r."sum" AS {out.native_type}) AS "{out.name}"')
+                exprs.append(f'CAST(r."sum" AS {out.native_type})')
         else:                                  # count / count_star on a v0.6 set
-            cols.append(f'CAST(r."count" AS {out.native_type}) AS "{out.name}"')
+            exprs.append(f'CAST(r."count" AS {out.native_type})')
+    cols = [f'{x} AS "{out.name}"' for x, out in zip(exprs, plan.outputs)]
+    ties = ties_qualify(plan, exprs) if ties else ""
     sql = (f"SELECT {', '.join(cols)} FROM {fn}({', '.join(args)}) r, "
            f"(SELECT gpu_assert_rows('{tag}', count(*)) AS ok FROM {fqn}) gd "
            f"WHERE gd.ok{extra_pred}")

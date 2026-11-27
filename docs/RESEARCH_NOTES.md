@@ -6241,6 +6241,84 @@ about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
 `BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
 changes no measured statement. Not yet run on the NVIDIA machine.
 
+## 2026-11-26 — A select alias that shadows a column: what an ORDER BY name binds to
+
+Found on pip 0.7.3: `SELECT k AS kk, sum(v) AS k FROM t WHERE w < 3 GROUP BY
+t.k ORDER BY k`. DuckDB orders it by the sum; the matcher bound `k` to the
+GROUP BY column, so the plan's ORDER BY target was the key. The first
+execution was right (the extension's renderer binds the alias), and the same
+template re-run with another literal, drawn by the reference renderer from the
+plan, came back in key order; with a `LIMIT` the device picked the top k by the
+key. At shipped defaults (`gpudb.connect()` and nothing else, 4M rows, 200K
+groups, no WHERE, the template re-run with `LIMIT 11`) the published 0.7.3
+wheel returns the 11 largest keys where native returns the 11 largest sums.
+
+DuckDB's rules, measured rather than remembered, on 1.5.6, 2.0.0 and 2.0.1
+(identical on all three): an unqualified ORDER BY name is an explicit select
+alias first — without regard to case, quoted or not; an unaliased item is not
+an alias — and a column only when no alias carries it; `t.k` is always the
+column; a name two aliases carry binds to the LAST one. Inside an ORDER BY
+expression (`-k`, `k + 0`) the column comes first and an alias only when no
+column carries the name. GROUP BY and WHERE: column first, alias second.
+HAVING: a grouped column first, then the alias (an ungrouped column of that
+name does not count). The QUALIFY window's ORDER BY: a FROM column first.
+
+The extent on 0.7.3, 60 shapes x 3 literals against native
+(`floor_rows=0, thresholds=False`): 76 wrong results. Wrong only when
+re-rendered (the reference renderer): the plain, top-k, HAVING and several
+payload forms, case-different aliases, swapped aliases (`k AS j, j AS k`), two
+ORDER BY items, GROUP BY ALL and GROUP BY 1, nested statements, joins (`ORDER
+BY k2` beside `sum(v) AS k2`). Wrong on the FIRST execution too: every split
+(§4.11) and count(DISTINCT) form, because the split's outer ORDER BY replaced
+a name that matched a GROUP BY column by the key before looking at aliases (an
+ORDER BY written `K` or `"K"` reaches the split and was wrong both times);
+every derived table, view and CTE whose outer alias is named like a derived
+column (the fold substituted the column); a fold that turned `ORDER BY kx`
+into a bare `k` that an output alias then captured (the extension's renderer
+bound it); ORDER BY 2 / ORDER BY ALL spelled out as a bare name another output
+carries (`SELECT sum(v) AS k, k AS kk ... ORDER BY 2`); a joined `ORDER BY
+dq.k2` lowered to a bare `k2` beside `sum(v) AS k2`; a duplicate alias, where
+the extension's renderer takes the first match and DuckDB the last; a WHERE
+that names an outer alias over a folded derived table that hides a column of
+that name (the fold made it the table's column). And the pushed top-k's tie
+guard: its window names the output, and an output called `key` / `count` /
+`ok` (columns of the rewritten FROM) was ranked by that column — a tie in the
+real ordering value went undetected (`sum(v) AS "key"`, both renderers), or a
+spurious one sent every run of `sum(v) AS ok` back to DuckDB.
+
+Fixed at the binding, in each place that decides it: the matcher binds as
+DuckDB does and records the ORDER BY target as an output INDEX (the renderers
+name it by its final DESCRIBE name, the device top-k reads that output's
+aggregate and payload); the split keeps an alias in the outer ORDER BY; the
+shorthand pass keeps an ordinal where the bare item would be captured; the
+fold keeps outer aliases, qualifies a captured substitution with the base
+table (or does not fold), and does not fold a WHERE / GROUP BY / HAVING name
+that only a renaming outer alias answers; the join lowering leaves an
+alias-bound name alone and declines a resolved column whose name another
+output's alias carries (the split then answers it); the tie guard ranks the
+output's expression when its name is a FROM column, and such a top-k is drawn
+by the reference renderer. Probing DuckDB for the binding was considered and
+not needed: the rule is one precedence, the same on the three versions, and
+every case where it could be in doubt declines.
+
+What declines now that did not: an ORDER BY name two outputs carry (two of
+these were right on 0.7.3 by coincidence, two wrong), a GROUP BY alias two
+items carry, and the folded WHERE-alias shape (it was wrong). A first cut
+treated every pinned alias (`tier AS tier`) as an alias the fold must not
+lose and stopped three CTE join arms from folding; only renaming aliases count.
+
+Measured with the worktree's `python/` and the 0.7.3 wheel's binary, other
+jobs running (load average 15-25): the 60-shape map 0 wrong; the four suites
+pass on DuckDB 2.0.1, 2.0.0 and 1.5.6 (test_wrapper 1738 / 1738 / 1768 against
+main's 1408 / 1408 / 1438 — the 330 new checks; shell 76, residency policy
+131, ast compat 9, unchanged); 144 of the 330 fail on main's tree on all three
+versions, 74 of them rows that differ from native. Rule 2: no query is added on
+any path; the matcher costs 28.2-28.8 us against 27.2-27.6 us (median of 7 x
+2000, same load). `scripts/tpch_coverage.py`, DuckDB 2.0.1, N=5, both trees:
+SF1 16 of 22, SF10 18 of 22, the same path per query, 0 rows differing; Q11
+measured 1.00x (main) and 0.98x (fix) at SF10 under that load, the same path
+on both. Not run on the NVIDIA machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

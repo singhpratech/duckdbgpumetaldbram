@@ -98,7 +98,7 @@ def _colname(e) -> Optional[str]:
     return None
 
 
-def fold_once(tree: dict) -> bool:
+def fold_once(tree: dict, names: Optional[list] = None) -> bool:
     """Fold the statement's derived table (or its single CTE) into it. True when the tree changed."""
     stmts = tree.get("statements") or []
     if len(stmts) != 1:
@@ -224,42 +224,91 @@ def fold_once(tree: dict) -> bool:
         return requalify(out) if qual else out
 
     select_aliases = {(s.get("alias") or "").casefold() for s in (node.get("select_list") or []) if s.get("alias")}
+    # an alias that only names its own column (`tier AS tier`, as every item is once its name is pinned)
+    # cannot answer for a name that column does not
+    renaming = {(s.get("alias") or "").casefold() for s in (node.get("select_list") or [])
+                if s.get("alias") and (_colname(s) or "").casefold() != s["alias"].casefold()}
+    # A name keeps the binding it had (§6): ORDER BY binds an unqualified
+    # name to an outer select alias before a derived column, and everywhere
+    # else a name binds a derived column first and an outer alias only when no
+    # column carries it. Folding removes the derived table's columns from
+    # sight and puts the base table's in their place, so
+    #   * a top-level ORDER BY name an outer alias carries stays that name;
+    #   * a name that only an outer alias answered (WHERE w, where the derived
+    #     table hides the table's w) would bind the table's column once
+    #     folded: the statement is not folded;
+    #   * a derived column substituted into a top-level ORDER BY as a bare
+    #     name an output carries would be captured by that output's alias:
+    #     it is qualified with the base table, or the statement not folded.
+    abort = [False]
 
-    def sub(e, top_select: bool = False, in_order: bool = False):
+    def sub(e, top_select: bool = False, in_order: bool = False, order_top: bool = False):
         if isinstance(e, list):
             return [sub(x, top_select, in_order) for x in e]
         if not isinstance(e, dict):
             return e
         if e.get("class") == "COLUMN_REF":
             names = e.get("column_names") or []
-            if in_order and len(names) == 1 and names[0].casefold() in select_aliases \
-                    and names[0].casefold() not in mapping:
+            if order_top and len(names) == 1 and names[0].casefold() in select_aliases:
                 return e                       # ORDER BY an outer select alias
             r = expr_for(names)
             if r is None:
+                if not star and len(names) == 1 and names[0].casefold() in renaming:
+                    abort[0] = True            # bound to an outer alias, could bind a hidden column once folded
                 return e
             # a select-list item keeps the derived column's name
             r["alias"] = e.get("alias") or (names[-1] if top_select else "")
             return r
         return {k: (v if k in ("value", "cast_type", "type_info") else sub(v, False, in_order)) for k, v in e.items()}
 
+    cond_subs = []
     if arm_slot is not None:
         # the arm's columns are named in the join's own ON conditions too
         def sub_conditions(j):
             if isinstance(j, dict) and j.get("type") == "JOIN":
                 if j.get("condition") is not None:
-                    j["condition"] = sub(j["condition"])
+                    cond_subs.append((j, sub(j["condition"])))
                 sub_conditions(j.get("left"))
                 sub_conditions(j.get("right"))
         sub_conditions(ft)
-    node["select_list"] = [sub(it, top_select=True) for it in (node.get("select_list") or [])]
-    node["group_expressions"] = sub(node.get("group_expressions") or [])
-    node["having"] = sub(node.get("having")) if node.get("having") is not None else None
+    new_select = [sub(it, top_select=True) for it in (node.get("select_list") or [])]
+    new_groups = sub(node.get("group_expressions") or [])
+    new_having = sub(node.get("having")) if node.get("having") is not None else None
     outer_where = sub(node.get("where_clause")) if node.get("where_clause") is not None else None
+    new_orders = []
     for m in node.get("modifiers") or []:
         if m.get("type") == "ORDER_MODIFIER":
             for o in m.get("orders") or []:
-                o["expression"] = sub(o.get("expression"), in_order=True)
+                x = sub(o.get("expression"), in_order=True, order_top=True)
+                new_orders.append((o, x))
+    # a substituted bare name an output carries: what would the ORDER BY bind?
+    out_names = [((names[i] if names is not None and i < len(names) else "") or it.get("alias")
+                  or _colname(it) or "").casefold() for i, it in enumerate(new_select)]
+    base_qual = ((inner.get("from_table") or {}).get("alias") or (inner.get("from_table") or {}).get("table_name") or "") \
+        if (inner.get("from_table") or {}).get("type") == "BASE_TABLE" and arm_slot is None else ""
+    for i, (o, x) in enumerate(new_orders):
+        orig = o.get("expression") or {}
+        if not (isinstance(x, dict) and x.get("class") == "COLUMN_REF" and x is not orig
+                and len(x.get("column_names") or []) == 1):
+            continue
+        nm = x["column_names"][0].casefold()
+        hits = [it for it, n in zip(new_select, out_names) if n == nm]
+        if all(it.get("class") == "COLUMN_REF" and [c.casefold() for c in it.get("column_names") or []] == [nm]
+               for it in hits):
+            continue                           # no output, or the output IS that column: same binding
+        if not base_qual:
+            abort[0] = True
+            break
+        new_orders[i] = (o, dict(x, column_names=[base_qual, x["column_names"][0]]))
+    if abort[0]:
+        return False                           # nothing above has touched the tree
+    for j, c in cond_subs:
+        j["condition"] = c
+    node["select_list"] = new_select
+    node["group_expressions"] = new_groups
+    node["having"] = new_having
+    for o, x in new_orders:
+        o["expression"] = x
     inner_where = inner.get("where_clause")
     if inner_where is not None and qual:
         inner_where = requalify(json.loads(json.dumps(inner_where)))
@@ -289,7 +338,7 @@ def fold(tree_json: str, names: Optional[list] = None) -> Optional[str]:
         return None
     changed = False
     for _ in range(8):                          # several derived tables, one per pass
-        if not fold_once(tree):
+        if not fold_once(tree, names):
             break
         changed = True
     if not changed:

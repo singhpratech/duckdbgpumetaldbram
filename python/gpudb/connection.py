@@ -3177,6 +3177,11 @@ class Connection:
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form
+                if d.form == "topk" and _rewrite.tie_window_shadowed(plan):
+                    # the extension's tie guard names the output inside its window,
+                    # where the name binds a column of the table function first
+                    # (`count(*) AS count`): the reference renderer draws it instead
+                    d.scalar_sql = ""
         return d
 
 

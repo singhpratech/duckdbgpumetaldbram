@@ -159,6 +159,49 @@ def is_join_statement(tree_json: str) -> bool:
         return False
 
 
+def _order_names(node: dict) -> List[dict]:
+    """The top-level ORDER BY names of a join statement, before its columns
+    are resolved (§6). An unqualified name a select alias carries binds to
+    that alias before any column, so it is marked to stay as written (the
+    matcher binds it); the other top-level names are returned, to be checked
+    once resolved by _check_order_names."""
+    aliases = {(it.get("alias") or "").casefold() for it in (node.get("select_list") or []) if it.get("alias")}
+    rest = []
+    for m in node.get("modifiers") or []:
+        if m.get("type") != "ORDER_MODIFIER":
+            continue
+        for o in m.get("orders") or []:
+            e = o.get("expression") or {}
+            if e.get("class") != "COLUMN_REF":
+                continue
+            names = e.get("column_names") or []
+            if len(names) == 1 and names[0].casefold() in aliases:
+                e["__inner"] = True          # left alone by rewrite_refs; removed by _scope.strip
+            else:
+                rest.append(e)
+    return rest
+
+
+def _check_order_names(node: dict, resolved: List[dict]) -> None:
+    """A column named in a top-level ORDER BY that comes out of resolution as a
+    bare virtual name an output alias carries (`ORDER BY dq.k2` beside `sum(v)
+    AS k2`) would be bound to that alias by the matcher. Unless the output is
+    that very column, the statement declines."""
+    by_alias: Dict[str, List[dict]] = {}
+    for it in node.get("select_list") or []:
+        if it.get("alias"):
+            by_alias.setdefault(it["alias"].casefold(), []).append(it)
+    for e in resolved:
+        names = e.get("column_names") or []
+        if len(names) != 1:
+            continue
+        hits = by_alias.get(names[0].casefold(), [])
+        if any(not (h.get("class") == "COLUMN_REF"
+                    and [c.casefold() for c in h.get("column_names") or []] == [names[0].casefold()])
+               for h in hits):
+            raise Decline("shape", f"ORDER BY column {names[0]} is also the name of another output")
+
+
 def lower(tree_json: str,
           resolve_fn: Callable[[str, str, str], Tuple[Optional[Identity], str]],
           rows_fn: Callable[[Identity], int],
@@ -337,8 +380,10 @@ def lower(tree_json: str,
                           "catalog_name": r_ident.catalog, "at_clause": None}
     rest = {k: v for k, v in node.items() if k != "from_table"}
     _scope.mark(rest, resolve_fn)
+    order_refs = _order_names(node)
     for v in rest.values():
         rewrite_refs(v)
+    _check_order_names(node, order_refs)
     _scope.strip(rest)
 
     # the native join as a derived table of virtual columns (decision-time probes)
@@ -802,8 +847,10 @@ def lower_upload(tree_json: str,
                           "catalog_name": r_ident.catalog, "at_clause": None}
     rest = {k: v for k, v in node.items() if k != "from_table"}
     _scope.mark(rest, resolve_fn)
+    order_refs = _order_names(node)
     for v in rest.values():
         rewrite_refs(v)
+    _check_order_names(node, order_refs)
     _scope.strip(rest)
     return LoweredUpload(tree_json=json.dumps(j), tables=tables, root=0, colmap=colmap, columns=columns,
                          from_text=from_text, edge_where=edge_where)

@@ -338,9 +338,15 @@ class Lowerer:
         groups = node.get("group_expressions") or []
         aliases = {(it.get("alias") or "").casefold(): it for it in (node.get("select_list") or [])
                    if isinstance(it, dict) and it.get("alias")}
+        alias_count: Dict[str, int] = {}
+        for it in node.get("select_list") or []:
+            if isinstance(it, dict) and it.get("alias"):
+                alias_count[it["alias"].casefold()] = alias_count.get(it["alias"].casefold(), 0) + 1
         for i, g in enumerate(groups):
             if _is_colref(g) and len(g.get("column_names") or []) == 1:
                 nm = g["column_names"][0].casefold()
+                if nm not in self._lower and alias_count.get(nm, 0) > 1:
+                    raise Decline("shape", f"GROUP BY {nm}: several select items carry that alias")
                 if nm not in self._lower and nm in aliases:
                     groups[i] = dict(json.loads(json.dumps(aliases[nm])), alias="")
                     changed = True
