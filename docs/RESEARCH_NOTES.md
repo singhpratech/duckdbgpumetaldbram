@@ -6322,6 +6322,143 @@ Laptop pip 0.7.3 returned the extra NULL group for both
 statements with shipped defaults (4000 and 4001 rows against DuckDB's 3999 and
 4000) and the fix matches DuckDB. TPC-H coverage is unchanged on DuckDB 2.0.1: 16 of 22 queries on the device at scale factor 1 and 18 of 22 at scale factor 10, no rows that differ.
 
+## 2026-11-26 — A release gate over generated statements and hostile data
+
+The wrapper suite and TPC-H check the statements someone thought of, on clean
+data. In one day five defect areas were found in the published package within
+minutes each, by people trying to break it, in regions the suite does not
+sample — and most only on the SECOND execution of a template (the Python
+renderer), or only in background residency, or only after a write. Each finder
+wrote a throwaway harness. `scripts/release_gate.py` (with
+`scripts/release_gate_lib/`) subsumes them as one deterministic command.
+
+**What it is.** One seed builds a 5,000-row fact table whose 33 typed columns (plus a row id) cover
+every type the wrapper reads and several it declines, each with NULLs,
+duplicates, the type's extremes, `infinity` / `-infinity`, NaN, -0.0, empty and
+case- or accent-variant strings and values that collide after rounding; keys of
+1, 2, 7, ~300 (skewed), 512 and 2,500 groups; a unique and a non-unique
+dimension; a view; plus a 1.1M-row table for shipped defaults. Values are
+integer hashes of the row number in SQL, so every DuckDB version builds the
+same data. Statements are the product of 9 dimensions (17 forms, 52 keys, 28
+aggregate sets, 23 WHERE forms, 34 WHERE columns, 39 literal slots, 15 ORDER BY
+/ LIMIT forms, 10 name hazards, 3 GROUP BY spellings): every pair of values in
+at least one statement (2,899 statements), every key with every WHERE form ON
+that key (937), then 1,500 random samples and the full WHERE literal matrix
+(column x literal x operator, 18,343) in `--full`. Each statement runs first
+(the extension's renderer), with a second literal set (the Python renderer),
+and with the first set again, each compared with native for its own literals:
+rows in order where the ORDER BY is total, up to ties where it is not (runs of
+equal ORDER BY keys must match; a run cut by the LIMIT may hold any rows of that
+tie, checked against native without the LIMIT), as a multiset without one;
+names; types; error class. Native mirrors the wrapper's handles (root, sibling
+cursor, raw cursor), so where a write or a setting lands is DuckDB's own rule,
+not the gate's. Ten modes: eager, `sql()` (also compared as DuckDB text),
+background residency, a write through the statement's connection / a sibling /
+a raw cursor, six settings x five ways of setting them, a warm connection, a
+fresh `cursor()` per statement, shipped defaults. A baseline of known-open
+failures, keyed by a hash of mode + template + literals, gates main on "no NEW
+failure" and fails when a listed failure starts passing.
+
+**What lost on the way.** (1) Plain all-pairs over all dimensions: 2,287 of
+2,287 statements declined — when every dimension of a statement is hostile at
+once, something in it declines, and the gate proved only that declining is
+exact. The generator now fills the dimensions a statement is not targeting
+from the values measured to reach the device one factor at a time (85% of the
+time): device coverage went from 0% to 27–42%. (2) A fresh `con.cursor()` per
+statement, to make every first execution a first execution: 0% device again,
+because a wrapper cursor never takes the exact path (below). Statements now run
+on the connection with its decision cache cleared; the cursor is its own mode.
+(3) Comparing DuckDB text from a second read of each relation: a tie at a LIMIT
+picked other rows the second time, on native too; text is compared only where
+the answer is determined. (4) The sign of a zero: DuckDB's own GROUP BY / min
+return whichever of -0.0 / 0.0 it met first, native against native differed;
+it is not compared. (5) Retrying every 50 ms while a background upload was
+pending kept the connection busy, so the upload (which waits for an idle
+stretch, longer on a loaded machine) never ran: retries back off now.
+
+**What the first runs found on main (pip 0.7.5), by itself.** Area 2: a global
+`min` / `max` of a TIMESTAMP holding ±infinity came back as the finite extremes
+(`'290309-12-22 (BC)'`, `'294247-01-10 ...'`) on the re-run, a DATE one raised
+`Out of Range Error: Date out of range` through `sql()`, and
+`count(*) ... WHERE c_ts >= TIMESTAMP '2020-01-05'` lost the 102 infinite rows.
+Area 3: `SET default_order` / `default_collation` / `default_null_order` (and
+their RESET) through a sibling cursor, a raw cursor or `SET GLOBAL`, after the
+statement was decided: top-k in the old order, 19 groups where NOCASE gives 15,
+and on 1.5 every LATER statement kept the old order after a raw-cursor RESET.
+Area 4: 147 statements — `ORDER BY t.k`, `(k)`, `k DESC NULLS LAST` where `k`
+is also an alias, swapped aliases, `"ké"` vs `ké`, including at shipped
+defaults over the 1.1M-row table. Area 5: 882 statements — `Decline`,
+`TypeError`, `OverflowError` and `InvalidInputException` raised to the user for
+`1e400`, `9223372036854775808`, `1.0000000000000000001`, `16777216.5`,
+`3.4e38`, mostly on the re-run; wrong rows for `k300 <> 999.9` and
+`NOT (c_bi = 2.5)` on a column with NULLs (the NULL rows kept), an extra NULL
+group for `c_in <> 2.5 GROUP BY c_in`, FLOAT against DECIMAL literals. Against
+the pip 0.7.3 wrapper it also finds area 1 (23 statements, among them
+`WHERE c_s IS NULL GROUP BY c_s` losing the NULL group and `c_s <> 'beta'`
+adding one), all of which pass on main.
+
+**What nobody knew.** (a) `count_if(x)` over a group whose `x` is all NULL:
+DuckDB returns NULL, the device returns 0 — on main, on 0.7.3 and on every fix
+branch, both DuckDB versions (36 baseline entries; nested under
+`WHERE count_if(...) IS NOT NULL` it changes the row count, 533 against 503).
+(b) A cursor of a wrapper connection (`con.cursor()`) never takes the exact
+path: `_probe_extension` sets `_exact` / `_join` / `_store` / `_global` on the
+root only and `Connection.cursor()` does not copy them, so every statement on
+a cursor declines (300 of 300 in the cursor mode, against 42% on the
+connection); not a wrong answer, a coverage gap; the settings branch's cursors
+do reach the device. (c) On the infinite-timestamps branch, the guard that
+keeps "an alias equal to another GROUP BY column, over a temporal output the
+Python renderer must draw" on DuckDB misses join shapes: `SELECT c_ts AS kk,
+min(c_dt) AS c_ts, max(c_dt) FROM ft JOIN dn ... GROUP BY c_ts ORDER BY c_ts
+DESC NULLS LAST` runs on the device with `engine=python` on its FIRST execution
+and comes back in key order. (d) A fix branch widens device coverage and so
+exposes the other open areas on shapes main declines: the infinity branch
+answers 31% of the quick statements against main's 27% and shows 21 failures
+0.7.3 does not have (area 5 `Decline` raises and area 4 orderings on temporal
+outputs), the literal branch exposes area 2 (`min(c_ts)` under
+`kc >= 0.30000000000000004e0`) and area 1 (it predates the NULL-key fix), the
+settings branch exposes area 1 in the settings modes. The branches were each
+checked against their own area; the gate says they have to be checked
+together, on top of main, before any of them merges.
+
+**What each fix branch clears (quick, DuckDB 2.0.1 / 1.5.6, failing statements
+labelled by which wrapper clears them).** infinite-timestamps: area 2 (1 / 2,
+and 13 of main's full eager failures). settings-across-cursors: area 3 (14 /
+40). order-by-alias: area 4 (24 / 27) and, being on 0.7.5, area 1. where-literals:
+area 5 (51 / 62; 718 of main's 782 full eager failures) and no RAISED at all.
+Raw totals per run, the area table and the timings are in the report of this
+work; the statements are replayable with `--replay <id>`.
+
+**Cost.** `--full` (32,335 statement-mode tasks, ~100,000 executions) took
+27.5 min on DuckDB 2.0.1 and 26.9 min on 1.5.6, run alone (other jobs on the
+machine, load 4–8); the eager literal matrix is two thirds of it and grows
+linearly with the statement count (about 25 ms per statement for three
+executions and two native runs). `--quick` (5,332 tasks): 187 s and 186 s on DuckDB 2.0.1 run alone (eager 88 s, background 49 s, settings 26 s), exit 0 against the baseline. Three
+gates at once took 11–18 min each.
+
+**Decided.** A release requires a clean `--full` run (exit 0, empty baseline)
+on Apple Silicon and on NVIDIA under every supported DuckDB version
+(docs/DEVELOPMENT.md); `scripts/release_gate_baseline.json` lists today's
+1,150 known-open failures by area and the branch that fixes each, and must
+shrink to empty as they merge.
+
+**Not covered, and why.** Parameters, prepared statements, `executemany`,
+transactions, `register()`, temp tables, `ATTACH`, file databases and a second
+process, Parquet, threads and interrupts, memory pressure and eviction (each
+needs its own protocol; the suite has the scenarios); window functions, ROLLUP
+and QUALIFY (generated by no dimension); timing (rule 1 is
+`scripts/transparent_gate.py`); on `execute()` values are compared as Python
+values, which fold an infinite TIMESTAMP into 9999-12-31 23:59:59.999999, a
+TIMESTAMP_NS into microseconds and one month into 30 days (the data holds no
+such real values; `sql()` compares DuckDB's text where the answer is
+determined); the sign of a zero; higher-order interactions beyond pairs except
+by sampling; the device's own size thresholds (5,000 rows keeps every set
+small; only the shipped mode reaches 1.1M rows). On DuckDB 1.5.6 a finite
+TIMESTAMPTZ cannot be fetched without `pytz`, which the test venv lacks: such
+statements raise on both sides and count as both-error. A settings-mode failure
+on a FIRST execution can depend on the previous task's RESET (that is the
+defect); `--replay` alone may not reproduce it, `--modes settings` does.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
