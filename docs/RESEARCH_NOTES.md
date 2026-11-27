@@ -6322,6 +6322,143 @@ Laptop pip 0.7.3 returned the extra NULL group for both
 statements with shipped defaults (4000 and 4001 rows against DuckDB's 3999 and
 4000) and the fix matches DuckDB. TPC-H coverage is unchanged on DuckDB 2.0.1: 16 of 22 queries on the device at scale factor 1 and 18 of 22 at scale factor 10, no rows that differ.
 
+## 2026-11-26 — The performance gate: a candidate against the released wrapper, statement by statement
+
+`scripts/perf_gate.py` (with `scripts/perf_gate_lib/`) is the speed and
+device-coverage half of the release gate; `scripts/release_gate.py` is the
+correctness half and this one does not repeat it (it compares result digests
+only to know that two sides timed the same work). It takes a baseline and one
+or more candidate `python/` trees, optionally an extension binary per side,
+and times every statement of a fixed, versioned workload (`2026-11-26.1`, 167
+statements in a full run) on raw DuckDB, the baseline and each candidate:
+TPC-H's 22 queries at SF1 and SF10 through `execute()` and `sql()`; 31
+single-shape statements over generated tables of 2M and 20M rows (key types,
+group counts, WHERE selectivities, the forms, joins, a view, a fresh cursor,
+a literal that changes every run); a declined set (below the floor,
+unrewritten shapes, over a 16 MB budget, `SELECT 1` on each entry point, an
+`INSERT`); and, optionally, the fourteen OS Open TOID statements (the same
+texts as `opentoid_bench.py`, checked equal). Fresh processes add first
+execution (connect, decision, upload), time to resident in background mode,
+peak host memory, the resident and device bytes the extension reports, and a
+declined statement issued at 0-50 ms gaps while a background upload runs.
+
+**What the first design got wrong, found by running the gate against itself.**
+- *Rotating the order is not interleaving.* The first version rotated the
+  side order every round, which keeps the cyclic order, so the side after
+  `native` always found the device idle after a CPU-only statement. In the
+  first A/A run that side alone was 12-45% slower than its two identical
+  twins on rewritten SF1 statements (Q21 5.43 ms against 3.79 and 3.69). The
+  order is now a Williams design: every side in every position, and after
+  every other side, equally often.
+- *One process per side is not enough.* With the order balanced, one process
+  of identical code still ran a 7-group aggregate at 1.12 ms against 0.90
+  for its three twins on all 14 rounds (rank test p < 0.0001): where the
+  scheduler put the process on a loaded machine, which interleaving cannot
+  remove. Every role now runs as two processes, and a verdict needs the
+  faster candidate process to be slower than the slower baseline process.
+  Judged one process against one, the later runs had no such false alarm,
+  but the replicate rule is what makes that a property rather than luck.
+- *Bytecode is part of the measurement.* A tree without a `__pycache__` ran
+  its first statement ~2 ms slower and peaked ~10 MiB higher than one with
+  it, so three seeded copies all "regressed" memory against the worktree they
+  were copied from. Every tree now compiles into a cache of the gate's own
+  (`-X pycache_prefix`), and every tree is copied into the run directory at
+  the start and hashed: a candidate worktree's `connection.py` was rewritten
+  seven minutes into a run (that run was discarded and repeated).
+- *Peak host RSS has two levels per process* whatever the code (+27 MiB on
+  a 200 MiB peak in 3 of 10 processes, one identical to the baseline), so it
+  is judged at 25%; the resident bytes are exact and judged at 2%.
+- *A tag is not a route.* A candidate that renders the same statement over a
+  differently named resident set read as 71 "different rendered statements";
+  tags are normalised before the comparison.
+
+**The wrapper's own nondeterminism.** Identical processes do not always route
+a statement the same way. The measured rule (§9.1) declines a template whose
+rewritten runs were not faster, and on a marginal win (SF1 Q7, Q8, Q12, Q19
+through `sql()`; the 2M-row VARCHAR, DECIMAL and view statements) that comes
+out differently per process. Two decisions taken once per process flip too:
+SF1 Q15 went to the device (nested) in some processes and declined with
+`threshold: CTE present` in others, and SF10 Q11 ran on the device in all 6
+baseline processes of three runs (and both of the 0.7.3 tree's) but declined
+with `threshold: having is not aggregate vs constant` in 2 of 2, 1 of 2,
+1 of 2, 1 of 2 and 1 of 2 processes of five candidate pairs, one of them
+based on 0.7.5 (there through `sql()` only). The gate
+reports these as COVERAGE_UNSTABLE / ROUTE_UNSTABLE and keeps them out of the
+noise floor; a coverage loss fails a run only when every baseline process ran
+the statement on the device, no candidate process did, the reason is not the
+candidate's own measurement of a win that was inside the noise, and a fresh
+pair of processes of each reproduces it.
+
+**Proof runs.** DuckDB 2.0.1 (Python 3.13), the extension binary pip 0.7.5
+bundles, baseline = this worktree's `python/` (0.7.5). The machine was shared
+throughout: load 5-60 on 16 cores, other processes 8-52% of it, so every run
+used `--allow-noisy` and every figure here is provisional.
+- A/A (quick, the same tree as a copy): no breach. Noise floor, p90 of
+  |baseline#2 / baseline - 1|: 4.7% over 86 statements at load 7 (median
+  1.4%), 4.5% in an earlier quick run at load 5; 9.3% and 9.9% in the two
+  full runs at load 19-23, with the 20-200 ms bucket at 33.9% in one of them.
+- Seeded regressions, all three as candidates in one quick run: a 1 ms sleep
+  on `execute()`'s rewritten path — SLOWER_THAN_BASELINE on 29 statements,
+  every one rewritten and on `execute()` or a cursor, none on `sql()` or
+  declined, and SLOWER_THAN_NATIVE on 9 that the millisecond pushed below
+  native; four rewritten statements went unflagged because their own spread
+  under load was wider than 1 ms. One extra query on the declined path —
+  SLOWER_THAN_BASELINE on 28 statements, every one declined, plus
+  FIRST_EXECUTION (fresh `SELECT 1` 5.2 against 3.3 ms) and DURING_UPLOAD
+  (8.7 against 7.3 ms). `global_join_min_rows` 0 -> 10^12 — COVERAGE_LOST on
+  SF1 Q14, Q17 and Q19, confirmed in fresh processes, with the decline
+  sentence; Q14 through `sql()` read COVERAGE_UNSTABLE because the baseline
+  itself did not run it on the device in every process.
+- Real candidates, as they stood in their worktrees (full runs of 26-28 min,
+  two candidates each, and a control re-run beside the 0.7.3 release tree,
+  which three of the four are based on):
+  `v08-settings-across-cursors` — slower than the baseline on 18 rewritten
+  statements by 0.4-0.7 ms (at least 1.11-1.21x: SF1 Q4, Q5, Q8, Q9, Q13,
+  Q17, Q18, Q19, Q22; SF10 Q5, Q22; two micro shapes); the control re-run
+  found the same direction on 19 of 20, 3 past the bar at that run's 12.7%
+  floor, and nothing for the 0.7.3 tree, so the cost is the branch's, not its
+  base's. Its SF10 Q11 coverage loss did not reproduce (the flip above).
+  `v08-where-literals` — no breach; the HAVING form moved from the extension
+  renderer to the Python one on both table sizes, at no measurable cost.
+  `v08-order-by-alias` and `v08-infinite-timestamps` — no breach; the latter's
+  VARCHAR-key WHERE renders differently, which is its 0.7.3 base (the 0.7.5
+  fix changed exactly that rendering).
+
+**What the released baseline already does** (BASELINE_SLOWER_THAN_NATIVE,
+failing only under `--absolute`, every one provisional): a GROUP BY through a
+fresh `con.cursor()` runs on the device at 8.4-11.2 ms against 4.7-6.0 ms
+native in every run (0.54-0.60x; the cause was not investigated here), and a
+`SELECT 1` through one costs 1.1 ms against 0.19; the 2M-row VARCHAR-key
+GROUP BY runs at 0.89-0.92x when it is on the device. The first statement of
+a connection costs far more than §0's first-sighting bound: connect 70-80 ms
+against 12-13 ms for `duckdb.connect`; a declined SF1 Q6 37-39 ms against 6
+ms; `SELECT 1` 3.6-4.4 ms against 0.4-0.6 ms. An eager SF10 Q18 takes 10.9-11.7
+s for its first execution and peaks at 7.3 GB of host memory for a 1.3 GB
+resident set; in background mode it is resident 13-14 s after the first
+sighting.
+
+**What it does not measure.** Correctness (release_gate.py). A long
+interactive session: each statement's routes are judged over about 20 runs,
+so the measured rule's 60 s re-measurement and eviction under budget
+pressure are not reached (wrapper_residency_gate.py and budget_gate.py
+cover those). Contention p99 beyond the one during-upload scenario.
+Parameterised statements, `executemany`, Arrow and DataFrame fetches (rows
+are fetched with `fetchall()`), the `gpudb` shell, SF50 and larger, a cold OS
+file cache, threads settings other than DuckDB's default, any DuckDB but the
+interpreter's own. A change smaller than the tolerance on the row (printed
+on every row; about 5% on a quiet-ish machine, 10-12% under the load here).
+The OS Open TOID group was run on one statement only (S13): its aggregates
+would put a resident set of several GB in each of four wrapper processes on
+a shared machine.
+
+**Decided.** A release needs a clean full `--absolute` run on a quiet Apple
+Silicon machine and on the NVIDIA machine. `--quick` is what a CPU-only
+runner can carry, and there the rewriter declines everything (reason
+`backend`), so it measures the declined path only: it would catch the
+second seed and not the first or the third. Deliberate losses are recorded
+with `--accept` in `scripts/perf_gate_accepted.json`, listed in every report,
+and `--rejudge` applies them to a run already measured.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
