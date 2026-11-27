@@ -2461,6 +2461,7 @@ def run():
     overload_checks()
     rewrite_error_checks()
     budget_checks()
+    settings_checks()
     return report()
 
 
@@ -3614,6 +3615,248 @@ def extension_age_checks():
     check(bare.last_rewrite()["detail"] == bare.extension_note,
           "no extension: last_rewrite()['detail'] says it too")
     bare.close()
+
+
+SETTINGS_SETUP = """
+CREATE TABLE st AS SELECT (i % 40)::BIGINT AS k,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 40)::BIGINT END AS kn,
+       (i % 97)::BIGINT AS v,
+       (CASE WHEN i % 600 < 300 THEN 'k' ELSE 'K' END) || (i % 300)::VARCHAR AS s,
+       (i % 5)::DOUBLE AS x,
+       'ab' || (i % 11)::VARCHAR AS r,
+       (i % 5)::VARCHAR AS sv
+FROM range(200000) t(i);
+CREATE TABLE sc AS SELECT (i % 7)::BIGINT AS "Kk", (i % 97)::BIGINT AS "Val" FROM range(200000) t(i);
+CREATE SCHEMA s3;
+CREATE TABLE s3.sp AS SELECT k, v + 1 AS v FROM main.st;
+"""
+
+
+def _known_setting(name):
+    try:
+        duckdb.connect().execute(f"SELECT current_setting('{name}')").fetchall()
+        return True
+    except duckdb.Error:
+        return False
+
+
+def _answer(cur, sql):
+    """(rows, column names) — or the class of the error DuckDB raised."""
+    try:
+        res = cur.execute(sql)
+        names = [d[0] for d in res.description]
+        return res.fetchall(), names
+    except duckdb.Error as e:
+        return ("error", type(e).__name__), None
+
+
+def _folded(rows):
+    """A GROUP BY under NOCASE keeps whichever spelling of a key it met first,
+    so two native runs can disagree on 'k5' against 'K5'. The rows are compared
+    with the key case-folded and in a fixed order; the group count and the
+    aggregates stay exact."""
+    if isinstance(rows, tuple):
+        return rows
+    return sorted((str(r[0]).lower(),) + tuple(r[1:]) for r in rows)
+
+
+def settings_checks():
+    """§5.11: a rewritten statement is answered under the settings in force
+    on its connection at that moment — however they were changed.
+
+    Several DuckDB settings are database-wide (a plain SET on one connection
+    moves them for every connection of the database: default_collation,
+    default_order, default_null_order, old_implicit_casting), and every
+    setting can be moved for every connection that has no session value of
+    its own by SET GLOBAL. Each case below changes one setting in one way —
+    the wrapper's own cursor, a sibling cursor (`con.cursor()`), SET GLOBAL
+    from a sibling, RESET from a sibling, a plain duckdb cursor on the same
+    database (`con._raw.cursor()`), and the wrapper's own DuckDB connection
+    behind its back (`con._raw`) — after the statement was decided and its
+    sets built, then runs the statement again (and with new literals) and
+    compares it with DuckDB under the setting now in force: rows, column
+    names, or the error DuckDB raises."""
+    print("== settings in force: every way of changing them, every shape they move")
+    probe = fresh()
+    device = has_device(probe) and getattr(probe, "_exact", False)
+    probe.close()
+    if not device:
+        skip("settings in force: needs the exact path on a GPU backend")
+        return
+    v1 = duckdb.__version__.startswith("1.")
+    SHARED = ("same", "sibling", "global", "reset", "raw_cursor", "raw_self")
+    LOCAL = ("same", "global", "reset", "raw_cursor", "raw_self")
+    EXACT, NOCASE = "exact", "nocase"
+    # shapes that are not rewritten under every starting value on every DuckDB
+    # version (2.0 raises on a division by zero where 1.5 returns NULL or inf)
+    MAY_DECLINE = {"ieee_floating_point_ops", "error_on_division_by_zero"}
+    cases = [
+        # (setting, start value or None, new value, shared?, ways, [(template, literals, compare)])
+        ("default_collation", None, "'nocase'", True, SHARED, [
+            ("SELECT s, count(*) AS c, sum(v) AS sv FROM st GROUP BY s ORDER BY s", (None,), NOCASE),
+            ("SELECT s, sum(v) AS sv FROM st WHERE v < {} GROUP BY s ORDER BY s", (50, 60), NOCASE)]),
+        ("default_order", None, "'DESC'", True, SHARED, [
+            ("SELECT k, sum(v) AS sv FROM st GROUP BY k ORDER BY k", (None,), EXACT),
+            ("SELECT k, sum(v) AS sv FROM st WHERE v < {} GROUP BY k ORDER BY k LIMIT 3", (50, 60), EXACT)]),
+        ("default_null_order", None, "'NULLS_FIRST'", True, SHARED, [
+            ("SELECT kn, sum(v) AS sv FROM st GROUP BY kn ORDER BY kn", (None,), EXACT),
+            ("SELECT kn, count(*) AS c FROM st WHERE v < {} GROUP BY kn ORDER BY kn LIMIT 3", (50, 60), EXACT)]),
+        ("integer_division", None, "true", False, LOCAL, [
+            ("SELECT k, count(*) AS c FROM st WHERE v / 2 = {} GROUP BY k ORDER BY k", (3, 4), EXACT)]),
+        ("ieee_floating_point_ops", None, "false", False, LOCAL, [
+            ("SELECT k, count(*) AS c FROM st WHERE (x / 0) IS NULL AND v < {} GROUP BY k ORDER BY k",
+             (50, 60), EXACT)]),
+        ("preserve_identifier_case", None, "false", False, LOCAL, [
+            ('SELECT "Kk", sum("Val") AS Total FROM sc WHERE "Val" < {} GROUP BY "Kk" ORDER BY "Kk"',
+             (50, 60), EXACT),
+            ('SELECT "Kk", sum("Val") FROM sc GROUP BY "Kk" ORDER BY "Kk"', (None,), EXACT)]),
+        # a name that resolves only through the search path: once it no longer
+        # does, DuckDB's answer is a catalog error (a name found in two places
+        # is never rewritten at all — reason 'ambiguous')
+        ("search_path", "'s3'", "'main'", False, ("same", "raw_self"), [
+            ("SELECT k, sum(v) AS sv FROM sp WHERE v < {} GROUP BY k ORDER BY k", (50, 60), EXACT)]),
+    ]
+    if _known_setting("error_on_division_by_zero"):
+        # built while the database returns NULL for a division by zero, asked
+        # once it raises: DuckDB's answer is the error
+        # (an integer division: a DOUBLE one is inf under ieee_floating_point_ops)
+        cases.append(("error_on_division_by_zero", "false", "true", False, LOCAL, [
+            ("SELECT k, count(*) AS c FROM st WHERE (v // 0) IS NULL AND v < {} GROUP BY k ORDER BY k",
+             (50, 60), EXACT)]))
+    if _known_setting("regex_match_operator_semantics"):
+        cases.append(("regex_match_operator_semantics", None, "'full'", False, LOCAL, [
+            ("SELECT k, count(*) AS c FROM st WHERE r ~ 'b1' AND v < {} GROUP BY k ORDER BY k", (50, 60), EXACT)]))
+    if _known_setting("old_implicit_casting"):        # 2.0 accepts it without listing it, still database-wide
+        cases.append(("old_implicit_casting", "true", "false", True, SHARED, [
+            # length(BIGINT) binds only through the implicit cast to VARCHAR
+            ("SELECT k, sum(v) AS sv FROM st WHERE length(k) = {} GROUP BY k ORDER BY k", (1, 2), EXACT)]))
+
+    def change(con, way, name, value, shared):
+        if way == "same":
+            con.execute(f"SET {name} = {value}")
+        elif way == "sibling":
+            con.cursor().execute(f"SET {name} = {value}")
+        elif way == "global":
+            con.cursor().execute(f"SET GLOBAL {name} = {value}")
+        elif way == "reset":
+            con.cursor().execute(f"RESET {name}" if shared else f"RESET GLOBAL {name}")
+        elif way == "raw_cursor":
+            con._raw.cursor().execute(f"SET {name} = {value}" if shared else f"SET GLOBAL {name} = {value}")
+        elif way == "raw_self":
+            con._raw.execute(f"SET {name} = {value}")
+
+    for name, start, new, shared, ways, shapes in cases:
+        for way in ways:
+            con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+            con.execute(SETTINGS_SETUP)
+            first = new if way == "reset" else start
+            if first is not None:
+                # search_path has no global value: it is set for the connection
+                con.execute(f"SET {name} = {first}" if name == "search_path" else f"SET GLOBAL {name} = {first}")
+            label = f"settings/{name}/{way}"
+            device_before = False
+            for tmpl, lits, mode in shapes:
+                sql = tmpl.format(lits[0])
+                for _ in range(2):
+                    got, names = _answer(con, sql)
+                    device_before = device_before or con.last_rewrite()["rewritten"]
+                want, want_names = _answer(con._raw, sql)
+                norm = _folded if mode == NOCASE else (lambda r: r)
+                check(norm(got) == norm(want) and names == want_names,
+                      f"{label}: before the change, native's answer ({sql[:60]})")
+            # (a reset case starts under the changed value, and NOCASE / folded
+            # names decline: the device takes over only after the RESET)
+            if device_before or (way == "reset" and name in ("default_collation", "preserve_identifier_case",
+                                                                "old_implicit_casting")):
+                check(True, f"{label}: the device answered before the change (the path under test ran)")
+            elif name in MAY_DECLINE:
+                skip(f"{label}: not rewritten before the change on DuckDB {duckdb.__version__} "
+                     f"(nothing resident to go stale; the answers are still compared)")
+            else:
+                check(False, f"{label}: the device answered before the change (the path under test ran)")
+            change(con, way, name, new, shared)
+            for tmpl, lits, mode in shapes:
+                norm = _folded if mode == NOCASE else (lambda r: r)
+                for lit in lits:
+                    sql = tmpl.format(lit)
+                    for run_no in (1, 2):
+                        got, names = _answer(con, sql)
+                        lr = con.last_rewrite()
+                        want, want_names = _answer(con._raw, sql)
+                        ok = norm(got) == norm(want) and names == want_names
+                        check(ok, f"{label}: after the change, run {run_no}, literal {lit}: native's answer "
+                                  f"({'rewritten' if lr['rewritten'] else lr['reason']}; {sql[7:60]})"
+                              + ("" if ok else f" got {str(got)[:80]} {names} want {str(want)[:80]} {want_names}"))
+            con.close()
+
+    # the resident sets are built on the manager's own cursor in background
+    # mode: a lane computed there under the database's setting must not answer
+    # a connection that overrides it for itself (DuckDB 1.5: ieee_floating_point_ops
+    # makes x / 0 NULL instead of inf), nor any connection once the database's
+    # setting has moved under the set
+    lane = ([("ieee_floating_point_ops", None, "false",
+              "SELECT k, count(*) AS c FROM st WHERE (x / 0) IS NULL GROUP BY k ORDER BY k")] if v1 else []) + (
+        [("error_on_division_by_zero", "false", "true",
+          "SELECT k, count(*) AS c FROM st WHERE (v // 0) IS NULL GROUP BY k ORDER BY k")]
+        if _known_setting("error_on_division_by_zero") else [])
+    for name, start, new, sql in lane:
+        for way in ("same", "raw_cursor"):
+            con = gpudb.connect(floor_rows=0, thresholds=False)       # background residency
+            con.execute(SETTINGS_SETUP)
+            if start is not None:
+                con.execute(f"SET GLOBAL {name} = {start}")
+            label = f"settings/background/{name}/{way}"
+            if way == "raw_cursor":
+                rewritten = False
+                for _ in range(80):
+                    got, _n = _answer(con, sql)
+                    if con.last_rewrite()["rewritten"]:
+                        rewritten = True
+                        break
+                    time.sleep(0.1)
+                check(rewritten, f"{label}: the set became resident and answered before the change")
+                con._raw.cursor().execute(f"SET GLOBAL {name} = {new}")
+            else:
+                con.execute(f"SET {name} = {new}")
+            for i in range(30):
+                got, _n = _answer(con, sql)
+                lr = con.last_rewrite()
+                want, _n = _answer(con._raw, sql)
+                if got != want:
+                    break
+                if i > 3 and not lr["rewritten"] and lr["reason"] != "not_resident":
+                    break
+                time.sleep(0.1)
+            check(got == want, f"{label}: native's answer after the change "
+                               f"({'rewritten' if lr['rewritten'] else lr['reason']}; got {str(got)[:60]} "
+                               f"want {str(want)[:60]})")
+            if way == "same" and not lr["rewritten"]:
+                check(lr["reason"] in ("settings", "not_resident") or isinstance(want, tuple),
+                      f"{label}: a connection overriding a lane setting for itself is DuckDB's "
+                      f"(reason {lr['reason']}: {lr['detail'][:90]})")
+            con.close()
+
+    # A sibling's SET moves the generation: the other cursor re-reads before
+    # its next statement and pays no read of its own while nothing moves.
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    con.execute(SETTINGS_SETUP)
+    a, b = con.cursor(), con.cursor()
+    q = "SELECT k, sum(v) AS sv FROM st GROUP BY k ORDER BY k"
+    a.execute(q).fetchall()
+    a.execute(q).fetchall()
+    b.execute("SET default_order = 'DESC'")
+    got = a.execute(q).fetchall()
+    check(got == con._raw.execute(q).fetchall() and got[0][0] == 39,
+          f"settings: a sibling's SET default_order reaches the other cursor ({got[:2]})")
+    # a cursor reads its own settings when it is made: the parent's session-only
+    # value is not the cursor's
+    con.execute("SET integer_division = true")
+    c = con.cursor()
+    q2 = "SELECT k, count(*) AS c FROM st WHERE v / 2 = 3 GROUP BY k ORDER BY k"
+    got = c.execute(q2).fetchall()
+    check(got == c._raw.execute(q2).fetchall(),
+          "settings: a new cursor does not inherit its parent's session-only integer_division")
+    con.close()
 
 
 def report():
