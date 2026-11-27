@@ -618,7 +618,7 @@ details td.num { font-size: .8rem; }
 
     <div class="tbl-wrap">
       <table class="stack">
-        <caption>DuckDB 2.0.1 with pip 0.7.2, measured 2026-11-25 (pip 0.7.3 changes only statements that set a NULL order, which none of these queries does), default memory budget, N=5. <code>sql()</code> is the lazy-relation path the <code>gpudb</code> shell takes; both entry points are timed separately.</caption>
+        <caption>DuckDB 2.0.1 with pip 0.7.2, measured 2026-11-25 and not re-measured since (pip 0.7.3 and 0.7.5 are correctness fixes), default memory budget, N=5. <code>sql()</code> is the lazy-relation path the <code>gpudb</code> shell takes; both entry points are timed separately.</caption>
         <thead>
           <tr><th scope="col">TPC-H</th><th scope="col">Machine</th><th scope="col">Asked through</th><th scope="col" class="num">On the GPU</th><th scope="col" class="num">Rows differing</th><th scope="col" class="num">Speed-up on those queries</th></tr>
         </thead>

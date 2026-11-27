@@ -6241,6 +6241,87 @@ about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
 `BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
 changes no measured statement. Not yet run on the NVIDIA machine.
 
+## 2026-11-26 — A NULL-sensitive WHERE on a VARCHAR GROUP BY key
+
+A wrong answer in pip 0.7.3 at shipped defaults (`gpudb.connect()`, DuckDB
+2.0.1; reproduced on 20M rows with a 4000-value key): `SELECT s, count(*) FROM
+t WHERE s <> 'k5' GROUP BY s` and `... WHERE s IS NOT NULL GROUP BY s` returned
+a NULL-key group that DuckDB does not, and `WHERE s IS NULL` lost the NULL group.
+
+**Root cause.** A VARCHAR GROUP BY key is uploaded as its tuple text
+(`_rewrite.key_lane_expr`), where a NULL key is the text `N` — a valid cell.
+`_rewrite._lane_of` (and `gpu_rewrite_ast`'s `lane_of` in the extension, which
+renders the statement on 0.7.x) sent a WHERE on that single key to the key lane
+`k`. `=` and `IN` are right there, because no literal's tuple text is `N`; `<>`
+compares `N` with the literal and keeps the row, and `IS [NOT] NULL` reads the
+lane's validity bit, which is always set.
+
+**Extent, mapped on main with the 0.7.3 wrapper and the extension binary pip
+0.7.3 bundles, 85 statements at test settings and again at shipped defaults.**
+Wrong: a single VARCHAR key — a column or a computed VARCHAR expression
+(`upper(s)`) — with `<>`, `!=`, `NOT (s = ...)`, `IS NULL` or `IS NOT NULL` on
+it, alone or AND-ed with other terms, in every form that groups by that key
+alone: plain, HAVING, top-k, an expression over aggregates (the split), with a
+subquery lane, over a device join and over an uploaded join, and a template
+re-planned for new literals. Right throughout: `=`, `IN`, every predicate DuckDB
+evaluates as a lane of its own (`NOT IN`, `IS DISTINCT FROM`, `LIKE`,
+`NOT LIKE`, `coalesce(s, '') <> ''`, an `OR`), several key columns (two VARCHAR,
+VARCHAR with INTEGER), DECIMAL, DATE, INTEGER, packed and computed integer keys
+(they read a raw lane whose NULLs are NULL), the global aggregate, and
+`count(DISTINCT s)`; ordering comparisons on VARCHAR decline.
+
+**Fix, wrapper-only.** `_rewrite.key_predicate_columns` (one rule, called by
+`check_types` and by `Connection._replan_literals`): when a single VARCHAR key
+has such a term, the key column — or, for a computed key, its expression —
+becomes a predicate column of its own set, so every term on it reads that lane. `_lane_of`
+now looks predicate lanes up before the key, which is the order the extension's
+renderer already used (it reads the predicate lanes from the tag), so the
+0.7.3 extension renders the fixed statement unchanged. The rule is applied
+again in `Connection._replan_literals`, or a template re-planned for a new
+literal declines (the predicate-column lists differ). The re-plan already
+dropped the other half of that rule — a single DECIMAL key with a WHERE on it,
+older than this fix — so every re-run of such a template with new literals
+declined (rows right, the device lost); both halves are now the one helper.
+The cost, for those statements only: a string predicate lane beside the key —
+8 bytes a row of hashes on the device (plus a validity bit a row where the
+column has NULLs), a host-side dictionary holding every distinct text of the
+column, and a second hashing pass over every string at upload. A store that
+already holds the column as a predicate lane shares it.
+
+**Tests.** `null_key_where_checks` in `python/tests/test_wrapper.py`: 148
+checks, 31 of which fail on main's wrapper on DuckDB 2.0.1, 2.0.0 and 1.5.6,
+all of which pass with the fix on the three. CUDA shares the wrapper and the
+extension's renderer; the same suite on Linux is the check.
+
+## 2026-11-26 — pip 0.7.5: the NULL-key WHERE fix as its own release
+
+The package version moves 0.7.3 -> 0.7.5 (`python/pyproject.toml`,
+`gpudb.__version__`); there is no 0.7.4. It carries the wrapper fix of the
+entry on a NULL-sensitive WHERE on a VARCHAR GROUP BY key, with its follow-up
+(the re-plan for new literals shares `key_predicate_columns`, so a single
+DECIMAL key with a WHERE on it no longer declines on every re-run), and nothing
+else. The extension is not rebuilt: the registry keeps serving v0.7.1, and the
+platform wheels bundle the same v0.7.0 binary the 0.7.1, 0.7.2 and 0.7.3 wheels
+did, which is the binary the fix was tested against, so the only difference
+between the packages is the Python tree. The defect returns rows that differ
+from native with shipped defaults: a `<>` or `IS [NOT] NULL` term on a single
+VARCHAR key kept or lost the NULL group (0.7.2 and 0.7.3). The infinite
+DATE / TIMESTAMP fix was held back from this release because an independent
+review found regressions in the changes around it; the release history lists
+the infinite-TIMESTAMP case, the alias / column ORDER BY case, the settings
+seen across cursors and the LIMIT tie case as still open. Docs that name the
+current package version follow; statements about what was measured on 0.7.2
+(the README's DuckDB 2.0.1 rows, `BENCHMARK.md`, the project page's tables)
+are history and stay, and the project page's caption now says those tables
+were not re-measured for 0.7.3 or 0.7.5. Measured at the released commit: the
+fix's test block has 186 checks, 42 of which fail on the
+0.7.3 wrapper; the wrapper suite passes with 1594 checks on DuckDB 2.0.1 and
+2.0.0 and 1624 on 1.5.6, none failing, on Apple Silicon and on an RTX 4090
+Laptop (CUDA) with the extension binary the wheels bundle; on the RTX 4090
+Laptop pip 0.7.3 returned the extra NULL group for both
+statements with shipped defaults (4000 and 4001 rows against DuckDB's 3999 and
+4000) and the fix matches DuckDB. TPC-H coverage is unchanged on DuckDB 2.0.1: 16 of 22 queries on the device at scale factor 1 and 18 of 22 at scale factor 10, no rows that differ.
+
 ## 2026-11-26 — A select alias that shadows a column: what an ORDER BY name binds to
 
 Found on pip 0.7.3: `SELECT k AS kk, sum(v) AS k FROM t WHERE w < 3 GROUP BY

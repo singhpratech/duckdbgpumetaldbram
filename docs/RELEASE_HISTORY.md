@@ -2,7 +2,64 @@
 
 What shipped in each release, newest first.
 
-### Latest — pip 0.7.3 (2026-11-26)
+### Latest — pip 0.7.5 (2026-11-26)
+
+Upgrade if you group by a text column that contains NULLs and filter on that
+same column with `<>` or `IS [NOT] NULL`. There is no 0.7.4.
+
+- [x] **A WHERE on a VARCHAR GROUP BY key drops the NULL group** (pip
+  `duckdb-gpudb` 0.7.5) — a single VARCHAR key is uploaded as its tuple text,
+  in which a NULL key is a valid cell, and a WHERE term on that key read that
+  lane. `SELECT s, count(*) FROM t WHERE s <> 'x' GROUP BY s` and
+  `... WHERE s IS NOT NULL GROUP BY s` returned a NULL group DuckDB does not,
+  and `IS NULL` read a validity bit that is always set. With shipped defaults
+  on 20M rows and a 4000-value key with NULLs, pip 0.7.3 returned 4000 and
+  4001 rows where DuckDB returns 3999 and 4000. A `<>` or `IS [NOT] NULL` term
+  on such a key now reads a lane of its own, whose NULLs are NULL.
+  `=`, `IN`, `NOT IN`, `IS DISTINCT FROM`, `LIKE`, multi-column keys and
+  DECIMAL / DATE / integer keys were already right. Present in pip 0.7.2 and
+  0.7.3.
+- [x] **A DECIMAL key with a WHERE stays on the device for new literals** — a
+  statement with a single DECIMAL key and a WHERE on it, re-run with different
+  literals, went back to DuckDB on every re-run; its rows were right, and it
+  now stays on the device.
+- [x] **Checked** — on Apple Silicon, with the extension binary the wheels
+  bundle: the fix adds 186 checks, 42 of which fail on
+  the 0.7.3 wrapper, and the wrapper suite passes with 1594 checks on DuckDB
+  2.0.1 and 2.0.0 and 1624 on 1.5.6, none failing. TPC-H coverage is unchanged on DuckDB 2.0.1: 16 of 22 queries on the device at scale factor 1 and 18 of 22 at scale factor 10, no rows that differ.
+
+  On an RTX 4090 Laptop (CUDA), with the same extension binary, pip 0.7.3
+  returned the same extra NULL group for both statements above with shipped
+  defaults (4000 and 4001 rows where DuckDB returns 3999 and 4000), and with
+  the fix both match DuckDB. The wrapper suite passes there with 1594 checks
+  on DuckDB 2.0.1 and 2.0.0 and 1624 on 1.5.6, none failing, and the fix's own
+  checks fail on the 0.7.3 wrapper there as they do on Apple Silicon.
+- [x] **Still open** — wrong-answer cases in the published package that this
+  release does not fix:
+  - A TIMESTAMP column that holds `infinity` or `-infinity`: a statement that
+    filters on it, or on an expression over it such as `date_trunc`, can count
+    those rows as NULL (pull request #197).
+  - An ORDER BY name that is both a select alias and a different column
+    (`SELECT k AS kk, sum(v) AS k ... ORDER BY k`): gpudb can order by the
+    column where DuckDB orders by the alias, which with a LIMIT returns
+    different rows; giving the alias a name no column has avoids it.
+  - A setting changed on another cursor or connection of the same database
+    (`default_collation`, `default_order`, `default_null_order`) is not seen
+    by a cached decision until the connection itself runs a statement that
+    changes settings, schema or data (pull request #196).
+  - When a `LIMIT` is not selected on the device and the rows at its boundary
+    tie on every `ORDER BY` column, gpudb and DuckDB can each return a
+    different, equally valid choice among the tied rows; adding a column that
+    makes the order unique avoids it.
+
+  `gpudb.connect(transparent=False)` (or `con.transparent = False` on an open
+  connection) hands every statement to DuckDB unchanged, for anyone who needs
+  to rule these out; the explicit `gpu_*` functions stay available.
+- [x] **Versions** — wrapper only. The extension stays at v0.7.1 in the
+  community registry; the pip 0.7.5 platform wheels bundle the same v0.7.0
+  extension binary as pip 0.7.1, 0.7.2 and 0.7.3.
+
+### pip 0.7.3 (2026-11-26)
 
 - [x] **An explicit NULL order survives a re-render** (pip `duckdb-gpudb`
   0.7.3) — `json_serialize_sql` writes the NULL order as `NULLS FIRST` /
