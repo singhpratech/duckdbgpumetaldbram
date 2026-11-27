@@ -31,6 +31,8 @@ from ._rewrite import Decline, IDENT_FOLD, Plan, _STRING_TYPES, decimal_scale
 from . import _rewrite, _scope
 from ._resolve import Identity
 
+_qi = _rewrite.quote_ident       # a name as a quoted identifier, its own quotes doubled
+
 MAX_TABLES = 8
 OUTER_ALIAS = "gpudb_o"      # the enclosing statement's row, as seen from inside a subquery (§4.18)
 _INT_JOIN_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER"}
@@ -389,11 +391,11 @@ def lower(tree_json: str,
     _scope.strip(rest)
 
     # the native join as a derived table of virtual columns (decision-time probes)
-    proj = ", ".join(f'"{tables[ti].alias}"."{c}" AS "{v}"' for v, (ti, c) in colmap.items())
-    src = f'{r_ident.fqn} AS "{tables[root].alias}"'
+    proj = ", ".join(f'{_qi(tables[ti].alias)}.{_qi(c)} AS {_qi(v)}' for v, (ti, c) in colmap.items())
+    src = f'{r_ident.fqn} AS {_qi(tables[root].alias)}'
     for s in steps:
-        src += (f' JOIN {tables[s.child].ident.fqn} AS "{tables[s.child].alias}" ON '
-                f'"{tables[s.parent].alias}"."{s.parent_col}" = "{tables[s.child].alias}"."{s.child_col}"')
+        src += (f' JOIN {tables[s.child].ident.fqn} AS {_qi(tables[s.child].alias)} ON '
+                f'{_qi(tables[s.parent].alias)}.{_qi(s.parent_col)} = {_qi(tables[s.child].alias)}.{_qi(s.child_col)}')
     from_sql = f"(SELECT {proj} FROM {src})"
     return Lowered(tree_json=json.dumps(j), tables=tables, root=root, steps=steps,
                    colmap=colmap, columns=columns, from_sql=from_sql)
@@ -430,7 +432,7 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
                 raise Decline("shape", "GROUP BY key components from different tables")
             if v in computed:
                 return computed[v].sql
-            return f'"{real}"'
+            return _qi(real)
         return q
 
     # §4.12: a global aggregate has no GROUP BY key, so the joined set carries
@@ -458,7 +460,7 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
         ti = low.colmap[c][0]
         need[("pred", c)] = (ti, _rewrite.pred_lane_expr(plan, c, q_for(ti)), _kind_of(plan.pred_types.get(c, "")))
     for s in low.steps:
-        need[("fk", s.parent, s.parent_col)] = (s.parent, f'CAST("{s.parent_col}" AS BIGINT)', "i")
+        need[("fk", s.parent, s.parent_col)] = (s.parent, f'CAST({_qi(s.parent_col)} AS BIGINT)', "i")
 
     # final lane order = the single-table layout the rewriter addresses
     finals: List[tuple] = ([] if plan.no_key else [("key",)]) + [final_val]
@@ -497,7 +499,7 @@ def plan_residency(low: Lowered, plan: Plan, computed: Optional[Dict[str, object
     child_key: Dict[int, tuple] = {}
     for s in low.steps:
         lid = ("bk", s.child, s.child_col)
-        need[lid] = (s.child, f'CAST("{s.child_col}" AS BIGINT)', "i")
+        need[lid] = (s.child, f'CAST({_qi(s.child_col)} AS BIGINT)', "i")
         child_key[s.child] = lid
     for ti, t in enumerate(tables):
         ids = [lid for lid, (tj, _e, _k) in need.items() if tj == ti and lid[0] != "bk"]
@@ -632,7 +634,7 @@ class LoweredUpload:
 
     def qualified(self, v: str) -> str:
         ti, real = self.colmap[v]
-        return f'"{self.tables[ti].alias}"."{real}"'
+        return f'{_qi(self.tables[ti].alias)}.{_qi(real)}'
 
     def derived(self, names: List[str], computed: Dict[str, object], with_rowid: bool) -> str:
         """The join's result as a derived table exposing `names` (virtual and
@@ -642,11 +644,11 @@ class LoweredUpload:
             if n in computed:
                 c = computed[n]
                 items.append((f"CAST({c.probe_sql} AS TINYINT)" if c.native_type == "BOOLEAN" and not with_rowid
-                              else c.probe_sql) + f' AS "{n}"')
+                              else c.probe_sql) + f' AS {_qi(n)}')
             else:
-                items.append(f'{self.qualified(n)} AS "{n}"')
+                items.append(f'{self.qualified(n)} AS {_qi(n)}')
         if with_rowid:
-            items.append(f'"{self.tables[self.root].alias}".rowid AS rowid')
+            items.append(f'{_qi(self.tables[self.root].alias)}.rowid AS rowid')
         where = f" WHERE {self.edge_where}" if self.edge_where else ""
         return f"(SELECT {', '.join(items) or '1'} FROM {self.from_text}{where})"
 

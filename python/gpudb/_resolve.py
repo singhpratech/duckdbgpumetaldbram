@@ -94,6 +94,11 @@ def resolve(con, catalog: str, schema: str, name: str) -> Tuple[Optional[Identit
     return Identity(db, sch, tbl, int(oid), {c: t for c, t in cols}), ""
 
 
+def _qi(name: str) -> str:
+    """A column name as a quoted identifier (its own quotes doubled)."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _engine_major() -> int:
     try:
         return int(str(duckdb.__version__).split(".")[0])
@@ -140,7 +145,7 @@ def _column_stats_struct(con, ident: Identity, col: str) -> Optional[ColumnStats
     # in 1.5), and no Python conversion runs (a TIMESTAMPTZ bound would need
     # pytz to fetch)
     try:
-        s = _one(con.execute(f'SELECT CAST(stats("{col}") AS JSON) FROM {ident.fqn} LIMIT 1'))
+        s = _one(con.execute(f'SELECT CAST(stats({_qi(col)}) AS JSON) FROM {ident.fqn} LIMIT 1'))
     except Exception:
         return None
     if not s or s[0] is None:
@@ -170,7 +175,7 @@ def column_stats(con, ident: Identity, col: str) -> Optional[ColumnStats]:
     if _STATS_STRUCT:
         return _column_stats_struct(con, ident, col)
     try:
-        s = _one(con.execute(f'SELECT stats("{col}") FROM {ident.fqn} LIMIT 1'))
+        s = _one(con.execute(f'SELECT stats({_qi(col)}) FROM {ident.fqn} LIMIT 1'))
     except Exception:
         return None
     if not s or s[0] is None:

@@ -991,7 +991,7 @@ def where_sql(plan: Plan) -> str:
     """The WHERE terms back as SQL (for the wrapper's selectivity probe)."""
     parts = []
     for w in plan.where:
-        c = f'"{w.col}"'
+        c = quote_ident(w.col)
         if w.op == "isnull":
             parts.append(f"{c} IS NULL")
         elif w.op == "isnotnull":
@@ -1421,7 +1421,7 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
 
 
 def _q_default(col: str) -> str:
-    return f'"{col}"'
+    return quote_ident(col)
 
 
 def _int_image(qcol: str, t: str) -> str:

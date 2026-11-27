@@ -6609,6 +6609,88 @@ a cursor taking the exact path (`Connection.cursor()` copies none of `_exact`,
 cross-cursor checks are written to hold once it does); not run on the NVIDIA
 machine.
 
+## 2026-11-27 — Packed keys after review: bounds over the uploaded rows, one retry per change, released sets
+
+An independent review of the entry above found no wrong rows and no error on a
+valid statement; its findings were all in the packed-key machinery, as cost
+and leaks.
+
+A loop. A device join whose packed key has a COMPUTED component
+(`date_trunc('day', f.ts), f.g` over `f JOIN dim`) took that component's
+bounds from a probe over the JOIN, while the key lane is uploaded over the
+whole key table. One fact row without a match, outside the joined rows' range,
+made the upload refuse (`GPUDB_IMAGE`); the decision was taken again from the
+same probe, got the same bounds and the same name, and forgetting the refused
+set had dropped the refusal — an upload and a refusal on every execution,
+11.8 ms against native's 1.7, for ever (in background residency, a failing
+upload per sighting). The base ran it on the device correctly, since the
+out-of-range row never joins. Now a device join's computed component is
+bounded over the key table, exactly the rows its lane holds; the statement is
+on the device again with no refusal, eager and background. And the general
+rule is enforced and tested by injecting a mismatch between bounds and data: a
+set refused for its bounds is not queued again until an invalidation moves
+its epoch; the decision is taken again once, and when that reproduces the same
+bounds it is kept and DuckDB answers (`not_resident`, the error starting
+`GPUDB_IMAGE` and saying the zone map gives the same bounds). Measured: one
+refused upload in six executions, and exactly one more after a write through
+the connection, for a single table, a computed component and a device join,
+eager and background. A raw-cursor write does not move that point; the wrapper
+cannot see it.
+
+Leaks. A superseded set's manager entry was forgotten while the extension
+still held it — a materialised join owns its columns, and an invalidation
+drops only a table's store — so 2.7 MB per bounds change stayed `stale` in
+`gpu_residents()` with nobody able to evict it, and stale view rows piled up
+one per change; a resident join base set carrying the suffix could be
+forgotten too. A superseded set is now freed with `gpu_drop_resident` before
+its entry goes, and `forget()` refuses a set that is resident or uploading. A
+write through the connection itself clears every decision, so the old
+decision never reached the check that forgot its set: 31 entries after 30
+inserts against the base's 1. `_invalidate_all` now releases the packed sets
+of the decisions it clears. Measured after four bounds changes through a raw
+cursor and through the connection, eager and background, device join and
+single table: every set the extension holds is one the manager knows, and the
+packed entries and the physical bytes equal a fresh connection's over the same
+data (6300584 / 6600566 bytes on both sides). One effect the reviewer noted
+is kept on purpose: a new name per set of bounds means a set refused for old
+bounds never stands in the way of the new ones, where main's twenty-attempt
+cap applied to one name.
+
+The rest. Names holding quotes are quoted wherever a statement is built from
+them (the lanes, the stats() probes, the join's derived tables); a column
+named `Ts."q` failed its upload and declined on both trees, and is on the
+device now. A failure of the reference renderer — which draws the first
+execution of every temporal plan — declines to DuckDB (reason `error`); an
+interrupt still reaches the caller. A tie on new literals moved the decision
+to those literals but kept the old literals' plan, so once the tie had gone
+(a raw-cursor write, the set rebuilt through another template's stale guard)
+and the re-measure restored the template, `LIMIT 5` was drawn as `LIMIT 3`;
+the plan now moves with the literals. Two decisions with different bounds — a
+cursor taking the exact path beside its parent, two connections to one
+database file — each read a set named after their own bounds.
+
+Measured (worktree `python/`, the 0.7.3 wheel's extension binary, load average
+3–7). The new block `packed_lifecycle_checks` (39 checks) passes; on the
+previous commit of this branch 35 of them fail, on the base 23 before it stops
+at a helper the base lacks — including the tie check, which returns three rows
+for `LIMIT 5` there too, so that defect predates this branch. test_wrapper:
+2870 / 2870 / 2900 on DuckDB 2.0.1 / 2.0.0 / 1.5.6 and 2900 under Python 3.9
+(DuckDB 1.4.5), all passing; shell 76 (77 on 3.9), residency policy 131, ast
+compat 9 (8 of 9 on 1.4.5, as on the base). `explore.py`: 0 differing over
+infinite values on 2.0.1; the remaining lines on 2.0.0 / 1.5.6 and over the
+extreme values are the probe's own (a TIMESTAMPTZ it cannot fetch without pytz,
+one DuckDB error printed to two lengths). `late.py`: 8 of 8 scenarios native-
+equal on all three. The review's probes p1–p21: every BAD line is DuckDB
+answering (a tie it resolves either way, a statement it raises for) or, on the
+device, a `LIMIT` over tied ordering values that is not a pushed top-k (110
+statements of p14; on the base 134, 74 of them without a `LIMIT` — wrong rows
+over infinities); p3, p3b, p3c, p5, p20, p21 show no refusal, one manager entry
+per live set and the base's physical bytes. The earlier probe sets are as
+before. Route against the base, TPC-H SF1 plus 20 temporal-key statements
+through `execute()` and `sql()`: 0 differences with thresholds off and on;
+`tpch_coverage.py` 16 of 22 on both trees, the same path per query, 0 rows
+differing. Not run on the NVIDIA machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

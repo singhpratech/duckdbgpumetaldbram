@@ -56,9 +56,9 @@ MEMORY_ERROR = "memory budget: "  # SetState.error prefix of a set the budget ke
 DEVICE_ERROR = "device refused: " # ... and of one the DEVICE would not take (an upload that raised)
 # An upload refused a packed key component outside the bounds the key was
 # packed for (_rewrite.IMAGE_ERROR, the same text). Retrying the same recipe
-# can only fail the same way or, after a delete, succeed over bounds the
-# decision no longer trusts: such a set is never queued again, and the
-# connection takes its decision again instead (Connection._packed_bounds_hold).
+# over the same data can only fail the same way: such a set is not queued
+# again until an invalidation moves its epoch, and the connection takes its
+# decision again meanwhile (Connection._packed_bounds_hold).
 IMAGE_ERROR = "GPUDB_IMAGE"
 # A set the budget or the device turned away is not asked for again until
 # something that could change the answer changes: the data under it, the
@@ -563,28 +563,40 @@ class ResidencyManager:
                 s.state = "pending"
                 self._cv.notify_all()
 
-    def forget(self, tag: str) -> None:
-        """Drop the bookkeeping of a set no decision will read again — a packed
-        key's set once its decision was taken over other bounds (§4.4), so
-        every bounds change does not leave an entry behind for good. The
-        device copy is gone already (an invalidation or the failed upload's
-        purge dropped it); an upload in flight is stopped the way an
-        invalidation stops one, and whatever it leaves is evictable residue."""
+    def forget(self, tag: str) -> bool:
+        """Drop the manager's bookkeeping of a set — and nothing else: the
+        caller frees what the extension holds of it first
+        (`Connection._release_sets`, `gpu_drop_resident`). A set that is resident
+        or being uploaded is not forgotten (False): it is valid for whichever
+        decision reads it, and an entry the manager does not know could never
+        be evicted. Used for a packed key's set once no decision names its
+        bounds (§4.4), so a bounds change does not leave an entry behind."""
         with self._cv:
-            s = self._sets.pop(tag, None)
+            s = self._sets.get(tag)
             if s is None:
-                return
-            s.epoch += 1
-            uploading = s.state == "uploading" and self._uploading_tag == tag
+                return True
+            if s.state in ("ready", "uploading"):
+                return False
+            del self._sets[tag]
+            s.epoch += 1                  # a holder of the object sees it moved
             s.state = "stale"
-            cur = self._upload_cursor if uploading else None
             self._cv.notify_all()
-        if cur is not None:
-            self._interrupt(cur)
+            return True
+
+    def image_refused(self, tag: str) -> bool:
+        """Was this set's last upload refused for a packed key component
+        outside its bounds (IMAGE_ERROR), with no invalidation since?"""
+        with self._lock:
+            s = self._sets.get(tag)
+            return s is not None and self._image_refused_locked(s)
 
     @staticmethod
     def _image_refused_locked(s: SetState) -> bool:
-        return s.state == "failed" and IMAGE_ERROR in (s.error or "")
+        """An upload refused for a packed component outside its bounds is never
+        asked for again over the same data: the same recipe can only be refused
+        again. It may be once the data has moved (an invalidation moves the
+        epoch), which is one further attempt per change of the data."""
+        return s.state == "failed" and IMAGE_ERROR in (s.error or "") and s.refused_epoch == s.epoch
 
     # ---- refusals the manager remembers (§5.5) ----
     def _refusal_holds_locked(self, s: SetState) -> bool:
@@ -1249,7 +1261,7 @@ class ResidencyManager:
         if s is None:
             return False
         with self._lock:
-            if self._refusal_holds_locked(s):
+            if self._refusal_holds_locked(s) or self._image_refused_locked(s):
                 # the answer for this set has not changed since it was refused;
                 # asking again costs an upload and gets the same answer
                 self.refusals_held += 1

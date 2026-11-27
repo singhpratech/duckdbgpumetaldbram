@@ -216,6 +216,7 @@ class Decision:
     # they are read once per invalidation (-2: the decision read them itself)
     pack_src: List[Optional[Tuple[Any, str, str]]] = field(default_factory=list)
     pack_epoch: int = -3
+    pack_refused: int = -3               # ... and the epoch at which a refused upload was looked at
     output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
     join: Optional[Any] = None         # _join.JoinResidency for a statement over a key join (§4.8)
     # computed lanes (§4.10) that embed a literal: the normalised template does
@@ -1186,6 +1187,12 @@ class Connection:
         lits = getattr(self, "_last_literals", None)
         if lits is not None and lits != d.literals:
             d.literals, d.scalar_sql, d.python_sql = lits, "", ""
+            # ... and so does the plan: the decision now stands for THESE literals,
+            # and a re-measure that restores it renders d.plan for them (its LIMIT,
+            # its HAVING threshold, its WHERE literals) without re-planning
+            rp = getattr(self, "_last_render_plan", None)
+            if rp is not None:
+                d.plan = rp
         d.literal_sensitive = True
         if native_ms is not None:
             d.native_ms = native_ms if d.native_ms is None else min(d.native_ms, native_ms)
@@ -1464,6 +1471,11 @@ class Connection:
             self._refresh_after = True
         self._manager.invalidate(None)
         self._drop_plans()
+        # §4.4: a packed decision's set is named after its bounds, and the decision
+        # goes with the cache; the next one may pack for other bounds, under another
+        # name, so the old set is released below rather than left behind for good
+        packed = [t for dd in self._cache.values() for vd in [dd] + list(dd.variants.values())
+                  for t in self._packed_tags(vd)]
         self._cache.clear()
         (self._parent or self)._ties_ok.clear()   # §4.24: the data may tie now where it did not
         self._nested_cache.clear()
@@ -1481,6 +1493,7 @@ class Connection:
             self._raw.execute("SELECT gpu_invalidate('gpudb:v1')").fetchall()
         except Exception:
             pass
+        self._release_sets(list(dict.fromkeys(packed)))
 
     def _refresh_big_tables(self) -> set:
         """Tables whose estimated size is at or above the floor: only a
@@ -2284,7 +2297,14 @@ class Connection:
                 # was evicted (measured at 313 characters once the estimate
                 # stopped rounding sets up)
                 self._last.error = st.error[:512]
+                if d.plan is not None and d.plan.key_suffix and self._image_failed(d):
+                    self._last.error = (f"{_rewrite.IMAGE_ERROR}: the upload refused a GROUP BY value outside the "
+                                        f"bounds the packed key was sized for, and the zone map gives the same bounds; "
+                                        f"DuckDB answers until the data changes")
                 return None
+        # the plan this statement's rendering is for (_note_ties_loss keeps it with
+        # the literals a tie declines)
+        self._last_render_plan = d.plan
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql
             self._last.engine = "scalar"
@@ -2296,14 +2316,26 @@ class Connection:
         else:
             # literals differ from the cached template (or no scalar): re-render
             # from the current statement's tree with the reference renderer
-            # (one serialize, no catalog work, no scalar call)
+            # (one serialize, no catalog work, no scalar call). It draws the first
+            # execution of every plan that decodes a DATE / TIMESTAMP, so a failure
+            # of its own is the statement's to answer natively, never the caller's
+            # to see; an interrupt is the caller's and goes through.
             plan = d.plan
-            if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
-                plan = self._replan_literals(sql, plan)
-                if plan is None:
-                    self._last.reason = "shape"
-                    return None
-            out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+            try:
+                if literals != d.literals and (plan.having is not None or plan.limit is not None or plan.where):
+                    plan = self._replan_literals(sql, plan)
+                    if plan is None:
+                        self._last.reason = "shape"
+                        return None
+                out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
+            except Exception as e:                # noqa: BLE001
+                if "INTERRUPT" in str(e).upper() or isinstance(e, getattr(duckdb, "InterruptException", ())):
+                    raise
+                self._log(f"reference renderer failed: {e}")
+                self._last.reason = "error"
+                self._last.detail = f"the reference renderer failed, so DuckDB answers: {str(e)[:160]}"
+                return None
+            self._last_render_plan = plan
             self._last.engine = "python"
             if literals == d.literals:
                 d.python_sql = out
@@ -2319,28 +2351,30 @@ class Connection:
         decision read, and its set is named after them (Plan.key_suffix). This
         is where a decision whose bounds the data has left is taken again.
 
-        Nothing is dropped by a write itself — through this connection, a
-        cursor of it, a raw cursor or another connection, the writer cannot
-        always be seen — and a set built from bounds the data still lies
-        within is right whatever happened since. Instead, before a set is
-        (re)uploaded, its decision is looked at:
+        A write through this connection clears every decision it holds
+        (`_invalidate_all`, which also releases their packed sets); a write
+        the connection does not see — a raw cursor, another connection, a
+        cursor of this one — drops nothing, and a set whose data still lies
+        within its bounds is right however it got there. So before a set is
+        (re)uploaded, its decision is looked at, once per invalidation of the
+        set (its epoch in the residency manager):
 
+          * the components' zone-map bounds are read again (stats(), metadata
+            only) and, if they are no longer within the decision's, the
+            decision is taken again now, so the upload that follows packs for
+            the bounds of now under a set of its own;
           * the upload refused a component outside the bounds (IMAGE_ERROR,
-            key_lane_expr): the decision is taken again now;
-          * the set is not resident and no upload of it is running: the
-            components' zone-map bounds are read again (stats(), metadata
-            only, once per invalidation of the set), and if they are no longer
-            within the decision's bounds the decision is taken again now — so
-            the upload that follows packs for the bounds of now, under a set
-            of its own.
+            key_lane_expr): the decision is taken again once. A computed
+            component has no zone map, so this is its check.
 
-        A decision just taken skips the reading (it read them a moment ago).
-        A computed component has no zone map; for it the upload's refusal is
-        the check. Taking the decision again forgets the old set's entry in
-        the residency manager, whose device copy an invalidation or the
-        failed upload has already dropped. Only this decision is touched:
-        another connection's decision over the same set meets the same test
-        at its own next sighting."""
+        When the decision taken again names the same set — the same bounds —
+        nothing would change by uploading it again: the decision is kept, the
+        refused set stays refused (`ResidencyManager`), and DuckDB answers
+        until the next invalidation lets it try once more. So after a refusal
+        at most one further upload is attempted per change of the data. A set
+        the new decision no longer names is released (`_release_sets`); only
+        this decision is touched, and another connection's decision over the
+        same set meets the same test at its own next sighting."""
         st = self._manager.get(d.tag)
         state = st.state if st is not None else "missing"
         epoch = st.epoch if st is not None else 0     # a new SetState starts at epoch 0
@@ -2349,22 +2383,25 @@ class Connection:
         if state in ("ready", "uploading"):
             return d
         failed = self._image_failed(d)
-        if not failed:
-            if d.pack_epoch == epoch:
-                return d
-            d.pack_epoch = epoch
-            if not self._pack_left(d):
-                return d
+        if d.pack_epoch == epoch and (not failed or d.pack_refused == epoch):
+            return d                                   # already looked at, at this epoch
+        d.pack_epoch = epoch
+        if failed:
+            d.pack_refused = epoch
+        elif not self._pack_left(d):
+            return d
         why = ("the upload refused a value outside the key's packed bounds" if failed
                else "the zone map left the key's packed bounds")
-        self._log(f"packed key: {why} — the decision is taken again ({d.tag})")
-        # the set, and a device join's base set holding the key lane (its name carries
-        # the same bounds); a base set of another table is any join's to share
-        for t in [d.tag] + ([b.tag for b in d.join.base] if d.join is not None else []):
-            if t == d.tag or d.plan.key_suffix in t:
-                self._manager.forget(t)
         nd = self._decide(sql, inner_out=inner_out)
         nd.literals = literals
+        if nd.rewritten and nd.tag == d.tag:
+            # the same bounds again: uploading the same set again could only be refused
+            # the same way, so the decision stays as it is until the data changes
+            self._log(f"packed key: {why}, and the zone map gives the same bounds — DuckDB "
+                      f"answers until the data changes ({d.tag})")
+            return d
+        self._log(f"packed key: {why} — the decision is taken again ({d.tag})")
+        self._release_sets(self._packed_tags(d))
         top = self._cache.get(key)
         if top is d:
             nd.variants = d.variants
@@ -2373,14 +2410,41 @@ class Connection:
             top.variants[literals] = nd
         return nd
 
-    def _image_failed(self, d: "Decision") -> bool:
-        """Did an upload of this decision's set — or, for a device join, of
-        the base set holding its key lane — refuse a value outside the packed
-        bounds (IMAGE_ERROR)?"""
-        tags = [d.tag] + ([b.tag for b in d.join.base] if d.join is not None else [])
+    @staticmethod
+    def _packed_tags(d: "Decision") -> List[str]:
+        """The sets named after a packed decision's bounds: its own, and a device
+        join's base set holding the key lane (its name carries the same suffix).
+        A base set of another table is any join's to share and is not listed."""
+        if d.plan is None or not d.plan.key_suffix:
+            return []
+        return [d.tag] + [b.tag for b in (d.join.base if d.join is not None else [])
+                          if d.plan.key_suffix in b.tag]
+
+    def _release_sets(self, tags: List[str]) -> None:
+        """Free sets no decision of this connection names any more, on the
+        device and in the residency manager. A set that is resident or being
+        uploaded is left alone: it is valid for whichever decision uses it, and
+        the manager can still evict it. Anything else is invalid anyway (stale,
+        refused, queued for bounds the data has left); `gpu_drop_resident` frees
+        what the extension still holds of it — an invalidation drops a table's
+        store but not a materialised join's own columns, nor a stale view's
+        registry row — and only then is the manager's entry dropped."""
         for t in tags:
             st = self._manager.get(t)
-            if st is not None and st.state == "failed" and _rewrite.IMAGE_ERROR in (st.error or ""):
+            if st is None or st.state in ("ready", "uploading"):
+                continue
+            try:
+                self._raw.execute("SELECT gpu_drop_resident(?)", [t]).fetchall()
+            except duckdb.Error:
+                pass                     # nothing of it left on the device
+            self._manager.forget(t)
+
+    def _image_failed(self, d: "Decision") -> bool:
+        """Is an upload of this decision's set — or, for a device join, of the
+        base set holding its key lane — refused for a value outside the packed
+        bounds (IMAGE_ERROR), with no invalidation since?"""
+        for t in [d.tag] + ([b.tag for b in d.join.base] if d.join is not None else []):
+            if self._manager.image_refused(t):
                 return True
         return False
 
@@ -2527,7 +2591,7 @@ class Connection:
             ok = any(list(r[0] or []) == [col] for r in rows)
             if not ok:
                 ok = bool(_one(self._raw.execute(
-                    f'SELECT count("{col}") = count(DISTINCT "{col}") FROM {ident.fqn}'))[0])
+                    f'SELECT count({_rewrite.quote_ident(col)}) = count(DISTINCT {_rewrite.quote_ident(col)}) FROM {ident.fqn}'))[0])
         except Exception as e:
             self._log(f"uniqueness probe failed: {e}")
             ok = False
@@ -2982,7 +3046,7 @@ class Connection:
             for cname, comp in computed.items():
                 columns[cname] = comp.lane_type
             proj = ", ".join(
-                (f"CAST({c.probe_sql} AS TINYINT)" if c.native_type == "BOOLEAN" else c.probe_sql) + f' AS "{n}"'
+                (f"CAST({c.probe_sql} AS TINYINT)" if c.native_type == "BOOLEAN" else c.probe_sql) + f' AS {_rewrite.quote_ident(n)}'
                 for n, c in computed.items())
             probe_from = f"(SELECT *, {proj} FROM {base_from}) gpudb_c"
         try:
@@ -3034,9 +3098,20 @@ class Connection:
                         # plain column: fetched as values, an infinite DATE / TIMESTAMP
                         # became Python's date.max / datetime.max — a finite bound, which
                         # a packed key then sized its slots by
+                        qc = _rewrite.quote_ident(col)
                         mn, mx, uq, nn = _one(self._raw.execute(
-                            f'SELECT CAST(min("{col}") AS VARCHAR), CAST(max("{col}") AS VARCHAR), '
-                            f'approx_count_distinct("{col}"), count(*) - count("{col}") FROM {probe_from}'))
+                            f'SELECT CAST(min({qc}) AS VARCHAR), CAST(max({qc}) AS VARCHAR), '
+                            f'approx_count_distinct({qc}), count(*) - count({qc}) FROM {probe_from}'))
+                        if low is not None and not upload_mode and plan.exact and plan.packed:
+                            # a device join uploads the key lane over the WHOLE key table
+                            # (_join.plan_residency), not over the joined rows: a packed
+                            # component's bounds must cover exactly those rows, or a fact
+                            # row without a match, outside the joined rows' range, makes
+                            # every upload refuse (GPUDB_IMAGE) a statement that is right
+                            kt = low.tables[computed[col].table].ident
+                            mn, mx = _one(self._raw.execute(
+                                f"SELECT CAST(min({computed[col].sql}) AS VARCHAR), "
+                                f"CAST(max({computed[col].sql}) AS VARCHAR) FROM {kt.fqn} AS {_join.OUTER_ALIAS}"))
                         st = _resolve.ColumnStats(has_null=bool(nn), min=None if mn is None else str(mn),
                                                   max=None if mx is None else str(mx), approx_unique=int(uq))
                     except Exception as e:
@@ -3114,7 +3189,7 @@ class Connection:
                 # no zone-map estimate (VARCHAR columns carry none): count the key's distinct
                 # values once — one scan per statement template
                 try:
-                    cols = ", ".join(f'"{kc}"' for kc in plan.keys)
+                    cols = ", ".join(_rewrite.quote_ident(kc) for kc in plan.keys)
                     src = probe_from if probe_from else ident.fqn
                     est = int(_one(self._raw.execute(
                         f"SELECT approx_count_distinct(hash({cols})) FROM {src}"))[0])
@@ -3183,7 +3258,7 @@ class Connection:
             # and is dropped at publish; a device join gathers no key lane).
             # Nothing uploads, stores or sorts a key for these statements.
             _rewrite.make_global(plan)
-        q = (lambda c: computed[c].sql if c in computed else f'"{c}"')   # noqa: E731
+        q = (lambda c: computed[c].sql if c in computed else _rewrite.quote_ident(c))   # noqa: E731
         if low is None:
             try:
                 plan.tag = ident.tag(plan.upload_columns) + (":global" if plan.no_key else "")

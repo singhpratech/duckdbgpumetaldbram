@@ -4395,6 +4395,7 @@ def infinite_temporal_checks():
     infinite_temporal_late_checks()
     infinite_temporal_background_checks()
     packed_bounds_checks()
+    packed_lifecycle_checks()
     temporal_misc_checks()
 
 
@@ -4569,7 +4570,8 @@ def _wait_device(con, ref, sql, tries=6, lazy=False):
     idle windows); every run's rows must be native's. (rows ok, device)."""
     ok_all, dev = True, False
     for _ in range(tries):
-        con._manager.wait_idle(60)
+        if con.residency == "background":
+            con._manager.wait_idle(60)
         got, dev, _lr = _device_text(con, sql, lazy=lazy)
         ok_all = ok_all and got == _as_text(ref, sql)
         if dev:
@@ -4784,6 +4786,360 @@ def packed_bounds_checks():
     n = con._raw.execute("SELECT count(*) FROM tcw").fetchone()[0]
     check(not errs and n == 210, f"cursors created while a cursor writes: every write ran ({n} rows, {errs[:1]})")
     con.close()
+
+
+def _residents(con):
+    """{name: (state, bytes)} the extension holds, read on a side cursor."""
+    cur = con._raw.cursor()
+    try:
+        return {r[0]: (r[1], int(r[2] or 0)) for r in cur.execute(
+            "SELECT name, state, bytes FROM gpu_residents()").fetchall()}
+    finally:
+        cur.close()
+
+
+def _refused_attempts(logs):
+    """Upload attempts refused for a packed component outside its bounds, one
+    log line each (eager: 'not uploaded', background: 'upload failed')."""
+    return [m for m in logs if "GPUDB_IMAGE" in m and m.startswith(("not uploaded: ", "upload failed: "))]
+
+
+def packed_lifecycle_checks():
+    """What a packed key's set costs over its life (§4.4), after an
+    independent review of the first version of this change:
+
+    1. A device join whose packed key has a COMPUTED component sized it over
+       the joined rows, while the key lane is uploaded over the whole key
+       table: a fact row without a match, outside the joined rows' range,
+       made every upload refuse and every re-taken decision reproduce the
+       same bounds — an upload and a refusal on every execution, for ever.
+       The bounds are now taken over the rows the lane holds; and, as an
+       invariant tested here by injecting a mismatch: after a refusal, at
+       most one further upload per change of the data.
+    2. A superseded set's device copy stayed in the extension after its
+       manager entry was forgotten (a materialised join owns its columns),
+       and a resident base set could be forgotten.
+    3. A write through the connection itself left one manager entry per
+       bounds change behind.
+    4. Columns whose names hold quotes; a reference-renderer failure.
+    5. A tie's literals kept the old literals' plan.
+    6. Two decisions with different bounds over one statement — a cursor and
+       its parent, two connections to one database file — each read the set
+       built from their own."""
+    print("== packed keys over their life: refusals, releases, entries, names, ties, several decisions")
+    import tempfile as _tf
+    from gpudb import _rewrite as _rw
+    from gpudb import connection as _conn
+    probe = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    caps = has_device(probe) and all(getattr(probe, a, False) for a in ("_exact", "_join", "_store"))
+    probe.close()
+    if not caps:
+        skip("packed key lifecycle: needs the exact, join and store paths on a GPU backend")
+        return
+    join_setup = """CREATE TABLE lf AS SELECT i AS id, i % 7 AS g, i % 3 AS h, i * 3 AS v, i % 40 AS k,
+          TIMESTAMP '2020-01-01' + to_seconds(i % 17) AS ts, DATE '2020-01-01' + (i % 5)::INTEGER AS d
+          FROM range(300000) r(i);
+        INSERT INTO lf VALUES (999999, 1, 1, 5, 999, TIMESTAMP '2030-06-01', DATE '2031-01-01');
+        CREATE TABLE ldim AS SELECT i AS k, i % 4 AS cat, i * 7 AS w FROM range(40) r(i)"""
+    join_q = ["SELECT date_trunc('day', lf.ts) AS m, lf.g, sum(ldim.w) FROM lf JOIN ldim ON lf.k = ldim.k "
+              "GROUP BY m, lf.g ORDER BY 1, 2",
+              "SELECT lf.d + 1 AS m, lf.g, sum(ldim.w) FROM lf JOIN ldim ON lf.k = ldim.k GROUP BY m, lf.g ORDER BY 1, 2",
+              "SELECT lf.d, lf.g, sum(ldim.w) FROM lf JOIN ldim ON lf.k = ldim.k GROUP BY lf.d, lf.g ORDER BY 1, 2"]
+    # 1. the unmatched row is outside the joined rows' range: on the device, every run, no refusal
+    for mode in ("eager", "background"):
+        logs = []
+        con = gpudb.connect(residency=mode, floor_rows=0, thresholds=False, idle_ms=5.0, log=logs.append)
+        ref = duckdb.connect()
+        for c in (con, ref):
+            c.execute(join_setup)
+        for sql in join_q:
+            ok, dev = _wait_device(con, ref, sql, tries=6)
+            tag = con.last_rewrite()["tag"]
+            runs = [_device_text(con, sql) for _ in range(3)]
+            check(ok and dev and all(r[1] and r[0] == _as_text(ref, sql) for r in runs) and ":join-" in tag,
+                  f"device join, packed key with an unmatched out-of-range row ({mode}): on the device join "
+                  f"with native's rows on every run ({tag.split(':')[6]}; {sql[:44]})")
+        check(not _refused_attempts(logs), f"... and no upload was refused ({mode}; {_refused_attempts(logs)[:1]})")
+        ref.close()
+        con.close()
+
+    # 1b. the invariant, by a mismatch injected into the bounds: a component's zone-map max read as
+    # one less than it is, for the first decision and for every one taken again — so every upload of
+    # that set is refused, and only an invalidation may let it try once more
+    real_stat_image = _rw.stat_image
+
+    def narrowed(x, t):
+        v = real_stat_image(x, t)
+        return v - 1 if (v is not None and str(x).strip() in ("106", "107")) else v
+    inv_setup = """CREATE TABLE tinv AS SELECT 100 + i % 7 AS g, i % 3 AS h, i % 40 AS k, i * 3 AS v FROM range(200000) r(i);
+                   CREATE TABLE tinvd AS SELECT i AS k, i * 7 AS w FROM range(40) r(i)"""
+    inv_q = {"single-table": "SELECT g, h, sum(v) FROM tinv GROUP BY g, h ORDER BY 1, 2",
+             "single-table, computed": "SELECT g + 1 AS m, h, sum(v) FROM tinv GROUP BY m, h ORDER BY 1, 2",
+             "device join": "SELECT tinv.g, tinv.h, sum(tinvd.w) FROM tinv JOIN tinvd ON tinv.k = tinvd.k "
+                            "GROUP BY tinv.g, tinv.h ORDER BY 1, 2"}
+    _rw.stat_image = narrowed
+    try:
+        for mode in ("eager", "background"):
+            for what, sql in inv_q.items():
+                logs = []
+                con = gpudb.connect(residency=mode, floor_rows=0, thresholds=False, idle_ms=5.0, log=logs.append)
+                ref = duckdb.connect()
+                for c in (con, ref):
+                    c.execute(inv_setup)
+                rows_ok, last = True, None
+                for _ in range(6):
+                    got, dev, last = _device_text(con, sql)
+                    rows_ok = rows_ok and got == _as_text(ref, sql) and not dev
+                    if mode == "background":
+                        con._manager.wait_idle(30)
+                first = len(_refused_attempts(logs))
+                check(rows_ok and first == 1 and last["reason"] == "not_resident"
+                      and (last.get("error") or "").startswith("GPUDB_IMAGE"),
+                      f"refused for its bounds ({what}, {mode}): ONE upload in six runs, DuckDB answers, and the reason "
+                      f"says why ({first} refused; {last['reason']}: {(last.get('error') or '')[:60]})")
+                w = "INSERT INTO tinv VALUES (101, 1, 1, 1)"           # in range, through the connection
+                con.execute(w)
+                ref.execute(w)
+                for _ in range(6):
+                    got, dev, last = _device_text(con, sql)
+                    rows_ok = rows_ok and got == _as_text(ref, sql)
+                    if mode == "background":
+                        con._manager.wait_idle(30)
+                second = len(_refused_attempts(logs))
+                check(rows_ok and second == first + 1,
+                      f"... a write moves the data: exactly one more attempt ({what}, {mode}; {second - first})")
+                ref.close()
+                con.close()
+    finally:
+        _rw.stat_image = real_stat_image
+
+    # 1c. a computed component whose upload is refused after a raw write: one refusal, then it
+    # packs anew under the bounds of now (§4.4)
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    logs = []
+    con._log = logs.append
+    ref = duckdb.connect()
+    for c in (con, ref):
+        c.execute("CREATE TABLE tcc AS SELECT i % 7 AS a, i % 5 AS b, i AS v FROM range(200000) r(i)")
+    sql = "SELECT a + 1 AS m, b, sum(v) FROM tcc GROUP BY m, b ORDER BY 1, 2"
+    ok, dev = _wait_device(con, ref, sql)
+    cur = con._raw.cursor()
+    cur.execute("INSERT INTO tcc VALUES (50, 1, 1)")
+    ref.execute("INSERT INTO tcc VALUES (50, 1, 1)")
+    cur.close()
+    seen = []
+    for _ in range(4):
+        got, dev, lr = _device_text(con, sql)
+        seen.append((got == _as_text(ref, sql), dev))
+    check(ok and all(r for r, _d in seen) and seen[-1][1] and seen[-2][1] and len(_refused_attempts(logs)) <= 1,
+          f"computed packed component after a raw write: at most one refused upload, then on the device under "
+          f"new bounds ({seen}, {len(_refused_attempts(logs))} refused)")
+    ref.close()
+    con.close()
+
+    # 2 + 3. superseded sets are freed on the device and forgotten by the manager, however the
+    # write came; what is left is what a fresh connection holds for the same statements
+    def held(con):
+        mgr = set(con._manager.snapshot())
+        ext = _residents(con)
+        unknown = sorted(n for n in ext if n not in mgr)
+        packed = sorted(t for t in mgr if "~" in t)
+        return unknown, packed, con.memory().get("bytes")
+
+    cases = {
+        "device join": ("CREATE TABLE rf AS SELECT i AS id, i % 7 AS g, i % 3 AS h, i * 3 AS v, i % 40 AS k "
+                        "FROM range(300000) r(i); CREATE TABLE rdim AS SELECT i AS k, i * 7 AS w FROM range(40) r(i)",
+                        ["SELECT rf.g, rf.h, sum(rdim.w) FROM rf JOIN rdim ON rf.k = rdim.k GROUP BY rf.g, rf.h ORDER BY 1, 2"],
+                        "INSERT INTO rf VALUES ({i}, {g}, 1, 5, 1)"),
+        "single table": ("CREATE TABLE rf AS SELECT i AS id, i % 7 AS g, i % 3 AS h, i * 3 AS v, "
+                         "DATE '2020-01-01' + (i % 30)::INTEGER AS d FROM range(300000) r(i)",
+                         ["SELECT g, h, sum(v) FROM rf GROUP BY g, h ORDER BY 1, 2",
+                          "SELECT d, g, sum(v) FROM rf GROUP BY d, g ORDER BY 1, 2"],
+                         "INSERT INTO rf VALUES ({i}, {g}, 1, 5, DATE '2021-01-01' + {r})"),
+    }
+    for what, (setup, qs, wtmpl) in cases.items():
+        for mode in ("eager", "background"):
+            for how in ("raw cursor", "connection"):
+                con = gpudb.connect(residency=mode, floor_rows=0, thresholds=False, idle_ms=5.0)
+                ref = duckdb.connect()
+                for c in (con, ref):
+                    for s in setup.split(";"):
+                        c.execute(s)
+                ok_all = True
+                for r in range(4):
+                    for q in qs:
+                        ok, dev = _wait_device(con, ref, q)
+                        ok_all = ok_all and ok and dev
+                    w = wtmpl.format(i=10 ** 6 + r, g=50 + r, r=r)
+                    if how == "raw cursor":
+                        c2 = con._raw.cursor()
+                        c2.execute(w)
+                        c2.close()
+                    else:
+                        con.execute(w)
+                    ref.execute(w)
+                for q in qs:
+                    ok, dev = _wait_device(con, ref, q)
+                    ok_all = ok_all and ok and dev
+                if mode == "background":
+                    con._manager.wait_idle(30)
+                unknown, packed, nbytes = held(con)
+                # a fresh connection over the same data, the same statements
+                fresh_con = gpudb.connect(residency=mode, floor_rows=0, thresholds=False, idle_ms=5.0)
+                for s in setup.split(";"):
+                    fresh_con.execute(s)
+                for r in range(4):
+                    fresh_con.execute(wtmpl.format(i=10 ** 6 + r, g=50 + r, r=r))
+                for q in qs:
+                    _wait_device(fresh_con, ref, q)
+                if mode == "background":
+                    fresh_con._manager.wait_idle(30)
+                _u, fpacked, fbytes = held(fresh_con)
+                fresh_con.close()
+                check(ok_all and not unknown and len(packed) == len(fpacked)
+                      and nbytes is not None and fbytes and abs(nbytes - fbytes) <= 0.02 * fbytes,
+                      f"{what}, {mode}, four bounds changes through {how}: on the device throughout, every set the "
+                      f"extension holds is the manager's ({unknown[:1]}), {len(packed)} packed entries against a fresh "
+                      f"connection's {len(fpacked)}, {nbytes} bytes against its {fbytes}")
+                ref.close()
+                con.close()
+
+    # 2. a resident set is never forgotten
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    con.execute("CREATE TABLE tfg AS SELECT i % 7 AS a, i % 3 AS b, i AS v FROM range(100000) r(i)")
+    con.execute("SELECT a, b, sum(v) FROM tfg GROUP BY a, b").fetchall()
+    tag = con.last_rewrite()["tag"]
+    forget = getattr(con._manager, "forget", None)
+    check(con._manager.is_ready(tag) and forget is not None and forget(tag) is False and con._manager.is_ready(tag),
+          f"forget() leaves a resident set alone ({con._manager.snapshot().get(tag)})")
+    con.close()
+
+    # 4. quoted names; a reference-renderer failure is DuckDB's to answer, an interrupt is the caller's
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    s = ('CREATE TABLE tq2 AS SELECT (i % 9)::INTEGER AS "Ts.""q", (i % 4)::INTEGER AS "w""x", i::BIGINT AS v, '
+         'TIMESTAMP \'2020-01-01\' + to_seconds(i % 50) AS "t""s" FROM range(200000) r(i)')
+    for c in (con, ref):
+        c.execute(s)
+    for sql in ('SELECT "Ts.""q", sum(v) FROM tq2 GROUP BY "Ts.""q" ORDER BY 1',
+                'SELECT "Ts.""q", "w""x", count(*) FROM tq2 GROUP BY "Ts.""q", "w""x" ORDER BY 1, 2',
+                'SELECT "w""x", max("t""s") FROM tq2 WHERE "Ts.""q" > 3 GROUP BY "w""x" ORDER BY 1',
+                'SELECT "t""s", count(*) FROM tq2 GROUP BY "t""s" ORDER BY 1 DESC LIMIT 3'):
+        got, dev = None, False
+        for _ in range(2):
+            got, dev, lr = _device_text(con, sql)
+        check(got == _as_text(ref, sql) and dev, f"a name holding quotes: on the device ({lr['reason']}; {sql[:50]})")
+    real_render = _rw.render
+    sql = "SELECT \"w\"\"x\", count(*) FROM tq2 WHERE v > {} GROUP BY \"w\"\"x\" ORDER BY 1"
+    _device_text(con, sql.format(10))
+    try:
+        def broken(*a, **k):
+            raise RuntimeError("a renderer defect")
+        _rw.render = broken
+        got, dev, lr = _device_text(con, sql.format(20))
+        check(got == _as_text(ref, sql.format(20)) and not dev and lr["reason"] == "error",
+              f"a reference-renderer failure: DuckDB answers, nothing reaches the caller ({lr['reason']})")
+
+        def interrupted(*a, **k):
+            raise duckdb.InterruptException("INTERRUPT Error: Interrupted!")
+        _rw.render = interrupted
+        try:
+            con.execute(sql.format(30)).fetchall()
+            check(False, "an interrupt during rendering reaches the caller")
+        except duckdb.InterruptException:
+            check(True, "an interrupt during rendering reaches the caller")
+    finally:
+        _rw.render = real_render
+    ref.close()
+    con.close()
+
+    # 5. a tie's literals keep their own plan: after the re-measure restores the decision, the
+    # statement with those literals is drawn with THEIR LIMIT
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    s = ("CREATE TABLE tt5 AS SELECT (i % 1000)::INTEGER AS k, "
+         "(CASE WHEN i % 1000 = 994 THEN 995 ELSE i % 1000 END)::BIGINT AS v FROM range(400000) r(i)")
+    for c in (con, ref):
+        c.execute(s)
+    tmpl = "SELECT k, sum(v) AS s FROM tt5 GROUP BY k ORDER BY s DESC LIMIT {}"
+    for _ in range(2):
+        _device_text(con, tmpl.format(3))
+    con._thresholds = True
+    real_remeasure, real_probe = _conn._REMEASURE_S, _conn.Connection._probe_ms
+    _conn._REMEASURE_S = 0.0
+    try:
+        got, dev, lr = _device_text(con, tmpl.format(5))          # the 5th and 6th sums tie
+        tied = lr["reason"] in ("ties", "threshold") and not dev
+        w = "INSERT INTO tt5 VALUES (994, 1)"                      # the tie goes, through a raw cursor
+        c2 = con._raw.cursor()
+        c2.execute(w)
+        c2.close()
+        ref.execute(w)
+        other = "SELECT k, count(*) FROM tt5 GROUP BY k ORDER BY k LIMIT 3"   # rebuilds the set (stale guard)
+        for _ in range(3):
+            _device_text(con, other)
+        _conn.Connection._probe_ms = lambda self, sql, p: 0.001          # the re-measure finds it faster
+        rows = []
+        for _ in range(3):
+            got, dev, lr = _device_text(con, tmpl.format(5))
+            rows.append((dev, got == _as_text(ref, tmpl.format(5)), len(got) if isinstance(got, list) else got))
+        check(tied and any(d for d, _o, _n in rows) and all(o for _d, o, _n in rows),
+              f"a tie declines LIMIT 5; once the tie has gone and the re-measure restores the template, "
+              f"LIMIT 5 returns its own five rows (tied {tied}; runs {rows})")
+    finally:
+        _conn._REMEASURE_S, _conn.Connection._probe_ms = real_remeasure, real_probe
+    ref.close()
+    con.close()
+
+    # 6. two decisions with different bounds over one statement: each reads its own set
+    s = "CREATE TABLE tdb AS SELECT (i % 7)::INTEGER AS a, (i % 5)::INTEGER AS b, i::BIGINT AS v FROM range(200000) r(i)"
+    sql = "SELECT a, b, sum(v) FROM tdb GROUP BY a, b ORDER BY 1, 2"
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    for c in (con, ref):
+        c.execute(s)
+    _wait_device(con, ref, sql)
+    tag_parent = con.last_rewrite()["tag"]
+    cur = con.cursor()
+    for a in ("_exact", "_join", "_store", "_global", "_narrow"):   # a cursor that takes the exact path
+        setattr(cur, a, getattr(con, a, False))
+    raw = con._raw.cursor()
+    raw.execute("INSERT INTO tdb VALUES (40, 30, 1)")
+    ref.execute("INSERT INTO tdb VALUES (40, 30, 1)")
+    raw.close()
+    seen = []
+    for who in (cur, con, cur, con, cur, con):
+        got, dev, lr = _device_text(who, sql)
+        d = who._last_decision
+        own = d.plan.key_suffix if (d is not None and d.plan is not None) else ""
+        seen.append((got == _as_text(ref, sql), (not dev) or (own and own in lr["tag"]), lr["tag"][-22:] if dev else lr["reason"]))
+    check(all(o and t for o, t, _x in seen) and any(x != tag_parent[-22:] for _o, _t, x in seen),
+          f"a cursor and its parent with different bounds: native's rows, each from its own set ({seen})")
+    cur.close()
+    ref.close()
+    con.close()
+    db = os.path.join(_tf.mkdtemp(), "two.duckdb")
+    c1 = gpudb.connect(db, residency="eager", floor_rows=0, thresholds=False)
+    c1.execute(s)
+    c2 = gpudb.connect(db, residency="eager", floor_rows=0, thresholds=False)
+    ref = duckdb.connect()
+    ref.execute(s)
+    _wait_device(c1, ref, sql)
+    other = duckdb.connect(db, config={"allow_unsigned_extensions": "true"})
+    other.execute("INSERT INTO tdb VALUES (40, 30, 1)")
+    other.close()
+    ref.execute("INSERT INTO tdb VALUES (40, 30, 1)")
+    seen = []
+    for who in (c2, c1, c2, c1, c2, c1):
+        got, dev, lr = _device_text(who, sql)
+        d = who._last_decision
+        own = d.plan.key_suffix if (d is not None and d.plan is not None) else ""
+        seen.append((got == _as_text(ref, sql), (not dev) or (own and own in lr["tag"])))
+    check(all(o and t for o, t in seen) and _device_text(c1, sql)[1] and _device_text(c2, sql)[1],
+          f"two connections to one database file: native's rows, each from a set of its own bounds ({seen})")
+    ref.close()
+    c2.close()
+    c1.close()
 
 
 def temporal_misc_checks():

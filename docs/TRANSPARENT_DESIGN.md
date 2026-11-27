@@ -644,9 +644,13 @@ group's slot):
   `CASE WHEN image BETWEEN min AND max THEN image - min + 1 WHEN image IS NULL
   THEN 0 ELSE error('GPUDB_IMAGE: …') END` (`_rewrite.key_lane_expr`), so the
   upload fails, the set is not resident and DuckDB answers. The residency
-  manager never queues such a set again (`_residency.IMAGE_ERROR`): the same
-  recipe can only fail again, or — after a delete — succeed over bounds the
-  decision no longer trusts.
+  manager does not queue such a set again until an invalidation moves its
+  epoch (`_residency.IMAGE_ERROR`): over the same data the same recipe can only
+  fail again. A component's bounds are taken over exactly the rows its lane is
+  uploaded over — a computed component of a device join's key over the whole
+  key table, which is what the key lane holds, not over the joined rows (a
+  fact row without a match, outside the joined rows' range, otherwise made
+  every upload refuse a statement that was right).
 - **The bounds are part of the key lane's name** (`a+b~<digest>`,
   `Plan.key_suffix`), and so of the set's tag and of the store column: a
   decision can only ever read a set built from its own bounds. The extension's
@@ -654,17 +658,34 @@ group's slot):
   exactly that suffix removed, and the suffix is put back into the statement it
   renders (a column named `a~b` is untouched).
 - **Before a packed set is uploaded again, its decision is looked at**
-  (`Connection._packed_bounds_hold`): if the upload refused a component, or if
-  the components' zone-map bounds — read again once per invalidation of the
-  set, metadata only — no longer lie within the decision's, the decision is
-  taken again on the spot and the old set's manager entry is forgotten. No
-  write drops a decision by itself: the writer cannot always be seen (a raw
-  cursor, another connection), and a set whose data still lies within its
-  bounds is right however it got there. Only the decision being run is
-  touched; another connection's decision over the same set meets the same
-  test at its own next sighting. A computed component has no zone map; for it
-  the upload's refusal is the check (one refused upload, DuckDB answers, the
-  next sighting packs anew).
+  (`Connection._packed_bounds_hold`), once per invalidation of the set: if
+  the components' zone-map bounds — metadata only — no longer lie within the
+  decision's, or if the upload refused a component, the decision is taken
+  again on the spot. A write through the connection itself clears every
+  decision it holds, as it always has; a write it does not see (a raw cursor,
+  another connection, a cursor of this one) drops nothing, and a set whose
+  data still lies within its bounds is right however it got there. Only the
+  decision being run is touched; another connection's decision over the same
+  set meets the same test at its own next sighting. A computed component has
+  no zone map; for it the upload's refusal is the check: one refused upload,
+  DuckDB answers, and the decision taken again scans the bounds of now.
+- **After a refusal, at most one further upload per change of the data.**
+  When the decision taken again names the same set — the same bounds — it is
+  kept, the refused set stays refused, and DuckDB answers (reason
+  `not_resident`, the error starting `GPUDB_IMAGE` and saying the zone map
+  gives the same bounds) until an invalidation lets it try once more. Without
+  this, a mismatch between the bounds and the uploaded rows was an upload and a
+  refusal on every execution.
+- **A superseded set is released.** A set no decision names any more — the one
+  a re-taken decision left behind, or a packed decision's set when a write
+  through the connection clears the decisions — is freed in the extension
+  (`gpu_drop_resident`: an invalidation drops a table's store, not a
+  materialised join's own columns nor a stale view's registry row) and only
+  then forgotten by the residency manager (`Connection._release_sets`). A set
+  that is resident or being uploaded is never forgotten: it is valid for
+  whichever decision reads it, and the manager can still evict it. A new name
+  per set of bounds also means a set refused for old bounds never stands in the
+  way of the new ones (main's twenty-attempt cap applied to one name).
 
 ### 4.5 VARCHAR keys via dictionary
 A VARCHAR key is uploaded as a dense int32 id against a host-side dictionary
