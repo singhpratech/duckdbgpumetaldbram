@@ -6293,6 +6293,35 @@ checks, 31 of which fail on main's wrapper on DuckDB 2.0.1, 2.0.0 and 1.5.6,
 all of which pass with the fix on the three. CUDA shares the wrapper and the
 extension's renderer; the same suite on Linux is the check.
 
+## 2026-11-26 — pip 0.7.5: the NULL-key WHERE fix as its own release
+
+The package version moves 0.7.3 -> 0.7.5 (`python/pyproject.toml`,
+`gpudb.__version__`); there is no 0.7.4. It carries the wrapper fix of the
+entry on a NULL-sensitive WHERE on a VARCHAR GROUP BY key, with its follow-up
+(the re-plan for new literals shares `key_predicate_columns`, so a single
+DECIMAL key with a WHERE on it no longer declines on every re-run), and nothing
+else. The extension is not rebuilt: the registry keeps serving v0.7.1, and the
+platform wheels bundle the same v0.7.0 binary the 0.7.1, 0.7.2 and 0.7.3 wheels
+did, which is the binary the fix was tested against, so the only difference
+between the packages is the Python tree. The defect returns rows that differ
+from native with shipped defaults: a `<>` or `IS [NOT] NULL` term on a single
+VARCHAR key kept or lost the NULL group (0.7.2 and 0.7.3). The infinite
+DATE / TIMESTAMP fix was held back from this release because an independent
+review found regressions in the changes around it; the release history lists
+the infinite-TIMESTAMP case, the alias / column ORDER BY case, the settings
+seen across cursors and the LIMIT tie case as still open. Docs that name the
+current package version follow; statements about what was measured on 0.7.2
+(the README's DuckDB 2.0.1 rows, `BENCHMARK.md`, the project page's tables)
+are history and stay, and the project page's caption now says those tables
+were not re-measured for 0.7.3 or 0.7.5. Measured at the released commit: the
+fix's test block has 186 checks, 42 of which fail on the
+0.7.3 wrapper; the wrapper suite passes with 1594 checks on DuckDB 2.0.1 and
+2.0.0 and 1624 on 1.5.6, none failing, on Apple Silicon and on an RTX 4090
+Laptop (CUDA) with the extension binary the wheels bundle; on the RTX 4090
+Laptop pip 0.7.3 returned the extra NULL group for both
+statements with shipped defaults (4000 and 4001 rows against DuckDB's 3999 and
+4000) and the fix matches DuckDB. TPC-H coverage is unchanged on DuckDB 2.0.1: 16 of 22 queries on the device at scale factor 1 and 18 of 22 at scale factor 10, no rows that differ.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
