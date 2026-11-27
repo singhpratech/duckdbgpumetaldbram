@@ -14,6 +14,7 @@ from __future__ import annotations
 import copy
 import json
 from typing import Optional
+from ._rewrite import IDENT_FOLD
 
 _AGGS = {"sum", "count", "count_star", "min", "max", "avg", "count_if", "bool_and", "bool_or",
          "sum_no_overflow", "first", "last", "any_value", "string_agg", "list", "array_agg",
@@ -106,7 +107,7 @@ def normalise(tree_json: str, names: Optional[list] = None) -> Optional[str]:
             node["group_sets"] = [list(range(len(new)))]
     # The output names the statement will carry once they are pinned below.
     out_names = [((names[i] if names is not None and i < len(names) else "") or it.get("alias")
-                  or _colname(it) or "").casefold() for i, it in enumerate(sel)]
+                  or _colname(it) or "").translate(IDENT_FOLD) for i, it in enumerate(sel)]
 
     def order_item(i: int) -> dict:
         """ORDER BY <i> as an expression that binds to select item i. Its bare
@@ -117,7 +118,7 @@ def normalise(tree_json: str, names: Optional[list] = None) -> Optional[str]:
         b = _bare(sel[i])
         n = _colname(b)
         if n is not None and len(b.get("column_names") or []) == 1 \
-                and any(on == n.casefold() for j, on in enumerate(out_names) if j != i):
+                and any(on == n.translate(IDENT_FOLD) for j, on in enumerate(out_names) if j != i):
             return _ordinal_const(i + 1)
         return b
 

@@ -23,6 +23,7 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from ._resolve import _one
+from ._rewrite import IDENT_FOLD
 
 _MAX_DEPTH = 4
 _CREATE_RE = re.compile(r"^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?"
@@ -46,7 +47,7 @@ class ViewCatalog:
             rows = self.con.execute(
                 "SELECT view_name, sql FROM duckdb_views() WHERE NOT internal AND NOT temporary "
                 "AND database_name = ? AND schema_name = ?", [db, sch]).fetchall()
-            self.tables = {r[0].casefold() for r in self.con.execute(
+            self.tables = {r[0].translate(IDENT_FOLD) for r in self.con.execute(
                 "SELECT table_name FROM duckdb_tables() WHERE NOT internal").fetchall()}
         except Exception:
             return
@@ -55,10 +56,10 @@ class ViewCatalog:
             if not m:
                 continue
             cols = [c.strip().strip('"') for c in (m.group("cols") or "").split(",") if c.strip()]
-            self.views[name.casefold()] = (m.group("body"), cols)
+            self.views[name.translate(IDENT_FOLD)] = (m.group("body"), cols)
 
     def body_of(self, table_name: str) -> Optional[Tuple[str, List[str]]]:
-        key = table_name.casefold()
+        key = table_name.translate(IDENT_FOLD)
         if key in self.tables:
             return None                     # a table of the same name exists: leave the binder to it
         return self.views.get(key)
@@ -102,7 +103,7 @@ def inline(tree_json: str, catalog: ViewCatalog, serialize: Callable[[str], str]
         if not isinstance(e, dict):
             return e
         if e.get("type") == "BASE_TABLE" and not e.get("schema_name") and not e.get("catalog_name") \
-                and not e.get("at_clause") and (e.get("table_name") or "").casefold() not in shadowed:
+                and not e.get("at_clause") and (e.get("table_name") or "").translate(IDENT_FOLD) not in shadowed:
             vn = view_node(e.get("table_name") or "", depth)
             if vn is not None:
                 out = json.loads(json.dumps(vn))
@@ -114,7 +115,7 @@ def inline(tree_json: str, catalog: ViewCatalog, serialize: Callable[[str], str]
         # a CTE of this statement hides a view of the same name (§4.22)
         entries = ((e.get("cte_map") or {}) if isinstance(e.get("cte_map"), dict) else {}).get("map") or []
         if entries:
-            shadowed = shadowed | {(c.get("key") or "").casefold() for c in entries if isinstance(c, dict)}
+            shadowed = shadowed | {(c.get("key") or "").translate(IDENT_FOLD) for c in entries if isinstance(c, dict)}
         for k, v in list(e.items()):
             if isinstance(v, (dict, list)) and k not in ("value", "cast_type", "type_info"):
                 e[k] = walk(v, depth, shadowed)

@@ -3560,6 +3560,10 @@ CREATE VIEW vq AS SELECT k AS kx, v, v2, w FROM tq;
 CREATE TABLE tt AS SELECT (i % 1000)::INTEGER AS k, ((i % 1000) // 2)::BIGINT AS v,
                           CASE WHEN i % 7 = 0 THEN NULL ELSE i END::BIGINT AS vn, ((i // 1000) % 10)::INTEGER AS w
                    FROM range(300000) r(i);
+CREATE TABLE tna AS SELECT (i % 1000)::INTEGER AS "ké", (300000 - i)::BIGINT AS v, ((i // 1000) % 10)::INTEGER AS w,
+                          (i % 1000)::INTEGER AS strasse FROM range(300000) r(i);
+CREATE TABLE tsk AS SELECT ('n' || (i % 1000)::VARCHAR) AS k, (300000 - i)::BIGINT AS v, ((i // 1000) % 10)::INTEGER AS w
+                   FROM range(300000) r(i);
 """
 
 
@@ -3597,6 +3601,19 @@ def order_alias_unit_checks():
         check(isinstance(p, _rw.Plan) and getattr(p, "order_outs", None) == [want_out] and p.order[0][0] == want_tgt,
               f"order-by name: {sql[sql.index('ORDER BY'):]} binds output {want_out} ({want_tgt}) in "
               f"{sql[:sql.index(' FROM')]} ({getattr(p, 'order', p)})")
+    # DuckDB folds ASCII letters only: `ké` / `KÉ` and `strasse` / `straße` are two names,
+    # `kÉ` / `KÉ` one (measured on 1.5.6, 2.0.0 and 2.0.1)
+    for sql, want_out in [('SELECT "ké" AS kk, sum(v) AS "KÉ" FROM tna GROUP BY "ké" ORDER BY "ké"', 0),
+                          ('SELECT strasse AS kk, sum(v) AS "straße" FROM tna GROUP BY strasse ORDER BY strasse', 0),
+                          ('SELECT "ké" AS kk, sum(v) AS "kÉ" FROM tna GROUP BY "ké" ORDER BY "KÉ"', 1)]:
+        p = plan_of(sql)
+        check(isinstance(p, _rw.Plan) and getattr(p, "order_outs", None) == [want_out],
+              f"order-by name: {sql[sql.index('ORDER BY'):]} beside {sql[7:sql.index(' FROM')]} binds output "
+              f"{want_out} (ASCII-only folding; {getattr(p, 'order_outs', p)})")
+    fold = getattr(_rw, "ident_fold", None)
+    check(fold is not None and fold("kÉ") == fold("KÉ") and fold("ké") != fold("KÉ")
+          and fold("strasse") != fold("straße") and fold("k") != fold("\u212a"),
+          "order-by name: names compare with ASCII letters folded and nothing else")
     p = plan_of("SELECT k AS kk, max(v2) AS k FROM tq GROUP BY tq.k ORDER BY k DESC LIMIT 5")
     check(isinstance(p, _rw.Plan) and p.form == "topk" and p.topk_agg == "max",
           f"order-by name: the device top-k selects by the output the name binds (max), not the key "
@@ -3629,6 +3646,24 @@ def order_alias_unit_checks():
               f"order-by name: the tie guard's window ranks the output, not r.key ({tq[:90]}...)")
     else:
         check(False, f"order-by name: the \"key\" alias plan ({p})")
+    # an output named like a relation of the rewritten statement: inside the window `"r"` is the
+    # table function's whole row, so the reference renderer never names the output there, and the
+    # extension's rendering (which does) is not used
+    p = plan_of('SELECT k, sum(v) AS r FROM tq GROUP BY k ORDER BY r DESC LIMIT 5')
+    if isinstance(p, _rw.Plan):
+        p.outputs[0].native_type, p.outputs[1].native_type = "INTEGER", "HUGEINT"
+        try:
+            tq = _rw.ties_qualify(p, ['CAST(r."key" AS INTEGER)', 'CAST(r."sum" AS HUGEINT)'])
+            shadowed = _rw.tie_window_shadowed(p, {"r", "gd"}) and _rw.tie_window_shadowed(p, None) is False
+            rel = _rw.relation_names(json.loads(con._serialize(
+                "SELECT 1 FROM range(3) AS r, (SELECT 1 AS ok FROM tq) AS gd")))
+        except (TypeError, AttributeError) as e:
+            tq, shadowed, rel = str(e), False, set()
+        check(shadowed and 'OVER (ORDER BY "r"' not in tq and 'ORDER BY (CAST(r."sum" AS HUGEINT)) DESC' in tq
+              and {"r", "gd", "tq"} <= rel,
+              f"order-by name: an output named r is ranked by its expression, never by the row r ({tq[:80]}...; {rel})")
+    else:
+        check(False, f"order-by name: the r alias plan ({p})")
 
     def tree_of(sql):
         return con._serialize(sql)
@@ -3639,6 +3674,16 @@ def order_alias_unit_checks():
     outer = con._deserialize(parts[1]) if parts else ""
     check(parts is not None and outer.rstrip().endswith("ORDER BY k") and "__k0 AS kk" in outer,
           f"order-by name: the split's outer ORDER BY keeps the alias, not the key ({outer[-60:]})")
+    parts = _sp.split(tree_of("SELECT k AS kk, sum(v)::VARCHAR AS k FROM tsk GROUP BY tsk.k ORDER BY k COLLATE NOCASE"),
+                      names, tmpl)
+    outer = con._deserialize(parts[1]) if parts else ""
+    check(parts is not None and outer.rstrip().endswith("ORDER BY k COLLATE NOCASE"),
+          f"order-by name: ORDER BY <alias> COLLATE binds the alias, and the split keeps it ({outer[-50:]})")
+    parts = _sp.split(tree_of("SELECT k AS kk, sum(v)::VARCHAR AS k FROM tsk GROUP BY tsk.k "
+                              "ORDER BY k COLLATE NOCASE COLLATE NOACCENT"), names, tmpl)
+    outer = con._deserialize(parts[1]) if parts else ""
+    check(parts is not None and "ORDER BY __k0 COLLATE" in outer,
+          f"order-by name: two collations bind the column first, as DuckDB does ({outer[-60:]})")
     parts = _sp.split(tree_of("SELECT sum(v) * 2 AS k, k FROM tq GROUP BY k ORDER BY k"), ["k", "k"], tmpl)
     check(parts is None, "order-by name: the split declines a name two outputs carry")
     out = _sx.normalise(tree_of("SELECT sum(v) AS k, k AS kk FROM tq GROUP BY tq.k ORDER BY 2 DESC"), ["k", "kk"])
@@ -3662,7 +3707,14 @@ def order_alias_unit_checks():
           f"order-by name: an outer alias named like a derived column keeps the ORDER BY ({txt[-30:]})")
     out = _fl.fold(tree_of("SELECT kx AS w, sum(v) AS s FROM (SELECT k AS kx, v FROM tq) d WHERE w < 300 "
                            "GROUP BY kx"), ["w", "s"])
-    check(out is None, "order-by name: a WHERE name only an outer alias answers is not folded onto a hidden column")
+    txt = con._deserialize(out) if out else ""
+    check("WHERE (k < 300)" in txt,
+          f"order-by name: a WHERE name only an outer alias answers folds as that alias, not the hidden tq.w ({txt[-40:]})")
+    out = _fl.fold(tree_of("SELECT kx AS g, sum(v) AS s FROM (SELECT k AS kx, v, w FROM tq) d WHERE w < 3 "
+                           "GROUP BY g ORDER BY g"), ["g", "s"])
+    txt = con._deserialize(out) if out else ""
+    check("GROUP BY k ORDER BY g" in txt,
+          f"order-by name: GROUP BY a renaming outer alias still folds ({txt[-40:]})")
     con.close()
 
 
@@ -3763,8 +3815,43 @@ def order_alias_checks():
         (f"SELECT sum(v) AS k, k FROM tq {W} GROUP BY k ORDER BY k", DECLINE),
         (f"SELECT k AS kk, sum(v) AS s FROM tq {W} GROUP BY tq.k ORDER BY -kk LIMIT 5", DECLINE),
         (f"SELECT k, sum(v) AS w FROM tq {W} GROUP BY k HAVING w > 0 ORDER BY k", DECLINE),
+        # names DuckDB compares with ASCII letters folded only
+        (f'SELECT "ké" AS kk, sum(v) AS "KÉ" FROM tna {W} GROUP BY "ké" ORDER BY "ké" LIMIT 5', "plain"),
+        (f'SELECT strasse AS kk, sum(v) AS "straße" FROM tna {W} GROUP BY strasse ORDER BY strasse LIMIT 5', "plain"),
+        (f'SELECT "ké" AS kk, sum(v) AS "kÉ" FROM tna {W} GROUP BY "ké" ORDER BY "KÉ" LIMIT 5', "topk"),
+        # outputs named like a relation of the rewritten statement (the row r, the guard gd)
+        (f"SELECT k, sum(v) AS r FROM tt {W} GROUP BY k ORDER BY r DESC LIMIT 5", TIES),
+        (f"SELECT k, count(*) AS r FROM tt {W} GROUP BY k ORDER BY r DESC LIMIT 5", TIES),
+        (f"SELECT k, sum(v) AS R FROM tq {W} GROUP BY k ORDER BY R DESC LIMIT 5", "topk"),
+        (f"SELECT k, sum(v) AS gd FROM tq {W} GROUP BY k ORDER BY gd DESC LIMIT 5", "topk"),
+        # ONE collation over an alias binds the alias; two bind the column
+        (f"SELECT k AS kk, sum(v)::VARCHAR AS k FROM tsk {W} GROUP BY tsk.k ORDER BY k COLLATE NOCASE LIMIT 5",
+         "projected"),
+        (f"SELECT k AS kk, sum(v)::VARCHAR AS k FROM tsk {W} GROUP BY tsk.k ORDER BY k COLLATE NOCASE DESC LIMIT 5",
+         "projected"),
+        (f"SELECT k AS kk, sum(v)::VARCHAR AS k FROM tsk {W} GROUP BY tsk.k ORDER BY k COLLATE NOCASE "
+         f"COLLATE NOACCENT LIMIT 5", "projected"),
+        # an outer alias over a folded derived table / view binds as that alias
         ("SELECT kx AS w, sum(v) AS s FROM (SELECT k AS kx, v FROM tq) d WHERE w < {}00 GROUP BY kx ORDER BY s",
-         DECLINE),
+         "plain"),
+        ("SELECT kx AS w, sum(v) AS s FROM (SELECT k AS kx, v FROM tq WHERE w < {}) d GROUP BY w ORDER BY s LIMIT 5",
+         "topk"),
+        ("SELECT kx AS g, sum(v) AS s FROM vq WHERE g < {}00 GROUP BY kx ORDER BY g", "plain"),
+        (f"SELECT kx AS g, sum(v) AS s FROM vq {W} GROUP BY kx HAVING s > 0 ORDER BY g LIMIT 5", "having"),
+    ]
+    # route parity (rule 2): these ran on the device on main, in this form, and still must
+    cases += [
+        (f"SELECT kx AS g, sum(v) AS s FROM vq {W} GROUP BY g ORDER BY g LIMIT 5", "plain"),
+        (f"SELECT kx AS g, sum(v) AS s FROM (SELECT k AS kx, v, w FROM tq) d {W} GROUP BY g ORDER BY s DESC LIMIT 5",
+         "topk"),
+        (f"SELECT kx AS tier, sum(v) AS s FROM (SELECT k AS kx, v, w FROM tq) d {W} GROUP BY tier ORDER BY tier",
+         "plain"),
+        (f"WITH q AS (SELECT k AS kx, v, w FROM tq) SELECT kx AS g, sum(v) AS s FROM q {W} GROUP BY g ORDER BY g",
+         "plain"),
+        (f"SELECT kx, sum(v) AS s FROM vq {W} GROUP BY kx ORDER BY kx LIMIT 5", "plain"),
+        (f"SELECT kx, sum(v) AS s FROM (SELECT k AS kx, v, w FROM tq) d {W} GROUP BY kx ORDER BY s DESC LIMIT 5",
+         "topk"),
+        (f"SELECT k, count(*) AS c, sum(v) AS s FROM tq {W} GROUP BY k HAVING sum(v) > 0 ORDER BY k LIMIT 5", "having"),
     ]
     if joins:
         cases += [
@@ -3776,6 +3863,14 @@ def order_alias_checks():
              f"ORDER BY j2 DESC LIMIT 5", "topk"),
             (f"SELECT dq.k2 AS kk, sum(tq.v) AS k2 FROM tq JOIN dq ON tq.k = dq.k {W} GROUP BY dq.k2 "
              f"ORDER BY dq.k2 LIMIT 5", "projected"),   # qualified: the column; the split answers it
+            # an arm of a join under a renaming outer alias: still folded (route parity with main),
+            # except where the arm's own table has a column of that name it hides
+            (f"SELECT dq.k2 AS g, sum(a.v) AS s FROM (SELECT k AS kx, v, w FROM tq) a JOIN dq ON a.kx = dq.k "
+             f"WHERE a.w < {{}} GROUP BY g ORDER BY g LIMIT 5", "plain"),
+            (f"SELECT dq.k2 AS j2x, sum(a.v) AS s FROM (SELECT k AS kx, v, w FROM tq) a JOIN dq ON a.kx = dq.k "
+             f"WHERE w < {{}} GROUP BY j2x ORDER BY j2x LIMIT 5", "plain"),
+            ("SELECT dq.k2 AS w, sum(a.v) AS s FROM (SELECT k AS kx, v FROM tq WHERE w < {}) a JOIN dq ON a.kx = dq.k "
+             "GROUP BY w ORDER BY s DESC LIMIT 5", DECLINE),
         ]
     else:
         skip("ORDER BY names over a join: this extension has no device join")
@@ -3806,7 +3901,8 @@ def order_alias_checks():
                 # the first literal is the extension's rendering where it has one (or the reference
                 # renderer's, where an output shadows a column of the rewritten FROM); the others
                 # are always the reference renderer's, drawn from the plan
-                shadow = form == "topk" and any(x in tmpl for x in ('AS "key"', 'AS "sum"', "AS ok"))
+                shadow = form == "topk" and any(x in tmpl for x in ('AS "key"', 'AS "sum"', "AS ok ", "AS r ",
+                                                                     "AS R ", "AS gd "))
                 first = "scalar" if scalar and not shadow else "python"
                 want_engine = first if n == 0 else "python"
             else:

@@ -25,6 +25,7 @@ import json
 from typing import Callable, List, Optional, Tuple
 
 from ._exprs import _same, _children, _is_const
+from ._rewrite import IDENT_FOLD
 
 _AGGS = {"sum", "count", "min", "max", "avg", "count_star"}
 _NO_LOC = 18446744073709551615
@@ -70,7 +71,7 @@ def _first_colref(e) -> Optional[dict]:
 def _name_count(names: List[str]) -> dict:
     out: dict = {}
     for n in names:
-        out[n.casefold()] = out.get(n.casefold(), 0) + 1
+        out[n.translate(IDENT_FOLD)] = out.get(n.translate(IDENT_FOLD), 0) + 1
     return out
 
 
@@ -81,13 +82,18 @@ def _order_alias(e: dict, select_aliases, name_count: dict, ok: list) -> bool:
     ORDER BY k` orders by the doubled sum. The outer statement keeps the name,
     and its own select list carries it with the original output names. A
     name two outputs carry binds to the last of them, which the outer
-    statement could not reproduce once every output is named: it declines."""
+    statement could not reproduce once every output is named: it declines.
+    `k COLLATE NOCASE` binds the same way (ONE collation over a bare name;
+    two, a cast, a function or `-k` bind the column first — measured on 1.5.6,
+    2.0.0 and 2.0.1), and keeps its collation in the outer statement."""
+    if e.get("class") == "COLLATE":
+        e = e.get("child") or {}
     if e.get("class") != "COLUMN_REF":
         return False
     nm = e.get("column_names") or []
-    if len(nm) != 1 or nm[0].casefold() not in select_aliases:
+    if len(nm) != 1 or nm[0].translate(IDENT_FOLD) not in select_aliases:
         return False
-    if name_count.get(nm[0].casefold(), 0) > 1:
+    if name_count.get(nm[0].translate(IDENT_FOLD), 0) > 1:
         ok[0] = False
     return True
 
@@ -139,7 +145,7 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
         return None
 
     aggs: List[dict] = []
-    select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
+    select_aliases = {(s.get("alias") or "").translate(IDENT_FOLD) for s in sel if s.get("alias")}
     name_count = _name_count(names)
 
     def key_of(e) -> Optional[int]:
@@ -148,7 +154,7 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
                 return i
             # t.k in the select list against GROUP BY k (or the reverse)
             if e.get("class") == "COLUMN_REF" and g.get("class") == "COLUMN_REF" and \
-                    (e.get("column_names") or [None])[-1].casefold() == (g.get("column_names") or [""])[-1].casefold():
+                    (e.get("column_names") or [None])[-1].translate(IDENT_FOLD) == (g.get("column_names") or [""])[-1].translate(IDENT_FOLD):
                 return i
         return None
 
@@ -188,7 +194,7 @@ def split(tree_json: str, names: List[str], outer_template: dict) -> Optional[Tu
                 return agg_ref(len(aggs) - 1, e)
             if e.get("class") == "COLUMN_REF":
                 nm = e.get("column_names") or []
-                if not (top_level_order and len(nm) == 1 and nm[0].casefold() in select_aliases):
+                if not (top_level_order and len(nm) == 1 and nm[0].translate(IDENT_FOLD) in select_aliases):
                     ok[0] = False                     # a column that is neither grouped nor aggregated
                 return e
         return {k: (v if k in ("value", "cast_type", "type_info") else sub(v)) for k, v in e.items()}
@@ -288,7 +294,7 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
     aggs: List[dict] = []
     _DISTINCT_OUTER = {"count": "count", "sum": "sum", "avg": "avg", "min": "min", "max": "max"}
     ok = [True]
-    select_aliases = {(s.get("alias") or "").casefold() for s in sel if s.get("alias")}
+    select_aliases = {(s.get("alias") or "").translate(IDENT_FOLD) for s in sel if s.get("alias")}
     name_count = _name_count(names)
 
     def key_of(e) -> Optional[int]:
@@ -296,7 +302,7 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
             if _same(g, e):
                 return i
             if e.get("class") == "COLUMN_REF" and g.get("class") == "COLUMN_REF" and \
-                    (e.get("column_names") or [None])[-1].casefold() == (g.get("column_names") or [""])[-1].casefold():
+                    (e.get("column_names") or [None])[-1].translate(IDENT_FOLD) == (g.get("column_names") or [""])[-1].translate(IDENT_FOLD):
                 return i
         return None
 
@@ -352,7 +358,7 @@ def split_distinct(tree_json: str, names: List[str], outer_template: dict) -> Op
                 return fn({"sum": "sum", "min": "min", "max": "max"}[name], r, alias)
             if e.get("class") == "COLUMN_REF":
                 nm = e.get("column_names") or []
-                if not (top_level_order and len(nm) == 1 and nm[0].casefold() in select_aliases):
+                if not (top_level_order and len(nm) == 1 and nm[0].translate(IDENT_FOLD) in select_aliases):
                     ok[0] = False
                 return e
         return {k: (v if k in ("value", "cast_type", "type_info") else sub(v)) for k, v in e.items()}

@@ -2188,36 +2188,50 @@ and the gate are the proof. Join results are still copies — stage D.
    everything else in the tree (CTEs, projections, further `ORDER BY`,
    joins to the result) is left as is.
    - **What a name in `ORDER BY` binds to** (2026-11-26, measured on DuckDB
-     1.5.6, 2.0.0 and 2.0.1, which agree): an *unqualified* name is an
-     explicit select alias first — matched without regard to case, quoted or
-     not — and a column of the `FROM` only when no alias carries it; `t.k` is
-     always the column; a name two aliases carry binds to the LAST of them.
-     So `SELECT k AS kk, sum(v) AS k … ORDER BY k` orders by the sum. Inside
-     an `ORDER BY` expression (`-k`), in `GROUP BY`, `HAVING` and `WHERE` it
-     is the other way round: a column first, an alias only when no column
-     carries the name (and in `HAVING` a column that is not grouped does not
-     count). The plan records the ORDER BY target as the index of the output
-     it binds to, the renderers name that output by its final name, and a
-     pushed top-k selects by that output's aggregate. Every pass that rewrites
-     a tree before the matcher sees it keeps those bindings: the split
-     (§4.11) keeps an alias in the outer `ORDER BY`; the shorthand pass
-     (§4.21) leaves an ordinal as an ordinal where the bare select item would
-     be a name another output carries; the fold (§4.16, views, CTEs) keeps an
-     outer alias in `ORDER BY`, qualifies a substituted derived column whose
-     bare name an output carries, and does not fold a statement whose
-     `WHERE` / `GROUP BY` / `HAVING` name only an outer alias answered (once
-     folded it could bind a column the derived table hid); the join lowering
-     leaves an alias-bound name alone and declines a resolved column whose
-     virtual name another output's alias carries. What declines: a name two
-     outputs carry (the rewritten statement names every output, so it could
-     not say which one), an alias-only name inside an `ORDER BY` or `HAVING`
-     expression. The tie guard's window (§4.24) is the one place in the
-     rewritten statement where a name binds a `FROM` column before an alias,
-     so an output named like one of the table function's columns (`count(*)
-     AS count`, `sum(v) AS "key"`, `… AS ok`) is ranked by its expression,
-     and the reference renderer draws such a top-k (the extension's tie guard
-     names the output). None of this adds a query: the bindings are read off
-     the tree the wrapper already holds.
+     1.5.6, 2.0.0 and 2.0.1, which agree): an *unqualified* name — or ONE
+     `COLLATE` over it (`k COLLATE NOCASE`) — is an explicit select alias
+     first, quoted or not, and a column of the `FROM` only when no alias
+     carries it; `t.k` is always the column; a name two aliases carry binds
+     to the LAST of them. So `SELECT k AS kk, sum(v) AS k … ORDER BY k`
+     orders by the sum. Names compare with **ASCII letters folded and nothing
+     else**: `k` / `K` and `kÉ` / `KÉ` are one name, `ké` / `KÉ`, `strasse` /
+     `straße` and `k` / U+212A KELVIN SIGN are two — for aliases and columns
+     alike — so the wrapper compares names through one table
+     (`_rewrite.IDENT_FOLD`), never Python's `casefold()` or `lower()`. Any
+     other `ORDER BY` expression (`-k`, `k::BIGINT`, `abs(k)`, `CASE`, two
+     collations), and `GROUP BY`, `HAVING` and `WHERE`, bind the other way
+     round: a column first, an alias only when no column carries the name
+     (in `HAVING` a column that is not grouped does not count). The plan
+     records the ORDER BY target as the index of the output it binds to, the
+     renderers name that output by its final name, and a pushed top-k
+     selects by that output's aggregate. Every pass that rewrites a tree
+     before the matcher sees it keeps those bindings: the split (§4.11)
+     keeps an alias, and its collation, in the outer `ORDER BY`; the
+     shorthand pass (§4.21) leaves an ordinal as an ordinal where the bare
+     select item would be a name another output carries; the fold (§4.16,
+     views, CTEs) keeps an outer alias in `ORDER BY`, qualifies a substituted
+     derived column whose bare name an output carries, and replaces a name
+     no derived column carries — which DuckDB bound to an outer alias
+     (`… FROM (SELECT k AS kx, v FROM t) d WHERE w < 3` with `kx AS w`) — by
+     that alias's expression, so a column the derived table hid cannot take
+     it over once folded; in an arm of a join such a name may be another
+     table's column instead, so it stays as written unless the arm's own
+     table has a column of that name (one catalog read, made only then), and
+     then the statement is not folded; the join lowering leaves an
+     alias-bound name alone and declines a resolved column whose virtual name
+     another output's alias carries. What declines: a name two outputs carry
+     (the rewritten statement names every output, so it could not say which
+     one), an alias-only name inside an `ORDER BY` or `HAVING` expression the
+     split cannot place. The tie guard's window (§4.24) is the one place in
+     the rewritten statement where a name binds the `FROM` before an alias —
+     a table-function column (`count(*) AS count`), or a relation, where
+     `"r"` is the table function's whole row (`sum(v) AS r`) — so the
+     reference renderer's window never names the output: it ranks the
+     output's own expression, whose column references are qualified. The
+     extension's tie guard does name it, so a top-k whose output is named
+     like a table-function column or like any relation its rendered
+     statement introduces is drawn by the reference renderer. No query is
+     added on the path of a statement without such a name.
 4. `last_rewrite()` is a **wrapper** method (not a SQL function: the scalar
    is pure and may run in parallel) reporting, for the last statement on
    that connection, whether it was rewritten and if not why (`shape` /

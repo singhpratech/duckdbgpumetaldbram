@@ -46,6 +46,20 @@ _FLIP = {">": "<", ">=": "<=", "<": ">", "<=": ">=", "=": "=", "<>": "<>"}
 TIES_MARKER = "GPUDB_TIES"
 
 
+# DuckDB compares identifiers with ASCII letters folded and every other
+# character as written: `k` / `K` and `kÉ` / `KÉ` are one name, `ké` / `KÉ`,
+# `strasse` / `straße` and `k` / KELVIN SIGN are two (measured on 1.5.6, 2.0.0
+# and 2.0.1, for select aliases and columns alike). Python's casefold() and
+# lower() fold far more than that, so every comparison of SQL names goes
+# through this table: `name.translate(IDENT_FOLD)`.
+IDENT_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def ident_fold(name: str) -> str:
+    """A SQL name the way DuckDB compares it (ASCII letters folded only)."""
+    return (name or "").translate(IDENT_FOLD)
+
+
 def _has_colref(e) -> bool:
     """Does this subtree name a column at all? (What §4.12's constant key
     needs: see the no-GROUP-BY decline in match().)"""
@@ -449,16 +463,18 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
     # An ORDER BY name binds the way DuckDB's binder binds it (measured on
     # 1.5.6, 2.0.0 and 2.0.1, docs/TRANSPARENT_DESIGN.md §6): an UNQUALIFIED
     # name is a select-list alias first — an explicit `AS` alias only, matched
-    # without regard to case, quoted or not — and a column of the table only
-    # when no alias carries it; a qualified `t.k` is always the column. So in
-    # `SELECT k AS kk, sum(v) AS k ... ORDER BY k` the order is the sum's. A
-    # name two select items answer to declines: DuckDB takes the last of them,
-    # and the rendered statement could not say which one it means.
+    # with ASCII letters folded (IDENT_FOLD; `ké` and `KÉ` are two names),
+    # quoted or not — and a column of the table only when no alias carries it;
+    # a qualified `t.k` is always the column. So in `SELECT k AS kk, sum(v) AS
+    # k ... ORDER BY k` the order is the sum's. A name two select items answer
+    # to declines: DuckDB takes the last of them, and the rendered statement
+    # could not say which one it means. (`k COLLATE x` binds alias-first too;
+    # the matcher declines a COLLATE and the split answers it.)
     explicit: Dict[str, List[int]] = {}
     for i, item in enumerate(sel):
         if item.get("alias"):
-            explicit.setdefault(item["alias"].casefold(), []).append(i)
-    keys_cf = [k.casefold() for k in plan.keys]
+            explicit.setdefault(item["alias"].translate(IDENT_FOLD), []).append(i)
+    keys_cf = [k.translate(IDENT_FOLD) for k in plan.keys]
     for m in node.get("modifiers") or []:
         t = m.get("type")
         if t == "ORDER_MODIFIER":
@@ -475,15 +491,15 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                     if idx is None or idx != idx.to_integral_value() or not (1 <= int(idx) <= len(plan.outputs)):
                         raise Decline("shape", "order by ordinal")
                     out_i = int(idx) - 1
-                elif c is not None and len(bare) == 1 and c.casefold() in explicit:
-                    hits = explicit[c.casefold()]
+                elif c is not None and len(bare) == 1 and c.translate(IDENT_FOLD) in explicit:
+                    hits = explicit[c.translate(IDENT_FOLD)]
                     if len(hits) > 1:
                         raise Decline("shape", f"order by {c}: {len(hits)} select items are named {c}")
                     out_i = hits[0]
                 elif c is not None:
-                    if c.casefold() not in keys_cf:
+                    if c.translate(IDENT_FOLD) not in keys_cf:
                         raise Decline("shape", f"order by {c}")
-                    ki = keys_cf.index(c.casefold())
+                    ki = keys_cf.index(c.translate(IDENT_FOLD))
                     out_i = next((i for i, out in enumerate(plan.outputs)
                                   if out.kind == "key" and out.key_index == ki), None)
                     if out_i is None:
@@ -761,9 +777,9 @@ def check_order_names(plan: Plan) -> None:
     but once every output is named, `ORDER BY "k"` would order by the key."""
     seen: Dict[str, int] = {}
     for o in plan.outputs:
-        seen[o.name.casefold()] = seen.get(o.name.casefold(), 0) + 1
+        seen[o.name.translate(IDENT_FOLD)] = seen.get(o.name.translate(IDENT_FOLD), 0) + 1
     for oi in plan.order_outs:
-        if oi is not None and seen[plan.outputs[oi].name.casefold()] > 1:
+        if oi is not None and seen[plan.outputs[oi].name.translate(IDENT_FOLD)] > 1:
             raise Decline("shape", f"order by {plan.outputs[oi].name}: two outputs carry that name")
 
 
@@ -1113,21 +1129,52 @@ def _order_out(plan: Plan, i: int) -> Optional[int]:
     return plan.order_outs[i] if i < len(plan.order_outs) else None
 
 
-# The columns the rewritten statement's FROM carries: the table functions'
-# (key, sum, count, count_star, min, max, avg, and sum0 / count0 / ... for
-# several payloads), the dictionary's (id, c0, c1, ...) and the guard's (ok).
-_FROM_COLUMN_RE = re.compile(r"^(?:(?:key|sum|count|count_star|min|max|avg)\d*|ok|id|c\d+)$", re.IGNORECASE)
+# The columns the extension's table functions return (key, sum, count,
+# count_star, min, max, avg, and sum0 / count0 / ... for several payloads),
+# the dictionary's (id, c0, c1, ...) and the guard's (ok). Only the
+# extension's rendering of a tie guard needs this list (tie_window_shadowed);
+# the reference renderer's window does not name the output at all.
+_FROM_COLUMN_RE = re.compile(r"^(?:(?:key|sum|count|count_star|min|max|avg)\d*|ok|id|c\d+)$")
 
 
-def tie_window_shadowed(plan: Plan) -> bool:
-    """Is the pushed top-k's target an output named like a column of the
-    rewritten statement's FROM? The tie guard's window would rank that
-    column instead of the output (see ties_qualify), so only a renderer that
-    hands the window the output's expression may draw the statement."""
+def relation_names(tree) -> set:
+    """Every relation name a rendered statement's tree introduces anywhere —
+    table function, derived table and table aliases, and the names of tables
+    read without one — folded as DuckDB folds names. A superset of what is
+    in scope at the top of the statement, which is the safe direction."""
+    out: set = set()
+
+    def walk(e):
+        if isinstance(e, dict):
+            if e.get("type") in ("TABLE_FUNCTION", "SUBQUERY", "BASE_TABLE", "JOIN", "EXPRESSION_LIST"):
+                if e.get("alias"):
+                    out.add(ident_fold(e["alias"]))
+                if e.get("type") == "BASE_TABLE" and e.get("table_name"):
+                    out.add(ident_fold(e["table_name"]))
+            for v in e.values():
+                walk(v)
+        elif isinstance(e, list):
+            for v in e:
+                walk(v)
+    walk(tree)
+    return out
+
+
+def tie_window_shadowed(plan: Plan, relations: Optional[set] = None) -> bool:
+    """Could a window that NAMES the pushed top-k's output bind something
+    else? Inside a window a name binds the FROM first: a column of the table
+    function (`count(*) AS count`, `sum(v) AS "key"`), or a relation itself —
+    `"r"` there is the table function's whole row, so `sum(v) AS r` ranked
+    (key, sum, ...) and missed every tie. `relations`: the names the rendered
+    statement introduces (relation_names). Only the extension's tie guard
+    names the output; the reference renderer ranks the output's expression."""
     if plan.form != "topk" or not plan.order:
         return False
     oi = _order_out(plan, 0)
-    return oi is not None and bool(_FROM_COLUMN_RE.match(plan.outputs[oi].name))
+    if oi is None:
+        return False
+    nm = ident_fold(plan.outputs[oi].name)
+    return bool(_FROM_COLUMN_RE.match(nm)) or nm in (relations or set()) or nm.startswith("gpudb_")
 
 
 def _order_suffix(direction: str, nulls: str) -> str:
@@ -1168,18 +1215,19 @@ def ties_qualify(plan: Plan, exprs: Optional[List[str]] = None) -> str:
     Both windows share one specification, so they cost one pass over the k + 1
     rows the device returned.
 
-    Inside a window, unlike in the ORDER BY beside it, a name binds to a
-    column of the FROM before a select alias (measured on 1.5.6 and 2.0.1).
-    An output named like one of the table function's columns (`count(*) AS
-    count`, `sum(v) AS "key"`) would rank the column, not the output, so the
-    window is given the output's expression instead (`exprs`, one per output,
-    as the renderer built them)."""
+    Inside a window, unlike in the ORDER BY beside it, a name binds to the
+    FROM before a select alias (measured on 1.5.6, 2.0.0 and 2.0.1): an
+    output named like a table-function column (`count(*) AS count`) ranks
+    that column, and one named like a relation (`sum(v) AS r`) ranks the
+    relation's whole row. So the window never names the output: it ranks the
+    output's own expression (`exprs`, one per output, as the renderer built
+    them), whose column references are all qualified."""
     if plan.limit is None or len(plan.order) != 1:
         return ""
     tgt, direction, nulls = plan.order[0]
     oi = _order_out(plan, 0)
     ref = _order_ref(plan, tgt, oi)
-    if oi is not None and exprs is not None and _FROM_COLUMN_RE.match(plan.outputs[oi].name):
+    if oi is not None and exprs is not None:
         ref = f"({exprs[oi]})"
     w = f"OVER (ORDER BY {ref}{_order_suffix(direction, nulls)})"
     kind, _, name = tgt.partition(":")

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ._rewrite import Decline
+from ._rewrite import Decline, IDENT_FOLD
 from ._resolve import Identity
 
 _SKIP = {"value", "cast_type", "type_info"}
@@ -30,17 +30,17 @@ class _Scope:
     def lookup(self, names: List[str]) -> Optional[str]:
         """The type of the column these names bind to in this scope, or None."""
         if len(names) == 2:
-            ident = self.aliases.get(names[0].casefold())
+            ident = self.aliases.get(names[0].translate(IDENT_FOLD))
             if ident is None:
                 return None
             for c, t in ident.columns.items():
-                if c.casefold() == names[1].casefold():
+                if c.translate(IDENT_FOLD) == names[1].translate(IDENT_FOLD):
                     return t
             raise Decline("shape", f"no column {names[1]} in {names[0]}")
         if len(names) == 1:
             for ident in self.aliases.values():
                 for c, t in ident.columns.items():
-                    if c.casefold() == names[0].casefold():
+                    if c.translate(IDENT_FOLD) == names[0].translate(IDENT_FOLD):
                         return t
         return None
 
@@ -57,7 +57,7 @@ def mark(e, resolve_fn: Callable[[str, str, str], Tuple[Optional[Identity], str]
             ident, why = resolve_fn(ft.get("catalog_name") or "", ft.get("schema_name") or "", ft.get("table_name") or "")
             if ident is None:
                 raise Decline(why or "shape", f"subquery over {ft.get('table_name')}")
-            alias = (ft.get("alias") or ident.table).casefold()
+            alias = (ft.get("alias") or ident.table).translate(IDENT_FOLD)
             if alias in scope.aliases:
                 raise Decline("shape", "repeated alias inside a subquery")
             scope.aliases[alias] = ident

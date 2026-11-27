@@ -6319,6 +6319,76 @@ SF1 16 of 22, SF10 18 of 22, the same path per query, 0 rows differing; Q11
 measured 1.00x (main) and 0.98x (fix) at SF10 under that load, the same path
 on both. Not run on the NVIDIA machine.
 
+## 2026-11-26 — The alias fix, reviewed: ASCII-only names, a window that names a relation, COLLATE, and a fold that stopped
+
+A review of the entry above ran 300 statements against native on 1.5.6, 2.0.0
+and 2.0.1 under both renderers and found four things; each is measured here
+on all three versions.
+
+Names. The matcher compared names with Python's `casefold()`. DuckDB folds
+ASCII letters and nothing else — for select aliases and for columns: `kÉ` /
+`KÉ` and `Straße` / `sTRAßE` are one name; `ké` / `KÉ`, `strasse` / `straße`,
+`k` / KELVIN SIGN, `i` / `İ`, `σ` / `ς`, `ǆ` / `ǅ` are two (14 pairs, same
+answer on the three versions). So `SELECT "ké" AS kk, sum(v) AS "KÉ" ...
+ORDER BY "ké"` bound the sum in the plan and came back in sum order on every
+re-run; main was right there. Every comparison of SQL names in the wrapper
+now goes through one table, `_rewrite.IDENT_FOLD` (`ident_fold()`), in the
+matcher, the split, the fold, the shorthand pass, the join lowering, the
+computed lanes and the scope / view / CTE passes. Python's `lower()` would
+have been as wrong as `casefold()`.
+
+The tie guard's window. A name there binds the FROM first, and that includes
+a RELATION: `"r"` is the table function's whole row, so `sum(v) AS r ... ORDER
+BY r DESC LIMIT 5` ranked (key, sum, ...) — a tie went undetected and the row
+set differed (k=995 against native's 994); `count(*) AS r`, every group tied,
+came back on the device instead of going to DuckDB. On main too, both
+renderers. Fixed by construction in the reference renderer: its window never
+names the output, it ranks the output's own expression (qualified column
+references only). The extension's window does name it, so a top-k whose output
+is named like a table-function column or like any relation the extension's
+rendered tree introduces (read from that tree, `relation_names()`) is drawn by
+the reference renderer.
+
+COLLATE. `ORDER BY k COLLATE NOCASE` binds the alias first, like a bare name;
+`(k)` is a bare name in the tree; two collations, a cast, `abs()`, `-k`,
+`+k`, `coalesce`, `CASE`, `k || ''` bind the column first (31 forms, VARCHAR
+and INTEGER, identical on the three versions). The split sent the COLLATE's
+child through the key lookup, so `SELECT k AS kk, sum(v)::VARCHAR AS k ...
+ORDER BY k COLLATE NOCASE LIMIT 5` ordered by the key, with the wrong row set,
+on every literal. The split, the fold and the join lowering now look through
+ONE collation; the matcher still declines a COLLATE (the split answers it).
+
+The fold. The first fix stopped folding any statement whose WHERE / GROUP BY /
+HAVING named a renaming outer alias, so `SELECT kx AS g ... FROM some_view
+GROUP BY g` — an everyday shape that ran on the device on main — went native.
+What DuckDB does there is plain: no column of the derived table carries `g`,
+so it is the alias. The fold now substitutes the alias's expression, which is
+that binding, and a column the derived table hid cannot take it over. That
+also puts on the device three shapes main declined and one it answered wrong
+(`... FROM (SELECT k AS kx, v FROM t) d WHERE w < 300` with `kx AS w`, where
+main filtered the table's `w`). In an ARM of a join the name may be another
+table's column instead, so it stays as written, and the fold stops only when
+the arm's own table has a column of that name — asked of the catalog, once
+per table, only on that path.
+
+Measured (worktree `python/`, the 0.7.3 wheel's binary, other jobs running):
+the reviewer's lists plus 29 of my own (180 statements, 540 executions) are
+native-equal, row order included, on 2.0.1, 2.0.0 and 1.5.6; main differs on
+117 of them. No statement that ran on the device on main runs native now
+except true ties handed to DuckDB; the no-clash sweep (72 executions) takes
+main's route on all three versions; 19 executions change form, each a
+statement whose main plan had the wrong target (main right on that literal by
+coincidence). The new checks fail on main (179 of 493) and on the first fix
+(57 of 493). The four suites pass on 2.0.1, 2.0.0 and 1.5.6 (test_wrapper 1870
+/ 1870 / 1900 against main's 1408 / 1408 / 1438; shell 76, residency policy
+131, ast compat 9, unchanged). `scripts/tpch_coverage.py`, 2.0.1, SF1, N=5:
+16 of 22 on both trees, the same path per query, 0 rows differing, 1.35x to
+13.24x. Rule 2: no query on a statement without such a name; the matcher
+costs 27.3-27.5 us against main's 24.7-25.6 us (median of 7 x 2000, load
+average 3-6); the catalog read of the join-arm case runs only on that path.
+The shipped-default reproductions are native-equal on the worktree. Not run on
+the NVIDIA machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

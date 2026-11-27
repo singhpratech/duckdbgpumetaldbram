@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 from typing import Dict, Optional
+from ._rewrite import IDENT_FOLD
 
 _NO_LOC = 18446744073709551615
 
@@ -98,7 +99,7 @@ def _colname(e) -> Optional[str]:
     return None
 
 
-def fold_once(tree: dict, names: Optional[list] = None) -> bool:
+def fold_once(tree: dict, names: Optional[list] = None, columns_of=None) -> bool:
     """Fold the statement's derived table (or its single CTE) into it. True when the tree changed."""
     stmts = tree.get("statements") or []
     if len(stmts) != 1:
@@ -132,19 +133,19 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
         if ft.get("sample"):
             return False
     elif ft.get("type") == "BASE_TABLE" and len(ctes) == 1 and not ft.get("schema_name") \
-            and (ctes[0].get("key") or "").casefold() == (ft.get("table_name") or "").casefold():
+            and (ctes[0].get("key") or "").translate(IDENT_FOLD) == (ft.get("table_name") or "").translate(IDENT_FOLD):
         val = ctes[0].get("value") or {}
         inner = (val.get("query") or {}).get("node")
         alias, col_aliases = ft.get("alias") or ft.get("table_name") or "", list(val.get("aliases") or [])
         if ft.get("sample") or ft.get("at_clause") or ft.get("column_name_alias"):
             return False
         # the CTE must not be read anywhere else in the statement
-        name = (ctes[0].get("key") or "").casefold()
+        name = (ctes[0].get("key") or "").translate(IDENT_FOLD)
         refs = [0]
 
         def count(e):
             if isinstance(e, dict):
-                if e.get("type") == "BASE_TABLE" and (e.get("table_name") or "").casefold() == name \
+                if e.get("type") == "BASE_TABLE" and (e.get("table_name") or "").translate(IDENT_FOLD) == name \
                         and not e.get("schema_name"):
                     refs[0] += 1
                 for k, v in e.items():
@@ -177,9 +178,9 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
         name = col_aliases[i] if col_aliases else (it.get("alias") or _colname(it))
         if not name:
             return False                       # an unnamed expression cannot be referenced anyway; be strict
-        if name.casefold() in mapping:
+        if name.translate(IDENT_FOLD) in mapping:
             return False
-        mapping[name.casefold()] = it
+        mapping[name.translate(IDENT_FOLD)] = it
     if arm_slot is not None:
         if star:
             return False                       # `arm.col` over SELECT * would lose its qualifier
@@ -212,9 +213,9 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
     def expr_for(names) -> Optional[dict]:
         if not names or len(names) > 2:
             return None
-        if len(names) == 2 and names[0].casefold() != alias.casefold():
+        if len(names) == 2 and names[0].translate(IDENT_FOLD) != alias.translate(IDENT_FOLD):
             return None
-        it = mapping.get(names[-1].casefold())
+        it = mapping.get(names[-1].translate(IDENT_FOLD))
         if it is None:
             if star and len(names) == 2:       # shipping.col over SELECT *: drop the qualifier
                 return {"class": "COLUMN_REF", "type": "COLUMN_REF", "alias": "", "query_location": _NO_LOC,
@@ -223,37 +224,98 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
         out = dict(json.loads(json.dumps(it)), alias="")
         return requalify(out) if qual else out
 
-    select_aliases = {(s.get("alias") or "").casefold() for s in (node.get("select_list") or []) if s.get("alias")}
+    sel_items = node.get("select_list") or []
+    select_aliases = {(s.get("alias") or "").translate(IDENT_FOLD) for s in sel_items if s.get("alias")}
+    alias_items: Dict[str, list] = {}
+    for i, s_ in enumerate(sel_items):
+        if s_.get("alias"):
+            alias_items.setdefault(s_["alias"].translate(IDENT_FOLD), []).append(i)
     # an alias that only names its own column (`tier AS tier`, as every item is once its name is pinned)
     # cannot answer for a name that column does not
-    renaming = {(s.get("alias") or "").casefold() for s in (node.get("select_list") or [])
-                if s.get("alias") and (_colname(s) or "").casefold() != s["alias"].casefold()}
+    renaming = {(s.get("alias") or "").translate(IDENT_FOLD) for s in sel_items
+                if s.get("alias") and (_colname(s) or "").translate(IDENT_FOLD) != s["alias"].translate(IDENT_FOLD)}
     # A name keeps the binding it had (§6): ORDER BY binds an unqualified
-    # name to an outer select alias before a derived column, and everywhere
-    # else a name binds a derived column first and an outer alias only when no
-    # column carries it. Folding removes the derived table's columns from
-    # sight and puts the base table's in their place, so
+    # name (or one COLLATE over it) to an outer select alias before a derived
+    # column, and everywhere else a name binds a derived column first and an
+    # outer alias only when no column carries it. Folding removes the derived
+    # table's columns from sight and puts the base table's in their place, so
     #   * a top-level ORDER BY name an outer alias carries stays that name;
-    #   * a name that only an outer alias answered (WHERE w, where the derived
-    #     table hides the table's w) would bind the table's column once
-    #     folded: the statement is not folded;
+    #   * a name no derived column carries, which an outer alias answered
+    #     (`WHERE w`, `GROUP BY g`, a lateral `g + 1`), is replaced by that
+    #     alias's expression when the derived table is the whole FROM — that is
+    #     the binding DuckDB made, and the base table's hidden `w` cannot take
+    #     it over. In an arm of a join the name may instead be another table's
+    #     column, so it is left as written unless the arm's own tables have a
+    #     column of that name (`columns_of`; unknown means they might): then
+    #     the statement is not folded;
     #   * a derived column substituted into a top-level ORDER BY as a bare
     #     name an output carries would be captured by that output's alias:
     #     it is qualified with the base table, or the statement not folded.
     abort = [False]
+    resolving: set = set()
+
+    def arm_has_column(nm: str) -> bool:
+        if columns_of is None:
+            return True
+        leaves: list = []
+
+        def walk(f):
+            if isinstance(f, dict) and f.get("type") == "JOIN":
+                walk(f.get("left")); walk(f.get("right"))
+            else:
+                leaves.append(f)
+        walk(inner.get("from_table"))
+        for lf in leaves:
+            cols = columns_of(lf) if isinstance(lf, dict) and lf.get("type") == "BASE_TABLE" else None
+            if cols is None or nm in cols:
+                return True
+        return False
+
+    def alias_expr(nm: str):
+        """The outer select item alias `nm` names, as folded (DuckDB's alias binding)."""
+        idx = alias_items.get(nm, [])
+        if len(idx) != 1 or nm in resolving:
+            abort[0] = True
+            return None
+        resolving.add(nm)
+        try:
+            x = sub(sel_items[idx[0]])
+        finally:
+            resolving.discard(nm)
+        return dict(x, alias="") if isinstance(x, dict) else None
+
+    def order_name(e) -> Optional[dict]:
+        """The bare name an ORDER BY item binds alias-first: a name, or ONE COLLATE over a name."""
+        if isinstance(e, dict) and e.get("class") == "COLLATE":
+            e = e.get("child")
+        if isinstance(e, dict) and e.get("class") == "COLUMN_REF" and len(e.get("column_names") or []) == 1:
+            return e
+        return None
 
     def sub(e, top_select: bool = False, in_order: bool = False, order_top: bool = False):
         if isinstance(e, list):
             return [sub(x, top_select, in_order) for x in e]
         if not isinstance(e, dict):
             return e
+        if order_top:
+            on = order_name(e)
+            if on is not None and on["column_names"][0].translate(IDENT_FOLD) in select_aliases:
+                return e                       # ORDER BY an outer select alias
         if e.get("class") == "COLUMN_REF":
             names = e.get("column_names") or []
-            if order_top and len(names) == 1 and names[0].casefold() in select_aliases:
-                return e                       # ORDER BY an outer select alias
             r = expr_for(names)
             if r is None:
-                if not star and len(names) == 1 and names[0].casefold() in renaming:
+                nm = names[0].translate(IDENT_FOLD) if len(names) == 1 else ""
+                if star or not nm or nm not in select_aliases:
+                    return e
+                if arm_slot is None:
+                    x = alias_expr(nm)         # the alias DuckDB bound it to
+                    if x is None:
+                        return e
+                    if top_select and e.get("alias"):
+                        x["alias"] = e["alias"]
+                    return x
+                if nm in renaming and arm_has_column(nm):
                     abort[0] = True            # bound to an outer alias, could bind a hidden column once folded
                 return e
             # a select-list item keeps the derived column's name
@@ -283,23 +345,24 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
                 new_orders.append((o, x))
     # a substituted bare name an output carries: what would the ORDER BY bind?
     out_names = [((names[i] if names is not None and i < len(names) else "") or it.get("alias")
-                  or _colname(it) or "").casefold() for i, it in enumerate(new_select)]
+                  or _colname(it) or "").translate(IDENT_FOLD) for i, it in enumerate(new_select)]
     base_qual = ((inner.get("from_table") or {}).get("alias") or (inner.get("from_table") or {}).get("table_name") or "") \
         if (inner.get("from_table") or {}).get("type") == "BASE_TABLE" and arm_slot is None else ""
     for i, (o, x) in enumerate(new_orders):
         orig = o.get("expression") or {}
-        if not (isinstance(x, dict) and x.get("class") == "COLUMN_REF" and x is not orig
-                and len(x.get("column_names") or []) == 1):
+        xn = order_name(x)
+        if xn is None or x is orig or xn is order_name(orig):
             continue
-        nm = x["column_names"][0].casefold()
+        nm = xn["column_names"][0].translate(IDENT_FOLD)
         hits = [it for it, n in zip(new_select, out_names) if n == nm]
-        if all(it.get("class") == "COLUMN_REF" and [c.casefold() for c in it.get("column_names") or []] == [nm]
+        if all(it.get("class") == "COLUMN_REF" and [c.translate(IDENT_FOLD) for c in it.get("column_names") or []] == [nm]
                for it in hits):
             continue                           # no output, or the output IS that column: same binding
         if not base_qual:
             abort[0] = True
             break
-        new_orders[i] = (o, dict(x, column_names=[base_qual, x["column_names"][0]]))
+        qx = dict(xn, column_names=[base_qual, xn["column_names"][0]])
+        new_orders[i] = (o, dict(x, child=qx) if x.get("class") == "COLLATE" else qx)
     if abort[0]:
         return False                           # nothing above has touched the tree
     for j, c in cond_subs:
@@ -327,7 +390,7 @@ def fold_once(tree: dict, names: Optional[list] = None) -> bool:
     return True
 
 
-def fold(tree_json: str, names: Optional[list] = None) -> Optional[str]:
+def fold(tree_json: str, names: Optional[list] = None, columns_of=None) -> Optional[str]:
     """The statement with its SPJ derived tables folded in, or None when there
     is nothing to fold. `names`: the original statement's output names
     (DESCRIBE) — folding changes an unnamed item's auto-name (`sum(vv)` becomes
@@ -338,7 +401,7 @@ def fold(tree_json: str, names: Optional[list] = None) -> Optional[str]:
         return None
     changed = False
     for _ in range(8):                          # several derived tables, one per pass
-        if not fold_once(tree, names):
+        if not fold_once(tree, names, columns_of):
             break
         changed = True
     if not changed:

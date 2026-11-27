@@ -35,7 +35,7 @@ import json
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ._rewrite import Decline, decimal_scale, _INT_TYPES, _STRING_TYPES, _TEMPORAL_TYPES
+from ._rewrite import Decline, IDENT_FOLD, decimal_scale, _INT_TYPES, _STRING_TYPES, _TEMPORAL_TYPES
 from . import _scope
 
 _AGGS = {"sum", "count", "min", "max", "avg"}
@@ -138,14 +138,14 @@ class Lowerer:
         self.function_ok, self.identity = function_ok, identity
         self.computed: Dict[str, Computed] = {}
         self._by_tree: List[Tuple[dict, str]] = []
-        self._lower = {c.casefold(): c for c in columns}
+        self._lower = {c.translate(IDENT_FOLD): c for c in columns}
 
     # ---- validation ----
     def _column(self, e) -> str:
         names = e.get("column_names") or []
         if not names or len(names) > 2:
             raise Decline("shape", "qualified column inside an expression")
-        c = self._lower.get(names[-1].casefold())
+        c = self._lower.get(names[-1].translate(IDENT_FOLD))
         if c is None:
             raise Decline("shape", f"unknown column {names[-1]} inside an expression")
         return c
@@ -336,15 +336,15 @@ class Lowerer:
         # statement has that name, so the resolution cannot differ from DuckDB's
         changed = False
         groups = node.get("group_expressions") or []
-        aliases = {(it.get("alias") or "").casefold(): it for it in (node.get("select_list") or [])
+        aliases = {(it.get("alias") or "").translate(IDENT_FOLD): it for it in (node.get("select_list") or [])
                    if isinstance(it, dict) and it.get("alias")}
         alias_count: Dict[str, int] = {}
         for it in node.get("select_list") or []:
             if isinstance(it, dict) and it.get("alias"):
-                alias_count[it["alias"].casefold()] = alias_count.get(it["alias"].casefold(), 0) + 1
+                alias_count[it["alias"].translate(IDENT_FOLD)] = alias_count.get(it["alias"].translate(IDENT_FOLD), 0) + 1
         for i, g in enumerate(groups):
             if _is_colref(g) and len(g.get("column_names") or []) == 1:
-                nm = g["column_names"][0].casefold()
+                nm = g["column_names"][0].translate(IDENT_FOLD)
                 if nm not in self._lower and alias_count.get(nm, 0) > 1:
                     raise Decline("shape", f"GROUP BY {nm}: several select items carry that alias")
                 if nm not in self._lower and nm in aliases:

@@ -1963,9 +1963,21 @@ class Connection:
                 try:
                     folded = None
                     tree = self._serialize(sql_v)
-                    if _flatten.fold(tree) is not None:                 # cheap structural test first
+                    seen_cols: Dict[tuple, object] = {}
+
+                    def columns_of(bt):
+                        # a join arm's table, asked only when an outer alias names a
+                        # column the arm does not show (§6): could the table's own
+                        # column take that name over once the arm is folded?
+                        key = (bt.get("catalog_name") or "", bt.get("schema_name") or "", bt.get("table_name") or "")
+                        if key not in seen_cols:
+                            ident, _why = _resolve.resolve(self._raw, *key)
+                            seen_cols[key] = (None if ident is None else
+                                              {_rewrite.ident_fold(c) for c in ident.columns})
+                        return seen_cols[key]
+                    if _flatten.fold(tree, columns_of=columns_of) is not None:     # cheap structural test first
                         want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql_v).fetchall()]
-                        folded = _flatten.fold(tree, [w[0] for w in want])
+                        folded = _flatten.fold(tree, [w[0] for w in want], columns_of)
                     if folded is not None:
                         cand = self._deserialize(folded)
                         have = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + cand).fetchall()]
@@ -3177,10 +3189,13 @@ class Connection:
             else:
                 d.scalar_sql = row[1]
                 d.form = info.get("form") or d.form
-                if d.form == "topk" and _rewrite.tie_window_shadowed(plan):
+                if d.form == "topk" and _rewrite.tie_window_shadowed(
+                        plan, _rewrite.relation_names(json.loads(_ast_compat.normalise_json(row[0])))):
                     # the extension's tie guard names the output inside its window,
-                    # where the name binds a column of the table function first
-                    # (`count(*) AS count`): the reference renderer draws it instead
+                    # where the name binds the FROM first — a table-function column
+                    # (`count(*) AS count`) or a relation (`sum(v) AS r`, the row of
+                    # r): the reference renderer, whose window ranks the output's
+                    # expression, draws it instead
                     d.scalar_sql = ""
         return d
 

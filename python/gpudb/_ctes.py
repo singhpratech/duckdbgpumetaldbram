@@ -43,6 +43,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Callable, Dict, List, Optional
+from ._rewrite import IDENT_FOLD
 
 _NO_LOC = 18446744073709551615
 _MAX_CTES = 16
@@ -64,10 +65,10 @@ _MAT_RE = re.compile(
 
 
 def materialized_names(sql: str) -> set:
-    """The CTE names declared AS MATERIALIZED in `sql`, casefolded."""
+    """The CTE names declared AS MATERIALIZED in `sql`, folded as DuckDB folds names."""
     # Cheap reject first: this runs on every statement, and almost none of
     # them contain the word at all.
-    if "materialized" not in sql.casefold():
+    if "materialized" not in sql.translate(IDENT_FOLD):
         return set()
     scrubbed = _BLANK_RE.sub(lambda m: " " * len(m.group(0)), sql)
     out = set()
@@ -75,7 +76,7 @@ def materialized_names(sql: str) -> set:
         name = m.group("name")
         if name.startswith('"'):
             name = name[1:-1].replace('""', '"')
-        out.add(name.casefold())
+        out.add(name.translate(IDENT_FOLD))
     return out
 
 def _has_class(e, classes) -> bool:
@@ -156,7 +157,7 @@ def inline(tree_json: str, function_ok: Optional[Callable[[str], bool]] = None,
             return e
         if e.get("type") == "BASE_TABLE" and not e.get("schema_name") and not e.get("catalog_name") \
                 and not e.get("at_clause") and not e.get("sample"):
-            body = scope.get((e.get("table_name") or "").casefold())
+            body = scope.get((e.get("table_name") or "").translate(IDENT_FOLD))
             if body is not None:
                 out = json.loads(json.dumps(body))
                 out["alias"] = e.get("alias") or e.get("table_name")
@@ -179,7 +180,7 @@ def inline(tree_json: str, function_ok: Optional[Callable[[str], bool]] = None,
                 body = walk(body, scope)
                 if isinstance(value.get("query"), dict):
                     value["query"]["node"] = body
-                key = (entry.get("key") or "").casefold()
+                key = (entry.get("key") or "").translate(IDENT_FOLD)
                 if key and value.get("materialized") != "CTE_MATERIALIZE_ALWAYS" \
                         and not (blocked and key in blocked) \
                         and _projects_and_joins(body) and ok_functions(body):

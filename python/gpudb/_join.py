@@ -27,7 +27,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from ._rewrite import Decline, Plan, _STRING_TYPES, decimal_scale
+from ._rewrite import Decline, IDENT_FOLD, Plan, _STRING_TYPES, decimal_scale
 from . import _rewrite, _scope
 from ._resolve import Identity
 
@@ -165,17 +165,19 @@ def _order_names(node: dict) -> List[dict]:
     that alias before any column, so it is marked to stay as written (the
     matcher binds it); the other top-level names are returned, to be checked
     once resolved by _check_order_names."""
-    aliases = {(it.get("alias") or "").casefold() for it in (node.get("select_list") or []) if it.get("alias")}
+    aliases = {(it.get("alias") or "").translate(IDENT_FOLD) for it in (node.get("select_list") or []) if it.get("alias")}
     rest = []
     for m in node.get("modifiers") or []:
         if m.get("type") != "ORDER_MODIFIER":
             continue
         for o in m.get("orders") or []:
             e = o.get("expression") or {}
+            if e.get("class") == "COLLATE":     # one collation over a name binds like the name
+                e = e.get("child") or {}
             if e.get("class") != "COLUMN_REF":
                 continue
             names = e.get("column_names") or []
-            if len(names) == 1 and names[0].casefold() in aliases:
+            if len(names) == 1 and names[0].translate(IDENT_FOLD) in aliases:
                 e["__inner"] = True          # left alone by rewrite_refs; removed by _scope.strip
             else:
                 rest.append(e)
@@ -190,14 +192,14 @@ def _check_order_names(node: dict, resolved: List[dict]) -> None:
     by_alias: Dict[str, List[dict]] = {}
     for it in node.get("select_list") or []:
         if it.get("alias"):
-            by_alias.setdefault(it["alias"].casefold(), []).append(it)
+            by_alias.setdefault(it["alias"].translate(IDENT_FOLD), []).append(it)
     for e in resolved:
         names = e.get("column_names") or []
         if len(names) != 1:
             continue
-        hits = by_alias.get(names[0].casefold(), [])
+        hits = by_alias.get(names[0].translate(IDENT_FOLD), [])
         if any(not (h.get("class") == "COLUMN_REF"
-                    and [c.casefold() for c in h.get("column_names") or []] == [names[0].casefold()])
+                    and [c.translate(IDENT_FOLD) for c in h.get("column_names") or []] == [names[0].translate(IDENT_FOLD)])
                for h in hits):
             raise Decline("shape", f"ORDER BY column {names[0]} is also the name of another output")
 
@@ -254,7 +256,7 @@ def lower(tree_json: str,
         if ident is None:
             raise Decline(why or "shape", f"table {lf.get('table_name')}")
         alias = lf.get("alias") or ident.table
-        if any(t.alias.casefold() == alias.casefold() for t in tables):
+        if any(t.alias.translate(IDENT_FOLD) == alias.translate(IDENT_FOLD) for t in tables):
             raise Decline("shape", "repeated table alias")
         if any(t.ident.oid == ident.oid and t.ident.catalog == ident.catalog for t in tables):
             raise Decline("shape", "self join")
@@ -262,7 +264,7 @@ def lower(tree_json: str,
 
     def real_column(ti: int, name: str) -> Optional[str]:
         for c in tables[ti].ident.columns:
-            if c.casefold() == name.casefold():
+            if c.translate(IDENT_FOLD) == name.translate(IDENT_FOLD):
                 return c
         return None
 
@@ -274,7 +276,7 @@ def lower(tree_json: str,
             return hits[0] if hits else None
         if len(names) == 2:
             for ti, t in enumerate(tables):
-                if t.alias.casefold() == names[0].casefold():
+                if t.alias.translate(IDENT_FOLD) == names[0].translate(IDENT_FOLD):
                     rc = real_column(ti, names[1])
                     if rc is None:
                         raise Decline("shape", f"no column {names[1]} in {names[0]}")
@@ -337,13 +339,13 @@ def lower(tree_json: str,
     count: Dict[str, int] = {}
     for t in tables:
         for c in t.ident.columns:
-            count[c.casefold()] = count.get(c.casefold(), 0) + 1
+            count[c.translate(IDENT_FOLD)] = count.get(c.translate(IDENT_FOLD), 0) + 1
     vname: Dict[Tuple[int, str], str] = {}
     colmap: Dict[str, Tuple[int, str]] = {}
     columns: Dict[str, str] = {}
     for ti, t in enumerate(tables):
         for c, typ in t.ident.columns.items():
-            v = c if count[c.casefold()] == 1 else f"{t.alias}__{c}"
+            v = c if count[c.translate(IDENT_FOLD)] == 1 else f"{t.alias}__{c}"
             if any(ch in v for ch in ":,+'\"") or v in colmap:
                 continue                      # not representable: a reference to it declines below
             vname[(ti, c)] = v
@@ -701,7 +703,7 @@ def lower_upload(tree_json: str,
         if ident is None:
             raise Decline(why or "shape", f"table {lf.get('table_name')}")
         alias = lf.get("alias") or ident.table
-        if any(t.alias.casefold() == alias.casefold() for t in tables):
+        if any(t.alias.translate(IDENT_FOLD) == alias.translate(IDENT_FOLD) for t in tables):
             raise Decline("shape", "repeated table alias")
         tables.append(TableRef(alias=alias, ident=ident, rows=0))
     for t in tables:
@@ -709,16 +711,16 @@ def lower_upload(tree_json: str,
 
     def real_column(ti: int, name: str) -> Optional[str]:
         for c in tables[ti].ident.columns:
-            if c.casefold() == name.casefold():
+            if c.translate(IDENT_FOLD) == name.translate(IDENT_FOLD):
                 return c
         return None
 
-    using_cols = {c.casefold(): n_left for cols, n_left in using for c in cols}
+    using_cols = {c.translate(IDENT_FOLD): n_left for cols, n_left in using for c in cols}
 
     def resolve_col(names: List[str]) -> Optional[Tuple[int, str]]:
         if len(names) == 1:
             hits = [(ti, rc) for ti in range(len(tables)) for rc in [real_column(ti, names[0])] if rc]
-            if len(hits) > 1 and names[0].casefold() in using_cols:
+            if len(hits) > 1 and names[0].translate(IDENT_FOLD) in using_cols:
                 # a USING column: the merged column is the left side's value
                 # for the INNER and LEFT joins accepted here
                 return hits[0]
@@ -727,7 +729,7 @@ def lower_upload(tree_json: str,
             return hits[0] if hits else None
         if len(names) == 2:
             for ti, t in enumerate(tables):
-                if t.alias.casefold() == names[0].casefold():
+                if t.alias.translate(IDENT_FOLD) == names[0].translate(IDENT_FOLD):
                     rc = real_column(ti, names[1])
                     if rc is None:
                         raise Decline("shape", f"no column {names[1]} in {names[0]}")
@@ -805,13 +807,13 @@ def lower_upload(tree_json: str,
     count: Dict[str, int] = {}
     for t in tables:
         for c in t.ident.columns:
-            count[c.casefold()] = count.get(c.casefold(), 0) + 1
+            count[c.translate(IDENT_FOLD)] = count.get(c.translate(IDENT_FOLD), 0) + 1
     vname: Dict[Tuple[int, str], str] = {}
     colmap: Dict[str, Tuple[int, str]] = {}
     columns: Dict[str, str] = {}
     for ti, t in enumerate(tables):
         for c, typ in t.ident.columns.items():
-            v = c if count[c.casefold()] == 1 else f"{t.alias}__{c}"
+            v = c if count[c.translate(IDENT_FOLD)] == 1 else f"{t.alias}__{c}"
             if any(ch in v for ch in ":,+'\"") or v in colmap:
                 continue
             vname[(ti, c)] = v
