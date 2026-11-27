@@ -3644,7 +3644,7 @@ def null_key_where_checks():
     (the NULL group vanished, or stayed): the single-table form, HAVING, top-k,
     the split, a subquery lane, a device join, an uploaded join, a computed
     VARCHAR key, and a template re-planned for new literals. Such terms now read
-    the column through its own lane (_rewrite.null_sensitive_key_lane). The shapes
+    the column through its own lane (_rewrite.key_predicate_columns). The shapes
     that were never wrong — other key types, several key columns, the
     predicates DuckDB evaluates as a lane of their own — are pinned beside them."""
     print("== a NULL-sensitive WHERE on a VARCHAR GROUP BY key")
@@ -3710,11 +3710,31 @@ def null_key_where_checks():
                        f"WHERE {p} GROUP BY d.name ORDER BY d.name NULLS FIRST", f"a device join, WHERE {p}")
         same_as_native("SELECT d.name, count(*) AS n, sum(f.v) AS sv FROM fnk f JOIN dnk d ON f.id = d.id AND f.id2 = d.id2 "
                        f"WHERE {p} GROUP BY d.name ORDER BY d.name NULLS FIRST", f"an uploaded join, WHERE {p}")
-    # the same template again with new literals: the re-planned statement keeps the rule
-    for lits in (("s1", "s2", "s3"),):
-        for lit in lits:
-            same_as_native(f"SELECT s, count(*) AS n FROM tnk WHERE s <> '{lit}' GROUP BY s ORDER BY s NULLS FIRST",
-                           f"WHERE s <> '{lit}', the template re-planned for a new literal")
+    # The same template again with new literals. The first sighting is decided
+    # (and rendered by the extension's scalar); every later literal set is
+    # RE-PLANNED (Connection._replan_literals) and rendered by the reference
+    # renderer. The re-plan must name the same predicate columns as the cached
+    # plan, or it declines silently — the rows stay right and the device is
+    # lost — so each later literal must run rewritten AND through the re-plan.
+    templates = (
+        ("SELECT s, count(*) AS n FROM tnk WHERE s <> {} GROUP BY s ORDER BY s NULLS FIRST", ("'s1'", "'s2'", "'s3'")),
+        ("SELECT s, count(*) AS n FROM tnk WHERE s IS NOT NULL AND v > {} GROUP BY s ORDER BY s NULLS FIRST", ("3", "5", "7")),
+        ("SELECT s, count(*) AS n FROM tnk WHERE s = {} GROUP BY s ORDER BY s NULLS FIRST", ("'s1'", "'s2'")),
+        ("SELECT d, count(*) AS n FROM tnk WHERE d <> {} GROUP BY d ORDER BY d NULLS FIRST", ("1.50", "1.20", "0.70")),
+        ("SELECT d, count(*) AS n FROM tnk WHERE d = {} GROUP BY d ORDER BY d NULLS FIRST", ("1.50", "1.20")),
+        ("SELECT d, count(*) AS n FROM tnk WHERE d IS NULL AND v > {} GROUP BY d ORDER BY d NULLS FIRST", ("3", "5")),
+        ("SELECT s, s2, count(*) AS n FROM tnk WHERE s2 <> {} GROUP BY s, s2 ORDER BY s, s2 NULLS FIRST", ("'q1'", "'q2'")),
+    )
+    for tmpl, lits in templates:
+        for i, lit in enumerate(lits):
+            sql = tmpl.format(lit)
+            what = f"{tmpl.split(' WHERE ')[1].split(' GROUP')[0].format(lit)} ({'first sighting' if i == 0 else 're-planned literal'})"
+            same_as_native(sql, what)
+            if i:
+                lr = con.last_rewrite()
+                check(lr["rewritten"] and lr["engine"] == "python",
+                      f"{what}: rewritten through the re-plan (rewritten={lr['rewritten']}, "
+                      f"engine={lr['engine']!r}, reason={lr['reason'] or '-'})")
     con.close()
 
 

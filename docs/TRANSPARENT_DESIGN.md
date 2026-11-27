@@ -650,8 +650,15 @@ which is one more reason the `ORDER BY` node is kept (§2).
   that groups by it alone — plain, HAVING, top-k, the split, a subquery lane, a
   device join, an uploaded join, and a template re-planned for new literals.
   When the WHERE has such a term on the key, the key column is now also a
-  predicate column of its own set (`_rewrite.null_sensitive_key_lane`), and
-  every term on it reads the raw column through its own lane; the wrapper's
+  predicate column of its own set (`_rewrite.key_predicate_columns`, the one
+  rule for which key columns a WHERE reads through a lane of their own), and
+  every term on it reads its own lane — the raw column, or for a computed key
+  the expression, which DuckDB evaluates at upload — whose NULLs are NULL. That
+  lane costs what any string predicate lane costs (§4.5, §4.6): 8 bytes a row
+  of hashes and, where the column has NULLs, a validity bit; a host-side
+  dictionary of every distinct text; and a second pass over the strings at
+  upload, which hashes each one again. A store that already holds the column as
+  a predicate lane for another statement shares it. The wrapper's
   `_lane_of` and the extension's `gpu_rewrite_ast` both look a column up among
   the predicate lanes first, so the fix is the wrapper's alone. Several key
   columns, DECIMAL / DATE / integer / packed / computed integer keys, and the

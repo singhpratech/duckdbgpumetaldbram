@@ -6270,15 +6270,23 @@ VARCHAR with INTEGER), DECIMAL, DATE, INTEGER, packed and computed integer keys
 (they read a raw lane whose NULLs are NULL), the global aggregate, and
 `count(DISTINCT s)`; ordering comparisons on VARCHAR decline.
 
-**Fix, wrapper-only.** `_rewrite.null_sensitive_key_lane`: when a single
-VARCHAR key has such a term, the key column becomes a predicate column of its
-own set, so every term on it reads the column through its own lane. `_lane_of`
+**Fix, wrapper-only.** `_rewrite.key_predicate_columns` (one rule, called by
+`check_types` and by `Connection._replan_literals`): when a single VARCHAR key
+has such a term, the key column — or, for a computed key, its expression —
+becomes a predicate column of its own set, so every term on it reads that lane. `_lane_of`
 now looks predicate lanes up before the key, which is the order the extension's
 renderer already used (it reads the predicate lanes from the tag), so the
 0.7.3 extension renders the fixed statement unchanged. The rule is applied
 again in `Connection._replan_literals`, or a template re-planned for a new
-literal declines (the predicate-column lists differ). It costs those statements
-one string predicate lane (8 bytes a row) beside the key.
+literal declines (the predicate-column lists differ). The re-plan already
+dropped the other half of that rule — a single DECIMAL key with a WHERE on it,
+older than this fix — so every re-run of such a template with new literals
+declined (rows right, the device lost); both halves are now the one helper.
+The cost, for those statements only: a string predicate lane beside the key —
+8 bytes a row of hashes on the device (plus a validity bit a row where the
+column has NULLs), a host-side dictionary holding every distinct text of the
+column, and a second hashing pass over every string at upload. A store that
+already holds the column as a predicate lane shares it.
 
 **Tests.** `null_key_where_checks` in `python/tests/test_wrapper.py`: 148
 checks, 31 of which fail on main's wrapper on DuckDB 2.0.1, 2.0.0 and 1.5.6,
