@@ -4,6 +4,7 @@ template cache and the rewrite before DuckDB sees it."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import threading
@@ -208,6 +209,7 @@ class Decision:
     form: str = ""
     literals: Tuple[str, ...] = ()     # literal values of the template this was decided on
     scalar_sql: str = ""               # gpu_rewrite_ast's rendering for exactly those literals
+    python_sql: str = ""               # the reference renderer's, where that one draws the statement
     output_checked: bool = False       # the first rewritten run's rows_out was compared to the plain-form bound
     join: Optional[Any] = None         # _join.JoinResidency for a statement over a key join (§4.8)
     # computed lanes (§4.10) that embed a literal: the normalised template does
@@ -306,6 +308,17 @@ def _num(x: Optional[str]):
             return float(x)
         except ValueError:
             return None
+
+
+def _bound(x: Optional[str]):
+    """A zone-map bound as a JSON number for the extension's renderer, or None.
+    A temporal column's `infinity` / `-infinity` and a DOUBLE's inf / nan read as
+    non-finite floats, which json.dumps writes as `Infinity` / `NaN` — not JSON —
+    and the renderer then failed on the whole context, declining every statement
+    over such a column with reason 'error'. The renderer reads the bounds of an
+    integer payload only (the v0.6 overflow test), so None loses nothing."""
+    v = _num(x)
+    return v if not isinstance(v, float) or math.isfinite(v) else None
 
 
 def _first_extension_in(d: str) -> Optional[str]:
@@ -1166,7 +1179,7 @@ class Connection:
         # decision used to carry, so it goes with them.
         lits = getattr(self, "_last_literals", None)
         if lits is not None and lits != d.literals:
-            d.literals, d.scalar_sql = lits, ""
+            d.literals, d.scalar_sql, d.python_sql = lits, "", ""
         d.literal_sensitive = True
         if native_ms is not None:
             d.native_ms = native_ms if d.native_ms is None else min(d.native_ms, native_ms)
@@ -1411,6 +1424,12 @@ class Connection:
     def _on_stale(self, sql: str) -> None:
         self._last.fallback = True
         self._drop_plans()
+        # The decisions go too, as on a write through the wrapper: a decision
+        # carries what the zone map said when it was made (a packed key's
+        # bounds), and the data under it has just moved. Rebuilt from the old
+        # bounds, the set's upload would refuse every value outside them
+        # (_rewrite.IMAGE_ERROR) until the attempts ran out.
+        self._cache.clear()
         (self._parent or self)._ties_ok.clear()   # §4.24: the set is being rebuilt from data that moved
         self._last.detail = ("the data moved under the resident set, so DuckDB answered "
                              "the original and the set is being rebuilt")
@@ -2245,6 +2264,12 @@ class Connection:
         if d.scalar_sql and literals == d.literals:
             out = d.scalar_sql
             self._last.engine = "scalar"
+        elif d.python_sql and literals == d.literals:
+            # the decided literals, drawn by the reference renderer once (a plan that
+            # decodes a DATE / TIMESTAMP, a global aggregate): measured on TPC-H Q3 at
+            # SF1, drawing it again on every execution cost 0.25-0.35 ms of 2.7
+            out = d.python_sql
+            self._last.engine = "python"
         else:
             # literals differ from the cached template (or no scalar): re-render
             # from the current statement's tree with the reference renderer
@@ -2257,6 +2282,8 @@ class Connection:
                     return None
             out = _rewrite.render(plan, d.fqn, self._settings["default_order"])
             self._last.engine = "python"
+            if literals == d.literals:
+                d.python_sql = out
         if d.wrap is not None:
             out = d.wrap[0] + out + d.wrap[1]
         if self._foreign_write_seen():
@@ -2899,9 +2926,13 @@ class Connection:
                 if col in (plan.keys or [plan.key]):
                     # a computed key: bounds and the distinct estimate from one scan
                     try:
+                        # the bounds as DuckDB's own text, as stats() gives them for a plain
+                        # column: fetched as values, an infinite DATE / TIMESTAMP became
+                        # Python's date.max / datetime.max — a finite bound, so a packed
+                        # key's range left the value out
                         mn, mx, uq, nn = _one(self._raw.execute(
-                            f'SELECT min("{col}"), max("{col}"), approx_count_distinct("{col}"), '
-                            f'count(*) - count("{col}") FROM {probe_from}'))
+                            f'SELECT CAST(min("{col}") AS VARCHAR), CAST(max("{col}") AS VARCHAR), '
+                            f'approx_count_distinct("{col}"), count(*) - count("{col}") FROM {probe_from}'))
                         st = _resolve.ColumnStats(has_null=bool(nn), min=None if mn is None else str(mn),
                                                   max=None if mx is None else str(mx), approx_unique=int(uq))
                     except Exception as e:
@@ -2912,14 +2943,14 @@ class Connection:
                 # the exact path keeps NULLs and never wraps: statistics are
                 # informative only (thresholds), never a gate
                 if st is not None:
-                    stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+                    stats[col] = {"has_null": st.has_null, "min": _bound(st.min), "max": _bound(st.max),
                                   "approx_unique": st.approx_unique,
                                   "min_raw": st.min, "max_raw": st.max}   # temporal bounds stay text
                 continue
             if st is None or st.has_null:
                 return Decision(False, "nulls",
                                 why=f"no statistics for {col}" if st is None else f"{col} carries NULLs")
-            stats[col] = {"has_null": st.has_null, "min": _num(st.min), "max": _num(st.max),
+            stats[col] = {"has_null": st.has_null, "min": _bound(st.min), "max": _bound(st.max),
                           "approx_unique": st.approx_unique}
             if col == plan.val and plan.needs_sum:
                 try:
@@ -3175,7 +3206,10 @@ class Connection:
                                     why=((info.get("detail") or "") +
                                          " (the extension's renderer declined)").strip())
             else:
-                d.scalar_sql = row[1]
+                # a plan that decodes a DATE / TIMESTAMP is drawn by the reference
+                # renderer: the extension's decode raises for an infinite value's image
+                # (_rewrite.decodes_temporal), the decision itself is the scalar's
+                d.scalar_sql = "" if _rewrite.decodes_temporal(plan) else row[1]
                 d.form = info.get("form") or d.form
         return d
 

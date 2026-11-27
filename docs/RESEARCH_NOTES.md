@@ -6241,6 +6241,129 @@ about what was measured on 0.7.2 (the README's DuckDB 2.0.1 rows,
 `BENCHMARK.md`, the project page's tables) are history and stay, since 0.7.3
 changes no measured statement. Not yet run on the NVIDIA machine.
 
+## 2026-11-26 — Infinite DATE / TIMESTAMP values on the device
+
+pip 0.7.3 on DuckDB 2.0.1, shipped defaults (`gpudb.connect()`), 40M rows, one
+`infinity`, one `-infinity` and 1% NULLs in a TIMESTAMP column:
+`count(*) … WHERE ts IS NULL` returned 388352 against native's 388350,
+`… WHERE ts IS NOT NULL` lost two rows and their sum, and `… WHERE ts >
+TIMESTAMP '2020-01-01 00:10:00'` lost one — all three rewritten. The TIMESTAMP
+lane image was `epoch_us(ts)` (`_rewrite._int_image`, used by the key, payload
+and predicate lanes and by computed lanes of TIMESTAMP type), and `epoch_us` is
+NULL for an infinite timestamp, so those rows were uploaded as NULL cells.
+Wrapper-only; the extension binary is the one in the 0.7.3 wheel.
+
+The extent, mapped over 202 statements on 300K rows with `residency='eager'`,
+`floor_rows=0`, `thresholds=False`, comparing DuckDB's own text of every result
+(fetched as Python values, `infinity` is `datetime.max` and compares equal to
+`9999-12-31 23:59:59.999999`): on 0.7.3, 86 ran on the device and 21 of those
+differed, the same 21 on DuckDB 2.0.1, 2.0.0 and 1.5.6 — every aggregate
+without GROUP BY under a WHERE on the TIMESTAMP (`>`, `>=`, `<`, `<=`, `<>`,
+`IS NULL`, `IS NOT NULL`, `NOT (…)`, a split global, a global over a key join),
+`min` / `max` of it without GROUP BY, and every computed lane whose value is a
+TIMESTAMP: `date_trunc` of a TIMESTAMP or a DATE, `ts + INTERVAL …`,
+`CAST(dt AS TIMESTAMP)`, `CAST(ts_ns AS TIMESTAMP)`, as a key and as a WHERE
+term. `=`, BETWEEN, NOT IN, IS [NOT] DISTINCT FROM, subquery lanes and the
+temporal join key were right (DuckDB evaluates those into BOOLEAN lanes, or
+runs the join itself). 56 other statements declined only by accident: the zone
+map's `infinity` bound read as a float, `json.dumps` wrote `Infinity` into the
+extension renderer's context, the renderer could not parse it, and every
+GROUP BY over such a column declined with reason `error` (DOUBLE columns
+holding inf / nan too). That accident did not protect a set decided before the
+infinity arrived: a count-changing insert through a raw cursor of an
+in-memory database left the old decisions in place, and the rebuilt sets
+answered every grouped shape wrong. An infinite DATE kept its day count
+(`dt - DATE '1970-01-01'` is ±2147483647) but did not decode
+(`DATE '1970-01-01' + n` raises), so those statements failed on the device,
+DuckDB answered them and the template stayed native (`error`). The extreme finite values (294247-01-10 04:00:54.775806,
+290309-12-22 BC, 5881580-07-10, 5877642-06-25 BC) were already exact, and
+TIMESTAMP_S / _MS / _NS, TIMESTAMPTZ, TIME and INTERVAL are not lanes, so
+nothing reached the device as one except through a computed TIMESTAMP. A
+mapping of the other image expressions found one more defect of the same
+class, not tied to infinities: a packed key's slots are sized from the zone
+map at decision time, and the same raw-cursor insert of a finite date outside
+those bounds was uploaded with the old bounds and carried into the next
+component (`GROUP BY k, dt` wrong). DECIMAL rescales and `CAST(… AS BIGINT)`
+raise on overflow rather than return NULL, `TRY_CAST` and `epoch_*` in a
+user's own expression are native's semantics by construction, and DOUBLE lanes
+compare on the total-order image (§4.6).
+
+What changed (`python/gpudb/_rewrite.py`, `python/gpudb/connection.py`):
+the TIMESTAMP image is `CASE WHEN isinf(ts) THEN ±9223372036854775807 ELSE
+epoch_us(ts) END` — DuckDB's own stored value, outside every finite one, so
+order, equality and grouping are DuckDB's; the DATE image is unchanged. The
+decode maps both pairs of infinite images back, and a plan that decodes a
+single DATE / TIMESTAMP key or a `min` / `max` of one is rendered by the
+Python renderer, because the extension's renderer decodes with
+`make_timestamp` / `DATE '1970-01-01' + n` (the decision is still the
+extension's). That rendering is drawn once per decided template and reused:
+drawn on every execution, and with the infinity CASE on packed components too,
+TPC-H Q3 at SF1 (an `o_orderdate` component of a packed key) went from 2.6-2.75
+to 2.9-3.0 ms, so a packed component — finite by its bounds — and a
+dictionary key — decoded from DuckDB's own text — keep the plain decode and the
+extension's rendering, and Q3 is back to the base tree's time. A packed
+component outside its bounds raises `GPUDB_IMAGE` at upload, so the set fails
+and DuckDB answers; the stale
+guard now drops the decisions as a write through the wrapper already did, so
+the next one reads the new bounds. A non-finite zone-map bound goes into the
+renderer's context as null, and a computed key's bounds are read as DuckDB's
+text. What lost: `= TIMESTAMP 'infinity'` inside the image — DuckDB 1.5.6
+rewrites `date_trunc(…) = <constant>` into a range on the argument, which is
+empty for an infinite constant, so on 1.5.6 the upload of a `date_trunc` lane
+failed for its own infinite row; and `coalesce(epoch_us(ts), …, error(…))`,
+which scanned 20M rows in 10.9 ms against 6.2 for the CASE and 4.0 for
+`epoch_us` alone, to guard a case the CASE does not leave open. After the
+change: 145 of the 202 on the device on all three versions, 0 differing. The
+DATE / TIMESTAMP statements still answered by DuckDB are IN lists of temporal
+literals (not a matcher shape), packed keys and `count(DISTINCT)` beside a
+GROUP BY over a column with an infinite bound (`shape`: no finite bounds to
+pack with), HAVING on a temporal payload, and the two DuckDB itself raises for
+(`max(ts) - min(ts)` and `ts - TIMESTAMP …` over an infinity); the rest of the
+57 are the other temporal types, wide DECIMALs and literal forms the matcher
+does not read. With shipped defaults on the 40M-row table the three
+statements above are on the device and equal. Shipped defaults reach the
+computed lanes too: over 5000 groups, 0.7.3 answered `GROUP BY k` under
+`WHERE date_trunc('second', ts) < TIMESTAMP …` and under `WHERE ts + INTERVAL 1
+HOUR IS NOT NULL` on the device and wrong (one group short by the infinite
+row); on this tree both are on the device and equal, and so are three that
+0.7.3 declined by the accident (`max(ts)` per group, `ts < TIMESTAMP …` per
+group, `GROUP BY ts` over 1003 groups). Grouped statements with fewer groups
+or a selective WHERE stay on DuckDB under the thresholds in both trees.
+
+Measured on a table without infinities (20M rows, 1% NULL, eager upload, five
+interleaved base / fix processes, medians; load average 4.5–5.4 while other
+jobs ran — provisional): the TIMESTAMP image alone scans the table in 7.0 ms
+against 4.3 (the DATE image is unchanged, 2.7 / 2.8). A TIMESTAMP-masked
+aggregate without GROUP BY: upload 120.8 → 125.2 ms, statement 4.89 → 5.17 ms,
+bimodal at 2.3–2.5 / 5.1–5.3 ms in both trees. A DATE-keyed GROUP BY over 2557
+groups (now drawn by the Python renderer, once): upload 174.9 → 178.8 ms,
+statement 6.22 → 6.39 ms; an earlier pair of runs at load 9–30 gave
+6.23 → 6.09 and 6.30 → 6.38, so no direction is resolved there. A packed
+DATE + INTEGER key: upload 138.1 → 140.8 ms (the bounds check, 5.7 ms per 20M
+rows when scanned alone), statement 9.97 → 10.14 ms. So an upload pays up to
+4% and a statement on a resident set does not move outside the machine's
+noise. TPC-H at SF1 (`scripts/tpch_coverage.py`, DuckDB 2.0.1, N=5, three
+times per tree, the last on the final code): 16 of 22 on the device on both
+trees, the same path per query, 0 rows differing, no query below 1.0× (lowest
+Q15, a 2.6–3.0 ms query in the two-mode band: 1.10–1.35× on this tree,
+1.28–1.59× on the base). Not run at SF10.
+
+Tests: `infinite_temporal_checks()` in `python/tests/test_wrapper.py` — the
+images over every value class (NULL exactly where NULL, DuckDB's order, decode
+back, a computed `date_trunc` lane included), the packed bounds check, 160
+statements over infinite values and over extreme finite values against
+native's text with the path each must take, and the late-arriving infinity
+(through the wrapper, a raw cursor, a second connection to a file, and a write
+between the segments of a background upload). With the fix reverted the
+section fails 132 of its checks, 63 of them rows that differ from native.
+The scalar-against-reference renderer check now expects the Python renderer
+for the four statements there that decode a single DATE key or a temporal
+`min` / `max`. With the worktree's `python/` and the 0.7.3 wheel's binary
+the four wrapper suites pass
+on DuckDB 2.0.1, 2.0.0 and 1.5.6: test_wrapper 2086 / 2086 / 2116 checks
+(main's 1408 / 1408 / 1438 and the 678 new ones), shell 76, residency policy
+131, ast compat 9, unchanged. Not yet run on the NVIDIA machine.
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:
