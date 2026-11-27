@@ -1,7 +1,9 @@
 # Known issues
 
-Status as of 2026-09-19, describing v0.7. Every row says which surface it
-belongs to. **All known functional bugs resolved.**
+Status as of 2026-09-19, describing v0.7, with the open issues as of
+2026-11-27. Every row says which surface it belongs to. No known wrong answer
+is open; two statements DuckDB answers can raise through the wrapper (*Open
+issues*).
 
 Four surfaces, because a limit almost always belongs to exactly one of them:
 
@@ -21,7 +23,37 @@ DuckDB: through `gpudb.connect()` that happens by itself and
 
 ## Open issues
 
-None.
+**1. A `sql()` relation read again after a write raises `GPUDB_STALE`**
+(the transparent path, Python wrapper). `con.sql(q)` hands back DuckDB's own
+relation over the REWRITTEN text, and DuckDB re-runs a relation on every
+read. Read it, run an `UPDATE` / `INSERT` / `DELETE` through the wrapper (or
+any write the wrapper sees), read it again: the rewritten text's guard finds
+its set gone and raises `InvalidInputException: GPUDB_STALE: gpu_assert_rows:
+no resident set named …`, where plain DuckDB re-runs the query over the new
+data. `execute()` on the same statement, or a new `sql()` call, answers
+natively; the `gpudb` shell does that by itself (`Shell.recover`). No change
+in Python alone covers every way a relation is consumed, and a partial cover
+is not shipped. The options, and what each costs:
+
+| Option | Covers | Costs |
+|---|---|---|
+| a. A proxy object in place of the relation, falling back to the original text on `GPUDB_STALE` | reads of that object (`fetch*`, `df`, `arrow`, `pl`, `show`) | it is not a `DuckDBPyRelation`: `isinstance` fails, a replacement scan `FROM rel` no longer finds it (a statement DuckDB accepts then fails), relations built on it (`filter`, `join`, `aggregate`) execute inside DuckDB and still raise |
+| b. Wrap the relation class's read methods (as the wrapper already wraps its write methods, §5.9) and answer a stale read of a relation the wrapper made from the original text | every direct read, `create`, `insert_into`, `to_*` / `write_*` | a relation BUILT on it and a replacement scan of it execute inside DuckDB without calling any method of the original, and still raise |
+| c. One temporary view per `sql()` result, redefined to the original statement on every write the wrapper sees | every consumer (a relation binds the view again on each execution) | the views are visible to `duckdb_views()`, `information_schema` and `SHOW ALL TABLES` — those statements would answer differently from plain DuckDB — and a write the wrapper does not see still reaches the old definition |
+| d. Never rewrite through `sql()` | every consumer | every `sql()` caller, the `gpudb` shell included, loses the device |
+| e. The extension's resident table functions answer a missing set by running the original statement themselves | every consumer | C++: the original text as an argument of the rewritten statement, and a nested query inside a table function's initialisation |
+
+**2. A Python variable named in a statement passed through the wrapper is not
+found** (the transparent path, Python wrapper; found during the same review,
+present in every release with the wrapper). DuckDB's replacement scan looks
+for `df` in `SELECT * FROM df` only in the frame that called DuckDB, and
+through the wrapper that frame is the wrapper's own: `con.execute("SELECT *
+FROM df")` raises `CatalogException` for a DataFrame, an Arrow table or a
+relation that plain DuckDB reads. Registering the object (`con.register("df",
+df)`) works. DuckDB's `python_scan_all_frames` setting would make the name
+visible, but it searches every frame outward, so it also finds names plain
+DuckDB does not and would answer statements DuckDB rejects; a correct fix
+has to hand DuckDB the caller's frame, and needs its own measurement.
 
 ---
 

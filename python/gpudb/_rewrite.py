@@ -176,6 +176,10 @@ class Plan:
     term_types: Dict[str, str] = field(default_factory=dict)   # WHERE column -> the type DuckDB compares it as
     term_bounds: Dict[str, Tuple] = field(default_factory=dict)  # WHERE column -> zone-map (min, max)
     bounds_used: bool = False          # a literal was admitted on those bounds (a BIGINT against a DOUBLE)
+    # every DATE / TIMESTAMP literal the matcher read in Python, as
+    # (type, text, lane image): Connection._resolve_literals has DuckDB read
+    # each text too, and declines where DuckDB rejects it or reads another value
+    temporal_lits: List[Tuple[str, str, int]] = field(default_factory=list)
     topk_pay: int = 0
     # §4.12: the statement has no GROUP BY. The split hands the matcher a
     # constant key so it reads as a GROUP BY; make_global() then strips it —
@@ -276,10 +280,42 @@ def _agg(e) -> Optional[Tuple[str, Optional[str]]]:
     return None
 
 
+def temporal_literals(tree) -> List[Tuple[str, str, int]]:
+    """(type, text, lane image) of every DATE / TIMESTAMP literal in a tree
+    that _temporal_const reads. Python's reading is wider than DuckDB's
+    (`date.fromisoformat` takes '20200101' and '2020-W01-1', `datetime`'s
+    takes '2020-01-01 10' and a comma before the fraction, and what it takes
+    depends on the Python version), so these are checked against DuckDB's own
+    cast before any of them is used (Connection._resolve_literals)."""
+    out: List[Tuple[str, str, int]] = []
+
+    def walk(e):
+        if isinstance(e, dict):
+            if e.get("class") == "CAST" and (e.get("cast_type") or {}).get("id") in ("DATE", "TIMESTAMP"):
+                try:
+                    x = _temporal_const(e)
+                except Decline:
+                    x = None
+                if x is not None:
+                    out.append(((e.get("cast_type") or {}).get("id"),
+                                str(((e.get("child") or {}).get("value") or {}).get("value")), _temporal_int(x)))
+            for v in e.values():
+                walk(v)
+        elif isinstance(e, list):
+            for v in e:
+                walk(v)
+    walk(tree)
+    return out
+
+
 def _temporal_const(e):
     """CAST('yyyy-mm-dd' AS DATE) / CAST('yyyy-mm-dd hh:mm:ss[.f]' AS TIMESTAMP)
     (how DATE '...' / TIMESTAMP '...' literals serialise) -> date | datetime,
-    else None. A literal that is not a plain date/time text declines."""
+    else None. A literal that is not a plain date/time text declines.
+
+    Python's reading only proposes a value: the plan carries every text read
+    here (Plan.temporal_lits) and DuckDB's own cast of it decides whether the
+    statement can be rewritten with that value."""
     if e.get("class") != "CAST":
         return None
     ch = e.get("child") or {}
@@ -692,6 +728,7 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
     for c in plan.vals[1:]:
         if c not in plan.pred_cols:
             plan.pred_cols.append(c)
+    plan.temporal_lits = temporal_literals(node)
     return plan
 
 

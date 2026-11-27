@@ -16,7 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import duckdb
 
 from . import (_aggs, _ast_compat, _classify, _ctes, _exprs, _flatten, _join, _literals, _resolve, _rewrite, _split, _syntax,
-               _thresholds, _views)
+               _sqlkey, _thresholds, _views)
 from ._residency import DEVICE_ERROR, MEMORY_ERROR, ResidencyManager
 from ._resolve import _one
 
@@ -63,6 +63,9 @@ _NO_EXTENSION = ("the gpudb extension is not loaded on this connection — insta
 _LITERAL_RULES: Dict[str, Any] = {}
 # (settings, the SQL of one literal's cast) -> the value DuckDB cast it to
 _LITERAL_VALUES: Dict[str, Any] = {}
+# (DATE | TIMESTAMP, literal text) -> the lane image DuckDB's cast gives, or
+# "error: ..." where DuckDB rejects the text (Connection._check_temporal_literals)
+_TEMPORAL_VALUES: Dict[Tuple[str, str], Any] = {}
 
 
 _SCALAR_LITERAL_WORDS = ("constant", "threshold", "IN list with no representable value")
@@ -102,8 +105,6 @@ def _maybe_aggregate(sql: str, single_global: bool = False) -> bool:
 _SELECT_START_RE = re.compile(r"^\s*(SELECT|FROM|VALUES)\b", re.IGNORECASE)
 _TABLE_REF_RE = re.compile(r'\bFROM\s+((?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:"[^"]+"|[A-Za-z_][A-Za-z0-9_]*)){0,2})', re.IGNORECASE)
 _MAX_STATEMENT_BYTES = 16 * 1024
-_LITERAL_RE = re.compile(r"""('(?:[^']|'')*')|(\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)""")
-_WS_RE = re.compile(r"\s+")
 STALE_MARKER = "GPUDB_STALE"
 # ... and what a pushed top-k's tie guard says when it stops (_rewrite.ties_qualify):
 # the k it was rendered for and the column the ORDER BY named.
@@ -689,6 +690,8 @@ class Connection:
                        residency=self._residency_mode, floor_rows=self._floor_rows,
                        log=self._log, _parent=self)
         c._thresholds = getattr(self, "_thresholds", True)
+        if self.__dict__.get("_rel_seen") == _RELATION_WRITES[0]:
+            c._rel_seen = _RELATION_WRITES[0]     # it copied settings that are current (_relation_write_check)
         return c
 
     def duplicate(self) -> "Connection":
@@ -742,6 +745,72 @@ class Connection:
         finally:
             self._manager.statement_end()
         return self
+
+    # §5.9: the rest of duckdb's surface that runs SQL or changes the catalog.
+    # `from_query` runs a non-SELECT as-is, exactly as `sql()` does, so it is
+    # `sql()` (below); the others invalidate before they run, as a write does.
+    def abort(self, *a, **kw):
+        self._invalidate_all("rollback")
+        self._tx_open = False
+        return self._raw.abort(*a, **kw)
+
+    # The function catalog is the database's, not this handle's: every other
+    # handle's decisions and its record of which functions may stand in a lane
+    # go too, through the same count a relation's write moves.
+    def load_extension(self, *a, **kw):
+        self._invalidate_all("LOAD")
+        self._refresh_after = True            # the settings may grow as well
+        try:
+            return self._raw.load_extension(*a, **kw)
+        finally:
+            _RELATION_WRITES[0] += 1
+            self._function_stability = None
+            self._after()
+
+    def create_function(self, *a, **kw):
+        self._invalidate_all("create_function")
+        try:
+            return self._raw.create_function(*a, **kw)
+        finally:
+            _RELATION_WRITES[0] += 1
+            self._function_stability = None   # a lane may not read the new definition from a cache
+
+    def remove_function(self, *a, **kw):
+        self._invalidate_all("remove_function")
+        try:
+            return self._raw.remove_function(*a, **kw)
+        finally:
+            _RELATION_WRITES[0] += 1
+            self._function_stability = None
+
+    def _relation_write_check(self) -> None:
+        """A relation can write: `insert`, `insert_into`, `create` / `to_table`,
+        `update`, `create_view` / `to_view`, and `query(name, sql)` runs any
+        SQL. Those run inside DuckDB where the wrapper never sees them, and on
+        an in-memory database no file moves to say so (§5.9). The methods are
+        counted where they are called (_hook_relation_writes), process-wide
+        since a relation does not say which connection it came from; a
+        connection that sees the count move invalidates everything before its
+        next statement, as for a foreign write, and reads the settings again
+        (`query` can SET)."""
+        now = _RELATION_WRITES[0]
+        if self.__dict__.get("_rel_seen") == now:
+            return
+        self._rel_seen = now
+        if getattr(self._manager, "_gpudb_rel_seen", None) != now:
+            # the first member of the family to see it drops the family's sets
+            self._manager._gpudb_rel_seen = now
+            self._log("a relation wrote through DuckDB's relational API — resident sets dropped")
+            self._invalidate_all("a write through a relation")
+            self._resnap_after = False               # a file change of that write is noticed on its own
+        else:
+            self._cache.clear()                      # another member caught up; this one's decisions go too
+        self._function_stability = None              # `create_function` / `load_extension` move the count too
+        try:
+            self._refresh_settings()
+        except Exception as e:
+            if _is_interrupt(e):
+                raise
 
     def _note_timing(self, ms: float, query=None, parameters=None) -> None:
         """Rule 1, measured: the thresholds PREDICT the win; the process is the
@@ -1405,6 +1474,7 @@ class Connection:
             self._after()
 
     query = sql
+    from_query = sql
 
     def _after(self) -> None:
         if self._refresh_after:
@@ -1777,6 +1847,7 @@ class Connection:
         self._last_tags = []
         self._last_inner_note = ""
         self._uploaded_now = False
+        self._relation_write_check()
         if not isinstance(query, str):
             self._last.reason = "shape"
             return query
@@ -1844,6 +1915,16 @@ class Connection:
     def _rewrite_select(self, sql: str) -> Optional[str]:
         if self._tx_open:
             self._last.reason = "transaction"
+            return None
+        if getattr(self._parent or self, "_shared_memory", False):
+            # §5.9: `duckdb.connect(':memory:name')` anywhere in the process
+            # opens THIS database, and its writes leave no trace the wrapper can
+            # read — no file moves, and a plain connection's UPDATE keeps the
+            # row count the guard compares. Nothing is rewritten here.
+            self._last.reason = "off"
+            self._last.detail = ("a named in-memory database (':memory:<name>') can be written by any "
+                                 "connection in the process without a trace the wrapper can read, so "
+                                 "DuckDB answers every statement on it")
             return None
         if self._backend in ("", "CPU"):
             self._last.reason = "backend"
@@ -2194,6 +2275,23 @@ class Connection:
         return sql
 
     _AGG_SPELLING_RE = re.compile(r"\bFILTER\s*\(|\bcount_if\s*\(|\bbool_(?:and|or)\s*\(", re.IGNORECASE)
+    _FILTER_RE = re.compile(r"\bFILTER\s*\(", re.IGNORECASE)
+
+    def _constant_casts(self, value: dict, target: dict) -> bool:
+        """Does DuckDB cast this text constant to `target` without error? A
+        constant's cast does not depend on the row, so if it succeeds now it
+        succeeds on every row (_aggs._never_raises)."""
+        tsql = _literals.type_sql(target)
+        v = value.get("value")
+        if tsql is None or (value.get("type") or {}).get("id") != "VARCHAR" or not isinstance(v, str):
+            return False
+        try:
+            self._raw.execute("SELECT CAST('" + v.replace("'", "''") + "' AS " + tsql + ")").fetchall()
+            return True
+        except duckdb.Error as e:
+            if _is_interrupt(e):
+                raise
+            return False
 
     def _normalise_aggs(self, sql: str) -> str:
         """§4.19: FILTER aggregates, count_if and bool_and / bool_or as the
@@ -2203,7 +2301,14 @@ class Connection:
             return sql
         try:
             want = [(r[0], r[1]) for r in self._raw.execute("DESCRIBE " + sql).fetchall()]
-            out = _aggs.normalise(self._serialize(sql), [w[0] for w in want])
+            # a FILTER becomes a CASE only where the CASE cannot hide an error
+            # DuckDB raises (_aggs.filters_cannot_raise, on the bound plan)
+            filters_ok = True
+            if self._FILTER_RE.search(sql):
+                filters_ok = _aggs.filters_cannot_raise(
+                    _one(self._raw.execute("SELECT json_serialize_plan(?, optimize := false)", [sql]))[0],
+                    self._constant_casts)
+            out = _aggs.normalise(self._serialize(sql), [w[0] for w in want], filters_ok)
             if out is None:
                 return sql
             cand = self._deserialize(out)
@@ -2673,19 +2778,34 @@ class Connection:
             return True
         return False
 
-    @staticmethod
-    def _normalise(sql: str) -> Tuple[str, Tuple[str, ...]]:
-        lits: List[str] = []
+    _KEY_CACHE_MAX = 1024
 
-        def sub(m):
-            lits.append(m.group(0))
-            return "'?'" if m.group(1) else "?"
-        return _WS_RE.sub(" ", _LITERAL_RE.sub(sub, sql)).strip(), tuple(lits)
+    def _normalise(self, sql: str) -> Tuple[str, Tuple[str, ...]]:
+        """(template, literals): the cache key of a statement (_sqlkey). A
+        literal slot is only what DuckDB's own parse holds as a constant at
+        that position; whitespace inside quotes, quoted names, comments and
+        type parameters is the template's. Kept per exact text: the parse it
+        may need is asked once per text."""
+        cache = self.__dict__.setdefault("_key_cache", {})
+        out = cache.get(sql)
+        if out is None:
+            out = _sqlkey.template(sql, lambda s: json.loads(self._serialize(s)))
+            if len(cache) >= self._KEY_CACHE_MAX:
+                cache.clear()
+            cache[sql] = out
+        return out
 
     def _serialize(self, sql: str) -> str:
         # one tree shape for every reader: DuckDB 2.0's is converted to the
-        # 1.4/1.5 shape here, the single place a tree enters (see _ast_compat)
-        return _ast_compat.normalise_json(_one(self._raw.execute("SELECT json_serialize_sql(?)", [sql]))[0])
+        # 1.4/1.5 shape here, the single place a tree enters (see _ast_compat).
+        # The parse is a function of the text alone, so the last one is kept:
+        # the cache key (_normalise) reads the tree the fold has just asked for.
+        memo = self.__dict__.get("_ser_memo")
+        if memo is not None and memo[0] == sql:
+            return memo[1]
+        out = _ast_compat.normalise_json(_one(self._raw.execute("SELECT json_serialize_sql(?)", [sql]))[0])
+        self._ser_memo = (sql, out)
+        return out
 
     def _deserialize(self, tree: str) -> str:
         return _one(self._raw.execute("SELECT json_deserialize_sql(?)",
@@ -3018,6 +3138,7 @@ class Connection:
         bounds (plan.term_bounds, read with the decision's statistics) stay
         inside +-2^53; the plan then records that it read them
         (plan.bounds_used), so a write anywhere in the family re-takes it."""
+        self._check_temporal_literals(plan)
         bounds = (plan.term_bounds or {}).get
 
         def used(c):
@@ -3039,6 +3160,42 @@ class Connection:
                     raise
                 raise _rewrite.Decline("shape", f"the WHERE literals' binding could not be read: "
                                                 f"{type(e).__name__}: {str(e)[:80]}")
+
+    def _check_temporal_literals(self, plan: _rewrite.Plan) -> None:
+        """Every DATE / TIMESTAMP literal the matcher read in Python
+        (Plan.temporal_lits) is read by DuckDB too, and the plan stands only
+        where DuckDB takes the same text to the same lane image. A text DuckDB
+        rejects (`DATE '20200101'`, `TIMESTAMP '2020-01-01 10'`) raises
+        natively, so the statement is DuckDB's; a text it reads otherwise is
+        too. Run for the decision and for every re-plan with new literals, so a
+        literal is never used before DuckDB has read it. The cast does not
+        depend on a session setting (measured under three TimeZone values on
+        1.5.6, 2.0.0 and 2.0.1), so its answer is kept per (type, text) for
+        the process — whose DuckDB is one version."""
+        for typ, text, image in getattr(plan, "temporal_lits", None) or []:
+            key = (typ, text)
+            got = _TEMPORAL_VALUES.get(key)
+            if got is None:
+                lit = "'" + text.replace("'", "''") + "'"
+                q = (f"SELECT epoch_us(CAST({lit} AS TIMESTAMP))" if typ == "TIMESTAMP"
+                     else f"SELECT CAST(CAST({lit} AS DATE) - DATE '1970-01-01' AS BIGINT)")
+                try:
+                    got = int(_one(self._raw.execute(q))[0])
+                except duckdb.Error as e:
+                    if _is_interrupt(e):
+                        raise
+                    got = "error: " + str(e).splitlines()[0][:100]
+                except (TypeError, ValueError, OverflowError) as e:
+                    got = f"error: {type(e).__name__}"
+                if len(_TEMPORAL_VALUES) > 4096:
+                    _TEMPORAL_VALUES.clear()
+                _TEMPORAL_VALUES[key] = got
+            if isinstance(got, str):
+                raise _rewrite.Decline("shape", f"DuckDB does not read the {typ} literal '{text[:40]}' "
+                                                f"({got[7:]}), so the statement is DuckDB's")
+            if got != image:
+                raise _rewrite.Decline("shape", f"DuckDB reads the {typ} literal '{text[:40]}' as another "
+                                                f"value than the wrapper's parser does")
 
     def _bind_literals(self, pending) -> None:
         """Bind the pending terms the way DuckDB binds them in the statement —
@@ -4010,4 +4167,53 @@ def connect(database: str = ":memory:", read_only: bool = False, config: Optiona
                      floor_rows=floor_rows, idle_ms=idle_ms, log=log, memory_budget=memory_budget,
                      read_only=read_only)
     con._thresholds = thresholds
+    # §5.9: ':memory:' alone is private to this connection; ':memory:<name>' is
+    # the process's shared instance of that name
+    con._shared_memory = isinstance(database, str) and database.startswith(":memory:") and database != ":memory:"
+    _hook_relation_writes()
+    con._rel_seen = con._manager._gpudb_rel_seen = _RELATION_WRITES[0]
     return con
+
+
+# §5.9: how many calls of a DuckDBPyRelation method that can write — and of
+# create_function / remove_function / load_extension, which change the
+# database's function catalog under every handle — have returned in this
+# process (Connection._relation_write_check)
+_RELATION_WRITES = [0]
+_RELATION_WRITE_METHODS = ("insert", "insert_into", "create", "to_table", "update", "create_view", "to_view")
+
+
+def _hook_relation_writes() -> None:
+    """Count every call of a relation method that writes data or the catalog.
+    The methods are wrapped on the class, once per process: a relation stays a
+    real DuckDBPyRelation (a replacement scan `FROM rel` and isinstance both
+    still see one), and nothing but the count changes. `query(name, sql)` runs
+    any SQL, so it counts unless the SQL is one SELECT."""
+    cls = getattr(duckdb, "DuckDBPyRelation", None)
+    if cls is None or getattr(cls, "_gpudb_counted", False):
+        return
+
+    def counted(orig, read_only=None):
+        def call(self, *a, **kw):
+            try:
+                return orig(self, *a, **kw)
+            finally:
+                if read_only is None or not read_only(a, kw):
+                    _RELATION_WRITES[0] += 1
+        call.__name__ = getattr(orig, "__name__", "call")
+        call.__doc__ = getattr(orig, "__doc__", None)
+        return call
+
+    def select_only(a, kw):
+        q = kw.get("sql_query", a[1] if len(a) > 1 else None)
+        return isinstance(q, str) and ";" not in q and bool(_SELECT_START_RE.match(q))
+    try:
+        for name in _RELATION_WRITE_METHODS:
+            orig = getattr(cls, name, None)
+            if orig is not None:
+                setattr(cls, name, counted(orig))
+        if getattr(cls, "query", None) is not None:
+            setattr(cls, "query", counted(cls.query, select_only))
+        cls._gpudb_counted = True
+    except (AttributeError, TypeError):
+        pass

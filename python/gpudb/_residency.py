@@ -1305,11 +1305,20 @@ class ResidencyManager:
             s.attempts += 1
             s.last_upload_start = self._now()
             epoch = s.epoch
+        empty = False
         try:
             for stmt in (s.steps if s.derived else ([s.upload_sql] if s.upload_sql else [])):
                 run(stmt)
-            for stmt in s.post_sql:
-                run(stmt)
+            # The statement ran and may have left nothing behind: its rows were
+            # none (an uploaded join whose ON or WHERE keeps no row, an empty
+            # table). A background session says so itself (GPUDB_UPLOAD_EMPTY at
+            # gpu_upload_finish); one statement over the whole result does not —
+            # an uploaded join's set was marked ready with nothing under its
+            # name, and every rewritten statement then failed on it.
+            empty = bool(s.upload_sql) and not s.derived and not self._extension_holds(run, s)
+            if not empty:
+                for stmt in s.post_sql:
+                    run(stmt)
         except Exception as e:
             err = str(e)
             if "GPUDB_UPLOAD_DISCARDED" in err:
@@ -1336,6 +1345,15 @@ class ResidencyManager:
             with self._lock:
                 self._note_refusal_locked(s, self._upload_refused_error(err))
             self._log(f"not uploaded: {s.tag}: {err[:160]}")
+            return False
+        if empty:
+            # The answer is the data's, so it holds until the data, the budget
+            # or the resident population moves — not for a retry window.
+            with self._lock:
+                self._note_refusal_locked(s, "GPUDB_UPLOAD_EMPTY: the upload holds no row, so there is no set "
+                                             "to answer from; DuckDB answers until the data changes")
+                s.resume_at = float("inf")
+            self._log(f"not uploaded: {s.tag}: the upload holds no row")
             return False
         self._note_bytes(run, s)
         self._note_columns(s)

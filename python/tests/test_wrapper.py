@@ -2468,6 +2468,7 @@ def run():
     infinite_temporal_checks()
     where_literal_checks()
     integration_checks()
+    rule1_review_checks()
     overload_checks()
     rewrite_error_checks()
     budget_checks()
@@ -5839,6 +5840,323 @@ CREATE TABLE dci AS SELECT i::INTEGER AS k, (i % 4)::INTEGER AS grp FROM range(5
     check(uploaded > 0, f"uploaded join: the pairs above do reach the uploaded-join form ({uploaded} of {len(seq)})")
     ref.close()
     con.close()
+
+
+def _r1_result(c, sql, path):
+    """rows (sorted, typed) or the error class, for execute() or sql()."""
+    try:
+        if path == "sql":
+            rel = c.sql(sql)
+            rows, types = rel.fetchall(), [str(t) for t in rel.types]
+        else:
+            cur = c.execute(sql)
+            rows, types = cur.fetchall(), [str(d[1]) for d in cur.description]
+        return ("rows", sorted(map(repr, rows)), types)
+    except duckdb.Error as e:
+        return ("error", type(e).__name__)
+
+
+def _r1_same(con, ref, sql, paths=("execute", "sql")):
+    """Does the wrapper give native's answer on every path? (rows and types,
+    or the same error class)"""
+    return all(_r1_result(con, sql, p) == _r1_result(ref, sql, p) for p in paths)
+
+
+def _r1_strip(tree, mask_constants=False):
+    """A json_serialize_sql tree without source positions — and, with
+    mask_constants, without the constants' values: what is left is the shape."""
+    if isinstance(tree, dict):
+        if mask_constants and tree.get("class") == "CONSTANT":
+            return {"class": "CONSTANT"}
+        return {k: _r1_strip(v, mask_constants) for k, v in tree.items()
+                if k not in ("query_location", "query_location_length")}
+    if isinstance(tree, list):
+        return [_r1_strip(v, mask_constants) for v in tree]
+    return tree
+
+
+def rule1_review_checks():
+    """An independent review of the rule (a statement through gpudb answers
+    what DuckDB answers, and raises where DuckDB raises) found, and the
+    fixes cover:
+
+    * the template cache key dropped whitespace inside a dollar-quoted string
+      and a quoted name, and took a number inside a quoted name or a type's
+      parameters for a literal — `$$a  b$$` answered with `$$a b$$`'s rows,
+      `"t 2"` with `"t 1"`'s, `DECIMAL(12,4)` with `DECIMAL(10,2)`'s
+      (_sqlkey);
+    * a DATE / TIMESTAMP literal DuckDB rejects (`DATE '20200101'`) was read
+      by Python's parser and answered (Connection._check_temporal_literals);
+    * `agg(x) FILTER (WHERE f)` as `agg(CASE WHEN f THEN x END)` skipped the
+      evaluations DuckDB makes and raises on (_aggs.filters_cannot_raise);
+    * an uploaded join with no row left an eager set named but absent, and
+      `sql()` raised on it (_residency.upload_now);
+    * writes through `from_query`, a relation's `update` / `insert` /
+      `query(...)`, and a plain connection on a named in-memory database were
+      never seen (§5.9)."""
+    print("== rule-1 review: cache keys, temporal text, FILTER errors, empty joins, unseen writes")
+    con0 = fresh()
+    if not has_device(con0) or not getattr(con0, "_exact", False):
+        skip("rule-1 review checks: need the exact path on a GPU backend")
+        con0.close()
+        return
+    con0.close()
+
+    # ---- 1. the cache key: equal keys only for statements DuckDB parses alike ----
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    parse = {}
+
+    def tree(sql):
+        if sql not in parse:
+            try:
+                j = json.loads(con._raw.execute("SELECT json_serialize_sql(?)", [sql]).fetchone()[0])
+                parse[sql] = None if j.get("error") else j
+            except duckdb.Error:
+                parse[sql] = None
+        return parse[sql]
+    holes = {
+        "SELECT k, sum(v) FROM t WHERE s = {} GROUP BY k": [
+            "$$a b$$", "$$a  b$$", "$$a\tb$$", "$$a\nb$$", "$t$a b$t$", "$t$a  b$t$", "$t$a $$ b$t$",
+            "'a b'", "'a  b'", "'a\tb'", "'it''s'", "'it''  s'", "'--x'", "'-- x'", "'/*x*/'", "'/* x */'",
+            "E'a\\' b'", "E'a\\'  b'", "e'a\\\\  b'", "N'a b'", "N'a  b'", "'a'\n'b'", "'a'\n\n'b'",
+            "'a\u00a0b'", "'a b'\u00a0", "$$a\u00a0b$$", "'1'", "'2'", "$$1$$",
+            "x'AA'", "x'AB'", "X'AA'", "b'101'", "B'101'", "x 'AA'"],
+        'SELECT k AS {}, sum(v) FROM t GROUP BY k': [
+            '"a b"', '"a  b"', '"a""b"', '"a"" b"', '"a 1"', '"a 2"', "a1", "a2", '"k\u00e9"', '"k\u00c9"',
+            "k\u00e9", '"stra\u00dfe"', '"strasse"', '"k\u00a0"', '"k "', '"k\u200b"', '"k"'],
+        "SELECT k, sum(v) FROM t {} GROUP BY k": [
+            "-- a b\n", "-- a  b\n", "/* a b */", "/* a  b */", "/* a /* b */ c */", "/* a /* b  */ c */",
+            "/* it's */", "-- it's\n", ""],
+        "SELECT k, sum(CAST(v AS DECIMAL({}))) FROM t GROUP BY k": [
+            "10,2", "12,4", "10, 2", "3,2", "18,0"],
+        "SELECT k, sum(v) FROM t WHERE v > {} GROUP BY k": [
+            "5", "6", "-5", "- 5", "-6", "1e3", "1E3", "1000", "1_000", "5.", ".5", "0.5", "1.5e2", "150"],
+        "SELECT k, sum(v){}FROM t GROUP BY k": [" ", "  ", "\t", "\n", "\u00a0", "\u2003", "\x0b",
+                                                "\u2028", "\u200b", "\ufeff", " \u00e9 "],
+        "SELECT k, sum(v) FROM t WHERE s = {} AND k > 1 GROUP BY k": [
+            "'\u00e9'", "'\u00df'", "'e\u0301'", "$$\u00e9$$", "'a\u00a0b'", "'a b'"],
+    }
+    collided, slot_not_constant, compared = [], [], 0
+    for tmpl, fills in holes.items():
+        stmts = [tmpl.format(f) for f in fills]
+        stmts = [s for s in stmts if tree(s) is not None]
+        keys = {s: con._normalise(s) for s in stmts}
+        for i, a in enumerate(stmts):
+            for b in stmts[i + 1:]:
+                compared += 1
+                same_parse = _r1_strip(tree(a)) == _r1_strip(tree(b))
+                if keys[a] == keys[b] and not same_parse:
+                    collided.append((a, b))
+                if keys[a][0] == keys[b][0] and keys[a][1] != keys[b][1] \
+                        and _r1_strip(tree(a), True) != _r1_strip(tree(b), True):
+                    slot_not_constant.append((a, b))
+    check(compared > 300 and not collided,
+          f"cache key: no two statements DuckDB parses differently share a key ({len(collided)} of {compared} "
+          f"pairs do: {collided[:2]})")
+    check(not slot_not_constant,
+          f"cache key: statements that share a template differ only in their constants ({slot_not_constant[:2]})")
+    a, b = "SELECT k, sum(v) FROM t WHERE v > 5 GROUP BY k", "SELECT k,  sum(v)\tFROM t WHERE v > 6   GROUP BY k"
+    check(con._normalise(a)[0] == con._normalise(b)[0] and con._normalise(a)[1] != con._normalise(b)[1],
+          "cache key: a number that is a constant is still a literal slot, and whitespace between tokens is not")
+    # DuckDB's positions are byte offsets: a constant after a non-ASCII name is still found
+    a, b = ('SELECT "k\u00e9" AS kk, sum(v) FROM t WHERE v > 5 AND s = \'\u00e9\' GROUP BY "k\u00e9"',
+            'SELECT "k\u00e9" AS kk, sum(v) FROM t WHERE v > 6 AND s = \'\u00df\' GROUP BY "k\u00e9"')
+    check(con._normalise(a)[0] == con._normalise(b)[0] and len(con._normalise(a)[1]) == 2,
+          "cache key: constants after a non-ASCII name are literal slots too")
+    con.close()
+
+    setup = """
+CREATE TABLE t AS SELECT (i % 7)::INTEGER AS k, (i % 50)::INTEGER AS v, (i % 50) * 1.25 AS dv,
+  CASE WHEN i % 3 = 0 THEN 'a b' WHEN i % 3 = 1 THEN 'a  b' ELSE 'a' || chr(9) || 'b' END AS s,
+  CASE WHEN i % 3 = 0 THEN 'abc' ELSE (i % 9)::VARCHAR END AS sn, i::BIGINT AS b,
+  DATE '2019-12-01' + (i % 60)::INTEGER AS d,
+  TIMESTAMP '2020-01-01 08:00:00' + to_minutes((i % 300)::BIGINT) AS ts
+FROM range(5000) r(i);
+CREATE TABLE "t 1" AS SELECT (i % 7)::INTEGER AS k, (i % 50)::INTEGER AS v FROM range(5000) r(i);
+CREATE TABLE "t 2" AS SELECT (i % 7)::INTEGER AS k, (i % 9)::INTEGER AS v FROM range(5000) r(i);
+"""
+    ref = duckdb.connect()
+    ref.execute(setup)
+    con = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    con.execute(setup)
+    seq = ["SELECT k, sum(v) FROM t WHERE s = $$a b$$ GROUP BY k",
+           "SELECT k, sum(v) FROM t WHERE s = $$a  b$$ GROUP BY k",
+           "SELECT k, sum(v) FROM t WHERE s = $$a\tb$$ GROUP BY k",
+           "SELECT k, count_if(s = $$a b$$) FROM t GROUP BY k",
+           "SELECT k, count_if(s = $$a  b$$) FROM t GROUP BY k",
+           "SELECT k, sum(v) FROM t WHERE s <> $q$a b$q$ GROUP BY k",
+           "SELECT k, sum(v) FROM t WHERE s <> $q$a  b$q$ GROUP BY k",
+           "SELECT sum(v) FROM t WHERE s = $$a b$$",
+           "SELECT sum(v) FROM t WHERE s = $$a  b$$",
+           'SELECT k, sum(v) FROM "t 1" GROUP BY k',
+           'SELECT k, sum(v) FROM "t 2" GROUP BY k',
+           'SELECT k, sum(v) FROM "t 1" WHERE v > 3 GROUP BY k',
+           'SELECT k, sum(v) FROM "t 2" WHERE v > 3 GROUP BY k',
+           "SELECT k, sum(CAST(v AS DECIMAL(10,2))) FROM t GROUP BY k",
+           "SELECT k, sum(CAST(v AS DECIMAL(12,4))) FROM t GROUP BY k",
+           "SELECT k, sum(CAST(v AS DECIMAL(3,2))) FROM t GROUP BY k",
+           "SELECT k, min(CAST(dv AS DECIMAL(10,1))) FROM t GROUP BY k",
+           "SELECT k, min(CAST(dv AS DECIMAL(10,0))) FROM t GROUP BY k"]
+    wrong = [q for q in seq for _ in range(2) if not _r1_same(con, ref, q)]
+    check(not wrong, f"cache key: each statement answers its own question, after its look-alikes ({wrong[:2]})")
+    q = "SELECT k, sum(v) FROM t WHERE s = $$a b$$ GROUP BY k"
+    con.execute(q)
+    check(con.last_rewrite()["rewritten"], "cache key: a dollar-quoted literal still reaches the device")
+
+    # ---- 2. DATE / TIMESTAMP text DuckDB rejects ----
+    cases = [("SELECT k, sum(v) FROM t WHERE d >= DATE '{}' GROUP BY k", "2020-01-05",
+              ["20200101", "2020-W01-1", "2020-1-5x"]),
+             ("SELECT sum(v), count(*) FROM t WHERE d >= DATE '{}'", "2020-01-05", ["20200101", "2020W011"]),
+             ("SELECT k, sum(v) FROM t WHERE ts >= TIMESTAMP '{}' GROUP BY k", "2020-01-01 10:00:00",
+              ["2020-01-01 10", "2020-01-01 10:00:00,5", "20200101T100000", "2020-01-01T11", "2020-01-01 10.5",
+               "2020-01-01 1000", "2020-01-01t10:00:00"]),
+             ("SELECT k, count(*) FROM t WHERE ts < TIMESTAMP '{}' GROUP BY k ORDER BY 2 DESC, k LIMIT 3",
+              "2020-01-01 10:00:00", ["20200101T100000"])]
+    bad_fresh, bad_replan, n = [], [], 0
+    for tmpl, good, bads in cases:
+        for badt in bads:
+            n += 1
+            sql = tmpl.format(badt)
+            c1 = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+            c1.execute(setup)
+            if not _r1_same(c1, ref, sql, ("execute",)):
+                bad_fresh.append(sql)
+            c1.close()
+            c2 = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+            c2.execute(setup)
+            c2.execute(tmpl.format(good)).fetchall()
+            c2.execute(tmpl.format(good)).fetchall()
+            if not _r1_same(c2, ref, sql):
+                bad_replan.append(sql)
+            c2.close()
+    check(not bad_fresh, f"temporal text: DuckDB's error on the first sighting ({len(bad_fresh)} of {n}: {bad_fresh[:2]})")
+    check(not bad_replan, f"temporal text: ... and after the template ran with good text ({len(bad_replan)} of {n}: "
+                          f"{bad_replan[:2]})")
+    good_q = "SELECT k, sum(v) FROM t WHERE d >= DATE '2020-01-07' AND ts < TIMESTAMP '2020-01-01 11:30:00' GROUP BY k"
+    ok = _r1_same(con, ref, good_q)
+    con.execute(good_q)
+    check(ok and con.last_rewrite()["rewritten"], "temporal text: DuckDB's own spelling stays on the device")
+
+    # ---- 3. FILTER as CASE may not hide an error ----
+    raising = ["SELECT k, count_if(CAST(sn AS INTEGER) > 1) FILTER (WHERE sn <> 'abc') FROM t GROUP BY k",
+               "SELECT k, sum(CAST(sn AS INTEGER)) FILTER (WHERE sn <> 'abc') FROM t GROUP BY k",
+               "SELECT k, avg(CAST(sn AS INTEGER)) FILTER (WHERE sn <> 'abc') AS a FROM t GROUP BY k",
+               "SELECT k, max(CAST(sn AS INTEGER)) FILTER (WHERE sn <> 'abc') FROM t GROUP BY k",
+               "SELECT k, bool_or(CAST(sn AS INTEGER) > 3) FILTER (WHERE sn <> 'abc') FROM t GROUP BY k",
+               "SELECT sum(CAST(sn AS INTEGER)) FILTER (WHERE sn <> 'abc') FROM t",
+               "SELECT k, count(*) FILTER (WHERE sn <> 'abc' AND CAST(sn AS INTEGER) > 1) FROM t GROUP BY k",
+               "SELECT k, sum(v) FILTER (WHERE v > 1000 AND CAST(sn AS INTEGER) > 1) FROM t GROUP BY k",
+               "SELECT k, sum(v) FILTER (WHERE v < 1000 OR CAST(sn AS INTEGER) > 1) FROM t GROUP BY k",
+               "SELECT k, sum(v) FILTER (WHERE k > 100 AND v = 'abc') FROM t GROUP BY k",
+               "SELECT k, count(*) FILTER (WHERE v > 1000 AND b = 1.00000000000000000000000000000000001) FROM t GROUP BY k",
+               "SELECT k, count(*) FILTER (WHERE v BETWEEN 1000 AND 'abc') FROM t GROUP BY k",
+               "SELECT k, count(*) FILTER (WHERE v > 1000 AND d > DATE 'garbage') FROM t GROUP BY k",
+               "SELECT k, sum(100 // (v % 5)) FILTER (WHERE v % 5 <> 0) FROM t GROUP BY k"]
+    wrong = [q for q in raising for _ in range(2) if not _r1_same(con, ref, q)]
+    check(not wrong, f"FILTER: DuckDB's error (or rows) where the aggregate's argument or a filter arm raises "
+                     f"({len(wrong)}: {wrong[:2]})")
+    safe = ["SELECT k, sum(v) FILTER (WHERE s <> 'a b') FROM t GROUP BY k",
+            "SELECT k, count(*) FILTER (WHERE v > 3 AND v < 40) FROM t GROUP BY k",
+            "SELECT k, sum(v) FILTER (WHERE d >= DATE '2019-12-15' AND d < DATE '2020-01-01') FROM t GROUP BY k",
+            "SELECT k, count_if(v > 5) FILTER (WHERE k = 1) FROM t GROUP BY k",
+            "SELECT k, sum(v) FILTER (WHERE v BETWEEN 3 AND 9), max(b) FILTER (WHERE NOT (k = 2 OR v < 4)) FROM t GROUP BY k",
+            "SELECT k, sum(v) FILTER (WHERE CAST(sn AS INTEGER) > 1) FROM t WHERE sn <> 'abc' GROUP BY k",
+            "SELECT sum(v) FILTER (WHERE s <> 'a b' AND v > 2), count(*) FROM t"]
+    kept, wrong = [], []
+    for q in safe:
+        if not _r1_same(con, ref, q):
+            wrong.append(q)
+        con.execute(q)
+        kept.append(con.last_rewrite()["rewritten"] or con.last_rewrite()["reason"] == "not_resident")
+    check(not wrong, f"FILTER: native's rows for the shapes that cannot raise ({wrong[:2]})")
+    check(sum(kept) >= len(safe) - 1, f"FILTER: ... and they stay on the device ({sum(kept)} of {len(safe)})")
+    con.close()
+
+    # ---- 4. an uploaded join with no row ----
+    jsetup = """
+CREATE TABLE f AS SELECT (i % 50)::INTEGER AS k, (i % 97)::BIGINT AS v FROM range(20000) r(i);
+CREATE TABLE m AS SELECT (i % 25)::INTEGER AS k, (i % 3)::INTEGER AS g FROM range(100) r(i);
+CREATE TABLE e (k INTEGER, v BIGINT);"""
+    jref = duckdb.connect()
+    jref.execute(jsetup)
+    joins = ["SELECT m.g, count(*), sum(f.v) FROM f JOIN m ON f.k = m.k AND m.g = 7 GROUP BY m.g",
+             "SELECT count(*), sum(f.v), min(f.v) FROM f JOIN m ON f.k = m.k AND m.g = 7",
+             "SELECT m.g, sum(f.v) AS s FROM f JOIN m ON f.k = m.k AND m.g = 7 GROUP BY m.g ORDER BY s DESC LIMIT 2",
+             "SELECT k, sum(v), count(*) FROM e GROUP BY k",
+             "SELECT sum(v), count(*) FROM e WHERE v > 0"]
+    wrong, retried, back = [], [], []
+    for q in joins:
+        for path in ("sql", "execute"):
+            c = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+            c.execute(jsetup)
+            for _ in range(3):
+                if not _r1_same(c, jref, q, (path,)):
+                    wrong.append((path, q))
+            att = [p["attempts"] for t, p in c._manager.progress().items() if ":joinu-" in t or ":e:" in t]
+            if any(x > 1 for x in att):
+                retried.append((path, q, att))
+            c.execute("INSERT INTO m VALUES (1, 7)")
+            c.execute("INSERT INTO e VALUES (1, 5)")
+            c2 = duckdb.connect()
+            c2.execute(jsetup + "INSERT INTO m VALUES (1, 7); INSERT INTO e VALUES (1, 5);")
+            same = _r1_same(c, c2, q, (path,)) and _r1_same(c, c2, q, (path,))
+            back.append(same and c.last_rewrite()["rewritten"])
+            c2.close()
+            c.close()
+    check(not wrong, f"empty join: native's answer on sql() and execute(), the global form's one row included "
+                     f"({len(wrong)}: {wrong[:2]})")
+    check(not retried, f"empty join: the empty upload is remembered, not retried per statement ({retried[:2]})")
+    check(all(back), f"empty join: after a write that fills it the device answers again ({back.count(False)} not)")
+    jref.close()
+
+    # ---- 5. writes the wrapper did not see ----
+    wsetup = "CREATE TABLE t AS SELECT (i % 7)::INTEGER AS k, (i % 50)::INTEGER AS v FROM range(5000) r(i)"
+    wq = "SELECT k, sum(v), count(*) FROM t GROUP BY k ORDER BY k"
+    upd = "UPDATE t SET v = v + 1000 WHERE k = 3"
+    routes = [("con.from_query", lambda c: c.from_query(upd)),
+              ("cursor().from_query", lambda c: c.cursor().from_query(upd)),
+              ("table().update", lambda c: c.table("t").update({"v": duckdb.ColumnExpression("v") + 1000},
+                                                                 condition=duckdb.ColumnExpression("k") == 3)),
+              ("table().query UPDATE", lambda c: c.table("t").query("x", upd)),
+              ("sql(..).query UPDATE", lambda c: c.sql("SELECT 1").query("x", upd)),
+              ("relation .query CREATE OR REPLACE", lambda c: c.sql("SELECT 1").query(
+                  "x", "CREATE OR REPLACE TABLE t AS SELECT k, v + 7 AS v FROM t")),
+              ("table().insert", lambda c: c.table("t").insert([3, 5])),
+              ("values().insert_into", lambda c: c.values([3, 5]).insert_into("t"))]
+    stale = []
+    for name, act in routes:
+        for path in ("execute", "sql"):
+            c = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+            c.execute(wsetup)
+            for _ in range(3):
+                c.execute(wq).fetchall()
+            act(c)
+            got = c.execute(wq).fetchall() if path == "execute" else c.sql(wq).fetchall()
+            if got != c._raw.execute(wq).fetchall():
+                stale.append((name, path))
+            c.close()
+    check(not stale, f"unseen writes: native's rows after a write through DuckDB's own API ({stale})")
+    rel = None
+    c = gpudb.connect(residency="eager", floor_rows=0, thresholds=False)
+    c.execute(wsetup)
+    rel = c.sql("SELECT 42 AS x")
+    # (read on the raw connection: DuckDB's replacement scan looks in its immediate caller's frame)
+    check(isinstance(rel, duckdb.DuckDBPyRelation) and c._raw.execute("SELECT x FROM rel").fetchall() == [(42,)],
+          "unseen writes: a relation is still DuckDB's own (isinstance, a replacement scan reads it)")
+    c.close()
+    name = f":memory:gpudb_r1_{os.getpid()}"
+    A = gpudb.connect(name, residency="eager", floor_rows=0, thresholds=False)
+    A.execute(wsetup)
+    P = duckdb.connect(name, config={"allow_unsigned_extensions": "true"})
+    for _ in range(3):
+        A.execute(wq).fetchall()
+    declined = not A.last_rewrite()["rewritten"] and A.last_rewrite()["reason"] == "off"
+    P.execute(upd)
+    check(declined and A.execute(wq).fetchall() == P.execute(wq).fetchall(),
+          "unseen writes: a named in-memory database is DuckDB's to answer — a plain connection can write it")
+    P.close()
+    A.close()
+    ref.close()
 
 
 def report():

@@ -383,6 +383,32 @@ relevant settings; literals that change the rewrite (`HAVING` threshold,
 `LIMIT`, `IN` list) are re-substituted per statement from the current text,
 never taken from the cached entry.
 
+Two statements DuckDB reads differently must never share a key, and the key
+is built so that it cannot (`gpudb/_sqlkey.py`). The text is read with
+PostgreSQL's lexer rules as DuckDB keeps them — `'…'` with `''`, `E'…'` with
+backslash escapes, `$$…$$` / `$tag$…$tag$`, `"…"` with `""`, `--` and nested
+`/* */` comments — and the key may lose only what DuckDB's lexer loses: the
+length of a run of whitespace between two tokens (a run that holds a line
+break stays a line break: `'a'⏎'b'` is the string `'ab'`, and a `--` comment
+ends at it). A string or number becomes a literal slot only where DuckDB's
+own parse (`json_serialize_sql`) holds a constant of the same value at that
+position (its `query_location`, a byte offset into the UTF-8 text), so digits
+inside a quoted name (`"t 1"` / `"t 2"`) and a type's
+parameters (`DECIMAL(10,2)` / `DECIMAL(12,4)`) stay in the template: both
+pairs used to share one decision and the second answered the first's
+question. Whitespace inside quotes, quoted names and comments is the
+template's verbatim (`$$a  b$$` answered `$$a b$$`'s rows). A statement with a
+non-ASCII space, separator, format or control character outside a confirmed
+slot, an ASCII control character other than that whitespace, an unterminated
+quote or comment, or a prefixed string other than `E` / `N` (`x'AA'` is a
+BLOB on 2.x and the text `'xAA'` on 1.5.6) is keyed by its exact text: DuckDB
+rewrites non-ASCII spaces outside what its own pre-pass takes for quoted
+text, and that pre-pass is not the lexer (it knows `'`, `"` and `--`, not
+`$$`, `E'\''` or `/* */`). It touches no other character, so a name such as
+`"ké"` or `"straße"` is ordinary template text. An exact-text key is always
+correct; it only shares nothing with other literals of the same shape. The parse is asked once per distinct text, and is usually
+the one the fold (§4.16) has just asked for.
+
 The rewriter never parses SQL text itself; every decision is made on the
 tree DuckDB produced, and the SQL that runs is the SQL DuckDB unparsed.
 Failure containment (see §5.4 for the transaction rule): the rewritten
@@ -452,7 +478,14 @@ table the statement reads). A write that commits between that check and the
 caller's first fetch still reaches the relation's own guard and raises
 there, where the wrapper is no longer in the call; `execute()` on the same
 statement is the way back, and that is exactly what the shell's `recover()`
-does. The same holds for any error that only appears at materialisation.
+does. The same holds for any error that only appears at materialisation,
+and for a relation read AGAIN after a write: DuckDB re-runs a relation on
+every read, the rewritten text's guard finds its set gone and raises
+`GPUDB_STALE`, where native would re-run the query over the new data. No
+Python-only change closes this for every way a relation is consumed (a
+relation built on it, a replacement scan, `.create()` all execute inside
+DuckDB with no wrapper frame), so it is listed in KNOWN_ISSUES.md with the
+options and what each costs.
 
 A pushed top-k's tie guard (§2, §4.24) has to come back inside the call for
 the same reason, and it is not a `count(*)`: it is the statement. So it runs
@@ -788,6 +821,36 @@ as the comparison type holds it, deciding from every literal of the term's node:
   `IN (NULL)`), `<>` true on every non-NULL row (`lane is not null`), and a
   bound past the BIGINT range or ±inf is always or never true by DuckDB's order
   (NaN above everything).
+
+**A DATE / TIMESTAMP literal's value is DuckDB's (2026-11-27).** The matcher
+reads `DATE '…'` / `TIMESTAMP '…'` text with Python's `date.fromisoformat` /
+`datetime.fromisoformat`, which take forms DuckDB's cast rejects —
+`'20200101'`, `'2020-W01-1'`, `'2020-01-01 10'`, `'2020-01-01 10:00:00,5'`,
+`'20200101T100000'`, a lower-case `t` — and which forms it takes depends on
+the Python version. Those statements raise `ConversionException` natively and
+answered rows through the wrapper, on the first sighting (the extension's
+renderer declines such text as "not a plain literal", and that decline hands
+the statement to the reference renderer, §4.25) and on a re-plan with new
+literals alike. Now every temporal literal the matcher read is cast by DuckDB
+too (`Connection._check_temporal_literals`, from `_resolve_literals`, so the
+decision and every re-plan pass through it): a text DuckDB rejects, or reads
+as another lane image, declines the statement (literal-sensitive: another
+literal of the template is decided on its own). The parser in use is
+therefore the intersection of the two — a subset of DuckDB's that yields the
+same value by construction. The cast's answer does not depend on TimeZone
+(measured under three zones on 1.5.6, 2.0.0 and 2.0.1; an offset in the text
+is ignored by a TIMESTAMP cast on all three), so it is kept per (type, text)
+for the process. DuckDB itself differs between versions here (`'2020-01-01 '`
+with a trailing no-break space is a date on 1.5.6 and an error on 2.x; a zone
+name after the time is accepted on 2.x only), which is why the text is never
+judged by a rule of the wrapper's own. Of the other declines the extension's
+renderer hands to this renderer (`_scalar_literal_decline`: "constant",
+"threshold", "IN list with no representable value"), only typed text
+literals can be rejected by DuckDB at all — a numeric or string token always
+parses — and the one other text literal the matcher reads,
+`CAST('…' AS DOUBLE)`, is accepted only in the canonical spellings
+(`repr` of a double, `inf`, `-inf`, `nan`), each of which DuckDB's cast reads
+to the same value on all three versions.
 
 The admission on zone-map bounds is re-taken after any write: a write through
 the wrapper drops the writing connection's decisions and counts the family's
@@ -1379,6 +1442,42 @@ as written. The CASE / cast is a computed lane (§4.10), so no operator changed;
 a CAST around the aggregate makes the statement the projected form (§4.11).
 Left alone: DISTINCT or ordered aggregates with a FILTER, and anything the
 lane rules refuse (a volatile function in the filter).
+
+**The FILTER identity holds for values, not for errors.** DuckDB evaluates a
+filtered aggregate's argument on every input row — the rows its filter
+rejects included — and evaluates every arm of an AND, OR or BETWEEN in the
+filter; `CASE WHEN c THEN x END` evaluates `x` only where `c` holds, and stops
+an AND at its first false arm (measured on 1.5.6, 2.0.0 and 2.0.1:
+`sum(CAST(s AS INTEGER)) FILTER (WHERE s <> 'abc')` raises natively over a
+column holding `'abc'`; `count(*) FILTER (WHERE v > 1000 AND v = 'abc')`
+raises on the implicit cast of `'abc'` though no row passes `v > 1000`;
+`sum(100 // (v % 5)) FILTER (WHERE v % 5 <> 0)` raises on 2.x). The CASE form
+answered rows for all three. So a FILTER is rewritten only when the CASE
+cannot hide an error (`_aggs.filters_cannot_raise`, read off DuckDB's bound,
+unoptimised plan, where the types and implicit casts are explicit): every
+filtered aggregate's argument raises for no row — a column, a constant, a
+comparison / IN / BETWEEN / IS NULL / NOT / AND / OR over such, a widening
+cast of a column, a numeric literal the binder cast to the comparison's type,
+or a text literal DuckDB casts without error now (`DATE '2020-01-01'`; a
+constant's cast does not depend on the row) — and a filter holding an AND, OR
+or BETWEEN raises for no row either. A filter without them is evaluated on
+every row by both forms and may be anything. Everything else — arithmetic
+(it can overflow or divide by zero), a function, a cast of a column that
+narrows or parses — keeps its FILTER and DuckDB answers. Coverage: `sum(v)
+FILTER (WHERE s = 'x')`, date-range and conjunctive comparison filters over
+columns, `count_if(v > 5) FILTER (…)` stay on the device; `sum(a * b) FILTER
+(…)` and `FILTER` over a parsing cast do not. A count_if / bool_* without a
+FILTER evaluates its condition on every row in both forms and is unaffected.
+
+The device lanes themselves can only raise MORE than DuckDB, never less: a
+computed lane (§4.10), a predicate lane and an uploaded join's lanes are
+evaluated by DuckDB at upload over every row of the table (or of the join
+result), a superset of the rows the statement evaluates them on after its
+WHERE, with the same CASE / AND semantics. A row only the upload reaches
+fails the upload, the set is refused, and DuckDB answers the statement
+(`sum(CAST(s AS INTEGER)) … WHERE s <> 'abc'` is answered natively for that
+reason). The split's outer statement (§4.11) evaluates its expressions over
+the same groups native does.
 
 ### 4.20 Views
 `FROM revenue0` means `FROM (SELECT …) AS revenue0` — that is what a view is —
@@ -2299,6 +2398,20 @@ same database — the extension stays free of threads and hidden connections
   `'eager'` uploads on first sight (for scripts that know their workload),
   `'manual'` restores v0.6 behaviour (`gpu_upload_pair` only, no managed
   sets, no rewrite).
+- **An upload with no row (2026-11-27).** A background session says so
+  itself: `gpu_upload_finish` raises `GPUDB_UPLOAD_EMPTY`, the set is refused
+  and the statement runs on DuckDB. An eager upload is one statement over the
+  whole result and raises nothing — an uploaded join (§4.13) whose ON or WHERE
+  keeps no row was marked ready with no set under its name, `execute()` paid a
+  failed device attempt per run, and every `sql()` relation raised `no
+  resident set named …` (`gpu_agg_exact_global` for the global form). An
+  empty table's store upload left no lanes and was re-attempted on every
+  statement. `ResidencyManager.upload_now` now asks the extension whether the
+  set (or the view's lanes) exists before the post-upload steps; when it does
+  not, the set is refused with `GPUDB_UPLOAD_EMPTY` and the refusal holds
+  until the data, the budget or the resident population moves — not for the
+  retry window, since emptiness is the data's. The statement is DuckDB's, so
+  the global form returns its one row of NULL / 0 exactly as native does.
 
 ### 5.6 Concurrency — prerequisite of the background path
 Before the residency work described here, `gpu_resident.cpp` took the global mutex inside
@@ -2373,11 +2486,46 @@ committed a write, every resident set is dropped and the statement runs native
 writes re-take the snapshot after they run, so they cost no second
 invalidation. Cursors of one connection share the snapshot.
 
-Not covered: an in-memory database (no file — writes made through a raw
-`duckdb` cursor rather than the wrapper's `cursor()` are invisible; the
-wrapper's own cursors are seen), and a read-only connection watches nothing
-because nobody can write the file while it is open read-only. A checkpoint
-from another connection looks like a write and costs one rebuild.
+Not covered by the file: an in-memory database, and a read-only connection
+watches nothing because nobody can write the file while it is open
+read-only. A checkpoint from another connection looks like a write and costs
+one rebuild.
+
+An in-memory database has no file, so every way to write it has to pass
+through the wrapper's own write accounting (2026-11-27, after an independent
+review found three that did not):
+
+* **The connection's own methods.** `execute`, `executemany`, `sql` / `query`
+  and the transaction calls always did. `from_query` runs a non-SELECT as-is
+  and is now `sql()`; `abort`, `load_extension`, `create_function` and
+  `remove_function` invalidate before they run. The last three change the
+  database's function catalog under every handle, so they also move the
+  process-wide count below: every handle then forgets which functions may
+  stand in a lane, not only the one that called. `register`, `unregister` and
+  `append` already invalidated. An `appender` adds rows only, which the
+  row-count guard sees.
+* **A relation's methods.** `insert`, `insert_into`, `create` / `to_table`,
+  `update`, `create_view` / `to_view`, and `query(name, sql)` — which runs any
+  SQL, `UPDATE` and `SET` included — write inside DuckDB where the wrapper is
+  not called. They are counted where they are called: the methods are wrapped
+  once per process on the `DuckDBPyRelation` class (`_hook_relation_writes`),
+  so a relation stays a real relation — `isinstance` and a replacement scan
+  `FROM rel` still see one — and `query` with a single SELECT is not counted.
+  A relation does not say which connection made it, so the count is
+  process-wide: a connection that sees it move drops its sets and decisions
+  and reads its settings again before its next statement
+  (`Connection._relation_write_check`, one integer comparison per statement).
+  A relation write anywhere in the process therefore costs every gpudb
+  connection one rebuild; correctness does not depend on which.
+* **Another connection to the same database.** `duckdb.connect(':memory:name')`
+  anywhere in the process opens the one shared instance of that name, and a
+  plain connection's UPDATE there leaves nothing the wrapper can read: no file,
+  and the row count the guard compares is unchanged. There is no cheap exact
+  signal (`pragma_storage_info` is the inexact one above), so a gpudb
+  connection to a NAMED in-memory database declines every statement (reason
+  `off`, the detail says why). Coverage cost: statements on `':memory:<name>'`
+  run on DuckDB; `':memory:'` alone is private to its connection and is
+  unaffected.
 
 ### 5.10 Resident columns: the store
 The storage design that replaces per-statement sets with per-table columns —

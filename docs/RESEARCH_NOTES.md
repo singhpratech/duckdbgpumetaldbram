@@ -6967,6 +6967,141 @@ against 3.7 ms native with routes that differ between processes of the same
 wrapper. Nothing in the fixes was found to change how Q15 is decided, which is
 not proof that nothing does: it stays open, for a quiet machine to settle.
 
+## 2026-11-27 — An independent rule-1 review: cache keys, temporal text, FILTER errors, empty joins, unseen writes
+
+An independent review of the rule (a statement through `gpudb.connect()`
+answers what DuckDB answers and raises where DuckDB raises) reported seven
+defects with a reproduction each; five are fixed here (the interrupt one is
+another branch's, and one is left open with its options, below). Every
+reproduction was run first, and each fix started from the general form of the
+defect rather than the reported statement — in two cases the general form was
+wider than the report.
+
+**The template key (§3.3).** `_normalise` collapsed whitespace over every
+character its regex did not take for a literal, and that regex knew neither
+dollar quoting nor quoted names: `WHERE s = $$a  b$$` answered with the rows of
+`$$a b$$`. The general form was worse than whitespace. The regex also took any
+digit run at a word boundary for a literal, so digits inside a quoted name and
+a type's parameters became literal slots: `FROM "t 2"` answered with `"t 1"`'s
+rows (the cached plan's table), `sum(CAST(v AS DECIMAL(12,4)))` with
+`DECIMAL(10,2)`'s scale, and `DECIMAL(3,2)` — which raises natively — with
+rows. The new key (`gpudb/_sqlkey.py`) reads the text with PostgreSQL's lexer
+rules as DuckDB keeps them (measured on 1.5.6, 2.0.0, 2.0.1: `E'a\'b'` is a'b;
+`'a'⏎'b'` is 'ab' and `'a' 'b'` a syntax error; nested block comments; a
+vertical tab is whitespace on 2.x only; `1abc` is `1 AS abc`, `0x1F` is
+`0 AS x1F`, `1.5e` an error on 2.x and `1.5 AS e` on 1.5.6) and makes a slot of
+a string or number only where DuckDB's own parse holds a constant of that value
+at that position (`query_location`; on 2.x a typed literal's constant has
+none and its cast carries the type name's). DuckDB rewrites non-ASCII spaces
+outside what its pre-pass takes for quoted text, a pass that knows `'`, `"`
+and `--` only, so a text with a non-ASCII space, separator, format or control
+character outside a slot is keyed by its exact text; letters (`"ké"`,
+`"straße"`) are ordinary template text. Two drafts passed every correctness
+check and failed six route checks of the ORDER BY name suite, which expect a
+second literal of a non-ASCII-named template to be re-planned rather than
+decided afresh: one sent every non-ASCII text to the exact key, the other read
+`query_location` as a character offset — it is a byte offset into the UTF-8
+text, so after `"ké"` no constant was found and nothing became a slot. The
+parse costs ~130–150 µs per distinct text and is usually the one the fold has
+just made (`_serialize` keeps its last answer). A differential check in the
+suite generates 919–928 pairs of statements that differ inside one lexical
+form (strings, `E''`, dollar quotes with and without a tag, quoted names with
+`""`, `--` and nested comments, quotes inside comments and comment markers
+inside strings, numeric spellings, type parameters, unicode and ASCII
+whitespace, `x''` / `b''`) and asserts that no two with different parses share
+a key, and that two sharing a template differ only in constants.
+
+**DATE / TIMESTAMP text (§4.6).** `_temporal_const` read literal text with
+`date.fromisoformat` / `datetime.fromisoformat`, which take `'20200101'`,
+`'2020-W01-1'`, `'2020-01-01 10'`, a comma before the fraction, a basic-format
+`T` time — all rejected by DuckDB's cast — and what they take depends on the
+Python version. The first sighting reached the reference renderer because the
+extension declines such text with a detail containing "constant", which
+`_scalar_literal_decline` hands to Python; a re-plan with new literals never
+asked DuckDB at all. Every temporal literal the matcher reads is now recorded
+on the plan and cast by DuckDB in `_resolve_literals` (decision and re-plan
+alike); a rejected or differently-read text declines, literal-sensitively. The
+cast is independent of TimeZone on all three versions (an offset in a
+TIMESTAMP text is ignored; a zone name after the time is accepted on 2.x
+only; `'2020-01-01'` with a trailing no-break space is a date on 1.5.6 and an
+error on 2.x), so it is cached per (type, text). The other reasons
+`_scalar_literal_decline` matches were audited: only typed text literals can
+be rejected by DuckDB, and the only other one the matcher reads,
+`CAST('…' AS DOUBLE)`, is taken in canonical spellings only, each of which
+DuckDB reads to the same double on all three versions.
+
+**FILTER as CASE (§4.19).** Measured on all three versions: DuckDB evaluates a
+filtered aggregate's argument on every input row and every arm of an AND / OR
+/ BETWEEN in the filter, while `CASE WHEN f THEN x END` skips both — including
+the implicit cast in `v = 'abc'` and the DECIMAL(38,35) widening of a BIGINT
+column. `count_if(a AND b)` without a FILTER does not raise natively either:
+the full evaluation is FILTER's own. Wrapping the filter in `coalesce(…, false)`
+to force a full evaluation was tried and does not. So a FILTER is rewritten
+only where the CASE cannot hide an error, judged on DuckDB's bound plan
+(`_aggs.filters_cannot_raise`): arguments and short-circuiting filters must be
+built of columns, constants, comparisons and connectives, widening casts of
+columns, numeric literal casts, and text literal casts DuckDB performs without
+error now. Date ranges, conjunctive comparisons, IN, BETWEEN and
+`count_if(v > 5) FILTER (…)` stay on the device; arithmetic and parsing casts
+under a FILTER do not. Computed lanes under a WHERE and CASE forms were
+audited and need nothing: a lane is evaluated at upload over every row, a
+superset of the rows native evaluates it on, so the device can only raise
+more, which fails the upload and leaves the statement to DuckDB.
+
+**An empty uploaded join (§5.5).** An eager upload of a join result with no
+row ran without error and left no set; it was marked ready and every `sql()`
+relation raised `no resident set named …`. An empty table's store upload was
+re-attempted on every statement for the same reason. `upload_now` now asks the
+extension whether the set (or the view's lanes) exists before the
+post-upload steps and refuses it as `GPUDB_UPLOAD_EMPTY` until the data moves.
+Checked in eager and background mode, through `sql()` and `execute()`: the
+grouped, global and top-k forms, a WHERE the join bakes in, an empty base
+table, a table emptied by DELETE after upload, and a write that fills the
+join (the device answers again).
+
+**Writes the wrapper did not see (§5.9).** `from_query` ran an UPDATE
+straight through; it is `sql()` now. A relation's `update`, `insert`,
+`insert_into`, `create`, `create_view` and `query(name, sql)` — which runs any
+SQL — write inside DuckDB; on an in-memory database nothing showed it
+(`table().update`, `query('x', 'UPDATE …')` and `query('x', 'CREATE OR
+REPLACE TABLE …')` gave stale rows, insert-only paths were caught by the
+row-count guard). Wrapping a proxy around the relation would break `FROM rel`
+replacement scans and `isinstance`; wrapping the class's methods does not
+(checked on all three versions), so those methods now move a process-wide
+count that every wrapper connection compares before each statement. A named
+in-memory database (`':memory:name'`) can be written by any plain connection
+in the process with no trace the wrapper can read, so it declines (reason
+`off`). File databases were already covered by the file guard.
+
+**Left open.** A `sql()` relation read again after a write raises
+`GPUDB_STALE` where native re-runs the query; no Python change covers every
+consumer of a relation, and the options are in KNOWN_ISSUES.md. Found on the
+way: DuckDB's replacement scan reads only its immediate caller's frame, so a
+DataFrame or relation named in a statement passed through the wrapper is not
+found (`CatalogException`) where plain DuckDB reads it — present in every
+release with the wrapper, also in KNOWN_ISSUES.md.
+
+**Measured.** The suite's new section (`rule1_review_checks`, 18 checks)
+fails 10 of them on the tree before the fixes and passes all 18 after; the
+residency policy suite's new empty-upload section fails 4 of 6 before. Every
+suite (`test_wrapper`, `test_shell`, `test_residency_policy`,
+`test_ast_compat`) passes on DuckDB 2.0.1, 2.0.0 and 1.5.6 (load 2.5–4.2 on a
+shared 16-core machine). The quick correctness gate on 2.0.1 against its
+baseline: 22 NEW before the fixes (interrupt 4, filter-raise 3,
+join-on-literal 1, temporal-text 4, write-read 5, ws-literal 5), 8 NEW after —
+the interrupt family (another branch's) and the four relation re-reads of the
+open issue above; known-open 19, all settings-across-handles. Routes before
+and after, 2.0.1 and 1.5.6: the WHERE-literal route list (59 lines)
+identical; the ORDER BY name lists 402 of 459 rewritten on both sides; the
+WHERE-literal matrix's re-plan, group, global and join paths 18,196 of 27,040
+rewritten on both sides with no statement changing route; TPC-H SF1 the same
+queries on the device through `execute()` and `sql()`, with and without the
+thresholds (2.0.1: 19 / 19 / 16 of 22; 1.5.6: 20 / 20 / 17), 0 differing
+rows. No route was lost on any list; the declines that are new by design
+(FILTER over arithmetic or a parsing cast, named in-memory databases) do not
+occur in them. Nothing here is CUDA's: every change is in the Python wrapper.
+x86 was not run (its `long double` paths are untouched by these changes).
+
 ## Open questions
 
 - **`median`, `stddev`, several DISTINCT columns, `avg` beside a DISTINCT**:

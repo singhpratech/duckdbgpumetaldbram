@@ -60,6 +60,7 @@ class Device:
         self.host_cols = set()
         self.aborted = []               # upload sessions the manager aborted
         self.upload_fails = {}          # tag -> the error its upload raises
+        self.empty = set()              # tags / stores whose upload statement holds no row
 
     # -- what the test drives it with --
     def touch(self, name):
@@ -101,6 +102,9 @@ class Device:
         if sql.startswith("SELECT name FROM gpu_residents()"):
             name = sql.split("'")[1]
             return [(name,)] if name in self.sets else []
+        if sql.startswith("SELECT state FROM gpu_residents()"):
+            name = sql.split("'")[1]
+            return [("ready",)] if name in self.sets else []
         if sql.startswith("SELECT gpu_upload_abort"):
             self.aborted.append(sql.split("'")[1])
             return [(True,)]
@@ -117,6 +121,8 @@ class Device:
             _, store, per, lanes = sql.split(" ", 3)
             if store in self.upload_fails:
                 raise RuntimeError(self.upload_fails[store])
+            if store in self.empty:
+                return []                       # no row: the statement leaves no lane behind
             for lane in lanes.split(","):
                 self.cols[(store, lane)] = [int(per), self.clock()]
             return [(1,)]
@@ -124,6 +130,8 @@ class Device:
             _, tag, nbytes = sql.split(" ")
             if tag in self.upload_fails:
                 raise RuntimeError(self.upload_fails[tag])
+            if tag in self.empty:
+                return []                       # no row: the statement leaves no set behind
             self.sets[tag] = [int(nbytes), 0, self.clock(), "managed"]
             return [(1,)]
         if sql.startswith("MATERIALIZE"):
@@ -890,6 +898,7 @@ def backoff():   # noqa: C901
 
     run_accounting()
     run_refusals()
+    run_empty_uploads()
 
 
 def run_accounting():
@@ -1041,6 +1050,41 @@ def run_refusals():
     offer_view(mgr, "v", "store", ["k", "p"], 1 * MiB)
     check(upload(mgr, dev, "v"),
           "placement: a backend that reports no placement does not lose its set")
+
+
+def run_empty_uploads():
+    """An upload statement that ran without error and left nothing behind —
+    an uploaded join with no row, an empty table — is not a resident set. One
+    statement over the whole result raises nothing (only a background
+    session's gpu_upload_finish says GPUDB_UPLOAD_EMPTY), so the manager asks
+    the extension, and the refusal holds until the data moves."""
+    print("== an upload with no row is refused, and the refusal holds until a write")
+    for kind in ("set", "view"):
+        clock = Clock()
+        dev = Device(clock)
+        mgr = manager(clock, dev, None)
+        if kind == "set":
+            offer(mgr, "j", 1 * MiB)
+            dev.empty.add("j")
+        else:
+            offer_view(mgr, "j", "store", ["k", "p"], 1 * MiB)
+            dev.empty.add("store")
+        ok = upload(mgr, dev, "j")
+        st = mgr.get("j")
+        check(not ok and st.state == "failed" and st.error.startswith("GPUDB_UPLOAD_EMPTY"),
+              f"empty upload ({kind}): refused, not ready with nothing under its name ({st.state}: {st.error[:60]})")
+        attempts = st.attempts
+        clock.advance(3600.0)
+        mgr.note_candidate("j", st.upload_sql, fqn="tbl", est_bytes=1 * MiB,
+                           **({"store_key": "store", "store_lanes": ["k", "p"]} if kind == "view" else {}))
+        check(not upload(mgr, dev, "j") and mgr.get("j").attempts == attempts,
+              f"empty upload ({kind}): an hour later it is still not attempted again ({mgr.get('j').attempts})")
+        dev.empty.clear()
+        mgr.invalidate("j")
+        mgr.note_candidate("j", st.upload_sql, fqn="tbl", est_bytes=1 * MiB,
+                           **({"store_key": "store", "store_lanes": ["k", "p"]} if kind == "view" else {}))
+        check(upload(mgr, dev, "j") and mgr.get("j").state == "ready",
+              f"empty upload ({kind}): after a write the set is uploaded and ready ({mgr.get('j').state})")
 
 
 if __name__ == "__main__":
