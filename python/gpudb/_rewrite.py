@@ -114,6 +114,15 @@ class WhereTerm:
     col: str
     op: str
     lit: object = None        # Decimal | list[Decimal] | None
+    # the literal as DuckDB compares it (_literals): the parser's type of each
+    # literal, the term's own expression node (what DuckDB binds), and once
+    # resolved the comparison domain ('q' exact rational / 'f' double / ''
+    # the temporal and VARCHAR encodings) with one value per literal
+    sigs: list = field(default_factory=list)
+    node_sigs: list = field(default_factory=list)   # every literal of the node (a BETWEEN's two bounds)
+    node: object = None
+    dom: str = ""
+    img: object = None
 
 
 @dataclass
@@ -163,6 +172,10 @@ class Plan:
     # decline and the SQL derivation is not used.
     native_avg_decimal: bool = False
     having_pay: int = 0
+    having_sig: object = None          # the HAVING literal's type (_literals.sig_of)
+    term_types: Dict[str, str] = field(default_factory=dict)   # WHERE column -> the type DuckDB compares it as
+    term_bounds: Dict[str, Tuple] = field(default_factory=dict)  # WHERE column -> zone-map (min, max)
+    bounds_used: bool = False          # a literal was admitted on those bounds (a BIGINT against a DOUBLE)
     topk_pay: int = 0
     # §4.12: the statement has no GROUP BY. The split hands the matcher a
     # constant key so it reads as a GROUP BY; make_global() then strips it —
@@ -322,10 +335,41 @@ def _temporal_int(x) -> int:
     return (x - _EPOCH).days
 
 
+_DOUBLE_TEXT_RE = re.compile(r"^-?(?:[0-9]+\.[0-9]+(?:e[+-][0-9]+)?|[0-9]e[+-][0-9]+|inf|nan)$")
+
+
+def _double_cast(e):
+    """CAST('<text>' AS DOUBLE) — how a DOUBLE literal leaves the wrapper's
+    renderer (_ast_compat.for_renderer) and comes back in an inner statement
+    — as its float, else None.
+
+    Only the exact text that renderer writes is read: Python's float()
+    accepts what DuckDB's cast rejects (`'١'`, full-width digits, `'1_0'`,
+    `' 1'`, `'+1'`, `'Infinity'`), and a user-written cast of such a text raises
+    natively — so anything but the canonical spelling (repr of the double, or
+    inf / -inf / nan) is not a literal here, and DuckDB decides it."""
+    if e.get("class") != "CAST" or (e.get("cast_type") or {}).get("id") != "DOUBLE" or e.get("try_cast"):
+        return None
+    v = (e.get("child") or {}).get("value") or {}
+    if (e.get("child") or {}).get("class") != "CONSTANT" or v.get("is_null") \
+            or (v.get("type") or {}).get("id") != "VARCHAR":
+        return None
+    text = v.get("value")
+    if not isinstance(text, str) or not _DOUBLE_TEXT_RE.match(text) or text == "-nan":
+        return None
+    x = float(text)
+    if x == x and not math.isinf(x) and repr(x) != text:
+        return None
+    return x
+
+
 def _const(e):
     t = _temporal_const(e)
     if t is not None:
         return t
+    d = _double_cast(e)
+    if d is not None:
+        return Decimal("NaN") if d != d else Decimal(repr(d)) if math.isfinite(d) else Decimal(d)
     if e.get("class") != "CONSTANT":
         return None
     v = e.get("value") or {}
@@ -333,12 +377,16 @@ def _const(e):
         raise Decline("shape", "NULL constant")
     t = (v.get("type") or {}).get("id", "")
     val = v.get("value")
+    from ._literals import wide_int
     if t in ("INTEGER", "BIGINT", "SMALLINT", "TINYINT", "HUGEINT", "UBIGINT", "UINTEGER"):
-        return Decimal(int(val))
+        # a 128-bit value serialises as {upper, lower}
+        return Decimal(wide_int(val))
     if t == "DECIMAL":
         info = (v.get("type") or {}).get("type_info") or {}
         scale = int(info.get("scale", 0))
-        return Decimal(int(val)) / (Decimal(10) ** scale)
+        # exact: a division in the default 28-digit context rounded a 36-digit
+        # literal (1.000…001 read as 1)
+        return Decimal(f"{wide_int(val)}E-{scale}")
     if t in ("DOUBLE", "FLOAT"):
         return Decimal(repr(float(val)))
     if t == "VARCHAR":
@@ -347,6 +395,7 @@ def _const(e):
 
 
 def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
+    from ._literals import sig_of
     j = json.loads(tree_json)
     if j.get("error"):
         raise Decline("shape", j.get("error_message", "serialize error"))
@@ -423,9 +472,9 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             left, right = e.get("left") or {}, e.get("right") or {}
             c = _colref(left)
             if c is not None and _const(right) is not None:
-                plan.where.append(WhereTerm(c, op, _const(right)))
+                plan.where.append(WhereTerm(c, op, _const(right), sigs=[sig_of(right)], node=e))
             elif _colref(right) is not None and _const(left) is not None:
-                plan.where.append(WhereTerm(_colref(right), _FLIP[op], _const(left)))
+                plan.where.append(WhereTerm(_colref(right), _FLIP[op], _const(left), sigs=[sig_of(left)], node=e))
             else:
                 raise Decline("shape", "WHERE is not column vs constant")
             return
@@ -441,22 +490,25 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
             c = _colref(ch[0]) if ch else None
             if c is None or len(ch) < 2:
                 raise Decline("shape", "IN shape")
-            vals = []
+            vals, sigs = [], []
             for x in ch[1:]:
                 if x.get("class") != "CONSTANT":
                     raise Decline("shape", "IN over a non-constant")
                 if (x.get("value") or {}).get("is_null"):
                     continue
                 vals.append(_const(x))
-            plan.where.append(WhereTerm(c, "in", vals))
+                sigs.append(sig_of(x))
+            plan.where.append(WhereTerm(c, "in", vals, sigs=sigs, node=e))
             return
         if cls == "BETWEEN" and ty == "COMPARE_BETWEEN":
             c = _colref(e.get("input") or {})
             lo, hi = _const(e.get("lower") or {}), _const(e.get("upper") or {})
             if c is None or lo is None or hi is None:
                 raise Decline("shape", "BETWEEN shape")
-            plan.where.append(WhereTerm(c, ">=", lo))
-            plan.where.append(WhereTerm(c, "<=", hi))
+            # one node for both halves: DuckDB binds the three operands to one type
+            both = [sig_of(e.get("lower")), sig_of(e.get("upper"))]
+            plan.where.append(WhereTerm(c, ">=", lo, sigs=both[:1], node_sigs=both, node=e))
+            plan.where.append(WhereTerm(c, "<=", hi, sigs=both[1:], node_sigs=both, node=e))
             return
         raise Decline("shape", f"WHERE expression {cls}")
     if node.get("where_clause"):
@@ -500,8 +552,10 @@ def match(tree_json: str, default_order: str, default_null_order: str) -> Plan:
                  _agg(right) if right.get("class") == "FUNCTION" else None
         if la and _const(right) is not None:
             akind, acol, lit = la[0], la[1], _const(right)
+            plan.having_sig = sig_of(right)
         elif ra and _const(left) is not None:
             akind, acol, lit = ra[0], ra[1], _const(left)
+            plan.having_sig = sig_of(left)
             op = _FLIP[op]
         else:
             raise Decline("shape", "having is not aggregate vs constant")
@@ -897,7 +951,8 @@ def make_global(plan: Plan) -> None:
 def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional[int]]:
     """Exact rescale of a HAVING threshold to the payload's integer scale:
     > floors, >= ceils, < ceils, <= floors; = / <> only when representable."""
-    t = lit * (Decimal(10) ** scale)
+    from ._literals import _CTX
+    t = lit.scaleb(scale, context=_CTX)     # exact: the default 28-digit context rounded a wide literal
     if t == t.to_integral_value():
         return op, int(t)
     f, c = math.floor(t), math.ceil(t)
@@ -910,6 +965,81 @@ def _rescale_threshold(op: str, lit: Decimal, scale: int) -> Tuple[str, Optional
     if op == "<=":
         return "<=", f
     raise Decline("shape", "=/<> against a non-representable threshold")
+
+
+def having_device(plan: Plan, op: str, lit, scale: int) -> Optional[Tuple[str, int]]:
+    """(op, BIGINT threshold) for a device HAVING filter, or None when the
+    literal is one the filter cannot take exactly — a DOUBLE (native compares
+    the aggregate in DOUBLE), a value outside BIGINT, `=` / `<>` against a
+    value the aggregate cannot equal — and DuckDB is to compare the typed
+    aggregate with the literal itself, as native does."""
+    sig = plan.having_sig
+    if sig is not None and sig[0] not in ("INT", "DEC"):
+        return None
+    if sig is not None and sig[0] == "DEC" and sig[2] > 9:
+        # native casts the aggregate to DECIMAL(38, scale): past nine decimals that
+        # cast can overflow for a sum the device holds, and native raises
+        return None
+    if not isinstance(lit, Decimal) or not lit.is_finite():
+        return None
+    try:
+        op2, thr = _rescale_threshold(op, lit, scale)
+    except Decline:
+        return None
+    if thr is None or not (-(2 ** 63) <= thr <= 2 ** 63 - 1):
+        return None
+    return op2, thr
+
+
+def _bare_arg(a: str) -> str:
+    """A table function argument without the quotes or the cast a renderer
+    may wrap it in (`CAST(1000 AS BIGINT)`, `1000::BIGINT`), whitespace gone."""
+    m = re.match(r"^\(?CAST\((.*)AS[A-Z0-9_]+\)\)?$", a, re.IGNORECASE) or re.match(r"^\(?(.*?)\)?::[A-Z0-9_]+$", a, re.IGNORECASE)
+    if m:
+        a = m.group(1)
+    a = a.strip("()")
+    return a.strip("'")
+
+
+def device_having(sql: str):
+    """The device HAVING filter a rendered statement asks for, normalised:
+    the (aggregate, operator, threshold) arguments of a `..._having(...)`
+    call, the `having ...` filter of gpu_groupby_exact_multi, or None when
+    the statement filters no groups on the device. For comparing two
+    renderings of one plan (Connection._decide_body)."""
+    out = []
+    t = re.sub(r"\s+", "", sql or "")
+    for m in re.finditer(r"_having\(", t):
+        i, depth, q, args, cur = m.end(), 0, False, [], ""
+        while i < len(t):
+            ch = t[i]
+            if q:
+                cur += ch
+                if ch == "'":
+                    if i + 1 < len(t) and t[i + 1] == "'":
+                        cur += "'"
+                        i += 1
+                    else:
+                        q = False
+            elif ch == "'":
+                q, cur = True, cur + ch
+            elif ch == "(":
+                depth, cur = depth + 1, cur + ch
+            elif ch == ")":
+                if depth == 0:
+                    args.append(cur)
+                    break
+                depth, cur = depth - 1, cur + ch
+            elif ch == "," and depth == 0:
+                args.append(cur)
+                cur = ""
+            else:
+                cur += ch
+            i += 1
+        out.append(tuple(_bare_arg(a) for a in args[-3:]))
+    for m in re.finditer(r"'having(\d+)(\w+?)(>=|<=|<>|!=|>|<|=)(-?\d+)'", t):
+        out.append(m.groups())
+    return tuple(out) or None
 
 
 def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
@@ -943,7 +1073,25 @@ def _lane_of(plan: Plan, col: str) -> Tuple[str, str, int]:
     raise Decline("shape", f"WHERE column {col} is not in the set")
 
 
+def term_type(plan: Plan, col: str) -> str:
+    """The type a WHERE column is compared as: what the connection recorded
+    (a computed lane's own type, not its lane's), else the set's."""
+    t = (plan.term_types or {}).get(col)
+    if t:
+        return t
+    if col == plan.key and len(plan.keys) == 1 and plan.key_type:
+        return plan.key_type
+    if col == plan.val and plan.val_type:
+        return plan.val_type
+    return plan.pred_types.get(col, "")
+
+
 def _where_program(plan: Plan) -> str:
+    """The WHERE as the device program. A numeric literal is compared as DuckDB
+    compares it (_literals): its value in the comparison type, and a value the
+    lane cannot hold makes the term constant — `=` never true, `<>` true on
+    every non-NULL row — instead of raising here, after the decision."""
+    from . import _literals
     terms = []
     for w in plan.where:
         lane, kind, scale = _lane_of(plan, w.col)
@@ -954,36 +1102,37 @@ def _where_program(plan: Plan) -> str:
             def q(x):
                 return "'" + str(x).replace("'", "''") + "'"
             if w.op == "in":
-                terms.append(f"{lane} in ({', '.join(q(x) for x in w.lit)})")
+                # `s IN (NULL)` is never true: no member left, a constant term
+                terms.append(f"{lane} in ({', '.join(q(x) for x in w.lit)})" if w.lit
+                             else f"{lane} is null; {lane} is not null")
             else:
                 terms.append(f"{lane} {'!=' if w.op == '<>' else '='} {q(w.lit)}")
             continue
+        if not w.dom and w.img is None:
+            # not resolved by the connection (a plan built by hand): the types alone must decide
+            if not _literals.resolve_fast(_literals.term_type(term_type(plan, w.col)), w):
+                raise Decline("shape", f"the literal against {w.col} needs DuckDB's own cast")
+        if w.dom == "f":
+            terms += _literals.double_terms(lane, w.op, w.img)
+            continue
+        if w.dom == "q":
+            terms += _literals.rational_terms(lane, w.op, w.img, scale)
+            continue
         if kind == "f":
-            def f(x):
-                return repr(float(x))
-            if w.op == "in":
-                terms.append(f"{lane} in ({', '.join(f(x) for x in w.lit)})")
-            else:
-                terms.append(f"{lane} {'!=' if w.op == '<>' else w.op} {f(w.lit)}")
-            continue
+            raise Decline("shape", f"a literal against the floating column {w.col} that is not a number")
+        # DATE / TIMESTAMP: days / microseconds, against literals of the column's own type
+        # (a datetime is a date to isinstance: a DATE lane takes no TIMESTAMP literal)
+        lits = w.lit if w.op == "in" else [w.lit]
+        tt = term_type(plan, w.col).upper()
+        if not all(isinstance(x, _dt.datetime) if tt == "TIMESTAMP" else
+                   (isinstance(x, _dt.date) and not isinstance(x, _dt.datetime)) if tt == "DATE" else
+                   isinstance(x, _dt.date)
+                   for x in lits):
+            raise Decline("shape", f"a literal against {w.col} that is not of its type")
         if w.op == "in":
-            vals = []
-            for x in w.lit:
-                if isinstance(x, _dt.date):
-                    vals.append(str(_temporal_int(x)))
-                    continue
-                t = x * (Decimal(10) ** scale)
-                if t == t.to_integral_value():
-                    vals.append(str(int(t)))
-            if not vals:
-                raise Decline("shape", "IN list with no representable value")
-            terms.append(f"{lane} in ({', '.join(vals)})")
-            continue
-        if isinstance(w.lit, _dt.date):
+            terms.append(f"{lane} in ({', '.join(str(_temporal_int(x)) for x in lits)})")
+        else:
             terms.append(f"{lane} {'!=' if w.op == '<>' else w.op} {_temporal_int(w.lit)}")
-            continue
-        op, thr = _rescale_threshold(w.op, w.lit, scale)
-        terms.append(f"{lane} {'!=' if op == '<>' else op} {thr}")
     return "; ".join(terms)
 
 
@@ -997,13 +1146,23 @@ def where_sql(plan: Plan) -> str:
         elif w.op == "isnotnull":
             parts.append(f"{c} IS NOT NULL")
         elif w.op == "in":
-            parts.append(f"{c} IN ({', '.join(_lit_sql(x) for x in w.lit)})")
+            sigs = w.sigs if len(w.sigs) == len(w.lit) else [None] * len(w.lit)
+            parts.append(f"{c} IN ({', '.join(_lit_sql(x, g) for x, g in zip(w.lit, sigs))})")
         else:
-            parts.append(f"{c} {w.op} {_lit_sql(w.lit)}")
+            parts.append(f"{c} {w.op} {_lit_sql(w.lit, w.sigs[0] if w.sigs else None)}")
     return " AND ".join(parts) if parts else "TRUE"
 
 
-def _lit_sql(x) -> str:
+def _lit_sql(x, sig=None) -> str:
+    """A literal back as SQL of its own type: a DOUBLE stays a DOUBLE (its
+    shortest decimal spelling would read back as a DECIMAL, and compare
+    differently), a DECIMAL is spelled without an exponent (which would make
+    it a DOUBLE)."""
+    if sig is not None and sig[0] == "DOUBLE":
+        from ._literals import fmt_double
+        return f"CAST('{fmt_double(sig[1])}' AS DOUBLE)"
+    if isinstance(x, Decimal):
+        return format(x, "f") if x.is_finite() else f"CAST('{x}' AS DOUBLE)"
     if isinstance(x, str):
         return "'" + x.replace("'", "''") + "'"
     if isinstance(x, _dt.datetime):
@@ -1178,16 +1337,18 @@ def _render_exact(plan: Plan, fqn: str, default_order: str) -> str:
         akind, op, lit = plan.having
         hp = plan.having_pay
         col = {"count": "count", "count_star": "count_star"}.get(akind, akind)
-        if akind != "avg" and op in (">", ">=", "<", "<="):
-            scale = plan.scales.get(plan.vals[hp], plan.scale) if akind in ("sum", "min", "max") and plan.vals else 0
-            op2, thr = _rescale_threshold(op, lit, scale)
+        scale = plan.scales.get(plan.vals[hp], plan.scale) if akind in ("sum", "min", "max") and plan.vals else 0
+        dev = having_device(plan, op, lit, scale) if akind != "avg" and op in (">", ">=", "<", "<=") else None
+        if dev is not None:
+            op2, thr = dev
             if multi:
                 mfilter = f"having {hp} {col} {op2} {thr}"
             else:
                 fn += "_having"
                 args += [f"'{col}'", f"'{op2}'", str(thr)]
         else:
-            extra_pred = f" AND {_agg_expr(plan, col, hp, _native_type_of(plan, akind, hp))} {op} {lit}"
+            extra_pred = (f" AND {_agg_expr(plan, col, hp, _native_type_of(plan, akind, hp))} {op} "
+                          f"{_lit_sql(lit, plan.having_sig)}")
     elif plan.form == "topk":
         tgt, direction, _ = plan.order[0]
         d = direction if direction != "ORDER_DEFAULT" else default_order
@@ -1380,12 +1541,21 @@ def render(plan: Plan, fqn: str, default_order: str) -> str:
     ties = ""                                  # the pushed top-k's tie guard (§4.24)
     if plan.form == "having":
         akind, op, lit = plan.having
-        if akind == "sum":
-            op, thr = _rescale_threshold(op, lit, plan.scale)
+        dev = having_device(plan, op, lit, plan.scale if akind == "sum" else 0)
+        if dev is None:
+            # a literal the device filter cannot take exactly: DuckDB compares the typed aggregate
+            if akind == "sum":
+                agg = (f'CAST((CAST(r."sum" AS DECIMAL({38 - plan.scale},0)) * {Decimal(1).scaleb(-plan.scale)}) '
+                       f'AS DECIMAL(38,{plan.scale}))' if plan.scale else 'CAST(r."sum" AS HUGEINT)')
+            else:
+                agg = 'r."count"'
+            extra_pred = f" AND {agg} {op} {_lit_sql(lit, plan.having_sig)}"
+        elif akind == "sum":
+            op, thr = dev
             fn = base + "_having"
             args += [f"'{op}'", str(thr)]
         else:                                  # count / count_star
-            op, thr = _rescale_threshold(op, lit, 0)
+            op, thr = dev
             if sum_path:
                 extra_pred = f' AND r."count" {op} {thr}'
             else:

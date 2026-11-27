@@ -749,6 +749,79 @@ compares integers. `'nan'::DOUBLE > 5` is true natively and must be true on
 the device; the parity scenarios include NaN and ±inf rows under every
 operator.
 
+**The literal a lane is compared with is the literal DuckDB compares with
+(2026-11-26).** A term `col <op> literal` is not compared in the column's type:
+DuckDB binds the pair by its implicit-cast rules and casts one side or both.
+`f = 0.1` over a FLOAT column casts the literal to FLOAT (0.10000000149011612);
+`z = 2.5` over a SMALLINT casts both to DECIMAL(6,1); `f = 1e0` widens the
+column to DOUBLE; `d = 0.1e0` rounds a DECIMAL column into DOUBLE; a literal
+with 35 decimals casts a BIGINT column to DECIMAL(38,35), which raises
+natively for any value past 999. A BETWEEN's three operands and an IN list's
+members are bound to ONE type: `ii BETWEEN 1.00000000000000001 AND 2e0` is
+compared in DOUBLE, lower bound included, and so is a DECIMAL beside a 23-digit
+integer. The wrapper (`python/gpudb/_literals.py`) gives every term its literal
+as the comparison type holds it, deciding from every literal of the term's node:
+
+- an integer / DECIMAL column against integer / DECIMAL literals whose digits
+  fit DECIMAL(37), a FLOAT / DOUBLE column against DOUBLE literals or integers
+  the float type holds exactly, an integer column of at most 32 bits against
+  DOUBLE literals, and a BIGINT column whose zone-map bounds stay inside
+  ±2^53 against DOUBLE literals are decided from the types alone, with no query
+  (the test suite pins these rules against DuckDB's own binding, term by term);
+- anything else is bound by DuckDB — the term's own node over a NULL of the
+  column's type, `json_serialize_plan(..., optimize := false)` — and the
+  comparison type and every cast are read off the bound plan; DuckDB then casts
+  each literal to that type itself. The binding depends on the operands' types,
+  not on a DECIMAL or DOUBLE literal's value, so it is kept per term shape: the
+  first sighting of a shape costs three round trips, a new literal of a known
+  shape one (the cast), a literal seen before none;
+- a comparison the lane image cannot reproduce declines with reason `shape`:
+  the column rounded into DOUBLE (a DECIMAL column, or a BIGINT not known to
+  stay inside ±2^53, against a DOUBLE literal), the column cast into a type that
+  does not hold every value of its own, a literal that does not cast (native
+  raises, or answers, itself), a `CAST('…' AS DOUBLE)` whose text is not the
+  canonical spelling of a double (DuckDB's cast rejects texts Python's float()
+  accepts). Such a decline is the literal's, not the template's: another
+  literal of the same template is decided on its own;
+- a value the lane cannot hold makes the term constant instead of raising:
+  `=` and `IN` never true (`lane is null; lane is not null`, also for
+  `IN (NULL)`), `<>` true on every non-NULL row (`lane is not null`), and a
+  bound past the BIGINT range or ±inf is always or never true by DuckDB's order
+  (NaN above everything).
+
+The admission on zone-map bounds is re-taken after any write: a write through
+the wrapper drops the writing connection's decisions and counts the family's
+writes (`_invalidate_all`), so a sibling cursor's cached decision that read
+bounds is taken again too, and a foreign write to the database file goes the
+same way (§5.9); an in-process writer the wrapper did not open stays the
+documented gap of §0. A write the wrapper does not see that changes the row
+count — a raw DuckDB cursor of the same database — is caught by the staleness
+guard, which rebuilds the set but keeps the decision; before that set is
+uploaded again, the bounds of every BIGINT WHERE column the decision could
+admit a DOUBLE literal on are read again (metadata only, once per
+invalidation of the set, at the same moment as a packed key's, §4.4), and if
+they have left ±2^53 the decision is taken again and the literal declines
+(`Connection._term_bounds_left`).
+
+The extension's renderer (`gpu_rewrite_ast`, which draws a template's first
+execution) compares a FLOAT column with the literal's DOUBLE, drops a `<>` it
+cannot represent — which lets NULL rows through — and rescales a DOUBLE HAVING
+threshold in double arithmetic (`sum(d) >= 0.55e0` on DECIMAL(15,2): 55.000000000000007,
+ceiling 56, the group whose sum is 0.55 dropped). The wrapper draws the program
+and the device HAVING filter itself first and keeps the extension's statement
+only when it carries the same ones; otherwise, and when the extension declines
+because of a literal alone (`z = 2.5`, a `CAST('0.45' AS DOUBLE)` that a round
+trip through DuckDB 1.5's renderer writes), the reference renderer draws the
+statement, as it already does for every later literal of the template. A HAVING
+literal the device filter cannot take exactly (a DOUBLE, a value outside
+BIGINT, more than nine decimals) is then compared, in the reference renderer's
+statement, by DuckDB with the typed aggregate. Nothing raised while drawing a
+decided statement reaches the user: the statement runs on DuckDB
+(`_rewrite_text`, and a last net around routing that remembers the failure
+until the next write, and that drops the resident sets — or fails the
+statement — before a statement that may write runs). An interrupt is never
+turned into a decline.
+
 **The mask stage is one pass (Metal, 2026-09-18).** It used to be one kernel
 dispatch per term: each of them read a byte of the mask and wrote one back to
 look at a single lane, so a five-term WHERE walked a 60 MB mask ten times and
@@ -1113,6 +1186,12 @@ composite-key join, all forms, 60 rewritten rows at 1.03–7.9×. Through the
 wrapper: Q14 1.6×, a Q19-style `OR` across two tables 2.2×, the full Q3 with
 its three-column GROUP BY over two tables 1.5×.
 
+The set is the join's result, so a constant in the join's ON (or edge) text
+is inside the set and its name, not in the rewritten statement. A decision
+whose join text holds one is therefore literal-sensitive (each literal tuple
+of the template is decided, and named, on its own); re-planning a new literal
+over the old set answered for the old literal (found 2026-11-27, on main too).
+
 ### 4.14 Nested rewriting: a rewritable SELECT inside a statement DuckDB keeps
 `o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING
 sum(l_quantity) > 300)` (TPC-H Q18), a derived table that aggregates before
@@ -1280,12 +1359,19 @@ Some aggregates are another aggregate in disguise, and the identity is SQL's own
 
     agg(x) FILTER (WHERE c)      =  agg(CASE WHEN c THEN x END)        agg in sum count min max avg
     count(*) FILTER (WHERE c)    =  count(CASE WHEN c THEN 1 END)
-    count_if(c)                  =  CAST(count(CASE WHEN c THEN 1 END) AS HUGEINT)
+    count_if(c)                  =  CAST(sum(CAST(CAST(c AS BOOLEAN) AS INTEGER)) AS HUGEINT)
     bool_and(b) / bool_or(b)     =  CAST(min / max (CAST(b AS TINYINT)) AS BOOLEAN)
 
 An aggregate skips NULL inputs and a CASE without ELSE is NULL for the rows the
 filter rejects; over no qualifying row sum / min / max / avg / bool_* are NULL
-and the counts 0 on both sides (a fixture pins that). `_aggs.normalise` rewrites
+and the counts 0 on both sides (a fixture pins that). `count_if` is not a count:
+DuckDB sums the condition as an integer, so over a group whose condition is
+NULL on every row, or over no row, it is NULL, and 0 only where some row's
+condition is FALSE (measured on 1.5.6, 2.0.0 and 2.0.1; with a FILTER, the rows
+the filter rejects are skipped). Until 2026-11-27 it was mapped to
+`count(CASE WHEN c THEN 1 END)`, which answered 0 for the all-NULL group; the
+release gate found it. The explicit cast to BOOLEAN is the implicit cast
+`count_if` binds, and evaluates the condition once per row. `_aggs.normalise` rewrites
 the top-level SELECT (select list, HAVING, ORDER BY) before the decision, in
 the stage that folds derived tables (§4.16): output names are pinned as
 aliases and names + types verified with DESCRIBE, otherwise the text is left
@@ -1589,6 +1675,25 @@ own tests on both backends.
 
 TIMESTAMP_S / _MS / _NS, TIMESTAMP WITH TIME ZONE, TIME and INTERVAL are not
 lanes (a comparison over one is a computed BOOLEAN lane DuckDB evaluates).
+
+**Which renderer draws a decided statement: one rule.** Three fixes each set
+the extension's rendering aside for a reason of their own (a temporal decode,
+here; a tie window whose name a FROM column shadows, §6; a WHERE program or a
+device HAVING filter that is not the reference one, §4.6), and a packed key's
+set name has to be put back into it (§4.4). They are one ordered rule now
+(`Connection._settle_renderer`), applied when the decision is taken: the
+reference WHERE program is drawn for the decision's literals first (a literal
+it cannot draw declines the decision, as one another literal may not); the
+extension's statement is kept only if it exists (no global form; a decline for
+a literal alone leaves the statement to the reference renderer), names the
+packed set, decodes no temporal image, has no shadowed tie window, carries the
+reference WHERE program text for text and the reference device HAVING filter;
+otherwise the reference renderer draws it there and then (`python_sql`), so a
+statement it cannot draw declines with its decision rather than on every
+execution. At routing the decided literals take whichever of the two was kept;
+any other literal tuple is re-planned and drawn afresh, never from the cached
+drawing, which stands for the decided literals alone; a tie loss that re-points
+the decision's literals clears both.
 
 ## 5. Automatic residency (piece C)
 

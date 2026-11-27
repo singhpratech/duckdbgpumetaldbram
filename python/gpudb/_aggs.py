@@ -2,12 +2,19 @@
 
     agg(x) FILTER (WHERE c)      ->  agg(CASE WHEN c THEN x END)
     count(*) FILTER (WHERE c)    ->  count(CASE WHEN c THEN 1 END)
-    count_if(c)                  ->  CAST(count(CASE WHEN c THEN 1 END) AS HUGEINT)
+    count_if(c)                  ->  CAST(sum(CAST(CAST(c AS BOOLEAN) AS INTEGER)) AS HUGEINT)
+    count_if(c) FILTER (WHERE f) ->  CAST(sum(CASE WHEN f THEN CAST(CAST(c AS BOOLEAN) AS INTEGER) END) AS HUGEINT)
     bool_and(b) / bool_or(b)     ->  CAST(min / max (CAST(b AS TINYINT)) AS BOOLEAN)
 
 Each is an identity in SQL's own semantics: an aggregate skips NULL inputs, a
 CASE without ELSE yields NULL for the rows the filter rejects, and over no
 qualifying row sum / min / max / avg are NULL and count is 0 on both sides.
+count_if is DuckDB's sum of the condition as an integer, not a count: over a
+group in which the condition is NULL on every row (or over no row at all) it
+is NULL, and 0 only where some row's condition is FALSE (measured on 1.5.6,
+2.0.0 and 2.0.1). Counting the rows where it holds gave 0 for the first case.
+The condition is cast to BOOLEAN explicitly — the implicit cast count_if
+binds, so one evaluation of it per row, as natively.
 The CASE (or the cast) is a row-local expression, so it becomes a computed
 lane (§4.10) and the device aggregates it like any column; a CAST around the
 aggregate is an expression over an aggregate (§4.11).
@@ -61,9 +68,11 @@ def _rewrite_agg(e: dict) -> Optional[dict]:
     alias = e.get("alias") or ""
     out = None
     if name == "count_if" and len(children) == 1:
-        cond = children[0] if flt is None else {"class": "CONJUNCTION", "type": "CONJUNCTION_AND", "alias": "",
-                                                "query_location": _NO_LOC, "children": [flt, children[0]]}
-        inner = dict(e, function_name="count", children=[_case(cond, _one())], filter=None, alias="")
+        # sum, not count: NULL over a group whose condition is never non-NULL, as natively
+        arg = _cast(_cast(children[0], "BOOLEAN"), "INTEGER")
+        if flt is not None:
+            arg = _case(flt, arg)
+        inner = dict(e, function_name="sum", children=[arg], filter=None, alias="")
         out = _cast(inner, "HUGEINT", alias)
     elif name in _BOOL and len(children) == 1:
         arg = _cast(children[0], "TINYINT")

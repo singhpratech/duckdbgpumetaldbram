@@ -6609,6 +6609,152 @@ a cursor taking the exact path (`Connection.cursor()` copies none of `_exact`,
 cross-cursor checks are written to hold once it does); not run on the NVIDIA
 machine.
 
+## 2026-11-26 — WHERE literals: compared as DuckDB compares them
+
+Two reviewers found wrong rows and raised exceptions in the WHERE mask on main
+(pip 0.7.3); the extension binary is the one the 0.7.3 wheel bundles and was not
+touched. A matrix script (outside the repo) ran every column type the mask reads —
+TINYINT … UINTEGER, FLOAT and DOUBLE (with and without NaN / ±inf / -0.0 rows),
+DECIMAL(4,1) / (15,2) / (18,4) / (38,3), DATE, TIMESTAMP, VARCHAR, BOOLEAN, each
+with NULLs — against 33 literal forms (integer, DECIMAL with more scale, DOUBLE,
+a string that casts, out of range, NULL, -0.0, 1e400, a typed literal, a wide
+DECIMAL, a HUGEINT) and 13 operator forms, on seven paths (GROUP BY, global
+aggregate, WHERE beside HAVING, a join condition's extra predicate, beside a
+subquery lane, a template re-run in both orders), plus a HAVING-literal matrix:
+47,320 + 2,772 statements per DuckDB version, `floor_rows=0, thresholds=False`.
+
+On 0.7.3 / DuckDB 2.0.1: 466 statements returned other rows than native and 944
+raised a wrapper exception to the user. The causes:
+
+- **FLOAT columns compared with the literal's DOUBLE.** DuckDB casts `0.1` to
+  FLOAT (0.10000000149011612) when the column is FLOAT; both renderers wrote
+  0.1. `=`, `<>`, `<=`, `>`, `IN`, BETWEEN at float-rounded values, and
+  `f = 16777217` (FLOAT holds 16777216), on every path.
+- **A `<>` the lane cannot hold let NULL rows through** (extension renderer,
+  first execution of a template): `z <> 2.5` on a SMALLINT is true on every
+  non-NULL row, and the term was dropped, so NULL rows were counted (800 vs 738
+  per group). Every integer and DECIMAL column, every non-representable literal.
+- **Raised after the decision**: `Decline` from `_render_global` and from the
+  re-render of a template for new literals (`z = 2.5`, `z <> 2.5`, `z IN (2.5)`,
+  `IN (NULL)`), `OverflowError` for `z < 1e400`, `TypeError` for a HUGEINT or a
+  DECIMAL wider than 18 digits (serialised as `{upper, lower}`), in HAVING too.
+- **A 36-digit DECIMAL literal read in the default 28-digit context** — `z =
+  1.00000000000000000000000000000000001` read as `z = 1`.
+- **DuckDB 1.5's renderer writes a DOUBLE literal as a DECIMAL** (`0.1e0` comes
+  back as `0.1`), so every deserialised tree — a computed lane, the inner
+  statement of the global aggregate's split — compared a FLOAT column with a
+  FLOAT literal where native compared in DOUBLE (on 0.7.3 / 1.5.6: 97 GROUP BY
+  statements differ where 2.0.1 has 79, and 62 global ones). 2.0's renderer writes `CAST(0.1 AS DOUBLE)`,
+  a DECIMAL cast that is not the literal's bits past 2^53.
+
+Reachable with shipped defaults (`gpudb.connect()` and nothing else), measured
+on the published 0.7.3 wheel, 1,000,000 rows (the row floor), 2,000 groups:
+`... WHERE f <> 0.1 GROUP BY k` returned 2,000 groups where native returns 1,800;
+`WHERE f < 0.7` 1,600 vs 1,400; `WHERE zn <> 2.5` (a column with NULLs)
+counted the NULL rows; `WHERE z <> 2` then `WHERE z <> 2.5` (one template)
+raised `Decline` on the second, and so did `z IN (1, 2, 3, 4, 5)` then `z IN
+(1.5, …)`. The global aggregate over a join has no row bound beyond the floor:
+`SELECT count(*), sum(t.v) FROM t JOIN d ON t.k = d.k WHERE t.z = 2.5` raised,
+`... WHERE t.f = 0.1` returned `(0, NULL)` for `(100000, 4799930)`. Over a single
+table the global form needs 16M rows and rows × (1 + terms) ≥ 60M, so the
+earlier probe's 20M rows with one term was declined: 16M rows with three terms
+reproduces both. The selectivity bound (plain form ≥ 0.5) is what kept `f = 0.1`
+itself (10%) native at defaults; `<>` and wide ranges pass it.
+
+What changed. The comparison is taken from DuckDB: `_literals.py` gives every
+term its literal as the comparison type holds it. Where the types alone decide
+— integer / DECIMAL against integer / DECIMAL whose digits fit DECIMAL(37),
+FLOAT / DOUBLE against DOUBLE literals or integers the float type holds, a
+32-bit integer column against DOUBLE literals — no query is made; the test pins
+those rules against DuckDB's binding term by term (501 terms agree). Otherwise
+the term's own node is bound over a NULL of the column's type
+(`json_serialize_plan(…, optimize := false)`), the comparison type and casts are
+read off the bound plan, and DuckDB casts the literal itself. A comparison the
+lane image cannot reproduce declines: the column rounded into DOUBLE (BIGINT /
+DECIMAL against a DOUBLE literal — these ran on the device before and were
+right only where no value sat within rounding of the literal), the column cast
+into a type that cannot hold all its values (native raises past 999 for
+`b = 1.000…01` with 35 decimals). A value the lane cannot hold makes the term
+constant (`=` never, `<>` every non-NULL row, a bound past BIGINT or ±inf by
+DuckDB's order). The wrapper draws the program before it takes the extension's
+statement and keeps that statement only when it carries the same program text
+(doubles are now spelled `%.17g`, as the extension spells them); otherwise the
+reference renderer draws it. HAVING literals the device filter cannot take
+exactly go to DuckDB in the rewritten statement. DOUBLE constants leave the
+renderer as `CAST('<%.17g>' AS DOUBLE)` and are read back as DOUBLE literals.
+Rendering after the decision is guarded, and a last net around routing runs the
+statement on DuckDB if anything inside the wrapper raises.
+
+After: 0 statements differ and 0 raise on DuckDB 2.0.1 (the device answers
+26,332 of the 47,320 against 25,851 before, 2,054 of the HAVING 2,772 against
+1,734), and the same on 2.0.0 and 1.5.6. TPC-H SF1 with thresholds off: the same
+19 of 22 rewritten, all equal, and not one bind made. What it costs
+(provisional; M4 Max beside two other jobs, load average 9–18): a statement the
+fix does not concern makes no new query; a re-rendered GROUP BY with three
+integer / DECIMAL terms routes in 309 µs against 286 µs (medians of five runs of
+400 each, alternating), the type checks and the exact Decimal arithmetic. An
+affected term pays three round trips once, 0.49–0.55 ms (median of 60, cold),
+and a dictionary hit per literal after that (13 µs routing for a re-rendered
+global aggregate). What lost: DOUBLE-literal comparisons on BIGINT and
+DECIMAL columns now run on DuckDB (226 matrix statements on 2.0.1); a BIGINT
+column whose statistics stay inside ±2^53 could take them back. The extension's
+renderer still compares a FLOAT column with the DOUBLE and drops a `<>`; the
+wrapper no longer uses its statement when that happens, and the C++ fix is owed.
+
+A second review of the change (an edge matrix of 15 column types × 77 literal
+forms × 9 operator forms, both renderers) confirmed it and found what it had
+missed, each now fixed and pinned in `where_literal_checks`:
+
+- **A BETWEEN was resolved one bound at a time.** DuckDB binds the three
+  operands to one type: `ii BETWEEN 1.00000000000000001 AND 2e0`, and a DECIMAL
+  beside a 23-digit integer, compare in DOUBLE, so `ii = 1` qualifies natively
+  (228 rows a group) and the exact device comparison dropped it (114). The
+  no-query rules now read every literal of the term's node (BETWEEN and IN), and
+  the bound plan of the whole node decides otherwise.
+- **`CAST('<text>' AS DOUBLE)` was read with Python's float()**, which accepts
+  texts DuckDB's cast rejects (`'١'`, full-width digits, `'1_0'`, `' 1'`):
+  native raised, the global aggregate answered. Only the canonical spelling the
+  wrapper's own renderer writes is read as a literal now.
+- **A DOUBLE HAVING threshold over a DECIMAL aggregate, first execution**: the
+  extension rescales 0.55e0 × 100 in double (55.000000000000007, ceiling 56) and
+  dropped the group whose sum is 0.55. The device HAVING filter is now compared
+  like the WHERE program, and the reference renderer draws when they differ.
+- **A decline caused by a literal was cached for the template**: `bi > 1e3` then
+  `bi > 1000` stayed native. Such a decline is now marked literal-sensitive, so
+  every other literal of the template is decided on its own.
+- **DuckDB 1.5: every DOUBLE literal after a renderer round trip** (CTE, view,
+  derived table, split, nested) reached the extension as a CAST, which it
+  declines; main ran those on the device. When the extension declines for a
+  literal alone, the reference renderer draws the statement (and draws `z =
+  2.5` on a first execution too). Route parity with main on 1.5.6 for an
+  everyday list of 58 statements: identical routes, and the two that differed in
+  rows on main (`fl > 0.3`) are now equal.
+- **A cached decline grew its traceback on every raise**; declines are cached as
+  (reason, detail). **Interrupts** were turned into declines in the new handlers
+  and in `_check_bound`; they reach the user now.
+- **BIGINT against a DOUBLE literal** is admitted again when the column's
+  zone-map bounds stay inside ±2^53, re-taken after any write in the family.
+  DECIMAL against a DOUBLE literal stays on DuckDB (the column itself rounds).
+- **Smaller**: `x IN (NULL)` on a DOUBLE / VARCHAR lane renders as the constant it
+  is (it was an empty list the device refused, then a fallback per execution);
+  a routing failure is remembered until the next write and its message shown;
+  a statement that may write and whose routing raised drops the resident sets
+  first, or fails.
+
+After these: the reviewer's edge matrix, 60,750 statements per run, 0 differ and
+0 raise (global and GROUP BY on 2.0.1 and 1.5.6); the matrix of this entry 0 and 0
+on 2.0.1, 2.0.0 and 1.5.6, with the device answering 3,846 of its 6,760 GROUP BY
+statements where the first version of the fix answered 3,274; TPC-H SF1 with
+thresholds off routes exactly as main (19 of 22, all equal, no bind made). Left
+for the NULL-key branch: `s <> 'a'` on a VARCHAR key with NULLs keeps the NULL
+group (its fix is on main; a trial merge of the two passes that probe).
+
+The binding is now kept per term shape: a new DECIMAL literal against a FLOAT
+column costs one cast SELECT, 0.12–0.13 ms (median of 60, three runs, load
+average 8), against 0.45–0.47 ms for a shape's first sighting; a literal seen
+before costs 0.02 ms. The reviewer's re-run cost probe: 2.55 ms against 2.38 ms
+for the same shape with an integer literal (median of 199).
+
 ## 2026-11-27 — Packed keys after review: bounds over the uploaded rows, one retry per change, released sets
 
 An independent review of the entry above found no wrong rows and no error on a
@@ -6690,6 +6836,136 @@ before. Route against the base, TPC-H SF1 plus 20 temporal-key statements
 through `execute()` and `sql()`: 0 differences with thresholds off and on;
 `tpch_coverage.py` 16 of 22 on both trees, the same path per query, 0 rows
 differing. Not run on the NVIDIA machine.
+
+## 2026-11-27 — Four rule-2 fixes on one tree, and count_if over a group with no answer
+
+Four reviewed fixes were combined on one branch: the ORDER BY name binding
+(`Plan.order_outs`, one ASCII-only identifier fold), infinite DATE / TIMESTAMP
+values and packed keys that carry their bounds in the lane name, the WHERE /
+HAVING literals compared as DuckDB compares them (`_literals`), all on top of
+main's NULL-key WHERE rule (`key_predicate_columns`). The literals branch was
+based on pip 0.7.3 and conflicted textually in `connection.py`, the wrapper
+suite and this journal; `_rewrite.py` merged on its own, and was read through
+anyway.
+
+**Which renderer draws a decided statement.** Each fix had a rule of its own
+for setting the extension's statement aside (a temporal decode; a tie window a
+FROM name shadows; a WHERE program or device HAVING filter that is not the
+reference one) and the packed key has to put its set name back into it. The
+merge makes them one ordered rule, `Connection._settle_renderer`, applied at
+decision time: the reference WHERE program is drawn first (a literal it cannot
+draw declines the decision as literal-sensitive); the extension's statement is
+kept only when it exists, names the packed set, decodes no temporal image, has
+no shadowed tie window, carries the reference program text for text and the
+reference HAVING filter; otherwise the reference renderer draws the statement
+there and then and the decision keeps it (`python_sql`), so a statement it
+cannot draw declines with the decision instead of failing on every execution.
+Another literal tuple is re-planned and drawn afresh every time, never from the
+kept drawing. One net around a re-render (the literals fix's: a decline keeps
+its own reason, an interrupt goes through, the timing verdict is not fed), one
+net around routing (the literals fix's: a write whose routing raised drops the
+resident sets first).
+
+**Bounds read twice.** The literals fix admits a DOUBLE literal against a
+BIGINT column when its zone-map bounds stay inside ±2^53 and re-takes the
+decision after any write the family sees (`_write_seq`). A write it does not
+see — a raw DuckDB cursor of the same database — changes the row count, the
+staleness guard rebuilds the set and keeps the decision, and the rebuilt set
+held a value past 2^53 that the device compared exactly where DuckDB compares
+in DOUBLE (`bb > 9007199254740992e0` after inserting 2^53 + 1: one row on the
+device, none natively, measured on the merged tree before the change). The
+packed-key fix already re-reads zone-map bounds once per invalidation of a set,
+before it is uploaded again; the BIGINT WHERE columns a DOUBLE literal can be
+admitted on are now read at the same moment (`Decision.bounds_src`,
+`_term_bounds_left`), and a decision whose bounds left ±2^53 is taken again and
+declines the literal. A re-planned template now also keeps the decision's
+`native_avg_decimal` (`check_types` is not run again there, so a new literal of
+an `avg(DECIMAL)` template rendered the SQL division that differs on x86), and
+a DATE lane no longer takes a TIMESTAMP literal (`isinstance(datetime, date)`
+is true in Python).
+
+**A literal inside an uploaded join.** Running the WHERE-literal suite's join
+statements one after another without clearing the decision cache (as a user's
+session does) found wrong rows on main too: a join answered as an uploaded set
+(§4.13) builds its ON condition into the set, so the template's next literal
+(`ON t.k = d.k AND t.z IN (0.45e0, 2)` then `… IN (0.45e0,
+10000000000000000000000)`) was re-planned over the old set and answered with
+the first literal's rows, or with rows where DuckDB raises (`CAST('١' AS
+DOUBLE)`): 5 statements of one column's sequence on the merged tree, more on
+main. Such a decision is now literal-sensitive whenever DuckDB's parse of the
+join's FROM / edge text holds a constant (`_join_text_has_literal`): each
+literal tuple is decided on its own, as for a computed lane that embeds one.
+Pinned in `integration_checks`; the sequence now gives 0.
+
+**count_if.** The correctness gate's open count_if area: `count_if(b)` over a
+group whose `b` is NULL on every row is NULL in DuckDB and was 0 on the device.
+Measured on 1.5.6, 2.0.0 and 2.0.1: count_if is the sum of the condition as an
+integer — NULL over an all-NULL group and over no rows (a global aggregate
+under a WHERE nothing passes), 0 for an all-FALSE group; with a FILTER the
+rejected rows are skipped (NULL where none pass). `count(CASE WHEN c THEN 1
+END)` is 0 in the first two cases. It is now `CAST(sum(CAST(CAST(c AS BOOLEAN)
+AS INTEGER)) AS HUGEINT)`, the FILTER as a CASE around the argument. The other
+derived aggregates were checked against the same three cases: `agg(x) FILTER`
+→ `agg(CASE …)` (sum / min / max / avg NULL, count 0: the same natively),
+`count(*) FILTER` → `count(CASE … 1 END)` (0), `bool_and` / `bool_or` → `min` /
+`max` of a TINYINT (NULL), avg (NULL from the device for an all-NULL group;
+`avg(DECIMAL)` declines on 2.0), `count(DISTINCT x)` through the distinct split
+(0, as a sum of per-group counts), expressions over aggregates through the
+split (a global one coalesces counts to 0 under its LEFT JOIN, and count_if is
+now a sum, so it stays NULL). Pinned in `integration_checks`.
+
+**What was run** (M4 Max, shared with other jobs; load averages 2–18 during the
+runs, 39 at one peak). The four suites pass on DuckDB 2.0.1, 2.0.0 and 1.5.6
+(wrapper 3,030 / 3,030 / 3,060 checks, shell 76, residency 131, AST 9, none
+failing, after the last change; 3,020 / 3,020 / 3,050 before the uploaded-join
+fix). Every fix's reproduction and matrix: the WHERE-literal matrix 0
+differ / 0 raise on all three versions with the device answering 3,846 of its
+6,760 GROUP BY statements (the same as the branch alone); the literal
+reviewer's edge matrix 0 / 0 (2.0.1 and 1.5.6; device 44,152 of 60,750 global
+and 27,330 grouped, against 43,431 and 23,103 for the branch alone); the
+infinite-temporal explorations, late arrivals and shipped-defaults reproduction,
+the ORDER BY shipped reproduction and its 516 route-list statements, the NULL-key
+shipped reproduction: all equal to native, and every reviewer probe that
+reports a difference reports the same lines under the fix's own tree (ties at a
+LIMIT both sides answer natively, both sides raising the same DuckDB error, a
+missing `pytz` in the 1.5.6 environment).
+
+The correctness gate against the baseline, `--quick` then `--full`, 2.0.1 and
+1.5.6: 0 NEW on 1.5.6; on 2.0.1 `--full` one NEW, which is not the wrapper's —
+the statement declined (`shape`) and DuckDB answered it as written; it groups by
+a DOUBLE column holding both `0.0` and `-0.0`, DuckDB puts them in one group and
+prints whichever arrived first, and the gate's DuckDB-text comparison of an
+ORDER BY it judges total reads the two spellings as different rows. The same
+statement passed its re-run in the same task, passed on 1.5.6, and passed in a
+second `--full` run on 2.0.1 (after the uploaded-join fix: 0 NEW; the 1.5.6
+`--full` ran before that fix, both `--quick` runs after it, 0 NEW each). Stale (listed
+and now passing on both versions): where-literal 882 of 882, name-binding 145 of
+147, temporal-infinity 35 of 35, count_if-null 36 of 36, settings 4 of 4 and 13
+of the 49 settings-across-handles entries (those last two areas flaky,
+timing-dependent modes). Left open: settings-across-handles 36 (its branch is
+not merged), name-binding 2 — `SELECT DISTINCT c_d383 AS x … ORDER BY CAST(x AS
+VARCHAR)`, which also declines: `x` inside the cast binds the table's own column
+`x`, DuckDB orders by `first(x)` per distinct value, and native's own order is
+not determined — and the one unclassified entry, a device key join whose
+DECIMAL dictionary key is also a WHERE column: the materialised set carries no
+predicate lane for it and the `sql()` relation raises at fetch (on main too).
+
+The speed gate `--quick` against pip 0.7.5's wrapper (provisional, load 1.8 at
+the start): no SLOWER_THAN_BASELINE, SLOWER_THAN_NATIVE or COVERAGE_LOST. One
+BASELINE_SLOWER_THAN_NATIVE (a fresh `con.cursor()` on the 2M-row GROUP BY,
+7.9 ms against 4.7 ms native, the baseline the same), which is what the
+settings branch addresses. Four ROUTE_CHANGED, all the temporal fix's: TPC-H Q3
+and the DATE / TIMESTAMP key microbenchmarks are now drawn by the reference
+renderer (0.95–1.03× the baseline, inside the 10.6% floor). A second run after
+the uploaded-join fix flagged TPC-H Q15 through `sql()` SLOWER_THAN_NATIVE
+(5.2–5.6 ms against 3.7 ms; the baseline declined it on its measured verdict
+in both processes there). Q15 is a marginal template whose route the measured
+rule decides per process: in the first run the baseline's own processes
+disagreed on it, and a run of Q14 / Q15 alone against each fix branch and the
+merged tree (load 1.4–1.8) put every side, baseline included, at 3.6–3.9 ms
+against 3.7 ms native with routes that differ between processes of the same
+wrapper. Nothing in the fixes was found to change how Q15 is decided, which is
+not proof that nothing does: it stays open, for a quiet machine to settle.
 
 ## Open questions
 
